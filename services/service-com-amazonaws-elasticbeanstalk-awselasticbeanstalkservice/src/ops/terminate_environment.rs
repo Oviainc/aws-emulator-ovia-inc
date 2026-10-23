@@ -224,14 +224,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Must specify either EnvironmentId or EnvironmentName.",
                     )
                 }
-                crate::state::EnvironmentRefusal::NotFound(message) => {
-                    TerminateEnvironmentError::invalid_parameter_value(message)
+                // This operation words a not-found refusal in the template the
+                // real service answers THIS operation in — the kind of
+                // identifier the request used, its value and the account the
+                // lookup was made in — which is not the one the shared resolver
+                // composed, so it is built here from the request instead.
+                crate::state::EnvironmentRefusal::NotFound(_) => {
+                    TerminateEnvironmentError::invalid_parameter_value(
+                        crate::state::missing_environment_in_account_message(
+                            None,
+                            input.environment_id.as_deref(),
+                            input.environment_name.as_deref(),
+                        ),
+                    )
                 }
             })?;
 
         let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {
             TerminateEnvironmentError::invalid_parameter_value(
-                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+                crate::state::missing_environment_in_account_message(
+                    None,
+                    Some(environment_id.as_str()),
+                    None,
+                ),
             )
         })?;
         // "Ready: Environment is available to have an action performed on it,

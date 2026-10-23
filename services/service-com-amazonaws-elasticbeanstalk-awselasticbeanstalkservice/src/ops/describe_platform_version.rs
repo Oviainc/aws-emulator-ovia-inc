@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(platform_version) => platform_version.to_description(),
             None => crate::state::managed_platform_version(&region, platform_arn)
                 .ok_or_else(|| {
-                    DescribePlatformVersionError::invalid_parameter_value(format!(
-                        "No Platform named '{platform_arn}' found."
-                    ))
+                    DescribePlatformVersionError::invalid_parameter_value(
+                        crate::state::missing_platform_message(platform_arn),
+                    )
                 })?
                 .to_description(&region),
         };

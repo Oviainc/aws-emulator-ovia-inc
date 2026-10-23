@@ -169,11 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let source = Selector {
             side: "Source",
+            role: crate::state::ENVIRONMENT_ROLE_SOURCE,
             environment_id: input.source_environment_id.as_deref(),
             environment_name: input.source_environment_name.as_deref(),
         };
         let destination = Selector {
             side: "Destination",
+            role: crate::state::ENVIRONMENT_ROLE_DESTINATION,
             environment_id: input.destination_environment_id.as_deref(),
             environment_name: input.destination_environment_name.as_deref(),
         };
@@ -251,12 +253,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 struct Selector<'a> {
     /// `Source` or `Destination`, the prefix this side's input members carry.
     side: &'static str,
+    /// The same side as the real service names it inside a not-found message —
+    /// `source` / `destination`, lower case. See
+    /// [`crate::state::missing_environment_in_account_message`].
+    role: &'static str,
     environment_id: Option<&'a str>,
     environment_name: Option<&'a str>,
 }
 
 /// The id of the environment this side names, or `InvalidParameterValue` naming
-/// the member that matched nothing.
+/// the value that matched nothing and the side it arrived on.
+///
+/// The wording is the service's shared environment not-found template, told
+/// which role the missing environment played, so this operation cannot disagree
+/// with the ones that name a single environment.
 fn resolve(
     store: &crate::state::ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
     selector: &Selector<'_>,
@@ -264,17 +274,12 @@ fn resolve(
     store
         .resolve_environment_id(selector.environment_id, selector.environment_name)
         .ok_or_else(|| {
-            let side = selector.side;
             SwapEnvironmentCNAMEsError::invalid_parameter_value(
-                match (selector.environment_id, selector.environment_name) {
-                    (Some(id), _) => {
-                        format!("No Environment found for {side}EnvironmentId = '{id}'.")
-                    }
-                    (None, Some(name)) => {
-                        format!("No Environment found for {side}EnvironmentName = '{name}'.")
-                    }
-                    (None, None) => unreachable!("refused above"),
-                },
+                crate::state::missing_environment_in_account_message(
+                    Some(selector.role),
+                    selector.environment_id,
+                    selector.environment_name,
+                ),
             )
         })
 }
@@ -297,10 +302,13 @@ fn swappable_cname(
     // the record is there. The branch keeps the lookup honest rather than
     // asserting, and reports the side whose selector produced the id.
     let environment = store.environments.get(environment_id).ok_or_else(|| {
-        SwapEnvironmentCNAMEsError::invalid_parameter_value(format!(
-            "No Environment found for {}EnvironmentId = '{environment_id}'.",
-            selector.side
-        ))
+        SwapEnvironmentCNAMEsError::invalid_parameter_value(
+            crate::state::missing_environment_in_account_message(
+                Some(selector.role),
+                Some(environment_id),
+                None,
+            ),
+        )
     })?;
     if environment.status != crate::state::STATUS_READY {
         return Err(SwapEnvironmentCNAMEsError::invalid_parameter_value(format!(

@@ -622,6 +622,22 @@ pub fn now() -> ::aws_smithy_types::DateTime {
     )
 }
 
+/// One instant as an EXACT ordering key: whole epoch seconds, then the
+/// nanoseconds inside that second.
+///
+/// A comparison that has to tell two instants a microsecond apart apart cannot
+/// go through `DateTime::as_secs_f64`: an epoch second count needs ten digits
+/// before the point, which leaves an `f64` a step of about a quarter of a
+/// microsecond at that magnitude, so two timestamps the service rendered as
+/// different (`…:05.334986Z` and `…:05.334987Z`) can compare EQUAL as `f64` —
+/// and a `DescribeEvents` window that opens at the later one then reports the
+/// earlier one too, in front of a bound its own documentation calls "on or
+/// after this time". A lexicographic `(secs, subsec_nanos)` key compares the
+/// two integers the timestamp is made of, so it is exact at every epoch.
+pub fn instant_key(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
 /// The region this request is addressed to: the region field of its SigV4
 /// credential scope, or [`DEFAULT_REGION`] when it carries none.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
@@ -2289,9 +2305,23 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// aged out, whether or not anybody called, so applying it here cannot hide
     /// an event that was still reportable.
     fn expire_events(&mut self) {
-        let horizon = now().as_secs_f64() - EVENT_RETENTION.as_secs_f64();
+        // The horizon as an EXACT instant: the retention taken off the clock's
+        // own (seconds, nanoseconds) rather than off a float of epoch seconds,
+        // whose step at the current epoch is coarser than the nanoseconds
+        // [`instant_key`] compares — the same reason the comparison below goes
+        // through that key.
+        let (now_secs, now_nanos) = instant_key(&now());
+        let retention_secs = i64::try_from(EVENT_RETENTION.as_secs()).unwrap_or(i64::MAX);
+        let mut secs = now_secs.saturating_sub(retention_secs);
+        let mut nanos = i64::from(now_nanos) - i64::from(EVENT_RETENTION.subsec_nanos());
+        if nanos < 0 {
+            // Borrow a whole second, so the horizon stays a normalised instant.
+            nanos += 1_000_000_000;
+            secs = secs.saturating_sub(1);
+        }
+        let horizon = (secs, u32::try_from(nanos).unwrap_or_default());
         self.events
-            .retain(|event| event.event_date.as_secs_f64() >= horizon);
+            .retain(|event| instant_key(&event.event_date) >= horizon);
     }
 
     /// Hold the count bound on the event log: past [`MAX_RETAINED_EVENTS`] the
@@ -2311,9 +2341,8 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
                 .iter()
                 .enumerate()
                 .min_by(|(_, left), (_, right)| {
-                    left.event_date
-                        .as_secs_f64()
-                        .total_cmp(&right.event_date.as_secs_f64())
+                    instant_key(&left.event_date)
+                        .cmp(&instant_key(&right.event_date))
                         .then_with(|| left.sequence.cmp(&right.sequence))
                 })
                 .map(|(index, _)| index);
@@ -2367,10 +2396,17 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
 
 /// The message this service refuses a request with `InvalidParameterValue` for
 /// when the identifier it supplied names no stored environment, built from the
-/// request: it names the member the caller used and the value it carried, the
-/// way the real service's "No Environment found for EnvironmentName = '…'."
-/// does. Shared by every operation that takes the `EnvironmentId` /
-/// `EnvironmentName` either-or pair, so they cannot disagree.
+/// request: it names the member the caller used and the value it carried —
+/// `No Environment found for EnvironmentName = '<name>'.`
+///
+/// This is the wording the real service answers MOST of its environment lookups
+/// in (`RestartAppServer`, `RebuildEnvironment`, `AbortEnvironmentUpdate`, the
+/// two operations-role calls, `ApplyEnvironmentManagedAction` and the two health
+/// reads, as their recorded transcripts show). The environment-lifecycle pair
+/// answers in a template of its own, which is
+/// [`missing_environment_in_account_message`]: an operation's not-found message
+/// is the one the real service words THAT operation's refusal with, so neither
+/// template is applied to an operation that does not answer in it.
 pub fn missing_environment_message(
     environment_id: Option<&str>,
     environment_name: Option<&str>,
@@ -2382,6 +2418,62 @@ pub fn missing_environment_message(
         // caller makes before reaching here.
         (None, None) => "No Environment found.".to_string(),
     }
+}
+
+/// The role a request gives the environment it names, for an operation that
+/// names MORE than one: `SwapEnvironmentCNAMEs` takes a source and a
+/// destination, and the real service leads the not-found message with that role
+/// ("source environment not found with Name: …") so a caller can tell which of
+/// the two inputs was bad. See [`missing_environment_in_account_message`].
+pub const ENVIRONMENT_ROLE_SOURCE: &str = "source";
+/// The destination half of [`ENVIRONMENT_ROLE_SOURCE`].
+pub const ENVIRONMENT_ROLE_DESTINATION: &str = "destination";
+
+/// The message the ENVIRONMENT-LIFECYCLE pair — `TerminateEnvironment` and
+/// `SwapEnvironmentCNAMEs` — refuses a request with `InvalidParameterValue` for
+/// when the identifier it supplied names no stored environment.
+///
+/// Also built from the request alone, but in the real service's other template
+/// for these two: the kind of identifier the caller used (`Id` or `Name`), the
+/// value it carried, and the ACCOUNT the lookup was made in —
+/// `Environment not found with Name: <value> in account '<account>'`. `role`
+/// (`None` for an operation that names a single environment) replaces the
+/// leading `Environment` with that environment's role, lower case, the way the
+/// real service words the two sides of a swap. Shared by the operations that
+/// answer in it, so they cannot disagree; every other environment lookup answers
+/// in [`missing_environment_message`].
+pub fn missing_environment_in_account_message(
+    role: Option<&str>,
+    environment_id: Option<&str>,
+    environment_name: Option<&str>,
+) -> String {
+    let subject = match role {
+        Some(role) => format!("{role} environment"),
+        None => "Environment".to_string(),
+    };
+    let account = ::engine::emulator_account_id();
+    match (environment_id, environment_name) {
+        (Some(id), _) => format!("{subject} not found with Id: {id} in account '{account}'"),
+        (None, Some(name)) => {
+            format!("{subject} not found with Name: {name} in account '{account}'")
+        }
+        // Neither supplied is a MissingRequiredParameter refusal, which every
+        // caller makes before reaching here.
+        (None, None) => format!("{subject} not found in account '{account}'"),
+    }
+}
+
+/// The message `DescribePlatformVersion` refuses a `PlatformArn` that answers to
+/// no platform version with — neither a CUSTOM one this account created nor a
+/// MANAGED one this service publishes.
+///
+/// Built from the request, in the real service's template for the platform
+/// READ: the requested ARN quoted, then `does not exist.`. `CreateEnvironment`
+/// words its own platform refusal differently ("No Platform named '<arn>'
+/// found."), the same per-operation split the two environment templates above
+/// have, so this one is not applied there.
+pub fn missing_platform_message(platform_arn: &str) -> String {
+    format!("Platform '{platform_arn}' does not exist.")
 }
 
 /// The message that records a created resource, the middle event of the

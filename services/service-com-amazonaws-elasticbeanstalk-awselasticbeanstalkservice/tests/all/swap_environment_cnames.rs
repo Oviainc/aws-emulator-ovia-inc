@@ -376,9 +376,11 @@ struct RefusalCase {
     case: &'static str,
     params: Vec<(&'static str, &'static str)>,
     code: &'static str,
-    /// Fragments the message must carry — the member the caller has to fix and,
-    /// where the refusal is about a value, that value. Kept free of punctuation
-    /// the XML envelope escapes.
+    /// Fragments the message must carry — for an incomplete request the member
+    /// the caller has to fix, and for a value that resolves to nothing the
+    /// service's not-found template (which names the side and the kind of
+    /// identifier) plus the value itself. Kept free of punctuation the XML
+    /// envelope escapes.
     message_contains: &'static [&'static str],
 }
 
@@ -449,7 +451,7 @@ async fn unresolvable_and_incomplete_swaps_are_refused_and_change_nothing() {
                 ("DestinationEnvironmentName", "other-env"),
             ],
             code: "InvalidParameterValue",
-            message_contains: &["SourceEnvironmentName", "no-such-env"],
+            message_contains: &["source environment not found with Name", "no-such-env"],
         },
         RefusalCase {
             case: "unknown destination name",
@@ -458,7 +460,10 @@ async fn unresolvable_and_incomplete_swaps_are_refused_and_change_nothing() {
                 ("DestinationEnvironmentName", "no-such-env"),
             ],
             code: "InvalidParameterValue",
-            message_contains: &["DestinationEnvironmentName", "no-such-env"],
+            message_contains: &[
+                "destination environment not found with Name",
+                "no-such-env",
+            ],
         },
         RefusalCase {
             case: "both names unknown",
@@ -467,7 +472,7 @@ async fn unresolvable_and_incomplete_swaps_are_refused_and_change_nothing() {
                 ("DestinationEnvironmentName", "ghost-two"),
             ],
             code: "InvalidParameterValue",
-            message_contains: &["SourceEnvironmentName", "ghost-one"],
+            message_contains: &["source environment not found with Name", "ghost-one"],
         },
         RefusalCase {
             case: "unknown ids",
@@ -476,7 +481,7 @@ async fn unresolvable_and_incomplete_swaps_are_refused_and_change_nothing() {
                 ("DestinationEnvironmentId", "e-eeeeeeee"),
             ],
             code: "InvalidParameterValue",
-            message_contains: &["SourceEnvironmentId", "e-ffffffff"],
+            message_contains: &["source environment not found with Id", "e-ffffffff"],
         },
     ];
 
