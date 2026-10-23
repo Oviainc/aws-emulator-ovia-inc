@@ -311,15 +311,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
-        // One customer managed configuration recorder per account per Region.
-        if !store.recorders.contains_key(&name) && !store.recorders.is_empty() {
+        // One customer managed configuration recorder per account per Region — the
+        // limit the refusal's message states.
+        if !store.recorders.contains_key(&name)
+            && store.recorders.len() >= crate::state::CUSTOMER_MANAGED_RECORDERS_QUOTA
+        {
             return Err(
                 PutConfigurationRecorderErrorModeled::MaxNumberOfConfigurationRecordersExceededException(
                     MaxNumberOfConfigurationRecordersExceededException {
-                        message: Some(format!(
-                            "this account already has a customer managed configuration recorder \
-                             in {region}; only one can exist for each account for each Region"
-                        )),
+                        message: Some(crate::state::max_configuration_recorders_message()),
                     },
                 )
                 .into(),
