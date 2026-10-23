@@ -83,18 +83,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-transcribe-transcribe.j
 pub struct DeleteMedicalTranscriptionJobOutput;
 
 impl DeleteMedicalTranscriptionJobOutput {
-    // `with_http` carries this operation's modelled response status. Remove it and
-    // the status falls back to the protocol default, so a modelled 204 answers 200.
+    // NO `with_http` opt-in: Amazon Transcribe speaks awsJson1_1, an RPC protocol, so
+    // `smithy_query(query="operation")` reports this operation's @http binding as
+    // `httpBindingsInert` — the modelled method, URI and code (DELETE
+    // /medicaltranscriptionjobs/{MedicalTranscriptionJobName}, 204) never reach the
+    // wire. The success status is the protocol's 200; see `SUCCESS_STATUS` below.
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
         &[],
-    )
-    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
-        "DELETE",
-        "/medicaltranscriptionjobs/{MedicalTranscriptionJobName}",
-        Some(204u16),
-    ));
+    );
 }
 
 pub static DELETE_MEDICAL_TRANSCRIPTION_JOB_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &DeleteMedicalTranscriptionJobOutput::SCHEMA;
