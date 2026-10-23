@@ -1091,8 +1091,10 @@ pub struct StackScope<'a> {
 ///
 /// A name the template builds with an intrinsic function is evaluated first (the common
 /// `TopicName: !Ref TopicName` case), against the stack's parameters and pseudo
-/// parameters: the resources are what this function is producing, so a name that refers
+/// parameters: a NAME is resolved before any resource has an identity, so one that refers
 /// to ANOTHER resource is not resolvable here and that resource takes the generated name.
+/// (What a later round does resolve is an IDENTIFIER built from another resource's — see
+/// [`resolve_dependent_identities`] — not the name it was computed from.)
 ///
 /// Every record starts out NOT materialised: this function computes the identity
 /// CloudFormation gives the resource, and
@@ -1898,6 +1900,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::BedrockAgentCore::Memory",
     "AWS::BedrockAgentCore::Runtime",
     "AWS::BedrockAgentCore::WorkloadIdentity",
+    "AWS::CloudWatch::Alarm",
     "AWS::DynamoDB::Table",
     "AWS::EC2::SecurityGroup",
     ECR_PUBLIC_REPOSITORY,
@@ -2488,6 +2491,17 @@ fn return_values(
         // AWS::Transfer::Server is in above).
         "AWS::RUM::AppMonitor" => {
             attributes.insert("Id".to_string(), generated_uuid("rum/appmonitor", name));
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the alarm name"; Fn::GetAtt: Arn. A CloudWatch alarm's ARN spells
+        // its resource with a COLON
+        // (`arn:aws:cloudwatch:<region>:<account>:alarm:<alarm name>`), which is why the
+        // type is catalogued rather than left to the uniform `<type>/<name>` convention.
+        "AWS::CloudWatch::Alarm" => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("cloudwatch", region, &format!("alarm:{name}")),
+            );
             (name.to_string(), attributes)
         }
         _ => (name.to_string(), attributes),
