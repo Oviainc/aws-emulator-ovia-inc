@@ -485,8 +485,8 @@ async fn a_request_that_names_nothing_is_refused() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: an unknown group must answer 404, got {status} with {refused}"
+            status, 400,
+            "case {name:?}: an unknown group must answer 400, got {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),

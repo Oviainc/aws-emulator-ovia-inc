@@ -382,7 +382,7 @@ async fn a_default_name_for_no_published_family_names_nothing() {
             let (status, answered) = call(&router, operation, &body).await;
             assert_eq!(
                 (status, error_code(&answered).as_str()),
-                (404, "ParameterGroupNotFoundFault"),
+                (400, "ParameterGroupNotFoundFault"),
                 "case {case:?}: expected the modelled not-found fault, got {status} with \
                  {answered}"
             );

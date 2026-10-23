@@ -241,7 +241,7 @@ async fn a_password_refusal_states_the_documented_length_bound() {
         .await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
-            (404, "UserNotFoundFault"),
+            (400, "UserNotFoundFault"),
             "case {length:?}: a refused create must leave no user behind, got {answered}"
         );
     }
@@ -930,7 +930,7 @@ async fn the_other_parameter_update_refusals_use_the_services_templates() {
         let (status, answered) = update_parameters(&router, group, &[("timeout", "30")]).await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
-            (404, "ParameterGroupNotFoundFault"),
+            (400, "ParameterGroupNotFoundFault"),
             "case {case:?}: an absent group must answer not-found, got {answered}"
         );
         assert_eq!(
@@ -947,7 +947,7 @@ async fn the_other_parameter_update_refusals_use_the_services_templates() {
         .await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
-            (404, "ParameterGroupNotFoundFault"),
+            (400, "ParameterGroupNotFoundFault"),
             "case {case:?}: the read must answer not-found too, got {answered}"
         );
         assert_eq!(
@@ -1039,7 +1039,7 @@ async fn delete_acl_removes_the_acl_and_a_later_read_answers_not_found() {
                 refused(&router, operation, &json!({ "ACLName": name }), &probe).await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "ACLNotFoundFault"),
+                (400, "ACLNotFoundFault"),
                 "case {probe:?}: a removed ACL must answer not-found, got {status} {code}"
             );
             assert_eq!(

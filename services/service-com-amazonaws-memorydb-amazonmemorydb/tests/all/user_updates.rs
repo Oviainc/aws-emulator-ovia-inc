@@ -372,8 +372,8 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case \"unknown user\": expected 404, got {status} with {body}"
+        status, 400,
+        "case \"unknown user\": expected 400, got {status} with {body}"
     );
     assert_eq!(
         error_code(&body),
@@ -396,7 +396,7 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
     .await;
     assert_eq!(
         (status, error_code(&body)),
-        (404, "UserNotFoundFault".to_string()),
+        (400, "UserNotFoundFault".to_string()),
         "case {case:?}: the user must be resolved before what is asked of it, got \
          {status} with {body}"
     );

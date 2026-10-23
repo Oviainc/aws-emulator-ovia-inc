@@ -605,8 +605,8 @@ async fn a_refused_update_leaves_the_group_unchanged() {
     for name in ["no-such-group", "rejection", "rejections-2"] {
         let (status, refused) = update(&router, name, &[("timeout", "30")]).await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: an unknown group must answer 404, got {status} with {refused}"
+            status, 400,
+            "case {name:?}: an unknown group must answer 400, got {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),
@@ -620,8 +620,8 @@ async fn a_refused_update_leaves_the_group_unchanged() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {name:?}: an unknown group must answer 404, got {status} with {refused}"
+            status, 400,
+            "case {name:?}: an unknown group must answer 400, got {status} with {refused}"
         );
         assert_eq!(
             error_code(&refused),

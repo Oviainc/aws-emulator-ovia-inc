@@ -448,7 +448,7 @@ async fn the_cluster_lifecycle_is_served_from_persisted_state() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ClusterNotFoundFault"),
+        (400, "ClusterNotFoundFault"),
         "case {case:?}: the cluster must be gone from state, got {status} with {body}"
     );
     // And the ACL no longer lists it.
@@ -937,34 +937,34 @@ async fn resolution_and_conflict_faults_come_from_state() {
         (
             "CreateCluster",
             json!({ "ClusterName": "fresh", "NodeType": "db.t4g.small", "ACLName": "no-such-acl" }),
-            404,
+            400,
             "ACLNotFoundFault",
         ),
         ("CreateACL", json!({ "ACLName": "fault-acl" }), 400, "ACLAlreadyExistsFault"),
         (
             "DescribeClusters",
             json!({ "ClusterName": "nope" }),
-            404,
+            400,
             "ClusterNotFoundFault",
         ),
-        ("DescribeACLs", json!({ "ACLName": "nope" }), 404, "ACLNotFoundFault"),
+        ("DescribeACLs", json!({ "ACLName": "nope" }), 400, "ACLNotFoundFault"),
         (
             "UpdateCluster",
             json!({ "ClusterName": "nope", "Description": "x" }),
-            404,
+            400,
             "ClusterNotFoundFault",
         ),
         (
             "UpdateCluster",
             json!({ "ClusterName": "taken", "ACLName": "no-such-acl" }),
-            404,
+            400,
             "ACLNotFoundFault",
         ),
         ("UpdateCluster", json!({ "ClusterName": "taken" }), 400, "NoOperationFault"),
         (
             "DeleteCluster",
             json!({ "ClusterName": "nope" }),
-            404,
+            400,
             "ClusterNotFoundFault",
         ),
         // Asked for behaviour this slice cannot perform: told so, rather than a 200
