@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIPSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIPSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the IPSet the request's detector holds under `IpSetId`,
+//! read out of [`crate::state`] exactly as `CreateIPSet` stored it, plus the
+//! activation status the clock owes it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIPSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIPSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIPSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIPSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetIPSetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // A report. The lock is taken MUTABLY only to materialise the status change
+        // the CLOCK already made due (see `IpSetRecord::settle`); nothing here
+        // depends on the caller, and no later caller sees anything this read chose.
+        let mut state = state.lock();
+        let now = crate::state::now_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+        let Some(ip_set) = detector.ip_sets.get_mut(&input.ip_set_id) else {
+            // An `IpSetId` this detector does not hold, classified from the
+            // REQUEST like every other id this service refuses.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ip_set_id_rejection(&input.ip_set_id),
+            ));
+        };
+        ip_set.settle(now);
+
+        Ok(GetIPSetOutput {
+            name: ip_set.name.clone(),
+            format: ip_set.format.clone(),
+            location: ip_set.location.clone(),
+            status: ip_set.status.clone(),
+            // An IPSet always reports a tag map, EMPTY when nothing tagged it, so a
+            // client iterates it without a null guard — the same way `GetDetector`
+            // reports the detector's tags.
+            tags: Some(
+                ip_set
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            // "This field appears in the response only if it was provided during
+            // IPSet creation or update" (`smithy_query(operation="GetIPSet")`).
+            expected_bucket_owner: ip_set.expected_bucket_owner.clone(),
+        })
     }
 }

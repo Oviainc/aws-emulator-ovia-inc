@@ -45,6 +45,8 @@ mod repository_description;
 mod repository_lifecycle;
 #[path = "all/repository_rename.rs"]
 mod repository_rename;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wire.rs"]
