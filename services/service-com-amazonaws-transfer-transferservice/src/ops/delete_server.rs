@@ -161,8 +161,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
+        // WHO is asking is decided before anything is deleted: a caller whose
+        // identity policy explicitly denies this action on this server is refused
+        // with the modelled `AccessDeniedException` (HTTP 403) and nothing is
+        // removed. The gate reads the account's own IAM store — see
+        // `crate::state::authorization`.
+        let resource = st::server_arn(&st::request_region(ctx.parts()), &input.server_id);
+        if let Some(message) = st::authorization::explicit_deny(
+            &*self.engine,
+            ctx.parts(),
+            Self::NAME,
+            Some(&resource),
+        ) {
+            return Err(DeleteServerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             DeleteServerErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),

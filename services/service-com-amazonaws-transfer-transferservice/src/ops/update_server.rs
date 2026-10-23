@@ -280,8 +280,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
+        // WHO is asking is decided before anything is written: a caller whose
+        // identity policy explicitly denies this action on this server is refused
+        // with the modelled `AccessDeniedException` (HTTP 403) and nothing changes.
+        // The gate reads the account's own IAM store — see
+        // `crate::state::authorization`.
+        let resource = st::server_arn(&st::request_region(ctx.parts()), &input.server_id);
+        if let Some(message) = st::authorization::explicit_deny(
+            &*self.engine,
+            ctx.parts(),
+            Self::NAME,
+            Some(&resource),
+        ) {
+            return Err(UpdateServerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             UpdateServerErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),
@@ -289,6 +307,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::Instant::now();
+
+        // An `API_GATEWAY` identity provider is VERIFIED before anything is written,
+        // on the same rule `CreateServer` applies: the invocation role the server
+        // would end up with has to be a role this account holds that may invoke the
+        // API the URL names. The verification reads the account's IAM store, so the
+        // inputs it needs are read under this service's own lock and that lock is
+        // RELEASED before the IAM store is touched — the two are never held at once,
+        // so there is no lock order here to cycle. A `ServerId` the store does not
+        // hold has no provider to verify; the write below answers it as not found.
+        let stored_provider = {
+            let guard = state.lock();
+            guard.servers.get(&input.server_id).map(|server| {
+                (
+                    server.identity_provider_type.clone(),
+                    server.identity_provider_details.clone(),
+                )
+            })
+        };
+        if let Some((stored_type, stored_details)) = stored_provider {
+            // The provider the update would LEAVE: the request's where it names one,
+            // the stored server's otherwise — the same "effective configuration"
+            // reading the cross-member check below uses.
+            let next_type = input
+                .identity_provider_type
+                .clone()
+                .unwrap_or(stored_type);
+            let next_details = input
+                .identity_provider_details
+                .clone()
+                .or(stored_details);
+            if next_type == st::IDENTITY_PROVIDER_API_GATEWAY {
+                if let Some(invocation_role) = next_details
+                    .as_ref()
+                    .and_then(|details| details.invocation_role.as_deref())
+                {
+                    let url = next_details
+                        .as_ref()
+                        .and_then(|details| details.url.as_deref());
+                    if !st::authorization::invocation_role_can_invoke(
+                        &*self.engine,
+                        invocation_role,
+                        url,
+                    ) {
+                        return Err(UpdateServerErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: st::unverifiable_identity_provider(url),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
         let mut guard = state.lock();
         let Some(stored) = guard.servers.get_mut(&input.server_id) else {
             return Err(st::not_found(

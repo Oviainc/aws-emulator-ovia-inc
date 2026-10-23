@@ -61,6 +61,70 @@ use std::sync::Arc;
 /// the message's CONSTRUCTION changes below.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The error code this service answers a malformed ARN with.
+///
+/// Transfer validates an ARN-valued member ITSELF — "Invalid Role ARN" is the
+/// refusal the service answers a role ARN it will not accept with — and surfaces it
+/// as its own modelled client error, which every operation that takes such a member
+/// declares (`InvalidRequestException`, `errorKind` client, `httpError` 400). The
+/// framework's synthetic `ValidationException` is NOT in any Transfer operation's
+/// modelled error list, so a client branching on this refusal through the service's
+/// own exception would never catch it.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
+/// Whether `pattern` is one that requires the value to be an ARN.
+///
+/// The model states these as `^arn:...` (`Role`: `^arn:.*role/\S+$`) or as an
+/// optional ARN (`NullableRole`: `^(|arn:.*role/\S+)$`), so both forms are
+/// recognised — and no member name is listed here: the rule follows the CONSTRAINT,
+/// so it covers every member of this service whose pattern demands an ARN.
+fn is_arn_pattern(pattern: &str) -> bool {
+    pattern.starts_with("^arn:") || pattern.starts_with("^(|arn:")
+}
+
+/// The member name an ARN refusal names, from the violation's dotted path: its last
+/// segment, in the PascalCase the model spells the member with (the path carries the
+/// lowerCamel form, e.g. `role` -> `Role`, `loggingRole` -> `LoggingRole`).
+fn member_name(path: &str) -> String {
+    let segment = path.rsplit('.').next().unwrap_or(path);
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Render ONE ARN-pattern violation the way Transfer states it: `Invalid <Member>
+/// ARN` — the member whose ARN was rejected, and nothing of the value that was
+/// rejected.
+///
+/// `None` for every other violation class, including a pattern on a member that is
+/// not an ARN: those keep this service's generic constraint wording below.
+fn arn_constraint_clause(violation: &Violation) -> Option<String> {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return None;
+    };
+    if !is_arn_pattern(pattern) {
+        return None;
+    }
+    Some(format!("Invalid {} ARN", member_name(&violation.path)))
+}
+
+/// The refusal for a set of violations that are ALL ARN-pattern violations: one
+/// clause per violation, so the single-violation case — the only one a request with
+/// one bad ARN produces — is exactly `Invalid <Member> ARN`.
+///
+/// `None` declines the whole refusal, including a refusal that mixes an ARN
+/// violation with another class: one consistent wording per message rather than two
+/// half-rendered ones.
+fn arn_constraint_envelope(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(arn_constraint_clause)
+        .collect::<Option<Vec<_>>>()?;
+    (!clauses.is_empty()).then(|| clauses.join("; "))
+}
+
 /// The MODEL's pattern as a message states it: the expression without the anchors a
 /// Smithy `@pattern` writes around it.
 ///
@@ -222,18 +286,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // Transfer states a constraint violation WITHOUT the value that was
-        // submitted: the message names the member path and the modelled constraint
-        // only, so caller-controlled input is never echoed back into a client's
-        // logs. The code stays the `ValidationException` the framework
-        // would have answered with. An authentication refusal, and a violation
-        // class this service has no wording for, keep the framework's
-        // wording.
+        // Two classes are reworded, and both for the same reason — the framework's
+        // default would answer a code or a message this service does not:
+        //
+        // * a value that fails a member's ARN-shaped pattern is Transfer's OWN
+        //   client error, `InvalidRequestException` (HTTP 400), worded `Invalid
+        //   <Member> ARN`: the service validates an ARN itself, and
+        //   `ValidationException` is not in any of its operations' modelled error
+        //   lists, so a client cannot catch that refusal through the service's
+        //   exception.
+        // * every other constraint violation keeps the framework's
+        //   `ValidationException` but is stated WITHOUT the value that was
+        //   submitted: the message names the member path and the modelled
+        //   constraint only, so caller-controlled input is never echoed back into a
+        //   client's logs.
+        //
+        // An authentication refusal, and a violation class this service has no
+        // wording for, keep the framework's wording.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: VALIDATION_EXCEPTION.to_string(),
-                message: constraint_envelope(violations)?,
-            }),
+            Refusal::Invalid(violations) => match arn_constraint_envelope(violations) {
+                Some(message) => Some(Refused {
+                    code: INVALID_REQUEST_EXCEPTION.to_string(),
+                    message,
+                }),
+                None => Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: constraint_envelope(violations)?,
+                }),
+            },
             _ => None,
         }
     }

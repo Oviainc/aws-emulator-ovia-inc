@@ -43,6 +43,8 @@ mod host_key_lifecycle;
 mod host_key_listing;
 #[path = "all/host_keys.rs"]
 mod host_keys;
+#[path = "all/identity_and_authorization.rs"]
+mod identity_and_authorization;
 #[path = "all/input_validation.rs"]
 mod input_validation;
 #[path = "all/not_found_errors.rs"]
@@ -83,6 +85,8 @@ mod web_app_listing;
 mod workflow_execution_listing;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
+#[path = "all/write_validation_and_normalization.rs"]
+mod write_validation_and_normalization;
 // `connector_deletion` is declared HERE rather than in its alphabetical place beside the
 // other `connector_*` suites, for the reason the `workflow_step_contract` note above
 // records: the sorted list is where every concurrent change inserts, so those are the

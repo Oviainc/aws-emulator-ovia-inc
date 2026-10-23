@@ -140,9 +140,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-transfer-transferservic
 // here — hence the `CreateAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.transfer#CreateAccess")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`, exactly as `CreateUser`
+// widens it: the SERVICE models the shape (`CreateServer`, `UpdateServer` and
+// `DeleteServer` all list it) and the real service answers a pass-role refusal with
+// it, while this operation's modelled error list omits it. The shape, its status
+// (403) and its body stay the model's own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.transfer#CreateAccess",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateAccessErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceError(InternalServiceError),
     InvalidRequestException(InvalidRequestException),
     ResourceExistsException(ResourceExistsException),
@@ -203,9 +213,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // `DescribedAccess` models no ARN, so this operation reads no request
-        // metadata; the engine comes from `self`.
-        let _ = ctx;
+        // `DescribedAccess` models no ARN, so nothing here reads request metadata
+        // except the caller identity the authorization gate below resolves.
+
+        // WHO is asking is decided before WHAT is asked, by the same gate the server
+        // and user operations consult: a caller whose identity policy explicitly
+        // denies this action is refused with the modelled `AccessDeniedException`
+        // (HTTP 403) and no access is created. `DescribedAccess` models no ARN, so
+        // this request addresses no nameable resource and only a statement covering
+        // every resource can apply to it — the reading `explicit_deny` documents for
+        // `None`.
+        if let Some(message) =
+            st::authorization::explicit_deny(&*self.engine, ctx.parts(), Self::NAME, None)
+        {
+            return Err(CreateAccessErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The ACCOUNT of the role this request asks the service to pass is checked
+        // BEFORE any resource the request names is resolved — the same rule, in the
+        // same order, as the two user writes: passing a role across accounts is a
+        // privilege-escalation guard, so it is refused for its own reason
+        // (`AccessDeniedException`, HTTP 403) whether or not the server exists.
+        if st::authorization::cross_account_role(&input.role) {
+            return Err(CreateAccessErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(st::authorization::CROSS_ACCOUNT_PASS_ROLE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A session policy that is not a JSON document is refused before it can be
+        // stored, by the same rule and the same helper the two user writes apply:
+        // the member is a policy DOCUMENT, so a document the service cannot parse
+        // would otherwise silently become this access's effective permissions.
+        if let Some(message) = st::policy_document_violation("Policy", input.policy.as_deref()) {
+            return Err(CreateAccessErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
 
         // A home-directory configuration the service would never create is refused
         // BEFORE the state write, with the modelled `InvalidRequestException`

@@ -87,9 +87,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-transfer-transferservic
 // here — hence the `DescribeServerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.transfer#DescribeServer")]
+//
+// `AccessDeniedException` is widened in with `extra_errors`: the SERVICE models the
+// shape (`CreateServer`, `UpdateServer` and `DeleteServer` all list it) and the real
+// service answers a caller its identity policy denies with it, whichever operation
+// was called, but this operation's modelled error list omits it. The shape, its
+// status (403) and its body stay the model's own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.transfer#DescribeServer",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum DescribeServerErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServiceError(InternalServiceError),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -149,8 +159,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
-        // This operation reads no request metadata; the engine comes from `self`.
-        let _ = ctx;
+        // WHO is asking is decided before anything is read: a caller whose identity
+        // policy explicitly denies this action on this server is refused with
+        // `AccessDeniedException` (HTTP 403). The gate reads the account's own IAM
+        // store — see `crate::state::authorization`.
+        let resource = st::server_arn(&st::request_region(ctx.parts()), &input.server_id);
+        if let Some(message) = st::authorization::explicit_deny(
+            &*self.engine,
+            ctx.parts(),
+            Self::NAME,
+            Some(&resource),
+        ) {
+            return Err(DescribeServerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = st::service_state(&*self.engine).ok_or_else(|| {
             DescribeServerErrorModeled::InternalServiceError(InternalServiceError {
                 message: "the transfer service state is unavailable".to_string(),

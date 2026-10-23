@@ -446,7 +446,13 @@ async fn protocol_requirements_on_other_members_are_enforced() {
                 "EndpointType": "VPC",
                 "EndpointDetails": vpc,
             }),
-            Some(vec!["IdentityProviderType", "Protocols includes FTP"]),
+            // The identity-provider half of the requirement, which is evaluated
+            // before the endpoint-type half: this provider cannot serve FTP at all,
+            // whatever the endpoint type (here already the required `VPC`).
+            Some(vec![
+                "FTP and FTPS protocols unsupported",
+                "IdentityProviderType SERVICE_MANAGED",
+            ]),
         ),
         (
             "AS2 on a public endpoint",

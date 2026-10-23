@@ -35,6 +35,15 @@ use crate::harness::{
 #[tokio::test]
 async fn describe_server_rebuilds_every_created_member_from_stored_state() {
     let emulator = Emulator::new();
+    // One row names an `API_GATEWAY` identity provider with an invocation role, and
+    // `CreateServer` VERIFIES that role can invoke the API before it accepts the
+    // server (see `identity_and_authorization.rs`), so the account holds a role
+    // that may.
+    emulator.seed_role(
+        "arn:aws:iam::000000000000:role/transfer-idp",
+        r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"execute-api:Invoke","Resource":"*"}]}"#,
+    );
 
     let cases: Vec<(&str, Value, Value)> = vec![
         (
