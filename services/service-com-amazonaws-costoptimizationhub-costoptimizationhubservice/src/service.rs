@@ -61,10 +61,11 @@
 //! set and one `fields` entry per invalid member. A refusal a handler raises for a rule
 //! the model cannot express (an unknown `nextToken`, an `orderBy` dimension that
 //! names no member) fills the same two members through
-//! [`field_validation_exception`], the one place that envelope is built; a
-//! refusal no field accounts for — a rule about the CALLER rather than about a
-//! value the request carries — goes through [`other_validation_exception`],
-//! which is what the model's `Other` reason names.
+//! [`field_validation_exception`], the one place that envelope is built. The
+//! model's other reason (`Other`) names a refusal no field accounts for, and no
+//! operation of this service raises one: a preference write, for instance,
+//! declares no rule about the CALLER, so every refusal it can answer is a
+//! member outside its declared constraint.
 //!
 //! # A member's own value set or bound is the one its operation enforces
 //!
@@ -101,11 +102,6 @@ const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 /// reported under — one of the two values the model's enum holds, the other
 /// (`Other`) being for a refusal no field accounts for.
 pub(crate) const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
-
-/// The `ValidationExceptionReason` for a refusal no field accounts for: a rule
-/// about the CALLER or about the account's configuration rather than about a
-/// value the request carries.
-pub(crate) const REASON_OTHER: &str = "Other";
 
 /// The top-level `message` of a refusal whose detail is carried in `fields`: the
 /// per-member diagnosis lives in the field list, so the summary points the reader
@@ -295,19 +291,6 @@ pub(crate) fn field_validation_exception(
         // is exactly what this reason names.
         reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
         fields: Some(fields),
-    }
-}
-
-/// This service's `ValidationException` for a request no field accounts for:
-/// one refused for a rule about the caller or about the account's
-/// configuration. `reason` is `Other` and there is no field list, because no
-/// value the request carries is the thing that is wrong; `message` states the
-/// rule.
-pub(crate) fn other_validation_exception(message: impl Into<String>) -> ValidationException {
-    ValidationException {
-        message: message.into(),
-        reason: Some(REASON_OTHER.to_string()),
-        fields: None,
     }
 }
 

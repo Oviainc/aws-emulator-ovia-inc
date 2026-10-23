@@ -337,9 +337,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every member below is resolved from the stored project with this request's
         // `*Override` applied — never echoed from the request alone. None of it needs
         // the state lock, so none of it is done while holding it.
-        let source = resolve_source(project.source.clone().unwrap_or_default(), &input);
-        let environment =
-            resolve_environment(project.environment.clone().unwrap_or_default(), &input);
+        // A started build reports the configuration it RUNS WITH, so the members AWS
+        // documents a default for are resolved here (see
+        // `crate::state::effective_source` and its siblings) rather than left absent.
+        let source = crate::state::effective_source(resolve_source(
+            project.source.clone().unwrap_or_default(),
+            &input,
+        ));
+        let environment = crate::state::effective_environment(resolve_environment(
+            project.environment.clone().unwrap_or_default(),
+            &input,
+        ));
         let logs_config = input
             .logs_config_override
             .clone()
@@ -362,14 +370,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             project_name: Some(input.project_name.clone()),
             phases: Some(crate::state::in_progress_phases(now)),
             source: Some(source),
-            secondary_sources: input
-                .secondary_sources_override
-                .clone()
-                .or(project.secondary_sources),
-            secondary_source_versions: input
-                .secondary_sources_version_override
-                .clone()
-                .or(project.secondary_source_versions),
+            secondary_sources: Some(
+                input
+                    .secondary_sources_override
+                    .clone()
+                    .or(project.secondary_sources)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(crate::state::effective_source)
+                    .collect(),
+            ),
+            // The secondary source versions this build runs with: present and empty
+            // when the project pins none, the way `secondarySources` is.
+            secondary_source_versions: Some(
+                input
+                    .secondary_sources_version_override
+                    .clone()
+                    .or(project.secondary_source_versions)
+                    .unwrap_or_default(),
+            ),
             artifacts: input
                 .artifacts_override
                 .clone()
@@ -384,7 +403,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .map(crate::state::build_artifacts_of)
                         .collect()
                 }),
-            cache: input.cache_override.clone().or(project.cache),
+            cache: Some(crate::state::effective_cache(
+                input.cache_override.clone().or(project.cache),
+            )),
             environment: Some(environment),
             service_role: input
                 .service_role_override
@@ -403,10 +424,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Allocated when a build container joins the project's VPC; no container
             // is provisioned here.
             network_interface: None,
-            encryption_key: input
-                .encryption_key_override
-                .clone()
-                .or(project.encryption_key),
+            encryption_key: Some(
+                input
+                    .encryption_key_override
+                    .clone()
+                    .or(project.encryption_key)
+                    .unwrap_or_else(|| crate::state::default_encryption_key(&region)),
+            ),
             // Exported by a buildspec's `env/exported-variables` while it runs, and
             // reports and artifacts are produced by a running build.
             exported_environment_variables: None,

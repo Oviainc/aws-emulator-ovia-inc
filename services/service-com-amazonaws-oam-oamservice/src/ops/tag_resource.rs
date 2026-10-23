@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns tags to one stored sink or link, addressed by its ARN.
+//!
+//! The rule, from this operation's own documentation: the tags in the request are
+//! MERGED into the tag set the resource already carries — a key the resource does not
+//! hold is appended, a key it does hold has its value replaced — and a resource may
+//! end up holding no more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, past
+//! which the call is refused with `TooManyTagsException` and NOTHING is written. An
+//! ARN naming no stored resource of this account and Region is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `ResourceArn`'s presence and its `^arn:(\w|-)+:oam:.+:.+:.+` pattern, every
+        // tag key's and value's length, and `Tags`' own 0..50 entry count are modelled
+        // constraints: the centralized walk has already refused anything outside them
+        // before this body runs. What is left for this handler is the rule the model
+        // cannot state — the cap on what the RESOURCE ends up holding.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // This operation models no server fault, so a store it cannot reach is
+            // reported through the modelled client-input error it does declare —
+            // never as a 501, which would claim the operation is unimplemented.
+            TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some("the sink and link store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        let tags = store
+            .resource_tags_mut(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    // The service-wide constant: OAM's not-found text names no
+                    // identifier, so this refusal echoes nothing the caller sent.
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    ..Default::default()
+                })
+            })?;
+
+        // Only a key the resource does not already hold grows its tag set, so
+        // replacing an existing key's value can never exceed the cap however full the
+        // resource already is. Counted over DISTINCT keys, which is what a map's
+        // entries are.
+        let appended = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(*key))
+            .count();
+        let resulting = tags.len() + appended;
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "these tags would leave the resource holding {resulting} tags, and a \
+                         resource can have no more than {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Checked before anything is stored, so a refused call leaves the resource's
+        // tag set exactly as it was. An upsert: a key the resource holds takes the
+        // request's value, a key it does not is appended, and a key the request does
+        // not mention is left alone (`UntagResource` is what removes one).
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

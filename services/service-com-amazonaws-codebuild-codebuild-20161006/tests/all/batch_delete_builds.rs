@@ -281,12 +281,11 @@ async fn batch_delete_builds_removes_every_named_build_whatever_its_status() {
             "case {:?}: buildsDeleted must report each held id once, in request order; got {body}",
             case.name
         );
-        // `buildsDeleted` targets `BuildIds` (@length min 1), so nothing deleted means
-        // the member is absent rather than an empty list.
-        assert_eq!(
-            body["buildsDeleted"].is_null(),
-            expected_deleted.is_empty(),
-            "case {:?}: an empty buildsDeleted must be absent, got {body}",
+        // The deleted half of the partition is always serialized — `[]` when this call
+        // deleted nothing — the way the not-deleted half below is.
+        assert!(
+            body["buildsDeleted"].is_array(),
+            "case {:?}: buildsDeleted must be a list, got {body}",
             case.name
         );
 
@@ -469,9 +468,10 @@ async fn deleting_a_build_neither_rewinds_the_build_number_nor_can_be_repeated()
         status, 200,
         "the repeated delete: expected 200, got {status} with {again}"
     );
-    assert!(
-        again["buildsDeleted"].is_null(),
-        "nothing was held, so buildsDeleted is absent; got {again}"
+    assert_eq!(
+        again["buildsDeleted"],
+        json!([]),
+        "nothing was held, so buildsDeleted is empty; got {again}"
     );
     assert_eq!(
         again["buildsNotDeleted"][0]["id"],
