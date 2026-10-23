@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetInvoiceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetInvoiceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetInvoiceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the invoice profile of each account the request names, for accounts of the
+//! requester's organization as [`crate::state::ComAmazonawsInvoicingInvoicingState::organization_accounts`]
+//! knows them. The operation is documented "the accounts must be linked accounts under
+//! the requester management account organization", so a request that names an account
+//! this organization does not contain is refused WHOLE with the modelled
+//! `AccessDeniedException` (HTTP 403) — the requester has no access to an account
+//! outside its own organization, and none of the requested profiles is reported, because
+//! the request itself is what the service refuses.
+//!
+//! `@readonly`: this handler only reads state.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +104,7 @@ pub enum BatchGetInvoiceProfileErrorModeled {
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
 pub type BatchGetInvoiceProfileError = crate::scaffolded::Scaffolded<BatchGetInvoiceProfileErrorModeled>;
 
+
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
@@ -148,18 +151,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetInvoiceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetInvoiceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetInvoiceProfile"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetInvoiceProfileErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let store = state.lock();
+
+        // `AccountIdList` is not `@uniqueItems`, so a request may name one account more
+        // than once; the output is "a list of invoice profiles corresponding to the
+        // requested accounts", which is one profile per account asked about, in the
+        // order the request first names it.
+        let mut seen = std::collections::BTreeSet::new();
+        let requested: Vec<&str> = input
+            .account_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|account_id| seen.insert(*account_id))
+            .collect();
+
+        // "The accounts must be linked accounts under the requester management account
+        // organization": the requester holds no access to an account its organization
+        // does not contain, so naming one is refused with the modelled 403, naming the
+        // first such account in request order — and refused WHOLE, rather than answered
+        // for the accounts it may read.
+        let organization = store.organization_accounts();
+        if let Some(outsider) = requested
+            .iter()
+            .find(|account_id| !organization.contains(**account_id))
+        {
+            return Err(BatchGetInvoiceProfileErrorModeled::AccessDeniedException(
+                crate::state::not_authorized_for_account(outsider),
+            )
+            .into());
+        }
+
+        Ok(BatchGetInvoiceProfileOutput {
+            profiles: Some(
+                requested
+                    .into_iter()
+                    .map(crate::state::invoice_profile)
+                    .collect(),
+            ),
+        })
     }
 }

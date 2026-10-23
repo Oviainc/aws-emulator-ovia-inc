@@ -14,13 +14,14 @@
 //! create the invoices" — so a read at an instant must answer with the configuration
 //! that was in effect then, not with the latest one.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    InternalServerException, InvoiceUnit, InvoiceUnitRule, ResourceNotFoundException, ResourceTag,
+    AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceUnit, InvoiceUnitRule,
+    ResourceNotFoundException, ResourceTag,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
@@ -139,6 +140,44 @@ impl ComAmazonawsInvoicingInvoicingState {
             }
         }
     }
+
+    /// Every account the requester's organization contains, as this service's state
+    /// names them.
+    ///
+    /// An operation documented over "linked accounts under the requester management
+    /// account organization" (`BatchGetInvoiceProfile`) has to decide membership from
+    /// what the emulator actually holds, and this service's state names an account of
+    /// that organization in exactly two places: an invoice unit's `InvoiceReceiver`
+    /// ("the Amazon Web Services account ID chosen to be the receiver of an invoice
+    /// unit") and an invoice-unit rule's `LinkedAccounts` ("the list of
+    /// `LINKED_ACCOUNT` IDs where charges are included within the invoice unit") —
+    /// `smithy_query(query="shape", shape="InvoiceUnitRule")` and
+    /// `smithy_query(query="operation", operation="CreateInvoiceUnit")`. The requester's
+    /// own account ([`::engine::emulator_account_id`]) is the management account of that
+    /// organization, so it is a member of it too.
+    ///
+    /// `BillSourceAccounts` is deliberately NOT a source: the model documents those as
+    /// accounts that "can be payer accounts from other organizations that have
+    /// authorized billing transfer to this account", so naming one does not place it in
+    /// this organization.
+    ///
+    /// Every RETAINED configuration of a unit counts, not only its current one: an
+    /// account an update dropped from a rule left that invoice unit, not the
+    /// organization. A deleted invoice unit takes its accounts with it — state is the
+    /// only record either way.
+    pub fn organization_accounts(&self) -> BTreeSet<String> {
+        let mut accounts = BTreeSet::new();
+        accounts.insert(::engine::emulator_account_id().to_string());
+        for unit in self.invoice_units.values() {
+            accounts.insert(unit.invoice_receiver.clone());
+            for version in std::iter::once(&unit.current).chain(unit.superseded.iter()) {
+                if let Some(linked) = version.rule.linked_accounts.as_ref() {
+                    accounts.extend(linked.iter().cloned());
+                }
+            }
+        }
+        accounts
+    }
 }
 
 /// One invoice unit as it is stored: the members that can never change, plus the
@@ -248,6 +287,24 @@ pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
         .collect()
 }
 
+/// The invoice profile this service holds for an account of its organization.
+///
+/// Every other member of `InvoiceProfile` describes the invoice RECEIVER itself —
+/// `ReceiverName`, `ReceiverAddress`, `ReceiverEmail`, `Issuer` and
+/// `TaxRegistrationNumber` (`smithy_query(query="shape", shape="InvoiceProfile")`) —
+/// and all five are set through the billing/tax-settings plane that this service does
+/// not own: no operation of THIS model writes any of them, so there is nothing in state
+/// to report them from. Each is an optional member, so they are reported ABSENT —
+/// "not on file here" — rather than invented. `AccountId`, the member that says whose
+/// profile this is, is the one this service can answer, and it is answered only for an
+/// account [`ComAmazonawsInvoicingInvoicingState::organization_accounts`] holds.
+pub fn invoice_profile(account_id: &str) -> InvoiceProfile {
+    InvoiceProfile {
+        account_id: Some(account_id.to_string()),
+        ..Default::default()
+    }
+}
+
 /// The message a `ResourceNotFoundException` of this service carries: a CONSTANT, the
 /// same sentence whatever was asked for.
 ///
@@ -264,6 +321,27 @@ pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
         resource_id: Some(arn.to_string()),
+    }
+}
+
+/// The 403 an operation of this service answers when the requester may not read what it
+/// asked about: the account it asked about is not one the requester's organization
+/// contains, so the requester is not authorized for that account's resources.
+///
+/// The message is BUILT FROM THE REQUEST, as the recorded refusals of this service state
+/// it: it names the requester ([`::engine::emulator_account_id`], the account this
+/// emulator presents to every caller) and the account the requester was refused.
+///
+/// `resourceName` is left absent: the model types it as an `InvoiceUnitArnString`
+/// (`smithy_query(query="shape", shape="AccessDeniedException")`), so it names an
+/// invoice unit rather than an account.
+pub fn not_authorized_for_account(account_id: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(format!(
+            "Account {} is not authorized to access resources for account {account_id}",
+            ::engine::emulator_account_id()
+        )),
+        resource_name: None,
     }
 }
 
