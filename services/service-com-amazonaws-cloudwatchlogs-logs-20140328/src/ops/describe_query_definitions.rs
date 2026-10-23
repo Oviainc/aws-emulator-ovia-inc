@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeQueryDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeQueryDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeQueryDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the saved query definitions `PutQueryDefinition` stored, filtered
+//! by name prefix and query language and returned one page at a time. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +110,49 @@ impl From<DescribeQueryDefinitionsErrorModeled> for DescribeQueryDefinitionsErro
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeQueryDefinitions";
+
+/// Where the next page resumes: the `queryDefinitionId` the last page ended on, plus the
+/// enumeration it belongs to. A continuation that changes either filter is refused,
+/// because the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    query_language: Option<String>,
+    query_definition_name_prefix: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "queryLanguage": self.query_language,
+            "queryDefinitionNamePrefix": self.query_definition_name_prefix,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            query_language: value
+                .get("queryLanguage")
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string),
+            query_definition_name_prefix: value
+                .get("queryDefinitionNamePrefix")
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 /// The `DescribeQueryDefinitions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,18 +189,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeQueryDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeQueryDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeQueryDefinitionsError::from(
+                DescribeQueryDefinitionsErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeQueryDefinitionsError::from(
+                DescribeQueryDefinitionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.query_language != input.query_language
+                    || cursor.query_definition_name_prefix != input.query_definition_name_prefix
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeQueryDefinitions request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // Two filters, each documented on its own member: `queryDefinitionNamePrefix`
+        // keeps "only the query definitions that have names that start with the prefix you
+        // specify", and `queryLanguage` keeps only the definitions that use the specified
+        // query language. A request that names neither reports every saved definition.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeQueryDefinitions"))
+        // The store keys definitions by `queryDefinitionId`, so this enumeration is in id
+        // order and needs no re-sorting; that is also what the cursor resumes on.
+        let matching: Vec<&crate::state::QueryDefinitionRecord> = store
+            .query_definitions
+            .values()
+            .filter(|record| {
+                input
+                    .query_definition_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| record.name.starts_with(prefix))
+                    && input
+                        .query_language
+                        .as_deref()
+                        .is_none_or(|language| record.query_language == language)
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching
+                .partition_point(|record| record.query_definition_id <= cursor.after),
+            None => 0,
+        };
+        // `maxResults` is modelled `range 1..1000`; a request that names none gets the
+        // largest page that member admits. A value outside that range is refused here with
+        // the code this operation declares, rather than silently clamped, so this handler
+        // cannot answer plausibly for an input it should reject — wherever in the request
+        // walk that value is caught.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::MAX_QUERY_DEFINITIONS_PER_PAGE);
+        if !(1..=crate::state::MAX_QUERY_DEFINITIONS_PER_PAGE).contains(&requested) {
+            return Err(invalid(&format!(
+                "maxResults must be between 1 and {}",
+                crate::state::MAX_QUERY_DEFINITIONS_PER_PAGE
+            )));
+        }
+        let limit = usize::try_from(requested).expect("a page size in range fits in a usize");
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token only where there is another page to ask for, so a client paginating
+        // stops when the enumeration is exhausted.
+        let next_token = page.last().filter(|_| last < matching.len()).map(|record| {
+            Cursor {
+                query_language: input.query_language.clone(),
+                query_definition_name_prefix: input.query_definition_name_prefix.clone(),
+                after: record.query_definition_id.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeQueryDefinitionsOutput {
+            query_definitions: Some(
+                page.iter()
+                    .map(|record| QueryDefinition {
+                        query_language: Some(record.query_language.clone()),
+                        query_definition_id: Some(record.query_definition_id.clone()),
+                        name: Some(record.name.clone()),
+                        query_string: Some(record.query_string.clone()),
+                        last_modified: Some(record.last_modified_ms),
+                        // "If this query definition contains a list of log groups that it
+                        // is limited to, that list appears here" — and nothing when the
+                        // put named none. The same for `parameters`.
+                        log_group_names: record.log_group_names.clone(),
+                        parameters: record.parameters.clone(),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

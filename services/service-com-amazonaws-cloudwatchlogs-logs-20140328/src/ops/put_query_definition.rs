@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutQueryDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutQueryDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutQueryDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates or updates one saved CloudWatch Logs Insights query definition in
+//! the shared store, so `DescribeQueryDefinitions` reports it back. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutQueryDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutQueryDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutQueryDefinition"))
+        // `ctx` carries only request metadata: a query definition is identified by its own
+        // `queryDefinitionId` and holds nothing region- or caller-scoped.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutQueryDefinitionError::from(
+                PutQueryDefinitionErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // "Specify the query language to use for this query": a put that names none saves
+        // the definition with the documented default, so every stored definition has a
+        // language to report and to be filtered on.
+        let query_language = input
+            .query_language
+            .unwrap_or_else(|| crate::state::DEFAULT_QUERY_LANGUAGE.to_string());
+        let last_modified_ms = crate::state::now_ms();
+
+        // "To update a query definition, specify its queryDefinitionId in your request."
+        if let Some(query_definition_id) = input.query_definition_id {
+            let Some(record) = store.query_definitions.get_mut(&query_definition_id) else {
+                return Err(PutQueryDefinitionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "query definition",
+                        )),
+                    },
+                )
+                .into());
+            };
+            // "The values of name, queryString, and logGroupNames are changed to the
+            // values that you specify in your update operation. No current values are
+            // retained from the current query definition" — so a member this request omits
+            // is absent afterwards rather than inherited from the previous put.
+            record.name = input.name;
+            record.query_string = input.query_string;
+            record.query_language = query_language;
+            record.log_group_names = input.log_group_names;
+            record.parameters = input.parameters;
+            // The stored `clientToken` is deliberately NOT touched here: it identifies the
+            // CREATE that minted this definition, which is the request an idempotency
+            // token de-duplicates, so an update neither claims nor clears it. It is not
+            // one of the definition's own values the sentence above replaces.
+            record.last_modified_ms = last_modified_ms;
+            return Ok(PutQueryDefinitionOutput {
+                query_definition_id: Some(record.query_definition_id.clone()),
+            });
+        }
+
+        // `clientToken` is "used as an idempotency token, to avoid returning an exception
+        // if the service receives the same request twice because of a network error": a
+        // create retried under the token a stored definition was CREATED with answers with
+        // that definition instead of saving a second one. The token keeps identifying that
+        // create for as long as the definition is stored — an update never re-points it —
+        // and the scan is over the stored definitions, which
+        // [`crate::state::MAX_QUERY_DEFINITIONS`] bounds, so the work one request does
+        // under the lock has a ceiling too.
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .query_definitions
+                .values()
+                .find(|record| record.client_token.as_deref() == Some(client_token))
+            {
+                return Ok(PutQueryDefinitionOutput {
+                    query_definition_id: Some(existing.query_definition_id.clone()),
+                });
+            }
+        }
+
+        // Only a put that CREATES a definition can exceed the ceiling on what this
+        // emulator stores — an update replaces values in a definition already counted —
+        // and the refusal is the `LimitExceededException` this operation models for
+        // "the maximum number of resources that can be created".
+        if store.query_definitions.len() >= crate::state::MAX_QUERY_DEFINITIONS {
+            return Err(PutQueryDefinitionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "an account can have up to {} saved query definitions",
+                        crate::state::MAX_QUERY_DEFINITIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If you are creating a query definition, do not specify this parameter.
+        // CloudWatch generates a unique ID for the new query definition and include it in
+        // the response to this operation."
+        let query_definition_id =
+            crate::state::mint_query_definition_id(store.take_query_definition_seq());
+        store.query_definitions.insert(
+            query_definition_id.clone(),
+            crate::state::QueryDefinitionRecord {
+                query_definition_id: query_definition_id.clone(),
+                name: input.name,
+                query_string: input.query_string,
+                query_language,
+                log_group_names: input.log_group_names,
+                parameters: input.parameters,
+                last_modified_ms,
+                client_token: input.client_token,
+            },
+        );
+
+        Ok(PutQueryDefinitionOutput {
+            query_definition_id: Some(query_definition_id),
+        })
     }
 }

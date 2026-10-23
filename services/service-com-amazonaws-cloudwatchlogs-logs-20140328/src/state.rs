@@ -29,6 +29,11 @@
 //! "applies to only the specified log group": one group holds at most one, and deleting
 //! the group takes its policy with it.
 //!
+//! The account's saved CloudWatch Logs Insights query definitions live here
+//! ([`ComAmazonawsCloudwatchlogsLogs20140328State::query_definitions`]) rather than on a
+//! log group: a definition is identified only by its own `queryDefinitionId`, and the log
+//! groups it names are a value it carries, not its owner.
+//!
 //! The account's deliveries — each "a connection between a logical delivery source and a
 //! logical delivery destination", which `CreateDelivery` creates and `DescribeDeliveries`
 //! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
@@ -328,6 +333,22 @@ pub const SUBSCRIPTION_SYSTEM_FIELDS: [&str; 3] = ["@aws.account", "@aws.region"
 /// always has a distribution to report.
 pub const DEFAULT_DISTRIBUTION: &str = "ByLogStream";
 
+/// The query language a query definition is saved with when the put named no
+/// `queryLanguage`. `CWLI` is how the model's `QueryLanguage` enum spells Logs Insights
+/// QL (`QUERY_LANGUAGE_VALUES`), and `PutQueryDefinition` offers `parameters` —
+/// "supported only for Logs Insights QL queries" — on a request that names no language
+/// at all, so a definition saved without one is a Logs Insights QL definition. Storing it
+/// is what lets `DescribeQueryDefinitions$queryLanguage` ("limits the returned queries to
+/// only the queries that use the specified query language") place every definition.
+pub const DEFAULT_QUERY_LANGUAGE: &str = "CWLI";
+
+/// The largest page `DescribeQueryDefinitions` hands back, which is also the page a
+/// request that names no `maxResults` gets: `maxResults` "limits the number of returned
+/// query definitions to the specified number" and documents no default, and the member's
+/// own `QueryListMaxResults` range (`range 1..1000`) is the most the API admits in one
+/// page.
+pub const MAX_QUERY_DEFINITIONS_PER_PAGE: i32 = 1_000;
+
 /// The bracketed forms a filter pattern can open, as `(open, close)` pairs: a JSON
 /// selector pattern is wrapped in `{ … }` and a space-delimited pattern in `[ … ]`
 /// ("Filter pattern syntax for metric filters, subscription filters, filter log events,
@@ -378,6 +399,15 @@ pub const IMPORT_STATUS_FAILED: &str = "FAILED";
 /// state rules that go with it.
 pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
 
+/// THE EMULATOR'S OWN CEILING on the saved query definitions one account holds, not a
+/// quota cited from AWS: each definition keeps its query string (modelled `@length` up to
+/// 10,000), name and parameters in memory for as long as the process runs and nothing
+/// expires one, so `PutQueryDefinition` refuses to create more than this many with the
+/// `LimitExceededException` it models ("You have reached the maximum number of resources
+/// that can be created") rather than growing without bound on request. An UPDATE of a
+/// definition already stored is never refused by it: it adds nothing.
+pub const MAX_QUERY_DEFINITIONS: usize = 1_000;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -397,6 +427,15 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// Monotonic counter behind the resource-policy revision ids, so every update of a
     /// resource-scoped policy mints a revision no earlier update used.
     pub next_policy_revision: u64,
+    /// Every saved CloudWatch Logs Insights query definition, keyed by its
+    /// `queryDefinitionId` — the only thing that identifies one. A `BTreeMap` so
+    /// `DescribeQueryDefinitions` enumerates them in a stable order and its pagination
+    /// cursor resumes at a position that does not move when another definition is saved.
+    pub query_definitions: BTreeMap<String, QueryDefinitionRecord>,
+    /// Monotonic counter behind the `queryDefinitionId`s `PutQueryDefinition` mints, so
+    /// every definition it creates gets an id no earlier create used — including after an
+    /// earlier definition has been deleted. See [`mint_query_definition_id`].
+    pub next_query_definition_seq: u64,
     /// The KMS key associated with the account's stored query-insights results — the
     /// `AssociateKmsKey` target named by the `query-result` ARN rather than by a log
     /// group ("use that key to encrypt the stored results of all future StartQuery
@@ -441,6 +480,13 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn take_policy_revision(&mut self) -> u64 {
         let seq = self.next_policy_revision;
         self.next_policy_revision = self.next_policy_revision.saturating_add(1);
+        seq
+    }
+
+    /// Take the next query-definition sequence number, advancing the counter.
+    pub fn take_query_definition_seq(&mut self) -> u64 {
+        let seq = self.next_query_definition_seq;
+        self.next_query_definition_seq = self.next_query_definition_seq.saturating_add(1);
         seq
     }
 
@@ -1990,6 +2036,42 @@ pub fn processor_transformations(processor: &crate::ops::types::Processor) -> Ve
     .collect()
 }
 
+/// One saved CloudWatch Logs Insights query definition — "details about a saved
+/// CloudWatch Logs Insights query" — as it is stored.
+///
+/// Every member a put names is replaced wholesale on an update, because
+/// `PutQueryDefinition` states that "the values of name, queryString, and logGroupNames
+/// are changed to the values that you specify in your update operation. No current values
+/// are retained from the current query definition."
+#[derive(Debug, Clone)]
+pub struct QueryDefinitionRecord {
+    /// The id CloudWatch generated for this definition, kept on the record as well as in
+    /// the map key so a report built by enumerating the map carries it.
+    pub query_definition_id: String,
+    pub name: String,
+    pub query_string: String,
+    /// The language this definition's query string is written in. Never absent: a put
+    /// that names no `queryLanguage` saves the definition with
+    /// [`DEFAULT_QUERY_LANGUAGE`], so `DescribeQueryDefinitions$queryLanguage` —
+    /// "limits the returned queries to only the queries that use the specified query
+    /// language" — can place every stored definition.
+    pub query_language: String,
+    /// The log groups the definition "is limited to", when the put named any; `None`
+    /// when it named none, which `QueryDefinition$logGroupNames` reports by omitting the
+    /// member ("If this query definition contains a list of log groups that it is
+    /// limited to, that list appears here").
+    pub log_group_names: Option<Vec<String>>,
+    /// The placeholder variables the definition's query string references, when the put
+    /// named any; `None` otherwise, on the same rule as `logGroupNames`.
+    pub parameters: Option<Vec<crate::ops::types::QueryParameter>>,
+    pub last_modified_ms: i64,
+    /// The `clientToken` of the CREATE that minted this definition, so a create retried
+    /// "twice because of a network error" with the same token answers with this definition
+    /// instead of saving a second one. An update never re-points it: the token identifies
+    /// the create it de-duplicates, not the definition's current values.
+    pub client_token: Option<String>,
+}
+
 /// One subscription filter — "a real-time stream of log events ingested through
 /// PutLogEvents" delivered to one destination — as it is stored. It lives on the log
 /// group it is "associated with", so deleting that group removes its filters with it.
@@ -2570,6 +2652,21 @@ pub fn mint_revision_id(seq: u64) -> String {
 /// CloudWatch Logs renders one: a fixed-width decimal string.
 pub fn mint_sequence_token(seq: u64) -> String {
     format!("{seq:056}")
+}
+
+/// The id `PutQueryDefinition` hands back for a definition it creates: "CloudWatch
+/// generates a unique ID for the new query definition and include it in the response to
+/// this operation."
+///
+/// CloudWatch Logs renders one as a canonical hyphenated UUID, so this mints one in that
+/// shape from the store's monotonic query-definition counter — the way
+/// [`mint_revision_id`] and [`mint_sequence_token`] mint from stored counters — which
+/// makes every id unique and DERIVED FROM STORED STATE rather than from a random source
+/// this crate would need a new dependency for. The version (`4`) and variant (`8`) nibbles
+/// sit where a UUID carries them, and the counter fills the node field, offset by one so
+/// the first id minted is not the nil UUID.
+pub fn mint_query_definition_id(seq: u64) -> String {
+    format!("00000000-0000-4000-8000-{:012x}", seq.saturating_add(1))
 }
 
 /// The refusal CloudWatch Logs answers when the resource an operation names is not
