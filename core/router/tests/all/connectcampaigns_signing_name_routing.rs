@@ -157,12 +157,12 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::Error("NotImplemented"),
         ),
         (
-            "V2 StartInstanceOnboardingJob (still a stub)",
+            "V2 StartInstanceOnboardingJob",
             "PUT",
             "/v2/connect-instance/instance-1/onboarding",
             r#"{"encryptionConfig":{"enabled":false}}"#,
-            501,
-            Expect::Error("NotImplemented"),
+            200,
+            Expect::Member("connectInstanceOnboardingJobStatus"),
         ),
         (
             "V2 PutOutboundRequestBatch (still a stub)",
