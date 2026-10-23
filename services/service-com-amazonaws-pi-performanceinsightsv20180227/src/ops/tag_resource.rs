@@ -161,7 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ServiceType` is required by the model and refused at the boundary when it
         // is not one of its values; it adds no gate here, because the `ResourceARN`
         // is what names the resource the tags are added to.
-        let _ = ctx;
+        //
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is asked before anything is tagged, and its answer
+        // depends on nothing the request names existing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::tagged_resource(&input.resource_arn),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let mut store = state.lock();
         let Some(report) = store.report_by_arn_mut(&input.resource_arn) else {

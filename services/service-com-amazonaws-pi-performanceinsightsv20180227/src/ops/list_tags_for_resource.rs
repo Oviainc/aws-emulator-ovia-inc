@@ -168,7 +168,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not one of its values; it adds no gate here, because the `ResourceARN`
         // is what names the resource — and the ARN of a report already carries the
         // service type and the data source it was created for.
-        let _ = ctx;
+        //
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is asked before the store is read at all, and its
+        // answer depends on nothing the request names existing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::tagged_resource(&input.resource_arn),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         let store = state.lock();
         let Some(report) = store.report_by_arn(&input.resource_arn) else {

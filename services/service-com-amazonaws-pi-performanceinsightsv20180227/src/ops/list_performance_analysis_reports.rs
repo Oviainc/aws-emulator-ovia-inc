@@ -171,7 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is the first question and its answer depends on
+        // nothing the request names existing. The whole report collection of
+        // the addressed data source is what a listing reads, so that is the
+        // resource the decision is made against.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::report_resource(
+                ctx.parts(),
+                &input.service_type,
+                &input.identifier,
+                crate::state::ANY_REPORT,
+            ),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
 
         // The listing is scoped to one data source, so authorization for it is
         // decided first: a cursor could never have been handed out for a data

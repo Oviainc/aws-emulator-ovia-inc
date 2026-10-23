@@ -15,8 +15,14 @@
 mod authorization_gate;
 #[path = "all/available_resource_metrics.rs"]
 mod available_resource_metrics;
+#[path = "all/dimension_keys.rs"]
+mod dimension_keys;
+#[path = "all/identity_based_authorization.rs"]
+mod identity_based_authorization;
 #[path = "all/input_validation.rs"]
 mod input_validation;
+#[path = "all/metric_aggregate_function.rs"]
+mod metric_aggregate_function;
 #[path = "all/performance_analysis_reports.rs"]
 mod performance_analysis_reports;
 #[path = "all/pi_harness.rs"]

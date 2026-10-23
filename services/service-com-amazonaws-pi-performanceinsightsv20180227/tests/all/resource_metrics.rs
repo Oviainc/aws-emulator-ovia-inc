@@ -6,10 +6,11 @@
 //! state: `AlignedStartTime` sits on a period boundary at or before the
 //! requested `StartTime` and `AlignedEndTime` on one at or after the requested
 //! `EndTime`; the period is one of the documented granularities, chosen from the
-//! window when the caller names none; `PeriodAlignment` decides whether a point
-//! is stamped with its period's start or its end (`END_TIME` by default); one
-//! `MetricList` entry per `MetricQueries` element; and a repeated call answers
-//! identically because nothing is stored.
+//! window when the caller names none; the series a metric key carries is one
+//! data point per period across the aligned window, and `PeriodAlignment`
+//! decides whether a point is stamped with its period's start or its end
+//! (`END_TIME` by default); one `MetricList` entry per `MetricQueries` element;
+//! and a repeated call answers identically because nothing is stored.
 
 use serde_json::{json, Value};
 
@@ -149,15 +150,336 @@ async fn the_window_is_widened_to_the_nearest_period_boundaries() {
             "case {label}: expected the nearest boundaries, got {aligned_start}..{aligned_end}"
         );
 
-        // Performance Insights reports counters measured on a running DB
-        // engine, which this emulator does not monitor, so the series is empty
-        // rather than carrying a value per period that nothing measured.
+        // The series spans the window the answer itself reports: one point per
+        // period of [AlignedStartTime, AlignedEndTime).
         let points = data_points(&answer.body, 0);
-        assert!(
-            points.is_empty(),
-            "case {label}: expected no invented data points, got {points:?}"
+        let expected = (aligned_end - aligned_start) / period;
+        assert_eq!(
+            points.len() as i64,
+            expected,
+            "case {label}: expected {expected} data points across the reported window, got {}",
+            points.len()
         );
     }
+}
+
+/// RULE: the series a metric key carries is the GRID the aligned window holds:
+/// one data point per `PeriodInSeconds` period across
+/// `[AlignedStartTime, AlignedEndTime)`, in time order, each stamped at that
+/// period's start or end as `PeriodAlignment` asks and each carrying the
+/// `@required` `Value` the model declares.
+#[tokio::test]
+async fn the_series_is_the_grid_the_aligned_window_holds() {
+    let emulator = emulator();
+
+    // The rows differ along what the rule generalises over: the period (every
+    // documented value, including both published bounds), the alignment
+    // (absent — the documented END_TIME default — and both enum values), and
+    // whether the requested window already sits on period boundaries.
+    let mut cases: Vec<(i64, i64, i64, Option<&str>)> = Vec::new();
+    for &period in DOCUMENTED_PERIODS {
+        for (start_offset, end_offset) in [(0, period * 3), (1, period * 2 + 1)] {
+            for alignment in [None, Some("START_TIME"), Some("END_TIME")] {
+                cases.push((T0 + start_offset, T0 + end_offset, period, alignment));
+            }
+        }
+    }
+
+    for (start, end, period, alignment) in cases {
+        let label = format!("start={start} end={end} period={period} alignment={alignment:?}");
+        let answer = call(
+            &emulator,
+            "GetResourceMetrics",
+            metrics_input(
+                IDENTIFIER,
+                &["db.load.avg"],
+                start,
+                end,
+                Some(period),
+                alignment,
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {label}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+
+        let aligned_start = answer.member("AlignedStartTime").as_i64().unwrap_or(-1);
+        let aligned_end = answer.member("AlignedEndTime").as_i64().unwrap_or(-1);
+        let points = data_points(&answer.body, 0);
+
+        // One point per period of the window the answer itself reports.
+        let expected = (aligned_end - aligned_start) / period;
+        assert_eq!(
+            points.len() as i64,
+            expected,
+            "case {label}: expected {expected} points across {aligned_start}..{aligned_end}, \
+             got {}",
+            points.len()
+        );
+
+        // Each point is stamped at its period's start or end, in time order,
+        // and carries a Value.
+        let stamps_the_period_start = alignment == Some("START_TIME");
+        for (index, point) in points.iter().enumerate() {
+            let timestamp = point.get("Timestamp").and_then(Value::as_i64);
+            let offset = if stamps_the_period_start {
+                index as i64
+            } else {
+                index as i64 + 1
+            };
+            assert_eq!(
+                timestamp,
+                Some(aligned_start + offset * period),
+                "case {label}: expected point {index} stamped at {}, got {point:?}",
+                aligned_start + offset * period
+            );
+            assert!(
+                point.get("Value").and_then(Value::as_f64).is_some(),
+                "case {label}: expected point {index} to carry the required Value, got {point:?}"
+            );
+        }
+
+        // The first and last stamps are the window's own ends, so a client
+        // charting the series has the x-axis the window describes: inclusive of
+        // the start under START_TIME, inclusive of the end under END_TIME.
+        if let (Some(first), Some(last)) = (points.first(), points.last()) {
+            let first_stamp = first.get("Timestamp").and_then(Value::as_i64);
+            let last_stamp = last.get("Timestamp").and_then(Value::as_i64);
+            if stamps_the_period_start {
+                assert_eq!(
+                    (first_stamp, last_stamp),
+                    (Some(aligned_start), Some(aligned_end - period)),
+                    "case {label}: expected the period-start grid {aligned_start}..\
+                     {}, got {first_stamp:?}..{last_stamp:?}",
+                    aligned_end - period
+                );
+            } else {
+                assert_eq!(
+                    (first_stamp, last_stamp),
+                    (Some(aligned_start + period), Some(aligned_end)),
+                    "case {label}: expected the period-end grid {}..{aligned_end}, got \
+                     {first_stamp:?}..{last_stamp:?}",
+                    aligned_start + period
+                );
+            }
+        }
+    }
+}
+
+/// RULE: every metric key of one answer carries the same grid — the series
+/// depends on the window and the alignment, never on which metric was asked
+/// for.
+#[tokio::test]
+async fn every_metric_key_carries_the_same_grid() {
+    let emulator = emulator();
+    let metrics = ["db.load.avg", "db.sampledload.avg", "os.memory.free.min"];
+
+    let answer = call(
+        &emulator,
+        "GetResourceMetrics",
+        metrics_input(IDENTIFIER, &metrics, T0, T0 + 1_800, Some(60), None),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case three metrics: expected 200, got {} {:?}",
+        answer.status, answer.body
+    );
+
+    let first = data_points(&answer.body, 0);
+    assert_eq!(
+        first.len(),
+        30,
+        "case three metrics: expected the 30-period grid, got {} points",
+        first.len()
+    );
+    for (index, metric) in metrics.iter().enumerate().skip(1) {
+        let series = data_points(&answer.body, index);
+        assert_eq!(
+            series, first,
+            "case entry {index} ({metric}): expected the same grid as the first entry, got \
+             {series:?}"
+        );
+    }
+}
+
+/// RULE: a cursor this operation did not issue is refused — including one whose
+/// scope it would accept but whose offset is at or past the metric-query list,
+/// which it never hands out. A refusal is what keeps the answer's SIZE bounded
+/// by the budget: an out-of-range offset must not be answered as an empty page
+/// over an arbitrarily wide window.
+#[tokio::test]
+async fn a_cursor_whose_offset_is_past_the_query_list_is_refused() {
+    let emulator = emulator();
+    let metrics = ["db.load.avg", "db.sampledload.avg"];
+
+    // A legitimately paged request, to obtain a cursor whose scope IS this
+    // request's. The cursor is `hex("<offset>|<scope>")`, so the rows below
+    // rewrite only the offset and keep the scope the service accepted.
+    let mut paged = metrics_input(IDENTIFIER, &metrics, T0, T0 + 3_600, Some(60), None);
+    paged["MaxResults"] = json!(1);
+    let issued = call(&emulator, "GetResourceMetrics", paged.clone())
+        .await
+        .member("NextToken")
+        .as_str()
+        .expect("a truncated page hands back a cursor")
+        .to_string();
+    let decoded = String::from_utf8(hex::decode(&issued).expect("the cursor is hex"))
+        .expect("the cursor is UTF-8");
+    let scope = decoded
+        .split_once('|')
+        .expect("the cursor carries an offset and a scope")
+        .1
+        .to_string();
+
+    // The rows differ in how far past the two-query list the offset sits.
+    for offset in [2_usize, 3, 99, usize::MAX] {
+        let crafted = hex::encode(format!("{offset}|{scope}"));
+        let mut input = paged.clone();
+        input["NextToken"] = json!(crafted);
+        let answer = call(&emulator, "GetResourceMetrics", input).await;
+        assert_eq!(
+            answer.error_code(),
+            "InvalidArgumentException",
+            "case offset={offset}: expected InvalidArgumentException, got {} {:?}",
+            answer.status,
+            answer.body
+        );
+        assert!(
+            answer.member("MetricList").is_null(),
+            "case offset={offset}: expected no MetricList in a refusal, got {:?}",
+            answer.body
+        );
+    }
+
+    // The offset the service DID issue still resumes the page.
+    let mut resumed = paged;
+    resumed["NextToken"] = json!(issued);
+    let answer = call(&emulator, "GetResourceMetrics", resumed).await;
+    assert_eq!(
+        answer.status, 200,
+        "case the issued cursor: expected 200, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer
+            .member("MetricList")
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(|entry| entry.get("Key"))
+            .and_then(|key| key.get("Metric"))
+            .and_then(Value::as_str),
+        Some(metrics[1]),
+        "case the issued cursor: expected the second metric's page, got {:?}",
+        answer.body
+    );
+}
+
+/// RULE: a response the emulator cannot materialise the grid of is refused with
+/// the modelled 400, never answered with a truncated series a client could not
+/// tell from a complete one. The budget is this emulator's own (one data point
+/// per period per metric key has to fit in memory), so what is pinned here is
+/// the SHAPE of the answer at the bound: served at it, refused past it, taken
+/// over the WHOLE response rather than per series, and paged back inside the
+/// bound by `MaxResults`.
+#[tokio::test]
+async fn a_response_past_the_emulators_data_point_budget_is_refused() {
+    let emulator = emulator();
+
+    // The rows differ in the period they reach the bound at, so the rule is
+    // about the POINT COUNT rather than about one granularity.
+    let budget = service_com_amazonaws_pi_performanceinsightsv20180227::state::MAX_DATA_POINTS_PER_RESPONSE;
+    for &period in &[1_i64, 60] {
+        let at_bound = call(
+            &emulator,
+            "GetResourceMetrics",
+            metrics_input(
+                IDENTIFIER,
+                &["db.load.avg"],
+                T0,
+                T0 + budget * period,
+                Some(period),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            at_bound.status, 200,
+            "case period={period} at the budget: expected 200, got {} {:?}",
+            at_bound.status, at_bound.body
+        );
+        assert_eq!(
+            data_points(&at_bound.body, 0).len() as i64,
+            budget,
+            "case period={period} at the budget: expected the full grid"
+        );
+
+        let past_bound = call(
+            &emulator,
+            "GetResourceMetrics",
+            metrics_input(
+                IDENTIFIER,
+                &["db.load.avg"],
+                T0,
+                T0 + (budget + 1) * period,
+                Some(period),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            past_bound.status, 400,
+            "case period={period} one period past the budget: expected 400, got {} {:?}",
+            past_bound.status, past_bound.body
+        );
+        assert_eq!(
+            past_bound.error_code(),
+            "InvalidArgumentException",
+            "case period={period} one period past the budget: expected \
+             InvalidArgumentException, got {:?}",
+            past_bound.body
+        );
+    }
+
+    // The budget is over the whole response: a window half the budget wide is
+    // served for one metric key and refused for three, and `MaxResults` pages
+    // it back inside.
+    let half = budget / 2;
+    for (keys, expected_status) in [(1_usize, 200), (2, 200), (3, 400)] {
+        let metrics: Vec<String> = (0..keys).map(|index| format!("db.sql.stat{index}.avg")).collect();
+        let metrics: Vec<&str> = metrics.iter().map(String::as_str).collect();
+        let answer = call(
+            &emulator,
+            "GetResourceMetrics",
+            metrics_input(IDENTIFIER, &metrics, T0, T0 + half * 60, Some(60), None),
+        )
+        .await;
+        assert_eq!(
+            answer.status, expected_status,
+            "case {keys} series of {half} points: expected {expected_status}, got {} {:?}",
+            answer.status, answer.body
+        );
+    }
+
+    let metrics: Vec<String> = (0..3).map(|index| format!("db.sql.stat{index}.avg")).collect();
+    let metrics: Vec<&str> = metrics.iter().map(String::as_str).collect();
+    let mut paged = metrics_input(IDENTIFIER, &metrics, T0, T0 + half * 60, Some(60), None);
+    paged["MaxResults"] = json!(1);
+    let answer = call(&emulator, "GetResourceMetrics", paged).await;
+    assert_eq!(
+        answer.status, 200,
+        "case the same request paged to one key: expected 200, got {} {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.member("MetricList").as_array().map(Vec::len),
+        Some(1),
+        "case the same request paged to one key: expected one entry, got {:?}",
+        answer.body
+    );
 }
 
 /// RULE: with no `PeriodInSeconds` the service picks the finest documented
@@ -300,7 +622,9 @@ async fn one_metric_list_entry_per_query_keyed_by_its_metric() {
 
     // The rows differ in count (1, 2, 4 and the modelled maximum of 15), in the
     // metrics named, and in whether a metric repeats.
-    let fifteen: Vec<String> = (0..15).map(|index| format!("db.sql.stat{index}")).collect();
+    let fifteen: Vec<String> = (0..15)
+        .map(|index| format!("db.sql.stat{index}.avg"))
+        .collect();
     let fifteen: Vec<&str> = fifteen.iter().map(String::as_str).collect();
     let cases: Vec<Vec<&str>> = vec![
         vec!["db.load.avg"],
@@ -389,11 +713,15 @@ async fn repeating_the_same_request_answers_identically() {
         first.body, second.body
     );
 
+    // The window is 60 periods of 60 seconds wide ([T0, T0 + 3600) widened to
+    // the nearest minute boundaries), and both entries carry that same grid.
     for index in 0..2 {
         let series = data_points(&first.body, index);
-        assert!(
-            series.is_empty(),
-            "case entry {index}: expected no invented data points, got {series:?}"
+        assert_eq!(
+            series.len(),
+            60,
+            "case entry {index}: expected the 60-period grid, got {} points",
+            series.len()
         );
     }
 }
@@ -603,7 +931,11 @@ async fn extreme_timestamps_are_refused_rather_than_overflowing() {
     let served: Vec<(&str, i64, i64)> = vec![
         ("a window before the epoch", -86_400, -3_600),
         ("a window spanning the epoch", -3_600, 3_600),
-        ("a window long past year 9999", 300_000_000_000, 400_000_000_000),
+        (
+            "a window long past year 9999",
+            300_000_000_000,
+            300_000_360_000,
+        ),
     ];
 
     for (label, start, end) in served {

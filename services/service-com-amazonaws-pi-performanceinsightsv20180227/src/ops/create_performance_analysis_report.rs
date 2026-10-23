@@ -165,6 +165,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // IAM evaluates the caller's identity-based policies in FRONT of the
+        // service, so this is the first question and its answer depends on
+        // nothing the request names existing — and an unauthorized Create
+        // mints nothing.
+        if let Some(denial) = crate::state::identity_based_denial(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::report_resource(
+                ctx.parts(),
+                &input.service_type,
+                &input.identifier,
+                crate::state::ANY_REPORT,
+            ),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         // Documented on `StartTime`: "The value for StartTime must be earlier than
         // the value for EndTime." An end at or before the start describes no
         // window, so there is nothing to analyse. The RULE is the model's; the
