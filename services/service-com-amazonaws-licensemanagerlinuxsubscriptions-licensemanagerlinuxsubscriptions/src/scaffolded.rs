@@ -45,13 +45,14 @@
 //!
 //! The tag APIs of this service (`/tags/{resourceArn}`) answer their own error
 //! taxonomy rather than the generic `ValidationException` their models list: a
-//! `resourceArn` the service cannot parse as a resource ARN is `BadRequestException`
-//! ([`Scaffolded::invalid_resource_arn`], and the same refusal at the request boundary
-//! is worded in `crate::service::validation`), one that addresses no resource is
-//! `NotFoundException` ([`Scaffolded::not_found`]), and a tag set past the size a
-//! resource may carry is `BadRequestException`
+//! `resourceArn` the service cannot parse as a resource ARN is HTTP 400
+//! `BadRequestException` ([`Scaffolded::invalid_resource_arn`], and the same refusal at
+//! the request boundary is worded in `crate::service::validation`), one that addresses no
+//! resource is HTTP 404 `NotFoundException` ([`Scaffolded::not_found`]), and a tag set
+//! past the size a resource may carry is HTTP 400 `BadRequestException`
 //! ([`Scaffolded::tag_limit_exceeded`]). None of those codes is a shape this service's
-//! model declares, so they travel as [`Scaffolded::Unmodeled`].
+//! model declares, so they travel as [`Scaffolded::Unmodeled`], each carrying the status
+//! that goes with ITS code rather than one status for every client error.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -227,9 +228,16 @@ pub static UNMODELED_REFUSAL_SCHEMA: Schema = Schema::new_struct(
 /// `ResourceNotFoundException` their model lists — the tag APIs are fronted by a layer
 /// with its own error taxonomy, and a client branching on the code sees that one.
 pub const NOT_FOUND_CODE: &str = "NotFoundException";
-/// The HTTP status of that refusal (the same 400 the modeled client errors of this
-/// service carry).
-pub const NOT_FOUND_STATUS: u16 = 400;
+/// The HTTP status of that refusal.
+///
+/// 404, not the 400 this service's modeled client errors carry: the refusal reports that
+/// the addressed resource is ABSENT, and the recorded responses of the tag APIs answer an
+/// unregistered `resourceArn` with 404 — which is what a client branching on the status
+/// (create-if-absent, tolerate-missing, retry and alarm classification) reads as "not
+/// there" rather than "malformed request". The model says nothing to the contrary: no
+/// `@httpError` is attached to the `ResourceNotFoundException` it lists for these
+/// operations, so its 400 is only Smithy's default for a client error.
+pub const NOT_FOUND_STATUS: u16 = 404;
 /// The text that refusal carries: a CONSTANT, naming nothing from the request.
 pub const NOT_FOUND_MESSAGE: &str = "Resource was not found";
 /// The wire error code the tag APIs answer when the tag set a write would leave on the
@@ -249,7 +257,7 @@ pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad 
 ///
 /// It carries its own wire code, HTTP status and message precisely because the shape is
 /// not in the model, so there is no `#[operation_error]` variant that could render it.
-/// The three this service states are [`not_found`](Self::not_found) (HTTP 400
+/// The three this service states are [`not_found`](Self::not_found) (HTTP 404
 /// `NotFoundException`), [`tag_limit_exceeded`](Self::tag_limit_exceeded) and
 /// [`invalid_resource_arn`](Self::invalid_resource_arn) (HTTP 400
 /// `BadRequestException`).
@@ -265,7 +273,7 @@ pub struct UnmodeledRefusal {
 
 impl UnmodeledRefusal {
     /// The tag APIs' refusal of a `resourceArn` that addresses no resource of this
-    /// account: HTTP 400 `NotFoundException`.
+    /// account: HTTP 404 `NotFoundException`.
     pub const fn not_found() -> Self {
         Self {
             code: NOT_FOUND_CODE,
@@ -343,7 +351,7 @@ impl<E> Scaffolded<E> {
     }
 
     /// Refuse the request the way the tag APIs refuse a `resourceArn` that addresses no
-    /// resource of this account: HTTP 400 `NotFoundException`.
+    /// resource of this account: HTTP 404 `NotFoundException`.
     pub const fn not_found() -> Self {
         Self::Unmodeled(UnmodeledRefusal::not_found())
     }

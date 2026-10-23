@@ -7,8 +7,9 @@
 //! had), so `ListTagsForResource` afterwards reports the union of every write.
 //!
 //! `resourceArn` is a `SubscriptionProviderArn`, so the resource it addresses is a
-//! registered subscription provider; an ARN naming none is refused with the
-//! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`]), and a
+//! registered subscription provider; an ARN naming none is refused with the HTTP 404
+//! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`] /
+//! [`crate::scaffolded::NOT_FOUND_STATUS`]), and a
 //! write whose resultant set would pass [`crate::state::MAX_TAGS_PER_RESOURCE`] is
 //! refused with `BadRequestException` before anything is stored.
 //!

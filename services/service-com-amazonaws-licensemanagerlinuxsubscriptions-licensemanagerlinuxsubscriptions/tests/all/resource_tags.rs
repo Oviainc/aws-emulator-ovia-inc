@@ -20,11 +20,12 @@
 //!   sees, including the rest of the provider record `GetRegisteredSubscriptionProvider`
 //!   reports;
 //! * a `resourceArn` addressing no resource of this account is refused by BOTH
-//!   operations with the code the tag APIs answer (`NotFoundException`, HTTP 400), and
-//!   the refused write stores nothing;
+//!   operations with the code and status the tag APIs answer for an ABSENT resource
+//!   (`NotFoundException`, HTTP 404), and the refused write stores nothing;
 //! * a write whose RESULTANT set would be larger than a resource may carry
 //!   ([`MAX_TAGS`], the modelled `Tags` maximum) is refused with `BadRequestException`
-//!   and leaves the stored set as it was.
+//!   (HTTP 400 — a malformed request, not an absent resource) and leaves the stored set
+//!   as it was.
 //!
 //! The tables span the class each rule covers rather than the one recorded tag set: the
 //! number of pairs written (none, one, three, the modelled maximum of 50), keys and
@@ -61,12 +62,14 @@ const RED_HAT: &str = "RedHat";
 /// (`smithy_query(query="shape",shape="Tags")`).
 const MAX_TAGS: usize = 50;
 
-/// The wire error code and message the tag APIs answer for a `resourceArn` that
-/// addresses no resource of this account.
-const NOT_FOUND: (&str, &str) = ("NotFoundException", "Resource was not found");
+/// The HTTP status, wire error code and message the tag APIs answer for a `resourceArn`
+/// that addresses no resource of this account.
+const NOT_FOUND: (u16, &str, &str) = (404, "NotFoundException", "Resource was not found");
 
-/// The wire error code and message a write past [`MAX_TAGS`] is refused with.
-const TAG_LIMIT: (&str, &str) = (
+/// The HTTP status, wire error code and message a write past [`MAX_TAGS`] is refused
+/// with.
+const TAG_LIMIT: (u16, &str, &str) = (
+    400,
     "BadRequestException",
     "The resultant tag set must not have more than 50 user tags.",
 );
@@ -106,12 +109,12 @@ impl Reply {
         &self.body
     }
 
-    /// Assert this reply is HTTP 400 with the wire error code and message of `refusal`.
-    fn refused(&self, case: &str, refusal: (&str, &str)) {
-        let (code, message) = refusal;
+    /// Assert this reply is the HTTP status, wire error code and message of `refusal`.
+    fn refused(&self, case: &str, refusal: (u16, &str, &str)) {
+        let (status, code, message) = refusal;
         assert_eq!(
-            self.status, 400,
-            "case {case:?}: expected HTTP 400, got {} with body {:?}",
+            self.status, status,
+            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
             self.status, self.body
         );
         let actual = self.error_type.as_deref().unwrap_or("<none>");

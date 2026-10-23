@@ -20,9 +20,10 @@
 //!    anchors;
 //! 5. an enum violation on an ELEMENT of a list is reported at the LIST member, with the
 //!    element's constraint nested;
-//! 6. the tag APIs answer their own taxonomy in two ordered stages: `BadRequestException`
-//!    for a `resourceArn` outside the modelled grammar, `NotFoundException` for one that
-//!    addresses no resource, and the tag removal they perform is readable back;
+//! 6. the tag APIs answer their own taxonomy in two ordered stages, each with the HTTP
+//!    status that goes with its code: HTTP 400 `BadRequestException` for a `resourceArn`
+//!    outside the modelled grammar, HTTP 404 `NotFoundException` for one that addresses
+//!    no resource, and the tag removal they perform is readable back;
 //! 7. a not-found refusal on a subscription-provider ARN carries FIXED text and nothing
 //!    from the request, and is idempotent.
 
@@ -460,7 +461,7 @@ async fn the_tag_apis_separate_a_bad_arn_from_a_missing_resource() {
             ("ListTagsForResource", list_tags(&h, arn).await),
         ] {
             let case = format!("{op} with {arn}");
-            reply.error(&case, 400, "NotFoundException");
+            reply.error(&case, 404, "NotFoundException");
             assert_eq!(
                 reply.message(),
                 TAG_NOT_FOUND_MESSAGE,
