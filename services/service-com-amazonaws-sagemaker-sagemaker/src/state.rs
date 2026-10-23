@@ -43,13 +43,25 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+/// The AutoML job V2 slice: the record, its clock and its constants. Re-exported below,
+/// so a handler names them as `crate::state::…` like every other slice.
+pub mod auto_ml_job_v2;
+pub use auto_ml_job_v2::{
+    auto_ml_problem_type_config_name, AutoMLJobV2, AUTO_ML_JOB_KIND_LABEL, AUTO_ML_JOB_QUOTA,
+    AUTO_ML_JOB_TERMINAL_AFTER, AUTO_ML_NOT_TRAINED_FAILURE_REASON,
+    AUTO_ML_SECONDARY_STATUS_FAILED, AUTO_ML_SECONDARY_STATUS_STARTING, AUTO_ML_STATUS_FAILED,
+    AUTO_ML_STATUS_IN_PROGRESS,
+};
+
 use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
-    AsyncInferenceConfig, BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition,
-    DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig,
-    GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
-    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
-    MetricsConfig, ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
+    AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,
+    AutoMLJobObjective, AutoMLOutputDataConfig, AutoMLProblemTypeConfig, AutoMLSecurityConfig,
+    BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig,
+    DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
+    InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
+    KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
+    ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig, ModelLifeCycle, ModelMetrics,
     ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
@@ -1474,6 +1486,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// AutoML jobs V2, keyed by [`entity_key`] of their `AutoMLJobName`.
+    pub auto_ml_jobs_v2: BTreeMap<String, AutoMLJobV2>,
     /// Lineage contexts, keyed by `ContextArn`: `ContextName` is documented unique to an
     /// account in a Region, so the ARN — which carries the Region beside the name — is
     /// what identifies one context. See [`context_key`].
@@ -3635,14 +3649,16 @@ impl ComAmazonawsSagemakerSagemakerState {
     }
 }
 
-/// The store key a `TrialComponentName` (or any other `ExperimentEntityName`) maps to.
+/// The store key a `TrialComponentName` (or any other case-insensitive SageMaker name,
+/// such as an `AutoMLJobName`) maps to.
 ///
 /// The member's model doc says the name "must be unique in your Amazon Web Services
-/// account and is not case-sensitive", so two names differing only in case are ONE
+/// account and is not case-sensitive" (`AutoMLJobName`'s says "must be unique to your
+/// account and is case insensitive"), so two names differing only in case are ONE
 /// entity: the store is keyed by the case-folded name, while the record keeps the casing
-/// the caller sent so a reader replays it. `ExperimentEntityName` is ASCII (pattern
-/// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`), so ASCII folding is exact for every name the
-/// boundary validator lets through.
+/// the caller sent so a reader replays it. Every such name is ASCII (`ExperimentEntityName`
+/// is `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,119}$`, `AutoMLJobName` the same shape bounded at 32),
+/// so ASCII folding is exact for every name the boundary validator lets through.
 pub fn entity_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }

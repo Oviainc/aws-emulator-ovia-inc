@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAutoMLJobV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAutoMLJobV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an AutoML job V2 and persists it in [`crate::state`], so
+//! `DescribeAutoMLJobV2` replays exactly what this call stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAutoMLJobV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The job is accepted in the non-terminal `InProgress`/`Starting` status, and the clock
+//! owes it a terminal transition ([`crate::state::AUTO_ML_JOB_TERMINAL_AFTER`]). That
+//! transition is to `Failed`: Autopilot's work is model training, which this emulator
+//! does not run, so the job reports
+//! [`crate::state::AUTO_ML_NOT_TRAINED_FAILURE_REASON`] rather than a `Completed` status,
+//! a best candidate or notebook artifacts that no training produced.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +187,96 @@ impl<Eng> CreateAutoMLJobV2<Eng> {
     }
 }
 
+/// The documented cross-member rules of `CreateAutoMLJobV2`, as a refusal message when
+/// the request breaks one.
+///
+/// None of these can be expressed in the model, so the boundary validator passes the
+/// request and the handler is where they are enforced. Each is quoted from this
+/// operation's own model docs (`smithy_query` query="doc" shape="CreateAutoMLJobV2Request"):
+///
+/// * `ModelDeployConfig.AutoGenerateEndpointName`: "If you set AutoGenerateEndpointName
+///   to True, do not specify the EndpointName; otherwise a 400 error is thrown", and
+///   `ModelDeployConfig.EndpointName`: "Specify the EndpointName if and only if you set
+///   AutoGenerateEndpointName to False; otherwise a 400 error is thrown" — so exactly
+///   one of the two must be given. An absent `AutoGenerateEndpointName` is the `False`
+///   side of that biconditional, because the same member documents "The default value is
+///   False": a `ModelDeployConfig` carrying neither member therefore breaks the "if and
+///   only if" and is refused, exactly as one setting the flag to `False` explicitly is.
+/// * `DataSplitConfig`: "This attribute must not be set for the time-series forecasting
+///   problem type, as Autopilot automatically splits the input dataset into training and
+///   validation sets."
+/// * `AutoMLJobObjective`: "For tabular problem types: You must either provide both the
+///   AutoMLJobObjective and indicate the type of supervised learning problem in
+///   AutoMLProblemTypeConfig (TabularJobConfig.ProblemType), or none at all."
+fn member_combination_violation(input: &CreateAutoMLJobV2Input) -> Option<&'static str> {
+    if let Some(deploy) = &input.model_deploy_config {
+        let auto_generate = deploy.auto_generate_endpoint_name.unwrap_or(false);
+        match (auto_generate, deploy.endpoint_name.is_some()) {
+            (true, true) => {
+                return Some(
+                    "ModelDeployConfig.EndpointName must not be specified when \
+                     ModelDeployConfig.AutoGenerateEndpointName is true",
+                );
+            }
+            (false, false) => {
+                return Some(
+                    "ModelDeployConfig.EndpointName is required when \
+                     ModelDeployConfig.AutoGenerateEndpointName is false or absent",
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if input.data_split_config.is_some()
+        && matches!(
+            input.auto_ml_problem_type_config,
+            AutoMLProblemTypeConfig::TimeSeriesForecastingJobConfig(_)
+        )
+    {
+        return Some(
+            "DataSplitConfig must not be set for the TimeSeriesForecasting problem type: \
+             Autopilot splits a time-series dataset into training and validation sets itself",
+        );
+    }
+
+    if let AutoMLProblemTypeConfig::TabularJobConfig(tabular) = &input.auto_ml_problem_type_config {
+        match (
+            input.auto_ml_job_objective.is_some(),
+            tabular.problem_type.is_some(),
+        ) {
+            (true, false) => {
+                return Some(
+                    "AutoMLProblemTypeConfig.TabularJobConfig.ProblemType is required when \
+                     AutoMLJobObjective is specified for the Tabular problem type",
+                );
+            }
+            (false, true) => {
+                return Some(
+                    "AutoMLJobObjective is required when \
+                     AutoMLProblemTypeConfig.TabularJobConfig.ProblemType is specified for the \
+                     Tabular problem type",
+                );
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// The `Tags` key a request takes twice, if any.
+///
+/// `Tags`' doc for this operation ends "Tag keys must be unique per resource", a rule
+/// the model cannot express (it carries only the list's `len 0..50`), so the boundary
+/// validator passes a list that repeats a key and the handler is where it is refused.
+fn duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
+    let mut seen = ::std::collections::BTreeSet::new();
+    tags.iter()
+        .map(|tag| tag.key.as_str())
+        .find(|key| !seen.insert(*key))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateAutoMLJobV2<Eng>
 {
@@ -204,18 +294,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAutoMLJobV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAutoMLJobV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // Documented combinations the model cannot express, so the boundary validator
+        // passed them: refuse as 400 `ValidationException`, never as 501.
+        if let Some(violation) = member_combination_violation(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
+        }
+        if let Some(duplicate) = input.tags.as_deref().and_then(duplicate_tag_key) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Tag keys must be unique per resource: Tags takes the key {duplicate} twice"
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "automl-job", &input.auto_ml_job_name);
+        let key = crate::state::entity_key(&input.auto_ml_job_name);
+
+        let mut store = state.lock();
+        // `AutoMLJobName`'s doc: "The name must be unique to your account and is case
+        // insensitive" — so a name differing only in case names the SAME job, and a
+        // second create is the modelled `ResourceInUse` rather than a second job.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAutoMLJobV2"))
+        // Identity is resolved BEFORE the store bound: a create that collides with a job
+        // already held asks for no new capacity, so the name is what refuses it however
+        // full the store is.
+        //
+        // The V1 `CreateAutoMLJob` shares that account-level name space on AWS; it is
+        // still a scaffold answering 501 here (its own stub issue), so this one store
+        // holds every AutoML job that can exist and is the whole name space to check.
+        if let Some(existing) = store.auto_ml_jobs_v2.get(&key) {
+            return Err(CreateAutoMLJobV2ErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "An AutoML job already exists with the name {}: AutoMLJobName must be \
+                     unique to your account and is case insensitive.",
+                    existing.name
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `AutoMLJobName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation
+        // models.
+        if !store.auto_ml_jobs_v2_below_quota() {
+            return Err(CreateAutoMLJobV2ErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for AutoML jobs is {}, with current \
+                         utilization of {} and a request delta of 1.",
+                        crate::state::AUTO_ML_JOB_QUOTA,
+                        store.auto_ml_jobs_v2.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.auto_ml_jobs_v2.insert(
+            key,
+            crate::state::AutoMLJobV2 {
+                name: input.auto_ml_job_name,
+                arn: arn.clone(),
+                input_data_config: input.auto_ml_job_input_data_config,
+                output_data_config: input.output_data_config,
+                problem_type_config: input.auto_ml_problem_type_config,
+                role_arn: input.role_arn,
+                objective: input.auto_ml_job_objective,
+                model_deploy_config: input.model_deploy_config,
+                data_split_config: input.data_split_config,
+                security_config: input.security_config,
+                compute_config: input.auto_ml_compute_config,
+                tags: input.tags.unwrap_or_default(),
+                status: crate::state::AUTO_ML_STATUS_IN_PROGRESS.to_string(),
+                secondary_status: crate::state::AUTO_ML_SECONDARY_STATUS_STARTING.to_string(),
+                failure_reason: None,
+                creation_time: now,
+                last_modified_time: now,
+                end_time: None,
+                terminal_at: now + crate::state::AUTO_ML_JOB_TERMINAL_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateAutoMLJobV2Output {
+            auto_ml_job_arn: arn,
+        })
     }
 }
+
