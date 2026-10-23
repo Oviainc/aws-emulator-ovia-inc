@@ -7,6 +7,12 @@
 //! Every test drives real HTTP requests through the framework router, so the wire
 //! protocol (restJson1), the URI bindings, the boundary validator and the handlers
 //! are all exercised, and every assertion reads a response BODY.
+//!
+//! The request harness below ([`router`], [`call`], [`create_session`],
+//! [`create_invocation`], [`put_step`] and the small readers beside them) is
+//! `pub(crate)`, so a sibling suite in `tests/all/` drives the service exactly the
+//! way this one does instead of growing a second copy of it (see
+//! `tests/all/invocations.rs`).
 
 use std::sync::Arc;
 
@@ -16,15 +22,15 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here signs for. It becomes the region segment of the
 /// `sessionArn` the service mints.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A router carrying only this service, over one shared engine — the same object
 /// the production router mounts, so state behaves exactly as it does in the
 /// emulator.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -38,7 +44,12 @@ fn router() -> MultiServiceRouter {
 
 /// Send one request and read back `(status, body)`. A `Value::Null` body is sent as
 /// no body at all, the way an SDK sends an operation with no body members.
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (u16, Value) {
     call_signed_for(router, method, path, body, REGION).await
 }
 
@@ -81,7 +92,7 @@ async fn call_signed_for(
 }
 
 /// The wire error code restJson1 puts in `__type`, or `""` on a success body.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
@@ -93,14 +104,14 @@ fn seconds(value: &Value) -> Option<f64> {
 
 /// Percent-encode a `sessionIdentifier` for use as a non-greedy `@httpLabel`: a
 /// session ARN contains `/`, which would otherwise split the path segment.
-fn label(identifier: &str) -> String {
+pub(crate) fn label(identifier: &str) -> String {
     identifier.replace('%', "%25").replace('/', "%2F")
 }
 
 /// Does `value` satisfy the model's `Uuid` pattern,
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`?
 /// (`smithy_query(query="operation",operation="CreateSession")` -> `sessionId`.)
-fn is_model_uuid(value: &str) -> bool {
+pub(crate) fn is_model_uuid(value: &str) -> bool {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let parts: Vec<&str> = value.split('-').collect();
     parts.len() == GROUPS.len()
@@ -111,7 +122,10 @@ fn is_model_uuid(value: &str) -> bool {
 }
 
 /// Create a session and return `(sessionId, sessionArn)`.
-async fn create_session(router: &MultiServiceRouter, metadata: Value) -> (String, String) {
+pub(crate) async fn create_session(
+    router: &MultiServiceRouter,
+    metadata: Value,
+) -> (String, String) {
     let body = if metadata.is_null() {
         json!({})
     } else {
@@ -265,7 +279,11 @@ async fn session_metadata_is_reported_exactly_as_it_was_written() {
 }
 
 /// Create an invocation under `identifier` and return its invocationId.
-async fn create_invocation(router: &MultiServiceRouter, identifier: &str, body: Value) -> String {
+pub(crate) async fn create_invocation(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    body: Value,
+) -> String {
     let path = format!("/sessions/{}/invocations/", label(identifier));
     let (status, out) = call(router, "PUT", &path, body).await;
     assert_eq!(
@@ -283,7 +301,7 @@ async fn create_invocation(router: &MultiServiceRouter, identifier: &str, body: 
 /// `step_time` is epoch seconds: that is the timestamp encoding this framework's
 /// JSON codec speaks, since the generated member schemas carry no
 /// `@timestampFormat` override.
-async fn put_step(
+pub(crate) async fn put_step(
     router: &MultiServiceRouter,
     identifier: &str,
     invocation_id: &str,

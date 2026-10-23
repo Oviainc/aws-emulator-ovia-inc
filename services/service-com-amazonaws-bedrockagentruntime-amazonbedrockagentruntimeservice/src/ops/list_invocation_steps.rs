@@ -213,6 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // session and invocation are resolved, so a request naming neither a known
         // resource nor a valid token answers 404 for the resource first.
         let scope = crate::state::pagination_scope(
+            Self::NAME,
             &session.session_id,
             input.invocation_identifier.as_deref(),
         );

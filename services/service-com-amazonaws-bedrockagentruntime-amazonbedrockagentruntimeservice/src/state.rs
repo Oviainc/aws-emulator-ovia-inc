@@ -6,9 +6,9 @@
 //! invocations, and an invocation holds invocation steps. Every session-scoped
 //! operation (`GetSession`, `UpdateSession`, `EndSession`, `DeleteSession`,
 //! `CreateInvocation`, `PutInvocationStep`, `GetInvocationStep`,
-//! `ListInvocationSteps`) resolves its `sessionIdentifier` through the ONE helper
-//! [`session_id_from_identifier`], so they all agree on what a bare UUID and a
-//! session ARN mean.
+//! `ListInvocations`, `ListInvocationSteps`) resolves its `sessionIdentifier`
+//! through the ONE helper [`session_id_from_identifier`], so they all agree on what
+//! a bare UUID and a session ARN mean.
 
 use std::collections::BTreeMap;
 
@@ -44,10 +44,10 @@ pub const MAX_INVOCATIONS_PER_SESSION: usize = 1_000;
 /// Resource guard: the most steps one invocation holds. See [`MAX_SESSIONS`].
 pub const MAX_STEPS_PER_INVOCATION: usize = 1_000;
 
-/// The `maxResults` bounds ListInvocationSteps declares
-/// (`smithy_query(query="operation",operation="ListInvocationSteps")` -> `maxResults`
-/// has `range {min: 1, max: 1000}` and `default: 10`), named here so the
-/// model-derived page bounds have one home.
+/// The `maxResults` bounds this service's session listings declare
+/// (`smithy_query(query="operation",operation="ListInvocationSteps,ListInvocations")`
+/// -> `maxResults` has `range {min: 1, max: 1000}` and `default: 10` in both), named
+/// here so the model-derived page bounds have one home.
 pub const MIN_LIST_PAGE: i32 = 1;
 
 /// See [`MIN_LIST_PAGE`].
@@ -232,14 +232,22 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The scope a pagination cursor is bound to: the session being listed, and the
-/// `invocationIdentifier` filter when one is supplied.
+/// The scope a pagination cursor is bound to: the listing that issued it (the
+/// operation name), the session being listed, and the `invocationIdentifier` filter
+/// when one is supplied.
 ///
 /// A cursor is only meaningful for the listing that issued it, so the scope goes
-/// INTO the token: a token minted while listing one session (or one invocation) is
-/// then refused on another rather than silently resuming at an unrelated offset.
-pub fn pagination_scope(session_id: &str, invocation_filter: Option<&str>) -> String {
-    format!("{session_id}:{}", invocation_filter.unwrap_or(""))
+/// INTO the token: a token minted while listing one session (or one invocation, or a
+/// different kind of item) is then refused on another rather than silently resuming
+/// at an unrelated offset. Store order is global across this service, so without the
+/// operation name a `ListInvocationSteps` cursor would read as a valid
+/// `ListInvocations` cursor for the same session.
+pub fn pagination_scope(
+    listing: &str,
+    session_id: &str,
+    invocation_filter: Option<&str>,
+) -> String {
+    format!("{listing}:{session_id}:{}", invocation_filter.unwrap_or(""))
 }
 
 /// Encode a pagination cursor: the scope it belongs to, and the store order of the
