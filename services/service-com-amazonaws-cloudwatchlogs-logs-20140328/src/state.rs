@@ -10,6 +10,10 @@
 //! A log group's subscription filters live on the group they are "associated with"
 //! ([`LogGroupRecord::subscription_filters`]), so deleting the group removes them too.
 //!
+//! A log group's log transformer lives on the group too
+//! ([`LogGroupRecord::transformer`]), because `PutTransformer` creates one "for a single
+//! log group" and nothing else identifies it.
+//!
 //! The account's resource policies live here too: an account-scoped one in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::account_resource_policies`], a
 //! resource-scoped one on the log group it is attached to
@@ -29,6 +33,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The log group class `CreateLogGroup` applies when the request omits
 /// `logGroupClass` ("If you omit this parameter, the default of STANDARD is used").
 pub const DEFAULT_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// The one log group class a log-group-level transformer may be created on, from
+/// `PutTransformer`: "You can create transformers only for the log groups in the
+/// Standard log class." Spelled as the model's `LogGroupClass` spells it
+/// (`LOG_GROUP_CLASS_VALUES`). Named apart from [`DEFAULT_LOG_GROUP_CLASS`] because the
+/// two state different rules — the class a group gets when the request names none, and
+/// the class this feature requires — even where the model spells them the same.
+pub const TRANSFORMER_LOG_GROUP_CLASS: &str = "STANDARD";
 
 /// Per-event storage overhead CloudWatch Logs charges a log group's `storedBytes`.
 /// From the PutLogEvents quota: a batch's size "is calculated as the sum of all event
@@ -443,6 +455,11 @@ pub struct LogGroupRecord {
     /// The resource-scoped policy attached to this group, if one has been put: AWS
     /// allows "one per LogGroup resourceARN", so at most one.
     pub resource_policy: Option<ResourcePolicyRecord>,
+    /// The log-group level transformer `PutTransformer` created for this group, if one
+    /// has been put. A log group has at most one — `PutTransformer` "creates or updates
+    /// a log transformer for a single log group" and names it by nothing but the group —
+    /// and it lives on the group, so deleting the group takes its transformer with it.
+    pub transformer: Option<TransformerRecord>,
     /// The data protection policy attached to this group, if one has been put:
     /// `PutDataProtectionPolicy` "applies to only the specified log group" and a put
     /// replaces the policy the group holds, so at most one. `None` again after
@@ -479,6 +496,7 @@ impl LogGroupRecord {
             streams: BTreeMap::new(),
             subscription_filters: BTreeMap::new(),
             resource_policy: None,
+            transformer: None,
             data_protection_policy: None,
             had_data_protection_policy: false,
             data_sources: Vec::new(),
@@ -669,6 +687,91 @@ pub fn log_group_name_matches_pattern(name: &str, pattern: &str) -> bool {
                 None => name.contains(alternative),
             }
         })
+}
+
+/// One log-group level transformer — "a series of processors, where each processor
+/// applies one type of transformation to the log events ingested into this log group" —
+/// as it is stored, on the single log group it transforms for.
+#[derive(Debug, Clone)]
+pub struct TransformerRecord {
+    /// The processors, in the order the put listed them: "The processors work one after
+    /// another, in the order that you list them, like a pipeline", so the order is part
+    /// of the configuration and a read reports it back unchanged.
+    pub processors: Vec<crate::ops::types::Processor>,
+    /// When this transformer was first created for the group. An update keeps it: a put
+    /// over an existing transformer is the same transformer, reconfigured.
+    pub creation_time_ms: i64,
+    /// When the transformer was last put, which for a transformer created and never
+    /// updated is its creation time.
+    pub last_modified_time_ms: i64,
+}
+
+/// The transformations one processor names, as the model spells the members that carry
+/// them.
+///
+/// `Processor` is "the information about one processor in a log transformer" and a
+/// `transformerConfig` is "an array of processors, where each processor applies one type
+/// of transformation", so exactly one of the structure's members is populated. Reporting
+/// the populated ones lets a put refuse a processor that names none, and one that names
+/// several, with a message that lists what it named.
+pub fn processor_transformations(processor: &crate::ops::types::Processor) -> Vec<&'static str> {
+    // Destructured EXHAUSTIVELY — no `..` — so a processor kind the model gains is a
+    // COMPILE error here rather than a member this function silently cannot see, which
+    // would make a put naming only that kind look like a processor naming none.
+    let crate::ops::types::Processor {
+        add_keys,
+        copy_value,
+        csv,
+        date_time_converter,
+        delete_keys,
+        grok,
+        list_to_map,
+        lower_case_string,
+        move_keys,
+        parse_cloudfront,
+        parse_json,
+        parse_key_value,
+        parse_route53,
+        parse_to_ocsf,
+        parse_postgres,
+        parse_vpc,
+        parse_waf,
+        rename_keys,
+        split_string,
+        substitute_string,
+        trim_string,
+        type_converter,
+        upper_case_string,
+    } = processor;
+    // The member names are the model's own (`Processor`'s members), in model order.
+    [
+        ("addKeys", add_keys.is_some()),
+        ("copyValue", copy_value.is_some()),
+        ("csv", csv.is_some()),
+        ("dateTimeConverter", date_time_converter.is_some()),
+        ("deleteKeys", delete_keys.is_some()),
+        ("grok", grok.is_some()),
+        ("listToMap", list_to_map.is_some()),
+        ("lowerCaseString", lower_case_string.is_some()),
+        ("moveKeys", move_keys.is_some()),
+        ("parseCloudfront", parse_cloudfront.is_some()),
+        ("parseJSON", parse_json.is_some()),
+        ("parseKeyValue", parse_key_value.is_some()),
+        ("parseRoute53", parse_route53.is_some()),
+        ("parseToOCSF", parse_to_ocsf.is_some()),
+        ("parsePostgres", parse_postgres.is_some()),
+        ("parseVPC", parse_vpc.is_some()),
+        ("parseWAF", parse_waf.is_some()),
+        ("renameKeys", rename_keys.is_some()),
+        ("splitString", split_string.is_some()),
+        ("substituteString", substitute_string.is_some()),
+        ("trimString", trim_string.is_some()),
+        ("typeConverter", type_converter.is_some()),
+        ("upperCaseString", upper_case_string.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(member, populated)| populated.then_some(member))
+    .collect()
 }
 
 /// One subscription filter — "a real-time stream of log events ingested through
