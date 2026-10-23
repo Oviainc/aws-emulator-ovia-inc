@@ -1491,6 +1491,22 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
                 .any(|rate_based| points_at(&rate_based.rule))
     }
 
+    /// Whether any stored `WebACL` activates the rule `rule_id` names.
+    ///
+    /// A web ACL's `ActivatedRule` list is what `UpdateWebACL` writes, and each entry's
+    /// `RuleId` is "the `RuleId` for a `Rule`" that web ACL uses. The refusal this
+    /// answers is on every rule kind's delete: "You can't delete a Rule if it's still
+    /// used in any WebACL objects […] If you just want to remove a Rule from a WebACL,
+    /// use UpdateWebACL."
+    pub fn is_referenced_by_a_web_acl(&self, rule_id: &str) -> bool {
+        self.web_acls.values().any(|web_acl| {
+            web_acl
+                .rules
+                .iter()
+                .any(|activated| activated.rule_id == rule_id)
+        })
+    }
+
     /// The status of `token`, or `None` when this service holds no such token.
     ///
     /// This materialises the one transition the CLOCK owes — a consumed token whose

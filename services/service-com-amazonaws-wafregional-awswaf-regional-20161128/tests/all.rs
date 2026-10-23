@@ -30,6 +30,8 @@ mod regex_pattern_set;
 mod regex_pattern_set_updates;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/rule_deletion.rs"]
+mod rule_deletion;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
 #[path = "all/rule_lifecycle.rs"]
