@@ -11,6 +11,15 @@
 //! a second one. A token carrying a request the first call did not make is
 //! `ConflictException` (HTTP 409) rather than a replay of someone else's answer.
 //!
+//! WHICH ACCOUNTS MAY CALL: a bill scenario models what some account will be billed, so
+//! planning one belongs to the account that pays that bill — the payer (management)
+//! account of an organization, or an account in no organization. A member account's
+//! request is refused with the modelled `ValidationException` (HTTP 400) carrying
+//! `reason` `invalidRequestFromMember`, answered before the request is read and before
+//! anything is written, so a refused create stores nothing and mints no id. The gate is
+//! the store's own `member_account_refusal`, applied the same way by every implemented
+//! operation of this subject.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -93,6 +102,9 @@
 //! * `DataUnavailableException` (HTTP 400) — The requested data is currently unavailable.
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request would cause you to exceed your
 //!   service quota.
+//! * `ValidationException` (HTTP 400) — The input provided fails to satisfy the constraints
+//!   specified by an Amazon Web Services service. Declared on the SERVICE rather than on
+//!   this operation, so it is widened in through `extra_errors`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -108,12 +120,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-bcmpricingcalculator-aw
 // here — hence the `CreateBillScenarioError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.bcmpricingcalculator#CreateBillScenario")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (smithy_query `query="service_info"`: `common_errors`) but this operation does not
+// list it, and it is the modelled answer to a request the caller's account class does
+// not permit — the only one of this operation's errors that carries a `reason`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.bcmpricingcalculator#CreateBillScenario",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum CreateBillScenarioErrorModeled {
     ConflictException(ConflictException),
     DataUnavailableException(DataUnavailableException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -193,6 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = store.lock();
+        // The account-class gate, before the request is read and before anything is
+        // written: a bill scenario models what some account will be billed, so planning
+        // one belongs to the account that pays that bill.
+        if let Some(refusal) = state.member_account_refusal(Self::NAME) {
+            return Err(CreateBillScenarioErrorModeled::ValidationException(refusal).into());
+        }
         let now = crate::state::now_secs();
         // Materialise the expiry the clock has already made due before answering, so
         // the retention this scenario's `expiresAt` advertises is enforced rather than
