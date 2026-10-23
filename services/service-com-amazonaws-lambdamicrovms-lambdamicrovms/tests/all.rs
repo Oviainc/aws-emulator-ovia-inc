@@ -17,5 +17,7 @@ mod image_request_validation;
 mod microvm_image_and_instance_paths;
 #[path = "all/microvm_lifecycle.rs"]
 mod microvm_lifecycle;
+#[path = "all/microvm_runtime_path.rs"]
+mod microvm_runtime_path;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

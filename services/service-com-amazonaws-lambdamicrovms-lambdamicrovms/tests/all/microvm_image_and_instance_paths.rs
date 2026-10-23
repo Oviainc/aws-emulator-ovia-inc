@@ -189,12 +189,20 @@ async fn deleting_an_image_is_durable_and_idempotent() {
                 "case {case:?}: expected {expected_type} by {form}, got {body}"
             );
         }
+        // A filter is not a lookup: the listing keeps answering, now selecting nothing.
+        // (`ListMicrovms` is `@paginated` with `items` `@required`, so a filter value
+        // that selects no MicroVM is a terminal empty page, not a refusal.)
         let (status, listed) =
             call(&router, "GET", &format!("/2025-09-09/microvms?imageIdentifier={name}"), None)
                 .await;
         assert_eq!(
-            status, 404,
+            status, 200,
             "case {case:?}: a deleted image filters nothing, got {status} {listed}"
+        );
+        assert_eq!(
+            listed["items"].as_array().cloned(),
+            Some(Vec::new()),
+            "case {case:?}: expected an empty page, got {listed}"
         );
 
         // "deleting an image that has already been deleted succeeds without error".
@@ -267,13 +275,6 @@ async fn every_not_found_carries_only_the_request_derived_message() {
             format!("/2025-09-09/microvm-images/{}", as_uri_value(&absent_arn)),
             None,
             format!("MicroVMImage not found for MicroVMImageID: {absent_arn}"),
-        ),
-        (
-            "list MicroVMs filtered by an absent image",
-            "GET",
-            "/2025-09-09/microvms?imageIdentifier=absent".to_string(),
-            None,
-            "MicroVMImage not found for MicroVMImageID: absent".to_string(),
         ),
         (
             "get an absent MicroVM by id",
