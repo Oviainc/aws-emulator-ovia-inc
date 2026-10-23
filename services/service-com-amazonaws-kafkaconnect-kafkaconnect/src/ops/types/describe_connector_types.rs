@@ -17,7 +17,10 @@ pub struct DescribeConnectorInput {
     pub connector_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#DescribeConnectorResponse")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="DescribeConnectorResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeConnectorOutput {
     pub capacity: Option<CapacityDescription>,
@@ -39,4 +42,65 @@ pub struct DescribeConnectorOutput {
     pub worker_configuration: Option<WorkerConfigurationDescription>,
     pub state_description: Option<StateDescription>,
 }
+
+kc_schema_and_codec!(
+    DescribeConnectorOutput,
+    DESCRIBE_CONNECTOR_OUTPUT_SCHEMA,
+    "com.amazonaws.kafkaconnect#DescribeConnectorResponse",
+    "com.amazonaws.kafkaconnect",
+    "DescribeConnectorResponse",
+    (M_CAPACITY, capacity, "capacity", 0, opt, struct_of(CapacityDescription)),
+    (M_CONNECTOR_ARN, connector_arn, "connectorArn", 1, opt, string),
+    (
+        M_CONNECTOR_CONFIGURATION,
+        connector_configuration,
+        "connectorConfiguration",
+        2,
+        opt,
+        map_of_string
+    ),
+    (M_CONNECTOR_DESCRIPTION, connector_description, "connectorDescription", 3, opt, string),
+    (M_CONNECTOR_NAME, connector_name, "connectorName", 4, opt, string),
+    (M_CONNECTOR_STATE, connector_state, "connectorState", 5, opt, string),
+    (M_CREATION_TIME, creation_time, "creationTime", 6, opt, date_time),
+    (M_CURRENT_VERSION, current_version, "currentVersion", 7, opt, string),
+    (M_KAFKA_CLUSTER, kafka_cluster, "kafkaCluster", 8, opt, struct_of(KafkaClusterDescription)),
+    (
+        M_KAFKA_CLUSTER_CLIENT_AUTHENTICATION,
+        kafka_cluster_client_authentication,
+        "kafkaClusterClientAuthentication",
+        9,
+        opt,
+        struct_of(KafkaClusterClientAuthenticationDescription)
+    ),
+    (
+        M_KAFKA_CLUSTER_ENCRYPTION_IN_TRANSIT,
+        kafka_cluster_encryption_in_transit,
+        "kafkaClusterEncryptionInTransit",
+        10,
+        opt,
+        struct_of(KafkaClusterEncryptionInTransitDescription)
+    ),
+    (M_KAFKA_CONNECT_VERSION, kafka_connect_version, "kafkaConnectVersion", 11, opt, string),
+    (M_LOG_DELIVERY, log_delivery, "logDelivery", 12, opt, struct_of(LogDeliveryDescription)),
+    (M_NETWORK_TYPE, network_type, "networkType", 13, opt, string),
+    (M_PLUGINS, plugins, "plugins", 14, opt, list_of(PluginDescription)),
+    (
+        M_SERVICE_EXECUTION_ROLE_ARN,
+        service_execution_role_arn,
+        "serviceExecutionRoleArn",
+        15,
+        opt,
+        string
+    ),
+    (
+        M_WORKER_CONFIGURATION,
+        worker_configuration,
+        "workerConfiguration",
+        16,
+        opt,
+        struct_of(WorkerConfigurationDescription)
+    ),
+    (M_STATE_DESCRIPTION, state_description, "stateDescription", 17, opt, struct_of(StateDescription)),
+);
 

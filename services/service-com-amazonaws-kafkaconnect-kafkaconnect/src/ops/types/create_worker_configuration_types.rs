@@ -20,7 +20,11 @@ pub struct CreateWorkerConfigurationInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#CreateWorkerConfigurationResponse")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), as does
+/// the `creationTime` of the `latestRevision` summary, so this shape's schema comes from
+/// `kc_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="CreateWorkerConfigurationResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct CreateWorkerConfigurationOutput {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
@@ -29,4 +33,38 @@ pub struct CreateWorkerConfigurationOutput {
     pub worker_configuration_arn: Option<String>,
     pub worker_configuration_state: Option<String>,
 }
+
+kc_schema_and_codec!(
+    CreateWorkerConfigurationOutput,
+    CREATE_WORKER_CONFIGURATION_OUTPUT_SCHEMA,
+    "com.amazonaws.kafkaconnect#CreateWorkerConfigurationResponse",
+    "com.amazonaws.kafkaconnect",
+    "CreateWorkerConfigurationResponse",
+    (M_CREATION_TIME, creation_time, "creationTime", 0, opt, date_time),
+    (
+        M_LATEST_REVISION,
+        latest_revision,
+        "latestRevision",
+        1,
+        opt,
+        struct_of(WorkerConfigurationRevisionSummary)
+    ),
+    (M_NAME, name, "name", 2, opt, string),
+    (
+        M_WORKER_CONFIGURATION_ARN,
+        worker_configuration_arn,
+        "workerConfigurationArn",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_WORKER_CONFIGURATION_STATE,
+        worker_configuration_state,
+        "workerConfigurationState",
+        4,
+        opt,
+        string
+    ),
+);
 

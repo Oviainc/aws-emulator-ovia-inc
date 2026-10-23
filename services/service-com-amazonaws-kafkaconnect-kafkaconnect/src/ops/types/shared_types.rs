@@ -59,13 +59,28 @@ pub struct UnauthorizedException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#WorkerConfigurationRevisionSummary")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` rather than
+/// `#[smithy_macros::smithy(shape = ...)]` — see `types/date_time_wire.rs`. Member set,
+/// order and requiredness from
+/// `smithy_query(query="shape", shape="WorkerConfigurationRevisionSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerConfigurationRevisionSummary {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
     pub description: Option<String>,
     pub revision: i64,
 }
+
+kc_schema_and_codec!(
+    WorkerConfigurationRevisionSummary,
+    WORKER_CONFIGURATION_REVISION_SUMMARY_SCHEMA,
+    "com.amazonaws.kafkaconnect#WorkerConfigurationRevisionSummary",
+    "com.amazonaws.kafkaconnect",
+    "WorkerConfigurationRevisionSummary",
+    (M_CREATION_TIME, creation_time, "creationTime", 0, opt, date_time),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (M_REVISION, revision, "revision", 2, def, long),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#CapacityDescription")]
 #[derive(Debug, Clone, Default)]
@@ -199,7 +214,10 @@ pub struct StateDescription {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#CustomPluginRevisionSummary")]
+/// `creationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kc_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="CustomPluginRevisionSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct CustomPluginRevisionSummary {
     pub content_type: Option<String>,
@@ -209,6 +227,27 @@ pub struct CustomPluginRevisionSummary {
     pub location: Option<CustomPluginLocationDescription>,
     pub revision: i64,
 }
+
+kc_schema_and_codec!(
+    CustomPluginRevisionSummary,
+    CUSTOM_PLUGIN_REVISION_SUMMARY_SCHEMA,
+    "com.amazonaws.kafkaconnect#CustomPluginRevisionSummary",
+    "com.amazonaws.kafkaconnect",
+    "CustomPluginRevisionSummary",
+    (M_CONTENT_TYPE, content_type, "contentType", 0, opt, string),
+    (M_CREATION_TIME, creation_time, "creationTime", 1, opt, date_time),
+    (M_DESCRIPTION, description, "description", 2, opt, string),
+    (
+        M_FILE_DESCRIPTION,
+        file_description,
+        "fileDescription",
+        3,
+        opt,
+        struct_of(CustomPluginFileDescription)
+    ),
+    (M_LOCATION, location, "location", 4, opt, struct_of(CustomPluginLocationDescription)),
+    (M_REVISION, revision, "revision", 5, def, long),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafkaconnect#CustomPluginFileDescription")]
 #[derive(Debug, Clone, Default)]
