@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metadata of ONE Lake query, read from the query registry in
+//! [`crate::state`]: the query's SQL, its status, the statistics its run
+//! accumulated and — when results were delivered to S3 — the delivery URI and
+//! status. It writes nothing: `DescribeQuery` is a reporting operation, so the
+//! status it answers with is the status the run last persisted, never one this
+//! call moves.
+//!
+//! Resolution order, which decides which refusal a caller sees:
+//!
+//! 1. the EVENT DATA STORE, because that is where a query lives: the one
+//!    `EventDataStore` names, or — the member being deprecated and optional here
+//!    — one of the addressed account's stores in this Region. An unreadable
+//!    identifier ⇒ `EventDataStoreARNInvalidException`; nothing resolved ⇒
+//!    `EventDataStoreNotFoundException`; a store awaiting deletion ⇒
+//!    `InactiveEventDataStoreException`. `EventDataStoreOwnerAccountId`, when
+//!    given, is the account the store must belong to.
+//! 2. the SELECTOR — exactly one of `QueryId` / `QueryAlias`, with `RefreshId`
+//!    only alongside the alias ⇒ otherwise `InvalidParameterException`.
+//! 3. the QUERY, within that store and Region ⇒ `QueryIdNotFoundException`,
+//!    naming the member and value the request selected it with.
+//!
+//! The two not-found refusals answer HTTP 400, not the `@httpError(404)` the
+//! model annotates: see `NOT_FOUND_STATUS` below.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +207,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeQuery"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeQueryErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "DescribeQuery needs the CloudTrail Lake query registry, which this \
+                     engine does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let store = state.lock();
+
+        // An event data store NAMED in the request is resolved first — the member
+        // is deprecated here, but a store that cannot be read or found is still
+        // what the caller is told about.
+        let named_store = match input.event_data_store.as_deref() {
+            None => None,
+            Some(identifier) => {
+                let record = store
+                    .event_data_store(identifier, &region)
+                    .map_err(|rejection| {
+                        DescribeQueryErrorModeled::EventDataStoreARNInvalidException(
+                            EventDataStoreARNInvalidException {
+                                message: Some(rejection.message()),
+                            },
+                        )
+                    })?
+                    .ok_or_else(event_data_store_not_found)?;
+                if !record.status.is_queryable() {
+                    return Err(DescribeQueryErrorModeled::InactiveEventDataStoreException(
+                        InactiveEventDataStoreException {
+                            message: Some(format!(
+                                "The event data store {} is {} and does not serve queries.",
+                                record.id,
+                                record.status.as_wire()
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(record)
+            }
+        };
+        let event_data_store_id = named_store.map(|record| record.id.as_str());
+
+        // A query lives IN an event data store, so the store is resolved before
+        // the selector is read: the one the request names, or — the member being
+        // deprecated here ("no longer required by DescribeQueryRequest") — one of
+        // the addressed account's stores in this Region.
+        // `EventDataStoreOwnerAccountId` names the account that owns it, for a
+        // query run against a store shared from another account. A request that
+        // resolves no store names nothing that could hold the query it asks
+        // about, whichever selector it carries.
+        let owner = input.event_data_store_owner_account_id.as_deref();
+        let store_resolved = match (named_store, owner) {
+            (Some(record), Some(owner)) => record.owner() == owner,
+            (Some(_), None) => true,
+            (None, Some(owner)) => store.has_event_data_store_owned_by(&region, owner),
+            (None, None) => store.has_event_data_store_in(&region),
+        };
+        if !store_resolved {
+            return Err(event_data_store_not_found());
+        }
+
+        // "You must specify either QueryId or QueryAlias": exactly one of the two
+        // selects the query, and `RefreshId` narrows an alias to one dashboard
+        // refresh, so it means nothing without one. A selector that matches no
+        // query in the store it resolved against is refused naming the member and
+        // the value the request supplied.
+        let query = match (input.query_id.as_deref(), input.query_alias.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_parameter(
+                    "QueryId and QueryAlias cannot both be specified: specify either QueryId \
+                     or QueryAlias.",
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_parameter(
+                    "You must specify either QueryId or QueryAlias.",
+                ));
+            }
+            (Some(query_id), None) => {
+                if input.refresh_id.is_some() {
+                    return Err(invalid_parameter(
+                        "RefreshId can be specified only together with QueryAlias.",
+                    ));
+                }
+                store
+                    .query(query_id, &region, event_data_store_id)
+                    .ok_or_else(|| query_not_found("QueryId", query_id))?
+            }
+            (None, Some(alias)) => store
+                .last_query_for_alias(
+                    alias,
+                    input.refresh_id.as_deref(),
+                    &region,
+                    event_data_store_id,
+                )
+                .ok_or_else(|| query_not_found("QueryAlias", alias))?,
+        };
+
+        // The store the resolved query actually RAN on is the one a cross-account
+        // request has to be addressing: when the caller named an owner account,
+        // that store must belong to it, not merely some store of that account.
+        if let Some(owner) = owner {
+            let ran_on_owned_store = store
+                .event_data_stores
+                .get(&query.event_data_store_id)
+                .is_some_and(|record| record.region == region && record.owner() == owner);
+            if !ran_on_owned_store {
+                return Err(event_data_store_not_found());
+            }
+        }
+
+        Ok(DescribeQueryOutput {
+            query_id: Some(query.query_id.clone()),
+            query_string: Some(query.query_string.clone()),
+            query_status: Some(query.status.as_wire().to_string()),
+            query_statistics: Some(QueryStatisticsForDescribeQuery {
+                events_matched: Some(query.statistics.events_matched),
+                events_scanned: Some(query.statistics.events_scanned),
+                bytes_scanned: Some(query.statistics.bytes_scanned),
+                execution_time_in_millis: query.statistics.execution_time_in_millis,
+                creation_time: query.created_at.map(::aws_smithy_types::DateTime::from),
+            }),
+            error_message: query.error_message.clone(),
+            // The URI and the status are reported together or not at all: a query
+            // that asked for no S3 delivery has neither.
+            delivery_s3_uri: query
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.s3_uri.clone()),
+            delivery_status: query
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.status.clone()),
+            prompt: query.prompt.clone(),
+            event_data_store_owner_account_id: query.event_data_store_owner_account_id.clone(),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException` (HTTP 400),
+/// whose text names the members that cannot hold together as given.
+fn invalid_parameter(message: &str) -> DescribeQueryError {
+    DescribeQueryErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` and
+/// `QueryIdNotFoundException` `@httpError(404)`, but CloudTrail answers 400 for
+/// them on the wire: the recorded response for this very operation is
+/// `HTTP 400` with `__type` `EventDataStoreNotFoundException` and `Message`
+/// "The event data store was not found.". The error CODE is the model's; only
+/// the status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`].
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// Refuse the request because no event data store resolved.
+fn event_data_store_not_found() -> DescribeQueryError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        DescribeQueryErrorModeled::EventDataStoreNotFoundException(
+            EventDataStoreNotFoundException {
+                message: Some(crate::state::EVENT_DATA_STORE_NOT_FOUND_MESSAGE.to_string()),
+            },
+        ),
+        NOT_FOUND_STATUS,
+    )
+}
+
+/// Refuse the request because the selector matched no query it could resolve.
+///
+/// The text names the member the caller supplied and its value, the way the
+/// service words it: "The QueryId value <id> does not exist or is not in the same
+/// region."
+fn query_not_found(member: &str, value: &str) -> DescribeQueryError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        DescribeQueryErrorModeled::QueryIdNotFoundException(QueryIdNotFoundException {
+            message: Some(crate::state::query_not_found_message(member, value)),
+        }),
+        NOT_FOUND_STATUS,
+    )
 }
