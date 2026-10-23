@@ -23,9 +23,15 @@ use crate::sync_inference::DOCUMENTS;
 /// "The list can contain a maximum of 25 documents."
 const MAX_BATCH_DOCUMENTS: usize = 25;
 
-/// The documented per-document ceiling, from the same member: "The maximum size of
-/// each document is 5 KB."
-const MAX_DOCUMENT_BYTES: usize = 5 * 1024;
+/// The per-document quota, the SAME one a single-document inference call enforces
+/// (`crate::state::REALTIME_TEXT_QUOTA_BYTES`): a count of UTF-8 bytes, which the
+/// member documentation rounds to "The maximum size of each document is 5 KB".
+/// `realtime_text_quotas.rs` holds the single-document side of the same quota.
+const MAX_DOCUMENT_BYTES: usize = 5_000;
+
+/// The byte length a quota misread as kibibytes would still accept — past the quota,
+/// so a document of this size is reported as an error at its index.
+const KIBIBYTE_ROUNDED_BYTES: usize = 5 * 1024;
 
 /// The `ResultList` of a successful call, as (Index, top LanguageCode) pairs in the
 /// order the response lists them.
@@ -206,12 +212,18 @@ async fn a_document_past_the_per_document_ceiling_is_reported_at_its_index() {
     let english = DOCUMENTS[2].2;
     let at_ceiling = "a".repeat(MAX_DOCUMENT_BYTES);
     let past_ceiling = "a".repeat(MAX_DOCUMENT_BYTES + 1);
+    let kibibyte_rounded = "a".repeat(KIBIBYTE_ROUNDED_BYTES);
 
     // Rows differ in where the oversized documents sit and how many there are:
     // (case, documents, the indices expected in ErrorList).
     let cases: Vec<(&str, Vec<&str>, Vec<i64>)> = vec![
         ("a document exactly at the ceiling", vec![&at_ceiling], vec![]),
         ("one document, one byte past it", vec![&past_ceiling], vec![0]),
+        (
+            "a document at the kibibyte-rounded size",
+            vec![&kibibyte_rounded],
+            vec![0],
+        ),
         (
             "an oversized document first",
             vec![&past_ceiling, english, &at_ceiling],
