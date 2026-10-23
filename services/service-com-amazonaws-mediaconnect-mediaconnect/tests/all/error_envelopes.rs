@@ -624,12 +624,16 @@ struct RefusalCase {
     body: Option<Value>,
 }
 
-/// Every `BadRequestException` this service answers carries `Validation failed:`, a
-/// newline, then what was unacceptable — the same envelope whether the framework's
-/// constraint walk refused the request (a value outside a modelled value set or range, a
-/// required member absent) or a handler did (a list that must not be empty, a name outside
-/// what a minted ARN admits, a bound the model does not express, a pagination token the
-/// service never issued).
+/// Every `BadRequestException` this service answers ABOUT A REQUEST'S CONTENT carries
+/// `Validation failed:`, a newline, then what was unacceptable — the same envelope whether
+/// the framework's constraint walk refused the request (a value outside a modelled value
+/// set or range, a required member absent) or a handler did (a list that must not be empty,
+/// a name outside what a minted ARN admits, a bound the model does not express, a
+/// pagination token the service never issued).
+///
+/// A well-formed request the addressed resource's STATE refuses carries the service's other
+/// 400 envelope (`Bad request: `, asserted in `tests/all/lifecycle_preconditions.rs`), so
+/// every case below is a content refusal.
 #[tokio::test]
 async fn every_refusal_message_uses_the_services_validation_envelope() {
     let emulator = Emulator::new();

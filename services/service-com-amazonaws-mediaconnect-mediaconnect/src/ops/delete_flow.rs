@@ -3,7 +3,11 @@
 //! @op DeleteFlow
 //!
 //! Removes the stored flow from [`crate::state`], so DescribeFlow afterwards answers
-//! `NotFoundException` and ListFlows no longer lists it.
+//! `NotFoundException` and ListFlows no longer lists it — but only for a flow that is
+//! STOPPED: "Before you can delete a flow, you must stop the flow", so a flow in any
+//! other status is refused with the modelled `BadRequestException` (400) and left intact.
+//! (`Status` carries no terminal `DELETED` value, unlike `GatewayState`, so a deleted flow
+//! is a record the store no longer holds rather than one reporting a deleted state.)
 //!
 //! ## Shape of an operation
 //!
@@ -158,16 +162,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(flow) = store.flows.remove(&input.flow_arn) else {
+        // The status change the clock already owes this flow is materialised before the
+        // flow is read, exactly as the reporting operations do it: a flow whose `STOPPING`
+        // became `STANDBY` while nobody was looking is a stopped flow, so it is deletable.
+        store.settle_due_transitions(now);
+
+        let Some(flow) = store.flows.get(&input.flow_arn) else {
             return Err(DeleteFlowErrorModeled::NotFoundException(NotFoundException {
                 message: crate::state::not_found_message(&input.flow_arn),
             })
             .into());
         };
 
+        // "Deletes a flow. Before you can delete a flow, you must stop the flow": the
+        // precondition is the flow's STATUS, and the status of a stopped flow is
+        // `STANDBY`. A flow in any other status — running, or still moving between
+        // statuses — is a semantic error, which is what `BadRequestException` is "thrown
+        // if the request contains", and the flow is left exactly as it was.
+        if flow.status != crate::state::STATUS_STANDBY {
+            return Err(DeleteFlowErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: crate::state::state_precondition_message(
+                        "Flow",
+                        crate::state::STATUS_STANDBY,
+                        "DELETE",
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let flow_arn = flow.flow_arn.clone();
+        store.flows.remove(&input.flow_arn);
+
         Ok(DeleteFlowOutput {
-            flow_arn: Some(flow.flow_arn),
+            flow_arn: Some(flow_arn),
+            // "The status of the flow when the DeleteFlow process begins"
+            // (`DeleteFlowResponse$Status`).
             status: Some(crate::state::STATUS_DELETING.to_string()),
         })
     }
