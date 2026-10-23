@@ -4355,6 +4355,10 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn remove_vpc(&mut self, vpc_id: &str) -> Option<Vpc> {
         let vpc = self.vpcs.remove(vpc_id)?;
         self.vpc_available_at.remove(vpc_id);
+        // The attributes `insert_vpc` wrote for this VPC go with it as well: a VPC created
+        // later must start from the creation defaults, never from what a
+        // `ModifyVpcAttribute` left behind for a VPC that no longer exists.
+        self.vpc_attributes.remove(vpc_id);
         self.release_stored_bytes(vpc_payload_bytes(&vpc));
         let groups: Vec<String> = self
             .security_groups
