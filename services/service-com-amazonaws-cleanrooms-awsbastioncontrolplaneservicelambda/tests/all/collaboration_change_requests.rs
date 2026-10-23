@@ -29,9 +29,9 @@ use super::cleanrooms_collaboration_lifecycle::{
 
 /// A 12-digit `AccountId` (model shape `AccountId`, len 12..12, pattern `^\d+$`) that is
 /// not the caller's, used as a collaboration member in these tables.
-const PARTNER_ACCOUNT: &str = "111122223333";
+pub(crate) const PARTNER_ACCOUNT: &str = "111122223333";
 /// A second non-caller `AccountId`, for the rows that add an account to a collaboration.
-const NEWCOMER_ACCOUNT: &str = "444455556666";
+pub(crate) const NEWCOMER_ACCOUNT: &str = "444455556666";
 
 /// Every `AutoApprovedChangeType` the model declares (shape `AutoApprovedChangeType`) —
 /// the 5-value subset of the 12-value `ChangeType` catalog a collaboration can
@@ -47,7 +47,7 @@ const ALL_AUTO_APPROVED_CHANGE_TYPES: [&str; 5] = [
 /// Create a collaboration for one row: `minimal_collaboration` with the members the row
 /// prescribes, the creator abilities it prescribes and, when given, the change types the
 /// collaboration auto-approves. Returns its id.
-async fn seeded_collaboration(
+pub(crate) async fn seeded_collaboration(
     emulator: &Emulator,
     case: &str,
     creator_abilities: &[&str],
@@ -71,7 +71,7 @@ async fn seeded_collaboration(
         .to_string()
 }
 
-async fn create_change_request(
+pub(crate) async fn create_change_request(
     emulator: &Emulator,
     collaboration_id: &str,
     changes: Value,
@@ -85,7 +85,7 @@ async fn create_change_request(
         .await
 }
 
-async fn get_change_request(
+pub(crate) async fn get_change_request(
     emulator: &Emulator,
     collaboration_id: &str,
     change_request_id: &str,
@@ -100,7 +100,7 @@ async fn get_change_request(
 }
 
 /// A `MEMBER` change for `account` stating the abilities it should hold.
-fn member_change(account: &str, abilities: &[&str]) -> Value {
+pub(crate) fn member_change(account: &str, abilities: &[&str]) -> Value {
     json!({
         "specificationType": "MEMBER",
         "specification": {
@@ -114,7 +114,7 @@ fn member_change(account: &str, abilities: &[&str]) -> Value {
 }
 
 /// A declared collaboration member (`MemberSpecification`) holding `abilities`.
-fn declared_member(account: &str, abilities: &[&str]) -> Value {
+pub(crate) fn declared_member(account: &str, abilities: &[&str]) -> Value {
     json!({
         "accountId": account,
         "memberAbilities": abilities,
@@ -123,7 +123,7 @@ fn declared_member(account: &str, abilities: &[&str]) -> Value {
 }
 
 /// The `changes[*].types` a response reports, sorted so a row asserts a SET.
-fn types_of(change: &Value) -> Vec<String> {
+pub(crate) fn types_of(change: &Value) -> Vec<String> {
     let mut types: Vec<String> = change["types"]
         .as_array()
         .unwrap_or_else(|| panic!("the change carries types: {change}"))
@@ -139,14 +139,14 @@ fn types_of(change: &Value) -> Vec<String> {
     types
 }
 
-fn sorted(values: &[&str]) -> Vec<String> {
+pub(crate) fn sorted(values: &[&str]) -> Vec<String> {
     let mut sorted: Vec<String> = values.iter().map(|value| value.to_string()).collect();
     sorted.sort();
     sorted
 }
 
 /// The `(account, approval status)` pairs a change request carries, sorted.
-fn approvals_of(request: &Value) -> Vec<(String, String)> {
+pub(crate) fn approvals_of(request: &Value) -> Vec<(String, String)> {
     let mut approvals: Vec<(String, String)> = request["approvals"]
         .as_object()
         .unwrap_or_else(|| panic!("the change request carries approvals: {request}"))

@@ -21,6 +21,8 @@ mod cleanrooms_created_resource_defaults;
 mod cleanrooms_privacy_budget_template;
 #[path = "all/cleanrooms_refusal_classification.rs"]
 mod cleanrooms_refusal_classification;
+#[path = "all/collaboration_change_request_decisions.rs"]
+mod collaboration_change_request_decisions;
 #[path = "all/collaboration_change_requests.rs"]
 mod collaboration_change_requests;
 #[path = "all/membership_updates.rs"]
