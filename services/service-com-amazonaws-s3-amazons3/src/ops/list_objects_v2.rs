@@ -2,7 +2,8 @@
 
 //! @op ListObjectsV2
 //! IMPLEMENTED: enumerates the keys actually stored in the bucket, in ascending UTF-8
-//! byte order, honouring Prefix, StartAfter, Delimiter, MaxKeys and ContinuationToken.
+//! byte order, honouring Prefix, StartAfter, Delimiter, MaxKeys, ContinuationToken and
+//! EncodingType.
 //!
 //! A read: it reports the stored objects and changes nothing.
 //!
@@ -289,16 +290,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `encoding-type=url` changes how Delimiter, Prefix, Key and StartAfter are
-        // written in the response, `fetch-owner` adds an Owner to every entry, and
-        // `OptionalObjectAttributes` adds restore state: none of the three is served
-        // yet, and answering as if they had been asked for would be a different
-        // response than the one requested.
-        if input.encoding_type.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "ListObjectsV2 with encoding-type",
-            ));
-        }
+        // `fetch-owner` adds an Owner to every entry and `OptionalObjectAttributes` adds
+        // restore state: neither is served yet, and answering as if they had been asked
+        // for would be a different response than the one requested. `encoding-type` IS
+        // served (below): it decides how the key-name elements of this response are
+        // written, which is a rendering of the same listing rather than a different one.
         if input.fetch_owner == Some(true) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "ListObjectsV2 with fetch-owner=true",
@@ -312,6 +308,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "ListObjectsV2 with x-amz-optional-object-attributes",
             ));
+        }
+
+        // `encoding-type` names the ONE value the model's `EncodingType` enum declares
+        // (`url`), and the boundary refuses anything else before this handler runs; this
+        // guard is what keeps a listing from answering 200 with its keys written verbatim
+        // while echoing back an encoding it did not apply. "The value of the parameter is
+        // not valid" is `InvalidArgument` (400), the code this handler already answers an
+        // out-of-range `max-keys` with.
+        if let Some(requested) = input.encoding_type.as_deref() {
+            if requested != crate::state::ENCODING_TYPE_URL {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    "Invalid Encoding Method specified in Request",
+                ));
+            }
         }
 
         let max_keys = match input.max_keys {
@@ -426,31 +438,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key_count = (contents.len() + common_prefixes.len()) as i32;
 
+        // "If you specify the encoding-type request parameter, Amazon S3 includes this
+        // element in the response, and returns encoded key name values in the following
+        // response elements: Delimiter, Prefix, Key, and StartAfter"
+        // (`ListObjectsV2Output$EncodingType`). The rolled-up `CommonPrefixes` are key
+        // names too — each is a prefix of the keys it stands for — so they are encoded
+        // with them; nothing else in the response is a key name. A request that asked for
+        // no encoding type is answered verbatim, and reports no `EncodingType`.
+        let encode = |value: String| match input.encoding_type.as_deref() {
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            _ => value,
+        };
+
         Ok(ListObjectsV2Output {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone(),
-            delimiter: input.delimiter.clone(),
+            prefix: input.prefix.clone().map(&encode),
+            delimiter: input.delimiter.clone().map(&encode),
             max_keys: Some(max_keys),
             // "KeyCount is the number of keys returned with this request" — the
             // entries on this page, each rolled-up prefix counting as one.
             key_count: Some(key_count),
             // Truncated exactly when a key was left for the next page.
             is_truncated: Some(next_continuation_token.is_some()),
+            // NOT a key name: the token is "obfuscated and is not a real key", and a
+            // client hands it straight back, so it is reported exactly as issued.
             next_continuation_token,
             // "If ContinuationToken was sent with the request, it is included in the
-            // response" — same for StartAfter.
+            // response" — same for StartAfter, which IS a key name.
             continuation_token: input.continuation_token.clone(),
-            start_after: input.start_after.clone(),
-            contents: (!contents.is_empty()).then_some(contents),
+            start_after: input.start_after.clone().map(&encode),
+            contents: (!contents.is_empty()).then(|| {
+                contents
+                    .into_iter()
+                    .map(|mut entry| {
+                        entry.key = entry.key.map(&encode);
+                        entry
+                    })
+                    .collect()
+            }),
             common_prefixes: (!common_prefixes.is_empty()).then(|| {
                 common_prefixes
                     .into_iter()
                     .map(|prefix| CommonPrefix {
-                        prefix: Some(prefix),
+                        prefix: Some(encode(prefix)),
                     })
                     .collect()
             }),
-            encoding_type: None,
+            // "Encoding type used by Amazon S3 to encode object key names in the XML
+            // response": echoed exactly when the request asked for one, because that is
+            // when the elements above are encoded.
+            encoding_type: input.encoding_type.clone(),
             request_charged: None,
         })
     }

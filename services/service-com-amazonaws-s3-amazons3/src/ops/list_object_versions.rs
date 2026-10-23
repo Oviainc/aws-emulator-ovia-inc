@@ -230,14 +230,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A listing needs nothing from the request beyond its deserialized input.
         let _ = ctx;
 
-        // `encoding-type=url` changes how Delimiter, Prefix, Key and the markers are
-        // written in the response, and `OptionalObjectAttributes` adds restore state:
-        // neither is served here, and answering a plain listing would be answering
-        // something the request did not ask for. `RequestPayer` confirms a charge this
-        // emulator does not model. Each keeps the scaffold's 501, exactly as
-        // `ListObjectsV2` refuses the same three.
+        // `OptionalObjectAttributes` adds restore state, which is not served here, and
+        // answering a plain listing would be answering something the request did not ask
+        // for. `RequestPayer` confirms a charge this emulator does not model. Each keeps
+        // the scaffold's 501. `encoding-type` IS served (below), exactly as
+        // `ListObjectsV2` serves it: it decides how the key-name elements of this response
+        // are written rather than which entries it reports.
         for (member, present) in [
-            ("encoding-type", input.encoding_type.is_some()),
             ("x-amz-request-payer", input.request_payer.is_some()),
             (
                 "x-amz-optional-object-attributes",
@@ -269,6 +268,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 403,
                 "Access Denied",
             ));
+        }
+
+        // `encoding-type` names the ONE value the model's `EncodingType` enum declares
+        // (`url`), and the boundary refuses anything else before this handler runs; this
+        // guard is what keeps a listing from answering 200 with its keys written verbatim
+        // while echoing back an encoding it did not apply — exactly as `ListObjectsV2`
+        // guards the same member.
+        if let Some(requested) = input.encoding_type.as_deref() {
+            if requested != crate::state::ENCODING_TYPE_URL {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    "Invalid Encoding Method specified in Request",
+                ));
+            }
         }
 
         let max_keys = match input.max_keys {
@@ -436,27 +450,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => (None, None),
         };
 
+        // The key-name elements of this listing, encoded when the request asked for an
+        // encoding type: `ListObjectVersionsOutput$EncodingType` is "the encoding type
+        // used by Amazon S3 to encode object key names in the XML response", and the key
+        // names here are `Prefix`, `Delimiter`, each version's `Key`, the two markers the
+        // request carried, the two it hands back, and the rolled-up `CommonPrefixes`. A
+        // version id is NOT a key name, so it is reported as minted.
+        let encode = |value: String| match input.encoding_type.as_deref() {
+            Some(crate::state::ENCODING_TYPE_URL) => crate::state::url_encoded_key(&value),
+            _ => value,
+        };
+
         Ok(ListObjectVersionsOutput {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone(),
-            delimiter: input.delimiter.clone(),
+            prefix: input.prefix.clone().map(&encode),
+            delimiter: input.delimiter.clone().map(&encode),
             max_keys: Some(max_keys),
             // "Marks the last key returned in a truncated response" / "Marks the last
             // version of the key returned in a truncated response": the markers the
             // request carried are echoed back.
-            key_marker: input.key_marker.clone(),
+            key_marker: input.key_marker.clone().map(&encode),
             version_id_marker: input.version_id_marker.clone(),
             // Truncated exactly when an entry was left for the next page; the markers
             // name the last entry reported here, which the next request resumes after.
             is_truncated: Some(truncated),
-            next_key_marker,
+            next_key_marker: next_key_marker.map(&encode),
             next_version_id_marker,
-            versions: (!versions.is_empty()).then_some(versions),
+            versions: (!versions.is_empty()).then(|| {
+                versions
+                    .into_iter()
+                    .map(|mut version| {
+                        version.key = version.key.map(&encode);
+                        version
+                    })
+                    .collect()
+            }),
             common_prefixes: (!common_prefixes.is_empty()).then(|| {
                 common_prefixes
                     .into_iter()
                     .map(|prefix| CommonPrefix {
-                        prefix: Some(prefix),
+                        prefix: Some(encode(prefix)),
                     })
                     .collect()
             }),
@@ -464,10 +497,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // neither the marker's version id nor the flag that would report it), so there
             // is none to list rather than an invented one.
             delete_markers: None,
-            // `EncodingType` is "included in the response" only when the request asked for
-            // one, which is refused above; `RequestCharged` reports a Requester Pays
-            // charge this emulator does not model.
-            encoding_type: None,
+            // `EncodingType` is "included in the response" exactly when the request asked
+            // for one, which is when the elements above are encoded; `RequestCharged`
+            // reports a Requester Pays charge this emulator does not model.
+            encoding_type: input.encoding_type.clone(),
             request_charged: None,
         })
     }

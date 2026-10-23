@@ -15,22 +15,28 @@
 //! The call is made in-process through the handler's own callback into this emulator
 //! ([`smithy_server_runtime::OperationContext::callback`]), signed with the emulator's
 //! credentials: the resource is created by the SAME code path a client's own
-//! `CreateDeliveryStream` goes through, so a stack cannot create a resource that differs
-//! from one the service would have created itself, and this crate names no other service's
-//! crate.
+//! `CreateDeliveryStream` or `CreateBucket` goes through, so a stack cannot create a
+//! resource that differs from one the service would have created itself.
 //!
-//! The call is written on the owning service's WIRE PROTOCOL rather than through its AWS
-//! SDK client (the shape
-//! `services/service-com-amazonaws-scheduler-awschronosservice/src/state.rs` uses to ask
-//! IAM a question) because of what a stack's resource properties are: CloudFormation's
-//! `AWS::KinesisFirehose::DeliveryStream` properties ARE the `CreateDeliveryStream`
-//! request's own members, so the evaluated property DOCUMENT is passed through verbatim.
-//! A typed SDK builder cannot carry a document through — it would need every member of
-//! every destination configuration mapped by hand here, which is precisely the mapping
-//! that would drift from the model as the service grows. The one thing CloudFormation
-//! itself decides, the resource's name, is the one member set on the way out. It also
-//! keeps this crate naming no other service's crate: every call goes out on the wire the
-//! router already serves.
+//! There are TWO shapes that call takes, and which one a type uses follows from what its
+//! properties are:
+//!
+//! * on the owning service's WIRE PROTOCOL, through [`call_json_rpc`] here — for a type
+//!   whose properties ARE the create request's own members, like
+//!   `AWS::KinesisFirehose::DeliveryStream`, where the evaluated property DOCUMENT is
+//!   passed through verbatim with only the name CloudFormation decides set on the way out.
+//!   A typed SDK builder cannot carry a document through: it would need every member of
+//!   every destination configuration mapped by hand, which is precisely the mapping that
+//!   would drift from the model as the service grows;
+//! * through the owning service's official AWS SDK client over this same in-process
+//!   callback — for a type whose properties are NOT the create's members and whose service
+//!   speaks a protocol other than awsJson (`AWS::S3::Bucket` on restXml through
+//!   `aws-sdk-s3`, `AWS::IAM::Role` on awsQuery through `aws-sdk-iam`), where the members
+//!   the create takes are named one by one anyway, so the typed builder costs nothing and
+//!   the protocol's serialization is the SDK's rather than this crate's.
+//!
+//! Both shapes ride the one signed, in-process transport below ([`dispatch`]), so neither
+//! reaches the network and both are served by the router that serves a client's own call.
 //!
 //! ## What this module owns, and what [`super::provisioner`] owns
 //!
@@ -117,13 +123,20 @@
 //!
 //! What this module does keep apart is one STACK's resources from another's: a stack's
 //! deletion deletes the resources ITS OWN records say it created
-//! ([`StoredResource::materialised`]), never everything an owning service happens to hold,
-//! and a resource another stack (or a client) already created is not adopted — the owning
-//! service answers the create with its own uniqueness rule (Firehose: "This name must be
-//! unique per Amazon Web Services account in the same Amazon Web Services Region"), which
-//! leaves the second stack `CREATE_FAILED` with that refusal and the existing resource
-//! untouched. Both are held to that by
-//! `core/router/tests/all/cloudformation_provisions_stack_resources.rs`.
+//! ([`StoredResource::materialised`]), never everything an owning service happens to hold.
+//! Whether a resource another stack (or a client) already created can be deployed over is
+//! the OWNING service's answer, not this module's: Firehose refuses the create with its own
+//! uniqueness rule ("This name must be unique per Amazon Web Services account in the same
+//! Amazon Web Services Region"), which leaves the second stack `CREATE_FAILED` with that
+//! refusal and the existing stream untouched, while S3 answers a re-create of a bucket the
+//! caller already owns with 200 in us-east-1 ("for legacy compatibility, if you re-create
+//! an existing bucket that you already own…"), so that create is accepted and the bucket
+//! is left exactly as it was — nothing is re-created and nothing in it is cleared. The
+//! stack's own deletion then deletes what ITS records say it created, so a bucket it
+//! deployed over is deleted by the stack that recorded it, and one that still holds objects
+//! is refused by S3 and reported as `DELETE_FAILED`. Both answers are held to by
+//! `core/router/tests/all/cloudformation_provisions_stack_resources.rs` and by
+//! `tests/all/stack_resource_provisioning.rs`.
 
 use std::time::SystemTime;
 
@@ -462,6 +475,10 @@ fn refusal_of(status: u16, document: &Value) -> Refusal {
 /// The request is signed because the emulator verifies every request signature when
 /// authentication is on; the credential scope is also what routes it, so the service that
 /// owns the resource is the one that serves the call.
+///
+/// An awsJson operation names what it acts on in its document rather than in the request
+/// line, so the method and the path are the protocol's own `POST /` for every call that
+/// rides this transport.
 async fn dispatch(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     signing_name: &str,

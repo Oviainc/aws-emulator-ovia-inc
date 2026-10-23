@@ -79,14 +79,24 @@ impl Answer {
     /// model sets `noErrorWrapping`, so it is the document's own child), or the
     /// `x-amzn-errortype` header when the protocol carried it there instead.
     pub(crate) fn error_code(&self) -> String {
-        let body = String::from_utf8_lossy(&self.body).to_string();
-        let between = body
-            .split_once("<Code>")
-            .and_then(|(_, rest)| rest.split_once("</Code>"))
-            .map(|(code, _)| code.to_string());
-        between
+        self.element("Code")
             .or_else(|| self.header("x-amzn-errortype"))
-            .unwrap_or(body)
+            .unwrap_or_else(|| String::from_utf8_lossy(&self.body).to_string())
+    }
+
+    /// The `<Message>` of that same error document, or the empty string when the body
+    /// carries none — which is exactly what a client renders as "Unknown".
+    pub(crate) fn error_message(&self) -> String {
+        self.element("Message").unwrap_or_default()
+    }
+
+    /// The text of the first `<name>` element of the body, with the XML escaping the
+    /// serializer applies undone, when it carries one.
+    fn element(&self, name: &str) -> Option<String> {
+        let body = String::from_utf8_lossy(&self.body).to_string();
+        body.split_once(&format!("<{name}>"))
+            .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))
+            .map(|(text, _)| super::bucket_tagging::unescaped(text))
     }
 }
 
@@ -488,7 +498,7 @@ async fn creating_past_the_account_bucket_quota_is_refused() {
         // Nothing was written: the refused name is still not a bucket.
         let head = head_bucket(&router, bucket).await;
         assert_eq!(
-            head.status, 400,
+            head.status, 404,
             "case {case:?}: the refused name must not have been recorded, got HeadBucket \
              {}",
             head.status
@@ -515,17 +525,25 @@ async fn heading_a_bucket_this_emulator_does_not_hold_is_not_found() {
 
     // Names that are NOT the one bucket created above: a different name, a prefix of it,
     // an extension of it, and one differing only in case (bucket names are
-    // case-sensitive). `NotFound` is the only error `HeadBucket` models, and the model
-    // carries no `@httpError` on it, so the framework renders the client-error default —
-    // `smithy_query(query="operation",operation="HeadBucket")` reports
-    // `httpError 400, httpErrorDefaulted true`.
+    // case-sensitive). Of the three statuses `HeadBucket` documents for a HEAD it cannot
+    // answer 200 — "a generic 400 Bad Request, 403 Forbidden, or 404 Not Found" — 404 is
+    // the one that means the bucket is not there, and a HEAD carries no body, so the
+    // status is the whole of what tells a caller that. The modelled `NotFound` shape
+    // carries no `@httpError` for the framework to render it with
+    // (`smithy_query(query="operation",operation="HeadBucket")` reports `httpError 400,
+    // httpErrorDefaulted true`), so the code and status go out directly.
     for bucket in ["absent-bucket", "held", "held-bucket-2", "Held-Bucket"] {
         let answer = head_bucket(&router, bucket).await;
         assert_eq!(
-            answer.status, 400,
-            "case {bucket:?}: expected the modeled NotFound status for a bucket this \
-             emulator does not hold, got {}",
+            answer.status, 404,
+            "case {bucket:?}: expected 404 for a bucket this emulator does not hold, got {}",
             answer.status
+        );
+        assert_eq!(
+            answer.error_code(),
+            "NotFound",
+            "case {bucket:?}: expected the NotFound code, got {:?}",
+            answer.error_code()
         );
     }
 

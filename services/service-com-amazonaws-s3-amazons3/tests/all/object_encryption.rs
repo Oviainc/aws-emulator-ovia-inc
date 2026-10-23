@@ -1,0 +1,463 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! An object's SERVER-SIDE ENCRYPTION, end to end: what a write may ask for, what it is
+//! stored under, and what every later read of it reports.
+//!
+//! RULE: `PutObject`'s modelled encryption members — `ServerSideEncryption`
+//! (`x-amz-server-side-encryption`), `SSEKMSKeyId`, `SSEKMSEncryptionContext` and
+//! `BucketKeyEnabled` — are part of the write: the object is recorded under the
+//! configuration they name and `PutObject`, `GetObject` and `HeadObject` all report it
+//! back in those same bound headers. The member list and the header each binds to is
+//! `smithy_query(query="operation",operation="PutObject")`; the algorithm values are the
+//! `ServerSideEncryption` enum
+//! (`smithy_query(query="shape",shape="ServerSideEncryption")`).
+//!
+//! Two refusals belong to the same rule, because they are what the emulator cannot carry
+//! out rather than a member it drops:
+//!
+//! * a KMS-only member (a key id, an encryption context, an enabled Bucket Key) beside an
+//!   algorithm that is not SSE-KMS is `InvalidArgument` (400) — "This parameter is allowed
+//!   if and only if `SSEAlgorithm` is set to `aws:kms` or `aws:kms:dsse`" — and stores
+//!   nothing;
+//! * an SSE-C write keeps the scaffold's 501: S3 "doesn't store the encryption key you
+//!   provide", so an object written with one could not be read back here.
+//!
+//! Every assertion drives a real HTTP request through the router (the harness is the one
+//! [`super::bucket_lifecycle`] and [`super::object_and_tagging_roundtrip`] own), so what
+//! is pinned is the wire behaviour a client sees.
+
+use smithy_server_runtime::MultiServiceRouter;
+
+use super::bucket_lifecycle::{router, send_bytes, Answer};
+use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
+
+/// `HEAD /<bucket>/<key>` — `HeadObject`, which reports the stored object's headers and
+/// no body.
+async fn head_object(router: &MultiServiceRouter, bucket: &str, key: &str) -> Answer {
+    send_bytes(router, "HEAD", &format!("/{bucket}/{key}"), &[], b"").await
+}
+
+/// One row of the encryption table: the case, the request headers the write carries, and
+/// the `(header, value)` pairs every answer about that object must then report. A header
+/// named with `None` must be ABSENT from the answer.
+type EncryptionRow<'a> = (
+    &'a str,
+    &'a [(&'a str, &'a str)],
+    &'a [(&'a str, Option<&'a str>)],
+);
+
+/// The bound response headers an object's encryption is reported in, for the rows that
+/// expect none of them at all.
+const ENCRYPTION_HEADERS: &[&str] = &[
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+];
+
+/// A KMS key id in the ARN form `SSEKMSKeyId` documents ("you can specify the key ID, key
+/// alias, or the Amazon Resource Name (ARN) of the KMS key").
+const KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+
+/// The same key named by alias, which is the second documented form.
+const KEY_ALIAS: &str = "alias/aws/s3";
+
+/// A `SSEKMSEncryptionContext`: "a Base64-encoded string holding a UTF-8 encoded JSON of
+/// additional encryption context key-value pairs" — here `{"project":"dags"}`.
+const ENCRYPTION_CONTEXT: &str = "eyJwcm9qZWN0IjoiZGFncyJ9";
+
+#[tokio::test]
+async fn a_write_is_stored_under_the_encryption_it_names_and_every_read_reports_it() {
+    let router = router();
+    bucket(&router, "encryption-bucket").await;
+
+    // The rows differ along what the rule generalises over: WHICH algorithm (every value
+    // of the `ServerSideEncryption` enum, including the two the issue never cited —
+    // `aws:fsx` and `aws:backup`), and WHICH qualifying members accompany it (none, a key
+    // id by ARN, a key id by alias with an encryption context, a Bucket Key switched on
+    // and one switched off).
+    let rows: &[EncryptionRow<'_>] = &[
+        (
+            "no encryption member at all",
+            &[],
+            &[
+                ("x-amz-server-side-encryption", None),
+                ("x-amz-server-side-encryption-aws-kms-key-id", None),
+            ],
+        ),
+        (
+            "SSE-S3, the AES256 value alone",
+            &[("x-amz-server-side-encryption", "AES256")],
+            &[
+                ("x-amz-server-side-encryption", Some("AES256")),
+                ("x-amz-server-side-encryption-aws-kms-key-id", None),
+            ],
+        ),
+        (
+            "SSE-KMS with the key named by ARN",
+            &[
+                ("x-amz-server-side-encryption", "aws:kms"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+            ],
+            &[
+                ("x-amz-server-side-encryption", Some("aws:kms")),
+                (
+                    "x-amz-server-side-encryption-aws-kms-key-id",
+                    Some(KEY_ARN),
+                ),
+                ("x-amz-server-side-encryption-bucket-key-enabled", None),
+            ],
+        ),
+        (
+            "SSE-KMS with an alias, an encryption context and a Bucket Key",
+            &[
+                ("x-amz-server-side-encryption", "aws:kms"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ALIAS),
+                ("x-amz-server-side-encryption-context", ENCRYPTION_CONTEXT),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled",
+                    "true",
+                ),
+            ],
+            &[
+                ("x-amz-server-side-encryption", Some("aws:kms")),
+                (
+                    "x-amz-server-side-encryption-aws-kms-key-id",
+                    Some(KEY_ALIAS),
+                ),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled",
+                    Some("true"),
+                ),
+            ],
+        ),
+        (
+            "dual-layer SSE-KMS, with the Bucket Key switched off",
+            &[
+                ("x-amz-server-side-encryption", "aws:kms:dsse"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled",
+                    "false",
+                ),
+            ],
+            &[
+                ("x-amz-server-side-encryption", Some("aws:kms:dsse")),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled",
+                    Some("false"),
+                ),
+            ],
+        ),
+        (
+            "the aws:fsx value",
+            &[("x-amz-server-side-encryption", "aws:fsx")],
+            &[("x-amz-server-side-encryption", Some("aws:fsx"))],
+        ),
+        (
+            "the aws:backup value",
+            &[("x-amz-server-side-encryption", "aws:backup")],
+            &[("x-amz-server-side-encryption", Some("aws:backup"))],
+        ),
+    ];
+
+    for (index, (case, request_headers, expected)) in rows.iter().enumerate() {
+        let key = format!("encrypted/{index}.csv");
+        let payload = format!("sepal,petal\n{index},{index}\n").into_bytes();
+
+        let written = put_object(
+            &router,
+            "encryption-bucket",
+            &key,
+            &payload,
+            request_headers,
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: a modelled encryption member is part of the write, so it must \
+             answer 200, got {} with body {:?}",
+            written.status,
+            text(&written)
+        );
+        assert_header_set(case, "PutObject", &written, expected);
+
+        // Read back through the two implemented readers: both report the configuration the
+        // object was STORED under, not the one the read happened to ask about.
+        let read = get_object(&router, "encryption-bucket", &key, "", &[]).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the stored object must read back, got {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.body.as_ref(),
+            payload.as_slice(),
+            "case {case:?}: the stored bytes must come back unchanged"
+        );
+        assert_header_set(case, "GetObject", &read, expected);
+
+        let headed = head_object(&router, "encryption-bucket", &key).await;
+        assert_eq!(
+            headed.status, 200,
+            "case {case:?}: HeadObject of the stored object must answer 200, got {}",
+            headed.status
+        );
+        assert_header_set(case, "HeadObject", &headed, expected);
+    }
+
+    // A write with no encryption member reports NONE of the encryption headers — nothing
+    // is invented for an object that asked for nothing.
+    let plain = put_object(&router, "encryption-bucket", "plain.csv", b"a,b\n", &[]).await;
+    for header in ENCRYPTION_HEADERS {
+        assert_eq!(
+            plain.header(header),
+            None,
+            "case \"no encryption member at all\": {header} must be absent, got {:?}",
+            plain.header(header)
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_encryption_member_s3_could_not_honour_is_refused_and_stores_nothing() {
+    let router = router();
+    bucket(&router, "encryption-refusals").await;
+
+    // The rows differ along WHICH KMS-only member is named and WHICH algorithm (or none)
+    // it is named beside. Each is refused with S3's `InvalidArgument`; the row for an
+    // algorithm the model's enum does not declare is asserted separately below, because
+    // the boundary validator refuses THAT through the framework's own channel before the
+    // handler runs.
+    let rows: &[(&str, &[(&str, &str)])] = &[
+        (
+            "a key id beside AES256",
+            &[
+                ("x-amz-server-side-encryption", "AES256"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+            ],
+        ),
+        (
+            "a key id with no algorithm at all",
+            &[("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN)],
+        ),
+        (
+            "an encryption context beside AES256",
+            &[
+                ("x-amz-server-side-encryption", "AES256"),
+                ("x-amz-server-side-encryption-context", ENCRYPTION_CONTEXT),
+            ],
+        ),
+        (
+            "an encryption context with no algorithm at all",
+            &[("x-amz-server-side-encryption-context", ENCRYPTION_CONTEXT)],
+        ),
+        (
+            "a Bucket Key beside aws:fsx",
+            &[
+                ("x-amz-server-side-encryption", "aws:fsx"),
+                (
+                    "x-amz-server-side-encryption-bucket-key-enabled",
+                    "true",
+                ),
+            ],
+        ),
+    ];
+
+    for (case, headers) in rows {
+        let refused = put_object(
+            &router,
+            "encryption-refusals",
+            "refused.csv",
+            b"a,b\n",
+            headers,
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: an encryption member S3 would not honour is refused with HTTP \
+             400, got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidArgument",
+            "case {case:?}: expected the InvalidArgument code, got {:?}",
+            refused.error_code()
+        );
+        assert!(
+            !refused.error_message().is_empty(),
+            "case {case:?}: the refusal must say which member it refused, got {:?}",
+            refused.error_message()
+        );
+        let absent = get_object(&router, "encryption-refusals", "refused.csv", "", &[]).await;
+        assert_eq!(
+            absent.status, 404,
+            "case {case:?}: a refused write must store nothing, got GetObject {}",
+            absent.status
+        );
+    }
+
+    // An algorithm outside the model's `ServerSideEncryption` enum is refused too — by
+    // the boundary validator, before the handler runs, through the framework's own
+    // refusal channel (`ValidationException`, HTTP 400) rather than S3's
+    // `InvalidArgument`. What this pins is that it is REFUSED rather than stored and
+    // reported back as an encryption no S3 knows; the handler carries the same guard
+    // behind it, the way `PutBucketEncryption` guards its own `SSEAlgorithm`.
+    let unmodelled_algorithm = put_object(
+        &router,
+        "encryption-refusals",
+        "unmodelled.csv",
+        b"a,b\n",
+        &[("x-amz-server-side-encryption", "AES128")],
+    )
+    .await;
+    assert_eq!(
+        unmodelled_algorithm.status, 400,
+        "case \"an algorithm the model does not declare\": expected HTTP 400, got {} with \
+         body {:?}",
+        unmodelled_algorithm.status,
+        text(&unmodelled_algorithm)
+    );
+    assert_eq!(
+        unmodelled_algorithm.error_code(),
+        "ValidationException",
+        "case \"an algorithm the model does not declare\": expected the boundary's refusal \
+         code, got {:?}",
+        unmodelled_algorithm.error_code()
+    );
+    let absent = get_object(&router, "encryption-refusals", "unmodelled.csv", "", &[]).await;
+    assert_eq!(
+        absent.status, 404,
+        "case \"an algorithm the model does not declare\": a refused write must store \
+         nothing, got GetObject {}",
+        absent.status
+    );
+
+    // An SSE-C write keeps the 501: the key it carries is one S3 itself does not store,
+    // so an object written with it could not be read back here.
+    let customer_key = put_object(
+        &router,
+        "encryption-refusals",
+        "sse-c.csv",
+        b"a,b\n",
+        &[
+            (
+                "x-amz-server-side-encryption-customer-algorithm",
+                "AES256",
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        customer_key.status, 501,
+        "case \"a customer-provided key\": expected the scaffold's 501, got {} with body \
+         {:?}",
+        customer_key.status,
+        text(&customer_key)
+    );
+    assert_eq!(
+        customer_key.error_code(),
+        "NotImplemented",
+        "case \"a customer-provided key\": expected NotImplemented, got {:?}",
+        customer_key.error_code()
+    );
+}
+
+/// One row of the replacement table: the case, the headers the write carries, and the
+/// `ServerSideEncryption` every read must report afterwards (`None` for none at all).
+type ReplacementRow<'a> = (&'a str, &'a [(&'a str, &'a str)], Option<&'a str>);
+
+#[tokio::test]
+async fn a_replacing_write_replaces_the_encryption_the_key_was_stored_under() {
+    // "You cannot use PutObject to only update a single piece of metadata for an existing
+    // object. You must put the entire object with updated metadata": the encryption is
+    // part of the object, so a replacing write that names another one — or none — leaves
+    // the key under THAT, and the readers follow.
+    let router = router();
+    bucket(&router, "encryption-replacement").await;
+
+    // (case, the headers the write carries, what the readers must report afterwards)
+    let writes: &[ReplacementRow<'_>] = &[
+        (
+            "first written with SSE-KMS",
+            &[
+                ("x-amz-server-side-encryption", "aws:kms"),
+                ("x-amz-server-side-encryption-aws-kms-key-id", KEY_ARN),
+            ],
+            Some("aws:kms"),
+        ),
+        (
+            "replaced with SSE-S3",
+            &[("x-amz-server-side-encryption", "AES256")],
+            Some("AES256"),
+        ),
+        ("replaced with no encryption member", &[], None),
+    ];
+
+    for (case, headers, expected) in writes {
+        let written = put_object(
+            &router,
+            "encryption-replacement",
+            "train/train.csv",
+            b"sepal,petal\n1,2\n",
+            headers,
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: the write must answer 200, got {} with body {:?}",
+            written.status,
+            text(&written)
+        );
+        let read = get_object(
+            &router,
+            "encryption-replacement",
+            "train/train.csv",
+            "",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            read.header("x-amz-server-side-encryption").as_deref(),
+            *expected,
+            "case {case:?}: a read must report the encryption of the version now stored, \
+             got {:?}",
+            read.header("x-amz-server-side-encryption")
+        );
+        // The key id goes with the algorithm it belonged to: nothing of a replaced
+        // version's encryption survives it.
+        if expected != &Some("aws:kms") {
+            assert_eq!(
+                read.header("x-amz-server-side-encryption-aws-kms-key-id"),
+                None,
+                "case {case:?}: the replaced version's key id must not survive, got {:?}",
+                read.header("x-amz-server-side-encryption-aws-kms-key-id")
+            );
+        }
+    }
+}
+
+/// Assert that `answer` carries exactly the `(header, value)` expectations of a row:
+/// `Some(value)` must be reported with that value, `None` must be absent.
+fn assert_header_set(
+    case: &str,
+    operation: &str,
+    answer: &Answer,
+    expected: &[(&str, Option<&str>)],
+) {
+    for (header, value) in expected {
+        assert_eq!(
+            answer.header(header).as_deref(),
+            *value,
+            "case {case:?}: {operation} must report {header} as {value:?}, got {:?}",
+            answer.header(header)
+        );
+    }
+}

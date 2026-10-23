@@ -49,9 +49,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::provisioning::{call_json_rpc, Refusal, AWS_JSON_1_0, AWS_JSON_1_1};
-use super::template::{
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, SQS_QUEUE,
-};
+use super::template::{ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, FIREHOSE_DELIVERY_STREAM, SQS_QUEUE};
 use super::StoredResource;
 
 /// `AWS::S3::Bucket`: "Ref returns the bucket name", so a resource of this type is a

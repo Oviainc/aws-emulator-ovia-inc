@@ -5,10 +5,10 @@
 //!
 //! The rule under test: **creating a stack calls the owning service's own create API once
 //! per resource the template's `Resources` section declares, and the stack's `Outputs`
-//! are resolved from those resources' physical ids and attributes.** Two crates have to
-//! agree for that to hold (CloudFormation makes the call; Firehose serves it), so the
-//! suite lives here rather than in either crate: a crate-local test can only ever see one
-//! side of the call.
+//! are resolved from those resources' physical ids and attributes.** Several crates have
+//! to agree for that to hold (CloudFormation makes the calls; Firehose and Amazon S3 serve
+//! them), so the suite lives here rather than in any one of them: a crate-local test can
+//! only ever see one side of the call.
 //!
 //! The rows differ along what the rule generalises over: whether the template NAMES the
 //! stream or leaves the name to CloudFormation, which destination configuration it

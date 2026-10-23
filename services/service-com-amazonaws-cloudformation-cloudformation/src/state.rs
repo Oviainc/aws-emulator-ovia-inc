@@ -308,9 +308,11 @@ pub mod status {
 /// `ResourceStatus` values this service leaves a stack's resource in (all from the
 /// model's `ResourceStatus` enum).
 ///
-/// A stack operation of this service deploys a whole template at once and never fails
-/// part-way, so the only statuses a resource reaches here are the completions of the
-/// operation that created, updated or deleted it.
+/// A stack operation of this service deploys a whole template at once, so the statuses a
+/// resource reaches here are the completions of the operation that created, updated or
+/// deleted it; a deployment that could not provision a resource is reported on the STACK
+/// (`StoredStack::fail_transition`), which does not install that template's resources at
+/// all.
 pub mod resource_status {
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
     pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
@@ -557,7 +559,8 @@ pub struct StoredEvent {
 pub struct PendingStatus {
     pub status: String,
     /// The `StackStatusReason` that status carries, for an operation that is headed for a
-    /// FAILED one: a failure has to say what failed, and a success states no reason.
+    /// FAILED one: a failure has to say what failed, and a success states no reason
+    /// (`StoredStack::fail_transition`).
     pub status_reason: Option<String>,
     pub due_at: SystemTime,
     pub operation_id: Option<String>,
@@ -896,7 +899,8 @@ impl StoredStack {
         } else if let Some(deployed) = self.pending_deployment.take() {
             // The create or update completed: the template it deployed is what the stack
             // reports resources and outputs for from here on.
-            self.resources = installed_resources(&self.resources, deployed.resources, pending.due_at);
+            self.resources =
+                installed_resources(&self.resources, deployed.resources, pending.due_at);
             self.outputs = deployed.outputs;
         }
         let status = self.status.clone();
@@ -943,6 +947,8 @@ impl StoredStack {
         );
         self.pending = Some(PendingStatus {
             status: settles_to.to_string(),
+            // A completion carries no reason, and nothing has failed yet:
+            // `Self::fail_transition` is what records a failure of this operation.
             status_reason: None,
             due_at: now + STATUS_TRANSITION_DELAY,
             operation_id,

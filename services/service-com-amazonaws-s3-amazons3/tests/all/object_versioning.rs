@@ -1126,9 +1126,17 @@ async fn a_version_listing_answers_for_an_unversioned_bucket_and_refuses_what_it
     );
 
     // Members this listing cannot carry out keep the scaffold's 501, and a negative
-    // page size is the InvalidArgument S3 answers rather than an empty page.
+    // page size — or an encoding type outside the one value the model declares — is the
+    // InvalidArgument S3 answers rather than an empty or differently written page.
+    // `encoding-type=url` is NOT among these: it is served, and `listing_encoding_type`
+    // pins what it does to the key names.
     for (case, query, headers, expected_status) in [
-        ("an encoding type", "&encoding-type=url", &[][..], 501),
+        (
+            "an encoding type the model does not declare",
+            "&encoding-type=base64",
+            &[][..],
+            400,
+        ),
         (
             "a requester-pays listing",
             "",

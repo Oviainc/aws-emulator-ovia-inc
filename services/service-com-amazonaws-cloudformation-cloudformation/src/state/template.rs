@@ -1649,8 +1649,79 @@ fn physical_name(
                 .get(&property)
                 .and_then(|value| text(value, naming, 0, budget))
         });
-    declared_name.unwrap_or_else(|| generated_name(&declared.logical_id, naming.stack))
+    match declared_name {
+        // The name the TEMPLATE supplied, exactly as it supplied it: it is the caller's,
+        // and a name the owning service refuses is reported as the failure that service
+        // answers rather than silently rewritten into a different resource than the one
+        // the template asked for.
+        Some(name) => name,
+        // A GENERATED name is held to the naming rules of the service that owns the type,
+        // because a name that service would refuse could not be provisioned at all.
+        None => naming_rules(
+            &declared.resource_type,
+            generated_name(&declared.logical_id, naming.stack),
+        ),
+    }
 }
+
+/// A GENERATED name held to the naming rules of the service that owns the resource type.
+///
+/// A generated `<stack name>-<logical id>-<unique id>` is built from a logical id and a
+/// stack name, and those admit characters the owning service's own names do not: an
+/// Amazon S3 bucket name "can consist only of lowercase letters, numbers, dots (.), and
+/// hyphens (-)", "must begin and end with a letter or number" and must be "between 3
+/// (min) and 63 (max) characters long" (Amazon S3 bucket naming rules), which is why
+/// CloudFormation's own generated bucket names are lowercase
+/// (`mystack-mybucket-kdwwxmddtr2g`). A name outside those rules is not one the owning
+/// service would accept, so the resource could not be provisioned under it at all.
+///
+/// The 3-character MINIMUM needs nothing here: the unique segment alone is
+/// [`GENERATED_NAME_DIGEST_CHARS`] characters, so every name [`generated_name`] produces
+/// is longer than that, and the truncation below keeps that segment.
+fn naming_rules(resource_type: &str, name: String) -> String {
+    match resource_type {
+        S3_BUCKET => {
+            // Lowercase, and every character outside the set a bucket name may carry
+            // replaced by a hyphen — which is one of them — rather than dropped, so two
+            // names that differ only in such a character cannot become one.
+            let within_the_set: String = name
+                .to_lowercase()
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || character == '.'
+                        || character == '-'
+                    {
+                        character
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let characters = within_the_set.chars().count();
+            // Past the maximum the TAIL is kept: it carries the unique segment, so two
+            // resources of one stack still cannot collide. A bucket name has to begin and
+            // end with a letter or a number, and the tail always ends in one, so what the
+            // truncation leaves in FRONT of the first one goes.
+            let kept: String = if characters > MAX_BUCKET_NAME_LEN {
+                within_the_set
+                    .chars()
+                    .skip(characters - MAX_BUCKET_NAME_LEN)
+                    .collect()
+            } else {
+                within_the_set
+            };
+            kept.trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
+                .to_string()
+        }
+        _ => name,
+    }
+}
+
+/// The longest name an Amazon S3 bucket may carry: "Bucket names must be between 3 (min)
+/// and 63 (max) characters long" (Amazon S3 bucket naming rules).
+const MAX_BUCKET_NAME_LEN: usize = 63;
 
 /// The physical name CloudFormation generates for a resource the template does not name:
 /// `<stack name>-<logical id>-<unique id>`.
@@ -1662,7 +1733,12 @@ fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
     format!(
         "{}-{logical_id}-{}",
         scope.stack_name,
-        derived_digits(scope.stack_id, logical_id, 12, Alphabet::Upper)
+        derived_digits(
+            scope.stack_id,
+            logical_id,
+            GENERATED_NAME_DIGEST_CHARS,
+            Alphabet::Upper
+        )
     )
 }
 
@@ -1699,6 +1775,13 @@ fn derived_digits(salt: &str, name: &str, digits: usize, alphabet: Alphabet) -> 
     };
     digest[..digits.min(digest.len())].to_string()
 }
+
+/// How many characters of the digest the unique segment of a [`generated_name`] carries.
+///
+/// Enough that two resources of one stack — and two stacks of one name — cannot collide,
+/// and short enough to leave room for the stack name and the logical id inside a name an
+/// owning service bounds (see [`naming_rules`]).
+const GENERATED_NAME_DIGEST_CHARS: usize = 12;
 
 /// A service-generated identifier of the form `<prefix>-<digits hexadecimal characters>`.
 ///
@@ -1919,7 +2002,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBCluster",
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
-    "AWS::S3::Bucket",
+    S3_BUCKET,
     "AWS::SNS::Topic",
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
@@ -1984,7 +2067,7 @@ fn return_values(
         }
         // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName. An Amazon S3 bucket
         // ARN carries neither a region nor an account id (`arn:aws:s3:::<bucket>`).
-        "AWS::S3::Bucket" => {
+        S3_BUCKET => {
             attributes.insert("Arn".to_string(), format!("arn:{PARTITION}:s3:::{name}"));
             attributes.insert("DomainName".to_string(), format!("{name}.s3.{URL_SUFFIX}"));
             (name.to_string(), attributes)
@@ -2512,6 +2595,12 @@ fn return_values(
 /// The middle segment is the Firehose model's own `awsService.cloudFormationName`
 /// (`smithy_query(query="service_info")` on that service's model).
 pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream";
+
+/// The type of an Amazon S3 bucket, whose middle segment is that model's own
+/// `cloudFormationName` the same way. "Ref returns the bucket name" for this type, so a
+/// bucket's physical resource id is the name its owning service creates it under — which
+/// is why [`naming_rules`] holds a GENERATED one to S3's bucket naming rules.
+pub const S3_BUCKET: &str = "AWS::S3::Bucket";
 
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.
