@@ -23,6 +23,8 @@ mod event_data_store_reads;
 mod event_selectors;
 #[path = "all/import_stop.rs"]
 mod import_stop;
+#[path = "all/insights_metric_data.rs"]
+mod insights_metric_data;
 #[path = "all/lake_queries.rs"]
 mod lake_queries;
 #[path = "all/state_roundtrip.rs"]
