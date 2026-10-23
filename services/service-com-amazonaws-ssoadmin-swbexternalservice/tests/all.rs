@@ -17,3 +17,5 @@ mod instance_describe;
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/trusted_token_issuers.rs"]
+mod trusted_token_issuers;

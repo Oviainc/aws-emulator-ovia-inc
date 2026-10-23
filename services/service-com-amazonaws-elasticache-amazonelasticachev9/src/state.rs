@@ -24,7 +24,11 @@
 //! so `CreateCacheCluster`'s defaults are read off it rather than from a second
 //! list.
 //!
-//! Everything else in this service (replication groups, users, parameter
+//! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
+//! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
+//! holds the built-in `default` user every account already has.
+//!
+//! Everything else in this service (replication groups, user groups, parameter
 //! groups, migrations, update actions) is still a scaffolded 501 and owns its
 //! own gap issue; where a member of an implemented operation belongs to one of
 //! those resources, the comment beside it says so.
@@ -40,9 +44,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AvailabilityZone, CacheCluster, CacheEngineVersion, CacheNode, CacheParameterGroup,
-    CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits, DestinationDetails, Endpoint,
-    LogDeliveryConfiguration, LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
+    Authentication, AuthenticationMode, AvailabilityZone, CacheCluster, CacheEngineVersion,
+    CacheNode, CacheParameterGroup, CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits,
+    CreateUserOutput, DestinationDetails, Endpoint, LogDeliveryConfiguration,
+    LogDeliveryConfigurationRequest, NodeGroupConfiguration, NodeSnapshot,
     NotificationConfiguration, PendingModifiedValues, RecurringCharge, ReservedCacheNodesOffering,
     ScaleConfig, SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
 };
@@ -1321,6 +1326,14 @@ impl CacheClusterRecord {
     /// — `ModifyCacheCluster$NewAvailabilityZones` is "the list of Availability
     /// Zones where the new Memcached cache nodes are created". Otherwise the
     /// added nodes take the cluster's own zone pool.
+    ///
+    /// `target` is clamped to a count some engine permits (1 ..=
+    /// [`MEMCACHED_MAX_NODES`]) before anything is allocated. Both callers
+    /// already refuse a count outside what their engine permits
+    /// ([`validate_num_cache_nodes`]) so the clamp changes no request the service
+    /// accepts; it is what keeps ONE request from sizing the allocation this
+    /// loop does, and it is the value stored, so the node list and
+    /// `num_cache_nodes` cannot disagree.
     pub fn resize_nodes(
         &mut self,
         target: i32,
@@ -1333,7 +1346,8 @@ impl CacheClusterRecord {
             self.nodes
                 .retain(|node| !ids_to_remove.contains(&node.cache_node_id));
         }
-        let target_len = usize::try_from(target).unwrap_or(0);
+        let target = target.clamp(1, MEMCACHED_MAX_NODES);
+        let target_len = usize::try_from(target).unwrap_or(1);
         while self.nodes.len() > target_len {
             self.nodes.pop();
         }
@@ -2605,6 +2619,524 @@ pub fn published_service_updates(anchor: SystemTime) -> BTreeMap<String, Service
     catalog
 }
 
+// ---------------------------------------------------------------------------
+// RBAC users
+// ---------------------------------------------------------------------------
+
+/// The cache engines an RBAC user may be created for, as `CreateUser$Engine`
+/// documents it: "The options are valkey or redis". RBAC is a Valkey / Redis
+/// OSS feature, so `memcached` — a legal CLUSTER engine, see [`ENGINES`] — is
+/// not one of them.
+pub const USER_ENGINES: [&str; 2] = ["redis", "valkey"];
+
+/// `engine` lowercased, or the reason it names no engine a user can run on.
+///
+/// ElastiCache stores engine names in lowercase, so the comparison and the
+/// stored value are both lowercase — the same rule [`normalize_engine`] applies
+/// to a cluster's engine, over the narrower set a user permits.
+pub fn normalize_user_engine(engine: &str) -> Result<String, String> {
+    let lowered = engine.to_ascii_lowercase();
+    if USER_ENGINES.contains(&lowered.as_str()) {
+        Ok(lowered)
+    } else {
+        Err(format!(
+            "Invalid value {engine} for Engine: must be one of {}.",
+            USER_ENGINES.join(" | ")
+        ))
+    }
+}
+
+/// `User$Status` of a user the service has accepted: "Indicates the user status.
+/// Can be \"active\", \"modifying\" or \"deleting\"". A created user is usable at
+/// once — ElastiCache answers `CreateUser` with it already active — so there is
+/// no transition for the clock to owe; only a later modify or delete moves it.
+pub const USER_STATUS_ACTIVE: &str = "active";
+
+/// How many passwords one user may hold, as `CreateUser$Passwords` documents it:
+/// "Passwords used for this user. You can create up to two passwords for each
+/// user."
+pub const MAX_PASSWORDS_PER_USER: usize = 2;
+
+/// How many users the store holds before a create is refused with the modelled
+/// `UserQuotaExceededFault`. The emulator's OWN bound on the store, for the
+/// reason [`CLUSTER_QUOTA`] gives.
+pub const USER_QUOTA: usize = 100;
+
+/// `User$MinimumEngineVersion` of a user that authenticates with a password or
+/// without one: "The minimum engine version required, which is Redis OSS 6.0" —
+/// the version RBAC itself arrived in.
+pub const USER_MIN_ENGINE_VERSION: &str = "6.0";
+
+/// `User$MinimumEngineVersion` of a user that authenticates with IAM:
+/// `InputAuthenticationType` accepts `iam`, and ElastiCache supports IAM
+/// authentication for RBAC users only from Redis OSS 7.0 onwards, so such a user
+/// cannot be attached to a cache running an older engine.
+pub const USER_MIN_ENGINE_VERSION_IAM: &str = "7.0";
+
+/// `AuthenticationType`'s values (`smithy_query(query="shape",
+/// shape="AuthenticationType")`: `password | no-password | iam`), named so the
+/// handlers branch on a constant rather than a literal. The full accepted set
+/// stays the GENERATED catalog `crate::ops::types::AUTHENTICATION_TYPE_VALUES`.
+pub mod authentication_type {
+    pub const PASSWORD: &str = "password";
+    pub const NO_PASSWORD: &str = "no-password";
+    pub const IAM: &str = "iam";
+}
+
+/// `InputAuthenticationType`'s values — what an `AuthenticationMode` may ASK for
+/// (`smithy_query(query="shape", shape="InputAuthenticationType")`: `password |
+/// no-password-required | iam`). They are NOT the same tokens a user reports
+/// back (`no-password-required` is asked for, `no-password` is reported).
+pub mod input_authentication_type {
+    pub const PASSWORD: &str = "password";
+    pub const NO_PASSWORD_REQUIRED: &str = "no-password-required";
+    pub const IAM: &str = "iam";
+}
+
+/// The user every ElastiCache account already has.
+///
+/// ElastiCache creates one RBAC user, with the id and the name `default`, in
+/// every account; it is the user a cache serves unauthenticated traffic as and
+/// the one every user group must contain. No call creates it, so the store is
+/// stocked with it when it is built — see [`built_in_users`] — and no reporting
+/// operation has to write it into existence.
+pub const DEFAULT_USER_ID: &str = "default";
+
+/// The access string that built-in user carries: every key (`~*`), every pub/sub
+/// channel (`&*`) and every command (`+@all`), in the Valkey / Redis OSS ACL
+/// syntax `User$AccessString` is written in.
+pub const DEFAULT_USER_ACCESS_STRING: &str = "on ~* &* +@all";
+
+/// The `User` members a `DescribeUsers` `Filter` may name, as `Filter$Name`
+/// documents it: "The property being filtered. For example, UserId." A filter
+/// names a property of the resource being reported, so the accepted set is the
+/// scalar members of the `User` shape.
+pub const USER_FILTER_NAMES: [&str; 7] = [
+    "UserId",
+    "UserName",
+    "Engine",
+    "Status",
+    "AccessString",
+    "MinimumEngineVersion",
+    "ARN",
+];
+
+/// The ARN of an RBAC user: `arn:aws:elasticache:<region>:<account>:user:<id>`.
+pub fn user_arn(region: &str, user_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("user:{user_id}"))
+}
+
+/// The ACL rule keywords a Valkey / Redis OSS access string may carry on their
+/// own — the rules that take no argument.
+///
+/// `AccessString` is "Access permissions string used for this user", written in
+/// the engine's own ACL syntax (the syntax `DEFAULT_USER_ACCESS_STRING` is one
+/// example of), and the engine's keyword rules are the catalog below. Rules that
+/// take an argument (`~`/`%`/`&` patterns and `+`/`-` command rules) are
+/// recognised by [`is_access_rule`] instead.
+const ACCESS_STRING_KEYWORDS: [&str; 14] = [
+    "on",
+    "off",
+    "nopass",
+    "resetpass",
+    "allkeys",
+    "allchannels",
+    "allcommands",
+    "nocommands",
+    "resetkeys",
+    "resetchannels",
+    "clearselectors",
+    "reset",
+    "sanitize-payload",
+    "skip-sanitize-payload",
+];
+
+/// True when `rule` is one rule of a Valkey / Redis OSS ACL rule list:
+///
+/// * a keyword from [`ACCESS_STRING_KEYWORDS`];
+/// * a key pattern `~<glob>`, or a read/write-qualified one `%R~`/`%W~`/`%RW~`;
+/// * a pub/sub channel pattern `&<glob>`;
+/// * a command rule `+<command>` / `-<command>`, or a category rule
+///   `+@<category>` / `-@<category>`.
+///
+/// A selector (`(+get ~key1)`) is a rule list in parentheses rather than a
+/// single rule, so [`access_string_rejection`] groups it and checks its inner
+/// rules through here.
+fn is_access_rule(rule: &str) -> bool {
+    if ACCESS_STRING_KEYWORDS.contains(&rule) {
+        return true;
+    }
+    // A key or channel pattern: the glob itself is any non-empty run of
+    // non-whitespace, because the engine matches it verbatim.
+    if let Some(glob) = rule.strip_prefix('~').or_else(|| rule.strip_prefix('&')) {
+        return !glob.is_empty();
+    }
+    // `%RW~<glob>`: the qualifier is a non-empty run of `R`/`W` before the `~`.
+    if let Some(rest) = rule.strip_prefix('%') {
+        let Some((qualifier, glob)) = rest.split_once('~') else {
+            return false;
+        };
+        return !qualifier.is_empty()
+            && qualifier
+                .bytes()
+                .all(|byte| byte.eq_ignore_ascii_case(&b'r') || byte.eq_ignore_ascii_case(&b'w'))
+            && !glob.is_empty();
+    }
+    let Some(rest) = rule
+        .strip_prefix('+')
+        .or_else(|| rule.strip_prefix('-'))
+    else {
+        return false;
+    };
+    match rest.strip_prefix('@') {
+        // A category name: letters and hyphens (`@read`, `@sanitize-payload`).
+        Some(category) => {
+            !category.is_empty()
+                && category
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphabetic() || byte == b'-')
+        }
+        // A command, optionally one subcommand of it (`+config|get`).
+        None => {
+            rest.starts_with(|first: char| first.is_ascii_alphabetic())
+                && rest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'|' || byte == b'-')
+        }
+    }
+}
+
+/// Why `access_string` is not an access string, or `None` when it is one.
+///
+/// The model constrains `AccessString` only with `@pattern "\S"` — any string
+/// carrying a non-space character passes the boundary validator — so the rule
+/// list itself is parsed here, and a request naming something that is not an ACL
+/// rule is refused instead of being stored as a permission set the engine could
+/// never apply. The caller maps the refusal onto its own modelled
+/// `InvalidParameterValueException`.
+///
+/// A SELECTOR — the Redis OSS 7 / Valkey form `(+get ~key1)` — is one rule that
+/// carries a rule list of its own, so it is read as a parenthesised group whose
+/// inner rules are checked by the same per-rule test. A group that is never
+/// closed is refused.
+pub fn access_string_rejection(member: &str, access_string: &str) -> Option<String> {
+    let refuse = |token: &str| {
+        Some(format!(
+            "Invalid value {token} for {member}: it is not a Valkey or Redis OSS ACL rule."
+        ))
+    };
+    let mut rules = 0usize;
+    // The selector being read, once its `(` has been seen and before its `)`.
+    let mut selector: Option<String> = None;
+    for token in access_string.split_whitespace() {
+        if let Some(group) = selector.as_mut() {
+            group.push(' ');
+            group.push_str(token);
+            if !token.ends_with(')') {
+                continue;
+            }
+            let group = selector.take().unwrap_or_default();
+            if !is_selector(&group) {
+                return refuse(&group);
+            }
+            rules += 1;
+            continue;
+        }
+        if token.starts_with('(') {
+            if token.ends_with(')') && token.len() > 1 {
+                if !is_selector(token) {
+                    return refuse(token);
+                }
+                rules += 1;
+            } else {
+                selector = Some(token.to_string());
+            }
+            continue;
+        }
+        if !is_access_rule(token) {
+            return refuse(token);
+        }
+        rules += 1;
+    }
+    if let Some(unterminated) = selector {
+        return refuse(&unterminated);
+    }
+    if rules == 0 {
+        return Some(format!("Invalid value for {member}: it names no access rule."));
+    }
+    None
+}
+
+/// True when `group` is a selector: a parenthesised, non-empty rule list, every
+/// rule of which is one [`is_access_rule`] accepts.
+fn is_selector(group: &str) -> bool {
+    let Some(inner) = group
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut rules = inner.split_whitespace().peekable();
+    rules.peek().is_some() && rules.all(is_access_rule)
+}
+
+/// An access string as the service STORES it: the rules it names, one space
+/// apart.
+///
+/// Only the whitespace between rules is normalised — no rule is added, removed
+/// or reordered — so what a later read reports is the permission set the request
+/// asked for.
+pub fn canonical_access_string(access_string: &str) -> String {
+    access_string.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Why a request's authentication members cannot make a user's `Authentication`.
+#[derive(Debug, Clone)]
+pub enum AuthRefusal {
+    /// A member's value is outside what the service accepts — the caller's
+    /// modelled `InvalidParameterValueException`.
+    Value(String),
+    /// The members supplied cannot hold together — the caller's modelled
+    /// `InvalidParameterCombinationException`.
+    Combination(String),
+}
+
+/// How a stored user authenticates: `Authentication`'s "Type" and, for a
+/// password user, "The number of passwords belonging to the user".
+///
+/// The passwords THEMSELVES are never stored: ElastiCache reports only the count
+/// (`Authentication$PasswordCount`), and a secret the API never reads back has no
+/// business sitting in emulator state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticationRecord {
+    /// An `AuthenticationType` token — see [`authentication_type`].
+    pub r#type: String,
+    /// How many passwords the user holds, for a password user; `None` for one
+    /// that authenticates with IAM or without a password.
+    pub password_count: Option<i32>,
+}
+
+impl AuthenticationRecord {
+    /// The user's `Authentication`, as the API reports it.
+    pub fn to_modeled(&self) -> Authentication {
+        Authentication {
+            r#type: Some(self.r#type.clone()),
+            password_count: self.password_count,
+        }
+    }
+
+    /// The `MinimumEngineVersion` a user authenticating this way requires.
+    pub fn minimum_engine_version(&self) -> &'static str {
+        if self.r#type == authentication_type::IAM {
+            USER_MIN_ENGINE_VERSION_IAM
+        } else {
+            USER_MIN_ENGINE_VERSION
+        }
+    }
+}
+
+/// The `Authentication` the passwords in `passwords` give a user, or why they
+/// are refused.
+fn password_authentication(passwords: &[String]) -> Result<AuthenticationRecord, AuthRefusal> {
+    if passwords.len() > MAX_PASSWORDS_PER_USER {
+        return Err(AuthRefusal::Value(format!(
+            "{} passwords were supplied; you can create up to {MAX_PASSWORDS_PER_USER} passwords \
+             for each user.",
+            passwords.len()
+        )));
+    }
+    // At most `MAX_PASSWORDS_PER_USER`, refused above, so the conversion is
+    // exact; the fallback only keeps the handler panic-free.
+    let count = i32::try_from(passwords.len()).unwrap_or(i32::MAX);
+    Ok(AuthenticationRecord {
+        r#type: authentication_type::PASSWORD.to_string(),
+        password_count: Some(count),
+    })
+}
+
+/// The `Authentication` a request's authentication members describe, or why they
+/// are refused.
+///
+/// A user authenticates in exactly ONE way, so the three members that can say
+/// which are mutually exclusive: `AuthenticationMode` ("Specifies how to
+/// authenticate the user") states the whole of it on its own, while the older
+/// `Passwords` ("Passwords used for this user") and `NoPasswordRequired`
+/// ("Indicates a password is not required for this user") are the two halves of
+/// the same choice. A request that names none of them has not said how the user
+/// authenticates and is refused rather than given a default the caller did not
+/// ask for.
+///
+/// `CreateUser` and `ModifyUser` take the same members, so both resolve them
+/// here and cannot drift about which combinations they refuse.
+pub fn authentication_from_request(
+    passwords: Option<&[String]>,
+    no_password_required: Option<bool>,
+    mode: Option<&AuthenticationMode>,
+) -> Result<AuthenticationRecord, AuthRefusal> {
+    let passwords = passwords.unwrap_or(&[]);
+    if let Some(mode) = mode {
+        if !passwords.is_empty() || no_password_required.is_some() {
+            return Err(AuthRefusal::Combination(
+                "AuthenticationMode cannot be combined with Passwords or NoPasswordRequired: \
+                 either states how the user authenticates on its own."
+                    .to_string(),
+            ));
+        }
+        let mode_passwords = mode.passwords.as_deref().unwrap_or(&[]);
+        return match mode.r#type.as_deref().unwrap_or_default() {
+            input_authentication_type::PASSWORD => {
+                if mode_passwords.is_empty() {
+                    return Err(AuthRefusal::Combination(format!(
+                        "AuthenticationMode.Passwords is required when AuthenticationMode.Type \
+                         is {}.",
+                        input_authentication_type::PASSWORD
+                    )));
+                }
+                password_authentication(mode_passwords)
+            }
+            token @ (input_authentication_type::NO_PASSWORD_REQUIRED
+            | input_authentication_type::IAM) => {
+                if !mode_passwords.is_empty() {
+                    return Err(AuthRefusal::Combination(format!(
+                        "AuthenticationMode.Passwords cannot be supplied when \
+                         AuthenticationMode.Type is {token}."
+                    )));
+                }
+                Ok(AuthenticationRecord {
+                    // `no-password-required` is what a request ASKS for;
+                    // `no-password` is what the user reports back.
+                    r#type: if token == input_authentication_type::IAM {
+                        authentication_type::IAM.to_string()
+                    } else {
+                        authentication_type::NO_PASSWORD.to_string()
+                    },
+                    password_count: None,
+                })
+            }
+            other => Err(AuthRefusal::Value(format!(
+                "AuthenticationMode.Type must be one of {} — got {other:?}.",
+                // The GENERATED catalog, so a refusal cannot name a different
+                // set from the one the model declares. `InputAuthenticationType`
+                // IS a modelled enum, so the boundary validator normally refuses
+                // an unknown token before a handler runs; this arm is what keeps
+                // an absent `Type` from being read as one of the three.
+                crate::ops::types::INPUT_AUTHENTICATION_TYPE_VALUES.join(", ")
+            ))),
+        };
+    }
+    if no_password_required == Some(true) {
+        if !passwords.is_empty() {
+            return Err(AuthRefusal::Combination(
+                "Passwords cannot be supplied when NoPasswordRequired is true.".to_string(),
+            ));
+        }
+        return Ok(AuthenticationRecord {
+            r#type: authentication_type::NO_PASSWORD.to_string(),
+            password_count: None,
+        });
+    }
+    if !passwords.is_empty() {
+        return password_authentication(passwords);
+    }
+    Err(AuthRefusal::Combination(
+        "No password was supplied and NoPasswordRequired was not set: name Passwords, \
+         NoPasswordRequired or an AuthenticationMode."
+            .to_string(),
+    ))
+}
+
+/// One stored RBAC user — the one copy `CreateUser` writes and every user
+/// operation reads.
+#[derive(Debug, Clone)]
+pub struct UserRecord {
+    /// `UserId`, as stored: "This value is stored as a lowercase string".
+    pub user_id: String,
+    pub user_name: String,
+    /// The engine, lowercased — see [`normalize_user_engine`].
+    pub engine: String,
+    /// The ACL rule list, as [`canonical_access_string`] stores it.
+    pub access_string: String,
+    pub authentication: AuthenticationRecord,
+    /// A `User$Status` token — see [`USER_STATUS_ACTIVE`].
+    pub status: String,
+    pub arn: String,
+    /// The tags the create was given, for `ListTagsForResource` (still a
+    /// scaffolded 501 with its own issue) to report.
+    pub tags: Vec<(String, String)>,
+}
+
+impl UserRecord {
+    /// The user as the API reports it — `CreateUser`'s output shape is the `User`
+    /// shape, so this is also what `DescribeUsers` answers with.
+    pub fn to_modeled(&self) -> CreateUserOutput {
+        CreateUserOutput {
+            user_id: Some(self.user_id.clone()),
+            user_name: Some(self.user_name.clone()),
+            status: Some(self.status.clone()),
+            engine: Some(self.engine.clone()),
+            minimum_engine_version: Some(
+                self.authentication.minimum_engine_version().to_string(),
+            ),
+            access_string: Some(self.access_string.clone()),
+            // "Returns a list of the user group IDs the user belongs to":
+            // membership is held by the user GROUPS that list the user, and every
+            // user-group operation is still a scaffolded 501 (each with its own
+            // issue), so no group can list a user yet and the list is empty
+            // rather than invented. When those land they derive it from the group
+            // records instead of a second copy kept here.
+            user_group_ids: Some(Vec::new()),
+            authentication: Some(self.authentication.to_modeled()),
+            arn: Some(self.arn.clone()),
+        }
+    }
+
+    /// The value of the `User` property a `DescribeUsers` `Filter` names, or
+    /// `None` when the name is not one of [`USER_FILTER_NAMES`].
+    pub fn property(&self, name: &str) -> Option<&str> {
+        match name {
+            "UserId" => Some(self.user_id.as_str()),
+            "UserName" => Some(self.user_name.as_str()),
+            "Engine" => Some(self.engine.as_str()),
+            "Status" => Some(self.status.as_str()),
+            "AccessString" => Some(self.access_string.as_str()),
+            "MinimumEngineVersion" => Some(self.authentication.minimum_engine_version()),
+            "ARN" => Some(self.arn.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// The users a store holds before any call of this API: the built-in `default`
+/// user ElastiCache gives every account.
+///
+/// Stocked when the store is BUILT, like the service-update and offering
+/// catalogs, so no reporting operation has to write the built-in into existence
+/// and no request's region can decide what its ARN says. The ARN therefore names
+/// [`DEFAULT_REGION`]: the user is not the product of any request, so there is no
+/// request region to take.
+pub fn built_in_users() -> BTreeMap<String, UserRecord> {
+    let mut users = BTreeMap::new();
+    users.insert(
+        DEFAULT_USER_ID.to_string(),
+        UserRecord {
+            user_id: DEFAULT_USER_ID.to_string(),
+            user_name: DEFAULT_USER_ID.to_string(),
+            // The built-in user predates Valkey support, so it runs the engine
+            // RBAC arrived on.
+            engine: DEFAULT_ENGINE.to_string(),
+            access_string: DEFAULT_USER_ACCESS_STRING.to_string(),
+            authentication: AuthenticationRecord {
+                r#type: authentication_type::NO_PASSWORD.to_string(),
+                password_count: None,
+            },
+            status: USER_STATUS_ACTIVE.to_string(),
+            arn: user_arn(DEFAULT_REGION, DEFAULT_USER_ID),
+            tags: Vec::new(),
+        },
+    );
+    users
+}
+
 /// Per-service state for com-amazonaws-elasticache-amazonelasticachev9. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
@@ -2633,6 +3165,11 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// rather than an account creating them, so the store holds the catalog
     /// from the moment it comes up — see [`published_service_updates`].
     pub service_updates: BTreeMap<String, ServiceUpdateRecord>,
+    /// Every stored RBAC user, keyed by its (lowercased) `UserId` — the
+    /// resource's identity in this API — including the built-in `default` user
+    /// [`built_in_users`] stocks the store with. A `BTreeMap`, so `DescribeUsers`
+    /// has the stable total order its `Marker` indexes into.
+    pub users: BTreeMap<String, UserRecord>,
     /// The cache engine versions this emulator publishes, keyed by
     /// [`engine_version_key`]. AWS publishes these rather than an account
     /// creating them, so the store holds the catalog from the moment it comes
@@ -2673,6 +3210,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
+            users: built_in_users(),
             cache_engine_versions: published_cache_engine_versions(),
             dns_token_seq: 0,
             vpc_seq: 0,

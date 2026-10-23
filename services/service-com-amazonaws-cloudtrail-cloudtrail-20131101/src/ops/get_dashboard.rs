@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one CloudTrail Lake dashboard from the shared dashboard registry
+//! (`crate::state`), addressed by its name or its ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only, with one exception the clock owes: a dashboard still `CREATING`
+//! whose settle instant has passed is materialised into `CREATED` here, a transition
+//! that was due at that instant whether or not anybody read the dashboard.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDashboard"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDashboardErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GetDashboard needs the CloudTrail dashboard registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `DashboardId` is "the name or ARN for the dashboard": a bare name addresses
+        // the caller's own Region, an ARN the Region it carries. An identifier that
+        // can name no dashboard is answered the same way as one that names none.
+        let record = store
+            .resolve_dashboard_mut(&input.dashboard_id, &region, now)
+            .ok_or_else(|| {
+                GetDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("Unknown dashboard: {}", input.dashboard_id)),
+                })
+            })?;
+
+        Ok(GetDashboardOutput {
+            dashboard_arn: Some(record.dashboard_arn.clone()),
+            r#type: Some(record.dashboard_type.clone()),
+            status: Some(record.status.clone()),
+            widgets: Some(record.widgets.clone()),
+            refresh_schedule: record.refresh_schedule.clone(),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            updated_timestamp: Some(::aws_smithy_types::DateTime::from(record.updated_at)),
+            // A refresh has never run — `StartDashboardRefresh` is not implemented —
+            // so there is no refresh id or failure reason to report.
+            last_refresh_id: record.last_refresh_id.clone(),
+            last_refresh_failure_reason: record.last_refresh_failure_reason.clone(),
+            termination_protection_enabled: Some(record.termination_protection_enabled),
+        })
     }
 }

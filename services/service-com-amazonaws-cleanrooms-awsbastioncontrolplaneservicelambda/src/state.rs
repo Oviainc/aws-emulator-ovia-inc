@@ -20,6 +20,12 @@
 //! Insertion order is kept in `collaboration_order` / `membership_order` /
 //! `configured_table_order` so the list operations page deterministically and a
 //! pagination token stays valid across calls.
+//!
+//! The privacy budget template a collaboration holds is stored the same way the
+//! modelled [`Membership`] is — as the modelled `PrivacyBudgetTemplate`, because every
+//! one of its members is absolute — plus the
+//! `privacy_budget_template_by_collaboration` index that makes "each collaboration can
+//! have only one privacy budget template" a lookup rather than a scan.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -27,14 +33,16 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Collaboration, CollaborationSummary, ComputeConfiguration, ConfiguredTable,
-    DataEncryptionMetadata, MLMemberAbilities, MemberSpecification, Membership,
-    MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
+    AccessBudgetsPrivacyTemplateParametersOutput, Collaboration, CollaborationSummary,
+    ComputeConfiguration, ConfiguredTable, DataEncryptionMetadata,
+    DifferentialPrivacyTemplateParametersOutput, MLMemberAbilities, MemberSpecification,
+    Membership, MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
     MembershipModelInferencePaymentConfig, MembershipModelTrainingPaymentConfig,
     MembershipPaymentConfiguration, MembershipProtectedJobResultConfiguration,
     MembershipProtectedQueryOutputConfiguration, MembershipProtectedQueryResultConfiguration,
     MembershipQueryComputePaymentConfig, MembershipSummary,
-    MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, ProtectedQuery,
+    MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, PrivacyBudgetTemplate,
+    PrivacyBudgetTemplateParametersInput, PrivacyBudgetTemplateParametersOutput, ProtectedQuery,
     ProtectedQueryError, ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
     TableReference, WorkerComputeConfiguration,
 };
@@ -164,6 +172,27 @@ pub const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
 pub const CONFLICT_REASON_ALREADY_EXISTS: &str = "ALREADY_EXISTS";
 
+/// `PrivacyBudgetType` values this slice keys on (model shape `PrivacyBudgetType`:
+/// DIFFERENTIAL_PRIVACY | ACCESS_BUDGET). Each value names exactly one member of the
+/// `PrivacyBudgetTemplateParametersInput` union, which is what makes a type/parameters
+/// mismatch detectable.
+pub const PRIVACY_BUDGET_TYPE_DIFFERENTIAL_PRIVACY: &str = "DIFFERENTIAL_PRIVACY";
+/// See [`PRIVACY_BUDGET_TYPE_DIFFERENTIAL_PRIVACY`].
+pub const PRIVACY_BUDGET_TYPE_ACCESS_BUDGET: &str = "ACCESS_BUDGET";
+
+/// How often a privacy budget template refreshes when the create request names no
+/// cadence.
+///
+/// `PrivacyBudgetTemplate$autoRefresh` is REQUIRED on the output while
+/// `CreatePrivacyBudgetTemplateInput$autoRefresh` is optional, so the service decides
+/// the value a template without one carries. The `PrivacyBudgetTemplateAutoRefresh`
+/// catalog is CALENDAR_MONTH | NONE, and CALENDAR_MONTH is documented as an opt-in
+/// ("you can use CALENDAR_MONTH to automatically get a new privacy budget … Avoid
+/// choosing this if the same rows will be repeatedly queried"), so a template nobody
+/// asked to refresh does not refresh. This is the emulator's choice of the value the
+/// service supplies, not a published AWS default.
+pub const DEFAULT_PRIVACY_BUDGET_TEMPLATE_AUTO_REFRESH: &str = "NONE";
+
 /// `ConflictExceptionReason` for a resource whose current status does not admit the
 /// requested change — a membership whose collaboration is gone, say (model shape
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
@@ -222,6 +251,15 @@ pub const MAX_CONFIGURED_TABLES: usize = 5_000;
 /// `ServiceQuotaExceededException` (HTTP 402) `StartProtectedQuery` declares. The
 /// number is the EMULATOR's own bound, not a published AWS default.
 pub const MAX_PROTECTED_QUERIES: usize = 5_000;
+
+/// See [`MAX_COLLABORATIONS`]: the same EMULATOR-enforced bound on the privacy budget
+/// template store, reported through the `ServiceQuotaExceededException` (HTTP 402)
+/// `CreatePrivacyBudgetTemplate` declares.
+///
+/// A per-collaboration limit is not a bound on this store on its own: a collaboration
+/// can be deleted and recreated, which frees the slot [`MAX_COLLABORATIONS`] counts, so
+/// the template store needs its own maximum entry count like every other store here.
+pub const MAX_PRIVACY_BUDGET_TEMPLATES: usize = 5_000;
 
 /// A collaboration exactly as its creator declared it.
 #[derive(Debug, Clone)]
@@ -328,6 +366,17 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// Tags by resource ARN, shared by collaboration and membership ARNs so a later
     /// TagResource/ListTagsForResource slice has one place to read and write.
     pub tags: HashMap<String, HashMap<String, String>>,
+    /// Privacy budget templates by `PrivacyBudgetTemplate.id`. The modelled shape is
+    /// stored as-is: every one of its members is absolute, so there is nothing to
+    /// derive per request.
+    pub privacy_budget_templates: HashMap<String, PrivacyBudgetTemplate>,
+    /// Privacy budget template ids in creation order — the order a list operation
+    /// pages in.
+    pub privacy_budget_template_order: Vec<String>,
+    /// `collaboration id -> privacy budget template id`: the index that makes
+    /// "each collaboration can have only one privacy budget template" (the
+    /// `CreatePrivacyBudgetTemplate` doc) computable instead of guessed.
+    pub privacy_budget_template_by_collaboration: HashMap<String, String>,
     /// Protected queries by `ProtectedQuery.id`.
     pub protected_queries: HashMap<String, ProtectedQueryRecord>,
     /// Protected query ids in start order — the order a listing pages in.
@@ -438,6 +487,37 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         })
     }
 
+    /// The privacy budget template `collaboration_id` holds, if any.
+    ///
+    /// `CreatePrivacyBudgetTemplate` documents "Each collaboration can have only one
+    /// privacy budget template", so this is the record a second create collides with.
+    pub fn privacy_budget_template_of_collaboration(
+        &self,
+        collaboration_id: &str,
+    ) -> Option<&PrivacyBudgetTemplate> {
+        let id = self
+            .privacy_budget_template_by_collaboration
+            .get(collaboration_id)?;
+        self.privacy_budget_templates.get(id)
+    }
+
+    /// The stored template `template_id`, but only when it belongs to
+    /// `collaboration_id`.
+    ///
+    /// A privacy budget template is a resource of the COLLABORATION, and the read
+    /// operations address it through a membership ("the privacy budget template is
+    /// retrieved from the collaboration that this membership belongs to"), so a
+    /// template of another collaboration is not visible through this membership.
+    pub fn privacy_budget_template_in_collaboration(
+        &self,
+        collaboration_id: &str,
+        template_id: &str,
+    ) -> Option<&PrivacyBudgetTemplate> {
+        self.privacy_budget_templates
+            .get(template_id)
+            .filter(|template| template.collaboration_id == collaboration_id)
+    }
+
     /// Materialize every protected-query transition the CLOCK already owes at `now`.
     ///
     /// A query's terminal status falls due [`PROTECTED_QUERY_SETTLE_DELAY`] after the
@@ -536,6 +616,63 @@ pub fn membership_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("membership/{id}"))
 }
 
+/// `arn:aws:cleanrooms:<region>:<account>:privacybudgettemplate/<id>`, the form the
+/// model's `PrivacyBudgetTemplateArn` pattern declares.
+pub fn privacy_budget_template_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("privacybudgettemplate/{id}"),
+    )
+}
+
+/// The `privacyBudgetType` the parameters union itself declares: each member of
+/// `PrivacyBudgetTemplateParametersInput` carries the parameters of exactly one
+/// `PrivacyBudgetType`, so a request whose `privacyBudgetType` names the other one
+/// cannot be stored coherently.
+pub fn privacy_budget_type_of_parameters(
+    parameters: &PrivacyBudgetTemplateParametersInput,
+) -> &'static str {
+    match parameters {
+        PrivacyBudgetTemplateParametersInput::differentialPrivacy(_) => {
+            PRIVACY_BUDGET_TYPE_DIFFERENTIAL_PRIVACY
+        }
+        PrivacyBudgetTemplateParametersInput::accessBudget(_) => PRIVACY_BUDGET_TYPE_ACCESS_BUDGET,
+    }
+}
+
+/// The stored `PrivacyBudgetTemplateParametersOutput` for the parameters a create
+/// carried. The input and output unions declare the same members with the same
+/// members inside them, so this is a projection, not a reinterpretation.
+pub fn privacy_budget_template_parameters_output(
+    parameters: &PrivacyBudgetTemplateParametersInput,
+) -> PrivacyBudgetTemplateParametersOutput {
+    match parameters {
+        PrivacyBudgetTemplateParametersInput::differentialPrivacy(input) => {
+            PrivacyBudgetTemplateParametersOutput::differentialPrivacy(
+                DifferentialPrivacyTemplateParametersOutput {
+                    epsilon: input.epsilon,
+                    users_noise_per_query: input.users_noise_per_query,
+                },
+            )
+        }
+        PrivacyBudgetTemplateParametersInput::accessBudget(input) => {
+            PrivacyBudgetTemplateParametersOutput::accessBudget(
+                AccessBudgetsPrivacyTemplateParametersOutput {
+                    budget_parameters: input.budget_parameters.clone(),
+                    resource_arn: input.resource_arn.clone(),
+                },
+            )
+        }
+    }
+}
+
+/// The refresh cadence a created privacy budget template carries: the one the caller
+/// asked for, else [`DEFAULT_PRIVACY_BUDGET_TEMPLATE_AUTO_REFRESH`].
+pub fn effective_template_auto_refresh(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_PRIVACY_BUDGET_TEMPLATE_AUTO_REFRESH.to_string())
+}
+
 /// `arn:aws:cleanrooms:<region>:<account>:configuredtable/<id>`, the form the model's
 /// `ConfiguredTableArn` pattern declares
 /// (`^arn:aws:[\w]+:[\w]{2}-[\w]{4,9}-[\d]:[\d]{12}:configuredtable/[\d\w-]+$`).
@@ -558,15 +695,16 @@ pub fn table_reference_type(reference: &TableReference) -> &'static str {
 /// How many DISTINCT analysis methods a `selectedAnalysisMethods` list configures.
 ///
 /// The list is a set of enum values, so a method repeated in the request still
-/// configures one method — see [`MIN_SELECTED_ANALYSIS_METHODS`].
+/// configures one method — see [`MIN_SELECTED_ANALYSIS_METHODS`]. The count is taken
+/// through a hash set, so it is LINEAR in the list the request carries: a membership
+/// scan would make the per-request work quadratic in a list the model does not bound
+/// above.
 pub fn distinct_selected_analysis_methods(methods: &[String]) -> usize {
-    let mut seen: Vec<&str> = Vec::with_capacity(methods.len());
-    for method in methods {
-        if !seen.contains(&method.as_str()) {
-            seen.push(method.as_str());
-        }
-    }
-    seen.len()
+    methods
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<&str>>()
+        .len()
 }
 
 /// Whether `region` can appear in the ARN region segment the model's

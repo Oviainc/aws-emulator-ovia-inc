@@ -8,6 +8,11 @@
 //! (HTTP 404) — the same miss `GetTheme` and `DeleteTheme` report. An update is never an
 //! upsert.
 //!
+//! `clientToken` needs no replay record here: applying the same `updatedTheme` twice
+//! leaves the same record (only `modifiedAt`, which reports the last call that changed
+//! the theme, moves). Nothing is minted, consumed or counted that a second application
+//! could duplicate.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -69,6 +74,8 @@
 //!   for the input parameter.
 //! * `ResourceConflictException` (HTTP 409) — The resource specified in the request conflicts
 //!   with an existing resource.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, declared for the same id lookup by `GetTheme`.
 
 #[allow(unused_imports)]
 use super::types::*;

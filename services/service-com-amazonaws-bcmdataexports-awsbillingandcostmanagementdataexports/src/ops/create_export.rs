@@ -171,25 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Each tag consists of a key and a value, and each key must be unique for the
         // resource" (the modelled doc for `ResourceTags`), so a request carrying one key
-        // twice names two values for one tag and cannot be satisfied.
-        let mut tags: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for tag in input.resource_tags.unwrap_or_default() {
-            if tags.insert(tag.key.clone(), tag.value).is_some() {
-                return Err(CreateExportErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "ResourceTags carries the key {} more than once; each tag key must be unique for the resource.",
-                        tag.key
-                    ),
-                    reason: Some("fieldValidationFailed".to_string()),
-                    fields: Some(vec![ValidationExceptionField {
-                        name: "ResourceTags".to_string(),
-                        message: "Each tag key must be unique for the resource.".to_string(),
-                    }]),
-                })
-                .into());
-            }
-        }
+        // twice names two values for one tag and cannot be satisfied. The same reading of
+        // a `ResourceTagList` serves every operation that accepts one, so it lives in
+        // `crate::state` rather than here.
+        let tags = crate::state::tag_map(input.resource_tags.unwrap_or_default())
+            .map_err(CreateExportErrorModeled::ValidationException)?;
 
         let region = crate::state::request_region(&ctx.parts().headers);
         let arn = crate::state::export_arn(&region, &input.export.name);

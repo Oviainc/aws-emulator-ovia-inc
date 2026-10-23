@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::file_system_lifecycle::{
-    call, create_file_system, created_file_system_id, new_router, Answer, ROLE_ARN,
+    call, create_file_system, created_file_system_id, encoded, new_router, Answer, ROLE_ARN,
 };
 
 /// The route all three resource-policy operations are bound to:
@@ -261,10 +261,7 @@ async fn either_id_form_names_the_same_policy() {
     let id = created.text("fileSystemId");
     // A non-greedy `@httpLabel` carries the ARN percent-encoded, which is how an SDK
     // puts a value containing `/` and `:` into a path segment.
-    let encoded_arn = created
-        .text("fileSystemArn")
-        .replace(':', "%3A")
-        .replace('/', "%2F");
+    let encoded_arn = encoded(&created.text("fileSystemArn"));
 
     let document = json!({
         "Version": "2012-10-17",

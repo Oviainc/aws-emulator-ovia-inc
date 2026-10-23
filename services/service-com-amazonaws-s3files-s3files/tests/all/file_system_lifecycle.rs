@@ -2,7 +2,7 @@
 
 //! End-to-end cover for the S3 Files file-system and access-point lifecycle:
 //! `CreateFileSystem`, `GetFileSystem`, `ListFileSystems`, `CreateAccessPoint`,
-//! `GetAccessPoint` and `DeleteFileSystem`.
+//! `GetAccessPoint`, `DeleteAccessPoint` and `DeleteFileSystem`.
 //!
 //! Every case drives the service the way a client does — one restJson1 HTTP request per
 //! call, through the same `MultiServiceRouter` the emulator boots — so what is asserted
@@ -25,6 +25,9 @@
 //!    the clock made the transition due, not because anybody read it.
 //! 7. A file system still in use is not deleted unless the caller asked for its
 //!    children to go with it.
+//! 8. A delete removes exactly the resource its id names: that resource is observably
+//!    gone to every later caller, every other resource is untouched, and a repeat of the
+//!    delete reports the resource as not found.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -435,9 +438,7 @@ async fn either_id_form_names_the_same_file_system() {
     let router = new_router();
     let id = created_file_system_id(&router, "arn:aws:s3:::s3files-id-forms", Some("forms")).await;
     let arn = format!("{}{id}", file_system_arn_prefix());
-    // A non-greedy `@httpLabel` carries the ARN percent-encoded, which is how an SDK
-    // puts a value containing `/` and `:` into a path segment.
-    let encoded_arn = arn.replace(':', "%3A").replace('/', "%2F");
+    let encoded_arn = encoded(&arn);
 
     for (case, label) in [("the bare id", id.clone()), ("the ARN", encoded_arn)] {
         let read = call(&router, "GET", &format!("/file-systems/{label}"), None).await;
@@ -923,6 +924,267 @@ async fn creating_settles_to_available_because_the_clock_made_it_due() {
         json!("available"),
         "case \"list after the transition came due\": expected available, got {:?}",
         listed.body
+    );
+}
+
+/// `DeleteAccessPoint` on the label (bare id or percent-encoded ARN) `label`.
+async fn delete_access_point(router: &MultiServiceRouter, label: &str) -> Answer {
+    call(router, "DELETE", &format!("/access-points/{label}"), None).await
+}
+
+/// The percent-encoded form of a value carrying `:` and `/` — an ARN, or an opaque
+/// `nextToken` — which is how an SDK puts one into a single non-greedy `@httpLabel` path
+/// segment or an `@httpQuery` parameter. `%` goes first so an already-encoded byte is
+/// not decoded twice.
+pub(crate) fn encoded(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+}
+
+/// Rule 8 for the child resource: `DeleteAccessPoint` removes exactly the access point
+/// its `accessPointId` names — over a table whose rows differ along the id form the
+/// delete names, the member shape of the access point, and whether the clock had already
+/// settled it out of `creating`. A sibling is left untouched, the deleted id is a 404 to
+/// every later caller (including a repeat of the delete), and the parent file system
+/// stops counting it among its children, so rule 7's in-use conflict lifts once the last
+/// child is gone.
+#[tokio::test]
+async fn deleting_an_access_point_removes_only_that_access_point() {
+    let router = new_router();
+    let parent =
+        created_file_system_id(&router, "arn:aws:s3:::s3files-ap-delete", Some("ap-del")).await;
+    let parent_arn = format!("{}{parent}", file_system_arn_prefix());
+
+    // The sibling exists for the whole test: nothing any delete below does may touch it.
+    let sibling = create_access_point(&router, &parent, json!({ "clientToken": "ap-del-sib" })).await;
+    assert_eq!(
+        sibling.status, 200,
+        "case \"create the sibling\": expected 200, got {} / {:?}",
+        sibling.status, sibling.body
+    );
+    let sibling_id = sibling.text("accessPointId");
+
+    let table = vec![
+        (
+            "the bare id, no optional member, still creating",
+            json!({ "clientToken": "ap-del-bare" }),
+            false,
+            false,
+        ),
+        (
+            "the ARN, a posix user, still creating",
+            json!({
+                "clientToken": "ap-del-arn",
+                "posixUser": { "uid": 1000, "gid": 1000, "secondaryGids": [7] },
+            }),
+            true,
+            false,
+        ),
+        (
+            "the bare id, a root directory and tags, already available",
+            json!({
+                "clientToken": "ap-del-settled",
+                "rootDirectory": {
+                    "path": "/team/data",
+                    "creationPermissions": { "ownerUid": 42, "ownerGid": 43, "permissions": "0755" },
+                },
+                "tags": [{ "key": "Name", "value": "to-delete" }],
+            }),
+            false,
+            true,
+        ),
+        (
+            "the ARN, every optional member, already available",
+            json!({
+                "clientToken": "ap-del-arn-settled",
+                "posixUser": { "uid": 0, "gid": 0 },
+                "rootDirectory": { "path": "/" },
+                "tags": [{ "key": "env", "value": "test" }],
+            }),
+            true,
+            true,
+        ),
+    ];
+
+    for (case, extra, by_arn, settle_first) in table {
+        let created = create_access_point(&router, &parent, extra.clone()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200 from CreateAccessPoint, got {} / {:?}",
+            created.status, created.body
+        );
+        let access_point_id = created.text("accessPointId");
+        let access_point_arn = format!("{parent_arn}/access-point/{access_point_id}");
+        assert_eq!(
+            created.text("accessPointArn"),
+            access_point_arn,
+            "case {case:?}: accessPointArn"
+        );
+
+        if settle_first {
+            tokio::time::sleep(PAST_PROVISIONING).await;
+            let read = call(
+                &router,
+                "GET",
+                &format!("/access-points/{access_point_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                read.text("status"),
+                "available",
+                "case {case:?}: the clock owed this access point `available` before the \
+                 delete, got {:?}",
+                read.field("status")
+            );
+        }
+
+        let label = if by_arn {
+            encoded(&access_point_arn)
+        } else {
+            access_point_id.clone()
+        };
+        let deleted = delete_access_point(&router, &label).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {case:?}: expected the modelled 204, got {} / {:?}",
+            deleted.status, deleted.body
+        );
+        assert_eq!(
+            deleted.body,
+            Value::Null,
+            "case {case:?}: a 204 carries no body, got {:?}",
+            deleted.body
+        );
+
+        // Gone to a reader, under either id form.
+        for (form, read_label) in [
+            ("the bare id", access_point_id.clone()),
+            ("the ARN", encoded(&access_point_arn)),
+        ] {
+            let gone = call(&router, "GET", &format!("/access-points/{read_label}"), None).await;
+            assert_eq!(
+                gone.status, 404,
+                "case {case:?} read by {form}: expected 404 after the delete, got {} / {:?}",
+                gone.status, gone.body
+            );
+            assert_eq!(
+                gone.error_type, "ResourceNotFoundException",
+                "case {case:?} read by {form}: expected the modelled \
+                 ResourceNotFoundException, got {:?}",
+                gone.error_type
+            );
+        }
+
+        // Repeating the delete leaves the same state and reports the resource gone.
+        let again = delete_access_point(&router, &label).await;
+        assert_eq!(
+            again.status, 404,
+            "case {case:?}: a repeated delete expects 404, got {} / {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            again.error_type, "ResourceNotFoundException",
+            "case {case:?}: a repeated delete expects the modelled ResourceNotFoundException, \
+             got {:?}",
+            again.error_type
+        );
+
+        // Nothing else moved: the sibling and the parent are still readable.
+        let sibling_read = call(&router, "GET", &format!("/access-points/{sibling_id}"), None).await;
+        assert_eq!(
+            sibling_read.status, 200,
+            "case {case:?}: a delete must not touch another access point, got {} / {:?}",
+            sibling_read.status, sibling_read.body
+        );
+        assert_eq!(
+            sibling_read.text("accessPointId"),
+            sibling_id,
+            "case {case:?}: the sibling must still be itself"
+        );
+        let parent_read = call(&router, "GET", &format!("/file-systems/{parent}"), None).await;
+        assert_eq!(
+            parent_read.status, 200,
+            "case {case:?}: a delete must not touch the parent file system, got {} / {:?}",
+            parent_read.status, parent_read.body
+        );
+
+        // The idempotency record of a deleted access point can replay nothing: the same
+        // `clientToken` mints a new access point rather than naming the gone one.
+        let token = extra["clientToken"].as_str().expect("every row sends a clientToken");
+        let recreated =
+            create_access_point(&router, &parent, json!({ "clientToken": token })).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {case:?}: expected 200 recreating under the same token, got {} / {:?}",
+            recreated.status, recreated.body
+        );
+        assert_ne!(
+            recreated.text("accessPointId"),
+            access_point_id,
+            "case {case:?}: a token whose access point was deleted must mint a new one"
+        );
+        let cleaned = delete_access_point(&router, &recreated.text("accessPointId")).await;
+        assert_eq!(
+            cleaned.status, 204,
+            "case {case:?}: expected 204 deleting the recreated access point, got {} / {:?}",
+            cleaned.status, cleaned.body
+        );
+    }
+
+    // An id this service never minted is a 404; a value no `AccessPointId` pattern
+    // accepts is refused before any state is touched.
+    let refusals = [
+        (
+            "an unknown access point",
+            "fsap-00000000000000000",
+            404,
+            "ResourceNotFoundException",
+        ),
+        ("an id that is too short", "fsap-0a1b2c3d", 400, "ValidationException"),
+        ("an id that is not hex", "fsap-zzzzzzzzzzzzzzzzz", 400, "ValidationException"),
+        (
+            "an id with the file system prefix",
+            "fs-00000000000000000",
+            400,
+            "ValidationException",
+        ),
+    ];
+    for (case, label, status, error) in refusals {
+        let refused = delete_access_point(&router, label).await;
+        assert_eq!(
+            refused.status, status,
+            "case {case:?}: expected HTTP {status}, got {} / {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type, error,
+            "case {case:?}: expected the modelled {error}, got {:?} / {:?}",
+            refused.error_type, refused.body
+        );
+    }
+
+    // Rule 7 the other way round: once its last child is deleted the parent is no longer
+    // in use, so an unforced delete of it succeeds.
+    let in_use = call(&router, "DELETE", &format!("/file-systems/{parent}"), None).await;
+    assert_eq!(
+        in_use.status, 409,
+        "case \"delete the parent while the sibling lives\": expected 409, got {} / {:?}",
+        in_use.status, in_use.body
+    );
+    let last_child = delete_access_point(&router, &sibling_id).await;
+    assert_eq!(
+        last_child.status, 204,
+        "case \"delete the last child\": expected 204, got {} / {:?}",
+        last_child.status, last_child.body
+    );
+    let parent_deleted = call(&router, "DELETE", &format!("/file-systems/{parent}"), None).await;
+    assert_eq!(
+        parent_deleted.status, 204,
+        "case \"delete the parent once childless\": expected 204, got {} / {:?}",
+        parent_deleted.status, parent_deleted.body
     );
 }
 

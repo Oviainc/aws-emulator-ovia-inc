@@ -355,7 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // A provider names the third-party cloud this recorder records
                     // from, which only a third-party service-linked recorder has.
                     provider: None,
-                    tags: input.tags.clone().unwrap_or_default(),
+                    tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
                 },
             );
             // A recorder that has just been created is not recording: it begins
