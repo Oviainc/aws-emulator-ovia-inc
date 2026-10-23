@@ -15,12 +15,13 @@
 //! catalog cannot name, yields no type at all, and `ChangeTypeList` is `len 1..`, so it
 //! is refused rather than stored as a change that changes nothing.
 //!
-//! `isAutoApproved` is then decided by the collaboration's own auto-approval settings
-//! ([`crate::state::change_request_is_auto_approved`]): a request every one of whose
-//! change types the collaboration auto-approves needs no member decision, so it is
-//! applied to the collaboration here and reported COMMITTED; any other request is stored
-//! PENDING with a PENDING approval for each party to the collaboration, and changes
-//! nothing until a later decision commits it.
+//! `isAutoApproved` is then decided by whether the request needs any decision that is
+//! still outstanding ([`crate::state::change_request_is_auto_approved`]): a request the
+//! requesting account is the only party to, or one every change type of which the
+//! collaboration auto-approves, needs no member decision, so it is applied to the
+//! collaboration here and reported COMMITTED; any other request is stored PENDING with a
+//! PENDING approval for each party to the collaboration, and changes nothing until a
+//! later decision commits it.
 //!
 //! ## Shape of an operation
 //!
@@ -328,7 +329,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let is_auto_approved = st::change_request_is_auto_approved(&record, &changes);
+        let is_auto_approved =
+            st::change_request_is_auto_approved(&record, &changes, &approving_accounts, caller);
         let approval_status = if is_auto_approved {
             st::APPROVAL_STATUS_APPROVED
         } else {

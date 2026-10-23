@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMatchmakingRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMatchmakingRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMatchmakingRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Parses the rule set the request supplies, refuses a body that is not a FlexMatch rule
+//! set, and persists the rest — so this response and every later read of the rule set
+//! (`DescribeMatchmakingRuleSets`) are served from the one stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMatchmakingRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMatchmakingRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMatchmakingRuleSet"))
+        use crate::state::MAX_MATCHMAKING_RULE_SETS_PER_ACCOUNT;
+
+        let invalid = |message: String| -> Self::Error {
+            CreateMatchmakingRuleSetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // "The rule set must be formatted as JSON": a body that is not, or that omits an
+        // element a rule set must define, is not a rule set at all — so it is refused
+        // BEFORE any state is locked and nothing is stored. The reason names the element
+        // and the constraint it missed.
+        if let Err(reason) = crate::state::validate_rule_set_body(&input.rule_set_body) {
+            return Err(invalid(reason));
+        }
+
+        // A resource's tags are a key-value MAP, so one key cannot carry two values;
+        // `TaggingFailedException`'s doc: "This may be due to invalid tag format". The
+        // modelled `TagList` length and each tag's own lengths are refused by the boundary
+        // walk before this handler runs.
+        let tags = input.tags.clone().unwrap_or_default();
+        let mut keys = ::std::collections::HashSet::new();
+        if let Some(duplicate) = tags.iter().find(|tag| !keys.insert(tag.key.clone())) {
+            return Err(CreateMatchmakingRuleSetErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(format!(
+                        "Tags assigns the key {} more than once; a resource's tags carry each key \
+                         at most once.",
+                        duplicate.key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateMatchmakingRuleSetErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // `MatchmakingRuleSet$RuleSetName` is "a unique identifier for the matchmaking
+        // rule set", and a matchmaking configuration names the rule set it matches with by
+        // that identifier, so a second create cannot take the name of a rule set that
+        // exists: the stored rule set is left exactly as it was.
+        if state.matchmaking_rule_sets.contains_key(&input.name) {
+            return Err(invalid(format!(
+                "A matchmaking rule set named {} already exists; a rule set name identifies one \
+                 rule set.",
+                input.name
+            )));
+        }
+        if state.matchmaking_rule_sets.len() >= MAX_MATCHMAKING_RULE_SETS_PER_ACCOUNT {
+            return Err(CreateMatchmakingRuleSetErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already has the maximum of \
+                         {MAX_MATCHMAKING_RULE_SETS_PER_ACCOUNT} matchmaking rule sets."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `MatchmakingRuleSet$RuleSetArn` doc: "Format is
+        // `arn:aws:gamelift:<region>::matchmakingruleset/<ruleset name>`[;] the resource ID
+        // matches the RuleSetName value."
+        let rule_set_arn =
+            crate::state::gamelift_arn(&region, &format!("matchmakingruleset/{}", input.name));
+        let record = crate::state::MatchmakingRuleSetRecord {
+            rule_set_name: input.name.clone(),
+            rule_set_arn,
+            // The body is stored VERBATIM: "a collection of matchmaking rules, formatted
+            // as a JSON string", which every read reports back as supplied.
+            rule_set_body: input.rule_set_body.clone(),
+            tags,
+            creation_time: now,
+            region,
+        };
+        state
+            .matchmaking_rule_sets
+            .insert(input.name.clone(), record);
+
+        // Report the STORED record, so this response and every later describe of the same
+        // rule set can only agree.
+        let Some(stored) = state.matchmaking_rule_sets.get(&input.name) else {
+            return Err(
+                CreateMatchmakingRuleSetErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the new matchmaking rule set could not be read back".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreateMatchmakingRuleSetOutput {
+            rule_set: stored.to_modelled(),
+        })
     }
 }

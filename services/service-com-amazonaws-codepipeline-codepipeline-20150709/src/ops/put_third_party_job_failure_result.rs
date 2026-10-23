@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutThirdPartyJobFailureResult
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutThirdPartyJobFailureResult`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutThirdPartyJobFailureResult::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A partner action's job worker reports its FAILURE for one job it holds — the other
+//! outcome of the lifecycle whose success `PutThirdPartyJobSuccessResult` reports. The
+//! job is looked up in this service's third-party job store
+//! ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::third_party_jobs`]),
+//! through the one lookup every third-party job operation of this crate goes through:
+//! an id no retained job carries is `JobNotFoundException` whatever its form (the id
+//! has no modelled pattern), a job found under a different `clientToken` is
+//! `InvalidClientTokenException`, and a job no worker currently holds — one still being
+//! handed out, or already in a terminal status — is `InvalidJobStateException`.
+//! Otherwise the job reaches `Failed` and keeps the `failureDetails` the worker
+//! reported with it.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +168,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutThirdPartyJobFailureResult` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutThirdPartyJobFailureResultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutThirdPartyJobFailureResult"))
+        let state = crate::state::require_state(&*self.engine)?;
+        let mut state = state.lock();
+
+        // The job the worker names, if the service is holding one under that id and
+        // the call carries the `clientToken` it was handed out with. Both refusals
+        // come from the store, so no id — well-formed or not — is accepted without a
+        // job behind it, and only a job that WAS found can reject a token it was not
+        // handed out with.
+        let job = match state.third_party_job_mut(&input.job_id, &input.client_token) {
+            Ok(job) => job,
+            Err(problem) => {
+                let (outcome, error) = match problem {
+                    crate::state::ThirdPartyJobProblem::NotFound(message) => (
+                        "refused: job not found",
+                        PutThirdPartyJobFailureResultError::from(
+                            PutThirdPartyJobFailureResultErrorModeled::JobNotFoundException(
+                                JobNotFoundException {
+                                    message: Some(message),
+                                },
+                            ),
+                        ),
+                    ),
+                    crate::state::ThirdPartyJobProblem::ClientToken(message) => (
+                        "refused: invalid client token",
+                        PutThirdPartyJobFailureResultError::from(
+                            PutThirdPartyJobFailureResultErrorModeled::InvalidClientTokenException(
+                                InvalidClientTokenException {
+                                    message: Some(message),
+                                },
+                            ),
+                        ),
+                    ),
+                };
+                audit(ctx, &input.job_id, outcome);
+                return Err(error);
+            }
+        };
+
+        // A result can only be reported for a job a worker holds: the outcome of a
+        // job that is still being handed out is not this caller's to report, and a
+        // job that already reached a terminal status has an outcome that cannot be
+        // replaced — so reporting a failure for a job that already completed, or
+        // reporting one twice, is refused rather than silently overwriting the
+        // result already recorded.
+        if !job.accepts_result() {
+            let message = format!(
+                "job {} is {}, so no result can be reported for it",
+                input.job_id, job.status
+            );
+            audit(ctx, &input.job_id, "refused: invalid job state");
+            return Err(
+                PutThirdPartyJobFailureResultErrorModeled::InvalidJobStateException(
+                    InvalidJobStateException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        job.record_failure(input.failure_details, ::std::time::SystemTime::now());
+        drop(state);
+
+        audit(ctx, &input.job_id, "job failed");
+
+        Ok(PutThirdPartyJobFailureResultOutput)
     }
+}
+
+/// The audit record this state-changing operation emits for every outcome: who
+/// presented which access key id, which job it named, and what the service did with
+/// it.
+///
+/// No secret is recorded — the access key id is the public half the request already
+/// carries in its SigV4 scope, and the `clientToken` the call authenticates the
+/// worker with is never logged. `job_id` is request-supplied text, so it is recorded
+/// with `Debug` formatting, which escapes control characters (a newline cannot forge
+/// a second log line).
+fn audit(ctx: &smithy_server_runtime::OperationContext<'_>, job_id: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "PutThirdPartyJobFailureResult",
+        access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+        job_id = ?job_id,
+        outcome = outcome,
+        "codepipeline state change"
+    );
 }

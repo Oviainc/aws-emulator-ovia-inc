@@ -157,7 +157,7 @@ async fn stored_build(router: &MultiServiceRouter, id: &str) -> Value {
     );
     assert_eq!(
         fetched["buildsNotFound"],
-        json!(null),
+        json!([]),
         "BatchGetBuilds {id:?}: the build must be held, got {fetched}"
     );
     fetched["builds"][0].clone()

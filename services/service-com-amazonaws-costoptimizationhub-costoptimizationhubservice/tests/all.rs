@@ -17,6 +17,8 @@ mod cost_optimization_hub;
 mod management_account_gating;
 #[path = "all/max_results_bounds.rs"]
 mod max_results_bounds;
+#[path = "all/preference_writes.rs"]
+mod preference_writes;
 #[path = "all/recommendation_summaries.rs"]
 mod recommendation_summaries;
 #[path = "all/rejection_fidelity.rs"]

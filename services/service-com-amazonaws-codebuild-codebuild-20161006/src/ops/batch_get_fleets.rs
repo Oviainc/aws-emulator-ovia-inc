@@ -155,16 +155,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|stored| stored.fleet.clone());
             match found {
                 Some(fleet) => fleets.push(fleet),
-                None => not_found.push(identifier.clone()),
+                // Only an identifier given as an ARN is reported back in
+                // `fleetsNotFound`. A fleet's ARN is `fleet/<name>:<id>`, so the ARN
+                // of a fleet this account does not hold is not derivable from a bare
+                // name: the service has nothing to name the missing fleet by, and the
+                // recorded answer to a probe for an absent fleet NAME is a plain empty
+                // result with no `fleetsNotFound` entry for it. An ARN the caller
+                // supplied is reported back exactly as sent.
+                None if crate::state::is_arn(identifier) => not_found.push(identifier.clone()),
+                None => {}
             }
         }
 
         Ok(BatchGetFleetsOutput {
-            // Both lists target `@length(min: 1, max: 100)` shapes (`Fleets` and
-            // `FleetNames`), so an empty one is left absent rather than serialized
-            // as `[]`.
-            fleets: (!fleets.is_empty()).then_some(fleets),
-            fleets_not_found: (!not_found.is_empty()).then_some(not_found),
+            // Both halves of the partition are always serialized, `[]` when a half is
+            // empty: the `@length(min: 1)` on `Fleets` / `FleetNames` bounds what a
+            // request may carry, not whether the answer states its result, and a
+            // caller that reads `fleets` unconditionally must find a list there.
+            fleets: Some(fleets),
+            fleets_not_found: Some(not_found),
         })
     }
 }
