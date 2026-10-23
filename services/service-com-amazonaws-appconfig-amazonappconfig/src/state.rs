@@ -347,8 +347,8 @@ pub fn first_parameter_rejection(parameters: &HashMap<String, Parameter>) -> Opt
 /// (`application/<id>`, `application/<id>/environment/<id>`,
 /// `application/<id>/configurationprofile/<id>`,
 /// `application/<id>/environment/<id>/deployment/<number>`) or, for a resource that has no
-/// owning application, at the resource type itself (`deploymentstrategy/<id>`), which is
-/// what [`parse_resource_arn`] reads.
+/// owning application, at the resource type itself (`deploymentstrategy/<id>`,
+/// `extension/<id>/<version>`), which is what [`parse_resource_arn`] reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedResource<'arn> {
     /// `application/<application id>`.
@@ -1792,6 +1792,10 @@ pub const LISTING_ENVIRONMENTS: &str = "ListEnvironments";
 /// The `kind` a `ListDeploymentStrategies` cursor is stamped with, so a token minted by
 /// another listing cannot resume this one. See [`paginate`].
 pub const LISTING_DEPLOYMENT_STRATEGIES: &str = "ListDeploymentStrategies";
+
+/// The `kind` a `ListExtensions` cursor is stamped with, so a token minted by another
+/// listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXTENSIONS: &str = "ListExtensions";
 
 /// One page of a list operation: the items on it, and the token that resumes the walk
 /// after them (`None` on the last page).

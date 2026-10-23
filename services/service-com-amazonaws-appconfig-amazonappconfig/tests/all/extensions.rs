@@ -62,8 +62,9 @@ fn action(name: &str) -> Value {
     })
 }
 
-/// An `ActionsMap` binding one action to each point in `points`.
-fn actions(points: &[&str]) -> Value {
+/// An `ActionsMap` binding one action to each point in `points`. `pub(crate)` because
+/// every extension a suite creates needs at least one action bound.
+pub(crate) fn actions(points: &[&str]) -> Value {
     Value::Object(
         points
             .iter()
@@ -99,7 +100,9 @@ fn parameters(count: usize, flags: impl Fn(usize) -> (bool, bool)) -> Value {
 
 /// `POST /extensions`. `LatestVersionNumber` is bound to `@httpHeader`, so when the case
 /// supplies one it travels as the `Latest-Version-Number` header rather than in the body.
-async fn create_extension(
+/// `pub(crate)` because the `ListExtensions` suite creates its fixtures through the same
+/// front door.
+pub(crate) async fn create_extension(
     router: &MultiServiceRouter,
     body: &Value,
     latest_version_number: Option<i32>,
@@ -119,8 +122,9 @@ async fn create_extension(
 }
 
 /// `GET /extensions/{ExtensionIdentifier}[?version_number=..]`. The identifier is bound
-/// to a NON-greedy `@httpLabel`, so an ARN travels percent-encoded.
-async fn get_extension(
+/// to a NON-greedy `@httpLabel`, so an ARN travels percent-encoded. `pub(crate)` because
+/// the `ListExtensions` suite reads its fixtures back through the same reader.
+pub(crate) async fn get_extension(
     router: &MultiServiceRouter,
     identifier: &str,
     version_number: Option<i32>,
@@ -151,8 +155,9 @@ fn extension_facts(body: &Value) -> BTreeMap<&'static str, Value> {
 }
 
 /// The `Id` of a 201 answer, asserted to be present and to match the model's `Id` shape
-/// (`^[a-z0-9]{4,7}$`).
-fn minted_id(case: &str, body: &Value) -> String {
+/// (`^[a-z0-9]{4,7}$`). `pub(crate)` because every suite that creates an extension needs
+/// the same check.
+pub(crate) fn minted_id(case: &str, body: &Value) -> String {
     let id = body
         .get("Id")
         .and_then(Value::as_str)

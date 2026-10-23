@@ -33,6 +33,34 @@ pub const MAX_VOLUME_SIZE_GIB: i64 = 65_536;
 /// of the data. Only SHA256 checksums are supported.").
 pub const CHECKSUM_ALGORITHM_SHA256: &str = "SHA256";
 
+/// How long after an accepted `CompleteSnapshot` the seal becomes observable.
+///
+/// `CompleteSnapshot` is modelled `@http(code: 202)` — Accepted — and acknowledges the
+/// request while the snapshot is still `pending`: the seal is asynchronous and the
+/// terminal `completed` is observed by a later call. Nothing AWS publishes says how long
+/// that takes, so the span is CHOSEN: short enough not to slow a caller down, and never
+/// zero, so a caller acting straight after the 202 still observes the transient state and
+/// the refusals that go with it. The due instant is stored on the snapshot; nothing ever
+/// sleeps for it.
+pub const SNAPSHOT_COMPLETION_DELAY: Duration = Duration::from_millis(300);
+
+/// The expression a `blockToken` must satisfy, as the LIVE service reports it in its
+/// validation refusal: `1 validation error detected: Value '' at 'blockToken' failed to
+/// satisfy constraint: Member must satisfy regular expression pattern:
+/// ^[A-Za-z0-9+/=_-]+$`.
+///
+/// Wider than the on-disk model's `BlockToken` `@pattern`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#BlockToken")` reports
+/// `^[A-Za-z0-9+/=]+$`): the service accepts the URL-safe base64 alphabet, so `_` and `-`
+/// are admitted. The member therefore carries `skip_validation` on
+/// `GetSnapshotBlockInput` and `crate::ops::get_snapshot_block` enforces THIS expression,
+/// reporting the one it enforced.
+pub const BLOCK_TOKEN_PATTERN: &str = "^[A-Za-z0-9+/=_-]+$";
+
+/// The modelled `BlockToken` `@length`, which `skip_validation` takes off the boundary
+/// along with the pattern, so `crate::ops::get_snapshot_block` enforces it too.
+pub const BLOCK_TOKEN_LENGTH: (i64, i64) = (0, 256);
+
 /// Blocks in one GiB of volume.
 ///
 /// `PutSnapshotBlockRequest$BlockIndex` documents "A block index is a logical index in
@@ -87,10 +115,14 @@ impl SnapshotStatus {
 }
 
 /// The server-side encryption a snapshot reports through `StartSnapshotResponse$SseType`.
+///
+/// A snapshot that is not encrypted has NO SSE type: the member is optional with no
+/// `@default`, and the recorded response of an unencrypted `StartSnapshot` carries no
+/// `SseType` key at all. So "no server-side encryption" is `Option::None` — the member is
+/// omitted — rather than the modelled `none` value, and this enum holds only the types a
+/// snapshot can actually have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseType {
-    /// Not encrypted.
-    None,
     /// Encrypted with the EBS-managed key.
     SseEbs,
     /// Encrypted with a caller-named KMS key.
@@ -101,7 +133,6 @@ impl SseType {
     /// The wire value for this type: one of `SSEType`'s modeled values.
     pub const fn as_wire(self) -> &'static str {
         match self {
-            Self::None => "none",
             Self::SseEbs => "sse-ebs",
             Self::SseKms => "sse-kms",
         }
@@ -116,7 +147,8 @@ pub struct StoredTag {
     pub value: Option<String>,
 }
 
-/// One block of a snapshot, as `PutSnapshotBlock` persisted it.
+/// One block of a snapshot: the bytes `PutSnapshotBlock` persisted, or the ones
+/// `StartSnapshot` copied from a parent snapshot.
 #[derive(Debug, Clone)]
 pub struct BlockEntry {
     /// The bytes written, verbatim. `GetSnapshotBlock` returns exactly these.
@@ -133,6 +165,15 @@ pub struct BlockEntry {
     pub block_token: String,
     /// The write progress the caller reported, if any.
     pub progress: Option<i32>,
+    /// Whether this block was WRITTEN to this snapshot by `PutSnapshotBlock`, as opposed
+    /// to inherited from a `ParentSnapshotId`.
+    ///
+    /// `CompleteSnapshotRequest$ChangedBlocksCount` is "The number of blocks that were
+    /// written to the snapshot", and an incremental snapshot shares its parent's
+    /// unchanged blocks rather than writing them, so only the ones flagged here are
+    /// counted against it. Overwriting an inherited index is a write, so the entry that
+    /// replaces it carries the flag.
+    pub written: bool,
 }
 
 /// A snapshot and everything written into it.
@@ -153,11 +194,46 @@ pub struct Snapshot {
     pub parent_snapshot_id: Option<String>,
     pub kms_key_arn: Option<String>,
     pub encrypted: bool,
-    pub sse_type: SseType,
+    /// The server-side encryption this snapshot has, or `None` when it has none — in
+    /// which case `SseType` is omitted from a response rather than reported as `none`.
+    pub sse_type: Option<SseType>,
     pub timeout_minutes: i32,
+    /// When an accepted `CompleteSnapshot` makes this snapshot's seal observable, or
+    /// `None` when no completion has been asked for.
+    ///
+    /// Set by `CompleteSnapshot`, which answers 202 while the snapshot is still
+    /// `pending`; [`ComAmazonawsEbsEbsState::apply_due_transitions`] moves the status to
+    /// `completed` once the clock has passed it. A snapshot with this set is already
+    /// SEALED — its content is final and it accepts no further writes — even while it
+    /// still reports `pending`.
+    pub completion_due: Option<SystemTime>,
     /// The blocks written, keyed by `BlockIndex`. A `BTreeMap` because
     /// `ListSnapshotBlocks` enumerates ascending by index and pages from an index.
     pub blocks: BTreeMap<i32, BlockEntry>,
+}
+
+impl Snapshot {
+    /// The number of blocks WRITTEN to this snapshot, which is what
+    /// `CompleteSnapshotRequest$ChangedBlocksCount` counts. See
+    /// [`BlockEntry::written`].
+    pub fn written_block_count(&self) -> usize {
+        self.blocks.values().filter(|entry| entry.written).count()
+    }
+
+    /// Whether this snapshot's content is final: it was completed, or a
+    /// `CompleteSnapshot` was accepted and the seal is in flight.
+    ///
+    /// "You cannot write new blocks to a snapshot after it has been completed", so this
+    /// is also the answer to "may a block still be written", negated.
+    pub fn is_sealed(&self) -> bool {
+        self.status == SnapshotStatus::Completed || self.completion_due.is_some()
+    }
+
+    /// Whether `PutSnapshotBlock` may still write into this snapshot: "The target
+    /// snapshot must be in the pending state", and its seal has not been asked for.
+    pub fn accepts_writes(&self) -> bool {
+        self.status == SnapshotStatus::Pending && self.completion_due.is_none()
+    }
 }
 
 /// What a `ClientToken` remembers, so a repeat of the SAME request replays the original
@@ -175,11 +251,12 @@ pub struct ComAmazonawsEbsEbsState {
     pub snapshots: HashMap<String, Snapshot>,
     /// `StartSnapshot` idempotency, keyed by `ClientToken`.
     pub client_tokens: HashMap<String, StartSnapshotIdempotencyRecord>,
-    /// The earliest instant at which some stored snapshot's `Timeout` falls due, or
-    /// `None` when nothing is pending. [`Self::expire_due_snapshots`] returns without
-    /// scanning until that instant passes, so per-request cost does not grow with the
-    /// number of stored snapshots.
-    next_expiry_due: Option<SystemTime>,
+    /// The earliest instant at which some stored snapshot owes a status transition — a
+    /// `Timeout` falling due, or an accepted `CompleteSnapshot`'s seal becoming
+    /// observable — or `None` when nothing is pending. [`Self::apply_due_transitions`]
+    /// returns without scanning until that instant passes, so per-request cost does not
+    /// grow with the number of stored snapshots.
+    next_transition_due: Option<SystemTime>,
     /// Bumped on every minted id or token, so two mints in the same nanosecond still
     /// differ.
     mint_counter: u64,
@@ -204,8 +281,9 @@ impl ComAmazonawsEbsEbsState {
 
     /// Mint the opaque block token for `(snapshot_id, block_index)`.
     ///
-    /// Base64 of a 32-byte digest, so the value matches the modeled `BlockToken`
-    /// pattern `^[A-Za-z0-9+/=]+$` and its 0..256 length.
+    /// Base64 of a 32-byte digest, so the value is inside both the modeled `BlockToken`
+    /// pattern `^[A-Za-z0-9+/=]+$` and the wider [`BLOCK_TOKEN_PATTERN`] the service
+    /// accepts, and inside [`BLOCK_TOKEN_LENGTH`].
     ///
     /// The token is stored on the [`BlockEntry`] it names and NOWHERE else: there is no
     /// side table of live tokens to keep in step or to reclaim, so `GetSnapshotBlock`
@@ -221,39 +299,60 @@ impl ComAmazonawsEbsEbsState {
         ::aws_smithy_types::base64::encode(digest)
     }
 
-    /// Materialise the `Timeout` the clock has already made due.
+    /// Materialise every status change the CLOCK has already made due.
     ///
-    /// `StartSnapshotRequest$Timeout` documents that a snapshot is "automatically
-    /// cancelled" when it is not completed within that many minutes; a cancelled
-    /// snapshot is what the modeled `Status` enum calls `error`. This is owed at
-    /// `expiry_time` whether or not anybody calls, so every handler applies it before
-    /// reading — it never moves a status the clock did not already owe.
+    /// Two are owed, both at an instant stored when the call that started them ran, so
+    /// each was owed whether or not anybody called again:
+    ///
+    /// * an accepted `CompleteSnapshot`'s seal: the 202 reports the snapshot `pending`
+    ///   and [`SNAPSHOT_COMPLETION_DELAY`] later it is `completed`.
+    /// * a `Timeout`: `StartSnapshotRequest$Timeout` documents that a snapshot is
+    ///   "automatically cancelled" when it is not completed within that many minutes;
+    ///   a cancelled snapshot is what the modeled `Status` enum calls `error`.
+    ///
+    /// Every handler applies this before reading, and it never moves a status the clock
+    /// did not already owe.
     ///
     /// A cancelled snapshot can never be completed, nor its blocks listed or fetched
     /// again, so this is also where their bytes are released (and with them their block
     /// tokens, which live on the entries): it is this store's retention policy, not just
-    /// a status flip.
-    pub fn expire_due_snapshots(&mut self, now: SystemTime) {
+    /// a status flip. A snapshot whose seal is in flight is NOT cancelled — its content
+    /// is already final, so the `Timeout` has nothing left to cancel.
+    pub fn apply_due_transitions(&mut self, now: SystemTime) {
         // Nothing is due yet, so do not walk the map on every request.
-        if self.next_expiry_due.is_none_or(|due| now < due) {
+        if self.next_transition_due.is_none_or(|due| now < due) {
             return;
         }
         for snapshot in self.snapshots.values_mut() {
-            if snapshot.status == SnapshotStatus::Pending && now >= snapshot.expiry_time {
-                snapshot.status = SnapshotStatus::Error;
-                snapshot.blocks.clear();
+            if snapshot.status != SnapshotStatus::Pending {
+                continue;
+            }
+            match snapshot.completion_due {
+                Some(due) => {
+                    if now >= due {
+                        snapshot.status = SnapshotStatus::Completed;
+                        snapshot.completion_due = None;
+                    }
+                }
+                None => {
+                    if now >= snapshot.expiry_time {
+                        snapshot.status = SnapshotStatus::Error;
+                        snapshot.blocks.clear();
+                    }
+                }
             }
         }
-        self.refresh_expiry_schedule();
+        self.refresh_transition_schedule();
     }
 
-    /// Recompute the earliest `Timeout` still outstanding. Call after storing a snapshot.
-    pub fn refresh_expiry_schedule(&mut self) {
-        self.next_expiry_due = self
+    /// Recompute the earliest transition still outstanding. Call after storing a
+    /// snapshot or asking for its completion.
+    pub fn refresh_transition_schedule(&mut self) {
+        self.next_transition_due = self
             .snapshots
             .values()
             .filter(|snapshot| snapshot.status == SnapshotStatus::Pending)
-            .map(|snapshot| snapshot.expiry_time)
+            .map(|snapshot| snapshot.completion_due.unwrap_or(snapshot.expiry_time))
             .min();
     }
 
@@ -282,6 +381,112 @@ impl ComAmazonawsEbsEbsState {
         hasher.finalize().into()
     }
 }
+
+// ---------------------------------------------------------------------------
+// How this service words the refusals whose text is part of the contract
+// ---------------------------------------------------------------------------
+//
+// A refusal's status and error code are always the contract. Its MESSAGE is only
+// part of the contract where the rule that produces it is known — a template the
+// service fills in from the request, or a fixed sentence it always sends. Those are
+// the ones below, each stated once so every operation that raises the same refusal
+// words it the same way; every other refusal in this crate words itself at the site
+// that raises it, because no published rule pins the words.
+
+/// The widths of the hex suffix of a snapshot id the service accepts: the original
+/// 8-character EC2 id and the 17-character one it mints today.
+///
+/// The modelled `SnapshotId` pattern `^snap-[0-9a-f]+$` with `@length` 1..64
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#SnapshotId")`) admits ANY width,
+/// so the boundary lets `snap-0` through; the service accepts only these two widths and
+/// refuses every other as a malformed PARAMETER — a different refusal from a well-formed
+/// id it holds no snapshot for.
+pub const SNAPSHOT_ID_HEX_WIDTHS: [usize; 2] = [8, 17];
+
+/// Whether `snapshot_id` has the form a snapshot id the service would mint has:
+/// `snap-` followed by exactly one of [`SNAPSHOT_ID_HEX_WIDTHS`] lowercase hex digits,
+/// not all of them zero.
+///
+/// The hex suffix is the resource's number: zero is not one, so an all-zero id is as
+/// malformed as one of the wrong width. (The recorded refusals show both halves: an
+/// all-zero id of an accepted width is refused as a malformed PARAMETER, while an id of
+/// the same width carrying non-zero digits is refused as a snapshot that does not
+/// exist.)
+///
+/// Form only — it says nothing about whether a snapshot with that id is stored.
+pub fn is_well_formed_snapshot_id(snapshot_id: &str) -> bool {
+    let Some(hex) = snapshot_id.strip_prefix("snap-") else {
+        return false;
+    };
+    SNAPSHOT_ID_HEX_WIDTHS.contains(&hex.len())
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && hex.bytes().any(|byte| byte != b'0')
+}
+
+/// The message this service answers with when a snapshot id is not even shaped like one,
+/// for ANY operation that takes one: a request-derived template naming the rejected value
+/// and the parameter it arrived in, `Value (<value>) for parameter <parameter> is
+/// invalid. Expected: 'snap-...'.`
+///
+/// `parameter` is the member's wire name, lower-camelled as the service reports it
+/// (`snapshotId`, `parentSnapshotId`).
+pub fn malformed_snapshot_id_message(parameter: &str, value: &str) -> String {
+    format!("Value ({value}) for parameter {parameter} is invalid. Expected: 'snap-...'.")
+}
+
+/// The message `GetSnapshotBlock` answers with when a `BlockToken` does not name a block
+/// of the snapshot at the requested index: a request-derived template naming the rejected
+/// token, `The block token <BlockToken> is invalid.`
+///
+/// It states nothing about the block index: a token is the only thing that names a block,
+/// so a token that resolves to nothing is the refusal whatever the index holds.
+pub fn invalid_block_token_message(block_token: &str) -> String {
+    format!("The block token {block_token} is invalid.")
+}
+
+/// The message this service answers with when a request names a snapshot that is not
+/// stored, for ANY operation that resolves a snapshot id.
+///
+/// A request-derived template naming the snapshot id, shared by every snapshot
+/// not-found refusal: `The snapshot 'snap-…' does not exist.` It says only that the id
+/// does not resolve — never that a snapshot exists but is in some other state, which is
+/// a different refusal (a `ValidationException` naming the state).
+pub fn snapshot_not_found_message(snapshot_id: &str) -> String {
+    format!("The snapshot '{snapshot_id}' does not exist.")
+}
+
+/// The message this service answers with when a request asks for a checksum algorithm
+/// the service does not support, for ANY operation carrying `ChecksumAlgorithm`.
+///
+/// A request-derived template naming the rejected algorithm and the supported set, which
+/// is [`CHECKSUM_ALGORITHM_SHA256`] — the only value the modelled `ChecksumAlgorithm`
+/// enum declares.
+pub fn unsupported_checksum_algorithm_message(algorithm: &str) -> String {
+    format!(
+        "Unsupported Checksum Algorithm '{algorithm}', supported algorithms are \
+         {CHECKSUM_ALGORITHM_SHA256}"
+    )
+}
+
+/// The message `StartSnapshot` answers with when `VolumeSize` is outside the sizes the
+/// service accepts: a request-derived template naming only the rejected value.
+///
+/// It states no bound: the refusal reports which input was rejected, and the bound that
+/// rejected it ([`MAX_VOLUME_SIZE_GIB`], from `StartSnapshotRequest$VolumeSize`'s "The
+/// maximum size is 65536 GiB (64 TiB)") is documentation, not part of this sentence.
+pub fn invalid_volume_size_message(volume_size: i64) -> String {
+    format!("Invalid volume size: {volume_size}")
+}
+
+/// The message the modelled `ConflictException` (HTTP 409) carries when a `ClientToken`
+/// is reused for a request that does not match the one it was stored with.
+///
+/// FIXED and request-independent: the refusal does not echo the token, the operation or
+/// any other caller-supplied value.
+pub const CLIENT_TOKEN_CONFLICT_MESSAGE: &str =
+    "Current request does not match request stored with this token.";
 
 /// Base64 SHA256 of `data`, the form `Checksum` is documented to carry.
 pub fn checksum_base64_sha256(data: &[u8]) -> String {

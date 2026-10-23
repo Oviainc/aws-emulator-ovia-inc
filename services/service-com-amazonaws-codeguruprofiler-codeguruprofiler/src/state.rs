@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AgentOrchestrationConfig, FindingsReportSummary, ProfilingGroupDescription, ProfilingStatus,
+    AgentOrchestrationConfig, Channel, FindingsReportSummary, NotificationConfiguration,
+    ProfilingGroupDescription, ProfilingStatus,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -117,6 +118,15 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 /// one unparameterised request cannot materialise a response that grows with the
 /// stored group count. Inside the modelled `maxResults` range (1..1000).
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+/// How many anomaly-notification channels one profiling group holds. NOT an
+/// emulator-chosen bound: the model's `Channels` list carries `@length(min: 1, max: 2)`
+/// both on the `AddNotificationChannels` input and on the `NotificationConfiguration`
+/// every notification operation returns, and `AddNotificationChannels`' own doc says
+/// "Add up to 2 anomaly notifications channels for a profiling group". An add that
+/// would push a group past this is refused with that operation's modelled
+/// `ServiceQuotaExceededException`.
+pub const MAX_NOTIFICATION_CHANNELS_PER_GROUP: usize = 2;
 
 /// The `AggregationPeriod` of a DAILY profile, as the model's `AggregationPeriod` enum
 /// spells it (its values are "P1D", "PT1H", "PT5M" — see `AGGREGATION_PERIOD_VALUES`).
@@ -306,6 +316,32 @@ pub struct AgentProfile {
     pub received_at: DateTime,
 }
 
+/// One anomaly-notification channel of a profiling group, as
+/// `AddNotificationChannels` stored it.
+///
+/// `id` is a plain `String` rather than the modelled `Option<String>`: a STORED channel
+/// always has an id — the one the request named, or the random UUID the model's
+/// `Channel$id` doc says is used "when adding a channel to the notification
+/// configuration if not specified in the request" — and
+/// `RemoveNotificationChannel` addresses a channel by it.
+#[derive(Debug, Clone)]
+pub struct NotificationChannel {
+    pub id: String,
+    pub uri: String,
+    pub event_publishers: Vec<String>,
+}
+
+impl NotificationChannel {
+    /// This channel as the modelled shape every notification operation reports.
+    pub fn to_modeled(&self) -> Channel {
+        Channel {
+            id: Some(self.id.clone()),
+            uri: self.uri.clone(),
+            event_publishers: self.event_publishers.clone(),
+        }
+    }
+}
+
 /// One recommendation ("findings") report: the result of analysing ONE profile window
 /// of one group, which `ListFindingsReports` and `GetFindingsReportAccountSummary`
 /// summarise as a `FindingsReportSummary`.
@@ -390,6 +426,12 @@ pub struct ProfilingGroup {
     /// first. Bounded at [`MAX_RETAINED_PROFILE_TOKENS_PER_GROUP`] by
     /// [`ProfilingGroup::remember_profile_token`], which is the only writer.
     pub seen_profile_tokens: VecDeque<String>,
+    /// This group's anomaly-notification channels, in the order they were added —
+    /// what `GetNotificationConfiguration` reports, `AddNotificationChannels` appends
+    /// to and `RemoveNotificationChannel` deletes from. Bounded at
+    /// [`MAX_NOTIFICATION_CHANNELS_PER_GROUP`] by
+    /// [`ProfilingGroup::add_notification_channels`], which is the only writer.
+    pub notification_channels: Vec<NotificationChannel>,
     /// The group's resource-based policy, or `None` while it has none — a group is
     /// created without one, and the permission writers
     /// ([`ComAmazonawsCodeguruprofilerCodeguruprofilerState::put_permission`] and
@@ -522,6 +564,61 @@ impl ProfilingGroup {
         true
     }
 
+    /// The notification configuration every notification operation answers with,
+    /// built from the channels stored on THIS group.
+    ///
+    /// `channels` is always present, as an empty list when the group has none: that is
+    /// what distinguishes a group whose notifications nobody has configured from one
+    /// whose configuration is unknown (which is a 404 instead).
+    pub fn notification_configuration(&self) -> NotificationConfiguration {
+        NotificationConfiguration {
+            channels: Some(
+                self.notification_channels
+                    .iter()
+                    .map(NotificationChannel::to_modeled)
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Whether this group already holds a channel with `id`.
+    pub fn has_notification_channel(&self, id: &str) -> bool {
+        self.notification_channels
+            .iter()
+            .any(|channel| channel.id == id)
+    }
+
+    /// Append a batch of notification channels, ALL or nothing: `false` — and nothing
+    /// stored — unless every channel fits, i.e. no channel repeats an id this group or
+    /// an earlier channel of the batch already holds, and the group stays within
+    /// [`MAX_NOTIFICATION_CHANNELS_PER_GROUP`]. The only writer, so the stored
+    /// configuration never leaves what the model's `Channels` list allows and a refused
+    /// add is never a partial one.
+    pub fn add_notification_channels(&mut self, channels: Vec<NotificationChannel>) -> bool {
+        if self.notification_channels.len() + channels.len() > MAX_NOTIFICATION_CHANNELS_PER_GROUP {
+            return false;
+        }
+        let repeated = channels.iter().enumerate().any(|(index, channel)| {
+            self.has_notification_channel(&channel.id)
+                || channels[..index]
+                    .iter()
+                    .any(|earlier| earlier.id == channel.id)
+        });
+        if repeated {
+            return false;
+        }
+        self.notification_channels.extend(channels);
+        true
+    }
+
+    /// Remove the channel with `id`, answering whether there was one.
+    pub fn remove_notification_channel(&mut self, id: &str) -> bool {
+        let before = self.notification_channels.len();
+        self.notification_channels
+            .retain(|channel| channel.id != id);
+        self.notification_channels.len() != before
+    }
+
     /// The start instants of the aggregated profiles this group holds for an
     /// aggregation period `period_seconds` long, ASCENDING and distinct.
     ///
@@ -639,6 +736,10 @@ pub struct ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// [`Self::mint_revision_id`], the only minter, and mixed into every revision it
     /// derives, so two writes of the same grants never carry the same revision.
     pub revisions_minted: u64,
+    /// How many notification-channel ids this store has minted. Bumped by
+    /// [`Self::mint_channel_id`], the only minter, and mixed into every id it derives,
+    /// so two channels added in the same instant never carry the same id.
+    pub channel_ids_minted: u64,
 }
 
 /// What [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::post_profile`] did with a
@@ -711,6 +812,15 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     fn mint_revision_id(&mut self, group_name: &str, action_group: &str) -> String {
         self.revisions_minted = self.revisions_minted.wrapping_add(1);
         revision_id(self.revisions_minted, now(), group_name, action_group)
+    }
+
+    /// The `ChannelId` the next notification channel the caller did not name one for
+    /// carries: the store's own mint count is bumped first, so every id this store
+    /// hands out is distinct even for two channels added in the same instant. The ONLY
+    /// minter.
+    pub fn mint_channel_id(&mut self, group_name: &str) -> String {
+        self.channel_ids_minted = self.channel_ids_minted.wrapping_add(1);
+        channel_id(self.channel_ids_minted, now(), group_name)
     }
 
     /// Grant `action_group`'s permissions to exactly `principals` on `group_name`,
@@ -1219,6 +1329,42 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A fresh notification-channel id for a channel the request did not name one for.
+///
+/// The model's `ChannelId` carries the SAME pattern as `RevisionId`
+/// (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`) and `Channel$id`'s
+/// doc says "A random UUID for channelId is used when adding a channel to the
+/// notification configuration if not specified in the request" — so the id is derived
+/// exactly the way this crate derives its other UUID-shaped id, through
+/// [`revision_id`]: SHA-256 over the store's own monotonically increasing mint count,
+/// the instant of the write and the group the channel is added to, cut into the five
+/// lowercase-hex groups [`REVISION_ID_GROUPS`] records. The mint count is store state a
+/// caller never sees, so a channel id cannot be computed from the request that produced
+/// it, and two channels added in the same instant still differ.
+fn channel_id(mint: u64, at: DateTime, group_name: &str) -> String {
+    revision_id(mint, at, group_name, CHANNEL_ID_SCOPE)
+}
+
+/// What [`channel_id`] mixes into its digest in place of an action group, so a channel
+/// id and a policy revision minted from the same count and instant differ.
+const CHANNEL_ID_SCOPE: &str = "notificationChannel";
+
+/// The ARN namespace (`aws.api#service$arnNamespace`) of Amazon SNS, the vendor field
+/// of a topic ARN.
+pub const SNS_ARN_NAMESPACE: &str = "sns";
+
+/// Whether `uri` is an Amazon SNS topic ARN, which is what a channel uri must be:
+/// `ChannelUri` is an `@arnReference` and its model doc says "Currently we only support
+/// SNS channels and thus required to be an ARN".
+///
+/// The ARN itself is read by `service_common::arn`, the one caller-supplied-ARN parse
+/// in this tree (six fields, a literal `arn`, a non-empty partition, vendor and
+/// resource; region and account may be empty, as a partition-global ARN writes them);
+/// only the vendor this service accepts is decided here.
+pub fn is_sns_topic_arn(uri: &str) -> bool {
+    ::service_common::arn::is_resource_arn_of(uri, SNS_ARN_NAMESPACE)
 }
 
 /// Now, as the wire timestamp type every modelled timestamp member uses.

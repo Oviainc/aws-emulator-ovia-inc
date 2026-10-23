@@ -1168,6 +1168,20 @@ pub struct RuleEvaluationEntry {
     pub last_successful_invocation_at: Option<SystemTime>,
     /// When the last completed pass finished evaluating the resources in scope.
     pub last_successful_evaluation_at: Option<SystemTime>,
+    /// Whether the pass in flight was asked for ON DEMAND — by a
+    /// `StartConfigRulesEvaluation` call — rather than run by Config itself because
+    /// the rule was written.
+    ///
+    /// The on-demand path states a precondition of its own about the pass IT started:
+    /// "An existing StartConfigRulesEvaluation call for the specified rules must
+    /// complete before you can call the API again" (`StartConfigRulesEvaluation`).
+    /// That sentence is about an existing on-demand call, not about the pass Config
+    /// runs by itself when a rule is created or updated ("When you create a rule,
+    /// Config evaluates your resources against the rule automatically" — which the
+    /// same page says needs no call from the caller), so which kind of pass is in
+    /// flight has to be part of the record for the precondition to be checkable.
+    /// Cleared when the pass completes, like every other in-flight member here.
+    pub on_demand: bool,
 }
 
 impl RuleEvaluationEntry {
@@ -1179,10 +1193,30 @@ impl RuleEvaluationEntry {
         evaluation
     }
 
-    /// Record that Config owes this rule an evaluation pass, invoked at `at`.
+    /// Record that Config owes this rule an evaluation pass, invoked at `at`, because
+    /// the rule was written.
     pub fn invoke(&mut self, at: SystemTime) {
         self.invoked_at = Some(at);
         self.completes_at = Some(at + RULE_EVALUATION_SETTLE_AFTER);
+        self.on_demand = false;
+    }
+
+    /// Record that Config owes this rule an evaluation pass, invoked at `at`, because
+    /// a caller asked for one on demand (`StartConfigRulesEvaluation`: it "re-runs an
+    /// evaluation against the last known state of your resources").
+    ///
+    /// The pass itself is the same pass a write owes — same invocation instant, same
+    /// span before it completes — so the two share [`Self::invoke`]; only
+    /// [`Self::on_demand`] tells them apart.
+    pub fn invoke_on_demand(&mut self, at: SystemTime) {
+        self.invoke(at);
+        self.on_demand = true;
+    }
+
+    /// Whether a pass a `StartConfigRulesEvaluation` call started has still not
+    /// completed as of `now`. See [`Self::on_demand`].
+    pub fn on_demand_in_progress(&self, now: SystemTime) -> bool {
+        self.on_demand && self.in_progress(now)
     }
 
     /// Whether the pass this rule is owed has still not completed as of `now`.
@@ -1212,6 +1246,7 @@ impl RuleEvaluationEntry {
             self.last_successful_evaluation_at = Some(due);
             self.invoked_at = None;
             self.completes_at = None;
+            self.on_demand = false;
         }
     }
 }
@@ -3632,6 +3667,81 @@ mod tests {
                 ),
                 before,
                 "case {case:?}: a second settle must not move the recorded instants"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_on_demand_pass_is_recorded_as_one_and_only_while_it_runs() {
+        // Rows differ along WHICH pass is in flight and how far the clock has moved:
+        // the pass a write owes, the pass an on-demand call owes, and an on-demand
+        // pass a later write replaced. Only a pass a `StartConfigRulesEvaluation`
+        // call started counts as on demand, and only until it completes.
+        let invoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        type Invoke = fn(&mut RuleEvaluationEntry, SystemTime);
+        let cases: [(&str, &[Invoke], Duration, bool); 6] = [
+            (
+                "a write's pass, in flight",
+                &[RuleEvaluationEntry::invoke],
+                Duration::ZERO,
+                false,
+            ),
+            (
+                "an on-demand pass, in flight",
+                &[RuleEvaluationEntry::invoke_on_demand],
+                Duration::ZERO,
+                true,
+            ),
+            (
+                "an on-demand pass, one millisecond before it is due",
+                &[RuleEvaluationEntry::invoke_on_demand],
+                RULE_EVALUATION_SETTLE_AFTER - Duration::from_millis(1),
+                true,
+            ),
+            (
+                "an on-demand pass, exactly when it is due",
+                &[RuleEvaluationEntry::invoke_on_demand],
+                RULE_EVALUATION_SETTLE_AFTER,
+                false,
+            ),
+            (
+                "a write's pass over an on-demand one",
+                &[
+                    RuleEvaluationEntry::invoke_on_demand,
+                    RuleEvaluationEntry::invoke,
+                ],
+                Duration::ZERO,
+                false,
+            ),
+            (
+                "an on-demand pass over a write's one",
+                &[
+                    RuleEvaluationEntry::invoke,
+                    RuleEvaluationEntry::invoke_on_demand,
+                ],
+                Duration::ZERO,
+                true,
+            ),
+        ];
+
+        for (case, invocations, elapsed, on_demand_in_progress) in cases {
+            let mut evaluation = RuleEvaluationEntry::default();
+            for invoke in invocations {
+                invoke(&mut evaluation, invoked_at);
+            }
+            let now = invoked_at + elapsed;
+            assert_eq!(
+                evaluation.on_demand_in_progress(now),
+                on_demand_in_progress,
+                "case {case:?}: expected on_demand_in_progress {on_demand_in_progress}, got {}",
+                evaluation.on_demand_in_progress(now)
+            );
+
+            // A completed pass is no longer in flight, whichever kind it was.
+            evaluation.settle(invoked_at + RULE_EVALUATION_SETTLE_AFTER);
+            assert!(
+                !evaluation.on_demand,
+                "case {case:?}: a completed pass must leave no pass in flight, got {evaluation:?}"
             );
         }
     }

@@ -484,13 +484,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // INSUFFICIENT_DATA. For PromQL alarms, the alarm state is instead immediately set
         // to OK." … "When you update an existing alarm, its state is left unchanged, but
         // the update completely overwrites the previous configuration of the alarm."
-        let existing = store.alarms.get(&input.alarm_name).map(|stored| {
+        // The alarm this call replaces, when it replaces one: its state carries over (below)
+        // and its configuration is what the history document records as the configuration
+        // this write replaced.
+        let previous = store
+            .alarms
+            .get(&input.alarm_name)
+            .map(|stored| stored.alarm.clone());
+        let existing = previous.as_ref().map(|alarm| {
             (
-                stored.alarm.state_value.clone(),
-                stored.alarm.state_reason.clone(),
-                stored.alarm.state_reason_data.clone(),
-                stored.alarm.state_updated_timestamp,
-                stored.alarm.state_transitioned_timestamp,
+                alarm.state_value.clone(),
+                alarm.state_reason.clone(),
+                alarm.state_reason_data.clone(),
+                alarm.state_updated_timestamp,
+                alarm.state_transitioned_timestamp,
             )
         });
         let is_update = existing.is_some();
@@ -569,6 +576,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action_configuration: input.action_configuration.clone(),
         };
 
+        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — for a
+        // configuration update, the configuration this call stored, and the one it replaced
+        // when it replaced an alarm. Built from the alarm the store now holds, so it records
+        // what was written rather than what the request happened to name.
+        let history_data =
+            crate::state::configuration_update_history_data(previous.as_ref(), &alarm);
+
         store.alarms.insert(
             input.alarm_name.clone(),
             crate::state::StoredAlarm {
@@ -590,7 +604,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 } else {
                     "Alarm created".to_string()
                 }),
-                history_data: None,
+                history_data: Some(history_data),
                 alarm_contributor_attributes: None,
             },
         );

@@ -11,6 +11,11 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ebs-ebs.json");
 
+// Every member of this input is validated at the boundary: the constraints the model
+// declares for `ParentSnapshotId` are the boundary's to enforce. The service's ADDITIONAL
+// rule about the SHAPE of a snapshot id (`crate::state::is_well_formed_snapshot_id`),
+// which the model does not express, is judged by the handler — reached only by a value
+// the boundary already accepted.
 #[smithy_macros::smithy(shape = "com.amazonaws.ebs#StartSnapshotRequest")]
 #[derive(Debug, Clone, Default)]
 pub struct StartSnapshotInput {

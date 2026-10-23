@@ -737,7 +737,11 @@ async fn history_is_reported_most_recent_first() {
 /// The two rows span the two bounds: many small events hit the event-count bound,
 /// while fewer large ones hit the text-byte bound first. The bounds themselves are
 /// `MAX_HISTORY_EVENTS_PER_FINDING` (256) and `MAX_HISTORY_BYTES_PER_FINDING`
-/// (128 KiB) in the crate's `state.rs`.
+/// (128 KiB) in the crate's `state.rs`. The large row writes the longest note the
+/// service accepts — `Note$Text` is bounded at 512 characters
+/// (`smithy_query(query="doc", shape="Note", member="Text")`), which
+/// `state::MAX_NOTE_TEXT_LEN` holds every note write to — so 200 of them still pass
+/// the byte bound while staying under the event-count bound.
 #[tokio::test]
 async fn the_recorded_history_stays_bounded() {
     /// The event-count bound in `state::MAX_HISTORY_EVENTS_PER_FINDING`.
@@ -746,7 +750,7 @@ async fn the_recorded_history_stays_bounded() {
     // (case, note text length, number of updates)
     let cases: [(&str, usize, usize); 2] = [
         ("small events past the count bound", 8, MAX_EVENTS + 40),
-        ("large events past the byte bound", 1024, 200),
+        ("large events past the byte bound", 512, 200),
     ];
 
     for (case, note_len, writes) in cases {

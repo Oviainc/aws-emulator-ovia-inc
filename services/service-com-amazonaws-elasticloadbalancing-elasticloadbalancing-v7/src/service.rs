@@ -45,12 +45,21 @@
 //! lookup can come from the model alone. [`api_version`] carries that whole rule — which
 //! API version the request's awsQuery envelope names, which of the two models therefore
 //! serves it, and what happens to an envelope naming a version neither declares.
+//!
+//! Both halves of that endpoint also answer their errors in the whole `awsQuery` envelope:
+//! `<ErrorResponse>` carries a `<RequestId>` beside its `<Error>`, which no model declares
+//! and the framework's error renderers do not write, so this service's definition and its
+//! routable operations are served behind `service_common::query_error_envelope`'s two
+//! wrappers and the refusals [`api_version`] renders itself pass through the same writer.
 
 pub mod api_version;
 
 use api_version::{ServingModel, UnsupportedApiVersionOperation, V2FrontDoor};
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdEnvelopeOperation,
+};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -60,7 +69,10 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, behind the `awsQuery` error-envelope wrapper: every error this
+    /// service answers carries the `<RequestId>` that envelope has (see
+    /// `service_common::query_error_envelope`), whichever layer rendered it.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// The ELBv2 half of this shared endpoint, served for an envelope naming that
     /// model's API version. Held in a field, built once over the same shared engine,
     /// because `override_operation` hands back a reference borrowed from `&self`.
@@ -68,6 +80,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The refusal served for an envelope naming an API version NEITHER Elastic Load
     /// Balancing model declares. Held in a field for the same reason.
     unsupported_api_version: UnsupportedApiVersionOperation,
+    /// The envelope wrapper a request this model serves is served through. Held in a
+    /// field for the same reason.
+    envelope: RequestIdEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -76,18 +91,27 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            entry: RequestIdEnvelopeDefinition::new(crate::ServiceDefinition::new(Arc::clone(
+                &engine,
+            ))),
             elbv2: V2FrontDoor::new(engine),
             unsupported_api_version: UnsupportedApiVersionOperation,
+            envelope: RequestIdEnvelopeOperation,
         }
     }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
-    fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
+    fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
+        //
+        // It is reached through the `awsQuery` envelope wrapper, which leaves identity,
+        // protocol and the routing table exactly as the entry carries them and adds the
+        // `<RequestId>` element to the framework-level error envelopes it renders — a
+        // transport failure and a pre-dispatch refusal — so they carry what a modelled
+        // error served through [`RequestIdEnvelopeOperation`] carries.
         &self.entry
     }
 
@@ -130,12 +154,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // is in [`api_version`].
         match api_version::serving_model(req) {
             // This model's own API version (or no `Version` field at all): the generated
-            // routing table resolves it, and an `Action` naming no modelled operation is
-            // the framework's own `400 InvalidAction` in this service's envelope.
-            ServingModel::Classic => None,
+            // routing table resolves it, through the envelope wrapper that adds the
+            // `<RequestId>` an awsQuery error envelope carries. An `Action` naming no
+            // modelled operation is declined here (the wrapper claims only what the
+            // routing table holds), so it stays this service's own `400 InvalidAction`
+            // naming the action and the version — see `override_routing_error`.
+            ServingModel::Classic => self.entry.routes(req).then_some(&self.envelope as _),
             // The ELBv2 API version: served out of the ELBv2 model, over the one shared
             // engine, which is how an AWS SDK ELBv2 client — signing the shared name and
-            // naming that version — reaches those operations at all.
+            // naming that version — reaches those operations at all. That model's own
+            // service adds the envelope element on its side.
             ServingModel::V2 => Some(&self.elbv2),
             // A version no Elastic Load Balancing model declares: an action/version pair
             // nothing can resolve.

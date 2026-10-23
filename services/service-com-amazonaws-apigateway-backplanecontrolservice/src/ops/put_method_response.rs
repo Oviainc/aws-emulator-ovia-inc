@@ -123,7 +123,12 @@ pub fn is_method_response_header(key: &str) -> bool {
 
 /// One character of an HTTP field name (RFC 9110 `tchar`); see
 /// [`is_method_response_header`].
-fn is_field_name_char(character: char) -> bool {
+///
+/// `pub` because the same token is what a header name must be on BOTH sides of a response
+/// parameter mapping — the method response header a key names and the integration
+/// response header a value names — so the operations that write those records resolve the
+/// character set in one place.
+pub fn is_field_name_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character)
 }
 

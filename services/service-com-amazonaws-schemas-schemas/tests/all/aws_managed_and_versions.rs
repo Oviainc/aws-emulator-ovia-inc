@@ -357,8 +357,8 @@ async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
         );
         assert_eq!(
             exported.str_at("SchemaVersion"),
-            "1",
-            "case {schema:?}: the catalogue holds one version"
+            entry.version_count.to_string(),
+            "case {schema:?}: the export answers the catalogue's newest version"
         );
         assert_eq!(
             exported.str_at("SchemaName"),
@@ -380,28 +380,32 @@ async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
             "case {schema:?}: no OpenAPI component ref may survive the conversion: {content:?}"
         );
 
-        // Every component of the source document other than the promoted envelope
-        // is a definition of the export, and the envelope's own members are the
-        // export's root.
+        // EVERY component of the source document is a definition of the export — an
+        // OpenAPI document names no root among its components — and the refs between
+        // them follow.
         let source: Value = serde_json::from_str(&entry.content)
             .unwrap_or_else(|e| panic!("case {schema:?}: the source must be JSON: {e}"));
         let components = source["components"]["schemas"]
             .as_object()
             .unwrap_or_else(|| panic!("case {schema:?}: the source has components"));
-        for name in components.keys().filter(|name| *name != "AWSEvent") {
+        for name in components.keys() {
             assert!(
                 content["definitions"][name].is_object(),
                 "case {schema:?}: component {name:?} must be a definition, got {content:?}"
             );
         }
         assert_eq!(
-            content["properties"]["detail"]["$ref"],
+            content["definitions"]["AWSEvent"]["properties"]["detail"]["$ref"],
             json!(format!("#/definitions/{schema_detail}", schema_detail = source
                 ["components"]["schemas"]["AWSEvent"]["properties"]["detail"]["$ref"]
                 .as_str()
                 .unwrap_or_default()
                 .trim_start_matches("#/components/schemas/"))),
             "case {schema:?}: the envelope's detail ref must point into definitions"
+        );
+        assert_eq!(
+            content["title"], source["info"]["title"],
+            "case {schema:?}: the export carries the source document's title"
         );
     }
 }

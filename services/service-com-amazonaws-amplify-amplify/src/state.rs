@@ -499,10 +499,31 @@ pub fn not_found_message(entity: &str, identifier: &str) -> String {
     format!("{entity} {identifier} not found.")
 }
 
+/// The `message` an Amplify `BadRequestException` carries when a create is refused
+/// because the owning app ALREADY HOLDS a resource of that kind under the name the
+/// request asked for.
+///
+/// Like [`not_found_message`], the text is built FROM THE REQUEST and from nothing
+/// else: Amplify names the kind of resource it failed to create, then the name the
+/// request used for it, then the app it already exists under —
+/// `Failed to create <entity>. The <entity> <name> already exists for the app <appId>`,
+/// with the entity in lower case, as recorded behaviour shows (the model does not
+/// spell the message out). Every duplicate-name refusal in this crate is formatted
+/// through this one function, so the creates cannot drift from one another, and an
+/// identifier is NEVER inspected here: the message is the same construction whatever
+/// the request named.
+pub fn already_exists_message(entity: &str, identifier: &str, app_id: &str) -> String {
+    let entity = entity.to_lowercase();
+    format!(
+        "Failed to create {entity}. The {entity} {identifier} already exists for the app {app_id}"
+    )
+}
+
 /// The entity name [`not_found_message`] uses for an app addressed by `appId`.
 pub const APP_ENTITY: &str = "App";
 
-/// The entity name [`not_found_message`] uses for a branch addressed by `branchName`.
+/// The entity name [`not_found_message`] and [`already_exists_message`] use for a
+/// branch addressed by `branchName`.
 pub const BRANCH_ENTITY: &str = "Branch";
 
 /// The entity name [`not_found_message`] uses for a job addressed by `jobId`.

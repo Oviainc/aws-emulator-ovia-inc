@@ -3,9 +3,9 @@
 //! Engine state for the com-amazonaws-apigatewayv2-apigatewayv2 service.
 //!
 //! A single store, [`ComAmazonawsApigatewayv2Apigatewayv2State::apis`], keyed by
-//! `ApiId`. An [`Api`] OWNS its child [`Route`]s and [`Integration`]s (and the
-//! [`Stage`]s a later slice will fill), so deleting an api cascades to its children in
-//! one `remove` and no second map can drift out of step with it.
+//! `ApiId`. An [`Api`] OWNS its child [`Route`]s, [`Integration`]s and [`Stage`]s, so
+//! deleting an api cascades to its children in one `remove` and no second map can
+//! drift out of step with it.
 //!
 //! The records here are the service's own, not the wire shapes: a record keeps a
 //! value the api always has (its id, its name, its creation instant) as a plain
@@ -194,7 +194,7 @@ pub struct Api {
     /// Drives [`Api::mint_integration_id`]. Per-api, for the same reason as
     /// [`Api::route_id_seed`]: an `IntegrationId` is unique within its api.
     pub integration_id_seed: u64,
-    /// This api's stages, keyed by `StageName`. Reserved for the stage slice.
+    /// This api's stages, keyed by `StageName`.
     pub stages: BTreeMap<String, Stage>,
     /// This api's models, keyed by `ModelId`.
     pub models: BTreeMap<String, Model>,
@@ -570,10 +570,13 @@ pub fn validate_model_schema(content_type: Option<&str>, schema: &str) -> Result
     ))
 }
 
-/// A persisted `Stage`. Reserved so the stage operations can land without a state
-/// rewrite; nothing creates one yet, but [`Deployment`] already points stages at the
-/// deployment they serve.
-#[derive(Debug, Clone, Default)]
+/// A persisted `Stage` resource, owned by its parent [`Api`].
+///
+/// The record keeps what the create resolved — the name it is keyed by, the instants
+/// it was created and last changed at, and the settings maps the request supplied — so
+/// every reader of the stage reports one value, and [`Stage::to_wire`] projects it onto
+/// the modelled shape the handlers serialize.
+#[derive(Debug, Clone)]
 pub struct Stage {
     pub stage_name: String,
     pub description: Option<String>,
@@ -583,6 +586,162 @@ pub struct Stage {
     /// "A Deployment must be associated with a Stage for it to be callable over the
     /// internet" (the `Deployment` shape's own doc).
     pub deployment_id: Option<String>,
+    pub access_log_settings: Option<wire::AccessLogSettings>,
+    /// "Supported only for WebSocket APIs" (`Stage$ClientCertificateId`).
+    pub client_certificate_id: Option<String>,
+    pub default_route_settings: Option<wire::RouteSettings>,
+    /// Route settings by `routeKey`. `BTreeMap`, so the stage reports them in one
+    /// stable order however the request ordered them.
+    pub route_settings: BTreeMap<String, wire::RouteSettings>,
+    /// The stage variable map, by variable name.
+    pub stage_variables: BTreeMap<String, String>,
+    /// "Describes the status of the last deployment of a stage. Supported only for
+    /// stages with autoDeploy enabled" (`Stage$LastDeploymentStatusMessage`), so a
+    /// stage that never auto-released one has none.
+    pub last_deployment_status_message: Option<String>,
+    pub created_date: SystemTime,
+    /// "The timestamp when the stage was last updated" (`Stage$LastUpdatedDate`): the
+    /// creation instant until something rewrites the record.
+    pub last_updated_date: SystemTime,
+    /// True only for a stage another operation created on the caller's behalf: "If you
+    /// created an API using quick create, the $default stage is managed by API Gateway"
+    /// (`Stage$ApiGatewayManaged`). A stage the caller asked for is its own.
+    pub api_gateway_managed: bool,
+}
+
+impl Stage {
+    /// Project the record onto the modelled `Stage` shape.
+    pub fn to_wire(&self) -> wire::Stage {
+        wire::Stage {
+            access_log_settings: self.access_log_settings.clone(),
+            api_gateway_managed: Some(self.api_gateway_managed),
+            auto_deploy: Some(self.auto_deploy),
+            client_certificate_id: self.client_certificate_id.clone(),
+            created_date: Some(to_timestamp(self.created_date)),
+            default_route_settings: self.default_route_settings.clone(),
+            deployment_id: self.deployment_id.clone(),
+            description: self.description.clone(),
+            last_deployment_status_message: self.last_deployment_status_message.clone(),
+            last_updated_date: Some(to_timestamp(self.last_updated_date)),
+            route_settings: Some(
+                self.route_settings
+                    .iter()
+                    .map(|(key, settings)| (key.clone(), settings.clone()))
+                    .collect(),
+            ),
+            stage_name: self.stage_name.clone(),
+            stage_variables: Some(
+                self.stage_variables
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            ),
+            tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        }
+    }
+}
+
+/// The most stages one api may hold, after which CreateStage is refused. AWS's
+/// published API Gateway quota is 10 stages per API.
+pub const MAX_STAGES_PER_API: usize = 10;
+
+/// The `StageName` of the stage that serves an api's root: "the $default stage"
+/// (`Stage$ApiGatewayManaged`), the one name that is not a plain stage name.
+pub const DEFAULT_STAGE_NAME: &str = "$default";
+
+/// The longest `StageName` the service accepts: the upper bound of
+/// `StringWithLengthBetween1And128`, the shape `CreateStage$StageName` targets.
+pub const MAX_STAGE_NAME_LEN: usize = 128;
+
+/// The longest stage variable VALUE the service accepts: the upper bound of
+/// `StringWithLengthBetween0And2048`, the value shape of `StageVariablesMap`
+/// (`smithy_query(query="shape", shape="StageVariablesMap")`).
+pub const MAX_STAGE_VARIABLE_VALUE_LEN: usize = 2048;
+
+/// Refuse a `StageName` the service does not accept.
+///
+/// "Stage names can only contain alphanumeric characters, hyphens, and underscores.
+/// Maximum length is 128 characters" (the `CreateStage$StageName` API reference), plus
+/// [`DEFAULT_STAGE_NAME`], the reserved name of the stage that serves an api's root.
+/// The length bound of `StringWithLengthBetween1And128` carries no `@length` trait in
+/// the model, so the request walk does not enforce it and this does.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// member and the rule it broke.
+pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
+    if stage_name == DEFAULT_STAGE_NAME {
+        return Ok(());
+    }
+    let length = stage_name.chars().count();
+    if length == 0 || length > MAX_STAGE_NAME_LEN {
+        return Err(format!(
+            "Invalid value for StageName: must have length between 1 and \
+             {MAX_STAGE_NAME_LEN}, got {length}."
+        ));
+    }
+    if !stage_name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
+    {
+        return Err(format!(
+            "Invalid value for StageName: stage names can only contain alphanumeric \
+             characters, hyphens and underscores, or be the reserved name \
+             {DEFAULT_STAGE_NAME}, got '{stage_name}'."
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a stage variable whose name or value is not one the service accepts.
+///
+/// "Variable names can have alphanumeric and underscore characters, and the values
+/// must match [A-Za-z0-9-._~:/?#&=,]+" (`Stage$StageVariables`), and a value is bounded
+/// by [`MAX_STAGE_VARIABLE_VALUE_LEN`], the upper bound of the map's value shape.
+/// Neither is a modelled trait, so the request walk does not enforce them and this
+/// does.
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
+/// variable and the rule it broke.
+pub fn validate_stage_variables<'a, I>(variables: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = (&'a String, &'a String)>,
+{
+    for (name, value) in variables {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(format!(
+                "Invalid value for StageVariables: variable names can have alphanumeric \
+                 and underscore characters, got '{name}'."
+            ));
+        }
+        let length = value.chars().count();
+        if length > MAX_STAGE_VARIABLE_VALUE_LEN {
+            return Err(format!(
+                "Invalid value for StageVariables: the value of '{name}' must have length \
+                 less than or equal to {MAX_STAGE_VARIABLE_VALUE_LEN}, got {length}."
+            ));
+        }
+        if value.is_empty() || !value.chars().all(is_stage_variable_value_character) {
+            return Err(format!(
+                "Invalid value for StageVariables: the value of '{name}' must match \
+                 [A-Za-z0-9-._~:/?#&=,]+."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Is `character` one the stage variable value pattern `[A-Za-z0-9-._~:/?#&=,]`
+/// admits (`Stage$StageVariables`)?
+fn is_stage_variable_value_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '-' | '.' | '_' | '~' | ':' | '/' | '?' | '#' | '&' | '=' | ','
+        )
 }
 
 /// A persisted `Deployment` resource, owned by its parent [`Api`].

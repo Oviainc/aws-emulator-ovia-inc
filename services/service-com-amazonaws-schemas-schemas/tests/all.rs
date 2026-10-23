@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/aws_managed_and_versions.rs"]
 mod aws_managed_and_versions;
+#[path = "all/aws_managed_catalog_metadata.rs"]
+mod aws_managed_catalog_metadata;
 #[path = "all/aws_managed_event_catalog.rs"]
 mod aws_managed_event_catalog;
 #[path = "all/code_binding_lifecycle.rs"]

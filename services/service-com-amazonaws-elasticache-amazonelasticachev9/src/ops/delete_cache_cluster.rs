@@ -178,9 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
             return Err(DeleteCacheClusterErrorModeled::CacheClusterNotFoundFault(
                 CacheClusterNotFoundFault {
-                    message: Some(format!(
-                        "Cache cluster {} not found.",
-                        input.cache_cluster_id
+                    message: Some(crate::state::cache_cluster_not_found_message(
+                        &input.cache_cluster_id,
                     )),
                 },
             )

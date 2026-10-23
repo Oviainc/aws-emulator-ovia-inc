@@ -185,17 +185,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
         let now = SystemTime::now();
         let mut store = state.lock();
-        // The only write a listing performs: materialising a `Timeout` the clock had
+        // The only write a listing performs: materialising a transition the clock had
         // already made due, which was owed whether or not anybody listed.
-        store.expire_due_snapshots(now);
+        store.apply_due_transitions(now);
 
         let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
             .unwrap_or(0);
 
         let Some(snapshot) = store.snapshots.get(&input.snapshot_id) else {
-            return Err(not_found(format!(
-                "snapshot {} does not exist",
-                input.snapshot_id
+            // A value that is not even shaped like a snapshot id is a malformed
+            // parameter, not a snapshot the service does not hold.
+            if !crate::state::is_well_formed_snapshot_id(&input.snapshot_id) {
+                return Err(validation(
+                    "INVALID_SNAPSHOT_ID",
+                    crate::state::malformed_snapshot_id_message(
+                        "snapshotId",
+                        &input.snapshot_id,
+                    ),
+                ));
+            }
+            return Err(not_found(crate::state::snapshot_not_found_message(
+                &input.snapshot_id,
             )));
         };
 

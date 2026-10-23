@@ -369,6 +369,14 @@ fn rejection_reason(finding: &AwsSecurityFinding) -> Option<String> {
             ));
         }
     }
+    // `Note$Text`'s documented bound, the same one
+    // `crate::state::note_text_violation` holds a customer's note write to, so a
+    // provider cannot store a note no update could.
+    if let Some(note) = finding.note.as_ref() {
+        if let Some(message) = crate::state::note_text_violation(&note.text) {
+            return Some(message);
+        }
+    }
     for (member, map) in [
         ("ProductFields", finding.product_fields.as_ref()),
         ("UserDefinedFields", finding.user_defined_fields.as_ref()),

@@ -65,6 +65,12 @@ impl Reply {
 /// `Cargo.lock` content six times, so the suite reads and writes the wire bytes with
 /// the crates the service already depends on. Escaping every non-alphanumeric byte is
 /// always a valid form encoding.
+///
+/// `pub(crate)` because the other suites in this one test binary
+/// (`all/shared_endpoint_routing.rs` and `all/query_error_envelope.rs`) write the same
+/// wire bytes and read them with the same helpers below: one encoder and one element
+/// reader for the crate, so the suites cannot drift on encoding or on how an empty
+/// element is reported.
 pub(crate) fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {

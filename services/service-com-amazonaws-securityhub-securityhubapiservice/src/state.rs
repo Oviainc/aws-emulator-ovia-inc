@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ops::types::{
     AutomationRulesAction, AutomationRulesFindingFieldsUpdate, AutomationRulesFindingFilters,
     AwsSecurityFinding, BooleanFilter, DateFilter, DateRange, FindingHistoryUpdate, Note,
-    NumberFilter, Severity, Standard, StandardsManagedBy, StandardsSubscription, StringFilter,
-    Workflow,
+    NoteUpdate, NumberFilter, Severity, Standard, StandardsManagedBy, StandardsSubscription,
+    StringFilter, Workflow,
 };
 
 /// The hub resource is one per account and Region, named `hub/default`.
@@ -746,6 +746,36 @@ pub const DEFAULT_RECORD_STATE: &str = "ACTIVE";
 /// finding, before it is reviewed" (`smithy_query(query="doc", shape="Workflow",
 /// member="Status")`).
 pub const DEFAULT_WORKFLOW_STATUS: &str = "NEW";
+
+/// The longest `Note.Text` a finding keeps: "Length Constraints: Minimum of 1.
+/// Maximum of 512." (`smithy_query(query="doc", shape="Note", member="Text")`). The
+/// bound is the service's own, and it is what keeps one note write bounded: a note is
+/// caller-sized text copied onto EVERY finding the write addresses, so without the
+/// documented ceiling a single request would grow this store by (findings written) ×
+/// (whatever text the caller sent).
+pub const MAX_NOTE_TEXT_LEN: usize = 512;
+
+/// Why this note text cannot be stored, naming the member and the constraint it
+/// violates, or `None` when it satisfies them.
+///
+/// The documented length constraint is on the stored `Note$Text`, so it holds wherever
+/// a note is written — a provider's `Note` on an imported finding as much as a
+/// customer's `NoteUpdate` — which is why the bound and its wording live here and
+/// every writer asks this one function. `Note$Text`'s minimum of 1 is already refused
+/// at the request boundary, where the member targets `NonEmptyString`
+/// (`@pattern("\\S")`).
+pub fn note_text_violation(text: &str) -> Option<String> {
+    let characters = text.chars().count();
+    (characters > MAX_NOTE_TEXT_LEN).then(|| {
+        format!("Note.Text must be at most {MAX_NOTE_TEXT_LEN} characters, got {characters}")
+    })
+}
+
+/// [`note_text_violation`] for the text a `NoteUpdate` carries, so an operation that
+/// holds one asks it directly.
+pub fn note_update_violation(note: &NoteUpdate) -> Option<String> {
+    note_text_violation(&note.text)
+}
 
 /// The Region an emulated request is for: the SigV4 credential scope's Region when
 /// the request is signed, else the emulator's default Region.

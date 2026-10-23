@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutIntegrationResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutIntegrationResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutIntegrationResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one `IntegrationResponse` of a method's integration: the record that maps a
+//! backend response — selected by `selectionPattern` — onto a method response status
+//! code, with the header mappings and body templates that transform it. The record is
+//! stored on the integration the method carries ([`crate::state::MethodEntry::integration`]'s
+//! `integrationResponses`), keyed by its `statusCode`, so `GetIntegrationResponse` and
+//! `GetIntegration` report the same one record.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +124,150 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::put_integration::MAX_TEMPLATE_CHARS;
+use super::put_method::method_key;
+use super::put_method_response::{
+    invalid_response_parameter, is_field_name_char, is_method_response_header,
+};
+
+/// The prefix an integration response header mapping expression carries.
+///
+/// From `PutIntegrationResponseRequest$responseParameters`' own documentation: "The mapped
+/// non-static value must match the pattern of `integration.response.header.{name}` or
+/// `integration.response.body.{JSON-expression}`". Hand-written because the model types
+/// the map value as a bare `String` and declares no pattern for it.
+pub const INTEGRATION_RESPONSE_HEADER_PREFIX: &str = "integration.response.header.";
+
+/// The prefix an integration response body mapping expression carries; see
+/// [`INTEGRATION_RESPONSE_HEADER_PREFIX`].
+pub const INTEGRATION_RESPONSE_BODY_PREFIX: &str = "integration.response.body.";
+
+/// Whether `value` is the static form a mapped value may take: "a static value enclosed
+/// within a pair of single quotes" (`responseParameters`). A pair of quotes is two
+/// characters, so the shortest static value is the empty string between them.
+pub fn is_static_mapping_value(value: &str) -> bool {
+    value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'')
+}
+
+/// Whether `value` is one of the forms a `responseParameters` value may take: a static
+/// value in single quotes, an `integration.response.header.{name}` expression naming a
+/// valid header, or an `integration.response.body.{JSON-expression}` expression carrying
+/// a JSON expression "without the `$` prefix".
+///
+/// The header name's character set is the HTTP field-name token of RFC 9110 §5.1, which
+/// is what "a valid and unique response header name" means on the wire — the same token
+/// [`is_method_response_header`] holds the mapping KEY to.
+pub fn is_integration_response_mapping_value(value: &str) -> bool {
+    if is_static_mapping_value(value) {
+        return true;
+    }
+    if let Some(name) = value.strip_prefix(INTEGRATION_RESPONSE_HEADER_PREFIX) {
+        return !name.is_empty() && name.chars().all(is_field_name_char);
+    }
+    if let Some(expression) = value.strip_prefix(INTEGRATION_RESPONSE_BODY_PREFIX) {
+        return !expression.is_empty() && !expression.starts_with('$');
+    }
+    false
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound.
+///
+/// Called BEFORE the store lock is taken, so an over-sized request never reaches the
+/// records at all. The integration response COUNT per integration needs no cap of its
+/// own: a response is keyed by a `statusCode` the model constrains to `^[1-5]\d\d$`, so
+/// an integration holds at most that many. A `responseTemplates` value is a mapping
+/// template, bounded by [`MAX_TEMPLATE_CHARS`] the way an integration's request templates
+/// are.
+fn bound_input(input: &PutIntegrationResponseInput) -> Result<(), String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    if let Some(pattern) = &input.selection_pattern {
+        bound_chars("selectionPattern", pattern, MAX_STRING_CHARS)?;
+    }
+    if let Some(parameters) = &input.response_parameters {
+        bound_entries(
+            "responseParameters",
+            parameters.len(),
+            MAX_COLLECTION_ENTRIES,
+        )?;
+        for (key, value) in parameters {
+            bound_chars("a responseParameters key", key, MAX_STRING_CHARS)?;
+            bound_chars("a responseParameters value", value, MAX_STRING_CHARS)?;
+        }
+    }
+    if let Some(templates) = &input.response_templates {
+        bound_entries("responseTemplates", templates.len(), MAX_COLLECTION_ENTRIES)?;
+        for (key, value) in templates {
+            bound_chars("a responseTemplates key", key, MAX_STRING_CHARS)?;
+            bound_chars("a responseTemplates value", value, MAX_TEMPLATE_CHARS)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `IntegrationResponse` record `input` asks for, as it must be STORED: the status
+/// code this call creates the response for, the selection pattern that chooses it, and
+/// the caller-supplied maps.
+///
+/// `Err` carries the `BadRequestException` message for a `responseParameters` entry that
+/// breaks one of the two rules the member publishes — a key that is not a
+/// `method.response.header.{name}` mapping expression (refused with
+/// [`invalid_response_parameter`], the message `PutMethodResponse` publishes for the same
+/// form), or a value that is neither a static value in single quotes nor an
+/// `integration.response.{header,body}` expression.
+/// The `responseTemplates` values are mapping templates, which this control plane stores
+/// verbatim: nothing in the model constrains their text.
+///
+/// Validation happens here, before anything is written, so a refused request leaves the
+/// integration's responses as they were.
+fn integration_response_of(
+    input: &PutIntegrationResponseInput,
+) -> Result<GetIntegrationResponseOutput, String> {
+    for (key, value) in input.response_parameters.iter().flatten() {
+        // The KEY form is the one `PutMethodResponse` publishes for the member it maps
+        // FROM, so the refusal is stated by that operation's shared helper: the two
+        // cannot drift on what a key outside the documented form says.
+        if !is_method_response_header(key) {
+            return Err(invalid_response_parameter(key));
+        }
+        if !is_integration_response_mapping_value(value) {
+            return Err(format!(
+                "Invalid mapping expression specified: {value}; an integration response parameter \
+                 value must be a static value enclosed in single quotes, \
+                 {INTEGRATION_RESPONSE_HEADER_PREFIX}{{name}} or \
+                 {INTEGRATION_RESPONSE_BODY_PREFIX}{{JSON-expression}}"
+            ));
+        }
+    }
+    Ok(GetIntegrationResponseOutput {
+        // The status code is a path label the model constrains to `^[1-5]\d\d$`, so the
+        // boundary validator has already refused anything that is not three digits.
+        status_code: Some(input.status_code.clone()),
+        // `selectionPattern` is reported only when the request set one: the response an
+        // empty pattern selects is the integration's default response, which carries no
+        // pattern of its own.
+        selection_pattern: input.selection_pattern.clone(),
+        response_parameters: crate::state::non_empty_map(input.response_parameters.clone()),
+        response_templates: crate::state::non_empty_map(input.response_templates.clone()),
+        // `contentHandling` is a modelled enum, so the boundary validator has already
+        // refused anything outside its value set.
+        content_handling: input.content_handling.clone(),
+    })
+}
+
+/// The stored `IntegrationResponse` as THIS operation's output shape. Both are the
+/// model's `IntegrationResponse`, so a stored record is rendered the same way by every
+/// reader of it.
+fn output_of(stored: GetIntegrationResponseOutput) -> PutIntegrationResponseOutput {
+    PutIntegrationResponseOutput {
+        status_code: stored.status_code,
+        selection_pattern: stored.selection_pattern,
+        response_parameters: stored.response_parameters,
+        response_templates: stored.response_templates,
+        content_handling: stored.content_handling,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,6 +303,24 @@ impl From<PutIntegrationResponseErrorModeled> for PutIntegrationResponseError {
     fn from(modeled: PutIntegrationResponseErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Refuse a request that breaks one of the `IntegrationResponse` rules; see
+/// [`integration_response_of`].
+fn bad_request(message: String) -> PutIntegrationResponseError {
+    PutIntegrationResponseErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> PutIntegrationResponseError {
+    PutIntegrationResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
 
 /// The `PutIntegrationResponse` operation.
@@ -201,16 +361,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutIntegrationResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutIntegrationResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutIntegrationResponse"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        bound_input(&input).map_err(bad_request)?;
+        let response = integration_response_of(&input).map_err(bad_request)?;
+
+        let mut store = state.lock();
+
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        // An integration response belongs to the INTEGRATION of a method: the verb in the
+        // URI must name a method on the resource, and that method must already carry an
+        // integration, or there is nothing to add the response to.
+        let method = resource
+            .methods
+            .get_mut(&method_key(&input.http_method))
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        let integration = method
+            .integration
+            .as_mut()
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
+
+        // A status code names at most one response of an integration: adding one that is
+        // already there is a conflict, not an overwrite — `UpdateIntegrationResponse` is
+        // the call that changes a stored response. Checked BEFORE the map is reached for
+        // writing, so the record is touched only once the request is known to succeed.
+        if integration
+            .integration_responses
+            .as_ref()
+            .is_some_and(|responses| responses.contains_key(&input.status_code))
+        {
+            return Err(PutIntegrationResponseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        "Integration response already exists for this method".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        integration
+            .integration_responses
+            .get_or_insert_with(::std::collections::HashMap::new)
+            .insert(input.status_code.clone(), response.clone());
+
+        Ok(output_of(response))
     }
 }
