@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/approval_rules_and_commits.rs"]
 mod approval_rules_and_commits;
+#[path = "all/batch_get_repositories.rs"]
+mod batch_get_repositories;
 #[path = "all/blob_content.rs"]
 mod blob_content;
 #[path = "all/branch_creation.rs"]

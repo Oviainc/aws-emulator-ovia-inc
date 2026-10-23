@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetRepositories
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetRepositories`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: answers with the stored metadata of each named repository, read from
+//! `crate::state`, and reports the names the store does not hold in
+//! `repositoriesNotFound`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetRepositories::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An empty `repositoryNames` array is served with empty lists rather than refused,
+//! which is what that member's own documentation states ("The array itself can be
+//! empty"); the modelled `RepositoryNamesRequiredException` answers a request that
+//! carries no `repositoryNames` member at all, which the `@required` boundary check
+//! refuses before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +91,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many repository names one `BatchGetRepositories` call may carry.
+///
+/// `MaximumRepositoryNamesExceededException` documents the limit itself: "The
+/// maximum number of allowed repository names was exceeded. Currently, this number
+/// is 100."
+/// (`smithy_query(query="shape",shape="MaximumRepositoryNamesExceededException")`).
+const MAX_REPOSITORY_NAMES: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,18 +174,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetRepositories` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetRepositoriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // Each name's length and pattern are modeled on `RepositoryNameList`'s member,
+        // so the boundary validator already refused anything outside them. The limit on
+        // the NUMBER of names is not modeled, and the service answers its own error
+        // for it.
+        if input.repository_names.len() > MAX_REPOSITORY_NAMES {
+            return Err(
+                BatchGetRepositoriesErrorModeled::MaximumRepositoryNamesExceededException(
+                    MaximumRepositoryNamesExceededException {
+                        message: Some(format!(
+                            "the maximum number of allowed repository names was exceeded: {} names were specified and the maximum is {MAX_REPOSITORY_NAMES}",
+                            input.repository_names.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+
+        // One entry per name, in the order the request listed them: a name the store
+        // holds contributes the SAME metadata projection `GetRepository` reports, and a
+        // name it does not hold contributes to `repositoriesNotFound`. A repeated name
+        // names one repository, so it is reported once.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetRepositories"))
+        // An EMPTY list is served, not refused: `repositoryNames`'s own documentation
+        // says "The array itself can be empty", and the modeled
+        // `RepositoryNamesRequiredException` covers the member being absent — which the
+        // boundary validator refuses first, the member being `@required` — so that
+        // variant is intentionally unreachable from here.
+        let mut repositories: Vec<RepositoryMetadata> = Vec::new();
+        let mut repositories_not_found: Vec<String> = Vec::new();
+        let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        for name in &input.repository_names {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            match store.repositories.get(name) {
+                Some(repository) => repositories.push(repository.metadata()),
+                None => repositories_not_found.push(name.clone()),
+            }
+        }
+
+        Ok(BatchGetRepositoriesOutput {
+            repositories: Some(repositories),
+            repositories_not_found: Some(repositories_not_found),
+            // `errors` reports a repository that was found but could not be read: every
+            // code `BatchGetRepositoriesErrorCodeEnum` declares beyond
+            // `RepositoryDoesNotExistException` is an encryption-key failure, and this
+            // emulator holds no key state in which a stored repository is unreadable,
+            // so the list is always empty. A name the store does not hold is reported in
+            // `repositoriesNotFound`, the member the model documents for it.
+            errors: Some(Vec::new()),
+        })
     }
 }
