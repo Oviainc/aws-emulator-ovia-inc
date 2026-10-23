@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstanceMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstanceMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the instance metric series the store holds for the instance the
+//! request names, over the window and at the granularity the request asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstanceMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting read: it looks up the instance, refuses a request whose values
+//! cannot hold together, and reports the datapoints the store has for that
+//! metric — it writes nothing, so a later caller sees exactly what it would have
+//! seen had this call never happened.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +201,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstanceMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstanceMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstanceMetricData"))
+        // `ctx` carries request metadata only, and nothing this operation
+        // reports comes from it: the metrics of one instance are the metrics of
+        // that instance's own record, wherever the request was signed for.
+        let _ = ctx;
+
+        // `instanceName`, `metricName`, `period`, `startTime`, `endTime`, `unit`
+        // and `statistics` are modelled `@required` members; the name's pattern,
+        // the `MetricPeriod` range (60..=86400) and every enum this input reaches
+        // (`InstanceMetricName`, `MetricUnit` and the `MetricStatistic` entries
+        // of `statistics`) are modelled constraints, so the centralized walk
+        // refused anything outside them before this body ran. What is left is
+        // what the model cannot express: the window has to be a window, the unit
+        // has to be the one the metric is published in, and the request has to
+        // ask for at least one statistic.
+
+        // "The start time of the time period" / "The end time of the time
+        // period": a period whose end does not follow its start is no period at
+        // all, so no window of it could be reported.
+        let start = crate::state::timestamp_key(input.start_time);
+        let end = crate::state::timestamp_key(input.end_time);
+        if start >= end {
+            return Err(invalid(format!(
+                "startTime must be earlier than endTime, got startTime {} and endTime {} \
+                 (seconds since the epoch)",
+                start.0, end.0
+            )));
+        }
+
+        // `unit` is "The unit for the metric data request. Valid units depend on
+        // the metric data being requested. For the valid units to specify with
+        // each available metric, see the metricName parameter" — and each
+        // instance metric's own entry states the ONE unit it is published in
+        // (`crate::state::INSTANCE_METRIC_UNITS`). A request asking for a metric
+        // in a unit it is not published in names no series, so it is refused as
+        // the invalid input it is rather than answered as if the series existed.
+        let Some(published_unit) = crate::state::instance_metric_unit(&input.metric_name) else {
+            // Unreachable while the catalog covers the modelled
+            // `InstanceMetricName` enum, which the boundary walk restricts
+            // `metricName` to. A metric the model gains and the catalog does not
+            // know yet has no published unit here, so it is honestly "not
+            // written yet" rather than refused or answered.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetInstanceMetricData for the instance metric {}",
+                input.metric_name
+            )));
+        };
+        if input.unit != published_unit {
+            return Err(invalid(format!(
+                "unit '{}' is not a valid unit for the instance metric {}: its published unit \
+                 is {published_unit}",
+                input.unit, input.metric_name
+            )));
+        }
+
+        // `statistics` is "The statistic for the metric": a request that names
+        // none asks for no statistic of the metric, so there is nothing it could
+        // be answered with.
+        if input.statistics.is_empty() {
+            return Err(invalid(
+                "statistics must name at least one statistic of the metric to return".to_string(),
+            ));
+        }
+
+        let metric_name = input.metric_name;
+        let instance_name = input.instance_name;
+        crate::state::with_state(&*self.engine, |store| {
+            // Metrics are reported for an instance this account HOLDS: a name no
+            // instance record answers to earns the service's `DoesNotExist`
+            // envelope, not an authoritative-looking empty series.
+            if store.instance(&instance_name).is_none() {
+                return Err(not_found(&instance_name));
+            }
+            Ok(GetInstanceMetricDataOutput {
+                // "The name of the metric returned" — the metric whose series
+                // this answer is, which is the one the request named.
+                metric_name: Some(metric_name.clone()),
+                // The datapoints the store holds for that metric over the
+                // requested window: NONE, for every window and every instance.
+                //
+                // Each instance metric is a measurement taken on a running
+                // guest — the percentage of allocated compute units in use, the
+                // bytes the instance's interfaces carried, the operations its
+                // system disk completed, whether its status checks passed, how
+                // often its metadata service was reached without a token. This
+                // emulator runs no guest and monitors none, so no observation
+                // was ever made in any of the period windows the request spans,
+                // whatever its `period` and whichever granularity the metric is
+                // published at (60 seconds for the status checks, 300 for the
+                // rest, from `GetInstanceMetricDataRequest$period`).
+                //
+                // An empty `metricData` says exactly that, and is what the
+                // service itself answers for a window it holds no data for — a
+                // window before the instance existed, say. A plausible-looking
+                // number per window would be invented telemetry a client could
+                // not tell from a measured one, and would contradict the rest of
+                // this store, where every alarm stays `INSUFFICIENT_DATA`
+                // because no metric of it has data
+                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`). The
+                // `statistics` the request asked for select members OF a
+                // datapoint, so with no datapoints they have nothing to fill.
+                metric_data: Some(Vec::new()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> GetInstanceMetricDataError {
+    GetInstanceMetricDataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> GetInstanceMetricDataError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetInstanceMetricDataError {
+    GetInstanceMetricDataErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

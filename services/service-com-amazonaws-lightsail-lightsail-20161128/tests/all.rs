@@ -47,6 +47,8 @@ mod domain_zone;
 mod instance_error_envelope;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
+#[path = "all/instance_metric_data.rs"]
+mod instance_metric_data;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/relational_database_blueprints.rs"]

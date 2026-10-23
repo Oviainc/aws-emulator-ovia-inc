@@ -4401,6 +4401,53 @@ pub fn public_domain_names_from_request(
 }
 
 // ---------------------------------------------------------------------------
+// Instance metrics
+// ---------------------------------------------------------------------------
+
+/// Every metric an instance publishes, each with the `unit` its data is
+/// published in.
+///
+/// The list is the modelled `GetInstanceMetricDataRequest$metricName`
+/// documentation — "Valid instance metric names are listed below, along with the
+/// most useful `statistics` to include in your request, and the published `unit`
+/// value" — and the `unit` of each row is the "published unit" that entry states.
+/// Source:
+/// `smithy_query(query="doc",shape="GetInstanceMetricDataRequest",member="metricName")`.
+/// It covers every member of the modelled `InstanceMetricName` enum, which is
+/// what `GetInstanceMetricData`'s boundary walk admits.
+///
+/// WIDER than the instance rows of [`ALARM_METRICS`]: that list is the narrower
+/// set of metrics an ALARM can watch, and `MetadataNoToken` is published by an
+/// instance without being one of them.
+pub const INSTANCE_METRIC_UNITS: &[(&str, &str)] = &[
+    ("BurstCapacityPercentage", "Percent"),
+    ("BurstCapacityTime", "Seconds"),
+    ("CPUUtilization", "Percent"),
+    ("NetworkIn", "Bytes"),
+    ("NetworkOut", "Bytes"),
+    ("StatusCheckFailed", "Count"),
+    ("StatusCheckFailed_Instance", "Count"),
+    ("StatusCheckFailed_System", "Count"),
+    ("MetadataNoToken", "Count"),
+    ("DiskReadOps", "Count"),
+    ("DiskWriteOps", "Count"),
+    ("DiskReadBytes", "Bytes"),
+    ("DiskWriteBytes", "Bytes"),
+    ("DiskTotalReadTime", "Seconds"),
+    ("DiskTotalWriteTime", "Seconds"),
+    ("DiskQueueLength", "Count"),
+];
+
+/// The unit the instance metric `metric_name` is published in, or `None` when
+/// this catalog does not know the metric.
+pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
+    INSTANCE_METRIC_UNITS
+        .iter()
+        .find(|(name, _)| *name == metric_name)
+        .map(|(_, unit)| *unit)
+}
+
+// ---------------------------------------------------------------------------
 // Alarms
 // ---------------------------------------------------------------------------
 
@@ -4409,8 +4456,11 @@ pub fn public_domain_names_from_request(
 /// immediately set to INSUFFICIENT_DATA."
 ///
 /// It is also where an alarm of this store STAYS until something moves it: the
-/// store holds no metric datapoints at all (every `Get*MetricData` operation is
-/// still a scaffold with its own issue), and the modelled `Alarm$state`
+/// store holds no metric datapoints at all (this emulator runs no instance,
+/// load balancer or database workload and receives no measurement of one, which
+/// is why `GetInstanceMetricData` answers an empty `metricData`; the other
+/// `Get*MetricData` operations are still scaffolds with their own issues), and
+/// the modelled `Alarm$state`
 /// documentation defines `INSUFFICIENT_DATA` as exactly that — "the metric is not
 /// available, or not enough data is available for the metric to determine the
 /// alarm state". Nothing here invents an evaluation that no metric data could
@@ -5585,6 +5635,13 @@ pub fn now_ms() -> i64 {
 /// Epoch milliseconds as the modelled `IsoDate` timestamp.
 pub fn timestamp(epoch_millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(epoch_millis)
+}
+
+/// Order two modelled timestamps. A `DateTime` carries seconds plus a
+/// sub-second part, so both are compared — two instants one nanosecond apart
+/// are not the same instant.
+pub fn timestamp_key(value: ::aws_smithy_types::DateTime) -> (i64, u32) {
+    (value.secs(), value.subsec_nanos())
 }
 
 /// A seed drawn once per process, so ids minted by two emulator processes from
