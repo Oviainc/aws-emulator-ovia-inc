@@ -247,6 +247,14 @@ pub const MARKER_SCOPE_ROLES: &str = "roles";
 /// another's: see [`role_attached_policies_marker_scope`].
 pub const MARKER_SCOPE_ROLE_ATTACHED_POLICIES: &str = "role-attached-policies";
 
+/// The marker scope of ONE role's EMBEDDED inline policies, which
+/// `ListRolePolicies` pages over. The role's key follows it, exactly as it does
+/// for the attachment set, so a marker issued while paging one role's inline
+/// policies names no position in another role's — and a marker issued for a
+/// role's attachments is not read as a position among its inline policies:
+/// see [`role_policies_marker_scope`].
+pub const MARKER_SCOPE_ROLE_POLICIES: &str = "role-policies";
+
 /// The marker scope of the entities ONE managed policy relates to, which
 /// `ListEntitiesForPolicy` pages over. The policy's ARN follows it, so a marker
 /// issued while paging the entities of one policy does not name a position in
@@ -816,6 +824,11 @@ pub fn service_linked_role_principal(path: &str) -> Option<&str> {
 /// The marker scope of the attachment set of the role keyed by `role_key`.
 pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
+}
+
+/// The marker scope of the inline-policy set of the role keyed by `role_key`.
+pub fn role_policies_marker_scope(role_key: &str) -> String {
+    format!("{MARKER_SCOPE_ROLE_POLICIES}:{role_key}")
 }
 
 /// The marker scope of the entity collection of the managed policy `policy_arn`
