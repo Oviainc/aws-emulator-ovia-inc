@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddEntityOwner
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddEntityOwner`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddEntityOwner::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one owner to a stored entity of one domain, writing it into `crate::state`:
+//! the entity's owners are a SET keyed by `crate::state::owner_key`, so the owner this
+//! call names is recorded exactly once and is reported from then on by
+//! `ListEntityOwners` and `GetDomainUnit`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddEntityOwner` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddEntityOwnerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddEntityOwner"))
+        use crate::state::{
+            caller_principal, now_ms, owner_from_properties, owner_key, ResourceKind,
+            DOMAIN_STATUS_AVAILABLE, MAX_OWNERS_PER_ENTITY,
+        };
+
+        // `entityType` targets an enum SHAPE, whose member set the request walk does
+        // not check, so the members the model declares are checked here rather than
+        // taken: a type this service has no entity of is bad input, and this operation
+        // models `ValidationException` for exactly that.
+        if !DATA_ZONE_ENTITY_TYPE_VALUES.contains(&input.entity_type.as_str()) {
+            return Err(AddEntityOwnerErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "entityType must be one of {}",
+                    DATA_ZONE_ENTITY_TYPE_VALUES.join(", ")
+                ),
+            })
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddEntityOwnerErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // This operation DOES model `ResourceNotFoundException`, so a domain or an
+        // entity that is not stored is reported as not found rather than as bad input.
+        let domain_status = store
+            .domains
+            .get(&input.domain_identifier)
+            .map(|domain| domain.status.clone())
+            .ok_or_else(|| {
+                AddEntityOwnerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                })
+            })?;
+        // A domain still being created, or already being deleted, cannot take an owner:
+        // the request conflicts with the domain's current state (the rule
+        // `CreateDomainUnit` and `AddPolicyGrant` apply to a write in that domain).
+        if domain_status != DOMAIN_STATUS_AVAILABLE {
+            return Err(AddEntityOwnerErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {domain_status}, so it cannot accept an entity owner",
+                    input.domain_identifier
+                ),
+            })
+            .into());
+        }
+
+        let wanted = owner_from_properties(&input.owner);
+        let wanted_key = owner_key(&wanted);
+        let added_by = caller_principal(ctx);
+        let entity = store
+            .owned_entity_mut(
+                &input.domain_identifier,
+                &input.entity_type,
+                &input.entity_identifier,
+            )
+            .ok_or_else(|| {
+                AddEntityOwnerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::DomainUnit.not_found_message(),
+                })
+            })?;
+
+        // The model marks this operation `@idempotent` and gives its `clientToken` the
+        // `@idempotencyToken` trait (smithy_query operation="AddEntityOwner"), so an
+        // entity's owners are a SET: a request naming an owner the entity already has
+        // leaves the entity exactly as it is and succeeds, however many times it is
+        // retried and whatever token it carries. `clientToken` therefore needs nothing
+        // remembered — the owner itself is the record of the first request.
+        if entity
+            .owners
+            .iter()
+            .any(|owner| owner_key(owner) == wanted_key)
+        {
+            return Ok(AddEntityOwnerOutput {});
+        }
+        // The store is bounded, so an add loop cannot grow the emulator's heap without
+        // limit; the refusal is the error the operation already models.
+        if entity.owners.len() >= MAX_OWNERS_PER_ENTITY {
+            return Err(AddEntityOwnerErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator keeps at most {MAX_OWNERS_PER_ENTITY} owners on one entity"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        entity.owners.push(wanted);
+        // Adding an owner changes the entity, which is what `lastUpdatedAt` reports:
+        // "The timestamp at which the domain unit was last updated" (smithy_query
+        // query="doc", shape="GetDomainUnitOutput", member="lastUpdatedAt").
+        entity.last_updated_by = Some(added_by);
+        entity.last_updated_at_ms = Some(now);
+
+        Ok(AddEntityOwnerOutput {})
     }
 }

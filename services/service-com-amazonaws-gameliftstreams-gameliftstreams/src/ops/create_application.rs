@@ -261,8 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateApplicationErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
@@ -270,6 +271,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize(now);
+
+        // `ApplicationSourceUri` — "Enter an Amazon S3 URI to a bucket that contains
+        // your game or other application." The model gives the member no `@pattern`,
+        // so the location is checked here, BEFORE any resource is allocated: a
+        // source the service could never read is not an application that streams
+        // nothing, it is a request to correct.
+        if !crate::state::is_s3_uri(&input.application_source_uri) {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::not_an_s3_uri("ApplicationSourceUri"),
+                },
+            )
+            .into());
+        }
 
         // `ApplicationLogOutputUri` — "Required if you specify one or more
         // ApplicationLogPaths." The model cannot express the dependency, so it is
@@ -282,19 +297,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !log_paths.is_empty() && log_output_uri.is_none() {
             return Err(CreateApplicationErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "ApplicationLogOutputUri is required when ApplicationLogPaths is set \
                          ({} path(s) given)",
                         log_paths.len()
-                    ),
+                    )),
                 },
             )
             .into());
         }
 
-        // A replayed `ClientToken` answers with the application the first request
-        // created rather than creating a second one.
-        let replayed = state.replayed(Self::NAME, input.client_token.as_deref());
+        // The parameters this request's `ClientToken` stands for. A second request
+        // carrying the same token answers with the application the first one created
+        // when they match, and is refused when they do not.
+        let mut fingerprint = crate::state::Fingerprint::new();
+        fingerprint.text("Description", &input.description);
+        fingerprint.text("RuntimeEnvironment.Type", &input.runtime_environment.r#type);
+        fingerprint.text(
+            "RuntimeEnvironment.Version",
+            &input.runtime_environment.version,
+        );
+        fingerprint.text("ExecutablePath", &input.executable_path);
+        fingerprint.text("ApplicationSourceUri", &input.application_source_uri);
+        fingerprint.list("ApplicationLogPaths", &log_paths);
+        fingerprint.optional("ApplicationLogOutputUri", log_output_uri.as_deref());
+        fingerprint.map("Tags", &input.tags.clone().unwrap_or_default());
+        let fingerprint = fingerprint.finish();
+
+        let replayed = match state.client_token_use(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::TokenUse::Fresh => None,
+            crate::state::TokenUse::Replay(id) => Some(id),
+            crate::state::TokenUse::Conflict => {
+                return Err(CreateApplicationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::client_token_conflict(),
+                    },
+                )
+                .into());
+            }
+        };
         let replayed = replayed.filter(|id| state.applications.contains_key(id));
         let id = match replayed {
             Some(id) => id,
@@ -305,11 +350,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         CreateApplicationErrorModeled::ServiceQuotaExceededException(
                             ServiceQuotaExceededException {
-                                message: format!(
+                                message: crate::state::with_internal_id(format!(
                                     "this emulator holds the maximum of {} applications; \
                                      delete one before creating another",
                                     crate::state::APPLICATION_QUOTA
-                                ),
+                                )),
                             },
                         )
                         .into(),
@@ -340,7 +385,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status_due_at: Some(now + crate::state::TRANSITION),
                 };
                 state.applications.insert(id.clone(), application);
-                state.remember(Self::NAME, input.client_token.as_deref(), &id);
+                state.remember(
+                    Self::NAME,
+                    input.client_token.as_deref(),
+                    &id,
+                    &fingerprint,
+                );
                 id
             }
         };

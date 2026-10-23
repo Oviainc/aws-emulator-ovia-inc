@@ -174,17 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let region = crate::state::region_of(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AddStreamGroupLocationsErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
         };
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
         let mut state = state.lock();
         state.materialize(now);
 
@@ -207,11 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if group.status != crate::state::STREAM_GROUP_ACTIVE {
             return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "stream group {} is in {} status; a location can only be added to a \
                          stream group in ACTIVE status",
                         group.id, group.status
-                    ),
+                    )),
                 },
             )
             .into());
@@ -227,18 +228,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for configuration in &input.location_configurations {
             if let Some(message) = crate::state::unstorable_location_configuration(configuration) {
                 return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
-                    ValidationException { message },
+                    ValidationException {
+                        message: crate::state::with_internal_id(message),
+                    },
                 )
                 .into());
             }
             if group.has_location(&configuration.location_name) {
                 return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
+                        message: crate::state::with_internal_id(format!(
                             "stream group {} already holds location {}; use UpdateStreamGroup to \
                              change the capacity of a location it holds",
                             group.id, configuration.location_name
-                        ),
+                        )),
                     },
                 )
                 .into());
@@ -246,10 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !configured.insert(configuration.location_name.as_str()) {
                 return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
+                        message: crate::state::with_internal_id(format!(
                             "LocationConfigurations configures location {} more than once",
                             configuration.location_name
-                        ),
+                        )),
                     },
                 )
                 .into());
@@ -264,14 +267,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 AddStreamGroupLocationsErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: format!(
+                        message: crate::state::with_internal_id(format!(
                             "stream group {} holds {} of the maximum of {} locations; \
                              adding {} more would exceed it",
                             group.id,
                             group.locations.len(),
                             crate::state::LOCATIONS_PER_STREAM_GROUP,
                             input.location_configurations.len()
-                        ),
+                        )),
                     },
                 )
                 .into(),

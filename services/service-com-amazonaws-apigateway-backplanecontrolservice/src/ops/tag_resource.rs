@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +66,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::BTreeMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +166,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The ARN is read and every tag bounded BEFORE the store lock is taken, so a
+        // request this service will not store never reaches the records at all. The ARN
+        // goes through [`crate::state::parse_tagged_resource`], the one place this
+        // service reads a `resourceArn`, so a tag write and a tag read can never resolve
+        // the same ARN to two different records.
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn)
+            .ok_or_else(|| {
+                bad_request(crate::state::invalid_tagged_resource_arn(&input.resource_arn))
+            })?;
+        // The request's OWN entry count is clamped before anything caller-sized is
+        // built: the merged collection always holds at least the request's distinct
+        // keys, so a request carrying more entries than the per-resource quota can never
+        // be stored anyway — and clamping it here keeps the allocation, the per-key
+        // check and the merge below bounded by the quota rather than by the body.
+        crate::state::bound_entries("tags", input.tags.len(), crate::state::MAX_TAGS)
+            .map_err(bad_request)?;
+        // Collected into a BTreeMap so the merge below is over the sorted collection the
+        // records keep.
+        let mut requested: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in &input.tags {
+            crate::state::bound_tag(key, value).map_err(bad_request)?;
+            requested.insert(key.clone(), value.clone());
+        }
+        let requested_count = requested.len();
+
+        let mut store = state.lock();
+        let stored = store.tags_of_mut(&resource).map_err(not_found)?;
+        // "Adds or updates a tag on a given resource": the request's entries are MERGED
+        // into the collection the resource already carries — a key it names takes the
+        // new value, a key it does not name keeps the value it had — so this call never
+        // replaces the collection. A request naming no tag therefore changes nothing,
+        // which is what merging an empty set means.
+        let mut merged = stored.clone();
+        merged.extend(requested);
+        // The per-resource tag quota is also charged on the RESULT, which is what the
+        // quota is about: re-setting a key the resource already carries does not grow
+        // its collection, while a new key that would take it past the quota is refused
+        // before anything is written.
+        crate::state::bound_entries("tags", merged.len(), crate::state::MAX_TAGS)
+            .map_err(bad_request)?;
+        *stored = merged;
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — a tag key and value are caller data and are never fields here.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            resource = ?input.resource_arn,
+            tags = requested_count,
+            outcome = "tagged",
+            "resource tagged",
+        );
+        Ok(TagResourceOutput)
     }
+}
+
+/// A request this service will not store: the bad request it is.
+fn bad_request(message: String) -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A well-formed ARN whose resource this emulator holds no record of.
+fn not_found(message: String) -> TagResourceError {
+    TagResourceErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

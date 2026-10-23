@@ -3,8 +3,17 @@
 //! @op CreateChangeSet
 //! IMPLEMENTED: persists a change set — its template, parameters, tags, capabilities and
 //! the rest of the request's configuration — together with the resource-level change list
-//! computed by comparing that template with the stack's current one, and answers the
-//! change set's ARN and its stack's id.
+//! computed by comparing the REVISION it submits (that template with those parameter
+//! values) against the one in force on the stack, and answers the change set's ARN and its
+//! stack's id.
+//!
+//! A change-set name the stack already carries is answered by COMPARING the attributes the
+//! request submits with the ones the stored change set carries: the same attributes name
+//! the same change set, so the call answers the change set that is already there, while
+//! differing ones cannot be created under that name and the refusal names the attribute
+//! that differs (`crate::state::StoredChangeSet::mismatching_attribute`). A request that
+//! would CREATE a stack that already exists is refused as the `ValidationError` it is —
+//! the request cannot be satisfied at all — rather than as a change-set name collision.
 //!
 //! `ChangeSetType=CREATE` also brings the stack itself into existence, in
 //! `REVIEW_IN_PROGRESS` with no template and no resources, keyed by the `StackId` this call
@@ -19,9 +28,10 @@
 //! what `DescribeChangeSet` reports and what `ExecuteChangeSet` waits for.
 //!
 //! The change list is read by the same template reader a deployment uses
-//! (`crate::state::template`), so it covers the JSON and YAML bodies `CreateStack` deploys;
-//! a body that reader will not read, or one declaring no resources, is refused with the
-//! `ValidationError` CloudFormation answers for a template format error.
+//! (`crate::state::template`) and computed by `crate::state::change_plan`, so it covers the
+//! JSON and YAML bodies `CreateStack` deploys; a body that reader will not read, or one
+//! declaring no resources, is refused with the `ValidationError` CloudFormation answers for
+//! a template format error.
 //!
 //! Answered 501 rather than guessed at: `TemplateURL` (fetching a template from Amazon S3
 //! needs an outbound connection this emulator does not make) and `ChangeSetType=IMPORT`
@@ -380,12 +390,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let creates_the_stack = requested_type == change_set_type::CREATE;
         if creates_the_stack {
             if existing.is_some() && !in_review {
-                return Err(CreateChangeSetErrorModeled::AlreadyExistsException(
-                    AlreadyExistsException {
-                        message: Some(format!("Stack [{}] already exists", input.stack_name)),
-                    },
-                )
-                .into());
+                // The request names a stack that is already there with the type that
+                // CREATES one, so it is the REQUEST that cannot be satisfied — not the
+                // change set's name colliding with another. CloudFormation answers the
+                // `ValidationError` it answers for a request whose shape is wrong, naming
+                // both the stack and the change set the request asked for; the modelled
+                // `AlreadyExistsException` is what a change-set NAME collision answers, and
+                // a client branching on the code has to be able to tell the two apart.
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Stack [{}] already exists and cannot be created again with the \
+                     changeSet [{}].",
+                    input.stack_name, input.change_set_name
+                )));
             }
             if existing.is_none() {
                 // The stack does not exist yet, so this call names it: the documented
@@ -438,20 +454,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The stack's current template, parameters and DEPLOYED resources, which the
-        // change set is computed against. A stack that does not exist yet has none.
-        let (previous_template, previous_parameters, deployed) = match target_stack_id.as_deref() {
-            None => (None, Vec::new(), Vec::new()),
-            Some(stack_id) => {
-                let stack = store
-                    .resolve(stack_id)
-                    .expect("the stack resolved immediately above");
-                (
-                    stack.template_body.clone(),
-                    stack.parameters.clone(),
-                    stack.resources.clone(),
-                )
-            }
-        };
+        // change set is computed against, plus the identity its pseudo parameters resolve
+        // to. A stack that does not exist yet has none of them.
+        let (previous_template, previous_parameters, deployed, stack_identity) =
+            match target_stack_id.as_deref() {
+                None => (None, Vec::new(), Vec::new(), None),
+                Some(stack_id) => {
+                    let stack = store
+                        .resolve(stack_id)
+                        .expect("the stack resolved immediately above");
+                    (
+                        stack.template_body.clone(),
+                        stack.parameters.clone(),
+                        stack.resources.clone(),
+                        Some((
+                            stack.region.clone(),
+                            stack.stack_name.clone(),
+                            stack.stack_id.clone(),
+                        )),
+                    )
+                }
+            };
         // "Whether to reuse the template that's associated with the stack to create the
         // change set."
         let template_body = match &input.template_body {
@@ -469,16 +492,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The change list is what a change set IS: "Creates a list of changes that will be
         // applied to a stack so that you can review the changes before executing them."
-        // It is computed here, once, from the two templates — never on a read — and by the
-        // SAME template reader a deployment uses, so a change set covers the JSON and YAML
-        // bodies `CreateStack` deploys.
-        let Some(declared) = crate::state::template_resources(&template_body) else {
+        // It is computed here, once — never on a read — by the SAME template reader a
+        // deployment uses, so a change set covers the JSON and YAML bodies `CreateStack`
+        // deploys, and from the stack's REVISION rather than its template alone:
+        // CloudFormation "compares the stack's information with the information that you
+        // submit in the change set", and the parameter values in force are part of that
+        // information.
+        let Some(submitted) = crate::state::declared_template(&template_body) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 "Template format error: the TemplateBody is not a template this service can \
                  read",
             ));
         };
-        if declared.is_empty() {
+        if submitted.resources.is_empty() {
             // A change set is a plan over resources, so a template that declares none has
             // nothing to plan: "Template format error: At least one Resources member must
             // be defined."
@@ -489,11 +515,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stack's own template is read the same way. A stack with no template yet, or
         // one whose template declares no resources, simply has none to compare against, so
         // every resource the submitted template declares is an addition.
-        let previous_declared = previous_template
+        let current = previous_template
             .as_deref()
-            .and_then(crate::state::template_resources)
+            .and_then(crate::state::declared_template)
             .unwrap_or_default();
-        let changes = crate::state::computed_changes(&previous_declared, &declared, &deployed);
+        let changes = crate::state::computed_changes(
+            stack_identity.as_ref().map(|(region, stack_name, stack_id)| {
+                crate::state::StackRevision {
+                    stack: crate::state::template::StackScope {
+                        region,
+                        stack_name,
+                        stack_id,
+                    },
+                    template: &current,
+                    parameters: &previous_parameters,
+                    deployed: &deployed,
+                }
+            }),
+            &submitted,
+            &parameters,
+        );
+
+        // The configuration the change set would carry, resolved once: it is what the
+        // comparison below holds a re-created name to AND what the record stores.
+        let capabilities = input.capabilities.clone().unwrap_or_default();
+        let resource_types = input.resource_types.clone().unwrap_or_default();
+        let notification_arns = input.notification_ar_ns.clone().unwrap_or_default();
+        let tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
+        let rollback_configuration =
+            crate::state::stored_rollback_configuration(input.rollback_configuration.as_ref());
+        let deployment_config =
+            crate::state::stored_deployment_config(input.deployment_config.as_ref());
+        let stored_change_set_type = if creates_the_stack {
+            change_set_type::CREATE
+        } else {
+            change_set_type::UPDATE
+        };
+        let submitted_attributes = crate::state::SubmittedChangeSet {
+            change_set_type: stored_change_set_type,
+            description: input.description.as_deref(),
+            template_body: &template_body,
+            parameters: &parameters,
+            capabilities: &capabilities,
+            resource_types: &resource_types,
+            role_arn: input.role_arn.as_deref(),
+            rollback_configuration: rollback_configuration.as_ref(),
+            notification_arns: &notification_arns,
+            tags: &tags,
+            on_stack_failure: input.on_stack_failure.as_deref(),
+            include_nested_stacks: input.include_nested_stacks.unwrap_or(false),
+            import_existing_resources: input.import_existing_resources.unwrap_or(false),
+            deployment_mode: input.deployment_mode.as_deref(),
+        };
 
         // A change set of this stack that this very request already created: "Specify this
         // token if you plan to retry requests so that CloudFormation knows that you're not
@@ -518,21 +591,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         // "The name must be unique among all change sets that are associated with the
-        // specified stack."
+        // specified stack." What a name the stack already carries answers depends on WHAT
+        // the request submits under it, not on the name alone: the same attributes name the
+        // same change set, so the call is answered with the change set that is already
+        // there, and differing attributes cannot be created under that name — a refusal
+        // that names the attribute that differs, so a client can tell an idempotent
+        // re-submit from a conflicting one.
         if let Some(stack_id) = target_stack_id.as_deref() {
-            if store
+            let existing_change_set = store
                 .change_sets_of(stack_id)
-                .any(|change_set| change_set.change_set_name == input.change_set_name)
-            {
-                return Err(CreateChangeSetErrorModeled::AlreadyExistsException(
-                    AlreadyExistsException {
-                        message: Some(format!(
-                            "ChangeSet [{}] already exists",
-                            input.change_set_name
-                        )),
-                    },
-                )
-                .into());
+                .find(|change_set| change_set.change_set_name == input.change_set_name)
+                .map(|change_set| {
+                    (
+                        change_set.change_set_id.clone(),
+                        change_set.stack_id.clone(),
+                        change_set.mismatching_attribute(&submitted_attributes),
+                    )
+                });
+            if let Some((change_set_id, stack_id, mismatch)) = existing_change_set {
+                return match mismatch {
+                    None => Ok(CreateChangeSetOutput {
+                        id: Some(change_set_id),
+                        stack_id: Some(stack_id),
+                    }),
+                    Some(attribute) => {
+                        Err(CreateChangeSetErrorModeled::AlreadyExistsException(
+                            AlreadyExistsException {
+                                message: Some(format!(
+                                    "ChangeSet {} cannot be created due to a mismatch with \
+                                     existing attribute {attribute}",
+                                    input.change_set_name
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                };
             }
             if store.change_sets_of(stack_id).count()
                 >= crate::state::MAX_CHANGE_SETS_PER_STACK
@@ -638,26 +732,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             change_set_name: input.change_set_name.clone(),
             stack_id: stack_id.clone(),
             stack_name,
-            change_set_type: if creates_the_stack {
-                change_set_type::CREATE.to_string()
-            } else {
-                change_set_type::UPDATE.to_string()
-            },
+            change_set_type: stored_change_set_type.to_string(),
             description: input.description.clone(),
             template_body,
             parameters,
-            capabilities: input.capabilities.clone().unwrap_or_default(),
-            tags: crate::state::stored_tags(input.tags.as_deref().unwrap_or_default()),
-            notification_arns: input.notification_ar_ns.clone().unwrap_or_default(),
+            capabilities,
+            tags,
+            notification_arns,
             role_arn: input.role_arn.clone(),
-            rollback_configuration: crate::state::stored_rollback_configuration(
-                input.rollback_configuration.as_ref(),
-            ),
-            deployment_config: crate::state::stored_deployment_config(
-                input.deployment_config.as_ref(),
-            ),
+            rollback_configuration,
+            deployment_config,
             deployment_mode: input.deployment_mode.clone(),
-            resource_types: input.resource_types.clone().unwrap_or_default(),
+            resource_types,
             on_stack_failure: input.on_stack_failure.clone(),
             include_nested_stacks: input.include_nested_stacks.unwrap_or(false),
             import_existing_resources: input.import_existing_resources.unwrap_or(false),

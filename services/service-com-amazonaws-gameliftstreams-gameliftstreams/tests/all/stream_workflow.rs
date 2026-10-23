@@ -59,6 +59,20 @@ pub(crate) async fn call(
     path_and_query: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    call_in_scope_region(router, method, path_and_query, body, REGION).await
+}
+
+/// The same call, with the credential scope naming `scope_region` instead of
+/// [`REGION`] — which is what decides the region segment of every ARN the
+/// emulator mints for the request, so a caller can send a region the emulator
+/// never chose itself.
+pub(crate) async fn call_in_scope_region(
+    router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<Value>,
+    scope_region: &str,
+) -> (u16, Value) {
     let payload = body
         .map(|value| serde_json::to_vec(&value).expect("a JSON request body serializes"))
         .unwrap_or_default();
@@ -72,8 +86,8 @@ pub(crate) async fn call(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIAEMULATORTEST/20260101/{REGION}/gameliftstreams/\
-                 aws4_request, SignedHeaders=host, Signature=0"
+                "AWS4-HMAC-SHA256 Credential=AKIAEMULATORTEST/20260101/{scope_region}/\
+                 gameliftstreams/aws4_request, SignedHeaders=host, Signature=0"
             ),
         )
         .body(::bytes::Bytes::from(payload))

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStreamSessionConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStreamSessionConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resolves the stream group and the stream session a reconnection names, and
+//! answers from the STORED session: an identifier that names nothing is a
+//! `ResourceNotFoundException`, and a session in a status a reconnection cannot
+//! start from is this operation's modelled `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStreamSessionConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No success path exists, and that is deliberate. `SignalResponse` is "the WebRTC
+//! answer string that the stream server generates in response to the
+//! SignalRequest"; this emulator runs no stream server, so a `SignalResponse` it
+//! returned would be fabricated rather than computed. Accordingly nothing here ever
+//! reaches a session in `ACTIVE` or `PENDING_CLIENT_RECONNECTION` status —
+//! `StartStreamSession` leaves a session `ACTIVATING` and the clock takes it to
+//! `ERROR` — and the one branch that would need a stream server answers the
+//! scaffold's 501 instead of inventing a signal.
+//!
+//! RESIDUAL 501 (deliberately NOT a `SCAFFOLDED, NOT IMPLEMENTED:` marker, which
+//! would re-report the whole operation as unwritten): the only 501 left is the
+//! branch for a session already in a connected status, which nothing in this
+//! emulator can produce and which no emulator without a real WebRTC stream server
+//! can answer faithfully. Every reachable call is served from state.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +199,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStreamSessionConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamSessionConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStreamSessionConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateStreamSessionConnectionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::with_internal_id(
+                            "the gameliftstreams emulator holds no state on this engine",
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::region_of(ctx.parts());
+        let mut state = state.lock();
+        state.materialize(now);
+
+        // Session-scoped: the resource this call addresses is the stream session its
+        // two path labels name, so an unresolvable session identifier, an absent
+        // group and an absent session are the SAME miss, reported against the
+        // composite stream session ARN — the rule `GetStreamSession` and
+        // `TerminateStreamSession` already answer by.
+        let session = crate::state::identifier_id(
+            &input.stream_session_identifier,
+            crate::state::STREAM_SESSION_RESOURCE,
+        )
+        .and_then(|session_id| {
+            state
+                .stream_group(&input.identifier)
+                .and_then(|group| group.sessions.get(&session_id))
+        });
+        let Some(session) = session else {
+            return Err(
+                CreateStreamSessionConnectionErrorModeled::ResourceNotFoundException(
+                    crate::state::stream_session_not_found(
+                        &crate::state::resolved_stream_session_arn(
+                            &region,
+                            &input.identifier,
+                            &input.stream_session_identifier,
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // "This reconnection process can be initiated when a stream session is in
+        // either PENDING_CLIENT_RECONNECTION or ACTIVE status." A session in any
+        // other status cannot be reconnected, which is the conflict this operation
+        // models.
+        if !matches!(
+            session.status.as_str(),
+            crate::state::SESSION_ACTIVE | crate::state::SESSION_PENDING_CLIENT_RECONNECTION
+        ) {
+            return Err(CreateStreamSessionConnectionErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::with_internal_id(format!(
+                        "stream session {} is in {} status; a connection can only be created \
+                         for a stream session in {} or {} status",
+                        session.id,
+                        session.status,
+                        crate::state::SESSION_ACTIVE,
+                        crate::state::SESSION_PENDING_CLIENT_RECONNECTION
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Reachable only for a session in a connected status, which this emulator
+        // never mints: answering it needs a stream server to turn the WebRTC offer in
+        // `SignalRequest` into the answer `SignalResponse` carries, and this emulator
+        // runs none. A synthesised answer would be a fabricated response, so the
+        // scaffold's 501 says what is true: nothing here can serve it.
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            "CreateStreamSessionConnection",
+        ))
     }
 }

@@ -188,8 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteApplicationErrorModeled::InternalServerException(
                 InternalServerException {
-                    message: "the gameliftstreams emulator holds no state on this engine"
-                        .to_string(),
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
                 },
             )
             .into());
@@ -217,10 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::APPLICATION_INITIALIZED | crate::state::APPLICATION_PROCESSING
         ) {
             return Err(DeleteApplicationErrorModeled::ConflictException(ConflictException {
-                message: format!(
+                message: crate::state::with_internal_id(format!(
                     "application {} is in {} status and cannot be deleted yet",
                     application.id, application.status
-                ),
+                )),
             })
             .into());
         }
@@ -230,12 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !application.associated_stream_groups.is_empty() {
             return Err(DeleteApplicationErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::with_internal_id(format!(
                         "application {} is still associated with {} stream group(s): {}",
                         application.id,
                         application.associated_stream_groups.len(),
                         application.associated_stream_groups.join(", ")
-                    ),
+                    )),
                 },
             )
             .into());

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account settings in effect, computed from the account-settings store
+//! `PutAccountSetting` and `PutAccountSettingDefault` write
+//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::principal_account_settings`]
+//! and its `account_setting_defaults`) over the catalog of every `SettingName` the
+//! model defines ([`crate::state::ACCOUNT_SETTINGS`]). A pure READ: it stores nothing,
+//! so two calls in a row answer the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +175,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountSettingsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "This value can be between 1 and 10." The member's modelled default is 0,
+        // which is how "this parameter isn't used" reaches a handler.
+        let max_page = i32::try_from(crate::state::ACCOUNT_SETTINGS_PAGE_SIZE)
+            .expect("the documented page cap fits an i32");
+        if input.max_results != 0 && !(1..=max_page).contains(&input.max_results) {
+            return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "maxResults must be between 1 and {max_page}; got {}",
+                        input.max_results
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `value`: "You must also specify an account setting name to use this
+        // parameter."
+        if input.value.is_some() && input.name.is_none() {
+            return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "name is required when value is specified; a value filters the \
+                         settings of one account setting name"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `principalArn`: "If this field is omitted, the account settings are listed
+        // only for the authenticated user" — the one identity this emulator
+        // authenticates every request as.
+        let principal_arn = match input.principal_arn.as_deref() {
+            Some(arn) if !crate::state::is_principal_arn(arn) => {
+                return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "principalArn must be the ARN of an IAM user, role or the root \
+                             user; got {arn:?}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            Some(arn) => arn.to_string(),
+            None => crate::state::caller_identity_arn(),
+        };
+
+        // "The name of the account setting you want to list the settings for" narrows
+        // the walk to that one name; without it every account setting the model defines
+        // is reported. `name` targets the closed `SettingName` enum, so a name that
+        // reaches here is one the catalog holds.
+        let names: Vec<&'static str> = crate::state::ACCOUNT_SETTINGS
+            .iter()
+            .map(|setting| setting.name)
+            .filter(|name| {
+                input
+                    .name
+                    .as_deref()
+                    .is_none_or(|requested| *name == requested)
+            })
+            .collect();
+
+        let mut matching: Vec<Setting> = {
+            let guard = state.lock();
+            names
+                .iter()
+                .filter_map(|name| {
+                    if input.effective_settings {
+                        // "If true, the account settings for the root user or the
+                        // default setting for the principalArn are returned": every name
+                        // has an effective value, so every name is reported.
+                        let resolved = guard.effective_account_setting(&principal_arn, name);
+                        Some(crate::state::setting_view(
+                            name,
+                            &resolved.value,
+                            &resolved.principal_arn,
+                        ))
+                    } else {
+                        // "If false, the account settings for the principalArn are
+                        // returned if they're set. Otherwise, no account settings are
+                        // returned" — so only a name this principal has written is
+                        // reported.
+                        guard
+                            .explicit_account_setting(&principal_arn, name)
+                            .map(|value| crate::state::setting_view(name, &value, &principal_arn))
+                    }
+                })
+                // "The value of the account settings to filter results with."
+                .filter(|setting| {
+                    input
+                        .value
+                        .as_deref()
+                        .is_none_or(|value| setting.value.as_deref() == Some(value))
+                })
+                .collect()
+        };
+        // One setting per name, so the name orders the page sequence and a token names
+        // the setting the next page starts at — a page is then unaffected by settings
+        // written or cleared before it. That is how this crate's other paginated reads
+        // mint a token (`ListTasks` returns the next ARN), and the member's own doc tells
+        // a client to treat it as "an opaque identifier that is only used to retrieve the
+        // next items in a list and not for other programmatic purposes".
+        matching.sort_by(|left, right| left.name.cmp(&right.name));
+
+        // `nextToken`: "The nextToken value returned from a ListAccountSettings request
+        // indicating that more results are available" — so a token this operation never
+        // minted names no page, and is refused rather than silently read as some
+        // insertion point in the sequence.
+        if let Some(token) = input.next_token.as_deref() {
+            if crate::state::account_setting_spec(token).is_none() {
+                return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "nextToken must be a token returned by a ListAccountSettings \
+                             request; got {token:?}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|max_results| *max_results > 0)
+            .unwrap_or(crate::state::ACCOUNT_SETTINGS_PAGE_SIZE);
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                matching.partition_point(|setting| setting.name.as_deref().unwrap_or("") < token)
+            }
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let settings = matching[start.min(matching.len())..end].to_vec();
+        // "This value is null when there are no more results to return."
+        let next_token = matching.get(end).and_then(|setting| setting.name.clone());
+
+        Ok(ListAccountSettingsOutput {
+            settings: Some(settings),
+            next_token,
+        })
     }
 }

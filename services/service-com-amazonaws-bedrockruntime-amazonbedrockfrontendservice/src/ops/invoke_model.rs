@@ -188,32 +188,12 @@ impl From<InvokeModelErrorModeled> for InvokeModelError {
     }
 }
 
-/// The only body MIME type `InvokeModel` accepts: "The MIME type of the input
-/// data in the request. You must specify application/json."
-const JSON_MIME: &str = "application/json";
-
-/// The body field that carries a guardrail configuration inline. Naming it
-/// without a `guardrailIdentifier` is one of the error situations the model
-/// documents for this operation.
-const INLINE_GUARDRAIL_CONFIG_FIELD: &str = "amazon-bedrock-guardrailConfig";
-
 /// This operation's own modelled 400 `ValidationException`.
 fn validation(message: String) -> InvokeModelError {
     InvokeModelErrorModeled::ValidationException(ValidationException {
         message: Some(message),
     })
     .into()
-}
-
-/// A MIME type with its parameters (`; charset=utf-8`) and casing removed, so
-/// `application/json; charset=utf-8` compares equal to `application/json`.
-fn mime_essence(value: &str) -> String {
-    value
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
 }
 
 /// The `InvokeModel` operation.
@@ -302,110 +282,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "You must provide the body in JSON format", and the response is in the
-        // format the `accept` header asks for, whose only documented value is
-        // `application/json` (its default).
-        if let Some(content_type) = input.content_type.as_deref() {
-            if mime_essence(content_type) != JSON_MIME {
-                return Err(validation(format!(
-                    "Invalid contentType {content_type}: you must specify {JSON_MIME}."
-                )));
-            }
-        }
-        if let Some(accept) = input.accept.as_deref() {
-            let essence = mime_essence(accept);
-            if essence != JSON_MIME && essence != "*/*" {
-                return Err(validation(format!(
-                    "Invalid accept {accept}: this model returns {JSON_MIME}."
-                )));
-            }
-        }
-
+        // Every refusal the request itself earns, in the order this operation
+        // makes them — the same request `InvokeModelWithResponseStream` takes, so
+        // both read the rule from `crate::state` and cannot refuse differently.
         let body = input.body.as_deref().unwrap_or_default();
-        if body.is_empty() {
-            return Err(validation(
-                "The request body must contain the prompt and inference parameters.".to_string(),
-            ));
-        }
-
-        // The three guardrail combinations the model documents as errors. The
-        // second one ("you enable the guardrail but the contentType isn't
-        // application/json") is already refused above, for guarded and unguarded
-        // requests alike.
-        let parsed_body = serde_json::from_slice::<serde_json::Value>(body).ok();
-        let guardrail_identifier = input
-            .guardrail_identifier
-            .as_deref()
-            .filter(|value| !value.is_empty());
-        let guardrail_version = input
-            .guardrail_version
-            .as_deref()
-            .filter(|value| !value.is_empty());
-        if guardrail_identifier.is_some() && guardrail_version.is_none() {
-            return Err(validation(
-                "guardrailVersion must be specified when guardrailIdentifier is provided."
-                    .to_string(),
-            ));
-        }
-        if guardrail_identifier.is_none()
-            && parsed_body
-                .as_ref()
-                .is_some_and(|value| value.get(INLINE_GUARDRAIL_CONFIG_FIELD).is_some())
-        {
-            return Err(validation(format!(
-                "guardrailIdentifier must be specified when the request body contains \
-                 {INLINE_GUARDRAIL_CONFIG_FIELD}."
-            )));
-        }
-
-        // The body is model-specific, so the model's own family is what says
-        // whether it can be read: a body that is not a JSON object, or that
-        // omits a member the family's documented request schema requires, is
-        // refused naming the violation.
-        if let Some(message) = crate::state::invoke_body_violation(family, body) {
-            return Err(validation(message));
-        }
-
-        // The generation cap the body carries for this family, bounded by the
-        // model's own ceiling; reaching it is what makes the family's response
-        // report its length stop reason instead of a completed one.
-        let max_output_tokens = parsed_body
-            .as_ref()
-            .and_then(|value| crate::state::body_max_tokens(family, value))
-            .unwrap_or(model.max_output_tokens)
-            .min(model.max_output_tokens);
-
-        let input_tokens = crate::state::body_input_tokens(body);
-        let full_text = crate::state::emulated_completion_text(&model.model_id, 1, input_tokens);
-        let truncated = crate::state::count_text_tokens(&full_text) > max_output_tokens;
-        let text = if truncated {
-            crate::state::truncate_to_tokens(&full_text, max_output_tokens)
-        } else {
-            full_text
-        };
-        let output_tokens = crate::state::count_text_tokens(&text);
-
-        // A completion id is a per-run, server-generated value; deriving it from
-        // the request keeps it stable for an identical call without inventing an
-        // id that looks recorded.
-        let completion_id = {
-            use sha2::{Digest, Sha256};
-            let mut digest = Sha256::new();
-            digest.update(model.model_id.as_bytes());
-            digest.update(body);
-            hex::encode(digest.finalize())[..24].to_string()
-        };
-
-        let response = crate::state::invoke_model_response_body(
+        crate::state::validate_invoke_request(
             family,
-            &model.model_id,
-            &completion_id,
-            &text,
-            input_tokens,
-            output_tokens,
-            truncated,
-        );
-        let body = serde_json::to_vec(&response).map_err(|error| {
+            input.content_type.as_deref(),
+            input.accept.as_deref(),
+            body,
+            input.guardrail_identifier.as_deref(),
+            input.guardrail_version.as_deref(),
+        )
+        .map_err(validation)?;
+
+        // The inference itself: the same turn the streaming surface serves, so
+        // the payload the two answer for identical input agrees by construction.
+        let turn = crate::state::invoke_turn(&model, family, body);
+        let input_tokens = turn.input_tokens;
+        let output_tokens = turn.output_tokens;
+        let body = serde_json::to_vec(&turn.response).map_err(|error| {
             InvokeModelError::from(InvokeModelErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(format!("could not render the inference response: {error}")),
@@ -425,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(InvokeModelOutput {
             body,
-            content_type: JSON_MIME.to_string(),
+            content_type: crate::state::JSON_MIME.to_string(),
             performance_config_latency: Some(input.performance_config_latency.clone()),
             service_tier: input.service_tier.clone(),
         })

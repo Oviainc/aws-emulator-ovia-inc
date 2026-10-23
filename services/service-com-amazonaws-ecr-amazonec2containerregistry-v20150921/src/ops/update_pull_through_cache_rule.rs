@@ -193,11 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // An update names a rule that must already exist: the prefix is the key AWS
-        // addresses a rule by, and one no rule answers to is refused with
-        // `PullThroughCacheRuleNotFoundException` rather than created here.
+        // addresses a rule by — whichever way its trailing slash is written, see
+        // [`crate::state::normalize_prefix`] — and one no rule answers to is refused
+        // with `PullThroughCacheRuleNotFoundException` rather than created here.
         let Some(rule) = store
             .pull_through_cache_rules
-            .get_mut(&input.ecr_repository_prefix)
+            .get_mut(&crate::state::normalize_prefix(&input.ecr_repository_prefix))
         else {
             return Err(
                 UpdatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
@@ -210,6 +211,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // An authenticated and an unauthenticated pull through cache rule are distinct
+        // kinds, and the kind is fixed when the rule is created: a rule created with no
+        // credential has none to update, so a request carrying one is refused rather
+        // than turning that rule into an authenticated one. The two members this
+        // operation takes ARE the rule's credentials, so either of them is such a
+        // request.
+        let updates_credentials = input.credential_arn.is_some() || input.custom_role_arn.is_some();
+        let authenticated = rule.credential_arn.is_some() || rule.custom_role_arn.is_some();
+        if updates_credentials && !authenticated {
+            return Err(
+                UpdatePullThroughCacheRuleErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "Invalid input: Please create an authenticated pull through cache \
+                             rule to update the credentials"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // Only the two credentials this operation takes are updatable; the upstream the
         // rule caches from is fixed at creation. A member the request omits keeps the

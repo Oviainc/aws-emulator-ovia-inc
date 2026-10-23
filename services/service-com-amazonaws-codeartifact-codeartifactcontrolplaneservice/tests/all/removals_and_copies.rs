@@ -158,6 +158,13 @@ async fn delete_package_group(
     .await
 }
 
+/// The namespace every [`Pkg`] carries unless a row names another.
+///
+/// A generic package version's identity is `<namespace>/<package>/<version>`, so
+/// `PublishPackageVersion` requires `namespace` of the `generic` format even though the
+/// model marks the member optional for the formats that derive it.
+const PKG_NAMESPACE: &str = "team-core";
+
 /// One generic package, addressed the way every package-scoped operation addresses it: by
 /// the repository it is in and its own `(format, namespace, name)` triple.
 #[derive(Debug, Clone)]
@@ -174,7 +181,7 @@ impl Pkg {
             domain: domain.to_string(),
             repository: repository.to_string(),
             package: package.to_string(),
-            namespace: None,
+            namespace: Some(PKG_NAMESPACE.to_string()),
         }
     }
 
@@ -971,8 +978,8 @@ async fn deleting_package_versions_commits_and_prunes_an_emptied_package() {
 
     for (index, case) in cases.iter().enumerate() {
         let router = emulator_with_repositories("version-removal", &["repo"]).await;
-        // Every other row carries a namespace: a package is addressed by its whole
-        // triple, so the rule has to hold with and without one.
+        // Every other row carries a DIFFERENT namespace: a package is addressed by its
+        // whole triple, so the rule has to hold under more than one of them.
         let pkg = if index % 2 == 0 {
             Pkg::new("version-removal", "repo", "pkg")
         } else {
@@ -1188,7 +1195,7 @@ async fn deleting_versions_of_a_resource_that_is_not_held_is_not_found() {
 // ---------------------------------------------------------------------------
 
 /// One copy row: the versions published into the source, the versions the request names,
-/// whether it names them by revision, and the package's namespace if it has one.
+/// whether it names them by revision, and the package's namespace.
 struct CopyCase {
     label: &'static str,
     published: &'static [&'static str],
@@ -1202,7 +1209,7 @@ struct CopyCase {
 ///
 /// Rows differ along what the rule generalises over: how many versions are copied (1, 2,
 /// every one the package holds), whether the versions are named by `versions` or by
-/// `versionRevisions`, and whether the package carries a namespace.
+/// `versionRevisions`, and which namespace the package carries.
 #[tokio::test]
 async fn copied_versions_read_back_from_the_destination_repository() {
     let cases = [
@@ -1211,38 +1218,38 @@ async fn copied_versions_read_back_from_the_destination_repository() {
             published: &["1.0.0"],
             copied: &["1.0.0"],
             by_revision: false,
-            namespace: None,
+            namespace: Some(PKG_NAMESPACE),
         },
         CopyCase {
             label: "one of three",
             published: &["1.0.0", "2.0.0", "3.0.0"],
             copied: &["2.0.0"],
             by_revision: false,
-            namespace: None,
+            namespace: Some(PKG_NAMESPACE),
         },
         CopyCase {
             label: "two of three",
             published: &["1.0.0", "2.0.0", "3.0.0"],
             copied: &["1.0.0", "3.0.0"],
             by_revision: false,
-            namespace: None,
+            namespace: Some(PKG_NAMESPACE),
         },
         CopyCase {
             label: "every version held",
             published: &["1.0.0", "2.0.0"],
             copied: &["1.0.0", "2.0.0"],
             by_revision: false,
-            namespace: None,
+            namespace: Some(PKG_NAMESPACE),
         },
         CopyCase {
             label: "named by revision",
             published: &["1.0.0", "2.0.0"],
             copied: &["1.0.0"],
             by_revision: true,
-            namespace: None,
+            namespace: Some(PKG_NAMESPACE),
         },
         CopyCase {
-            label: "a namespaced package",
+            label: "another namespace",
             published: &["1.0.0", "2.0.0"],
             copied: &["2.0.0"],
             by_revision: false,

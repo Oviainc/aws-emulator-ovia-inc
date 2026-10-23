@@ -18,17 +18,22 @@ use crate::repository_image_lifecycle::{given_repository, manifest_digest};
 use crate::wire::{at, call, emulator, ok, REGISTRY_ID};
 
 /// A Docker image manifest V2 schema 2, which declares its own media type.
+///
+/// The manifests this suite pushes reference no blob: a manifest cannot be pushed before
+/// every blob it references is in the repository (`PutImage`'s
+/// `LayersNotFoundException`), and what is under test here is how an `imageIds` entry
+/// resolves and what the stored manifest reports — not the repository's blobs, which the
+/// `layer_availability` suite covers.
 const MANIFEST_DOCKER_V2: &str = concat!(
     r#"{"schemaVersion":2,"#,
-    r#""mediaType":"application/vnd.docker.distribution.manifest.v2+json","#,
-    r#""config":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000001"}}"#
+    r#""mediaType":"application/vnd.docker.distribution.manifest.v2+json"}"#
 );
 
-/// An OCI image manifest, which declares a different media type.
+/// An OCI image manifest, which declares a different media type. See
+/// [`MANIFEST_DOCKER_V2`] on why it references no blob.
 const MANIFEST_OCI: &str = concat!(
     r#"{"schemaVersion":2,"#,
-    r#""mediaType":"application/vnd.oci.image.manifest.v1+json","#,
-    r#""config":{"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000002"}}"#
+    r#""mediaType":"application/vnd.oci.image.manifest.v1+json"}"#
 );
 
 /// A manifest that declares no media type at all, so the stored image reports none.

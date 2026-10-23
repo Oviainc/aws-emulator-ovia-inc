@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGatewayTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGatewayTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGatewayTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the targets `CreateGatewayTarget` persisted on one gateway in
+//! [`crate::state`], one `TargetSummary` per target, each with the status the clock
+//! owes it at the instant of this read. `@readonly` and `@paginated`, so it writes
+//! nothing and resumes exactly where the previous page ended.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGatewayTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGatewayTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGatewayTargets"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListGatewayTargetsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // A target is addressed only through its gateway, so a listing for a
+        // gateway that does not exist is the modelled 404 — never an empty page,
+        // which would say the gateway is there and holds nothing.
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            ListGatewayTargetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "no gateway with identifier {} exists in this account",
+                    input.gateway_identifier
+                )),
+            })
+        })?;
+
+        // The token is opaque on the wire: it carries the target id the previous
+        // page ended on, and the next page starts strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListGatewayTargetsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message:
+                            "must be a nextToken returned by a previous ListGatewayTargets call"
+                                .to_string(),
+                    }]),
+                })
+            })?),
+        };
+
+        // `maxResults` has the modeled range 1..1000; absent, a page holds that
+        // same documented maximum. The floor of 1 keeps the handler correct on
+        // its own terms rather than relying on the boundary check: a page size of
+        // zero would be a silent dead end.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .max(1);
+
+        let mut items = Vec::new();
+        let mut next_token = None;
+        let mut last_included: Option<&str> = None;
+        for (target_id, target) in &gateway.targets {
+            if resume_after
+                .as_deref()
+                .is_some_and(|last| target_id.as_str() <= last)
+            {
+                continue;
+            }
+            if items.len() >= page_size {
+                // At least one target is left over, so hand back a token that
+                // resumes exactly where this page ended.
+                next_token = last_included.map(crate::state::encode_page_token);
+                break;
+            }
+            items.push(target.summary(now));
+            last_included = Some(target_id.as_str());
+        }
+
+        Ok(ListGatewayTargetsOutput { items, next_token })
     }
 }
+
+/// The modeled upper bound of `maxResults` (`TargetMaxResults`, range 1..1000),
+/// used as the page size when the caller names none.
+const MAX_PAGE_SIZE: i32 = 1_000;

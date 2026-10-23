@@ -269,6 +269,33 @@
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies — the BYOIP range
 //! above included, whose record carries one beside the release it may owe.
 //!
+//! ## Network Access Scopes and their analyses
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scopes`] holds the account's
+//! Network Access Scopes as the modelled [`NetworkInsightsAccessScope`] shape itself, keyed
+//! by `NetworkInsightsAccessScopeId`: it is where
+//! `StartNetworkInsightsAccessScopeAnalysis` resolves the scope a caller asks to analyze,
+//! so a scope the account does not hold is refused rather than analyzed.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_analyses`] holds the
+//! analyses that start has started, keyed by `NetworkInsightsAccessScopeAnalysisId`, as
+//! [`NetworkInsightsAccessScopeAnalysisRecord`]s: the modelled
+//! [`NetworkInsightsAccessScopeAnalysis`] every operation that reports one answers with,
+//! plus the move the clock owes it. An analysis AWS hands back is `running`, a non-terminal
+//! `AnalysisStatus`, so its end is owed to the clock on the same [`TRANSITION_DELAY`] as
+//! every other transition this module records, and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it.
+//!
+//! That end is `failed`, carrying [`ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`]: a Network Access
+//! Scope analysis is a reachability computation over the account's real network, which this
+//! emulator does not perform, so the analysis ends in the `AnalysisStatus` catalog's own
+//! failure member with a message saying why rather than reporting findings nothing
+//! computed.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_insights_access_scope_analysis_client_tokens`]
+//! maps one start's `ClientToken` to the analysis it started, so a replay of the same
+//! request answers that analysis instead of starting a second one.
+//!
 //! ## VPC Block Public Access exclusions
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpc_block_public_access_exclusions`] holds the
@@ -483,7 +510,8 @@ use crate::ops::types::{
     EbsBlockDevice, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, Instance, InstanceApplicationStatus, IpamPool,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
-    LaunchTemplate, MacHost, Monitoring, OperatorResponse, PeeringAttachmentStatus, Placement,
+    LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
+    NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry,
@@ -874,7 +902,18 @@ pub const OPT_IN_NOT_REQUIRED: &str = "opt-in-not-required";
 /// EC2 models no error shapes at all (`smithy_query(query="operation", …)` reports
 /// `errors: []`), so this code is answered through
 /// [`crate::scaffolded::Scaffolded::service_error`].
+/// EC2's error code for a request member whose value is not valid.
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// EC2's error code for a `Filters` entry naming a filter the operation does not document —
+/// "The specified filter is not valid" (EC2 API error codes). Answered through
+/// [`invalid_filter`].
+pub const INVALID_FILTER: &str = "InvalidFilter";
+
+/// EC2's error code for a request that reuses a `ClientToken` with a different request —
+/// "The request uses the same client token as a previous, but non-identical request" (EC2
+/// API error codes). Answered through [`idempotent_parameter_mismatch`].
+pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatch";
 
 /// EC2's error code for a request that leaves out a member the action requires.
 pub const MISSING_PARAMETER: &str = "MissingParameter";
@@ -1175,6 +1214,24 @@ pub struct ComAmazonawsEc2Amazonec2State {
         String,
         crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
     >,
+    /// Every Network Access Scope the account holds, by `NetworkInsightsAccessScopeId`, as
+    /// the modelled [`NetworkInsightsAccessScope`] shape itself — see the module docs.
+    /// Ordered by id, the stable order every reader of it reports in.
+    ///
+    /// `StartNetworkInsightsAccessScopeAnalysis` resolves the scope it is asked to analyze
+    /// here; `CreateNetworkInsightsAccessScope` is its writer.
+    pub network_insights_access_scopes: BTreeMap<String, NetworkInsightsAccessScope>,
+    /// Every Network Access Scope analysis the account has started, by
+    /// `NetworkInsightsAccessScopeAnalysisId` — see the module docs. Ordered by id, which is
+    /// the order `DescribeNetworkInsightsAccessScopeAnalyses` reports and pages over.
+    pub network_insights_access_scope_analyses:
+        BTreeMap<String, NetworkInsightsAccessScopeAnalysisRecord>,
+    /// A `StartNetworkInsightsAccessScopeAnalysis` `ClientToken` and the analysis id that
+    /// request started, so a repeat of the same request answers with that analysis instead
+    /// of starting a second one: "Unique, case-sensitive identifier that you provide to
+    /// ensure the idempotency of the request"
+    /// (`StartNetworkInsightsAccessScopeAnalysisRequest$ClientToken`).
+    pub network_insights_access_scope_analysis_client_tokens: HashMap<String, String>,
     /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
     /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
@@ -1448,6 +1505,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
+            network_insights_access_scopes: BTreeMap::new(),
+            network_insights_access_scope_analyses: BTreeMap::new(),
+            network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
@@ -2451,7 +2511,8 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
-    /// calls.
+    /// calls. A `running` Network Access Scope analysis reaching its terminal
+    /// `AnalysisStatus` is one as well.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -2620,6 +2681,32 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         });
+        // The end of a Network Access Scope analysis `StartNetworkInsightsAccessScopeAnalysis`
+        // answered as `running`: at its due instant the analysis reaches the terminal
+        // `AnalysisStatus` the start recorded for it, whether or not anybody called again —
+        // the same contract as a `pending` VPC's move above.
+        for record in self.network_insights_access_scope_analyses.values_mut() {
+            let Some(pending) = record
+                .pending
+                .as_ref()
+                .filter(|pending| now >= pending.due_at)
+                .cloned()
+            else {
+                continue;
+            };
+            record.view.status = Some(pending.to.to_string());
+            // "The analysis end date" (`NetworkInsightsAccessScopeAnalysis$EndDate`): the
+            // analysis ended when the move fell due, not when somebody next asked about it.
+            record.view.end_date = Some(system_time_to_date_time(pending.at));
+            record.view.status_message = Some(ANALYSIS_UNSUPPORTED_STATUS_MESSAGE.to_string());
+            // "Indicates whether there are findings"
+            // (`NetworkInsightsAccessScopeAnalysis$FindingsFound`): nothing analyzed this
+            // scope, so whether it has findings was never determined — which is exactly
+            // what the `FindingsFound` catalog's `unknown` member says. `AnalyzedEniCount`
+            // stays absent for the same reason: no network interface was analyzed.
+            record.view.findings_found = Some(FINDINGS_FOUND_UNKNOWN.to_string());
+            record.pending = None;
+        }
         // The resources whose own record carries the move the clock owes it
         // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
         // left transient, one subnet association of a multicast domain, a route table
@@ -4078,6 +4165,35 @@ pub fn matches_every_filter<'a>(
 /// with a message naming the value at fault.
 pub fn invalid_parameter_value<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(INVALID_PARAMETER_VALUE, 400, message)
+}
+
+/// Refuse a `Filters` entry naming a filter the operation does not support, the way EC2
+/// does: HTTP 400 [`INVALID_FILTER`], with a message enumerating the names it DOES support.
+///
+/// A filter name is not an ordinary member value: EC2 has a code of its own for one it does
+/// not recognise, and the message it answers names the whole supported catalog rather than
+/// the entry at fault, so `supported` is given in the order the service enumerates it.
+pub fn invalid_filter<E>(supported: &[&str]) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_FILTER,
+        400,
+        format!("Filter name must be one of [{}]", supported.join(", ")),
+    )
+}
+
+/// Refuse a request that reuses an idempotency token for a request that is not the one that
+/// token already named, the way EC2 does: HTTP 400 [`IDEMPOTENT_PARAMETER_MISMATCH`].
+///
+/// The message is EC2's own documented wording for the code, which says what the caller has
+/// to change rather than echoing what it sent.
+pub fn idempotent_parameter_mismatch<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        IDEMPOTENT_PARAMETER_MISMATCH,
+        400,
+        "The request uses the same client token as a previous, but non-identical request. \
+         Do not reuse a client token with different requests, unless the requests are \
+         identical.",
+    )
 }
 
 /// Refuse a request that named a VPC id no VPC of the account has, the way EC2 does:
@@ -6806,7 +6922,12 @@ pub struct InstanceApplicationStatusRecord {
 
 /// A modelled timestamp as a sortable key, so two of them can be ordered without
 /// assuming anything about the timestamp type's own comparison traits.
-fn date_time_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+///
+/// The ONE definition of that key for this crate: the modelled timestamp type carries no
+/// `Ord`, and comparing two instants through `f64` seconds would lose the precision a
+/// `MillisecondDateTime` keeps, so every path that orders or windows timestamps — a
+/// describe's `*TimeBegin`/`*TimeEnd` window included — compares what this returns.
+pub fn date_time_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
@@ -8006,22 +8127,15 @@ impl CapacityBlockRecord {
         if let Some(pinned) = self.pinned_state {
             return pinned;
         }
-        let now = timestamp_key(system_time_to_date_time(now));
-        if self.block.start_date.map(timestamp_key).is_some_and(|start| now < start) {
+        let now = date_time_key(system_time_to_date_time(now));
+        if self.block.start_date.map(date_time_key).is_some_and(|start| now < start) {
             return CAPACITY_BLOCK_STATE_SCHEDULED;
         }
-        if self.block.end_date.map(timestamp_key).is_some_and(|end| now >= end) {
+        if self.block.end_date.map(date_time_key).is_some_and(|end| now >= end) {
             return CAPACITY_BLOCK_STATE_EXPIRED;
         }
         CAPACITY_BLOCK_STATE_ACTIVE
     }
-}
-
-/// A timestamp as a totally ordered key: the modelled timestamp type carries no `Ord`, and
-/// comparing the two instants of a window through `f64` seconds would lose precision the
-/// `MillisecondDateTime` the model uses for them keeps.
-fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
-    (at.secs(), at.subsec_nanos())
 }
 
 /// What one stored Capacity Block is created with, for
@@ -12221,6 +12335,290 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         stored
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network Access Scopes and their analyses
+// ---------------------------------------------------------------------------
+
+/// The id prefix of a Network Access Scope, as AWS mints one: `nis-<hex>` (the AWS CLI
+/// reference for `ec2 create-network-insights-access-scope` reports ids of that form).
+///
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the 17 lowercase hexadecimal digits
+/// every EC2 resource id of the long form carries.
+pub const NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX: &str = "nis";
+
+/// The id prefix of a Network Access Scope ANALYSIS, as AWS mints one: `nisa-<hex>` (the
+/// AWS CLI reference for `ec2 start-network-insights-access-scope-analysis` reports ids of
+/// that form), with the same 17-hex-digit suffix as every other long EC2 id.
+pub const NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX: &str = "nisa";
+
+/// An analysis AWS is still running: the `AnalysisStatus` enum's `running` member, which is
+/// what `StartNetworkInsightsAccessScopeAnalysis` answers with until [`TRANSITION_DELAY`]
+/// has passed.
+pub const ANALYSIS_STATUS_RUNNING: &str = "running";
+
+/// An analysis that did not produce a result: the `AnalysisStatus` enum's `failed` member.
+///
+/// The terminal status the clock owes every analysis this emulator starts — see
+/// [`ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`] and the module docs.
+pub const ANALYSIS_STATUS_FAILED: &str = "failed";
+
+/// "The status message" (`NetworkInsightsAccessScopeAnalysis$StatusMessage`) of an analysis
+/// this emulator could not run.
+///
+/// A Network Access Scope analysis evaluates the account's real network against the scope;
+/// this emulator runs no such evaluation, so the analysis ends in
+/// [`ANALYSIS_STATUS_FAILED`] carrying this reason rather than reporting findings, an
+/// analyzed interface count or a `succeeded` status that nothing computed.
+pub const ANALYSIS_UNSUPPORTED_STATUS_MESSAGE: &str =
+    "This emulator does not perform Network Access Scope reachability analysis, so no \
+     findings were produced for this scope.";
+
+/// The `FindingsFound` enum's `unknown` member: whether the scope has findings was never
+/// determined, which is what an analysis that did not run can say about it.
+pub const FINDINGS_FOUND_UNKNOWN: &str = "unknown";
+
+/// The `ResourceType` a `StartNetworkInsightsAccessScopeAnalysis` tag specification may
+/// name: the analysis it starts (the modelled `ResourceType` enum's
+/// `network-insights-access-scope-analysis` member).
+pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS: &str =
+    "network-insights-access-scope-analysis";
+
+/// The `ResourceType` enum's `network-insights-access-scope` member, which an access
+/// scope's own ARN names.
+pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE: &str = "network-insights-access-scope";
+
+/// The largest number of Network Access Scope analyses this in-memory store holds.
+///
+/// The crate's one store ceiling, [`MAX_STORED_RECORDS_PER_STORE`], named here because the
+/// start path's refusal message and this module's capacity predicate both read better for
+/// the resource than for "a store": the bound itself has ONE spelling, so no two stores of
+/// this module can drift apart. Like every other, it is a capacity bound on this process's
+/// memory rather than an AWS quota, and
+/// [`ComAmazonawsEc2Amazonec2State::has_network_insights_access_scope_analysis_capacity`] is
+/// the predicate the start path asks before inserting.
+pub const MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The code EC2 answers for a Network Access Scope id the account holds no scope under.
+///
+/// The same `Invalid<Resource>Id.NotFound` convention as
+/// [`INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND`].
+pub const INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND: &str =
+    "InvalidNetworkInsightsAccessScopeId.NotFound";
+
+/// The code EC2 answers for an analysis id the account holds no analysis under (see
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`] for the convention).
+pub const INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND: &str =
+    "InvalidNetworkInsightsAccessScopeAnalysisId.NotFound";
+
+/// The move the clock owes one Network Access Scope analysis: a [`ClockTransition`] to the
+/// `AnalysisStatus` member it reaches, reported as the analysis's `EndDate`.
+///
+/// The `to` is a `&'static str` so only a word from this module's own catalog constants can
+/// be stored — never a request's text.
+pub type AnalysisTransition = ClockTransition<&'static str>;
+
+/// One Network Access Scope analysis: the modelled [`NetworkInsightsAccessScopeAnalysis`]
+/// every operation that reports one answers with, plus the move the clock owes it.
+///
+/// `StartNetworkInsightsAccessScopeAnalysis` and
+/// `DescribeNetworkInsightsAccessScopeAnalyses` answer with that one shape, so the one
+/// stored view is what both report and they cannot describe one analysis differently.
+#[derive(Debug, Clone)]
+pub struct NetworkInsightsAccessScopeAnalysisRecord {
+    /// The analysis as the model shapes it, carrying the status reached so far.
+    pub view: NetworkInsightsAccessScopeAnalysis,
+    /// The move the clock owes this analysis, while one is owed.
+    pub pending: Option<AnalysisTransition>,
+}
+
+/// What a writer must say to store a Network Access Scope analysis; everything else about
+/// the record is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_insights_access_scope_analysis`].
+#[derive(Debug, Clone)]
+pub struct NetworkInsightsAccessScopeAnalysisSpec {
+    /// "The ID of the Network Access Scope"
+    /// (`StartNetworkInsightsAccessScopeAnalysisRequest$NetworkInsightsAccessScopeId`), as
+    /// resolved against [`ComAmazonawsEc2Amazonec2State::network_insights_access_scopes`].
+    pub network_insights_access_scope_id: String,
+    /// The Region the request was signed for, which the analysis's ARN names.
+    pub region: String,
+    /// The tags the request's `TagSpecifications` assign to the analysis.
+    pub tags: Vec<Tag>,
+    /// The request's `ClientToken`, which names this analysis from now on.
+    pub client_token: String,
+}
+
+/// The caller-chosen bytes one stored analysis holds: its tags and the client token that
+/// names it, on top of the record's own fixed overhead ([`STORED_RECORD_OVERHEAD_BYTES`]),
+/// so an untagged analysis is not free against [`MAX_STORED_BYTES`]. Everything else on the
+/// record — the ids, the ARN, the status, the dates — is derived by this module or bounded
+/// by the model, so it is fixed-size, which is what that overhead stands for.
+///
+/// The ONE definition of that charge, so a writer cannot ask one number and charge another.
+pub fn network_insights_access_scope_analysis_payload_bytes(
+    tags: &[Tag],
+    client_token: &str,
+) -> usize {
+    tag_list_bytes(tags)
+        .saturating_add(client_token.len())
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+/// Refuse a Network Access Scope id a request named that the account holds no scope under:
+/// HTTP 400 [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND`].
+pub fn invalid_network_insights_access_scope_id_not_found<E>(scope_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND,
+        400,
+        format!("The Network Access Scope ID '{scope_id}' does not exist"),
+    )
+}
+
+/// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
+/// [`INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND`].
+pub fn invalid_network_insights_access_scope_analysis_id_not_found<E>(
+    analysis_id: &str,
+) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_NOT_FOUND,
+        400,
+        format!("The Network Access Scope analysis ID '{analysis_id}' does not exist"),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another Network Access Scope analysis fits inside the store's ceiling
+    /// ([`MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES`]).
+    ///
+    /// The same contract as [`Self::has_vpc_endpoint_connection_capacity`]: the start path
+    /// asks first and refuses with EC2's own quota code when it answers `false`, and
+    /// [`Self::insert_network_insights_access_scope_analysis`] asks it again for itself, so
+    /// no path can get past the ceiling by forgetting to.
+    pub fn has_network_insights_access_scope_analysis_capacity(&self) -> bool {
+        self.network_insights_access_scope_analyses.len()
+            < MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES
+    }
+
+    /// Whether another Network Access Scope fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`].
+    pub fn has_network_insights_access_scope_capacity(&self) -> bool {
+        self.network_insights_access_scopes.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store a Network Access Scope, as the one way a scope enters the store, and answer
+    /// the `NetworkInsightsAccessScopeId` it was given — or `None` when the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    ///
+    /// Reached from `StartNetworkInsightsAccessScopeAnalysis`'s own suite today and from
+    /// `CreateNetworkInsightsAccessScope` once that scaffold is implemented (its stub issue
+    /// is `20261022T235108Z-ec2-createnetworkinsightsaccessscope-stub`): it is the ONE path
+    /// a scope enters the store by, so the create has nothing of its own to derive.
+    ///
+    /// Everything the service owns is derived here rather than taken from the caller — the
+    /// id, the ARN built from it and the creation date — so no two writers can report the
+    /// same scope differently. A scope AWS hands back is ready, so it has no clock-owed
+    /// move: only the analyses started against it do. The caller-chosen bytes it holds are
+    /// charged on top of [`STORED_RECORD_OVERHEAD_BYTES`], so an untagged scope is not free
+    /// against [`MAX_STORED_BYTES`] either.
+    pub fn insert_network_insights_access_scope(
+        &mut self,
+        region: &str,
+        tags: Vec<Tag>,
+    ) -> Option<String> {
+        if !self.has_network_insights_access_scope_capacity() {
+            return None;
+        }
+        let scope_id = self.next_id(NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX);
+        // "The creation date" (`NetworkInsightsAccessScope$CreatedDate`); nothing has
+        // changed the scope since, so that is also when it was last updated.
+        let created_date = system_time_to_date_time(SystemTime::now());
+        let scope = NetworkInsightsAccessScope {
+            network_insights_access_scope_id: Some(scope_id.clone()),
+            network_insights_access_scope_arn: Some(::engine::emulator_arn(
+                "ec2",
+                region,
+                &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE}/{scope_id}"),
+            )),
+            created_date: Some(created_date),
+            updated_date: Some(created_date),
+            tags: Some(tags),
+        };
+        self.add_stored_bytes(
+            tag_list_bytes(scope.tags.as_deref().unwrap_or_default())
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        self.network_insights_access_scopes
+            .insert(scope_id.clone(), scope);
+        Some(scope_id)
+    }
+
+    /// Start one Network Access Scope analysis and answer it as it was stored — or `None`
+    /// when the store is at [`MAX_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSES`] and NOTHING was
+    /// stored.
+    ///
+    /// The one way an analysis is stored, so the id it carries, the ARN it reports, the
+    /// status it starts in, the move the clock owes it, the token that names it and the
+    /// bytes it charges cannot be built two ways. An analysis is answered in the
+    /// non-terminal `running` status, so the clock owes it its terminal
+    /// [`ANALYSIS_STATUS_FAILED`] one [`TRANSITION_DELAY`] later (the module docs say why
+    /// that is the terminal status this emulator can honestly reach).
+    ///
+    /// The ceiling is enforced HERE as well as by
+    /// [`Self::has_network_insights_access_scope_analysis_capacity`], so a writer that
+    /// forgets the gate cannot grow the store without bound either, and a writer that sees
+    /// `None` refuses the request rather than reporting an analysis the store does not
+    /// hold.
+    ///
+    /// What comes back is the stored view itself, so a start answers exactly what a later
+    /// `DescribeNetworkInsightsAccessScopeAnalyses` will report.
+    pub fn insert_network_insights_access_scope_analysis(
+        &mut self,
+        spec: NetworkInsightsAccessScopeAnalysisSpec,
+    ) -> Option<NetworkInsightsAccessScopeAnalysis> {
+        if !self.has_network_insights_access_scope_analysis_capacity() {
+            return None;
+        }
+        let analysis_id = self.next_id(NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS_ID_PREFIX);
+        let view = NetworkInsightsAccessScopeAnalysis {
+            network_insights_access_scope_analysis_id: Some(analysis_id.clone()),
+            network_insights_access_scope_analysis_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_ACCESS_SCOPE_ANALYSIS}/{analysis_id}"),
+            )),
+            network_insights_access_scope_id: Some(spec.network_insights_access_scope_id),
+            status: Some(ANALYSIS_STATUS_RUNNING.to_string()),
+            // "The status message" and "The warning message": nothing to report while the
+            // analysis is still running.
+            status_message: None,
+            warning_message: None,
+            // "The analysis start date" (`StartDate`) is now; the end date, the findings and
+            // the analyzed interface count are owed by the clock, not by this call.
+            start_date: Some(system_time_to_date_time(SystemTime::now())),
+            end_date: None,
+            findings_found: None,
+            analyzed_eni_count: None,
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(network_insights_access_scope_analysis_payload_bytes(
+            view.tags.as_deref().unwrap_or_default(),
+            &spec.client_token,
+        ));
+        let stored = view.clone();
+        self.network_insights_access_scope_analyses.insert(
+            analysis_id.clone(),
+            NetworkInsightsAccessScopeAnalysisRecord {
+                view,
+                pending: Some(AnalysisTransition::starting_now(ANALYSIS_STATUS_FAILED)),
+            },
+        );
+        self.network_insights_access_scope_analysis_client_tokens
+            .insert(spec.client_token, analysis_id);
+        Some(stored)
     }
 }
 

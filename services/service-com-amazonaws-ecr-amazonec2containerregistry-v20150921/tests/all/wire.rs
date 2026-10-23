@@ -134,6 +134,70 @@ pub async fn refused(
     answer.body
 }
 
+/// The content digest of `content`: the `sha256:<hex>` form a registry addresses a blob
+/// by, computed here independently of the crate's own helper.
+pub fn layer_digest(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", hex::encode(Sha256::digest(content)))
+}
+
+/// Put `content` into `repository` as a layer, through the documented push sequence —
+/// `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload` — and answer the
+/// digest the registry registered it under, which is the digest a manifest references it
+/// by. A manifest cannot be pushed before its blobs are in the repository, so a suite
+/// that pushes one seeds its blobs through here.
+pub async fn given_layer(
+    router: &MultiServiceRouter,
+    case: &str,
+    repository: &str,
+    content: &[u8],
+) -> String {
+    let opened = ok(
+        router,
+        case,
+        "InitiateLayerUpload",
+        &serde_json::json!({"repositoryName": repository}),
+    )
+    .await;
+    let upload_id = opened["uploadId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: InitiateLayerUpload must hand back an uploadId"))
+        .to_string();
+    let last = i64::try_from(content.len()).expect("a test layer fits in an i64") - 1;
+    ok(
+        router,
+        case,
+        "UploadLayerPart",
+        &serde_json::json!({
+            "repositoryName": repository,
+            "uploadId": upload_id,
+            "partFirstByte": 0,
+            "partLastByte": last,
+            // A blob travels base64-encoded on the awsJson1_1 wire, with the codec the
+            // wire serializer itself uses.
+            "layerPartBlob": aws_smithy_types::base64::encode(content),
+        }),
+    )
+    .await;
+    let completed = ok(
+        router,
+        case,
+        "CompleteLayerUpload",
+        &serde_json::json!({
+            "repositoryName": repository,
+            "uploadId": upload_id,
+            "layerDigests": [layer_digest(content)],
+        }),
+    )
+    .await;
+    completed["layerDigest"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: CompleteLayerUpload must report the registered layerDigest")
+        })
+        .to_string()
+}
+
 /// The same call as [`call`], made against `region`: the credential scope's region is
 /// the Region a request is made against, so a suite exercising regional behaviour picks
 /// it per call instead of taking [`REGION`].

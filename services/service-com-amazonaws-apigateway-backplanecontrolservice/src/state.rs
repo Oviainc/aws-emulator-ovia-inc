@@ -1303,6 +1303,78 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
         }
     }
+
+    /// The same collection for WRITING, so `TagResource` and `UntagResource` edit the
+    /// very record [`Self::tags_of`] reports; see there for the failure.
+    pub fn tags_of_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Result<&mut BTreeMap<String, String>, String> {
+        match resource {
+            TaggedResource::RestApi { rest_api_id } => self
+                .rest_apis
+                .get_mut(rest_api_id)
+                .map(|api| &mut api.tags)
+                .ok_or_else(|| no_such_rest_api(rest_api_id)),
+            TaggedResource::Stage {
+                rest_api_id,
+                stage_name,
+            } => self
+                .rest_apis
+                .get_mut(rest_api_id)
+                .ok_or_else(|| no_such_rest_api(rest_api_id))?
+                .stages
+                .get_mut(stage_name)
+                .map(|stage| &mut stage.tags)
+                .ok_or_else(|| NO_SUCH_STAGE.to_string()),
+            TaggedResource::ApiKey { api_key_id } => self
+                .api_keys
+                .get_mut(api_key_id)
+                .map(|key| &mut key.tags)
+                .ok_or_else(|| NO_SUCH_API_KEY.to_string()),
+            TaggedResource::Unstored { kind, id } => Err(no_such_tagged_resource(kind, id)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tagging: the tags this service will STORE on the resource an ARN named.
+// Which resource that is comes from `parse_tagged_resource` above, the one place
+// this service reads a `resourceArn`; what follows is the one place it reads a tag.
+// ---------------------------------------------------------------------------
+
+/// The prefix AWS reserves for its OWN tag keys. From the `tags` member's own
+/// documentation: a tag key "must not start with aws:".
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Refuse one caller-supplied tag this service will not store.
+///
+/// Every bound comes from the `tags` member's own documentation — "The tag key can be
+/// up to 128 characters and must not start with aws:. The tag value can be up to 256
+/// characters." — so the one check serves every operation that takes tags, whether the
+/// tags ride on a create (`CreateRestApi`, `CreateStage`, `CreateApiKey`) or on
+/// `TagResource`. The member's documented "valid character set is [a-zA-Z+-=._:/]" is
+/// NOT enforced: AWS accepts a key and a value outside it (the recorded units
+/// `apigateway.tag-resource-unicode-key-value-round-trip` and
+/// `apigateway.tag-value-unicode-round-trip` round-trip non-ASCII tags), so refusing
+/// them would be stricter than the service.
+pub fn bound_tag(key: &str, value: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("a tag key may not be empty".to_string());
+    }
+    bound_chars("a tag key", key, MAX_TAG_KEY_CHARS)?;
+    bound_chars("a tag value", value, MAX_TAG_VALUE_CHARS)?;
+    // The reserved namespace is AWS's own, and a prefix is a prefix whatever its case.
+    if key
+        .to_ascii_lowercase()
+        .starts_with(RESERVED_TAG_KEY_PREFIX)
+    {
+        return Err(format!(
+            "a tag key must not start with the reserved prefix {RESERVED_TAG_KEY_PREFIX}, \
+             got {key}"
+        ));
+    }
+    Ok(())
 }
 
 /// The `NotFoundException` message for a `restApiId` that names no stored API.

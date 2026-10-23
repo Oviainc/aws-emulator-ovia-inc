@@ -41,7 +41,7 @@ use crate::harness::{call, emulator, Answer, ACCOUNT, REGION};
 /// `NON_ALPHANUMERIC` set, so an ARN's colons and slashes — and the spaces and non-ASCII
 /// characters the refusal rows carry — survive the server's decode. The maintained
 /// `percent-encoding` crate does this, as it does for the sibling service crates' suites.
-fn encode_query(value: &str) -> String {
+pub(crate) fn encode_query(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
@@ -56,7 +56,7 @@ fn tag_list(pairs: &[(String, String)]) -> Value {
 }
 
 /// `(key, value)` pairs, for a table row written from `&str` literals.
-fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
     rows.iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()
@@ -137,7 +137,11 @@ async fn create_tagged_package_group(
 }
 
 /// `TagResource`: `POST /v1/tag?resourceArn=…` with the batch in the body.
-async fn tag(router: &MultiServiceRouter, arn: &str, batch: &[(String, String)]) -> Answer {
+pub(crate) async fn tag(
+    router: &MultiServiceRouter,
+    arn: &str,
+    batch: &[(String, String)],
+) -> Answer {
     call(
         router,
         "POST",
@@ -148,7 +152,7 @@ async fn tag(router: &MultiServiceRouter, arn: &str, batch: &[(String, String)])
 }
 
 /// `ListTagsForResource`: `POST /v1/tags?resourceArn=…`.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(
         router,
         "POST",
