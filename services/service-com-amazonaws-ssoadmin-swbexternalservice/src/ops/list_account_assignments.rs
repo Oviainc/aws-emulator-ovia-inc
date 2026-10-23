@@ -163,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListAccountAssignmentsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the SSO Admin state store is unavailable".to_string()),
@@ -187,7 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         let ordered: Vec<(String, AccountAssignment)> = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves,
+            // and the account's ambient instance if nothing has enabled one yet.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
             // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
             // account assignments are a feature of an organization instance, so on an
             // account instance none can ever exist and the enumeration is refused

@@ -15,8 +15,9 @@
 //!    reports, a describe answers from that stored mapping attribute for attribute (and
 //!    reports `ENABLED` once the enabling instant has passed), an update REPLACES the
 //!    mapping, a delete removes it, and a create of a configuration that already exists
-//!    is the modelled `ConflictException` (409);
-//! 3. an `InstanceArn` the account holds no instance under is a missing resource (404),
+//!    is the modelled `ConflictException`;
+//! 3. an `InstanceArn` the account holds no instance under is a missing resource
+//!    (`ResourceNotFoundException`),
 //!    and so is an instance on which ABAC was never enabled (or has been deleted);
 //! 4. a mapping maps one key to one source, so a request carrying the same
 //!    `AccessControlAttribute$Key` twice is refused with `ValidationException` and stores
@@ -206,11 +207,13 @@ async fn describe_ok(router: &MultiServiceRouter, instance_arn: &str) -> (String
     )
 }
 
-/// Assert `operation` answered 404 `ResourceNotFoundException`.
+/// Assert `operation` answered `ResourceNotFoundException`, at the HTTP 400 this
+/// awsJson1_1 service answers every refusal of a request with
+/// (`crate::scaffolded::modeled_error_status`).
 fn assert_not_found(label: &str, status: u16, body: &Value) {
     assert_eq!(
-        status, 404,
-        "case {label:?}: expected HTTP 404, got {status} {body}"
+        status, 400,
+        "case {label:?}: expected HTTP 400, got {status} {body}"
     );
     assert_eq!(
         error_code(body),
@@ -283,8 +286,8 @@ async fn the_abac_configuration_round_trips_on_an_organization_instance() {
         )
         .await;
         assert_eq!(
-            status, 409,
-            "case {label:?}: a create over an existing configuration expected 409, got \
+            status, 400,
+            "case {label:?}: a create over an existing configuration expected 400, got \
              {status} {body}"
         );
         assert_eq!(

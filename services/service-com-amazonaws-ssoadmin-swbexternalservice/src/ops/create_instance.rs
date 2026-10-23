@@ -8,15 +8,28 @@
 //! The operation's own documentation is the whole rule: "You can create only one instance
 //! per account and across all Amazon Web Services Regions", and the request "is rejected
 //! if … An instance already exists in the same account" — which is the modelled
-//! `ServiceQuotaExceededException` (HTTP 402), the permitted number of instances being
-//! one. `ClientToken` is `@idempotencyToken`, so a retry carrying the token of the call
-//! that DID create the instance answers with that instance instead of the refusal, and
-//! the same token with different parameters is the modelled `ConflictException` (409).
+//! `ServiceQuotaExceededException`, the permitted number of instances being one, answered
+//! at the status this service answers every refusal of a request with
+//! (`crate::scaffolded::modeled_error_status`). `ClientToken` is `@idempotencyToken`, so a
+//! retry carrying the token of the call that DID create the instance answers with that
+//! instance instead of the refusal, and the same token with different parameters is the
+//! modelled `ConflictException`.
 //!
 //! What it creates is an ACCOUNT instance (`crate::state::InstanceType::Account`): the
 //! operation is documented as creating an instance "for a standalone Amazon Web Services
 //! account that is not managed by Organizations". Such an instance serves no permission
 //! sets, which is what `DescribeInstance$PermissionSetsEnabled` reports of it.
+//!
+//! The instance is enabled in the Region the request was made in, which is what
+//! `DescribeInstance$PrimaryRegion` ("the primary Region where the IAM Identity Center
+//! instance was originally enabled") then reports.
+//!
+//! This is also the one operation that does NOT enable the account's ambient instance
+//! first (`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::on_instance_create`):
+//! the caller is enabling the account's instance itself, so an invented one would refuse
+//! on the quota the very call that establishes the account's enablement. Once this call
+//! has stored its instance the account's enablement is settled, so no later read adds an
+//! ambient instance beside it.
 //!
 //! A created instance starts `CREATE_IN_PROGRESS` and becomes `ACTIVE` when the clock
 //! makes that due (`crate::state::INSTANCE_ACTIVATION_SPAN`), so a caller that reads it
@@ -184,18 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateInstanceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the SSO Admin state store is unavailable".to_string()),
             })
         })?;
+        // The Region this instance is being ENABLED in: `PrimaryRegion` is "the primary
+        // Region where the IAM Identity Center instance was originally enabled", and the
+        // request's own credential scope is where that enablement happened.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         // A create is a WRITE, so it also materialises what the clock already owes: an
         // instance whose activation instant has passed is ACTIVE before this call looks
-        // at it.
-        store.materialize_due(now);
+        // at it, and one whose deletion instant has passed is gone, which frees the
+        // account's one-instance quota. It enables NO ambient instance: this caller is
+        // enabling the account's instance itself, and an invented one would refuse the
+        // very call that establishes it.
+        store.on_instance_create(now);
 
         // `ClientToken` is `@idempotencyToken`: a retry of the call that created the
         // instance must answer with that instance, not with a refusal. "Passing the same
@@ -221,11 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One instance per account, across all Regions: with one already held there is
-        // no second to create, and the existing instance is left exactly as it was.
+        // no second to create, and the existing instance is left exactly as it was. AWS
+        // reports it as the account's INSTANCE QUOTA.
         if !store.instances.is_empty() {
             return Err(CreateInstanceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(crate::state::INSTANCE_QUOTA_EXCEEDED_MESSAGE.to_string()),
+                    message: Some(crate::state::instance_quota_exceeded_message()),
                 },
             )
             .into());
@@ -240,6 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::InstanceType::Account,
             input.name,
             now,
+            &region,
         );
         instance.client_token = input.client_token;
         instance.tags = input.tags.unwrap_or_default();
@@ -255,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let instance_arn = instance.instance_arn.clone();
         store.instances.insert(instance_arn.clone(), instance);
+        // The account's enablement is settled by THIS call, so no later read enables an
+        // ambient instance beside the one it just created.
+        store.instance_enablement_decided();
         // Answer from the STORED record, so this response cannot disagree with what the
         // next `ListInstances` / `DescribeInstance` reads.
         let stored = store.instance(&instance_arn).ok_or_else(|| {

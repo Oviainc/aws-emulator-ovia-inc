@@ -15,7 +15,7 @@
 //! 2. a paginated read enumerates exactly the stored set, once per item, for ANY page
 //!    size the model admits;
 //! 3. an operation whose target resource does not exist answers
-//!    `ResourceNotFoundException` (404) — never a 200;
+//!    `ResourceNotFoundException` — never a 200;
 //! 4. an assignment's identity is its (instance, account, permission set, principal
 //!    type, principal id) tuple, so creating it twice grants it once.
 //!
@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A pattern-valid `InstanceArn` for an instance that was never created, used to pin
-/// the 404 rule. Shaped by the model's `InstanceArn` pattern
+/// the not-found rule. Shaped by the model's `InstanceArn` pattern
 /// `^arn:aws(-[a-z]{1,5}){0,3}:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`.
 pub(crate) const UNKNOWN_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-0000000000000000";
 
@@ -47,6 +47,24 @@ const ACCOUNT_A: &str = "123456789012";
 /// performs, minus the other services.
 pub(crate) fn router() -> MultiServiceRouter {
     router_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// Read or write this service's store the way a handler does.
+///
+/// For a test that has to move a stored DUE INSTANT — the clock's business, not the wire's
+/// — or set up account state no operation of this API can reach; everything a test then
+/// asserts goes over the wire.
+pub(crate) fn with_store<R>(
+    engine: &Arc<engine::InMemoryEngine>,
+    change: impl FnOnce(
+        &mut service_com_amazonaws_ssoadmin_swbexternalservice::state::ComAmazonawsSsoadminSwbexternalserviceState,
+    ) -> R,
+) -> R {
+    let service_state =
+        service_com_amazonaws_ssoadmin_swbexternalservice::state::service_state(&**engine)
+            .expect("the SSO Admin state store");
+    let mut store = service_state.lock();
+    change(&mut store)
 }
 
 /// The same router, over an engine the caller already holds (so a test can seed state
@@ -99,20 +117,41 @@ pub(crate) fn organization_engine() -> (Arc<engine::InMemoryEngine>, String) {
             state::InstanceType::Organization,
             Some("Organization".to_string()),
             aws_smithy_types::DateTime::from(std::time::SystemTime::now()),
+            // Enabled in the Region every call of this harness signs for, so the
+            // organization instance reports the Region it was enabled in like any other.
+            TEST_REGION,
         );
         let instance_arn = instance.instance_arn.clone();
-        // One instance per account: the organization instance REPLACES the seeded
-        // account instance rather than joining it.
+        // One instance per account: the organization instance is the account's instance,
+        // so inserting it here is what the account holds — and because the store already
+        // holds an instance, no request enables the ambient account instance beside it.
         store.instances.clear();
         store.instances.insert(instance_arn.clone(), instance);
+        store.ambient_instance_enabled = true;
         instance_arn
     };
     (engine, instance_arn)
 }
 
+/// The Region every call of this harness signs for unless a test names another one: the
+/// service reads it off the request's SigV4 credential scope
+/// (`state::request_region`), so it is the Region the account's instance is enabled in.
+pub(crate) const TEST_REGION: &str = "us-east-1";
+
 /// Call one operation and return `(http status, parsed body)`.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    call_in_region(router, TEST_REGION, operation, body).await
+}
+
+/// The same call, signed for `region` — the Region an instance this call enables or reads
+/// is enabled in.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
@@ -122,11 +161,14 @@ pub(crate) async fn call(
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", format!("SWBExternalService.{operation}"))
         // The SigV4 credential scope is what routes a request to its service
-        // (`resolve_route_key`); `sso` is this service's signing name.
+        // (`resolve_route_key`); `sso` is this service's signing name, and the Region
+        // segment is the one the service reads the request's Region from.
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-east-1/sso/aws4_request, \
-             SignedHeaders=host;x-amz-date, Signature=0",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/sso/aws4_request, \
+                 SignedHeaders=host;x-amz-date, Signature=0"
+            ),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),
@@ -412,8 +454,8 @@ async fn a_second_permission_set_with_the_same_name_conflicts() {
         let retry = json!({"InstanceArn": instance_arn, "Name": case.name, "SessionDuration": "PT2H"});
         let (status, body) = call(&router, "CreatePermissionSet", &retry).await;
         assert_eq!(
-            status, 409,
-            "case {:?}: a duplicate name expected 409, got {status} {body}",
+            status, 400,
+            "case {:?}: a duplicate name expected 400, got {status} {body}",
             case.label
         );
         assert_eq!(
@@ -689,9 +731,10 @@ async fn an_unissued_next_token_is_refused() {
 }
 
 /// RULE 3 — every operation in this slice that names a resource answers
-/// `ResourceNotFoundException` (404) when that resource does not exist.
+/// `ResourceNotFoundException` when that resource does not exist, at the HTTP 400 this
+/// awsJson1_1 service answers every refusal of a request with.
 #[tokio::test]
-async fn an_unknown_resource_is_a_404_for_every_operation_that_names_one() {
+async fn an_unknown_resource_is_not_found_for_every_operation_that_names_one() {
     let (router, instance_arn) = organization_router();
     let (_, created) = call(
         &router,
@@ -773,8 +816,8 @@ async fn an_unknown_resource_is_a_404_for_every_operation_that_names_one() {
     for (operation, request) in unknown_instance.into_iter().chain(unknown_permission_set) {
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
-            status, 404,
-            "case {operation}: an unknown resource expected 404, got {status} {body}"
+            status, 400,
+            "case {operation}: an unknown resource expected 400, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -784,7 +827,7 @@ async fn an_unknown_resource_is_a_404_for_every_operation_that_names_one() {
     }
 
     // And the control: the same operations against resources that DO exist are 200, so
-    // the 404s above are about the resource and not about the request's shape.
+    // the not-founds above are about the resource and not about the request's shape.
     let (status, body) = call(
         &router,
         "DescribePermissionSet",
@@ -1040,7 +1083,7 @@ async fn account_assignments_are_persisted_once_per_identity_and_read_back_by_fi
 }
 
 /// RULE 1 — a delete removes the record, so every later reader sees it gone: the
-/// describe 404s, the list drops the ARN, the assignments made from it are gone, and a
+/// describe is not found, the list drops the ARN, the assignments made from it are gone, and a
 /// second delete has nothing left to remove.
 #[tokio::test]
 async fn deleting_a_permission_set_is_observable_to_every_later_reader() {
@@ -1093,8 +1136,8 @@ async fn deleting_a_permission_set_is_observable_to_every_later_reader() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {arn}: a deleted permission set must describe as 404, got {status} {body}"
+            status, 400,
+            "case {arn}: a deleted permission set must describe as not found, got {status} {body}"
         );
 
         // A second delete: nothing left to remove.
@@ -1105,11 +1148,11 @@ async fn deleting_a_permission_set_is_observable_to_every_later_reader() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {arn}: a second delete expected 404, got {status} {body}"
+            status, 400,
+            "case {arn}: a second delete expected not found, got {status} {body}"
         );
 
-        // The assignment it granted went with it, so listing by it 404s on the set.
+        // The assignment it granted went with it, so listing by it is not found on the set.
         let (status, body) = call(
             &router,
             "ListAccountAssignments",
@@ -1121,8 +1164,8 @@ async fn deleting_a_permission_set_is_observable_to_every_later_reader() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {arn}: assignments of a deleted permission set expected 404, got {status} {body}"
+            status, 400,
+            "case {arn}: assignments of a deleted permission set expected not found, got {status} {body}"
         );
 
         // The list reports exactly the sets that are left — the deleted one is gone and
@@ -1194,10 +1237,23 @@ async fn the_one_instance_is_active_and_stable_across_reads() {
         "expected a CreatedDate, got {:?}",
         instance["CreatedDate"]
     );
+    // AWS's `ListInstances` carries a `NextToken` on every page that returned an
+    // instance, including the account's only one, and following it ends the enumeration.
+    let token = first["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the page that returned an instance carries a NextToken: {first}"))
+        .to_string();
+    let (status, last) = call(&router, "ListInstances", &json!({"NextToken": token})).await;
+    assert_eq!(status, 200, "ListInstances expected 200, got {status} {last}");
     assert_eq!(
-        first["NextToken"],
+        last["Instances"].as_array().map(Vec::len),
+        Some(0),
+        "following the token ends the enumeration, got {last}"
+    );
+    assert_eq!(
+        last["NextToken"],
         Value::Null,
-        "the only page must carry no NextToken, got {first}"
+        "the empty page past the end carries no token, got {last}"
     );
 
     // A read is a read: the second call reports the identical record, and creating a
@@ -1281,7 +1337,7 @@ async fn requests_outside_the_modeled_constraints_are_refused() {
 /// Each caller-driven store holds at most
 /// [`service_com_amazonaws_ssoadmin_swbexternalservice::state::MAX_RECORDS_PER_STORE`]
 /// records — the emulator's own memory ceiling, not an AWS quota — and a create that
-/// would cross it is refused with the modeled `ServiceQuotaExceededException` (402)
+/// would cross it is refused with the modeled `ServiceQuotaExceededException`
 /// instead of growing the process. The ceiling is read from the crate, so the test
 /// tracks the constant rather than restating it.
 #[tokio::test]
@@ -1311,7 +1367,7 @@ async fn a_caller_cannot_grow_a_store_past_its_ceiling() {
     )
     .await;
     assert_eq!(
-        status, 402,
+        status, 400,
         "case {MAX_RECORDS_PER_STORE} permission sets: expected the modeled quota refusal, got {status} {body}"
     );
     assert_eq!(

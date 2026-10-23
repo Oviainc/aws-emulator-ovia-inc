@@ -119,10 +119,15 @@ async fn a_document_past_the_documented_byte_ceiling_is_refused_and_named() {
                 .as_str()
                 .or_else(|| body["Message"].as_str())
                 .unwrap_or_default();
-            assert!(
-                message.contains(&position.to_string()),
-                "case {size} bytes at index {position}: the refusal must name the document \
-                 that broke the ceiling, got {message:?}"
+            assert_eq!(
+                message,
+                format!(
+                    "Input text size exceeds limit. Max length of request text allowed \
+                     is {MAX_DOCUMENT_BYTES} bytes while in this request the text size \
+                     is {size} bytes"
+                ),
+                "case {size} bytes at index {position}: the refusal must report the quota \
+                 and the offending document's byte length, got {message:?}"
             );
         } else {
             assert_eq!(
