@@ -48,6 +48,21 @@ rationale is recorded here so it is visible with the code rather than only in a 
   workspace's curated `[workspace.dependencies]` is to own this dependency, the root
   manifest is the place for it — this crate declares it directly only because the root
   manifest is not editable from here.
+* **Snapshots of a warehouse (`backup`).** A Redshift Serverless snapshot is a snapshot of
+  "all databases in a namespace", and those databases live here — so `state.rs` exposes
+  `capture_warehouse` / `restore_warehouse`, which the redshift-serverless control plane
+  calls from `CreateSnapshot` and `RestoreFromSnapshot`. Both use the engine's own
+  page-level copy (`sqlite3_backup_*`, the dependency's `backup` feature) between two
+  connections this crate opened through `Database::open`: no path is named and no file is
+  opened, unlike `VACUUM INTO`, which the authorizer denies. A captured database is
+  confined exactly as a live one is, is reachable only through that opaque capture value,
+  and is bounded by the same `max_page_count` — which is a property of the destination
+  CONNECTION, so a restored database keeps it; the control plane bounds how many pages its
+  snapshots retain between them. Both are BLOCKING engine work, documented and driven the
+  way `run_on` is: the caller puts them on a blocking pool under `COPY_REQUEST_BUDGET` and
+  holds no state lock across them, and each copy holds itself to `COPY_TIMEOUT`, checked
+  while waiting for a database a statement is running on and between copy steps, so it is
+  always the copy's own deadline that ends it.
 
 ## Layout
 

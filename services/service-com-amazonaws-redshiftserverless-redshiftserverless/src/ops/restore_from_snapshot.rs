@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreFromSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreFromSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: makes the named namespace hold what the snapshot holds — its recorded
+//! namespace properties AND its databases — and answers with that namespace.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreFromSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The snapshot is addressed by `snapshotName` or by `snapshotArn`, never both (the model
+//! documents `snapshotArn` as "must not be specified at the same time as snapshotName"),
+//! and `ownerAccount` narrows the lookup the way `GetSnapshot`'s does, so a snapshot this
+//! account does not own is not found. A snapshot that resolves to nothing is the modelled
+//! `ResourceNotFoundException`.
+//!
+//! `workgroupName` is "the name of the workgroup used to restore the snapshot": it is the
+//! compute the restore runs through and the compute that serves the restored databases
+//! afterwards, so it has to exist — this operation creates no workgroup. A `workgroupName`
+//! that resolves to nothing is refused exactly as `GetWorkgroup` refuses one. It also
+//! keeps the namespace `CreateWorkgroup` attached it to: this operation models no
+//! workgroup property, so it moves no compute between namespaces.
+//!
+//! The DATA is the point of a restore, so the snapshot's copy of the namespace's databases
+//! is written back over that workgroup's databases
+//! ([`crate::state::restore_namespace_data`]): a `SELECT` submitted to the Data API against
+//! the restored workgroup afterwards reads the rows that were written before the snapshot
+//! was taken. The workgroup then holds exactly the databases the snapshot holds — a restore
+//! replaces a namespace's contents rather than merging into them.
+//!
+//! The namespace itself is restored from the snapshot: the admin credentials "that the
+//! namespace or cluster had at the time the snapshot was taken" come off the snapshot
+//! record, and a `namespaceName` that resolves to nothing is restored into a namespace
+//! minted from those same properties rather than refused — this operation is what creates
+//! the restored namespace. A namespace with a change already in flight (one reporting
+//! `MODIFYING` or `DELETING`) is the modelled `ConflictException`: two changes to one
+//! namespace cannot both be in flight.
+//!
+//! `manageAdminPassword` and `adminPasswordSecretKmsKeyId` are recorded on the namespace
+//! exactly as `CreateNamespace` records them, and mint no Secrets Manager secret here
+//! either. `maintainIntegration` names data-sharing, zero-ETL and S3-event integrations,
+//! none of which this emulator serves, so there is nothing for either value of it to keep
+//! or drop; it is accepted and changes nothing.
+//!
+//! The restored namespace reports `MODIFYING` and reaches `AVAILABLE` on its own a moment
+//! later, with nobody calling — the data is already materialised when the call returns, so
+//! the status is the only thing the clock still owes. See
+//! [`crate::state::NamespaceRecord::begin_transition`].
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +199,281 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreFromSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreFromSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `snapshotArn` is documented "must not be specified at the same time as
+        // snapshotName", and both are optional in the model — so a request naming both
+        // is contradictory and one naming neither addresses no snapshot at all.
+        match (input.snapshot_name.as_deref(), input.snapshot_arn.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(RestoreFromSnapshotErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "snapshotArn must not be specified at the same time as \
+                                  snapshotName"
+                            .to_string(),
+                    },
+                )
+                .into());
+            }
+            (None, None) => {
+                return Err(RestoreFromSnapshotErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "either snapshotName or snapshotArn must be specified"
+                            .to_string(),
+                    },
+                )
+                .into());
+            }
+            _ => {}
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RestoreFromSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Phase 1, under the state lock: every refusal this restore owes, the snapshot it
+        // is going to write back, and the RESERVATION of the namespace it restores into.
+        // The guard is RELEASED at the end of this block, because copying the databases is
+        // blocking engine work: holding the store's lock across it would stall every other
+        // request to this service. See [`crate::state::restore_namespace_data`].
+        let region = crate::state::request_region(ctx);
+        let (snapshot, data, minted) = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+
+            // The compute the restore runs through: it serves the restored databases
+            // afterwards, and this operation creates no workgroup, so it has to exist
+            // already.
+            if !state.workgroups.contains_key(&input.workgroup_name) {
+                return Err(RestoreFromSnapshotErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no workgroup named {}", input.workgroup_name),
+                        resource_name: Some(input.workgroup_name.clone()),
+                    },
+                )
+                .into());
+            }
+
+            // A namespace with a change already in flight cannot take a second one.
+            if let Some(status) = state
+                .namespaces
+                .get(&input.namespace_name)
+                .and_then(|record| record.namespace.status.clone())
+            {
+                if status != crate::state::NAMESPACE_AVAILABLE {
+                    return Err(RestoreFromSnapshotErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "There is an operation running on the namespace {}; it is \
+                                 {status}.",
+                                input.namespace_name
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // Minting the restored namespace is a new record, so the account's quota is
+            // checked here — before anything is copied, so a refused restore moves no
+            // data.
+            if !state.namespaces.contains_key(&input.namespace_name)
+                && state.namespaces.len() >= crate::state::MAX_NAMESPACES
+            {
+                return Err(namespace_quota_exceeded());
+            }
+
+            // Name first, ARN second, narrowed by `ownerAccount` — the same resolution
+            // `GetSnapshot` performs, so the two operations address a snapshot alike.
+            let found = match input.snapshot_name.as_deref() {
+                Some(name) => state.snapshots.get(name),
+                None => state.snapshots.values().find(|record| {
+                    record.snapshot.snapshot_arn.as_deref() == input.snapshot_arn.as_deref()
+                }),
+            }
+            .filter(|record| {
+                input.owner_account.as_deref().is_none_or(|account| {
+                    record.snapshot.owner_account.as_deref() == Some(account)
+                })
+            });
+            let Some(record) = found else {
+                let identifier = input
+                    .snapshot_name
+                    .clone()
+                    .or_else(|| input.snapshot_arn.clone())
+                    .unwrap_or_default();
+                return Err(RestoreFromSnapshotErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("no snapshot named {identifier}"),
+                        resource_name: Some(identifier),
+                    },
+                )
+                .into());
+            };
+            // Everything the answer and the restored namespace are built from, taken off
+            // the STORED snapshot: an ARN-addressed restore reports the snapshot's own
+            // name, and the restored namespace carries the credentials the namespace had
+            // when the snapshot was taken. The data is taken as a handle, so the copy
+            // below needs no guard on the store.
+            let snapshot = record.snapshot.clone();
+            let data = ::std::sync::Arc::clone(&record.data);
+
+            // The namespace this restore is for is RESERVED under the same lock that
+            // just checked the quota, so no refusal is left for after the copy: the slot
+            // cannot be taken in the meantime, and a copy that fails releases it again.
+            let minted = !state.namespaces.contains_key(&input.namespace_name);
+            if minted {
+                state.namespaces.insert(
+                    input.namespace_name.clone(),
+                    minted_namespace(&input, &snapshot, &region),
+                );
+            }
+            (snapshot, data, minted)
+        };
+
+        // Phase 2, with no state guard held: the restore itself, the snapshot's databases
+        // replacing the workgroup's. The copy either replaces them all or leaves them all
+        // as it found them, so a call that fails here moves no data — and the namespace
+        // this call reserved is released again, leaving the store as the call found it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreFromSnapshot"))
+        // The workgroup was resolved in phase 1. A request that deletes it while this copy
+        // runs leaves the restored databases open under its name, which the Data API
+        // closes when they go idle, exactly as it does for a workgroup deleted after a
+        // statement ran on it.
+        if let Err(failure) = crate::state::restore_namespace_data(
+            &self.engine,
+            data,
+            input.workgroup_name.clone(),
+        )
+        .await
+        {
+            if minted {
+                state.lock().namespaces.remove(&input.namespace_name);
+            }
+            let message = format!("the snapshot's databases could not be restored: {failure}");
+            // The emulator cannot hold another open database: a capacity limit, which
+            // this operation models as its own quota error.
+            return Err(if failure.is_capacity() {
+                RestoreFromSnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message },
+                )
+                .into()
+            } else {
+                RestoreFromSnapshotErrorModeled::InternalServerException(InternalServerException {
+                    message,
+                })
+                .into()
+            });
+        }
+
+        // Phase 3, under the state lock again, and with no refusal left to make: the
+        // namespace record is the one phase 1 reserved, or the namespace that already
+        // existed, so every step here is a write that cannot fail.
+        let mut state = state.lock();
+        state.settle_due_transitions();
+        let target = state
+            .namespaces
+            .entry(input.namespace_name.clone())
+            // Only reached if another request deleted the namespace this call had
+            // reserved while the data was being copied: the slot was this call's, so the
+            // restored namespace is put back rather than the restore refused.
+            .or_insert_with(|| minted_namespace(&input, &snapshot, &region));
+
+        // The snapshot's admin credentials replace the namespace's, because "Amazon
+        // Redshift uses the admin credentials that the namespace or cluster had at the
+        // time the snapshot was taken". A namespace this call minted already carries
+        // them, so the same writes serve both.
+        if let Some(admin_username) = snapshot.admin_username.clone() {
+            target.namespace.admin_username = Some(admin_username);
+        }
+        target.namespace.admin_password_secret_arn = snapshot.admin_password_secret_arn.clone();
+        target.namespace.admin_password_secret_kms_key_id = input
+            .admin_password_secret_kms_key_id
+            .clone()
+            .or_else(|| snapshot.admin_password_secret_kms_key_id.clone());
+        if let Some(manage_admin_password) = input.manage_admin_password {
+            target.manage_admin_password = manage_admin_password;
+        }
+        target.begin_transition(
+            crate::state::NAMESPACE_MODIFYING,
+            crate::state::NAMESPACE_AVAILABLE,
+        );
+
+        // The answer comes out of the STORED record, so what the caller reads is what a
+        // later `GetNamespace` reads.
+        let namespace = Some(target.namespace.clone());
+        Ok(RestoreFromSnapshotOutput {
+            snapshot_name: snapshot.snapshot_name,
+            owner_account: snapshot.owner_account,
+            namespace,
+        })
     }
+}
+
+/// The refusal a restore that would mint a namespace past the account's documented
+/// quota answers with: it is decided BEFORE the data is copied, under the lock that
+/// then reserves the slot.
+fn namespace_quota_exceeded() -> RestoreFromSnapshotError {
+    RestoreFromSnapshotErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "this account has reached its quota of {} namespaces in this Region",
+            crate::state::MAX_NAMESPACES
+        ),
+    })
+    .into()
+}
+
+/// The namespace a restore mints when `namespaceName` resolves to nothing: this call is
+/// what restores that namespace, so it is built from the snapshot's recorded properties.
+///
+/// The workgroup the restore runs through keeps the namespace `CreateWorkgroup` attached
+/// it to: `workgroupName` is "the workgroup used to restore the snapshot", and this
+/// operation models no workgroup property, so it moves no compute between namespaces —
+/// attaching compute to the restored namespace is `CreateWorkgroup`'s own call.
+///
+/// It is minted reporting `MODIFYING` with `AVAILABLE` owed, like every other namespace
+/// a restore touches.
+fn minted_namespace(
+    input: &RestoreFromSnapshotInput,
+    snapshot: &Snapshot,
+    region: &str,
+) -> crate::state::NamespaceRecord {
+    let namespace_id = crate::state::new_resource_id();
+    let namespace = Namespace {
+        namespace_arn: Some(crate::state::namespace_arn(region, &namespace_id)),
+        namespace_id: Some(namespace_id),
+        namespace_name: Some(input.namespace_name.clone()),
+        admin_username: snapshot.admin_username.clone(),
+        // `Snapshot` models no database name, so the restored namespace's first database
+        // carries the same default a created namespace's does.
+        db_name: Some(crate::state::DEFAULT_DB_NAME.to_string()),
+        kms_key_id: snapshot.kms_key_id.clone(),
+        iam_roles: Some(Vec::new()),
+        log_exports: Some(Vec::new()),
+        creation_date: Some(crate::state::now_timestamp()),
+        admin_password_secret_arn: snapshot.admin_password_secret_arn.clone(),
+        admin_password_secret_kms_key_id: input
+            .admin_password_secret_kms_key_id
+            .clone()
+            .or_else(|| snapshot.admin_password_secret_kms_key_id.clone()),
+        lakehouse_registration_status: Some(crate::state::LAKEHOUSE_NOT_REGISTERED.to_string()),
+        ..Namespace::default()
+    };
+    let mut record = crate::state::NamespaceRecord {
+        namespace,
+        // The snapshot holds no password: `Snapshot` models none, and the namespace's own
+        // password was never readable.
+        admin_user_password: None,
+        manage_admin_password: input.manage_admin_password.unwrap_or(false),
+        tags: Vec::new(),
+        pending_status: None,
+    };
+    record.begin_transition(
+        crate::state::NAMESPACE_MODIFYING,
+        crate::state::NAMESPACE_AVAILABLE,
+    );
+    record
 }

@@ -43,7 +43,14 @@ hex = { workspace = true }
 # untrusted schema, no URI filenames, `temp_store = MEMORY`, `max_page_count`,
 # plus length, column, depth and compound-select limits. `limits` and `hooks`
 # are the features those controls need; `load_extension` is deliberately absent.
-rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+#
+# `backup` is the engine's own page-level copy between two OPEN connections
+# (`sqlite3_backup_*`). It is what `state::capture_warehouse` /
+# `state::restore_warehouse` take and write back a Redshift Serverless snapshot of
+# a warehouse's databases with: both ends are in-memory databases this crate
+# opened through `Database::open`, so the copy names no path and opens no file —
+# unlike `VACUUM INTO`, which the authorizer denies for exactly that reason.
+rusqlite = { version = "0.37", features = ["backup", "bundled", "column_decltype", "hooks", "limits"] }
 # Mints the `UUID`-shaped statement, query and session identifiers.
 uuid = { version = "1", features = ["v4"] }
 

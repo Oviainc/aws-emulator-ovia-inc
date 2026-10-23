@@ -16,7 +16,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -25,6 +25,16 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # Opaque pagination tokens: the resume key, hex-encoded.
 hex = { workspace = true }
+# A Redshift Serverless namespace's DATA — its databases and the tables in them —
+# lives in the SQL engine the Redshift Data API runs statements on, which addresses
+# it by workgroup. `CreateSnapshot` ("creates a snapshot of all databases in a
+# namespace") and `RestoreFromSnapshot` have to copy those databases, so this crate
+# takes the capture through that crate's `state::capture_warehouse` /
+# `state::restore_warehouse` seam rather than keeping a second copy of the data or
+# reporting a restore nothing moved. The capture is opaque here: no SQL type crosses
+# the boundary, and the dependency points one way (the Data API crate does not
+# depend on this one).
+service-com-amazonaws-redshiftdata-redshiftdata = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

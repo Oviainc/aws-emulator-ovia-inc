@@ -17,6 +17,8 @@ mod namespace_response_fidelity;
 mod namespace_workgroup_lifecycle;
 #[path = "all/snapshot_and_usage_limit.rs"]
 mod snapshot_and_usage_limit;
+#[path = "all/snapshot_restore.rs"]
+mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/usage_limit_lifecycle.rs"]

@@ -11788,6 +11788,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-redshiftdata-redshiftdata",
  "sha2 0.10.9",
  "tokio",
  "tracing",

@@ -6,6 +6,12 @@
 //! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::snapshots`]
 //! that `GetSnapshot` / `ListSnapshots` then report.
 //!
+//! The record holds the namespace's DATA as well as its metadata: this operation
+//! "creates a snapshot of all databases in a namespace", so it copies the databases the
+//! namespace's workgroups serve (see [`crate::state::capture_namespace_data`]) and
+//! `RestoreFromSnapshot` writes that copy back. The copy is of the databases as they
+//! stand when the snapshot is taken, so a statement run afterwards does not change it.
+//!
 //! A namespace with no workgroup has no compute to snapshot through, so the create is
 //! refused with the 404-status `ResourceNotFoundException` and stores NOTHING; the same
 //! request succeeds once a workgroup on that namespace exists. A `namespaceName` that
@@ -185,47 +191,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.settle_due_transitions();
-        // The store grows one record per create, so a quota bounds it. Read before the
-        // `entry` below takes the borrow; it bounds only a NEW record.
-        let stored_snapshots = state.snapshots.len();
 
-        let Some(namespace) = state
-            .namespaces
-            .get(&input.namespace_name)
-            .map(|record| record.namespace.clone())
-        else {
-            // The name resolves to nothing: the modelled `ResourceNotFoundException`,
-            // answered with the status this service answers any namespace-name refusal
-            // with. See [`crate::state::namespace_not_found`].
-            return Err(crate::scaffolded::Scaffolded::restated(
-                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
-                CreateSnapshotErrorModeled::ResourceNotFoundException(
+        // Phase 1, under the state lock: every refusal that can be decided before the
+        // data is copied, and the facts the snapshot is built from. The guard is
+        // RELEASED at the end of this block, because copying the databases is blocking
+        // engine work: holding the store's lock across it would stall every other
+        // request to this service. See [`crate::state::capture_namespace_data`].
+        let (namespace, workgroups) = {
+            let mut state = state.lock();
+            state.settle_due_transitions();
+
+            let Some(namespace) = state
+                .namespaces
+                .get(&input.namespace_name)
+                .map(|record| record.namespace.clone())
+            else {
+                // The name resolves to nothing: the modelled `ResourceNotFoundException`,
+                // answered with the status this service answers any namespace-name refusal
+                // with. See [`crate::state::namespace_not_found`].
+                return Err(crate::scaffolded::Scaffolded::restated(
+                    crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                    CreateSnapshotErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::namespace_not_found(&input.namespace_name),
+                            resource_name: Some(input.namespace_name.clone()),
+                        },
+                    ),
+                ));
+            };
+
+            // A snapshot of a namespace is taken through the compute attached to it, so a
+            // namespace carrying no workgroup has nothing to take it with. The refusal
+            // comes BEFORE any write, so the rejected call leaves the snapshot store
+            // untouched. The names are taken owned because they are also what the
+            // namespace's DATA is reached through, below.
+            let workgroups: Vec<String> = state
+                .workgroups_in_namespace(&input.namespace_name)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if workgroups.is_empty() {
+                return Err(CreateSnapshotErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::namespace_not_found(&input.namespace_name),
+                        message: format!(
+                            "You can't create a snapshot because there isn't a workgroup \
+                             created for the namespace {}.",
+                            input.namespace_name
+                        ),
                         resource_name: Some(input.namespace_name.clone()),
                     },
-                ),
-            ));
+                )
+                .into());
+            }
+            // Refused here rather than after the copy, so a create that cannot be stored
+            // never asks the engine to copy anything.
+            if state.snapshots.contains_key(&input.snapshot_name) {
+                return Err(CreateSnapshotErrorModeled::ConflictException(ConflictException {
+                    message: format!("a snapshot named {} already exists", input.snapshot_name),
+                })
+                .into());
+            }
+            if state.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
+                return Err(CreateSnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account has reached its limit of {} snapshots in this \
+                             Region",
+                            crate::state::MAX_SNAPSHOTS
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            (namespace, workgroups)
         };
 
-        // A snapshot of a namespace is taken through the compute attached to it, so a
-        // namespace carrying no workgroup has nothing to take it with. The refusal comes
-        // BEFORE any write, so the rejected call leaves the snapshot store untouched.
-        if state.workgroups_in_namespace(&input.namespace_name).is_empty() {
-            return Err(CreateSnapshotErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "You can't create a snapshot because there isn't a workgroup \
-                         created for the namespace {}.",
-                        input.namespace_name
-                    ),
-                    resource_name: Some(input.namespace_name.clone()),
-                },
-            )
-            .into());
-        }
+        // Phase 2, with no state guard held: a snapshot "of all databases in a namespace"
+        // holds the DATABASES, not just the namespace's metadata, so they are copied as
+        // they stand at this instant — what the snapshot restores is what was written
+        // before it was taken and nothing written after. An empty copy is the correct
+        // answer for a namespace no statement has run against.
+        let data = match crate::state::capture_namespace_data(&self.engine, workgroups).await {
+            Ok(data) => data,
+            // The databases exist but could not be copied: the snapshot would claim to
+            // hold data it does not, so nothing is stored and the failure is reported.
+            Err(failure) if failure.is_capacity() => {
+                return Err(CreateSnapshotErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the namespace's databases could not be copied: {failure}"
+                        ),
+                    },
+                )
+                .into())
+            }
+            Err(failure) => {
+                return Err(CreateSnapshotErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "the namespace's databases could not be copied: {failure}"
+                        ),
+                    },
+                )
+                .into())
+            }
+        };
 
         let region = crate::state::request_region(ctx);
         let snapshot_id = crate::state::new_resource_id();
@@ -256,9 +327,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             admin_password_secret_arn: namespace.admin_password_secret_arn.clone(),
             admin_password_secret_kms_key_id: namespace.admin_password_secret_kms_key_id.clone(),
             // `status` is set by the CREATING -> AVAILABLE transition below. The backup
-            // size and rate members report how much data moved; this emulator holds no
-            // database contents, so there is no measurement to report and they stay unset
-            // rather than carrying a number nothing produced.
+            // size and rate members report a transfer measured in megabytes, and the only
+            // measurement this emulator's engine makes of a copy is its page count — so
+            // they stay unset rather than carrying a number converted from a page size
+            // nothing reports.
             ..Snapshot::default()
         };
 
@@ -267,11 +339,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             pending_status: None,
             created_at: ::std::time::Instant::now(),
+            data: ::std::sync::Arc::new(data),
         };
         record.begin_transition(
             crate::state::SNAPSHOT_CREATING,
             crate::state::SNAPSHOT_AVAILABLE,
         );
+
+        // Phase 3, under the state lock again: the write. Every refusal of phase 1 that
+        // another request could have made true in the meantime is decided again here, on
+        // the store as it is NOW, so a create never writes past a quota or into a name
+        // that has since been taken.
+        let mut state = state.lock();
+        state.settle_due_transitions();
+        if !state.namespaces.contains_key(&input.namespace_name) {
+            return Err(crate::scaffolded::Scaffolded::restated(
+                crate::state::NAMESPACE_NAME_REFUSAL_STATUS,
+                CreateSnapshotErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::namespace_not_found(&input.namespace_name),
+                    resource_name: Some(input.namespace_name.clone()),
+                }),
+            ));
+        }
+        // The retained copies are bounded as well as the number of records; see
+        // [`crate::state::MAX_SNAPSHOT_DATA_PAGES`].
+        if crate::state::retained_snapshot_data_pages(&state) + record.data.pages()
+            > crate::state::MAX_SNAPSHOT_DATA_PAGES
+        {
+            return Err(CreateSnapshotErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account's snapshots already hold the most snapshot data this \
+                         Region retains ({} engine pages)",
+                        crate::state::MAX_SNAPSHOT_DATA_PAGES
+                    ),
+                },
+            )
+            .into());
+        }
+        let stored_snapshots = state.snapshots.len();
 
         // The name is the snapshot's identity in this account, so an occupied slot IS the
         // conflict. The answer comes out of the STORED record, so what the caller reads is

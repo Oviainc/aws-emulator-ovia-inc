@@ -8,6 +8,11 @@
 //! just-created or just-modified workgroup or snapshot settles through, and the opaque
 //! page token the paginated lists hand out.
 //!
+//! A snapshot holds the namespace's DATA as well as its metadata. That data — the
+//! databases and the tables in them — lives in the SQL engine the Redshift Data API runs
+//! statements on, so this module also carries the seam the snapshot and restore
+//! operations copy it through: [`capture_namespace_data`] and [`restore_namespace_data`].
+//!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
 
@@ -85,6 +90,16 @@ pub const MAX_WORKGROUPS: usize = 25;
 /// needs no such bound: it is already bounded by the namespace and workgroup quotas times
 /// the modelled usage types and periods.)
 pub const MAX_SNAPSHOTS: usize = 100;
+
+/// How many engine pages of DATA the snapshots of this account may hold between them.
+///
+/// A snapshot holds a copy of the namespace's databases ([`SnapshotRecord::data`]), so the
+/// snapshot store grows with the data a caller wrote and not only with the number of
+/// records [`MAX_SNAPSHOTS`] bounds. Also an emulator-chosen bound, in the page unit the
+/// Data API's engine counts a database in, and surfaced the same way: `CreateSnapshot` is
+/// refused with its modelled `ServiceQuotaExceededException` rather than retaining more.
+/// 16,384 pages is 64 MiB at the engine's 4 KiB page.
+pub const MAX_SNAPSHOT_DATA_PAGES: i64 = 16_384;
 
 /// The `WorkgroupStatus` values this slice reports
 /// (`smithy_query(query="shape", shape="WorkgroupStatus")` -> CREATING, AVAILABLE,
@@ -340,7 +355,7 @@ impl WorkgroupRecord {
 /// only while a workgroup on that namespace exists; it then outlives every change to
 /// that compute, which is why the record holds the namespace-derived fields it answered
 /// with rather than looking the namespace up again on each read.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SnapshotRecord {
     /// The resource every reader of this snapshot returns, bar the retention countdown
     /// [`reported`](Self::reported) recomputes from the clock.
@@ -351,6 +366,14 @@ pub struct SnapshotRecord {
     pub pending_status: Option<PendingStatus>,
     /// When the snapshot was taken, the instant `snapshotRemainingDays` counts down from.
     pub created_at: Instant,
+    /// The namespace's DATA as it stood when the snapshot was taken: a copy of the
+    /// databases reached through the namespace's workgroups, which `RestoreFromSnapshot`
+    /// writes back. Empty for a namespace no statement has ever run against. See
+    /// [`capture_namespace_data`].
+    ///
+    /// Behind an `Arc` so a restore can copy FROM it with no state guard held: the
+    /// restore clones the handle under the lock, releases the lock, and copies.
+    pub data: ::std::sync::Arc<NamespaceData>,
 }
 
 impl SnapshotRecord {
@@ -564,4 +587,148 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsRedshiftserverlessRedshiftserverlessState>)
+}
+
+// ---------------------------------------------------------------------------
+// The namespace's data, which lives in the Data API's SQL engine
+// ---------------------------------------------------------------------------
+
+/// A copy of a namespace's databases, as [`capture_namespace_data`] took it.
+///
+/// Opaque here: the databases live in the SQL engine the Redshift Data API runs
+/// statements on, so the copy is taken, held and written back through that service's own
+/// seam and no SQL type crosses into this crate. See the dependency's note in
+/// `Cargo.toml`.
+pub type NamespaceData =
+    ::service_com_amazonaws_redshiftdata_redshiftdata::state::WarehouseCapture;
+
+/// Why a namespace's data could not be copied or written back.
+pub type DataPlaneUnavailable =
+    ::service_com_amazonaws_redshiftdata_redshiftdata::state::WarehouseUnavailable;
+
+/// Why a copy of a namespace's data did not happen.
+///
+/// The copy runs on the blocking pool under a budget, so it can fail three ways: the
+/// copy itself could not be made, the request gave up waiting for it, or the task
+/// carrying it did not return.
+#[derive(Debug)]
+pub enum DataPlaneFailure {
+    /// The databases could not be copied.
+    Unavailable(DataPlaneUnavailable),
+    /// The request waited [`DATA_COPY_BUDGET`] and gave up, so the copy is abandoned
+    /// rather than reported as done.
+    GaveUp(Duration),
+    /// The blocking task carrying the copy did not return a result.
+    Lost,
+}
+
+impl DataPlaneFailure {
+    /// True when the failure is this emulator being at its capacity for open
+    /// databases — the one of these an operation reports as a quota error rather
+    /// than as a server fault.
+    pub fn is_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable(DataPlaneUnavailable::TooManyOpen(_))
+        )
+    }
+}
+
+impl std::fmt::Display for DataPlaneFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(unavailable) => write!(f, "{unavailable}"),
+            Self::GaveUp(budget) => write!(
+                f,
+                "the copy did not finish within {} seconds and was abandoned",
+                budget.as_secs()
+            ),
+            Self::Lost => write!(f, "the copy did not return a result"),
+        }
+    }
+}
+
+/// How long a request waits for a copy of a namespace's data: the Data API's own
+/// budget for one copy, which is longer than the deadline the copy holds itself to,
+/// so what ends a copy is its own deadline and not this request's patience.
+pub const DATA_COPY_BUDGET: Duration =
+    ::service_com_amazonaws_redshiftdata_redshiftdata::state::COPY_REQUEST_BUDGET;
+
+/// Copy the databases reached through `workgroups` — the compute attached to one
+/// namespace — as they stand now.
+///
+/// This is what makes a snapshot a snapshot of DATA: `CreateSnapshot` "creates a
+/// snapshot of all databases in a namespace", and a namespace's databases are the ones
+/// the Data API serves through the workgroups attached to it. A namespace nothing has
+/// run a statement against captures empty, which is correct: it holds no table to
+/// restore.
+///
+/// The copy is blocking engine work, so it runs on the blocking pool under
+/// [`DATA_COPY_BUDGET`] and never on the async worker the request is served on — the
+/// rule the Data API's `capture_warehouse` documents and its `ExecuteStatement`
+/// follows for the same engine. Call it with NO state guard held, so one caller's copy
+/// serialises nothing else.
+pub async fn capture_namespace_data<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    workgroups: Vec<String>,
+) -> Result<NamespaceData, DataPlaneFailure> {
+    let engine = ::std::sync::Arc::clone(engine);
+    let joined = ::tokio::time::timeout(
+        DATA_COPY_BUDGET,
+        ::tokio::task::spawn_blocking(move || {
+            let names: Vec<&str> = workgroups.iter().map(String::as_str).collect();
+            ::service_com_amazonaws_redshiftdata_redshiftdata::state::capture_warehouse(
+                &*engine, &names,
+            )
+        }),
+    )
+    .await;
+    match joined {
+        Ok(Ok(Ok(data))) => Ok(data),
+        Ok(Ok(Err(unavailable))) => Err(DataPlaneFailure::Unavailable(unavailable)),
+        Ok(Err(_panicked)) => Err(DataPlaneFailure::Lost),
+        Err(_elapsed) => Err(DataPlaneFailure::GaveUp(DATA_COPY_BUDGET)),
+    }
+}
+
+/// Write `data` back over the databases `workgroup` serves, and report how many
+/// databases it materialised.
+///
+/// The workgroup then holds exactly the databases the snapshot holds, with exactly
+/// their contents, so a statement submitted against it afterwards reads the restored
+/// tables. Bounded and taken off the async worker exactly as
+/// [`capture_namespace_data`] is, and for the same reasons.
+pub async fn restore_namespace_data<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    data: ::std::sync::Arc<NamespaceData>,
+    workgroup: String,
+) -> Result<usize, DataPlaneFailure> {
+    let engine = ::std::sync::Arc::clone(engine);
+    let joined = ::tokio::time::timeout(
+        DATA_COPY_BUDGET,
+        ::tokio::task::spawn_blocking(move || {
+            ::service_com_amazonaws_redshiftdata_redshiftdata::state::restore_warehouse(
+                &*engine, &data, &workgroup,
+            )
+        }),
+    )
+    .await;
+    match joined {
+        Ok(Ok(Ok(restored))) => Ok(restored),
+        Ok(Ok(Err(unavailable))) => Err(DataPlaneFailure::Unavailable(unavailable)),
+        Ok(Err(_panicked)) => Err(DataPlaneFailure::Lost),
+        Err(_elapsed) => Err(DataPlaneFailure::GaveUp(DATA_COPY_BUDGET)),
+    }
+}
+
+/// The engine pages the stored snapshots' data occupies between them, the quantity
+/// [`MAX_SNAPSHOT_DATA_PAGES`] bounds.
+pub fn retained_snapshot_data_pages(
+    state: &ComAmazonawsRedshiftserverlessRedshiftserverlessState,
+) -> i64 {
+    state
+        .snapshots
+        .values()
+        .map(|record| record.data.pages())
+        .sum()
 }
