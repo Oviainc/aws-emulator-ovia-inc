@@ -5,6 +5,11 @@
 //! Searches the seeded offering catalog in [`crate::state`]: every supplied
 //! filter narrows it, and `maxResults`/`nextToken` page the result.
 //!
+//! The paging is a resumable cursor, not a "more results remain" flag: a search
+//! answers with one page — the caller's `maxResults`, or the service's own page
+//! when the caller names none — and hands back the cursor to resume at. Only a
+//! RESUMED answer with no more results to return carries a null `nextToken`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -163,8 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
         };
         // `maxResults` is `@required` with `@default: 0`, and 0 is "no page size
-        // asked for": the whole result set comes back in one page.
-        let limit = usize::try_from(input.max_results).ok().filter(|n| *n > 0);
+        // asked for": the service picks its own, so a search of a catalog the
+        // service owns answers with one page of it rather than all of it.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|asked| *asked > 0)
+            .unwrap_or(crate::state::DEFAULT_OFFERINGS_PAGE_SIZE);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeSavingsPlansOfferingsErrorModeled::InternalServerException(
@@ -174,17 +183,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let matched: Vec<SavingsPlanOffering> = {
+        let (page, next) = {
             let store = state.lock();
-            store
+            let matched: Vec<SavingsPlanOffering> = store
                 .offerings()
                 .iter()
                 .filter(|offering| admits(&input, offering))
                 .map(project)
-                .collect()
+                .collect();
+            let (page, next) = crate::state::paginate(&matched, offset, Some(page_size));
+            // The FIRST answer of a search always carries the cursor to resume
+            // at, even when the page it served already held every offering the
+            // filters admitted: this search reports where its walk of the
+            // catalog got to, not whether another match exists, and the
+            // recorded answers show AWS doing exactly that — a token beside a
+            // page carrying the complete set of matching offerings. A caller
+            // learns the walk is over by resuming it: a RESUMED answer carries
+            // a cursor only while results remain past its page, so the walk
+            // ends on the first resumed page with nothing more to return, which
+            // is what `nextToken` being "null when there are no more results to
+            // return" means here. One extra call at most, and never a loop.
+            let next = next
+                .or_else(|| (input.next_token.is_none()).then_some(matched.len()));
+            (page, next)
         };
 
-        let (page, next) = crate::state::paginate(&matched, offset, limit);
         Ok(DescribeSavingsPlansOfferingsOutput {
             search_results: Some(page),
             next_token: next.map(|offset| crate::state::encode_page_token(PAGE_KIND, offset)),
