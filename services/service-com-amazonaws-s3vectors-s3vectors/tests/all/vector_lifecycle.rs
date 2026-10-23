@@ -1655,11 +1655,6 @@ async fn the_operations_outside_this_slice_still_answer_501() {
 
     let cases: Vec<(&str, Value)> = vec![
         (
-            "DeleteVectors",
-            json!({ "vectorBucketName": "stub-bucket", "indexName": "stub-index",
-                    "keys": ["v1"] }),
-        ),
-        (
             "UpdateIndexMode",
             json!({ "vectorBucketName": "stub-bucket", "indexName": "stub-index",
                     "indexMode": "ENHANCED" }),
@@ -1688,6 +1683,394 @@ async fn the_operations_outside_this_slice_still_answer_501() {
             (status, error_code(&body).as_str()),
             (501, "NotImplemented"),
             "case {operation:?}: an unimplemented operation must answer 501, got {status} {body}"
+        );
+    }
+}
+
+/// The keys every deletion case starts from, in the order a read reports them.
+const SEEDED_KEYS: [&str; 5] = ["v1", "v2", "v3", "v4", "v5"];
+
+/// A fresh 2-dimensional cosine index holding one vector per [`SEEDED_KEYS`] entry,
+/// and the router serving it.
+async fn with_seeded_index(bucket: &str, index: &str) -> MultiServiceRouter {
+    let router = with_index(bucket, index, 2, "cosine").await;
+    let vectors: Vec<Value> = SEEDED_KEYS
+        .iter()
+        .enumerate()
+        .map(|(slot, key)| {
+            json!({
+                "key": key,
+                "data": { "float32": [1.0 + slot as f64, 1.0] },
+            })
+        })
+        .collect();
+    ok(
+        &router,
+        "PutVectors",
+        &json!({
+            "vectorBucketName": bucket,
+            "indexName": index,
+            "vectors": vectors,
+        }),
+    )
+    .await;
+    router
+}
+
+/// DeleteVectors removes exactly the vectors its `keys` name from the named index and
+/// nothing else, and a key the index does not hold is not a failure — the operation is
+/// `@idempotent`, so the request asks for a state a missing key is already in.
+///
+/// Rows span what the rule generalises over: how many keys one request names (one, a
+/// few, every key in the index, and a batch at `DeleteVectors$keys`'s modelled maximum
+/// of 500), whether a named key is present, absent or repeated, and a mixture of the
+/// two.
+#[tokio::test]
+async fn delete_vectors_removes_exactly_the_named_keys() {
+    // A batch at the top of `DeleteVectors$keys`'s modelled `len 1..500`, of which
+    // only two keys are in the index.
+    let max_batch: Vec<String> = ["v1".to_string(), "v5".to_string()]
+        .into_iter()
+        .chain((0..498).map(|n| format!("absent-{n}")))
+        .collect();
+    assert_eq!(
+        max_batch.len(),
+        500,
+        "the maximum-batch row must name 500 keys, got {}",
+        max_batch.len()
+    );
+
+    // (case, the keys the request deletes, the keys that must remain)
+    let cases: Vec<(&str, Vec<String>, Vec<&str>)> = vec![
+        (
+            "one key of several",
+            vec!["v2".to_string()],
+            vec!["v1", "v3", "v4", "v5"],
+        ),
+        (
+            "two keys in one request",
+            vec!["v1".to_string(), "v4".to_string()],
+            vec!["v2", "v3", "v5"],
+        ),
+        (
+            "every key in the index",
+            SEEDED_KEYS.iter().map(|key| key.to_string()).collect(),
+            vec![],
+        ),
+        (
+            "a key the index never held",
+            vec!["absent-key".to_string()],
+            vec!["v1", "v2", "v3", "v4", "v5"],
+        ),
+        (
+            "a present and an absent key together",
+            vec!["v3".to_string(), "absent-key".to_string()],
+            vec!["v1", "v2", "v4", "v5"],
+        ),
+        (
+            "the same key twice in one batch",
+            vec!["v5".to_string(), "v5".to_string()],
+            vec!["v1", "v2", "v3", "v4"],
+        ),
+        ("a batch of 500 keys", max_batch, vec!["v2", "v3", "v4"]),
+    ];
+
+    for (case, keys, remaining) in cases {
+        let router = with_seeded_index("delete-bucket", "delete-index").await;
+        let expected: Vec<String> = remaining.iter().map(|key| (*key).to_string()).collect();
+
+        let (status, body) = call(
+            &router,
+            "DeleteVectors",
+            &json!({
+                "vectorBucketName": "delete-bucket",
+                "indexName": "delete-index",
+                "keys": keys,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteVectors must succeed, got {status} {body}"
+        );
+
+        let listed = ok(
+            &router,
+            "ListVectors",
+            &json!({ "vectorBucketName": "delete-bucket", "indexName": "delete-index" }),
+        )
+        .await;
+        assert_eq!(
+            keys_of(&listed),
+            expected,
+            "case {case:?}: ListVectors must report exactly the undeleted keys, got {listed}"
+        );
+
+        let got = ok(
+            &router,
+            "GetVectors",
+            &json!({
+                "vectorBucketName": "delete-bucket",
+                "indexName": "delete-index",
+                "keys": SEEDED_KEYS,
+            }),
+        )
+        .await;
+        assert_eq!(
+            keys_of(&got),
+            expected,
+            "case {case:?}: GetVectors must not report a deleted key, got {got}"
+        );
+    }
+}
+
+/// A deleted vector is gone from every read of the index — including the nearest-
+/// neighbour search — a repeated delete of the same key answers the same success, and
+/// the key is free to be used again by a later put. The index ARN is accepted in place
+/// of the bucket-and-index pair, as the model allows for this operation.
+#[tokio::test]
+async fn a_deleted_vector_leaves_every_read_and_its_key_is_reusable() {
+    let router = with_seeded_index("reuse-bucket", "reuse-index").await;
+    let index_arn = expected_index_arn("reuse-bucket", "reuse-index");
+    let query = json!({
+        "indexArn": index_arn,
+        "topK": 5,
+        "queryVector": { "float32": [1.0, 1.0] },
+        "returnDistance": true,
+    });
+
+    let before = ok(&router, "QueryVectors", &query).await;
+    assert_eq!(
+        keys_of(&before).first().map(String::as_str),
+        Some("v1"),
+        "the nearest vector before the delete must be v1, got {before}"
+    );
+
+    // Deleted through the index ARN form.
+    ok(
+        &router,
+        "DeleteVectors",
+        &json!({ "indexArn": index_arn, "keys": ["v1"] }),
+    )
+    .await;
+    let after = ok(&router, "QueryVectors", &query).await;
+    assert!(
+        !keys_of(&after).contains(&"v1".to_string()),
+        "a deleted vector must not be a query result, got {after}"
+    );
+    assert_eq!(
+        keys_of(&after).len(),
+        4,
+        "the other four vectors must still be found, got {after}"
+    );
+
+    // Repeating the delete asks for a state the index is already in.
+    let (status, body) = call(
+        &router,
+        "DeleteVectors",
+        &json!({ "indexArn": index_arn, "keys": ["v1"] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "repeating a delete must answer the same success, got {status} {body}"
+    );
+
+    // The key is reusable: a put under it stores a new vector, readable end to end.
+    ok(
+        &router,
+        "PutVectors",
+        &json!({
+            "indexArn": index_arn,
+            "vectors": [
+                { "key": "v1", "data": { "float32": [1.0, 1.0] }, "metadata": { "color": "blue" } },
+            ],
+        }),
+    )
+    .await;
+    let got = ok(
+        &router,
+        "GetVectors",
+        &json!({
+            "indexArn": index_arn,
+            "keys": ["v1"],
+            "returnData": true,
+            "returnMetadata": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        got["vectors"][0]["data"]["float32"],
+        json!([1.0, 1.0]),
+        "a reused key must hold the data the new put stored, got {got}"
+    );
+    assert_eq!(
+        got["vectors"][0]["metadata"],
+        json!({ "color": "blue" }),
+        "a reused key must hold the metadata the new put stored, got {got}"
+    );
+    let requeried = ok(&router, "QueryVectors", &query).await;
+    let nearest = requeried["vectors"][0]["distance"].as_f64();
+    assert_eq!(
+        (keys_of(&requeried).first().map(String::as_str), nearest.is_some_and(|d| close(d, 0.0))),
+        (Some("v1"), true),
+        "the re-put vector must be the nearest again, at distance 0, got {requeried}"
+    );
+}
+
+/// DeleteVectors is scoped to the one index its target names: a sibling index in the
+/// same bucket, holding the same keys, is untouched.
+#[tokio::test]
+async fn delete_vectors_only_touches_the_named_index() {
+    let router = with_seeded_index("scoped-bucket", "scoped-index").await;
+    ok(
+        &router,
+        "CreateIndex",
+        &json!({
+            "vectorBucketName": "scoped-bucket",
+            "indexName": "sibling-index",
+            "dataType": "float32",
+            "dimension": 2,
+            "distanceMetric": "cosine",
+        }),
+    )
+    .await;
+    ok(
+        &router,
+        "PutVectors",
+        &json!({
+            "vectorBucketName": "scoped-bucket",
+            "indexName": "sibling-index",
+            "vectors": [{ "key": "v1", "data": { "float32": [1.0, 1.0] } }],
+        }),
+    )
+    .await;
+
+    ok(
+        &router,
+        "DeleteVectors",
+        &json!({
+            "vectorBucketName": "scoped-bucket",
+            "indexName": "scoped-index",
+            "keys": SEEDED_KEYS,
+        }),
+    )
+    .await;
+
+    let sibling = ok(
+        &router,
+        "ListVectors",
+        &json!({ "vectorBucketName": "scoped-bucket", "indexName": "sibling-index" }),
+    )
+    .await;
+    assert_eq!(
+        keys_of(&sibling),
+        vec!["v1".to_string()],
+        "the sibling index must still hold its vector, got {sibling}"
+    );
+    let emptied = ok(
+        &router,
+        "ListVectors",
+        &json!({ "vectorBucketName": "scoped-bucket", "indexName": "scoped-index" }),
+    )
+    .await;
+    assert_eq!(
+        keys_of(&emptied),
+        Vec::<String>::new(),
+        "the named index must be empty, got {emptied}"
+    );
+}
+
+/// A delete whose target does not resolve is refused, not silently accepted: an absent
+/// bucket or index (including one just deleted) is the modelled 404, and a target named
+/// in no accepted form, or in two that disagree, is the 400. A deleted index also
+/// refuses a later write for the same reason.
+#[tokio::test]
+async fn delete_vectors_refuses_a_target_it_cannot_resolve() {
+    let router = with_seeded_index("refusal-bucket", "refusal-index").await;
+    let index_arn = expected_index_arn("refusal-bucket", "refusal-index");
+    let other_arn = expected_index_arn("refusal-bucket", "other-index");
+
+    // (case, request, expected status and error code)
+    let cases: Vec<(&str, Value, (u16, &str))> = vec![
+        (
+            "an absent vector bucket",
+            json!({ "vectorBucketName": "absent-bucket", "indexName": "refusal-index",
+                    "keys": ["v1"] }),
+            (404, "NotFoundException"),
+        ),
+        (
+            "an absent vector index",
+            json!({ "vectorBucketName": "refusal-bucket", "indexName": "absent-index",
+                    "keys": ["v1"] }),
+            (404, "NotFoundException"),
+        ),
+        (
+            "an absent index ARN",
+            json!({ "indexArn": other_arn, "keys": ["v1"] }),
+            (404, "NotFoundException"),
+        ),
+        (
+            "neither a name pair nor an ARN",
+            json!({ "keys": ["v1"] }),
+            (400, "ValidationException"),
+        ),
+        (
+            "a bucket name with no index name",
+            json!({ "vectorBucketName": "refusal-bucket", "keys": ["v1"] }),
+            (400, "ValidationException"),
+        ),
+        (
+            "a name pair that disagrees with the ARN",
+            json!({ "vectorBucketName": "refusal-bucket", "indexName": "other-index",
+                    "indexArn": index_arn, "keys": ["v1"] }),
+            (400, "ValidationException"),
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let (status, body) = call(&router, "DeleteVectors", &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            expected,
+            "case {case:?}: {request} must be refused with {expected:?}, got {status} {body}"
+        );
+    }
+
+    // The refusals left the index exactly as it was.
+    let listed = ok(
+        &router,
+        "ListVectors",
+        &json!({ "indexArn": index_arn }),
+    )
+    .await;
+    assert_eq!(
+        keys_of(&listed),
+        SEEDED_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<Vec<String>>(),
+        "a refused delete must change nothing, got {listed}"
+    );
+
+    // A deleted index holds nothing to delete from, and takes no further writes.
+    ok(&router, "DeleteIndex", &json!({ "indexArn": index_arn })).await;
+    for (operation, request) in [
+        (
+            "DeleteVectors",
+            json!({ "indexArn": index_arn, "keys": ["v1"] }),
+        ),
+        (
+            "PutVectors",
+            json!({ "indexArn": index_arn,
+                    "vectors": [{ "key": "v1", "data": { "float32": [1.0, 1.0] } }] }),
+        ),
+    ] {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "NotFoundException"),
+            "case {operation:?}: a deleted index must refuse it, got {status} {body}"
         );
     }
 }
