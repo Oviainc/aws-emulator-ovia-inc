@@ -48,6 +48,100 @@ pub fn not_found(resource_type: &str, message: impl Into<String>) -> NotFoundExc
     }
 }
 
+/// The fixed prefix AmplifyBackend puts in front of the app-identity refusal's message.
+///
+/// Recorded behaviour, not modelled: the refusal for an unregistered app id reads
+/// "An error occurred while processing your request: Invalid appId passed.", so this
+/// prefix plus an appId-invalid sentence is the requirement for THAT message. It is not
+/// claimed for the others: no recording fixes the text of this service's per-resource or
+/// bound refusals ([`not_found`], [`limit_exceeded`], [`bound_identifier`]), so each of
+/// those says what was asked for, built from the request, and none is prefixed here.
+pub const ERROR_MESSAGE_PREFIX: &str = "An error occurred while processing your request: ";
+
+/// The message a request whose `AppId` identifies no registered Amplify app is refused
+/// with: [`ERROR_MESSAGE_PREFIX`] plus the sentence that says the app id is the problem.
+///
+/// Built from the RULE, not from the request: the refusal is about the identity of the
+/// app, which the service will not echo back, so the same sentence answers every
+/// unregistered app id.
+pub fn invalid_app_id_message() -> String {
+    format!("{ERROR_MESSAGE_PREFIX}Invalid appId passed.")
+}
+
+/// Whether `app_id` identifies an Amplify app this emulator has registered.
+///
+/// The registry is this service's own `apps` map: `CreateBackend` is the one operation in
+/// this crate that brings an app record into being, and every other operation that
+/// addresses an app answers from that same record, so an id the map does not hold is an
+/// id this emulator knows no app by.
+///
+/// It is deliberately a registry LOOKUP and not "does this resource exist": the two
+/// answers differ, which is the whole point of the gate. An app id the map does not hold
+/// is refused as invalid INPUT (see [`require_registered_app`]), while a resource missing
+/// INSIDE a registered app — an environment, a job, an auth resource, a challenge token —
+/// is the modelled `NotFoundException`.
+///
+/// What it is NOT, and the one known gap: an `AppId` is minted by Amplify's `CreateApp`,
+/// so the authoritative registry is the Amplify service's app store, and an app that
+/// exists there but has no backend here is refused by this gate where the real service
+/// would answer about the resource. Reading that store would make this crate depend on
+/// the Amplify crate; it is the same cross-service read `ListS3Buckets` performs for S3's
+/// buckets, and it is what the open app-identity issue for `CreateBackend`
+/// (`20261022T052247Z-amplifybackend-control-plane-7-fidelity-divergences-no-environment`,
+/// Cause 2) has to settle — it decides whether `CreateBackend` may register an app at
+/// all. This function is the single place that answers the question, so widening it to a
+/// second registry changes nothing else in the crate.
+///
+/// `false` when the store is unreachable as well, which no caller can observe: every
+/// handler resolves its own [`service_state`] and answers the modelled
+/// `GatewayTimeoutException` BEFORE running the gate.
+///
+/// LOCK ORDER: the store's lock is taken and released here, and this is called with NO
+/// store guard held, so it cannot be part of a lock cycle.
+pub fn app_is_registered<Eng: Send + Sync + 'static>(engine: &Eng, app_id: &str) -> bool {
+    service_state(engine).is_some_and(|state| state.lock().apps.contains_key(app_id))
+}
+
+/// Refuse the request unless `app_id` identifies a registered Amplify app
+/// ([`app_is_registered`]).
+///
+/// The app-identity gate every operation that addresses an existing app runs FIRST, so a
+/// well-formed but unregistered app id is answered as the client-input error it is —
+/// HTTP 400 with the error code `ValidationException` — rather than as a missing
+/// resource. `ValidationException` is not a shape this service's model declares, so it is
+/// raised through the crate's own [`crate::scaffolded::Scaffolded::validation`] channel,
+/// which renders exactly that status and code; the modelled `NotFoundException` then
+/// means what it says, "this app has no such resource", and is reachable only for an app
+/// that does exist.
+///
+/// NOT the modelled `BadRequestException`, although this service declares it at the same
+/// 400 and `crate::scaffolded`'s own note prefers a modelled client-input error in
+/// general: the wire error code of that shape is `BadRequestException`, and the recorded
+/// AmplifyBackend response for an unregistered app id carries the code
+/// `ValidationException`. The code is what a client matches on, so the recording decides
+/// it. Do not "correct" this to the modelled shape without a recording that says so.
+///
+/// Generic over the operation's modelled error enum: every operation's error channel is
+/// `Scaffolded<{Op}ErrorModeled>`, so one gate serves them all and cannot word the same
+/// refusal two ways.
+///
+/// The gate is only as strong as the registry it reads: `CreateBackend` writes this
+/// service's `apps` map without consulting Amplify, so a caller can still bring an app id
+/// into being that Amplify never minted and then pass this gate with it — see
+/// [`app_is_registered`] for that gap and the issue that owns it.
+pub fn require_registered_app<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+    app_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if app_is_registered(engine, app_id) {
+        Ok(())
+    } else {
+        Err(crate::scaffolded::Scaffolded::validation(
+            invalid_app_id_message(),
+        ))
+    }
+}
+
 /// The modelled server-side failure for a request that could not reach this service's
 /// store at all. `GatewayTimeoutException` is the only server-side error every
 /// AmplifyBackend operation declares, so it is what an unreachable store answers with.

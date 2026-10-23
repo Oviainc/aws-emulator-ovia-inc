@@ -4,7 +4,10 @@
 //!
 //! Reports an app's backend FROM STATE: the name `CreateBackend` stated, the
 //! environments that currently exist, and the requested environment name when it is one
-//! of them. An app no backend was ever created for answers `NotFoundException` (404).
+//! of them. An `AppId` that identifies no registered Amplify app is refused with HTTP
+//! 400 `ValidationException` before any lookup ([`crate::state::require_registered_app`]);
+//! the `NotFoundException` (404) below it answers an app record this store does not hold
+//! at all, which the gate already refuses — it is the defensive arm of the same lookup.
 //! Reporting only — it writes nothing.
 //!
 //! ## Shape of an operation
@@ -155,6 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             ))
         })?;
+
+        // The app-identity gate, BEFORE any per-resource lookup: a well-formed app id
+        // that identifies no registered Amplify app is a client-input error (400
+        // `ValidationException`), not a missing backend.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let store = state.lock();
         let app = store.app(&input.app_id).ok_or_else(|| {

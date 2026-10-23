@@ -5,7 +5,10 @@
 //! Reclaims the challenge token `(AppId, SessionId)` addresses and answers
 //! `IsSuccess: true`. A session id this service holds no LIVE token for — never minted,
 //! already deleted, or past its `Ttl` — is the modelled `NotFoundException` (404):
-//! there is nothing to delete, which is a different answer from "deleted".
+//! there is nothing to delete, which is a different answer from "deleted". An `AppId`
+//! that identifies no registered Amplify app is refused with HTTP 400
+//! `ValidationException` before the token is looked up at all
+//! ([`crate::state::require_registered_app`]).
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::store_unavailable(),
             ))
         })?;
+
+        // The app-identity gate, BEFORE the token is looked up or reclaimed: a
+        // well-formed app id that identifies no registered Amplify app is a client-input
+        // error (400 `ValidationException`), not a missing challenge token.
+        crate::state::require_registered_app(&*self.engine, &input.app_id)?;
 
         let now = std::time::SystemTime::now();
         let mut store = state.lock();
