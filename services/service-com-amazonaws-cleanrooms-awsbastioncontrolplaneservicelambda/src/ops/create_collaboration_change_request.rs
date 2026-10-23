@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCollaborationChangeRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCollaborationChangeRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCollaborationChangeRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a change request against a stored collaboration and persists it in
+//! [`crate::state`]; the response is the stored record, which
+//! `GetCollaborationChangeRequest` reads back unchanged.
+//!
+//! What the SERVICE computes, rather than echoes, is each change's `types`: the input
+//! carries only a specification (an account's intended grant, or the collaboration's
+//! intended `autoApprovedChangeTypes`), and the stored `Change$types` is the difference
+//! between that specification and the collaboration as stored, named from the
+//! `ChangeType` catalog — see [`crate::state::change_types_for`]. A specification that
+//! asks for nothing the collaboration does not already have, or for something the
+//! catalog cannot name, yields no type at all, and `ChangeTypeList` is `len 1..`, so it
+//! is refused rather than stored as a change that changes nothing.
+//!
+//! `isAutoApproved` is then decided by the collaboration's own auto-approval settings
+//! ([`crate::state::change_request_is_auto_approved`]): a request every one of whose
+//! change types the collaboration auto-approves needs no member decision, so it is
+//! applied to the collaboration here and reported COMMITTED; any other request is stored
+//! PENDING with a PENDING approval for each party to the collaboration, and changes
+//! nothing until a later decision commits it.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +167,235 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCollaborationChangeRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCollaborationChangeRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCollaborationChangeRequest"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateCollaborationChangeRequestErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let caller = st::caller_account_id();
+        let collaboration_id = input.collaboration_identifier;
+        let mut store = state.lock();
+
+        // The collaboration is resolved exactly as every other operation that takes a
+        // `collaborationIdentifier` resolves it, so an id this account is not a party to
+        // is refused the same way whether or not a collaboration is stored under it.
+        let Some(record) = store
+            .visible_collaboration(&collaboration_id, caller)
+            .cloned()
+        else {
+            return Err(
+                CreateCollaborationChangeRequestErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(st::collaboration_access_denied_message(
+                            &collaboration_id,
+                            caller,
+                        )),
+                        reason: Some(
+                            st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The store grows by one change request per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the quota
+        // error it models. See `st::MAX_COLLABORATION_CHANGE_REQUESTS` — the cap and
+        // these quota identifiers are the emulator's own, not values AWS publishes.
+        if store.collaboration_change_requests.len() >= st::MAX_COLLABORATION_CHANGE_REQUESTS {
+            return Err(
+                CreateCollaborationChangeRequestErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the number of collaboration change requests would exceed the limit of {}",
+                            st::MAX_COLLABORATION_CHANGE_REQUESTS
+                        ),
+                        quota_name: "CollaborationChangeRequests".to_string(),
+                        quota_value: st::MAX_COLLABORATION_CHANGE_REQUESTS as f64,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut subjects: ::std::collections::HashSet<String> =
+            ::std::collections::HashSet::with_capacity(input.changes.len());
+        let mut changes: Vec<Change> = Vec::with_capacity(input.changes.len());
+        for change in &input.changes {
+            // `specificationType` names which kind of specification the change carries,
+            // so one that names the other member of the `ChangeSpecification` union
+            // describes a change the request did not send.
+            let (carried_type, subject) = match &change.specification {
+                ChangeSpecification::Member(spec) => (
+                    st::CHANGE_SPECIFICATION_TYPE_MEMBER,
+                    format!(
+                        "{}:{}",
+                        st::CHANGE_SPECIFICATION_TYPE_MEMBER, spec.account_id
+                    ),
+                ),
+                ChangeSpecification::Collaboration(_) => (
+                    st::CHANGE_SPECIFICATION_TYPE_COLLABORATION,
+                    st::CHANGE_SPECIFICATION_TYPE_COLLABORATION.to_string(),
+                ),
+            };
+            if change.specification_type != carried_type {
+                return Err(validation(
+                    format!(
+                        "specificationType {} does not describe the specification the change \
+                         carries, which is a {} specification",
+                        change.specification_type, carried_type
+                    ),
+                    "specificationType must name the specification the change carries",
+                ));
+            }
+
+            // Every change in one request is computed against the SAME stored
+            // collaboration, so two changes to one subject are not composable: the
+            // second would be read against a collaboration the first has not been
+            // applied to.
+            if !subjects.insert(subject.clone()) {
+                return Err(validation(
+                    format!("changes must not carry more than one change for {subject}"),
+                    "each change must name a different subject",
+                ));
+            }
+
+            let types = st::change_types_for(&record, &change.specification);
+            if types.is_empty() {
+                return Err(validation(
+                    format!(
+                        "the change for {subject} asks for no modification the collaboration \
+                         does not already have"
+                    ),
+                    "each change must ask for at least one change type",
+                ));
+            }
+
+            // A member being ADDED is materialized as a `MemberSpecification`, whose
+            // `displayName` is required, so an add without one cannot be applied.
+            if types.iter().any(|t| t == st::CHANGE_TYPE_ADD_MEMBER) {
+                if let ChangeSpecification::Member(spec) = &change.specification {
+                    if spec.display_name.is_none() {
+                        return Err(validation(
+                            format!(
+                                "the change adding account {} to the collaboration carries no \
+                                 displayName",
+                                spec.account_id
+                            ),
+                            "a change that adds a member must carry displayName",
+                        ));
+                    }
+                }
+            }
+
+            changes.push(Change {
+                specification_type: change.specification_type.clone(),
+                specification: change.specification.clone(),
+                types,
+            });
+        }
+
+        // One approval entry per party to the collaboration. `ApprovalStatuses` is
+        // `len 1..50`, so a collaboration with more parties than that has no
+        // representable approvals map.
+        let approving_accounts = store.change_request_approvals(&record);
+        if approving_accounts.len() > st::MAX_CHANGE_REQUEST_APPROVALS {
+            return Err(
+                CreateCollaborationChangeRequestErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the collaboration has {} parties, more than the {} approvals a \
+                             change request can carry",
+                            approving_accounts.len(),
+                            st::MAX_CHANGE_REQUEST_APPROVALS
+                        ),
+                        quota_name: "ApprovalsPerCollaborationChangeRequest".to_string(),
+                        quota_value: st::MAX_CHANGE_REQUEST_APPROVALS as f64,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let is_auto_approved = st::change_request_is_auto_approved(&record, &changes);
+        let approval_status = if is_auto_approved {
+            st::APPROVAL_STATUS_APPROVED
+        } else {
+            st::APPROVAL_STATUS_PENDING
+        };
+        let approvals: ::std::collections::HashMap<String, ApprovalStatusDetails> =
+            approving_accounts
+                .into_iter()
+                .map(|account| {
+                    (
+                        account,
+                        ApprovalStatusDetails {
+                            status: approval_status.to_string(),
+                        },
+                    )
+                })
+                .collect();
+
+        let created_at = st::now();
+        let request = CollaborationChangeRequest {
+            id: st::new_uuid(),
+            collaboration_id: collaboration_id.clone(),
+            create_time: created_at,
+            update_time: created_at,
+            // An auto-approved request needs no member decision, so it is applied here
+            // and reported COMMITTED; every other request waits PENDING for one.
+            status: if is_auto_approved {
+                st::CHANGE_REQUEST_STATUS_COMMITTED.to_string()
+            } else {
+                st::CHANGE_REQUEST_STATUS_PENDING.to_string()
+            },
+            is_auto_approved,
+            changes,
+            approvals: Some(approvals),
+        };
+
+        if is_auto_approved {
+            for change in &request.changes {
+                store.apply_collaboration_change(&collaboration_id, change, created_at);
+            }
+        }
+
+        store
+            .collaboration_change_request_order
+            .push(request.id.clone());
+        store
+            .collaboration_change_requests
+            .insert(request.id.clone(), request.clone());
+
+        Ok(CreateCollaborationChangeRequestOutput {
+            collaboration_change_request: request,
+        })
     }
+}
+
+/// A `ValidationException` (HTTP 400) naming the input member that failed and the
+/// constraint it failed, as `ValidationExceptionField` declares (`name`, `message`).
+///
+/// Every refusal here is about one entry of `changes`, so that is the member named.
+fn validation(message: String, field_message: &str) -> CreateCollaborationChangeRequestError {
+    CreateCollaborationChangeRequestErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "changes".to_string(),
+            message: field_message.to_string(),
+        }]),
+    })
+    .into()
 }
