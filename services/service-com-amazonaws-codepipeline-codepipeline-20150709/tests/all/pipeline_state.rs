@@ -428,8 +428,9 @@ async fn an_unknown_or_deleted_pipeline_has_no_state() {
 }
 
 /// Reporting the state changes nothing a later caller sees: the same request answers
-/// the same thing, and starting an execution does not give a stage or an action an
-/// execution, because nothing in this emulator runs them.
+/// the same thing, and reading the state never starts an execution. What a started
+/// execution DOES publish is the stage and action state the execution plane records
+/// (`crate::state::driver`), which the execution-engine suite covers.
 #[tokio::test]
 async fn reporting_the_state_changes_nothing() {
     let emulator = Emulator::new();
@@ -452,10 +453,37 @@ async fn reporting_the_state_changes_nothing() {
     emulator
         .ok("StartPipelineExecution", &json!({"name": "repeatable"}))
         .await;
+    // The declaration half of the answer is unchanged by a start: the same stages, in
+    // the same order, with the same action names and transition states. Only the
+    // execution members the start really created are added to it.
     let after_start = emulator.ok("GetPipelineState", &request).await;
+    let shape_of = |answer: &Value| {
+        answer["stageStates"]
+            .as_array()
+            .expect("stage states are reported")
+            .iter()
+            .map(|stage| {
+                (
+                    stage["stageName"].clone(),
+                    stage["actionStates"]
+                        .as_array()
+                        .map(|actions| {
+                            actions
+                                .iter()
+                                .map(|action| action["actionName"].clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    stage["inboundTransitionState"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        after_start, first,
-        "no stage or action execution is recorded by starting one, got {after_start}"
+        shape_of(&after_start),
+        shape_of(&first),
+        "a start must not change the stages, their action names or their transitions, \
+         got {after_start}"
     );
 
     let executions = emulator

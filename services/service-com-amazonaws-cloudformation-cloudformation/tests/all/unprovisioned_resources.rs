@@ -112,22 +112,22 @@ async fn a_resource_whose_owning_service_does_not_answer_fails_the_stack() {
 #[tokio::test]
 async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_completes() {
     let router = crate::stack_lifecycle::router();
-    let case = "a bucket and a role, neither of which this emulator provisions";
+    let case = "a table and a log group, neither of which this emulator provisions";
     let stack_name = "declared-only-stack";
     let template = json!({
         "Resources": {
-            "Bucket": {
-                "Type": "AWS::S3::Bucket",
-                "Properties": { "BucketName": "declared-only-bucket" }
+            "Table": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": { "TableName": "declared-only-table" }
             },
-            "Role": {
-                "Type": "AWS::IAM::Role",
-                "Properties": { "RoleName": "declared-only-role" }
+            "Group": {
+                "Type": "AWS::Logs::LogGroup",
+                "Properties": { "LogGroupName": "declared-only-group" }
             }
         },
         "Outputs": {
-            "BucketName": { "Value": { "Ref": "Bucket" } },
-            "RoleArn": { "Value": { "Fn::GetAtt": ["Role", "Arn"] } }
+            "GroupArn": { "Value": { "Fn::GetAtt": ["Group", "Arn"] } },
+            "TableName": { "Value": { "Ref": "Table" } }
         }
     })
     .to_string();
@@ -148,8 +148,8 @@ async fn resource_types_with_no_provisioner_are_declared_only_and_the_stack_comp
     assert_eq!(
         values,
         vec![
-            "declared-only-bucket".to_string(),
-            "arn:aws:iam::000000000000:role/declared-only-role".to_string(),
+            "arn:aws:logs:us-east-1:000000000000:log-group:declared-only-group:*".to_string(),
+            "declared-only-table".to_string(),
         ],
         "case {case:?}: expected the documented Ref and Fn::GetAtt values, got {values:?}"
     );

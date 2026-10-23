@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pipeline = state.pipelines.get(&input.name).ok_or_else(|| {
             GetPipelineError::from(GetPipelineErrorModeled::PipelineNotFoundException(
                 PipelineNotFoundException {
-                    message: Some(format!("pipeline {} does not exist", input.name)),
+                    message: Some(crate::state::pipeline_not_found_message(&input.name)),
                 },
             ))
         })?;

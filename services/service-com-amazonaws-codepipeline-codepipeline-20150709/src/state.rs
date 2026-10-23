@@ -18,12 +18,25 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     ActionConfigurationProperty, ActionDeclaration, ActionExecutionDetail, ActionExecutionInput,
-    ActionRevision, ActionState, ActionType, ActionTypeId, ActionTypeSettings, ArtifactDetail,
+    ActionRevision, ActionType, ActionTypeId, ActionTypeSettings, ArtifactDetail,
     ArtifactDetails, Condition, ConditionState, CurrentRevision, ExecutionDetails, ExecutionTrigger,
     ListWebhookItem, PipelineDeclaration, PipelineExecution, PipelineExecutionSummary,
     PipelineMetadata, PipelineSummary, PipelineVariable, ResolvedPipelineVariable, RuleState,
-    SourceRevision, StageConditionState, StageState, Tag, ThirdPartyJob, TransitionState,
+    SourceRevision, StageConditionState, Tag, ThirdPartyJob, TransitionState,
     WebhookDefinition,
+};
+
+/// The execution plane's data model: what an execution's stages and actions are.
+pub mod execution;
+/// The driver that moves an execution forward and performs its artifact I/O.
+pub mod driver;
+
+pub use driver::advance;
+pub use execution::{
+    artifact_store, is_terminal_status, plan_stages, stage_states, ActionRun, ArtifactRef,
+    StageRun, StopRequest, MAX_ARCHIVE_ENTRIES, MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE,
+    MAX_EXTRACTED_BYTES, STATUS_FAILED, STATUS_STOPPED, STATUS_SUCCEEDED, STATUS_SUPERSEDED,
+    TRANSITION_INBOUND, TRANSITION_OUTBOUND,
 };
 
 /// The region an ARN carries when the request names none.
@@ -247,6 +260,17 @@ pub const MAX_ACTION_TYPES_PER_ACCOUNT: usize = 1000;
 /// `MAX_PIPELINES_PER_ACCOUNT * MAX_EXECUTION_HISTORY_PER_PIPELINE`.
 pub const MAX_EXECUTION_HISTORY_PER_PIPELINE: usize = 1000;
 
+/// The most executions this emulator retains ACROSS every pipeline.
+///
+/// The per-pipeline window above leaves the store bounded only by its product with
+/// [`MAX_PIPELINES_PER_ACCOUNT`] (a million records), and every record now retains the
+/// stage/action plan its execution runs, so this store-wide window is what actually
+/// bounds the execution store's memory: at most this many records, each with at most
+/// [`MAX_ACTIONS_PER_PIPELINE`] action entries. Starting another execution past it drops
+/// the oldest retained one, exactly as the per-pipeline window does. The figure is this
+/// emulator's own, chosen the way the S3 emulator's service-wide object ceiling is.
+pub const MAX_EXECUTIONS_TOTAL: usize = 10_000;
+
 /// The most webhooks this emulator holds for the account before `PutWebhook`
 /// refuses another one.
 ///
@@ -415,11 +439,15 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
 
     /// Record `record` as its pipeline's newest execution and return its id.
     ///
-    /// The retained history is bounded by [`MAX_EXECUTION_HISTORY_PER_PIPELINE`]:
-    /// the oldest records beyond that window are dropped here, and so are the
-    /// idempotency tokens that named them — otherwise a token would keep naming an
-    /// execution no caller can read, and the three maps would grow per request
-    /// without limit.
+    /// The retained history is bounded TWICE: by
+    /// [`MAX_EXECUTION_HISTORY_PER_PIPELINE`] per pipeline, and by
+    /// [`MAX_EXECUTIONS_TOTAL`] across every pipeline — the per-pipeline window alone
+    /// would leave the store bounded only by its product with
+    /// [`MAX_PIPELINES_PER_ACCOUNT`], and each record retains a plan with one entry per
+    /// action of its declaration (itself bounded by [`MAX_ACTIONS_PER_PIPELINE`]). The
+    /// oldest records beyond either window are dropped here, and so are the idempotency
+    /// tokens that named them — otherwise a token would keep naming an execution no
+    /// caller can read, and the maps would grow per request without limit.
     ///
     /// Starting an execution also starts the actions it begins with, so the action
     /// executions those actions get are minted HERE rather than by each caller: this
@@ -446,7 +474,7 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                 .insert(action_execution_id, action_execution);
         }
 
-        let evicted: Vec<String> = {
+        let mut evicted: Vec<String> = {
             let history = self
                 .executions_by_pipeline
                 .entry(pipeline_name.clone())
@@ -457,6 +485,27 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
                 .saturating_sub(MAX_EXECUTION_HISTORY_PER_PIPELINE);
             history.drain(..overflow).collect()
         };
+        // Then the store-wide window: the oldest retained executions of the pipelines
+        // with the longest histories go first, so no caller can grow the store past
+        // `MAX_EXECUTIONS_TOTAL` records whatever it does with pipelines.
+        while self
+            .executions_by_pipeline
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+            > MAX_EXECUTIONS_TOTAL
+        {
+            let Some(longest) = self
+                .executions_by_pipeline
+                .iter_mut()
+                .filter(|(_, history)| !history.is_empty())
+                .max_by_key(|(_, history)| history.len())
+                .map(|(_, history)| history)
+            else {
+                break;
+            };
+            evicted.push(longest.remove(0));
+        }
         if !evicted.is_empty() {
             for id in &evicted {
                 self.executions.remove(id);
@@ -1875,82 +1924,21 @@ impl Pipeline {
         }
     }
 
-    /// This pipeline's `StageState` list, as `GetPipelineState` reports it, in the
-    /// order the declaration lists the stages.
-    ///
-    /// Every member is read from stored state: the stage and action names from the
-    /// stored declaration, the inbound transition state from what the transition
-    /// calls persisted, each condition set's rules from the conditions the stage
-    /// declares, and an action's `currentRevision` from `revisions` — the revision
-    /// `PutActionRevision` recorded for it, keyed by `(pipeline, stage, action)`. The
-    /// members the stage-, action- and rule-execution plane owns (`latestExecution`,
-    /// `inboundExecution(s)`, an action's execution, a condition's or a rule's
-    /// execution) are absent, because this slice runs no such plane and so has no
-    /// outcome to report for them.
-    pub fn stage_states(
-        &self,
-        revisions: &BTreeMap<(String, String, String), ActionRevision>,
-    ) -> Vec<StageState> {
-        self.declaration
-            .stages
-            .iter()
-            .enumerate()
-            .map(|(index, stage)| StageState {
-                stage_name: Some(stage.name.clone()),
-                inbound_execution: None,
-                inbound_executions: None,
-                inbound_transition_state: self.inbound_transition_state(index, &stage.name),
-                action_states: Some(
-                    stage
-                        .actions
-                        .iter()
-                        .map(|action| ActionState {
-                            action_name: Some(action.name.clone()),
-                            current_revision: revisions
-                                .get(&(
-                                    self.declaration.name.clone(),
-                                    stage.name.clone(),
-                                    action.name.clone(),
-                                ))
-                                .cloned(),
-                            latest_execution: None,
-                            entity_url: None,
-                            revision_url: None,
-                        })
-                        .collect(),
-                ),
-                latest_execution: None,
-                // A condition set has a state exactly when the stage declares it:
-                // `beforeEntry` and `onSuccess` carry their conditions directly,
-                // while `onFailure` also carries the stage's failure `result` and
-                // retry configuration, which are declaration rather than state.
-                before_entry_condition_state: stage
-                    .before_entry
-                    .as_ref()
-                    .map(|before_entry| condition_state(&before_entry.conditions)),
-                on_success_condition_state: stage
-                    .on_success
-                    .as_ref()
-                    .map(|on_success| condition_state(&on_success.conditions)),
-                on_failure_condition_state: stage
-                    .on_failure
-                    .as_ref()
-                    .and_then(|on_failure| on_failure.conditions.as_deref())
-                    .map(condition_state),
-                // `RetryStageMetadata` counts the retry attempts a stage has had, so
-                // a stage nothing has retried carries none.
-                retry_stage_metadata: None,
-            })
-            .collect()
-    }
-
     /// The inbound `TransitionState` to report for the stage at `index`.
     ///
     /// An inbound transition is the edge artifacts cross INTO a stage from the stage
     /// before it, so the first stage has none to report — unless a caller has
     /// changed one for it, in which case the state that call persisted is what the
     /// reader reports rather than silently dropping it.
-    fn inbound_transition_state(&self, index: usize, stage_name: &str) -> Option<TransitionState> {
+    ///
+    /// The ONE place this rule lives: `GetPipelineState` reports a stage through
+    /// [`execution::stage_states`], which reads it from here, so the stored-pipeline
+    /// view and the execution view cannot disagree about it.
+    pub fn inbound_transition_state(
+        &self,
+        index: usize,
+        stage_name: &str,
+    ) -> Option<TransitionState> {
         let changed = self
             .transitions
             .contains_key(&(stage_name.to_string(), TRANSITION_TYPE_INBOUND.to_string()));
@@ -2003,7 +1991,7 @@ impl Pipeline {
 /// neither the set, nor a condition in it, nor a rule of it carries an execution: what
 /// is reported is the declaration the store holds, exactly as a stage's action states
 /// report the declared actions by name.
-fn condition_state(conditions: &[Condition]) -> StageConditionState {
+pub fn condition_state(conditions: &[Condition]) -> StageConditionState {
     StageConditionState {
         latest_execution: None,
         condition_states: Some(
@@ -2271,8 +2259,29 @@ pub struct PipelineExecutionRecord {
     pub execution_type: String,
     /// The pipeline variables resolved for this execution.
     pub variables: Vec<ResolvedPipelineVariable>,
-    /// The source revisions this execution was started with.
+    /// The source revisions this execution was started with, plus the ones its source
+    /// actions resolved as they ran.
     pub source_revisions: Vec<SourceRevision>,
+    /// The stages and actions this execution runs, pinned from the declaration at the
+    /// instant it started.
+    pub stages: Vec<StageRun>,
+    /// The artifact-store bucket this execution's artifacts are written to.
+    pub artifact_bucket: String,
+    /// The customer managed key the artifact store declares, when it declares one.
+    pub artifact_encryption_key: Option<String>,
+    /// True while the execution has not been admitted to run — the state a start takes
+    /// in `QUEUED` and `SUPERSEDED` mode while another execution of the pipeline runs.
+    pub queued: bool,
+    /// The `StopPipelineExecution` request recorded against this execution, if any.
+    pub stop: Option<StopRequest>,
+    /// The artifacts produced so far, keyed by `OutputArtifact$name`.
+    pub artifacts: BTreeMap<String, ArtifactRef>,
+    /// The variables actions of this execution may resolve `#{namespace.key}`
+    /// placeholders against: the pipeline variables under the `variables` namespace,
+    /// plus each action's published output variables under its own namespace.
+    pub variables_map: BTreeMap<String, String>,
+    /// How many times `RetryStageExecution` has retried a stage of this execution.
+    pub manual_retry_attempts: i32,
 }
 
 impl PipelineExecutionRecord {
@@ -2284,9 +2293,19 @@ impl PipelineExecutionRecord {
             pipeline_execution_id: Some(self.pipeline_execution_id.clone()),
             status: Some(self.status.clone()),
             status_summary: self.status_summary.clone(),
-            // Artifact revisions are recorded by the action-execution plane, which
-            // this slice does not run, so none are reported rather than invented.
-            artifact_revisions: None,
+            artifact_revisions: (!self.artifacts.is_empty()).then(|| {
+                self.artifacts
+                    .iter()
+                    .map(|(name, location)| crate::ops::types::ArtifactRevision {
+                        name: Some(name.clone()),
+                        revision_id: location.revision.clone(),
+                        revision_change_identifier: None,
+                        revision_summary: None,
+                        created: None,
+                        revision_url: None,
+                    })
+                    .collect()
+            }),
             variables: optional_list(self.variables.clone()),
             trigger: Some(self.trigger.clone()),
             execution_mode: Some(self.execution_mode.clone()),
@@ -2306,8 +2325,9 @@ impl PipelineExecutionRecord {
             last_update_time: Some(to_date_time(self.last_update_time)),
             source_revisions: optional_list(self.source_revisions.clone()),
             trigger: Some(self.trigger.clone()),
-            // Set only by StopPipelineExecution, which this slice does not serve.
-            stop_trigger: None,
+            stop_trigger: self.stop.as_ref().map(|stop| crate::ops::types::StopExecutionTrigger {
+                reason: stop.reason.clone(),
+            }),
             execution_mode: Some(self.execution_mode.clone()),
             execution_type: Some(self.execution_type.clone()),
             rollback_metadata: None,
@@ -2489,7 +2509,7 @@ fn optional_list<T>(list: Vec<T>) -> Option<Vec<T>> {
 /// the value is a well-formed v4 UUID rather than an arbitrary hex string. An
 /// execution id names an execution for correlation and is not a credential, so a
 /// non-cryptographic source is the right one.
-fn random_uuid_v4() -> String {
+pub fn random_uuid_v4() -> String {
     use ::std::collections::hash_map::RandomState;
     use ::std::fmt::Write as _;
     use ::std::hash::BuildHasher as _;
@@ -2524,8 +2544,80 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_and_nanos(secs, since_epoch.subsec_nanos())
 }
 
-/// The region to mint a resource's ARN in: the one the request's SigV4 credential
-/// scope names, else [`DEFAULT_REGION`].
+/// Whether IAM positively reports that `role_arn` names no role.
+///
+/// `PipelineDeclaration$roleArn` is the role CodePipeline assumes to run the pipeline's
+/// actions, so a declaration naming a role that does not exist describes a pipeline that
+/// cannot run — which is what `InvalidStructureException` reports. Shared by
+/// `CreatePipeline` and `UpdatePipeline`, so a declaration one of them refuses is not
+/// accepted by the other.
+///
+/// `true` only for IAM's own `NoSuchEntity`: any other answer (IAM not reachable, a
+/// malformed ARN this emulator cannot resolve to a role name, a transport failure)
+/// leaves the question unanswered, and an unanswered question is not a refusal.
+pub async fn role_is_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    role_arn: &str,
+) -> bool {
+    // An IAM role ARN is `arn:<partition>:iam::<account>:role/<path/><name>`, and
+    // `GetRole` takes the NAME (the last path segment).
+    let Some(role_name) = role_arn
+        .split_once(":role/")
+        .map(|(_, path)| path)
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+    else {
+        return false;
+    };
+    let region = request_region(&ctx.parts().headers);
+    let config = ::aws_sdk_iam::Config::builder()
+        .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
+        .region(::aws_sdk_iam::config::Region::new(region))
+        // The endpoint is a FIXED literal (see [`in_process_endpoint`]): no
+        // request-derived text reaches the host position, so nothing a caller sends can
+        // re-point this call, which carries the emulator's own credentials. The
+        // request's region is only the signing scope, never part of the URL.
+        .endpoint_url(in_process_endpoint("iam"))
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: nothing to retry, time out or watch for a
+        // stalled stream, and each would need a sleep implementation this client is
+        // not given.
+        .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_iam::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_iam::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_iam::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    match ::aws_sdk_iam::Client::from_conf(config)
+        .get_role()
+        .role_name(role_name)
+        .send()
+        .await
+    {
+        Ok(_) => false,
+        Err(err) => err
+            .as_service_error()
+            .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception),
+    }
+}
+
+/// The endpoint URL an in-process call to another emulated service is addressed at.
+///
+/// The host is built from `service` and the FIXED [`DEFAULT_REGION`] literal, never from
+/// request-derived text: the framework's callback routes such a call in process on the
+/// service label, and the client carries the emulator's own credentials, so no value a
+/// caller sends may reach the host position. A request's own region still decides what
+/// the call is ABOUT (which artifact store, which ARN) and is the client's signing
+/// scope; it is not part of the destination.
+pub fn in_process_endpoint(service: &str) -> String {
+    format!("https://{service}.{DEFAULT_REGION}.amazonaws.com")
+}
+
+/// The region to mint a resource's ARN in, and the signing scope of the in-process
+/// calls this service makes: the one the request's SigV4 credential scope names, else
+/// [`DEFAULT_REGION`].
 ///
 /// The scope's region is accepted only when it is a region token
 /// ([`is_region_token`]) — the same rule [`parse_resource_arn`] applies when reading
@@ -2533,7 +2625,9 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
 /// rather than an assumption: a credential scope naming something that is not a
 /// Region (an upper-case or punctuated string) would otherwise mint an ARN that no
 /// ARN-addressed operation could ever resolve, so the request is answered in the
-/// default Region instead.
+/// default Region instead. It is also what keeps this REQUEST-controlled text out of
+/// anything that resolves a destination (see [`in_process_endpoint`], whose host is a
+/// fixed literal).
 pub fn request_region(headers: &::http::HeaderMap) -> String {
     ::emulator_server::sigv4_credential_scope(headers)
         .map(|scope| scope.region)
@@ -2659,6 +2753,9 @@ pub enum DeclarationProblem {
     Structure(String),
     /// Refused as `InvalidStageDeclarationException`: one stage is malformed.
     Stage(String),
+    /// Refused as `LimitExceededException`: the declaration is past a quota rather than
+    /// malformed — more stages, actions or configuration entries than this service runs.
+    Limit(String),
 }
 
 impl DeclarationProblem {
@@ -2666,20 +2763,82 @@ impl DeclarationProblem {
     /// fix the declaration from this text alone.
     pub fn message(&self) -> &str {
         match self {
-            Self::Structure(message) | Self::Stage(message) => message,
+            Self::Structure(message) | Self::Stage(message) | Self::Limit(message) => message,
         }
     }
 }
 
+/// The most stages one pipeline declaration may carry.
+///
+/// AWS's published CodePipeline quota ("Maximum number of stages in a pipeline: 50").
+/// It is enforced BEFORE the declaration is walked, because every later check — and
+/// every execution's retained plan — is sized by this count.
+pub const MAX_STAGES_PER_PIPELINE: usize = 50;
+
+/// The most actions one stage may carry: AWS's published quota ("Maximum number of
+/// actions in a stage: 50").
+pub const MAX_ACTIONS_PER_STAGE: usize = 50;
+
+/// The most actions one pipeline may carry in total.
+///
+/// This emulator's OWN bound, not an AWS quota (AWS's two quotas above would allow
+/// 2,500): every execution of the pipeline retains a plan with one entry per action, so
+/// this figure times [`MAX_EXECUTION_HISTORY_PER_PIPELINE`] times
+/// [`MAX_PIPELINES_PER_ACCOUNT`] is what bounds the execution store's memory.
+pub const MAX_ACTIONS_PER_PIPELINE: usize = 100;
+
+/// The most `configuration` entries one action may declare.
+///
+/// This emulator's own bound as well: `ActionConfigurationMap` carries no `@length` of
+/// its own (only its key and value do, 1..50 and 1..1000), so without this an action's
+/// configuration — which the validation walks and the handler stores — would be sized
+/// only by the request body.
+pub const MAX_CONFIGURATION_ENTRIES_PER_ACTION: usize = 100;
+
+/// The `ActionCategory` of an action that brings a revision INTO the pipeline.
+pub const CATEGORY_SOURCE: &str = "Source";
+
+/// The message `PipelineNotFoundException` carries, for every operation that raises it.
+///
+/// The text is built from the request and the caller's account — the lookup is scoped
+/// to one account, so the refusal names the account it did not find the pipeline in.
+pub fn pipeline_not_found_message(name: &str) -> String {
+    format!(
+        "Account '{}' does not have a pipeline with name '{name}'",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The message `PipelineNameInUseException` carries.
+///
+/// Built the same way: the name the request asked for, and the account the collision
+/// happened in.
+pub fn pipeline_name_in_use_message(name: &str) -> String {
+    format!(
+        "A pipeline with the name '{name}' already exists in account '{}'",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// Refuse a `PipelineDeclaration` whose structure cannot describe a pipeline.
 ///
-/// Two rules, both documented and neither expressible as a Smithy constraint:
+/// Every rule here is one the model's own constraints cannot express, and each refuses
+/// a declaration that could never execute:
 ///
 /// * `CreatePipeline` documents "you must include either `artifactStore` or
 ///   `artifactStores` in your pipeline, but you cannot use both".
 /// * `stages` and `StageDeclaration$actions` are `@required`, which only makes the
 ///   members mandatory — an EMPTY list satisfies the constraint, yet a pipeline
 ///   with no stage, or a stage with no action, has nothing to run.
+/// * an `inputArtifacts` entry must name an artifact some EARLIER action outputs (an
+///   earlier stage, or the same stage at a lower `runOrder`): an action cannot consume
+///   an artifact nothing produces, and two actions cannot output the same name.
+/// * the first stage is the pipeline's source stage: it carries at least one `Source`
+///   action and nothing else, and no later stage carries a `Source` action.
+/// * a declaration that states `pipelineType` `V1` cannot carry the V2-only members
+///   `variables` or `triggers` — `PipelineDeclaration$pipelineType` documents that
+///   "including V2 parameters … in the pipeline JSON" is what makes a pipeline V2, so
+///   carrying them while declaring V1 is a contradiction.
 pub fn validate_declaration(
     declaration: &PipelineDeclaration,
 ) -> Result<(), DeclarationProblem> {
@@ -2704,6 +2863,59 @@ pub fn validate_declaration(
             "pipeline must include at least one stage in stages".to_string(),
         ));
     }
+
+    // The quotas come FIRST: every walk below is sized by the stage and action counts,
+    // and so is the plan each execution of this pipeline retains, so a declaration past
+    // these bounds is refused before any of that work is multiplied by it.
+    if declaration.stages.len() > MAX_STAGES_PER_PIPELINE {
+        return Err(DeclarationProblem::Limit(format!(
+            "pipeline declares {} stages, past the limit of {MAX_STAGES_PER_PIPELINE} \
+             stages for a pipeline",
+            declaration.stages.len()
+        )));
+    }
+    if let Some(stage) = declaration
+        .stages
+        .iter()
+        .find(|stage| stage.actions.len() > MAX_ACTIONS_PER_STAGE)
+    {
+        return Err(DeclarationProblem::Limit(format!(
+            "stage {} declares {} actions, past the limit of {MAX_ACTIONS_PER_STAGE} \
+             actions for a stage",
+            stage.name,
+            stage.actions.len()
+        )));
+    }
+    let actions: usize = declaration
+        .stages
+        .iter()
+        .map(|stage| stage.actions.len())
+        .sum();
+    if actions > MAX_ACTIONS_PER_PIPELINE {
+        return Err(DeclarationProblem::Limit(format!(
+            "pipeline declares {actions} actions, past the limit of \
+             {MAX_ACTIONS_PER_PIPELINE} actions for a pipeline"
+        )));
+    }
+    if let Some((stage, action)) = declaration.stages.iter().find_map(|stage| {
+        stage
+            .actions
+            .iter()
+            .find(|action| {
+                action
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|config| config.len() > MAX_CONFIGURATION_ENTRIES_PER_ACTION)
+            })
+            .map(|action| (stage, action))
+    }) {
+        return Err(DeclarationProblem::Limit(format!(
+            "action {} in stage {} declares more than the limit of \
+             {MAX_CONFIGURATION_ENTRIES_PER_ACTION} configuration entries for an action",
+            action.name, stage.name
+        )));
+    }
+
     if let Some(stage) = declaration
         .stages
         .iter()
@@ -2713,6 +2925,116 @@ pub fn validate_declaration(
             "stage {} must include at least one action in actions",
             stage.name
         )));
+    }
+
+    // The first stage is the source stage: it carries at least one Source action and
+    // nothing else, and no later stage carries one.
+    let (first, rest) = declaration.stages.split_at(1);
+    let first = &first[0];
+    if !first
+        .actions
+        .iter()
+        .any(|action| action.action_type_id.category == CATEGORY_SOURCE)
+    {
+        return Err(DeclarationProblem::Structure(format!(
+            "the first stage of a pipeline must contain at least one {CATEGORY_SOURCE} \
+             action, but stage {} contains none",
+            first.name
+        )));
+    }
+    if let Some(action) = first
+        .actions
+        .iter()
+        .find(|action| action.action_type_id.category != CATEGORY_SOURCE)
+    {
+        return Err(DeclarationProblem::Structure(format!(
+            "the first stage of a pipeline can contain only {CATEGORY_SOURCE} actions, \
+             but action {} in stage {} is a {} action",
+            action.name, first.name, action.action_type_id.category
+        )));
+    }
+    for stage in rest {
+        if let Some(action) = stage
+            .actions
+            .iter()
+            .find(|action| action.action_type_id.category == CATEGORY_SOURCE)
+        {
+            return Err(DeclarationProblem::Structure(format!(
+                "a {CATEGORY_SOURCE} action can only appear in the first stage, but \
+                 action {} is in stage {}",
+                action.name, stage.name
+            )));
+        }
+    }
+
+    // Every consumed artifact must be produced by an earlier action, and no name is
+    // produced twice. LINEAR in the declaration: the actions of a stage are grouped by
+    // `runOrder` in one pass and the produced names are a SET, so no part of this walk
+    // rescans the stage or the names already seen.
+    let mut produced: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    for stage in &declaration.stages {
+        let mut groups: BTreeMap<i32, Vec<&crate::ops::types::ActionDeclaration>> =
+            BTreeMap::new();
+        for action in &stage.actions {
+            groups
+                .entry(action.run_order.unwrap_or(1))
+                .or_default()
+                .push(action);
+        }
+        for group in groups.values() {
+            let mut outputs: Vec<&str> = Vec::new();
+            for action in group {
+                for input in action.input_artifacts.iter().flatten() {
+                    if !produced.contains(input.name.as_str()) {
+                        return Err(DeclarationProblem::Structure(format!(
+                            "action {} in stage {} declares the input artifact {}, which \
+                             no earlier action outputs",
+                            action.name, stage.name, input.name
+                        )));
+                    }
+                }
+                for output in action.output_artifacts.iter().flatten() {
+                    if produced.contains(output.name.as_str())
+                        || outputs.contains(&output.name.as_str())
+                    {
+                        return Err(DeclarationProblem::Structure(format!(
+                            "the output artifact {} is declared by more than one action; \
+                             an artifact name is produced exactly once",
+                            output.name
+                        )));
+                    }
+                    outputs.push(output.name.as_str());
+                }
+            }
+            produced.extend(outputs);
+        }
+    }
+
+    // A declaration that states V1 cannot carry the V2-only members.
+    if declaration.pipeline_type.as_deref() == Some(PIPELINE_TYPES[0]) {
+        let v2_only = [
+            (
+                "variables",
+                declaration
+                    .variables
+                    .as_ref()
+                    .is_some_and(|variables| !variables.is_empty()),
+            ),
+            (
+                "triggers",
+                declaration
+                    .triggers
+                    .as_ref()
+                    .is_some_and(|triggers| !triggers.is_empty()),
+            ),
+        ];
+        if let Some((member, _)) = v2_only.iter().find(|(_, present)| *present) {
+            return Err(DeclarationProblem::Structure(format!(
+                "pipeline.{member} is only supported on a V2 pipeline, but this \
+                 declaration states pipelineType {}",
+                PIPELINE_TYPES[0]
+            )));
+        }
     }
     Ok(())
 }

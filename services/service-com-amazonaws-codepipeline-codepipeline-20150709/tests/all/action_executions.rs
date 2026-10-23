@@ -50,6 +50,23 @@ fn stage(name: &str, actions: Vec<Value>) -> Value {
     json!({"name": name, "actions": actions})
 }
 
+/// One `ActionDeclaration` for a stage that is NOT the pipeline's first: a `Source`
+/// action can only appear in the first stage (`CreatePipeline` refuses one anywhere
+/// else, which `validation_and_messages.rs` pins), so a later stage's action is of
+/// another category.
+fn later_action(name: &str) -> Value {
+    json!({
+        "name": name,
+        "actionTypeId": {
+            "category": "Build",
+            "owner": "AWS",
+            "provider": "CodeBuild",
+            "version": "1",
+        },
+        "configuration": {"ProjectName": "my-project"},
+    })
+}
+
 /// A `PipelineDeclaration` named `name` with `stages`.
 fn pipeline(name: &str, stages: Vec<Value>) -> Value {
     json!({
@@ -200,8 +217,8 @@ async fn an_execution_records_the_actions_it_starts() {
             "only the first stage has started",
             vec![
                 stage("Source", vec![action("Src", None)]),
-                stage("Build", vec![action("Compile", None)]),
-                stage("Deploy", vec![action("Ship", None)]),
+                stage("Build", vec![later_action("Compile")]),
+                stage("Deploy", vec![later_action("Ship")]),
             ],
             vec![("Source", "Src")],
         ),
@@ -660,7 +677,12 @@ async fn a_record_reports_the_input_its_declaration_configures() {
 
     let emulator = Emulator::new();
     let mut inherits = action("Inherits", None);
-    inherits["inputArtifacts"] = json!([{"name": "SourceOut"}, {"name": "Extra"}]);
+    // No `inputArtifacts`: this action is in the pipeline's FIRST stage, where no earlier
+    // action outputs anything for it to consume, and `CreatePipeline` refuses a
+    // declaration that names one anyway (`validation_and_messages.rs` pins that
+    // refusal). What a record reports for declared input artifacts is covered by the
+    // execution suite, which runs a pipeline whose later stage consumes its source's
+    // output.
     inherits["namespace"] = json!("SourceVariables");
     let mut overrides = action("Overrides", None);
     overrides["roleArn"] = json!(ACTION_ROLE_ARN);
@@ -731,12 +753,6 @@ async fn a_record_reports_the_input_its_declaration_configures() {
             "Inherits",
             "namespace",
             json!("SourceVariables"),
-        ),
-        (
-            "the declared input artifacts, by name and with no stored location",
-            "Inherits",
-            "inputArtifacts",
-            json!([{"name": "SourceOut"}, {"name": "Extra"}]),
         ),
         (
             "the action's own role overrides the pipeline's",
@@ -848,7 +864,7 @@ async fn listing_action_executions_changes_nothing() {
             "demo",
             vec![
                 stage("Source", vec![action("A", None), action("B", None)]),
-                stage("Build", vec![action("Compile", None)]),
+                stage("Build", vec![later_action("Compile")]),
             ],
         ),
     )

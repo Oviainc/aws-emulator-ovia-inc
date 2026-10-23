@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopPipelineExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopPipelineExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopPipelineExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopPipelineExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopPipelineExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopPipelineExecution"))
+        let state = crate::state::require_state(&*self.engine)?;
+        // Whether the execution is still stoppable depends on where it has got to, so
+        // the steps the clock already made due are materialised first.
+        crate::state::advance(&*self.engine, ctx, &input.pipeline_name).await;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        if !state.pipelines.contains_key(&input.pipeline_name) {
+            return Err(
+                StopPipelineExecutionErrorModeled::PipelineNotFoundException(
+                    PipelineNotFoundException {
+                        message: Some(crate::state::pipeline_not_found_message(
+                            &input.pipeline_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(record) = state
+            .executions
+            .get_mut(&input.pipeline_execution_id)
+            .filter(|record| record.pipeline_name == input.pipeline_name)
+        else {
+            // The model declares no "no such execution" error for this operation, and an
+            // execution that is not there cannot be stopped, which is what
+            // `PipelineExecutionNotStoppableException` reports.
+            return Err(
+                StopPipelineExecutionErrorModeled::PipelineExecutionNotStoppableException(
+                    PipelineExecutionNotStoppableException {
+                        message: Some(format!(
+                            "Pipeline execution {} of pipeline {} is not in a state that \
+                             can be stopped",
+                            input.pipeline_execution_id, input.pipeline_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "You can stop a pipeline execution that is in progress": one that has already
+        // reached a terminal status cannot be stopped at all, and one that is already
+        // stopping has already had this request.
+        if crate::state::is_terminal_status(&record.status) {
+            return Err(
+                StopPipelineExecutionErrorModeled::PipelineExecutionNotStoppableException(
+                    PipelineExecutionNotStoppableException {
+                        message: Some(format!(
+                            "Pipeline execution {} has already reached the terminal status \
+                             {} and cannot be stopped",
+                            input.pipeline_execution_id, record.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if record.stop.is_some() {
+            return Err(
+                StopPipelineExecutionErrorModeled::DuplicatedStopRequestException(
+                    DuplicatedStopRequestException {
+                        message: Some(format!(
+                            "Pipeline execution {} is already being stopped",
+                            input.pipeline_execution_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.stop = Some(crate::state::StopRequest {
+            abandon: input.abandon,
+            reason: input.reason.clone(),
+            requested_at: now,
+        });
+        record.status_summary = input.reason.clone();
+        if input.abandon {
+            // "Use this option to stop the pipeline execution by abandoning, rather than
+            // finishing, in-progress actions": the execution is stopped at once and the
+            // in-flight actions are abandoned.
+            crate::state::driver::settle_stopped(record, now);
+        } else {
+            record.status = crate::state::STATUS_STOPPING.to_string();
+            record.last_update_time = now;
+        }
+
+        Ok(StopPipelineExecutionOutput {
+            pipeline_execution_id: Some(input.pipeline_execution_id),
+        })
     }
 }
