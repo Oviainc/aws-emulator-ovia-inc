@@ -23,6 +23,8 @@ mod extensions;
 mod list_configuration_profiles;
 #[path = "all/list_environments.rs"]
 mod list_environments;
+#[path = "all/resource_deletes.rs"]
+mod resource_deletes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
