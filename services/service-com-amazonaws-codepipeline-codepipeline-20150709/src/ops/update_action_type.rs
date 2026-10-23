@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateActionType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateActionType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateActionType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UpdateActionType` stores the definition of an action type the account already
+//! holds; `GetActionType` is what reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateActionType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateActionTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateActionType"))
+        let state = crate::state::require_state(&*self.engine)?;
+
+        let declaration = input.action_type;
+
+        // Rules the model documents for an action-type definition but cannot state as
+        // constraints; refused as the client error the operation models for exactly
+        // that ("The validation was specified in an invalid format").
+        if let Err(message) = crate::state::validate_action_type_declaration(&declaration) {
+            return Err(UpdateActionTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The identity the definition belongs to: the four members
+        // `ActionTypeIdentifier` carries, which are also the four `ActionTypeId`
+        // names a read addresses an action type by.
+        let key = crate::state::ActionTypeKey::from_identifier(&declaration.id);
+        // An action type is a regional resource, so the definition belongs to the
+        // Region this request was signed for — and it is that Region's catalog the
+        // identity has to be held in.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let mut state = state.lock();
+        // This operation UPDATES: it defines an action type the account already holds,
+        // and the service models no operation that creates one with an `AWS` or
+        // `ThirdParty` owner. An identity no action type in this Region's catalog
+        // carries is refused with the error the model declares for exactly that
+        // condition ("The specified action type cannot be found").
+        if !state.action_type_available_in(&key, &region) {
+            return Err(UpdateActionTypeErrorModeled::ActionTypeNotFoundException(
+                ActionTypeNotFoundException {
+                    message: Some(crate::state::action_type_not_found_message(&key.to_id())),
+                },
+            )
+            .into());
+        }
+        // `declare_action_type` is the one way into the definition store, and it is
+        // what enforces this emulator's cap on how many definitions it holds: it
+        // answers `false` when the store already holds
+        // `MAX_ACTION_TYPE_DEFINITIONS` definitions and this Region does not already
+        // hold one for this identity. The operation models no limit error, so a
+        // request the emulator cannot carry out is refused with the error it models
+        // for exactly that ("The request failed because of an unknown error,
+        // exception, or failure") rather than with an invented one.
+        if !state.declare_action_type(&region, key, declaration) {
+            return Err(UpdateActionTypeErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some(format!(
+                        "this emulator holds the {} action type definitions it can store",
+                        crate::state::MAX_ACTION_TYPE_DEFINITIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The operation's modelled output is `Unit`: what it asserts is what it
+        // persisted, which `GetActionType` reports.
+        Ok(UpdateActionTypeOutput)
     }
 }

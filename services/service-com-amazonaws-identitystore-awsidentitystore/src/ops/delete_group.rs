@@ -8,13 +8,18 @@
 //!
 //! The operation is `@idempotent`
 //! (`smithy_query(query="operation",operation="DeleteGroup")`), so a delete that finds
-//! nothing left to delete still answers an empty 200: the post-condition "this group
-//! is not in this identity store" already holds. That is what the recorded unit
-//! `identitystore.delete-already-deleted-group-is-idempotent` observes, and it is why
-//! the modelled `ResourceNotFoundException` is unreachable from here; the sibling
+//! no such GROUP still answers an empty 200: the post-condition "this group is not in
+//! this identity store" already holds. That is what the recorded unit
+//! `identitystore.delete-already-deleted-group-is-idempotent` observes; the sibling
 //! `DeleteUser` reports a user it does not hold as not found instead, which is the
 //! behaviour its own issue and units fixed, so the two are deliberately left as their
 //! own recordings describe them.
+//!
+//! Idempotence covers the group, NOT the identity store it is addressed to: a store
+//! that does not exist is not a post-condition this call can already satisfy — the
+//! caller addressed a deployment that is not there — so it is refused with the
+//! modelled `ResourceNotFoundException`, exactly as every other operation of this
+//! service refuses one.
 //!
 //! `Revision`, when the caller sends one, is an optimistic-concurrency precondition on
 //! a group that IS still there: a value that is not the group's current revision is
@@ -178,17 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // `store_mut` looks the store up and NEVER brings one into being: a delete that
-        // finds nothing to delete must not leave an identity store behind as a side
-        // effect.
-        //
-        // `@idempotent`: a store or a group that is already gone leaves this call
-        // nothing to do and the post-condition it promises already holds, so it
-        // succeeds with the empty response rather than reporting what an earlier
-        // delete removed as missing.
-        let Some(store) = state.store_mut(&input.identity_store_id) else {
-            return Ok(DeleteGroupOutput {});
-        };
+        // The store is RESOLVED, never vivified: naming an identity store does not bring
+        // one into being, and one that names no store is refused rather than answered.
+        // `@idempotent` makes a GROUP that is already gone a success (below); it says
+        // nothing about a store that was never there.
+        let store = state
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(DeleteGroupErrorModeled::ResourceNotFoundException)?;
         // Both the bare id and the resource's ARN name the same group.
         let group_key = crate::state::resource_key(&input.group_id);
 
@@ -206,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(group) = store.groups.get(&group_key) {
                 if expected.parse::<u64>().ok() != Some(group.revision) {
                     return Err(DeleteGroupErrorModeled::ConflictException(
-                        crate::state::concurrent_modification(format!(
-                            "group {} is at revision {}, not the expected revision {expected}",
-                            group.group_id, group.revision
-                        )),
+                        crate::state::revision_conflict(expected, &group.revision()),
                     )
                     .into());
                 }

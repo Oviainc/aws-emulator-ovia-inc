@@ -27,10 +27,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::identity_store_lifecycle::{call, create_group, create_user, emulator, ok, string};
-
-/// An identity store id the modelled `IdentityStoreId` pattern admits.
-const STORE: &str = "d-1234567890";
+use crate::harness::{call, emulator, ok, string, STORE};
+use crate::identity_store_lifecycle::{create_group, create_user};
 
 /// A `ResourceId` the modelled pattern admits but that no create ever minted.
 const UNKNOWN_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -426,11 +424,13 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             vec![UNKNOWN_ID.to_string()],
         ),
         (
-            "a group id in a store nothing ever created",
+            // The STORE is what is missing here, so the refusal names that class: a
+            // store that does not exist holds no group to report as missing.
+            "a group id in a store that does not exist",
             "DescribeGroup",
             json!({ "IdentityStoreId": "d-0000000000", "GroupId": OTHER_UNKNOWN_ID }),
-            "Group not found",
-            vec![OTHER_UNKNOWN_ID.to_string(), "d-0000000000".to_string()],
+            "Identity store not found",
+            vec!["d-0000000000".to_string()],
         ),
         (
             "a group named by its ARN",

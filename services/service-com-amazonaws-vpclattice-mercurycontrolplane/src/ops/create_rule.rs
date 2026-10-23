@@ -168,6 +168,15 @@ fn invalid(violation: crate::state::FieldViolation) -> CreateRuleError {
         .into()
 }
 
+/// HTTP 400 for a value a documented SERVICE RULE refuses — one the model carries no
+/// constraint trait for — in the construction AWS reports those with
+/// ([`crate::state::service_rule_exception`]): the rule's own sentence over the bare
+/// member it constrains, not a modelled constraint report.
+fn refused_by_rule(violation: &crate::state::ServiceRuleViolation) -> CreateRuleError {
+    CreateRuleErrorModeled::ValidationException(crate::state::service_rule_exception(violation))
+        .into()
+}
+
 /// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
 /// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
 /// not-found message over the submitted identifier, and the kind's resource-type token.
@@ -280,8 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
             return Err(invalid(violation));
         }
-        if let Err(violation) = crate::state::check_rule_action("action", &input.action) {
-            return Err(invalid(violation));
+        if let Err(violation) = crate::state::check_rule_action(&input.action) {
+            return Err(refused_by_rule(&violation));
         }
 
         // `clientToken` is an @idempotencyToken: its documentation states that a retry
@@ -322,9 +331,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name_key = crate::state::rule_name_key(&listener.id, &input.name);
         if let Some(taken_by) = store.name_index.get(&name_key) {
             return Err(conflict(
-                format!(
-                    "a rule named {} already exists in listener {}",
-                    input.name, listener.id
+                crate::state::duplicate_name_in_resource_message(
+                    crate::state::ResourceKind::Rule,
+                    &input.name,
+                    crate::state::ResourceKind::Listener,
+                    &listener.id,
                 ),
                 taken_by.clone(),
             ));

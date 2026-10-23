@@ -12,8 +12,8 @@ use ::aws_smithy_types::DateTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    InternalServerException, OriginDetails, ResourceNotFoundException,
-    ServiceLimitExceededException, ValidationException,
+    AssetConfiguration, ConflictException, InternalServerException, JobError, OriginDetails,
+    ResourceNotFoundException, ResponseDetails, ServiceLimitExceededException, ValidationException,
 };
 
 /// The service's SigV4 signing name, and so the ARN service segment.
@@ -71,6 +71,36 @@ pub struct Revision {
     pub updated_at: DateTime,
 }
 
+/// One stored job: what the caller asked for, in the response form every job
+/// operation reports it in, plus where it is in its lifecycle.
+///
+/// `details` is kept as the modelled `ResponseDetails` rather than as the request
+/// form, because that is what `CreateJob`, `GetJob` and `ListJobs` all answer with;
+/// keeping one representation is what makes those three agree. `data_set_id` and
+/// `revision_id` are lifted out of those details so a reader can filter on them
+/// without re-matching on which detail member the job carries.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: String,
+    pub arn: String,
+    /// One of the model's `Type` values, enumerated by
+    /// `crate::ops::types::TYPE_VALUES`.
+    pub r#type: String,
+    /// One of the model's `State` values, enumerated by
+    /// `crate::ops::types::STATE_VALUES`.
+    pub state: String,
+    pub asset_configuration: Option<AssetConfiguration>,
+    pub details: ResponseDetails,
+    /// The errors the job collected while it ran; empty until it runs.
+    pub errors: Vec<JobError>,
+    /// The data set the job's details name (`ListJobs` filters on it).
+    pub data_set_id: String,
+    /// The revision the job's details name, where the job type names exactly one.
+    pub revision_id: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
 /// Per-service state for com-amazonaws-dataexchange-dataexchange. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDataexchangeDataexchangeState {
@@ -78,6 +108,10 @@ pub struct ComAmazonawsDataexchangeDataexchangeState {
     pub data_sets: HashMap<String, DataSet>,
     /// Creation order of `data_sets`, so `ListDataSets` pages deterministically.
     pub data_set_order: Vec<String>,
+    /// Every job this emulator holds, keyed by its `JobId`.
+    pub jobs: HashMap<String, Job>,
+    /// Creation order of `jobs`, so `ListJobs` pages deterministically.
+    pub job_order: Vec<String>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -99,6 +133,17 @@ static MINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// (`ASSET | DATA_GRANT | DATA_SET | EVENT_ACTION | JOB | REVISION`).
 pub const RESOURCE_TYPE_DATA_SET: &str = "DATA_SET";
 
+/// `ResourceType` for a revision, from the same `ResourceType` enum.
+pub const RESOURCE_TYPE_REVISION: &str = "REVISION";
+
+/// `ResourceType` for a job, from the same `ResourceType` enum.
+pub const RESOURCE_TYPE_JOB: &str = "JOB";
+
+/// The `State` a job is in before anything has started it: one of the model's
+/// `State` values, enumerated by `crate::ops::types::STATE_VALUES`. A job does no
+/// work until `StartJob` moves it on, so this is the state a created job carries.
+pub const JOB_STATE_WAITING: &str = "WAITING";
+
 /// The 500 a handler answers with when the shared engine is not the one this
 /// service's store lives in. Never a fresh engine: that would drop the write.
 pub fn store_unavailable() -> InternalServerException {
@@ -113,6 +158,36 @@ pub fn data_set_not_found(data_set_id: &str) -> ResourceNotFoundException {
         message: format!("The data set {data_set_id} couldn't be found."),
         resource_id: Some(data_set_id.to_string()),
         resource_type: Some(RESOURCE_TYPE_DATA_SET.to_string()),
+    }
+}
+
+/// The modelled 404 for a well-formed `RevisionId` that names no revision of
+/// `data_set_id`.
+pub fn revision_not_found(revision_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("The revision {revision_id} couldn't be found."),
+        resource_id: Some(revision_id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_REVISION.to_string()),
+    }
+}
+
+/// The modelled 404 for a well-formed `JobId` that names no stored job.
+pub fn job_not_found(job_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("The job {job_id} couldn't be found."),
+        resource_id: Some(job_id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_JOB.to_string()),
+    }
+}
+
+/// The modelled 409 for a request that cannot hold against the current state of
+/// `revision_id` — a write into a revision the model's `Finalized` documentation
+/// calls "this read-only state".
+pub fn revision_conflict(revision_id: &str, message: impl Into<String>) -> ConflictException {
+    ConflictException {
+        message: message.into(),
+        resource_id: Some(revision_id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_REVISION.to_string()),
     }
 }
 
@@ -153,6 +228,11 @@ pub fn invalid_request(message: impl Into<String>) -> ValidationException {
 // MAX_TAG_KEY_CHARS/MAX_TAG_VALUE_CHARS characters, and at most
 // MAX_REVISIONS_PER_DATA_SET revisions, each itself holding a Comment the model
 // already bounds at 16384 characters plus the same bounded tag map.
+//
+// Jobs are bounded the same way: at most MAX_JOBS of them, each holding at most
+// MAX_JOB_DETAIL_ENTRIES entries in any one caller-sized detail list and at most
+// MAX_TAGS asset-configuration tags (the model's own `@length(max: 50)` on
+// `ListOfTag`) of at most MAX_TAG_KEY_CHARS/MAX_TAG_VALUE_CHARS characters.
 // ---------------------------------------------------------------------------
 
 /// Emulator resource guard, NOT an AWS-published value: how many data sets this
@@ -167,6 +247,20 @@ pub const LIMIT_DATA_SETS_PER_ACCOUNT: &str = "Data sets per account";
 /// Emulator resource guard, NOT an AWS-published value: how many revisions this
 /// emulator stores per data set. See [`LIMIT_REVISIONS_PER_DATA_SET`].
 pub const MAX_REVISIONS_PER_DATA_SET: usize = 250;
+
+/// Emulator resource guard, NOT an AWS-published value: how many jobs this emulator
+/// stores. A job is reclaimed by nothing — the model has no DeleteJob — so the
+/// store needs its own ceiling. The model's `LimitName` enum publishes only
+/// CONCURRENCY limits for jobs, and no number for any of them.
+pub const MAX_JOBS: usize = 500;
+
+/// Emulator resource guard, NOT an AWS-published value: how many entries a single
+/// job's caller-sized detail list (asset sources, asset destinations, revision
+/// destinations) may carry. The model's `LimitName` enum names these limits
+/// ("Assets per import job from Amazon S3", "Asset per export job from Amazon S3",
+/// "Amazon Redshift datashare assets per import job from Redshift") but carries no
+/// value for any of them.
+pub const MAX_JOB_DETAIL_ENTRIES: usize = 100;
 
 /// The model's `LimitName` value for the per-data-set revision limit.
 pub const LIMIT_REVISIONS_PER_DATA_SET: &str = "Revisions per data set";
@@ -271,6 +365,11 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// `arn:aws:dataexchange:<region>:<account>:data-sets/<data_set_id>`.
 pub fn data_set_arn(region: &str, data_set_id: &str) -> String {
     ::engine::emulator_arn(SERVICE, region, &format!("data-sets/{data_set_id}"))
+}
+
+/// `arn:aws:dataexchange:<region>:<account>:jobs/<job_id>`.
+pub fn job_arn(region: &str, job_id: &str) -> String {
+    ::engine::emulator_arn(SERVICE, region, &format!("jobs/{job_id}"))
 }
 
 /// `arn:aws:dataexchange:<region>:<account>:data-sets/<data_set_id>/revisions/<revision_id>`.

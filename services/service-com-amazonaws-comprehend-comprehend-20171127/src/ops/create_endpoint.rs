@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Mints the endpoint's ARN from the attached model's own resource type,
+//! persists the endpoint in `CREATING` together with the outcome the clock owes it,
+//! and answers the ARN pair the model declares. This is the ONLY file to touch for
+//! this operation.
+//!
+//! An endpoint is attached to a model this account holds: a `ModelArn` that names no
+//! model in [`crate::state`] — and a `FlywheelArn`, since this emulator persists no
+//! flywheel — is the "specified resource ARN was not found" this operation models,
+//! and a request naming neither attaches the endpoint to nothing, which is the
+//! invalid request it models.
+//!
+//! The status the creation settles into is the outcome of the provisioning that was
+//! actually performed ([`crate::state::EndpointProvisioning`]): `IN_SERVICE` only
+//! when there is a trained model behind the endpoint to serve inference from, and the
+//! modelled `FAILED` with a `Message` saying why when there is not. Nothing is
+//! assumed ready.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +119,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{endpoint_arn, endpoint_resource_type, Endpoint, EndpointProvisioning};
+
+/// The refusal for a resource ARN that does not name a Comprehend custom model: the
+/// message is built from the REQUEST, naming the ARN that was validated, and an
+/// absent one is reported as `null` because there was no ARN to name.
+///
+/// A request that names NO model and no flywheel is exactly that case: the endpoint
+/// would be attached to nothing, so the ARN under validation is absent.
+fn invalid_resource_arn_message(resource_arn: Option<&str>) -> String {
+    format!("Invalid resource ARN: {}", resource_arn.unwrap_or("null"))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -186,18 +208,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpoint"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEndpointErrorModeled::InternalServerException(InternalServerException {
+                message: Some("The service store is unavailable. Retry your request.".to_string()),
+            })
+        })?;
+
+        // The tag bound every Comprehend resource shares, stated once in
+        // `crate::state`; only the exception wrapper is this operation's own.
+        let tags = input.tags.unwrap_or_default();
+        if let Some(message) = crate::state::too_many_tags_message(&tags) {
+            return Err(CreateEndpointErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Decide against a store whose clock-owed changes are already materialised, so
+        // the model status read below is the status it already had at `now`.
+        store.settle_document_classifiers(now);
+        store.settle_endpoints(now);
+
+        // `ClientRequestToken` is `@idempotencyToken`, and its documentation states
+        // what a match means here: "If this token matches a previous endpoint creation
+        // request, Amazon Comprehend will not return a ResourceInUseException" — the
+        // retry resolves to the endpoint the first call created. The TOKEN decides,
+        // not the rest of the request: the model declares no error for a token reused
+        // with different members.
+        if let Some(token) = input.client_request_token.as_ref() {
+            if let Some(existing) = store.endpoint_idempotency_tokens.get(token).cloned() {
+                if let Some(endpoint) = store.endpoints.get(&existing) {
+                    return Ok(CreateEndpointOutput {
+                        endpoint_arn: Some(existing),
+                        model_arn: endpoint.model_arn.clone(),
+                    });
+                }
+            }
+        }
+
+        // An endpoint serves inference from ONE model, named either directly or
+        // through the flywheel that owns it. This emulator persists no flywheel, so a
+        // request that names one names a resource that does not exist; a request that
+        // names neither points the endpoint at nothing.
+        let Some(model_arn) = input.model_arn.clone() else {
+            return Err(match input.flywheel_arn.as_ref() {
+                Some(flywheel_arn) => CreateEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "RESOURCE_NOT_FOUND: Could not find the flywheel {flywheel_arn}."
+                        )),
+                    },
+                ),
+                None => {
+                    CreateEndpointErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: Some(invalid_resource_arn_message(None)),
+                        reason: None,
+                        detail: None,
+                    })
+                }
+            }
+            .into());
+        };
+
+        // The model has to be one this account holds: the custom models this service
+        // persists are keyed by their own ARN, so an ARN naming none of them — a model
+        // never created, one already deleted, or a model type this emulator does not
+        // persist — is the not-found this operation models.
+        let model = store.document_classifiers.get(&model_arn).ok_or_else(|| {
+            CreateEndpointErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "RESOURCE_NOT_FOUND: Could not find the model {model_arn}."
+                )),
+            })
+        })?;
+
+        // What the endpoint reports once the clock owes it its settled status: an
+        // endpoint is `IN_SERVICE` only with a trained model behind it, and this
+        // emulator fits no model (see `DocumentClassifier::settle`), so an endpoint on
+        // an untrained model settles into the modelled failure state with the reason.
+        let provisioning = if model.is_trained() {
+            EndpointProvisioning::in_service()
+        } else {
+            EndpointProvisioning::failed(format!(
+                "The model {model_arn} is in status {}, so no trained model could be deployed \
+                 behind this endpoint and it can serve no inference request.",
+                model.status
+            ))
+        };
+
+        // The ARN form the output member's own pattern states, rendered by the one
+        // place that states it: the attached model's resource type decides whether
+        // this is a `document-classifier-endpoint` or an `entity-recognizer-endpoint`.
+        let resource_type = endpoint_resource_type(&model_arn).ok_or_else(|| {
+            CreateEndpointErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(invalid_resource_arn_message(Some(&model_arn))),
+                reason: None,
+                detail: None,
+            })
+        })?;
+        let arn = endpoint_arn(&region, resource_type, &input.endpoint_name);
+
+        // One name names one endpoint within an account and Region, so a second
+        // creation under a live ARN is the "specified resource name is already in use"
+        // this operation models.
+        if store.endpoints.contains_key(&arn) {
+            return Err(CreateEndpointErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "The endpoint {arn} is already in use. Use a different name and try \
+                         your request again."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let seq = store.mint_endpoint_seq();
+        let mut endpoint = Endpoint::creating(
+            seq,
+            arn.clone(),
+            input.endpoint_name,
+            input.desired_inference_units,
+            now,
+            provisioning,
+        );
+        endpoint.model_arn = Some(model_arn.clone());
+        endpoint.data_access_role_arn = input.data_access_role_arn;
+        endpoint.flywheel_arn = input.flywheel_arn;
+        endpoint.tags = tags;
+        endpoint.client_request_token = input.client_request_token;
+        store.insert_endpoint(endpoint);
+
+        Ok(CreateEndpointOutput {
+            endpoint_arn: Some(arn),
+            model_arn: Some(model_arn),
+        })
     }
 }

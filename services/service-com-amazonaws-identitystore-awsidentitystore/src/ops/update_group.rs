@@ -7,7 +7,10 @@
 //! carries, or removes that attribute when it carries none. The operations are applied
 //! in request order and only after every one of them has been accepted, so a refused
 //! request leaves the group exactly as it was; a successful one bumps the group's
-//! revision and its `UpdatedAt`, so a later `DescribeGroup` reports what was applied.
+//! revision and its `UpdatedAt` and records the calling principal as its `UpdatedBy`,
+//! so a later `DescribeGroup` reports what was applied and who applied it. A path the
+//! service does not let an update change is refused by exactly the rule
+//! [`crate::ops::update_user`] applies to a user.
 //!
 //! ## Shape of an operation
 //!
@@ -295,11 +298,6 @@ impl GroupAttribute {
     }
 }
 
-/// The attribute paths a refusal names as the accepted ones: the `path()` of every
-/// [`GroupAttribute::ALL`] entry. A literal rather than a joined `Vec`, so a refusal
-/// allocates nothing; the two spellings are the ones [`GroupAttribute::path`] returns.
-const SUPPORTED_PATHS: &str = "displayName, description";
-
 /// The `target` the audit record this operation emits carries, so a consumer can
 /// select the access trail without reading the rest of the emulator's traces.
 const AUDIT_TARGET: &str = "emulator::audit";
@@ -375,10 +373,11 @@ fn planned_changes(
         .map(|operation| {
             let attribute = GroupAttribute::from_path(&operation.attribute_path).ok_or_else(
                 || {
-                    invalid(format!(
-                        "AttributePath {:?} names no group attribute this operation can add, \
-                         replace or remove; it accepts {SUPPORTED_PATHS}",
-                        operation.attribute_path,
+                    // A path this operation does not own gets the message AWS builds
+                    // from the requested path, which `crate::state` states once for
+                    // both update operations.
+                    invalid(crate::state::unsupported_attribute_path_message(
+                        &operation.attribute_path,
                     ))
                 },
             )?;
@@ -424,6 +423,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Who is making the change: recorded as the group's `UpdatedBy`.
+        let updated_by = crate::state::caller_principal(ctx);
         // Resolved first, from the request alone: an operation this service cannot
         // apply refuses the whole request, so nothing below it is ever half-written.
         // The list itself is never empty — `AttributeOperations` is modelled
@@ -443,16 +444,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.group_id,
             ))
         };
-        // An update changes a group that already exists, so the store is looked up with
-        // `store_mut` rather than vivified: an identity store nothing was ever created
-        // in holds no group to update, and it is THAT resource the refusal names.
-        // Both identifiers go through the crate's own key normalisation, so the ARN
-        // form and either letter case of each name the same resource the create used.
-        let store = state.store_mut(&input.identity_store_id).ok_or_else(|| {
-            UpdateGroupErrorModeled::ResourceNotFoundException(
-                crate::state::identity_store_not_found(&input.identity_store_id),
-            )
-        })?;
+        // The identity store must EXIST: an update addressed to one that does not is
+        // refused with the modelled `ResourceNotFoundException` naming THAT resource,
+        // and naming a store never brings one into being. Both identifiers go through
+        // the crate's own key normalisation, so the ARN form and either letter case of
+        // each name the same resource the create used.
+        let store = state
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(UpdateGroupErrorModeled::ResourceNotFoundException)?;
         let group_key = crate::state::resource_key(&input.group_id);
         let stored = store.groups.get(&group_key).ok_or_else(group_not_found)?;
 
@@ -460,19 +459,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // applied only if it matches", so a request carrying one that is not the
         // group's current revision is refused and changes nothing. A request without
         // one is applied unconditionally.
-        if input
-            .revision
-            .as_deref()
-            .is_some_and(|expected| expected != stored.revision())
-        {
-            return Err(UpdateGroupErrorModeled::ConflictException(
-                crate::state::concurrent_modification(
-                    "the group has been modified since the revision this request expects: \
-                     read it again and retry with its current revision"
-                        .to_string(),
-                ),
-            )
-            .into());
+        if let Some(expected) = input.revision.as_deref() {
+            if expected != stored.revision() {
+                return Err(UpdateGroupErrorModeled::ConflictException(
+                    crate::state::revision_conflict(expected, &stored.revision()),
+                )
+                .into());
+            }
         }
 
         // Applied to a copy, in request order, so two operations naming one attribute
@@ -516,9 +509,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The group was modified, so its revision moves and its `UpdatedAt` is now.
-        updated.revision = updated.revision.saturating_add(1);
-        updated.updated_at = ::std::time::SystemTime::now();
+        // The group was modified, so its revision moves, its `UpdatedAt` is now and its
+        // `UpdatedBy` is the principal that made the change.
+        updated.record_update(::std::time::SystemTime::now());
+        updated.updated_by = Some(updated_by);
 
         if previous_display_name != updated.display_name {
             // Released only when the index still records THIS group as the name's

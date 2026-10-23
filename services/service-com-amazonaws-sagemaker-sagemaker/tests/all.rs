@@ -35,6 +35,8 @@ mod cluster_scheduler_config_lifecycle;
 mod code_repositories;
 #[path = "all/code_repository_deletion.rs"]
 mod code_repository_deletion;
+#[path = "all/compute_quota_lifecycle.rs"]
+mod compute_quota_lifecycle;
 #[path = "all/custom_images.rs"]
 mod custom_images;
 #[path = "all/endpoint_config_deletion.rs"]

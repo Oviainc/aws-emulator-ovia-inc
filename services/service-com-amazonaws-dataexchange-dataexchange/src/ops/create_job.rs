@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records a job in state — a fresh `Id` and `Arn`, `State` `WAITING`,
+//! the response form of the `Details` the request carried, and the asset
+//! configuration — after refusing a `Details` that does not match `Type`, and one
+//! naming a data set or revision this emulator does not hold. The job itself does no
+//! work until `StartJob` moves it on. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,546 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateJobErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `Type` is a modelled enum and every id in `Details` is modelled
+        // `^[a-zA-Z0-9]{30,40}$`, so the boundary validator already refused a value
+        // outside those. What it cannot express is the correspondence between the two
+        // members, and the caller-sized collections the details carry.
+        if let Err(message) = bound_asset_configuration(input.asset_configuration.as_ref()) {
+            return Err(
+                CreateJobErrorModeled::ValidationException(crate::state::invalid_request(message))
+                    .into(),
+            );
+        }
+
+        let job_id = crate::state::mint_id();
+        let created_at = crate::state::now();
+        let plan = match plan_job(
+            &input.r#type,
+            input.details,
+            &job_id,
+            request_endpoint(ctx).as_deref(),
+            created_at,
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return Err(CreateJobErrorModeled::ValidationException(
+                    crate::state::invalid_request(message),
+                )
+                .into())
+            }
+        };
+
+        let region = crate::state::request_region(ctx);
+        let stored = {
+            let mut store = state.lock();
+            // A job names the resources it will work on, so a job naming resources
+            // this emulator does not hold is refused here rather than at the start
+            // call: nothing about it could ever run.
+            let Some(data_set) = store.data_sets.get(&plan.data_set_id) else {
+                return Err(CreateJobErrorModeled::ResourceNotFoundException(
+                    crate::state::data_set_not_found(&plan.data_set_id),
+                )
+                .into());
+            };
+            for revision_id in &plan.revision_ids {
+                let Some(revision) = data_set.revisions.get(revision_id) else {
+                    return Err(CreateJobErrorModeled::ResourceNotFoundException(
+                        crate::state::revision_not_found(revision_id),
+                    )
+                    .into());
+                };
+                // The model's own `Finalized` documentation calls a finalized revision
+                // "this read-only state", so a job that would add assets to one
+                // conflicts with the revision's current state. A revoked revision is
+                // finalized too, so this covers it.
+                if plan.writes_assets && revision.finalized {
+                    return Err(CreateJobErrorModeled::ConflictException(
+                        crate::state::revision_conflict(
+                            revision_id,
+                            format!(
+                                "The revision {revision_id} is finalized and can't be modified."
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+            }
+            // Nothing reclaims a job — the model has no DeleteJob — so the store's own
+            // ceiling is enforced here. This operation models no
+            // `ServiceLimitExceededException`, so the refusal is its modelled
+            // `ValidationException` naming the bound.
+            if store.jobs.len() >= crate::state::MAX_JOBS {
+                return Err(CreateJobErrorModeled::ValidationException(
+                    crate::state::invalid_request(format!(
+                        "this emulator stores at most {} jobs, and it already holds that many",
+                        crate::state::MAX_JOBS
+                    )),
+                )
+                .into());
+            }
+
+            let record = crate::state::Job {
+                arn: crate::state::job_arn(&region, &job_id),
+                id: job_id.clone(),
+                r#type: input.r#type,
+                // A created job has not run: it waits for `StartJob`.
+                state: crate::state::JOB_STATE_WAITING.to_string(),
+                asset_configuration: input.asset_configuration,
+                details: plan.details,
+                // Nothing has run, so nothing has failed yet.
+                errors: Vec::new(),
+                data_set_id: plan.data_set_id,
+                // The filter a reader pages on names ONE revision, so it is recorded
+                // only for a job type whose details name exactly one.
+                revision_id: match plan.revision_ids.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                },
+                created_at,
+                updated_at: created_at,
+            };
+            store.job_order.push(job_id.clone());
+            let stored = record.clone();
+            store.jobs.insert(job_id, record);
+            stored
+        };
+
+        Ok(CreateJobOutput {
+            arn: Some(stored.arn),
+            asset_configuration: stored.asset_configuration,
+            created_at: Some(stored.created_at),
+            details: Some(stored.details),
+            errors: (!stored.errors.is_empty()).then_some(stored.errors),
+            id: Some(stored.id),
+            state: Some(stored.state),
+            r#type: Some(stored.r#type),
+            updated_at: Some(stored.updated_at),
+        })
+    }
+}
+
+/// The `RequestDetails` (and `ResponseDetails`) member each `Type` value names.
+///
+/// Source: the model's `Type` enum together with the members of `RequestDetails` and
+/// `ResponseDetails`, which carry the same names:
+/// `smithy_query(query="shape", shape="Type,RequestDetails,ResponseDetails")`.
+/// `Type` says what the job does, and exactly one detail member describes that work,
+/// so this table is the whole of the correspondence between the two members.
+pub const DETAILS_MEMBER_FOR_TYPE: &[(&str, &str)] = &[
+    (
+        "CREATE_S3_DATA_ACCESS_FROM_S3_BUCKET",
+        "CreateS3DataAccessFromS3Bucket",
+    ),
+    ("EXPORT_ASSETS_TO_S3", "ExportAssetsToS3"),
+    ("EXPORT_ASSET_TO_SIGNED_URL", "ExportAssetToSignedUrl"),
+    ("EXPORT_REVISIONS_TO_S3", "ExportRevisionsToS3"),
+    (
+        "IMPORT_ASSETS_FROM_LAKE_FORMATION_TAG_POLICY",
+        "ImportAssetsFromLakeFormationTagPolicy",
+    ),
+    (
+        "IMPORT_ASSETS_FROM_REDSHIFT_DATA_SHARES",
+        "ImportAssetsFromRedshiftDataShares",
+    ),
+    ("IMPORT_ASSETS_FROM_S3", "ImportAssetsFromS3"),
+    (
+        "IMPORT_ASSET_FROM_API_GATEWAY_API",
+        "ImportAssetFromApiGatewayApi",
+    ),
+    ("IMPORT_ASSET_FROM_SIGNED_URL", "ImportAssetFromSignedUrl"),
+];
+
+/// How long a URL this operation hands out stays valid, in seconds.
+///
+/// This model publishes no validity for either URL member, so the window is this
+/// emulator's choice: long enough that a client can upload within it, short enough
+/// that the expiry is a real deadline rather than a formality.
+const UPLOAD_URL_VALIDITY_SECONDS: f64 = 3600.0;
+
+/// What the request asked the job to do, resolved against the model's
+/// `Type` <-> `Details` correspondence.
+struct Plan {
+    /// The details in the form every job operation reports them in.
+    details: ResponseDetails,
+    /// The data set the details name.
+    data_set_id: String,
+    /// Every revision OF THAT DATA SET the details name, in the order they appear.
+    revision_ids: Vec<String>,
+    /// Whether the job would add assets to those revisions (an import or an S3 data
+    /// access create) rather than only read them (an export).
+    writes_assets: bool,
+}
+
+/// The detail member `job_type` names, or `None` for a `Type` outside the model's
+/// enum (which the boundary validator has already refused).
+fn details_member_for(job_type: &str) -> Option<&'static str> {
+    DETAILS_MEMBER_FOR_TYPE
+        .iter()
+        .find(|(value, _)| *value == job_type)
+        .map(|(_, member)| *member)
+}
+
+/// Which members the request's `Details` actually carries.
+fn present_members(details: &RequestDetails) -> Vec<&'static str> {
+    [
+        ("CreateS3DataAccessFromS3Bucket", details.create_s3_data_access_from_s3_bucket.is_some()),
+        ("ExportAssetToSignedUrl", details.export_asset_to_signed_url.is_some()),
+        ("ExportAssetsToS3", details.export_assets_to_s3.is_some()),
+        ("ExportRevisionsToS3", details.export_revisions_to_s3.is_some()),
+        ("ImportAssetFromApiGatewayApi", details.import_asset_from_api_gateway_api.is_some()),
+        ("ImportAssetFromSignedUrl", details.import_asset_from_signed_url.is_some()),
+        ("ImportAssetsFromLakeFormationTagPolicy", details.import_assets_from_lake_formation_tag_policy.is_some()),
+        ("ImportAssetsFromRedshiftDataShares", details.import_assets_from_redshift_data_shares.is_some()),
+        ("ImportAssetsFromS3", details.import_assets_from_s3.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(member, present)| present.then_some(member))
+    .collect()
+}
+
+/// The refusal for a `Details` that does not carry exactly the member `Type` names.
+fn wrong_details(job_type: &str, expected: &str, present: &[&str]) -> String {
+    let carried = match present {
+        [] => "no member".to_string(),
+        members => members.join(", "),
+    };
+    format!(
+        "Details must carry exactly the {expected} member for a {job_type} job, got {carried}"
+    )
+}
+
+/// `instant` advanced by `seconds`, as a modelled `Timestamp`.
+fn later(instant: ::aws_smithy_types::DateTime, seconds: f64) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs_f64(instant.as_secs_f64() + seconds)
+}
+
+/// The endpoint THIS request arrived at, from its `Host` header or its URI's own
+/// authority — `None` when it names neither.
+fn request_endpoint(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ctx.parts()
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| ctx.parts().uri.authority().map(::http::uri::Authority::as_str))
+        .map(ToString::to_string)
+}
+
+/// Where a client uploads the bytes an import job will take its content from.
+///
+/// AWS answers an S3 presigned URL here. This emulator has no object data plane, so
+/// the URL names THIS job's upload on the endpoint THIS REQUEST ARRIVED AT: no
+/// operation in this service serves it, and nothing downstream reads it back as
+/// content. It is a locator built from the request's own host and the minted job id,
+/// never a stand-in for content that was uploaded — and when the request names no
+/// host there is no endpoint to point at, so `None` comes back (a baked-in AWS
+/// endpoint here would send a following client's bytes to the real service).
+fn upload_url(endpoint: Option<&str>, job_id: &str, leaf: &str) -> Option<String> {
+    endpoint.map(|host| format!("https://{host}/v1/jobs/{job_id}/{leaf}"))
+}
+
+/// Refuse an `AssetConfiguration` the store will not hold.
+///
+/// The model already bounds `ListOfTag` at 50 entries, so the entry count is checked
+/// only as this handler's belt and braces; the key and value lengths are plain
+/// `__string` in the model, so they are bounded here against AWS's tagging limits.
+fn bound_asset_configuration(configuration: Option<&AssetConfiguration>) -> Result<(), String> {
+    let Some(tags) = configuration.and_then(|configuration| configuration.tags.as_ref()) else {
+        return Ok(());
+    };
+    crate::state::bound_entries("AssetConfiguration.Tags", tags.len(), crate::state::MAX_TAGS)?;
+    for tag in tags {
+        crate::state::bound_chars(
+            &format!("AssetConfiguration.Tags key {:?}", tag.key),
+            &tag.key,
+            crate::state::MAX_TAG_KEY_CHARS,
+        )?;
+        crate::state::bound_chars(
+            &format!("AssetConfiguration.Tags value for key {:?}", tag.key),
+            &tag.value,
+            crate::state::MAX_TAG_VALUE_CHARS,
+        )?;
+    }
+    Ok(())
+}
+
+/// Refuse a caller-sized detail list the store will not hold.
+fn bound_detail_entries(member: &str, count: usize) -> Result<(), String> {
+    crate::state::bound_entries(member, count, crate::state::MAX_JOB_DETAIL_ENTRIES)
+}
+
+/// Resolve `Type` and `Details` into the job this request asks for, or the message
+/// refusing it.
+///
+/// The correspondence is the rule: `Type` names exactly one member of `Details`, and
+/// a request must carry that member and no other. The response form of the details
+/// repeats what the caller asked for, plus the values only the service can supply —
+/// the URL a client uploads to for an import that takes its content from one.
+fn plan_job(
+    job_type: &str,
+    details: RequestDetails,
+    job_id: &str,
+    endpoint: Option<&str>,
+    created_at: ::aws_smithy_types::DateTime,
+) -> Result<Plan, String> {
+    let expected = details_member_for(job_type)
+        .ok_or_else(|| format!("Type {job_type} is not a job type this service creates"))?;
+    let present = present_members(&details);
+    if present.as_slice() != [expected] {
+        return Err(wrong_details(job_type, expected, &present));
+    }
+    let missing = || wrong_details(job_type, expected, &[]);
+
+    match expected {
+        "CreateS3DataAccessFromS3Bucket" => {
+            let detail = details.create_s3_data_access_from_s3_bucket.ok_or_else(missing)?;
+            let member = "Details.CreateS3DataAccessFromS3Bucket.AssetSource";
+            bound_detail_entries(
+                &format!("{member}.KeyPrefixes"),
+                detail.asset_source.key_prefixes.as_ref().map_or(0, Vec::len),
+            )?;
+            bound_detail_entries(
+                &format!("{member}.Keys"),
+                detail.asset_source.keys.as_ref().map_or(0, Vec::len),
+            )?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: true,
+                details: ResponseDetails {
+                    create_s3_data_access_from_s3_bucket: Some(
+                        CreateS3DataAccessFromS3BucketResponseDetails {
+                            asset_source: detail.asset_source,
+                            data_set_id: detail.data_set_id,
+                            revision_id: detail.revision_id,
+                        },
+                    ),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ExportAssetToSignedUrl" => {
+            let detail = details.export_asset_to_signed_url.ok_or_else(missing)?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: false,
+                details: ResponseDetails {
+                    export_asset_to_signed_url: Some(ExportAssetToSignedUrlResponseDetails {
+                        asset_id: detail.asset_id,
+                        data_set_id: detail.data_set_id,
+                        revision_id: detail.revision_id,
+                        // An export's URL leads to the exported copy, which the job
+                        // has not produced yet: it is the start call that exports.
+                        signed_url: None,
+                        signed_url_expires_at: None,
+                    }),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ExportAssetsToS3" => {
+            let detail = details.export_assets_to_s3.ok_or_else(missing)?;
+            bound_detail_entries(
+                "Details.ExportAssetsToS3.AssetDestinations",
+                detail.asset_destinations.len(),
+            )?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: false,
+                details: ResponseDetails {
+                    export_assets_to_s3: Some(ExportAssetsToS3ResponseDetails {
+                        asset_destinations: detail.asset_destinations,
+                        data_set_id: detail.data_set_id,
+                        encryption: detail.encryption,
+                        revision_id: detail.revision_id,
+                    }),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ExportRevisionsToS3" => {
+            let detail = details.export_revisions_to_s3.ok_or_else(missing)?;
+            bound_detail_entries(
+                "Details.ExportRevisionsToS3.RevisionDestinations",
+                detail.revision_destinations.len(),
+            )?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                // This is the one job type whose details name MANY revisions.
+                revision_ids: detail
+                    .revision_destinations
+                    .iter()
+                    .map(|destination| destination.revision_id.clone())
+                    .collect(),
+                writes_assets: false,
+                details: ResponseDetails {
+                    export_revisions_to_s3: Some(ExportRevisionsToS3ResponseDetails {
+                        data_set_id: detail.data_set_id,
+                        encryption: detail.encryption,
+                        revision_destinations: detail.revision_destinations,
+                        // Set only on a job an auto-export event action created; a
+                        // caller's own CreateJob is not one.
+                        event_action_arn: None,
+                    }),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ImportAssetFromApiGatewayApi" => {
+            let detail = details.import_asset_from_api_gateway_api.ok_or_else(missing)?;
+            // The model makes this one's upload URL required, so a request that names
+            // no endpoint to serve it at cannot be answered at all.
+            let upload = upload_url(endpoint, job_id, "api-specification").ok_or_else(|| {
+                "the request carries no Host header, so there is no endpoint to serve \
+                 Details.ImportAssetFromApiGatewayApi.ApiSpecificationUploadUrl at"
+                    .to_string()
+            })?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: true,
+                details: ResponseDetails {
+                    import_asset_from_api_gateway_api: Some(
+                        ImportAssetFromApiGatewayApiResponseDetails {
+                            api_description: detail.api_description,
+                            api_id: detail.api_id,
+                            api_key: detail.api_key,
+                            api_name: detail.api_name,
+                            api_specification_md5_hash: detail.api_specification_md5_hash,
+                            api_specification_upload_url: upload,
+                            api_specification_upload_url_expires_at: later(
+                                created_at,
+                                UPLOAD_URL_VALIDITY_SECONDS,
+                            ),
+                            data_set_id: detail.data_set_id,
+                            protocol_type: detail.protocol_type,
+                            revision_id: detail.revision_id,
+                            stage: detail.stage,
+                        },
+                    ),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ImportAssetFromSignedUrl" => {
+            let detail = details.import_asset_from_signed_url.ok_or_else(missing)?;
+            let signed_url = upload_url(endpoint, job_id, "asset");
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: true,
+                details: ResponseDetails {
+                    import_asset_from_signed_url: Some(ImportAssetFromSignedUrlResponseDetails {
+                        asset_name: detail.asset_name,
+                        data_set_id: detail.data_set_id,
+                        md5_hash: Some(detail.md5_hash),
+                        revision_id: detail.revision_id,
+                        signed_url_expires_at: signed_url
+                            .is_some()
+                            .then(|| later(created_at, UPLOAD_URL_VALIDITY_SECONDS)),
+                        signed_url,
+                    }),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ImportAssetsFromLakeFormationTagPolicy" => {
+            let detail = details
+                .import_assets_from_lake_formation_tag_policy
+                .ok_or_else(missing)?;
+            // NOTE: this detail's `CatalogId` carries the model's pattern
+            // `/^[\d]{12}$/`, whose `/` delimiters are part of the pattern itself, so
+            // the boundary validator admits no value for it and no request reaches
+            // this arm today. It is written to the same rule as every other arm, so
+            // it is right the day the model's pattern is.
+            let member = "Details.ImportAssetsFromLakeFormationTagPolicy";
+            bound_detail_entries(
+                &format!("{member}.Database.Expression"),
+                detail
+                    .database
+                    .as_ref()
+                    .map_or(0, |database| database.expression.len()),
+            )?;
+            bound_detail_entries(
+                &format!("{member}.Table.Expression"),
+                detail.table.as_ref().map_or(0, |table| table.expression.len()),
+            )?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: true,
+                details: ResponseDetails {
+                    import_assets_from_lake_formation_tag_policy: Some(
+                        ImportAssetsFromLakeFormationTagPolicyResponseDetails {
+                            catalog_id: detail.catalog_id,
+                            database: detail.database,
+                            table: detail.table,
+                            role_arn: detail.role_arn,
+                            data_set_id: detail.data_set_id,
+                            revision_id: detail.revision_id,
+                        },
+                    ),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ImportAssetsFromRedshiftDataShares" => {
+            let detail = details
+                .import_assets_from_redshift_data_shares
+                .ok_or_else(missing)?;
+            bound_detail_entries(
+                "Details.ImportAssetsFromRedshiftDataShares.AssetSources",
+                detail.asset_sources.len(),
+            )?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: true,
+                details: ResponseDetails {
+                    import_assets_from_redshift_data_shares: Some(
+                        ImportAssetsFromRedshiftDataSharesResponseDetails {
+                            asset_sources: detail.asset_sources,
+                            data_set_id: detail.data_set_id,
+                            revision_id: detail.revision_id,
+                        },
+                    ),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        "ImportAssetsFromS3" => {
+            let detail = details.import_assets_from_s3.ok_or_else(missing)?;
+            bound_detail_entries(
+                "Details.ImportAssetsFromS3.AssetSources",
+                detail.asset_sources.len(),
+            )?;
+            Ok(Plan {
+                data_set_id: detail.data_set_id.clone(),
+                revision_ids: vec![detail.revision_id.clone()],
+                writes_assets: true,
+                details: ResponseDetails {
+                    import_assets_from_s3: Some(ImportAssetsFromS3ResponseDetails {
+                        asset_sources: detail.asset_sources,
+                        data_set_id: detail.data_set_id,
+                        revision_id: detail.revision_id,
+                    }),
+                    ..ResponseDetails::default()
+                },
+            })
+        }
+        // `DETAILS_MEMBER_FOR_TYPE` is keyed by the model's own `Type` enum, so every
+        // value it admits has an arm above; this is unreachable unless the model gains
+        // a value and the table is extended without the arm.
+        member => Err(format!(
+            "Details member {member} is modelled but this emulator does not create that job yet"
+        )),
     }
 }

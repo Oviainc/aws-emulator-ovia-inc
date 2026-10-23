@@ -2,11 +2,10 @@
 
 //! `GetGroupMembershipId`, driven end to end over HTTP.
 //!
-//! Every case goes through the same front door a client uses: `POST /` with
-//! `X-Amz-Target: AWSIdentityStore.<Operation>` and an `awsJson1_1` body
-//! (OPERATIONS.md, "Wire protocol"), dispatched by the production
-//! [`MultiServiceRouter`]. Nothing reaches into the state struct, so an answer that is
-//! not computed from the memberships `CreateGroupMembership` persisted cannot pass.
+//! Every case goes through the same front door a client uses, through the shared
+//! harness in [`crate::harness`]: nothing reaches into the state struct, so an answer
+//! that is not computed from the memberships `CreateGroupMembership` persisted cannot
+//! pass.
 //!
 //! The rule under test: `GetGroupMembershipId` reports the `MembershipId` and
 //! `MembershipArn` of the membership the identity store holds for the (group, member)
@@ -14,123 +13,16 @@
 //! (HTTP 404) when it holds none. The suites are TABLES whose rows differ along what
 //! that rule generalises over: how many memberships the group and the store hold,
 //! which member of which group is asked about, the FORM of each identifier (bare id,
-//! resource ARN, upper case, identity-store ARN), which identity store, and which part
-//! of the pair is missing.
-
-use std::sync::Arc;
+//! resource ARN, upper case, identity-store ARN), and which part of the pair is missing.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The `X-Amz-Target` prefix from OPERATIONS.md, "Wire protocol".
-const TARGET_PREFIX: &str = "AWSIdentityStore";
-
-/// Two identity stores, so the per-store scope of the lookup is observable. Any value
-/// the modelled `IdentityStoreId` pattern admits works.
-const STORE: &str = "d-1234567890";
-const OTHER_STORE: &str = "d-abcdef0123";
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
 
 /// A well-formed `ResourceId` of a resource nothing created, so a refusal comes from
 /// state rather than from the boundary validator.
 const MISSING_ID: &str = "0123abcd-4567-89ab-cdef-0123456789ab";
-
-/// A router with just this service mounted on a fresh engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signatures are not what these tests are about; the request still carries a SigV4
-    // credential scope, which is what routes it to this service.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_identitystore_awsidentitystore::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// One `awsJson1_1` call: the HTTP status, the wire error code and the parsed body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, String, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        .header("host", "identitystore.us-east-1.amazonaws.com")
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDIDENTITYSTORE/20260101/us-east-1\
-             /identitystore/aws4_request, SignedHeaders=host;x-amz-target, Signature=00",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header_code = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let payload = response.into_body();
-    let parsed: Value = if payload.is_empty() {
-        json!({})
-    } else {
-        serde_json::from_slice(&payload)
-            .unwrap_or_else(|_| json!({ "__unparsed": String::from_utf8_lossy(&payload) }))
-    };
-    let code = if header_code.is_empty() {
-        parsed
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        header_code
-    };
-    (status, code, parsed)
-}
-
-/// A call that must answer 200, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
-    let (status, code, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected {operation} to answer 200, got {status} {code} with {parsed}"
-    );
-    parsed
-}
-
-/// A call that must be refused with `status` and an error code naming `error`.
-async fn refused(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-    status: u16,
-    error: &str,
-    case: &str,
-) -> Value {
-    let (actual_status, code, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        actual_status, status,
-        "case {case:?}: expected {operation} to answer {status}, got {actual_status} {code} \
-         with {parsed}"
-    );
-    assert!(
-        code.ends_with(error),
-        "case {case:?}: expected the error code {error}, got {code:?} with {parsed}"
-    );
-    parsed
-}
-
-/// A required string member of a response body.
-fn string(body: &Value, member: &str, case: &str) -> String {
-    body[member]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
-        .to_string()
-}
 
 /// A `UserName` for a row: the modelled `UserName` pattern
 /// (`^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`) admits letters, marks, symbols, numbers and
@@ -240,19 +132,19 @@ fn assert_resolves_to(answer: &Value, store: &str, membership_id: &str, membersh
 async fn a_pair_resolves_to_the_membership_that_was_created_for_it() {
     let router = emulator();
     // Rows differ along how many members the group holds, how many groups the member
-    // belongs to, WHICH member of WHICH group is asked about, and which identity store
-    // holds them: (case, store, groups, members per group, the group and member index
-    // to look up).
-    let rows: [(&str, &str, usize, usize, usize, usize); 6] = [
-        ("one group, one member", STORE, 1, 1, 0, 0),
-        ("one group, three members, the first", STORE, 1, 3, 0, 0),
-        ("one group, three members, the last", STORE, 1, 3, 0, 2),
-        ("three groups, the middle one", STORE, 3, 2, 1, 1),
-        ("three groups, the last one", STORE, 3, 2, 2, 0),
-        ("a second identity store", OTHER_STORE, 2, 2, 1, 1),
+    // belongs to, and WHICH member of WHICH group is asked about: (case, groups,
+    // members per group, the group and member index to look up).
+    let rows: [(&str, usize, usize, usize, usize); 6] = [
+        ("one group, one member", 1, 1, 0, 0),
+        ("one group, three members, the first", 1, 3, 0, 0),
+        ("one group, three members, the last", 1, 3, 0, 2),
+        ("three groups, the middle one", 3, 2, 1, 1),
+        ("three groups, the last one", 3, 2, 2, 0),
+        ("four groups, four members, the last pair", 4, 4, 3, 3),
     ];
 
-    for (case, store, groups, members, group_index, member_index) in rows {
+    for (case, groups, members, group_index, member_index) in rows {
+        let store = STORE;
         // Every pair of the row's groups and members is a membership, so the lookup has
         // to pick the right one out of `groups * members` of them.
         let group_ids: Vec<String> = {
@@ -390,16 +282,17 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
     let stranger = create_user(&router, STORE, "bob", case).await;
     let (membership_id, membership_arn) = join(&router, STORE, &group, &user, case).await;
 
-    // Rows differ along WHICH part of the pair the store does not hold: the identity
-    // store, the group, the member, or the pairing itself.
+    // Rows differ along WHICH part of the pair is missing: the identity store, the
+    // group, the member, or the pairing itself.
     let rows = [
         (
-            "an identity store nothing was created in",
+            "an identity store that does not exist",
             json!({
-                "IdentityStoreId": OTHER_STORE,
+                "IdentityStoreId": MISSING_STORE,
                 "GroupId": group.clone(),
                 "MemberId": { "UserId": user.clone() },
             }),
+            "IDENTITY_STORE",
         ),
         (
             "a group nothing created",
@@ -408,6 +301,7 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
                 "GroupId": MISSING_ID,
                 "MemberId": { "UserId": user.clone() },
             }),
+            "GROUP_MEMBERSHIP",
         ),
         (
             "a member nothing created",
@@ -416,6 +310,7 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
                 "GroupId": group.clone(),
                 "MemberId": { "UserId": MISSING_ID },
             }),
+            "GROUP_MEMBERSHIP",
         ),
         (
             "a user who is not a member of that group",
@@ -424,6 +319,7 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
                 "GroupId": group.clone(),
                 "MemberId": { "UserId": stranger.clone() },
             }),
+            "GROUP_MEMBERSHIP",
         ),
         (
             "a member of another group, asked of the wrong group",
@@ -432,9 +328,10 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
                 "GroupId": other_group.clone(),
                 "MemberId": { "UserId": user.clone() },
             }),
+            "GROUP_MEMBERSHIP",
         ),
     ];
-    for (row_case, request) in rows {
+    for (row_case, request, expected_type) in rows {
         let refusal = refused(
             &router,
             "GetGroupMembershipId",
@@ -448,13 +345,17 @@ async fn a_pair_with_no_membership_is_reported_as_not_found() {
         // the caller did not already hold.
         assert_eq!(
             refusal["ResourceType"].as_str(),
-            Some("GROUP_MEMBERSHIP"),
-            "case {row_case:?}: expected the refusal to name the membership class, got {refusal}"
+            Some(expected_type),
+            "case {row_case:?}: expected the refusal to name {expected_type}, got {refusal}"
         );
-        assert!(
-            refusal["ResourceId"].is_null(),
-            "case {row_case:?}: expected no ResourceId on the refusal, got {refusal}"
-        );
+        // A membership has no id to report — the pair is what was asked about — while a
+        // store that does not exist is reported by the id the request itself named.
+        if expected_type == "GROUP_MEMBERSHIP" {
+            assert!(
+                refusal["ResourceId"].is_null(),
+                "case {row_case:?}: expected no ResourceId on the refusal, got {refusal}"
+            );
+        }
     }
 
     // The pair that does exist still resolves, so none of the refusals disturbed it.
