@@ -411,6 +411,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+
+        // Every named subnet has to be one the account HAS: the cache's VPC
+        // endpoint is deployed into it, so an id that names no subnet could
+        // never carry one. Which subnets the account has is a fact of the
+        // Region (`crate::state::region_subnets`) — the same fact the default
+        // selection below reads, so ElastiCache never selects a subnet it would
+        // itself refuse.
+        let unresolved =
+            crate::state::unresolved_subnets(&region, requested_subnets.iter().map(String::as_str));
+        if !unresolved.is_empty() {
+            return Err(invalid_value(crate::state::invalid_subnets_message(
+                &unresolved,
+            )));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -442,11 +457,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "If no subnet IDs are given … ElastiCache will select [2 or 3] default
-        // subnets across AZs": the selected ids are minted once and stored, so
-        // every later read reports the same subnets.
+        // subnets across AZs": the ones it selects are default subnets of the
+        // account's Region, so a later read reports subnets that exist and a
+        // request may name them itself.
         let subnet_ids = if requested_subnets.is_empty() {
-            (0..crate::state::default_subnet_count(&region))
-                .map(|_| store.mint_subnet_id())
+            crate::state::selected_default_subnets(&region)
+                .into_iter()
+                .map(|subnet| subnet.subnet_id)
                 .collect()
         } else {
             requested_subnets

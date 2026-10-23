@@ -66,6 +66,11 @@ mod describe_users;
 #[path = "all/describe_update_actions.rs"]
 mod describe_update_actions;
 
+// Appended for the same reason: the awsQuery error-envelope, subnet-resolution
+// and identifier-validation suite.
+#[path = "all/subnet_resolution_and_error_envelope.rs"]
+mod subnet_resolution_and_error_envelope;
+
 // Appended for the same reason: the awsQuery error-envelope suite and the
 // `DeleteCacheParameterGroup` suite it shares a fix with.
 #[path = "all/query_error_envelope.rs"]
