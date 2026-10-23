@@ -13,10 +13,11 @@ use ::aws_smithy_types::DateTime;
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ActivityType, ActivityTypeInfo, DecisionTaskScheduledEventAttributes, DomainConfiguration,
-    DomainInfo, ExecutionTimeFilter, HistoryEvent, ResourceTag, TagFilter, TaskList,
-    WorkflowExecution, WorkflowExecutionConfiguration, WorkflowExecutionFilter,
-    WorkflowExecutionInfo, WorkflowExecutionOpenCounts, WorkflowExecutionStartedEventAttributes,
+    ActivityType, ActivityTypeConfiguration, ActivityTypeInfo,
+    DecisionTaskScheduledEventAttributes, DomainConfiguration, DomainInfo, ExecutionTimeFilter,
+    HistoryEvent, ResourceTag, TagFilter, TaskList, WorkflowExecution,
+    WorkflowExecutionConfiguration, WorkflowExecutionFilter, WorkflowExecutionInfo,
+    WorkflowExecutionOpenCounts, WorkflowExecutionStartedEventAttributes,
     WorkflowExecutionTerminatedEventAttributes, WorkflowType, WorkflowTypeConfiguration,
     WorkflowTypeFilter, WorkflowTypeInfo,
 };
@@ -67,6 +68,10 @@ pub const MAX_DOMAINS: usize = 100;
 /// How many workflow types one domain holds. Emulator-chosen, for the same reason as
 /// [`MAX_DOMAINS`], and answered with the same modelled `LimitExceededFault`.
 pub const MAX_WORKFLOW_TYPES_PER_DOMAIN: usize = 1_000;
+
+/// How many activity types one domain holds. Emulator-chosen, for the same reason as
+/// [`MAX_DOMAINS`], and answered with the same modelled `LimitExceededFault`.
+pub const MAX_ACTIVITY_TYPES_PER_DOMAIN: usize = 1_000;
 
 /// How many workflow executions one domain retains. Emulator-chosen, for the same
 /// reason as [`MAX_DOMAINS`], and answered with the same modelled
@@ -145,9 +150,10 @@ impl WorkflowTypeRecord {
     }
 }
 
-/// A registered activity type. `RegisterActivityType` is still a 501 in this slice, so
-/// nothing writes this yet; the map it lives in is shaped now so the operation that
-/// implements it does not have to reshape the store.
+/// A registered activity type, as `RegisterActivityType` left it. The `default_*`
+/// members are the registration-time settings a `ScheduleActivityTask` decision falls
+/// back to when it does not override them, and are reported verbatim by
+/// `DescribeActivityType`: the type's configuration cannot change after registration.
 #[derive(Debug, Clone)]
 pub struct ActivityTypeRecord {
     pub name: String,
@@ -157,21 +163,52 @@ pub struct ActivityTypeRecord {
     pub status: String,
     pub creation_date: DateTime,
     pub deprecation_date: Option<DateTime>,
+    pub default_task_list: Option<String>,
+    pub default_task_priority: Option<String>,
+    pub default_task_heartbeat_timeout: Option<String>,
+    pub default_task_schedule_to_close_timeout: Option<String>,
+    pub default_task_schedule_to_start_timeout: Option<String>,
+    pub default_task_start_to_close_timeout: Option<String>,
 }
 
 impl ActivityTypeRecord {
+    /// The `ActivityType` identity this record is keyed by.
+    pub fn activity_type(&self) -> ActivityType {
+        ActivityType {
+            name: self.name.clone(),
+            version: self.version.clone(),
+        }
+    }
+
     /// The `ActivityTypeInfo` every activity-type reader returns, built from what is
     /// stored.
     pub fn info(&self) -> ActivityTypeInfo {
         ActivityTypeInfo {
-            activity_type: ActivityType {
-                name: self.name.clone(),
-                version: self.version.clone(),
-            },
+            activity_type: self.activity_type(),
             status: self.status.clone(),
             description: self.description.clone(),
             creation_date: self.creation_date,
             deprecation_date: self.deprecation_date,
+        }
+    }
+
+    /// The `ActivityTypeConfiguration` `DescribeActivityType` reports: the
+    /// registration-time defaults, exactly as stored.
+    pub fn configuration(&self) -> ActivityTypeConfiguration {
+        ActivityTypeConfiguration {
+            default_task_start_to_close_timeout: self.default_task_start_to_close_timeout.clone(),
+            default_task_heartbeat_timeout: self.default_task_heartbeat_timeout.clone(),
+            default_task_list: self
+                .default_task_list
+                .clone()
+                .map(|name| TaskList { name }),
+            default_task_priority: self.default_task_priority.clone(),
+            default_task_schedule_to_start_timeout: self
+                .default_task_schedule_to_start_timeout
+                .clone(),
+            default_task_schedule_to_close_timeout: self
+                .default_task_schedule_to_close_timeout
+                .clone(),
         }
     }
 }
@@ -440,8 +477,8 @@ pub struct Domain {
     pub tags: Vec<ResourceTag>,
     /// `(name, version)` -> the registered workflow type.
     pub workflow_types: HashMap<(String, String), WorkflowTypeRecord>,
-    /// `(name, version)` -> the registered activity type. Written by
-    /// `RegisterActivityType`, which is tracked as its own gap issue.
+    /// `(name, version)` -> the registered activity type, written by
+    /// `RegisterActivityType` and read back by `DescribeActivityType`.
     pub activity_types: HashMap<(String, String), ActivityTypeRecord>,
     /// `(workflowId, runId)` -> the execution.
     pub executions: HashMap<(String, String), Execution>,

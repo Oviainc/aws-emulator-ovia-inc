@@ -39,8 +39,8 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator: a fresh engine behind a router that claims `swf` requests.
 ///
-/// `pub(crate)` so a sibling suite under `tests/all/` drives the service through the
-/// same router rather than standing up a second harness of its own.
+/// `pub(crate)` so the sibling suites under `tests/all/` drive the service through the
+/// same router rather than each standing up a harness of its own.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterActivityType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterActivityType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterActivityType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler writes one `ActivityTypeRecord` into the addressed
+//! domain's `activity_types` map, keyed by `(name, version)`, and
+//! `DescribeActivityType` reads it back. A second registration of the same pair is a
+//! `TypeAlreadyExistsFault`; a domain this store does not hold is an
+//! `UnknownResourceFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -217,20 +214,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterActivityType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterActivityTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterActivityType"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterActivityTypeErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        crate::state::validate_name("name", &input.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        crate::state::validate_name("version", &input.version)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let default_task_list = match &input.default_task_list {
+            // An empty `name` is no task list at all, the same reading
+            // `RegisterWorkflowType` applies to its own default — so a stored default
+            // can never be a value a scheduling path would ignore. `TaskList.name` is
+            // modelled length 1..256, so the boundary validator normally refuses ""
+            // before this runs; the guard keeps the store clean if that stops holding.
+            Some(task_list) if !task_list.name.is_empty() => {
+                crate::state::validate_name("defaultTaskList.name", &task_list.name)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+                Some(task_list.name.clone())
+            }
+            _ => None,
+        };
+
+        // All four of this operation's timeouts are documented identically: "The
+        // duration is specified in seconds, an integer greater than or equal to 0. You
+        // can use NONE to specify unlimited duration." An empty one is an absent one.
+        let timeout = |member: &str, value: &Option<String>| -> Result<Option<String>, Self::Error> {
+            let value = crate::state::non_empty(value);
+            if let Some(value) = &value {
+                crate::state::validate_task_duration(member, value)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+            }
+            Ok(value)
+        };
+        let default_task_start_to_close_timeout = timeout(
+            "defaultTaskStartToCloseTimeout",
+            &input.default_task_start_to_close_timeout,
+        )?;
+        let default_task_heartbeat_timeout = timeout(
+            "defaultTaskHeartbeatTimeout",
+            &input.default_task_heartbeat_timeout,
+        )?;
+        let default_task_schedule_to_start_timeout = timeout(
+            "defaultTaskScheduleToStartTimeout",
+            &input.default_task_schedule_to_start_timeout,
+        )?;
+        let default_task_schedule_to_close_timeout = timeout(
+            "defaultTaskScheduleToCloseTimeout",
+            &input.default_task_schedule_to_close_timeout,
+        )?;
+
+        let mut guard = state.lock();
+        let Some(domain) = guard.domains.get_mut(&input.domain) else {
+            return Err(RegisterActivityTypeErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!("Unknown domain: {}", input.domain)),
+                },
+            )
+            .into());
+        };
+
+        let key = (input.name.clone(), input.version.clone());
+        // "You may get this fault if you are registering a type that is either already
+        // registered or deprecated" — a DEPRECATED type is still stored under this key,
+        // so the presence of the key is the whole test.
+        if domain.activity_types.contains_key(&key) {
+            return Err(RegisterActivityTypeErrorModeled::TypeAlreadyExistsFault(
+                TypeAlreadyExistsFault {
+                    message: Some(format!(
+                        "ActivityType=[name={}, version={}]",
+                        input.name, input.version
+                    )),
+                },
+            )
+            .into());
+        }
+        if domain.activity_types.len() >= crate::state::MAX_ACTIVITY_TYPES_PER_DOMAIN {
+            return Err(RegisterActivityTypeErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "this emulator holds at most {} activity types per domain",
+                        crate::state::MAX_ACTIVITY_TYPES_PER_DOMAIN
+                    )),
+                },
+            )
+            .into());
+        }
+
+        domain.activity_types.insert(
+            key,
+            crate::state::ActivityTypeRecord {
+                name: input.name.clone(),
+                version: input.version.clone(),
+                description: input.description.clone(),
+                status: crate::state::STATUS_REGISTERED.to_string(),
+                creation_date: crate::state::now(),
+                deprecation_date: None,
+                default_task_list,
+                default_task_priority: crate::state::non_empty(&input.default_task_priority),
+                default_task_heartbeat_timeout,
+                default_task_schedule_to_close_timeout,
+                default_task_schedule_to_start_timeout,
+                default_task_start_to_close_timeout,
+            },
+        );
+
+        Ok(RegisterActivityTypeOutput)
     }
 }
