@@ -19,19 +19,10 @@
 //! type, and which identity store is named.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::identity_store_lifecycle::{
-    assert_resource_arn, assert_uuid, emulator, ok, refused, string,
-};
-
-/// The identity store these cases use. Any value the modelled `IdentityStoreId`
-/// pattern admits works; this is one row's worth of that.
-const STORE: &str = "d-1234567890";
-
-/// A second store, so the per-store scope of a lookup is observable.
-const OTHER_STORE: &str = "d-abcdef0123";
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
 /// Which stored attribute a row resolves its user by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,35 +165,20 @@ async fn a_user_is_resolved_by_every_documented_unique_attribute_path() {
 #[tokio::test]
 async fn resolution_is_stable_and_scoped_to_one_identity_store() {
     let router = emulator();
-    // The same user name in two stores is two users, so the answer depends on which
-    // store the request names — and repeating a read answers the same thing.
+    // The answer depends on which store the request names — and repeating a read
+    // answers the same thing. The store that does not exist is the other side of that
+    // scope: it resolves nothing at all.
     let user_name = "shared-name";
     let (here, here_arn) = create_user(
         &router,
         STORE,
         user_name,
         Some("here@example.test"),
-        "two stores",
+        "one store",
     )
     .await;
-    let (there, there_arn) = create_user(
-        &router,
-        OTHER_STORE,
-        user_name,
-        Some("there@example.test"),
-        "two stores",
-    )
-    .await;
-    assert_ne!(
-        here, there,
-        "case \"two stores\": expected two stores to hold two different users, \
-         got {here:?} twice"
-    );
 
-    for (store, expected_id, expected_arn) in [
-        (STORE, &here, &here_arn),
-        (OTHER_STORE, &there, &there_arn),
-    ] {
+    for (store, expected_id, expected_arn) in [(STORE, &here, &here_arn)] {
         for attempt in 0..3 {
             let case = format!("{store} attempt {attempt}");
             let got = ok(
@@ -223,6 +199,25 @@ async fn resolution_is_stable_and_scoped_to_one_identity_store() {
                 "case {case:?}: expected the stored UserArn, got {got}"
             );
         }
+    }
+
+    // The same lookup addressed to a store that does not exist is refused, every time.
+    for attempt in 0..3 {
+        let case = format!("a store that does not exist, attempt {attempt}");
+        let body = refused(
+            &router,
+            "GetUserId",
+            get_user_id(MISSING_STORE, unique_attribute("userName", json!(user_name))),
+            404,
+            "ResourceNotFoundException",
+            &case,
+        )
+        .await;
+        assert_eq!(
+            body.get("ResourceType").and_then(Value::as_str),
+            Some("IDENTITY_STORE"),
+            "case {case:?}: expected the store to be the missing resource, got {body}"
+        );
     }
 }
 
@@ -272,18 +267,10 @@ async fn an_identifier_no_user_carries_is_reported_as_not_found() {
     let router = emulator();
     let case = "setup";
     create_user(&router, STORE, "present", Some("present@example.test"), case).await;
-    create_user(
-        &router,
-        OTHER_STORE,
-        "elsewhere",
-        Some("elsewhere@example.test"),
-        case,
-    )
-    .await;
 
-    // Rows: which identifier form misses, and how — an absent value, a value stored in
-    // a DIFFERENT store, an identity store that was never created, and an external id
-    // (no modelled operation of this service sets `ExternalIds`, so none ever matches).
+    // Rows: which identifier form misses, and how — an absent user name, an absent
+    // email, and an external id (no modelled operation of this service sets
+    // `ExternalIds`, so none ever matches).
     let rows: Vec<(&str, &str, Value)> = vec![
         (
             "unknown userName",
@@ -296,19 +283,9 @@ async fn an_identifier_no_user_carries_is_reported_as_not_found() {
             unique_attribute("emails.value", json!("absent@example.test")),
         ),
         (
-            "userName of another store",
+            "a userName that differs only in case",
             STORE,
-            unique_attribute("userName", json!("elsewhere")),
-        ),
-        (
-            "emails.value of another store",
-            STORE,
-            unique_attribute("emails.value", json!("elsewhere@example.test")),
-        ),
-        (
-            "userName in a store that was never created",
-            "d-00000000ff",
-            unique_attribute("userName", json!("present")),
+            unique_attribute("userName", json!("PRESENT")),
         ),
         (
             "external id",
@@ -334,6 +311,24 @@ async fn an_identifier_no_user_carries_is_reported_as_not_found() {
             "case {case:?}: expected ResourceType USER on the refusal, got {body}"
         );
     }
+
+    // A store that does not exist is a different missing resource: the STORE, not the
+    // user the identifier names.
+    let body = refused(
+        &router,
+        "GetUserId",
+        get_user_id("d-00000000ff", unique_attribute("userName", json!("present"))),
+        404,
+        "ResourceNotFoundException",
+        "a store that does not exist",
+    )
+    .await;
+    assert_eq!(
+        body.get("ResourceType").and_then(Value::as_str),
+        Some("IDENTITY_STORE"),
+        "case \"a store that does not exist\": expected the store to be the missing \
+         resource, got {body}"
+    );
 }
 
 #[tokio::test]
@@ -382,18 +377,30 @@ async fn an_identifier_the_service_resolves_no_user_by_is_refused() {
 #[tokio::test]
 async fn resolving_a_user_id_persists_nothing() {
     let router = emulator();
-    // `GetUserId` is `@readonly`, and an identity store springs into being only when a
-    // MUTATING operation names one. So reads of stores that do not exist must leave the
-    // store map empty: afterwards the full `MAX_IDENTITY_STORES` creates still fit.
-    let probe_stores: Vec<String> = (0..identitystore::state::MAX_IDENTITY_STORES + 4)
+    // `GetUserId` is `@readonly`: a read of a store that does not exist must not bring
+    // it into being, so the same read is refused however often it is made and a CREATE
+    // addressed to that store is refused too.
+    let probe_stores: Vec<String> = (0..4)
         .map(|index| format!("d-{:010x}", 0xf000_0000u64 + index as u64))
         .collect();
     for store in &probe_stores {
-        let case = format!("read of {store}");
+        for attempt in 0..2 {
+            let case = format!("read {attempt} of {store}");
+            refused(
+                &router,
+                "GetUserId",
+                get_user_id(store, unique_attribute("userName", json!("nobody"))),
+                404,
+                "ResourceNotFoundException",
+                &case,
+            )
+            .await;
+        }
+        let case = format!("create in {store} after the reads");
         refused(
             &router,
-            "GetUserId",
-            get_user_id(store, unique_attribute("userName", json!("nobody"))),
+            "CreateUser",
+            json!({ "IdentityStoreId": store.clone(), "UserName": "first" }),
             404,
             "ResourceNotFoundException",
             &case,
@@ -401,36 +408,12 @@ async fn resolving_a_user_id_persists_nothing() {
         .await;
     }
 
-    for (index, store) in probe_stores
-        .iter()
-        .take(identitystore::state::MAX_IDENTITY_STORES)
-        .enumerate()
-    {
-        let case = format!("create number {index} after the reads");
-        create_user(&router, store, "first", None, &case).await;
-    }
-
-    // The bound is reached by CREATES alone, which is only true if no read vivified a
-    // store: the store past the cap is refused with the modelled quota error.
-    let case = "one store past the cap";
-    refused(
-        &router,
-        "CreateUser",
-        json!({
-            "IdentityStoreId": probe_stores[identitystore::state::MAX_IDENTITY_STORES].clone(),
-            "UserName": "one-too-many",
-        }),
-        402,
-        "ServiceQuotaExceededException",
-        case,
-    )
-    .await;
-
-    // A SUCCESSFUL read persists nothing either: the user resolved in one of the stores
-    // above still resolves to the same ids, and that store still holds just the one
-    // user — so a resolution neither minted nor touched a record.
-    let store = &probe_stores[0];
+    // A SUCCESSFUL read persists nothing either: the user resolved in the store that
+    // DOES exist still resolves to the same ids, and that store still holds just the
+    // one user — so a resolution neither minted nor touched a record.
+    let store = STORE;
     let case = "a successful read, repeated";
+    create_user(&router, store, "first", None, case).await;
     let resolved = ok(
         &router,
         "GetUserId",
@@ -459,7 +442,7 @@ async fn resolving_a_user_id_persists_nothing() {
     refused(
         &router,
         "CreateUser",
-        json!({ "IdentityStoreId": store.clone(), "UserName": "first" }),
+        json!({ "IdentityStoreId": store, "UserName": "first" }),
         409,
         "ConflictException",
         case,

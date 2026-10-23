@@ -195,20 +195,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(
                 UpdateJobQueueErrorModeled::ServerException(batch::unreachable_state()).into(),
             );
         };
+        let region = batch::request_region(ctx);
         let now = batch::now_millis();
         let mut state = state.lock();
         state.materialize_due(now);
 
         // `jobQueue` is "the name or the Amazon Resource Name (ARN) of the job queue".
         let Some(name) = state.job_queue_name(&input.job_queue) else {
+            // The resolver's refusal names the ARN the identifier resolves to and nothing
+            // else ([`batch::does_not_exist_message`]). The job-queue resolver is recorded
+            // terminating that sentence with a period, which the other resolvers of this
+            // service do not.
             return Err(UpdateJobQueueErrorModeled::ClientException(batch::client_exception(
-                format!("Job queue {} does not exist", input.job_queue),
+                format!(
+                    "{}.",
+                    batch::does_not_exist_message(&batch::resolved_arn(
+                        &input.job_queue,
+                        |queue| batch::job_queue_arn(&region, queue),
+                    ))
+                ),
             ))
             .into());
         };

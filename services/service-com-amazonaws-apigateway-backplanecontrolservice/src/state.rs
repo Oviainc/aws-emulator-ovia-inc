@@ -71,6 +71,9 @@ pub struct RestApiEntry {
     pub stages: BTreeMap<String, StageEntry>,
     /// Every `Deployment` of this API, keyed by deployment id: what a stage points at.
     pub deployments: BTreeMap<String, DeploymentEntry>,
+    /// Every `Authorizer` of this API, keyed by authorizer id — the identifier a
+    /// `Method`'s `authorizerId` names and `GetAuthorizer` takes in its path label.
+    pub authorizers: BTreeMap<String, AuthorizerEntry>,
     /// This API's creation rank, from [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
 }
@@ -216,6 +219,35 @@ pub struct MethodEntry {
     /// Written by `PutIntegration` and reported by `GetIntegration` and a `Method`
     /// body's `methodIntegration`; absent until an integration is put on the method.
     pub integration: Option<GetIntegrationOutput>,
+}
+
+/// One stored `Authorizer` of an API: the custom authorization an API's methods may
+/// name in their `authorizerId`.
+///
+/// `authorizer_result_ttl_in_seconds` is NOT optional here even though the request
+/// member is: the service picks [`DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS`] when the
+/// request sets nothing, so a stored authorizer always has a TTL. Everything else is
+/// kept exactly as the request set it, so a reader reports what was stored rather than a
+/// value invented per read.
+#[derive(Debug, Clone, Default)]
+pub struct AuthorizerEntry {
+    pub id: String,
+    pub name: String,
+    /// One of [`crate::ops::types::AUTHORIZER_TYPE_VALUES`]; the boundary validator
+    /// refuses anything else before a handler runs.
+    pub r#type: String,
+    pub provider_arns: Vec<String>,
+    pub auth_type: Option<String>,
+    pub authorizer_uri: Option<String>,
+    pub authorizer_credentials: Option<String>,
+    pub identity_source: Option<String>,
+    pub identity_validation_expression: Option<String>,
+    /// The TTL in seconds of cached authorizer results; `0` disables caching.
+    pub authorizer_result_ttl_in_seconds: i32,
+    /// This authorizer's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than id order.
+    pub sequence: u64,
 }
 
 /// One stored `ApiKey`: the identifier the control plane assigns, the key value a
@@ -369,6 +401,9 @@ pub const MAX_RESOURCES_PER_API: usize = 300;
 /// API Gateway's default quota "Stages per API: 10".
 pub const MAX_STAGES_PER_API: usize = 10;
 
+/// API Gateway's default quota "Authorizers per API: 10".
+pub const MAX_AUTHORIZERS_PER_API: usize = 10;
+
 /// Emulator resource guard, NOT an AWS quota: the most deployments this emulator keeps
 /// for one API. API Gateway publishes no deployment quota.
 pub const MAX_DEPLOYMENTS_PER_API: usize = 300;
@@ -393,6 +428,18 @@ pub const CACHE_CLUSTER_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 
 /// The `cacheClusterStatus` of a cache cluster that is up.
 pub const CACHE_CLUSTER_AVAILABLE: &str = "AVAILABLE";
+
+/// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If this field
+/// is not set, the default value is 300."
+pub const DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 300;
+
+/// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "If it equals 0,
+/// authorization caching is disabled" — so 0 is the lowest value it takes.
+pub const MIN_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 0;
+
+/// From `Authorizer$authorizerResultTtlInSeconds`'s own documentation: "The maximum
+/// value is 3600, or 1 hour."
+pub const MAX_AUTHORIZER_RESULT_TTL_SECONDS: i32 = 3600;
 
 /// API Gateway's documented resource-policy document size: 8192 characters.
 pub const MAX_POLICY_CHARS: usize = 8192;
@@ -1037,6 +1084,10 @@ pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
+
+/// The `NotFoundException` message for an `authorizerId` that names no stored authorizer
+/// of the API.
+pub const NO_SUCH_AUTHORIZER: &str = "Invalid Authorizer identifier specified";
 
 /// The `target` every audit record this service emits carries, so a consumer can select
 /// the access trail without reading the rest of the emulator's traces.

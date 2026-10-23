@@ -15,6 +15,8 @@
 mod error_payload_construction;
 #[path = "all/list_service_network_service_associations.rs"]
 mod list_service_network_service_associations;
+#[path = "all/listener_conflict_deletion_and_error_shape.rs"]
+mod listener_conflict_deletion_and_error_shape;
 #[path = "all/listeners.rs"]
 mod listeners;
 #[path = "all/referential_integrity_conflict_messages.rs"]

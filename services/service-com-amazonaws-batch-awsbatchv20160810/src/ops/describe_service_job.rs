@@ -181,13 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(DescribeServiceJobErrorModeled::ServerException(
                 batch::unreachable_state(),
             )
             .into());
         };
+        let region = batch::request_region(ctx);
         let now = batch::now_millis();
         let mut state = state.lock();
         // A read: this only materialises what the clock already owed at `now`, so a
@@ -195,8 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         let Some(job) = state.service_jobs.get(&input.job_id) else {
+            // The resolver's refusal: the ARN the requested id resolves to, then
+            // ` does not exist` ([`batch::does_not_exist_message`]). No service job is
+            // stored for it, so the ARN is built from the request.
             return Err(DescribeServiceJobErrorModeled::ClientException(
-                batch::client_exception(format!("Service job {} does not exist", input.job_id)),
+                batch::does_not_exist_exception(&batch::resolved_arn(&input.job_id, |job_id| {
+                    batch::service_job_arn(&region, job_id)
+                })),
             )
             .into());
         };

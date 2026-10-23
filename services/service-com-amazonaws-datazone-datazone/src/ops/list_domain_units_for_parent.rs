@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomainUnitsForParent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomainUnitsForParent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomainUnitsForParent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the domain units stored under one parent unit of one domain, read from
+//! `crate::state`: every unit whose `parent_domain_unit_id` is the parent the request
+//! names, in the store's own (id) order, one `maxResults`-sized page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +120,13 @@ impl From<ListDomainUnitsForParentErrorModeled> for ListDomainUnitsForParentErro
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max 25
+/// on `MaxResultsForListDomains`, smithy_query operation="ListDomainUnitsForParent"). A
+/// request naming no `maxResults` gets the top of the range, and a value is clamped into
+/// it rather than trusted, the way `ListPolicyGrants` does.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 25;
+
 /// The `ListDomainUnitsForParent` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +163,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomainUnitsForParent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainUnitsForParentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomainUnitsForParent"))
+        let _ = ctx;
+        use crate::state::{decode_page_token, encode_page_token, now_ms};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDomainUnitsForParentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DataZone store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: materialise the domain lifecycle
+        // steps the clock already owed at this instant.
+        store.settle_clock(now_ms());
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListDomainUnitsForParentErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+
+        // This operation models no `ResourceNotFoundException`, so neither identifier can
+        // be reported as missing: an unknown domain, and an unknown parent unit within a
+        // stored domain, are both refused as invalid input naming the member to fix —
+        // the same treatment `CreateDomainUnit` gives those same two members. A domain
+        // that is still being deleted is reached here deliberately: it still holds its
+        // units and `GetDomainUnit` still reports them, so the listing agrees with the
+        // reader until the clock removes the domain.
+        let domain = store.domains.get(&input.domain_identifier).ok_or_else(|| {
+            ListDomainUnitsForParentErrorModeled::ValidationException(ValidationException {
+                message: "domainIdentifier does not name a domain in this account".to_string(),
+            })
+        })?;
+        if !domain
+            .domain_units
+            .contains_key(&input.parent_domain_unit_identifier)
+        {
+            return Err(ListDomainUnitsForParentErrorModeled::ValidationException(
+                ValidationException {
+                    message:
+                        "parentDomainUnitIdentifier does not name a domain unit in this domain"
+                            .to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Only the parent's DIRECT children: a grandchild hangs under its own parent, so
+        // it is reported by that parent's call and not by this one. The store keys units
+        // by id in a `BTreeMap`, so this walk has one stable order and a page resumes
+        // exactly after the id the previous page ended on.
+        let children = domain
+            .domain_units
+            .values()
+            .filter(|unit| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| unit.id.as_str() > after)
+            })
+            .filter(|unit| {
+                unit.parent_domain_unit_id.as_deref()
+                    == Some(input.parent_domain_unit_identifier.as_str())
+            });
+
+        let mut items: Vec<DomainUnitSummary> = Vec::new();
+        let mut next_token = None;
+        for unit in children {
+            if items.len() == page_size {
+                // Another child is waiting, so the caller gets the token that resumes
+                // after the last unit this page reported.
+                next_token = items.last().map(|last| encode_page_token(&last.id));
+                break;
+            }
+            items.push(DomainUnitSummary {
+                id: unit.id.clone(),
+                name: unit.name.clone(),
+            });
+        }
+
+        Ok(ListDomainUnitsForParentOutput { items, next_token })
     }
 }

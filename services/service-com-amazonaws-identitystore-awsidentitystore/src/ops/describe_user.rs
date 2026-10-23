@@ -228,17 +228,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it looks the store up rather than vivifying one, so describing a user
         // can never change what a later caller sees.
         let state = state.lock();
-        let not_found = || {
-            DescribeUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                crate::state::ResourceKind::User,
-                &input.user_id,
-            ))
-        };
-        let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
+        // The identity store the request names must exist; one that does not is the
+        // missing resource, reported as `IDENTITY_STORE` rather than as a missing user
+        // of a store that is not there either.
+        let store = state
+            .resolve_store(&input.identity_store_id)
+            .map_err(DescribeUserErrorModeled::ResourceNotFoundException)?;
         let user = store
             .users
             .get(&crate::state::resource_key(&input.user_id))
-            .ok_or_else(not_found)?;
+            .ok_or_else(|| {
+                DescribeUserErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                    crate::state::ResourceKind::User,
+                    &input.user_id,
+                ))
+            })?;
 
         Ok(DescribeUserOutput {
             identity_store_id: store.identity_store_id.clone(),
@@ -259,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             preferred_language: user.preferred_language.clone(),
             locale: user.locale.clone(),
             timezone: user.timezone.clone(),
-            user_status: user.user_status.clone(),
+            user_status: Some(user.user_status.clone()),
             photos: crate::state::modeled_list(&user.photos),
             website: user.website.clone(),
             birthdate: user.birthdate.clone(),

@@ -195,8 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A MemoryDB user name is a case-insensitive identifier the service bounds more
         // tightly than the model's pattern does, so it is checked and folded BEFORE
         // anything is persisted and the folded spelling is what state is keyed by.
-        if let Some(message) = crate::state::resource_name_rejection("UserName", &input.user_name)
-        {
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::User,
+            &input.user_name,
+        ) {
             return Err(CreateUserErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),
@@ -227,7 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.users.contains_key(&user_name) {
             return Err(CreateUserErrorModeled::UserAlreadyExistsFault(
                 UserAlreadyExistsFault {
-                    message: Some(format!("User with name {user_name} already exists.")),
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::ResourceKind::User,
+                        &user_name,
+                    )),
                 },
             )
             .into());

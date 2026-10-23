@@ -151,22 +151,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(DescribeConsumableResourceErrorModeled::ServerException(
                 batch::unreachable_state(),
             )
             .into());
         };
+        let region = batch::request_region(ctx);
         let now = batch::now_millis();
         let mut state = state.lock();
         state.materialize_due(now);
 
         let Some(resource) = state.consumable_resource(&input.consumable_resource) else {
+            // The resolver's own refusal: the ARN the identifier resolves to, then
+            // ` does not exist` ([`batch::does_not_exist_message`]). Nothing is stored
+            // for it, so the ARN is the one this region and account give that name.
             return Err(DescribeConsumableResourceErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Consumable resource {} does not exist",
-                    input.consumable_resource
+                batch::does_not_exist_exception(&batch::resolved_arn(
+                    &input.consumable_resource,
+                    |name| batch::consumable_resource_arn(&region, name),
                 )),
             )
             .into());

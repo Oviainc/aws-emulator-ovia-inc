@@ -152,10 +152,11 @@ fn newest_first(filter: &DocumentClassifierFilter) -> bool {
 }
 
 /// Render the page cursor that resumes after the classifier with creation sequence
-/// `seq`, in whichever direction the page was served. Opaque to the caller: the
-/// sequence number is not a member of any modelled shape.
+/// `seq`, in whichever direction the page was served, through the ONE cursor codec
+/// this service's paging operations share ([`crate::state::encode_page_cursor`]).
+/// Opaque to the caller: the sequence number is not a member of any modelled shape.
 fn encode_token(seq: u64) -> String {
-    hex::encode(seq.to_be_bytes())
+    crate::state::encode_page_cursor(seq)
 }
 
 /// Read back a cursor produced by [`encode_token`]; `None` when the string is not
@@ -163,9 +164,7 @@ fn encode_token(seq: u64) -> String {
 /// this service has minted, so a well-formed string naming no page it ever issued
 /// is refused too.
 fn decode_token(token: &str) -> Option<u64> {
-    let bytes = hex::decode(token).ok()?;
-    let bytes: [u8; 8] = bytes.try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
+    crate::state::decode_page_cursor(token)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

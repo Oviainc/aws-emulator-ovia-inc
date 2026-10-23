@@ -22,22 +22,15 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::identity_store_lifecycle::{
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{
     assert_absent, assert_resource_arn, assert_round_tripped, assert_uuid, create_group,
-    create_user, emulator, ok, refused, string, user_name, MAX_RESULTS_MAX, MAX_RESULTS_MIN,
-    OTHER_STORE, STORE,
+    create_user, user_name, MAX_RESULTS_MAX, MAX_RESULTS_MIN,
 };
 
 /// The bounds of the modelled `UserName` length (1..128), from
 /// `smithy_query(query="shape",shape="User",member="UserName")`.
 const USER_NAME_MAX_LEN: usize = 128;
-
-/// An `IdentityStoreId` for row `index`: the modelled pattern admits `d-[0-9a-f]{10}`
-/// (`smithy_query(query="operation",operation="ListUsers")`), so each row gets its own
-/// store and rows cannot see each other's users.
-fn store_id(index: usize) -> String {
-    format!("d-{index:010x}")
-}
 
 /// One page of `ListUsers`, as the parsed response body.
 async fn list_page(
@@ -142,7 +135,6 @@ fn ids(users: &[Value], case: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn every_created_user_is_listed_once_in_an_order_the_page_size_does_not_change() {
-    let router = emulator();
     // Rows differ along how many users the store holds and the page size asked for,
     // including both published `MaxResults` bounds and an absent `MaxResults` (the
     // model's `@default: 100`). The corpus's two-users-two-pages case is the third row.
@@ -157,9 +149,11 @@ async fn every_created_user_is_listed_once_in_an_order_the_page_size_does_not_ch
     ];
 
     for (index, (case, count, max_results)) in rows.into_iter().enumerate() {
-        let store = store_id(index);
-        // A store with no users still exists once anything was created in it, so the
-        // empty row is a listing of a store that holds a group and no user.
+        // A fresh emulator per row, so rows cannot see each other's users: the identity
+        // store is the one IAM Identity Center provisioned, and a caller cannot make a
+        // second one.
+        let router = emulator();
+        let store = STORE.to_string();
         create_group(&router, &store, &format!("group-{index}"), case).await;
         let mut created: Vec<String> = Vec::new();
         for user in 0..count {
@@ -319,11 +313,23 @@ async fn a_listed_user_is_reported_exactly_as_describe_user_reports_it() {
         let sent = sent.as_object().expect("a row is an object").clone();
         assert_round_tripped(&sent, item, case);
         assert_absent(&sent, item, case);
-        for member in ["Extensions", "ExternalIds", "UserStatus", "CreatedBy", "UpdatedBy"] {
+        // Nothing stored an external id or an extension, so the listing reports
+        // neither. `UserStatus` and `CreatedBy` are NOT in this list: every stored user
+        // has a status (a created one is `ENABLED`) and records the principal that
+        // created it, so both are reported — `assert_eq!` against `DescribeUser` above
+        // already pins that the listing and the describe agree on them.
+        for member in ["Extensions", "ExternalIds", "UpdatedBy"] {
             assert!(
                 item.get(member).is_none(),
                 "case {case:?}: nothing stored {member}, so the listing must not report \
                  it, got {:?}",
+                item.get(member)
+            );
+        }
+        for member in ["UserStatus", "CreatedBy"] {
+            assert!(
+                item.get(member).is_some_and(|value| value.is_string()),
+                "case {case:?}: expected the listing to report {member}, got {:?}",
                 item.get(member)
             );
         }
@@ -432,11 +438,12 @@ async fn an_attribute_path_other_than_user_name_is_refused() {
 }
 
 #[tokio::test]
-async fn an_identity_store_nothing_was_created_in_is_reported_as_not_found() {
+async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
     let router = emulator();
-    // Rows differ along the form of the id of a store this emulator holds no record of.
+    // Rows differ along the form of the id of a store this emulator does not hold.
     for (row_case, store) in [
-        ("a bare id", "d-00ff00ff00".to_string()),
+        ("a bare id", MISSING_STORE.to_string()),
+        ("another bare id", "d-00ff00ff00".to_string()),
         (
             "the store's ARN",
             format!(
@@ -461,21 +468,18 @@ async fn an_identity_store_nothing_was_created_in_is_reported_as_not_found() {
         );
     }
 
-    // A listing is scoped to the store it names: one store's users are never another's.
+    // A listing is scoped to the store it names, and the store that exists lists
+    // exactly its own users.
     let here = create_user(&router, STORE, "alice", "per-store scope").await;
-    let there = create_user(&router, OTHER_STORE, "alice", "per-store scope").await;
-    for (store, mine, theirs) in [(STORE, &here, &there), (OTHER_STORE, &there, &here)] {
-        let listed = ids(
-            &walk_users(&router, store, None, None, "per-store scope").await,
-            "per-store scope",
-        );
-        assert_eq!(
-            listed,
-            vec![mine.clone()],
-            "case \"per-store scope\": expected identity store {store} to list only its own \
-             user, and never {theirs}"
-        );
-    }
+    let listed = ids(
+        &walk_users(&router, STORE, None, None, "per-store scope").await,
+        "per-store scope",
+    );
+    assert_eq!(
+        listed,
+        vec![here],
+        "case \"per-store scope\": expected the provisioned store to list only its own user"
+    );
 }
 
 #[tokio::test]
@@ -485,23 +489,19 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
     for index in 0..3 {
         create_user(&router, STORE, &user_name(case, index), case).await;
     }
-    create_user(&router, OTHER_STORE, &user_name("other store", 0), case).await;
-    create_user(&router, OTHER_STORE, &user_name("other store", 1), case).await;
 
     let first_page = list_page(&router, STORE, Some(MAX_RESULTS_MIN), None, None, case).await;
     let token = string(&first_page, "NextToken", case);
-    let other_store_token = string(
-        &list_page(&router, OTHER_STORE, Some(MAX_RESULTS_MIN), None, None, case).await,
-        "NextToken",
-        case,
-    );
 
     // Rows differ along HOW the token is wrong. Each still satisfies the modelled
     // `NextToken` pattern, so the refusal is this handler's and not the framework's.
     for (row_case, bad_token) in [
         ("not a cursor this service mints", "not-a-cursor".to_string()),
         ("well-formed but naming nothing", "deadbeef".to_string()),
-        ("a cursor for another store's listing", other_store_token),
+        (
+            "a cursor naming a user this listing does not hold",
+            hex::encode(b"0123abcd-4567-89ab-cdef-0123456789ab"),
+        ),
         ("a truncated cursor", token[..token.len() - 2].to_string()),
     ] {
         refused(

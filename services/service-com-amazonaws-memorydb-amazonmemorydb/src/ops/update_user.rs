@@ -174,13 +174,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller's: neither its access string nor its authentication can be changed.
         // The recorded behaviour is explicit for this operation — an `UpdateUser`
         // naming the built-in `default` user answers
-        // `InvalidParameterValueException`, exactly as a `DeleteUser` naming it does.
-        if user_name == crate::state::DEFAULT_USER_NAME {
+        // `InvalidParameterValueException`, exactly as a `DeleteUser` naming it does —
+        // and the refusal is built by the one rule every write path over a built-in
+        // resource reads.
+        if let Some(message) = crate::state::builtin_resource_rejection(
+            crate::state::ResourceKind::User,
+            &user_name,
+            crate::state::Mutation::Modify,
+        ) {
             return Err(UpdateUserErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(format!(
-                        "User {user_name} is a default user and cannot be modified."
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

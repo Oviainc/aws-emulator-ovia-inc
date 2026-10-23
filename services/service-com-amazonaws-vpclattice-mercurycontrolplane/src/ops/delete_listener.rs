@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the listener through its owning service and REMOVES it from
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::listeners`], so a
+//! later `GetListener` of that identifier is the modelled 404 and the name and port it
+//! held are free again.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +111,16 @@ impl From<DeleteListenerErrorModeled> for DeleteListenerError {
     }
 }
 
+/// HTTP 404 for an identifier that names no persisted resource of `kind`, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the kind's resource-type token.
+fn not_found(identifier: &str, kind: crate::state::ResourceKind) -> DeleteListenerError {
+    DeleteListenerErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind, identifier,
+    ))
+    .into()
+}
+
 /// The `DeleteListener` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +157,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteListener"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteListenerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // Both identifiers are modelled as either the bare id or the resource's ARN.
+        let Some(service_id) = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        ) else {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        };
+        let Some(listener_id) = crate::state::id_from_identifier(
+            &input.listener_identifier,
+            crate::state::PREFIX_LISTENER,
+        ) else {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        };
+        let mut store = state.lock();
+        if !store.services.contains_key(&service_id) {
+            return Err(not_found(
+                &input.service_identifier,
+                crate::state::ResourceKind::Service,
+            ));
+        }
+        // A listener is a resource OF its service: one stored under a different service
+        // is not reachable — and so not deletable — through this one, exactly as
+        // `GetListener` reads it.
+        if store
+            .listeners
+            .get(&listener_id)
+            .filter(|listener| listener.service_id == service_id)
+            .is_none()
+        {
+            return Err(not_found(
+                &input.listener_identifier,
+                crate::state::ResourceKind::Listener,
+            ));
+        }
+        // The delete goes through the state's one listener-removal path, so the
+        // listener's rules go with it and the name and port it held are free again.
+        let removed = store.remove_listener(&listener_id);
+        debug_assert!(
+            removed.is_some(),
+            "the listener was just resolved out of this store"
+        );
+        // `DeleteListenerResponse` models no member: the answer is the modelled 204.
+        Ok(DeleteListenerOutput {})
     }
 }
