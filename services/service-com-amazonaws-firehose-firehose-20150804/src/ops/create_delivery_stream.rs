@@ -269,6 +269,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
         )?;
 
+        // Every `RoleARN` the create carries is a role Firehose itself assumes, and it
+        // resolves them against IAM BEFORE the stream exists: a role this account does
+        // not hold, or one that does not trust the Firehose service principal, is an
+        // argument fault, so the stream is never created and a client cannot be handed a
+        // stream that reports healthy and can never deliver.
+        if let Some(message) = crate::state::unassumable_role(ctx, &region, &role_arns(&input)).await
+        {
+            return Err(invalid_argument(message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let arn = ::engine::emulator_arn(
             "firehose",
@@ -361,6 +371,116 @@ fn invalid_argument(message: String) -> CreateDeliveryStreamError {
         message: Some(message),
     })
     .into()
+}
+
+/// Every IAM role ARN the create names, each distinct ARN once.
+///
+/// A Firehose stream carries a role in several places at once — the destination's own
+/// role, the role for the intermediate S3 location and for the S3 backup, the role that
+/// reaches a VPC, the role that reads a Secrets Manager secret, the role that reads the
+/// Glue schema, the role that reads the source — and Firehose assumes every one of them,
+/// so the gate is over all of them rather than over the destination's own role alone.
+/// Each is the modelled `RoleARN` shape, so the boundary validator has already refused
+/// anything that is not shaped like an IAM role ARN by the time this runs.
+fn role_arns(input: &CreateDeliveryStreamInput) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+
+    // The source roles: Firehose reads a Kinesis stream, an MSK cluster or a database
+    // through a role the source configuration names.
+    if let Some(config) = input.kinesis_stream_source_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+    }
+    if let Some(config) = input.msk_source_configuration.as_ref() {
+        found.push(config.authentication_configuration.role_arn.as_str());
+    }
+    if let Some(config) = input.database_source_configuration.as_ref() {
+        found.extend(crate::state::secrets_manager_role(Some(
+            &config
+                .database_source_authentication_configuration
+                .secrets_manager_configuration,
+        )));
+    }
+
+    // The destination roles, one arm per destination the model declares.
+    if let Some(config) = input.s3_destination_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+    }
+    if let Some(config) = input.extended_s3_destination_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+        found.extend(
+            config
+                .s3_backup_configuration
+                .as_ref()
+                .map(|backup| backup.role_arn.as_str()),
+        );
+        found.extend(
+            config
+                .data_format_conversion_configuration
+                .as_ref()
+                .and_then(|conversion| conversion.schema_configuration.as_ref())
+                .and_then(|schema| schema.role_arn.as_deref()),
+        );
+    }
+    if let Some(config) = input.redshift_destination_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(
+            config
+                .s3_backup_configuration
+                .as_ref()
+                .map(|backup| backup.role_arn.as_str()),
+        );
+        found.extend(crate::state::secrets_manager_role(
+            config.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(config) = input.elasticsearch_destination_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(crate::state::vpc_role(config.vpc_configuration.as_ref()));
+    }
+    if let Some(config) = input
+        .amazonopensearchservice_destination_configuration
+        .as_ref()
+    {
+        found.push(config.role_arn.as_str());
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(crate::state::vpc_role(config.vpc_configuration.as_ref()));
+    }
+    if let Some(config) = input.splunk_destination_configuration.as_ref() {
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(crate::state::secrets_manager_role(
+            config.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(config) = input.http_endpoint_destination_configuration.as_ref() {
+        found.extend(config.role_arn.as_deref());
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(crate::state::secrets_manager_role(
+            config.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(config) = input
+        .amazon_open_search_serverless_destination_configuration
+        .as_ref()
+    {
+        found.push(config.role_arn.as_str());
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(crate::state::vpc_role(config.vpc_configuration.as_ref()));
+    }
+    if let Some(config) = input.snowflake_destination_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+        found.push(config.s3_configuration.role_arn.as_str());
+        found.extend(crate::state::secrets_manager_role(
+            config.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(config) = input.iceberg_destination_configuration.as_ref() {
+        found.push(config.role_arn.as_str());
+        found.push(config.s3_configuration.role_arn.as_str());
+    }
+
+    crate::state::distinct_role_arns(found)
 }
 
 /// The one destination configuration the request carries, refusing both none and more

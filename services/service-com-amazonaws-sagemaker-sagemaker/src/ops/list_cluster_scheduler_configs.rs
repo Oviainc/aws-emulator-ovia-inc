@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusterSchedulerConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusterSchedulerConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusterSchedulerConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the cluster policies stored in `crate::state`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +83,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// This resource kind's slice of the service state: its records, quota and statuses.
+use crate::state::cluster_policy as policy;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -140,6 +136,26 @@ impl<Eng> ListClusterSchedulerConfigs<Eng> {
     }
 }
 
+/// `SortBy`'s members, as the model declares `SortClusterSchedulerConfigBy`.
+const SORT_BY_NAME: &str = "Name";
+/// See [`SORT_BY_NAME`].
+const SORT_BY_CREATION_TIME: &str = "CreationTime";
+/// See [`SORT_BY_NAME`].
+const SORT_BY_STATUS: &str = "Status";
+
+// `SortOrder`'s members are `crate::state::ORDER_ASCENDING` and
+// `crate::state::ORDER_DESCENDING`, shared with this service's other listings, so no
+// handler decides a sort direction by comparing a bare string literal.
+//
+// The sort key applied when `SortBy` is absent is `crate::state::DEFAULT_SORT_BY` and
+// the order applied when `SortOrder` is absent is `crate::state::DEFAULT_SORT_ORDER`,
+// shared with this service's other listings: this operation's model documents a default
+// for `SortOrder` ("By default, listed in Descending order according to by SortBy") but
+// none for `SortBy`, so the shared `CreationTime` — newest first — is the service's own
+// choice, the one `ListModels` and `ListEndpoints` document. A page boundary is an
+// opaque `NextToken` minted by `crate::state::encode_page_token`, so every listing here
+// reads one token format.
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListClusterSchedulerConfigs<Eng>
 {
@@ -157,18 +173,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusterSchedulerConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClusterSchedulerConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusterSchedulerConfigs"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `SortBy` and `SortOrder` are modelled enums, so the generated boundary layer
+        // has already refused anything outside them by the time this runs; the checks
+        // below are belt-and-braces, and what they really pin is the DEFAULT each member
+        // takes when the request omits it.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !matches!(sort_by, SORT_BY_NAME | SORT_BY_CREATION_TIME | SORT_BY_STATUS) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {SORT_BY_NAME}, {SORT_BY_CREATION_TIME}, \
+                 {SORT_BY_STATUS}; got \"{sort_by}\"."
+            )));
+        }
+        let descending = match input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER)
+        {
+            crate::state::ORDER_DESCENDING => true,
+            crate::state::ORDER_ASCENDING => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortOrder must be one of {}, {}; got \"{other}\".",
+                    crate::state::ORDER_ASCENDING,
+                    crate::state::ORDER_DESCENDING
+                )))
+            }
+        };
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise every `Creating` -> `Created` transition the clock already owes
+        // BEFORE filtering, so a `Status` filter selects on the status the policy is in
+        // at this instant rather than on a stale one. Each was due whether or not
+        // anybody listed, so this reporting call changes nothing a later caller sees.
+        let settled: Vec<String> = store
+            .cluster_policies
+            .configs
+            .values_mut()
+            .filter_map(|config| config.settle_status(now).then(|| config.arn.clone()))
+            .collect();
+
+        let mut matching: Vec<&policy::Config> = store
+            .cluster_policies
+            .configs
+            .values()
+            .filter(|config| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| config.name.contains(needle))
+            })
+            // `ClusterArn` and `Status` are equality filters: the policies of ONE
+            // cluster, or the ones in one state.
+            .filter(|config| {
+                input
+                    .cluster_arn
+                    .as_deref()
+                    .is_none_or(|wanted| config.cluster_arn == wanted)
+            })
+            .filter(|config| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| config.status == wanted)
+            })
+            .filter(|config| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that policy.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(config.creation_time));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays
+        // `ClusterSchedulerConfigId` ascending in both directions, so two policies
+        // sharing a sort key keep one order whichever way the page is sorted — and a
+        // `NextToken` resolved against a freshly computed result set lands on the same
+        // boundary.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                SORT_BY_NAME => left.name.cmp(&right.name),
+                SORT_BY_STATUS => left.status.cmp(&right.status),
+                _ => crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                ),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.id.cmp(&right.id))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|id| matching.iter().position(|config| config.id == id))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.id)),
+            _ => None,
+        };
+
+        let output = ListClusterSchedulerConfigsOutput {
+            cluster_scheduler_config_summaries: Some(
+                page.iter()
+                    .map(|config| ClusterSchedulerConfigSummary {
+                        cluster_scheduler_config_arn: config.arn.clone(),
+                        cluster_scheduler_config_id: config.id.clone(),
+                        cluster_scheduler_config_version: Some(config.version),
+                        name: config.name.clone(),
+                        creation_time: crate::state::timestamp(config.creation_time),
+                        last_modified_time: Some(crate::state::timestamp(
+                            config.last_modified_time,
+                        )),
+                        status: config.status.clone(),
+                        cluster_arn: Some(config.cluster_arn.clone()),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        };
+        drop(store);
+
+        // Recorded after the guard is dropped, as the create and the describe do: a
+        // transition this call materialised is a state change, and the clock owed it
+        // whether or not anybody listed.
+        for arn in &settled {
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }

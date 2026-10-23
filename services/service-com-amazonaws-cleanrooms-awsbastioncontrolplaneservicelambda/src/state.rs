@@ -15,7 +15,13 @@
 //!   absolute, so there is nothing to derive.
 //!
 //! * the modelled [`ConfiguredTable`] is likewise stored as-is: a configured table is an
-//!   account-level resource, so none of its members describes the caller.
+//!   account-level resource, so none of its members describes the caller. The analysis
+//!   rule a configured table holds is stored the same way, as the modelled
+//!   [`ConfiguredTableAnalysisRule`], keyed by the `(configured table id, analysis rule
+//!   type)` pair the analysis-rule operations address it by; which types a table holds a
+//!   rule for stays on the table, in `ConfiguredTable$analysisRuleTypes`, so
+//!   [`CleanRoomsState::analysis_rule_of_configured_table`] (the record a further create
+//!   collides with) is a lookup rather than a scan.
 //!
 //! Insertion order is kept in `collaboration_order` / `membership_order` /
 //! `configured_table_order` so the list operations page deterministically and a
@@ -47,6 +53,8 @@ use crate::ops::types::{
     AccessBudgetsPrivacyTemplateParametersOutput, ApprovalStatusDetails, Change, ChangeSpecification,
     Collaboration,
     CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration, ConfiguredTable,
+    ConfiguredTableAnalysisRule, ConfiguredTableAnalysisRulePolicy,
+    ConfiguredTableAnalysisRulePolicyV1,
     DataEncryptionMetadata, DifferentialPrivacyTemplateParametersOutput, MLMemberAbilities,
     MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
     MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
@@ -262,6 +270,16 @@ pub const TABLE_TYPE_SNOWFLAKE: &str = "SNOWFLAKE";
 pub const TABLE_TYPE_ATHENA: &str = "ATHENA";
 /// See [`TABLE_TYPE_GLUE`].
 pub const TABLE_TYPE_DATABRICKS: &str = "DATABRICKS";
+
+/// `ConfiguredTableAnalysisRuleType` values (model shape
+/// `ConfiguredTableAnalysisRuleType`: AGGREGATION | LIST | CUSTOM) — the `type` an
+/// analysis rule reports, one per member of the `ConfiguredTableAnalysisRulePolicyV1`
+/// union, which is what makes a type/policy mismatch detectable.
+pub const ANALYSIS_RULE_TYPE_AGGREGATION: &str = "AGGREGATION";
+/// See [`ANALYSIS_RULE_TYPE_AGGREGATION`].
+pub const ANALYSIS_RULE_TYPE_LIST: &str = "LIST";
+/// See [`ANALYSIS_RULE_TYPE_AGGREGATION`].
+pub const ANALYSIS_RULE_TYPE_CUSTOM: &str = "CUSTOM";
 
 /// The smallest `selectedAnalysisMethods` a request may configure.
 ///
@@ -482,6 +500,15 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     pub configured_tables: HashMap<String, ConfiguredTable>,
     /// Configured table ids in creation order — the order the list operation pages in.
     pub configured_table_order: Vec<String>,
+    /// Configured table analysis rules by `(configured table id, analysis rule type)`.
+    ///
+    /// The modelled `ConfiguredTableAnalysisRule` is stored as-is, like the
+    /// [`ConfiguredTable`] it belongs to: every one of its members is absolute. The key
+    /// is the pair the analysis-rule operations address a rule by
+    /// (`/configuredTables/{configuredTableIdentifier}/analysisRule/{analysisRuleType}`),
+    /// so a read is a lookup and not a scan, and which types a table holds a rule for
+    /// stays on the table itself, in `ConfiguredTable$analysisRuleTypes`.
+    pub configured_table_analysis_rules: HashMap<(String, String), ConfiguredTableAnalysisRule>,
     /// Tags by resource ARN, shared by collaboration and membership ARNs so a later
     /// TagResource/ListTagsForResource slice has one place to read and write.
     pub tags: HashMap<String, HashMap<String, String>>,
@@ -647,6 +674,54 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             membership_arn: membership.map(|m| m.arn.clone()),
             analytics_engine: Some(record.analytics_engine.clone()),
         })
+    }
+
+    /// The analysis rule of `analysis_rule_type` stored for configured table
+    /// `configured_table_id`, if any.
+    pub fn configured_table_analysis_rule(
+        &self,
+        configured_table_id: &str,
+        analysis_rule_type: &str,
+    ) -> Option<&ConfiguredTableAnalysisRule> {
+        self.configured_table_analysis_rules
+            .get(&(configured_table_id.to_string(), analysis_rule_type.to_string()))
+    }
+
+    /// The analysis rule configured table `configured_table_id` already holds, if any.
+    ///
+    /// `CreateConfiguredTableAnalysisRule` documents "Currently, only one analysis rule
+    /// can be created for a given configured table", so this is the record a further
+    /// create collides with — whatever type it asks for. Which types the table holds a
+    /// rule for lives on the table itself (`ConfiguredTable$analysisRuleTypes`), so this
+    /// is a lookup rather than a scan of every stored rule.
+    pub fn analysis_rule_of_configured_table(
+        &self,
+        configured_table_id: &str,
+    ) -> Option<&ConfiguredTableAnalysisRule> {
+        let table = self.configured_tables.get(configured_table_id)?;
+        table
+            .analysis_rule_types
+            .iter()
+            .find_map(|rule_type| self.configured_table_analysis_rule(configured_table_id, rule_type))
+    }
+
+    /// Persist `rule` and record its type on the configured table it belongs to.
+    ///
+    /// `ConfiguredTable$analysisRuleTypes` is "The types of analysis rules associated
+    /// with this configured table", so it is maintained here rather than recomputed by
+    /// every reader, and the configured table's `updateTime` moves to the rule's instant
+    /// because that member of it has changed.
+    pub fn insert_configured_table_analysis_rule(&mut self, rule: ConfiguredTableAnalysisRule) {
+        let configured_table_id = rule.configured_table_id.clone();
+        let rule_type = rule.r#type.clone();
+        if let Some(table) = self.configured_tables.get_mut(&configured_table_id) {
+            if !table.analysis_rule_types.contains(&rule_type) {
+                table.analysis_rule_types.push(rule_type.clone());
+            }
+            table.update_time = rule.update_time;
+        }
+        self.configured_table_analysis_rules
+            .insert((configured_table_id, rule_type), rule);
     }
 
     /// The privacy budget template `collaboration_id` holds, if any.
@@ -1172,6 +1247,22 @@ pub fn table_reference_type(reference: &TableReference) -> &'static str {
         TableReference::Snowflake(_) => TABLE_TYPE_SNOWFLAKE,
         TableReference::Athena(_) => TABLE_TYPE_ATHENA,
         TableReference::Databricks(_) => TABLE_TYPE_DATABRICKS,
+    }
+}
+
+/// The `ConfiguredTableAnalysisRuleType` a `ConfiguredTableAnalysisRulePolicy` carries:
+/// each member of the `ConfiguredTableAnalysisRulePolicyV1` union is the policy of
+/// exactly one rule type, so the pair is what makes a `analysisRuleType` naming another
+/// type detectable.
+pub fn configured_table_analysis_rule_policy_type(
+    policy: &ConfiguredTableAnalysisRulePolicy,
+) -> &'static str {
+    match policy {
+        ConfiguredTableAnalysisRulePolicy::V1(v1) => match v1 {
+            ConfiguredTableAnalysisRulePolicyV1::Aggregation(_) => ANALYSIS_RULE_TYPE_AGGREGATION,
+            ConfiguredTableAnalysisRulePolicyV1::List(_) => ANALYSIS_RULE_TYPE_LIST,
+            ConfiguredTableAnalysisRulePolicyV1::Custom(_) => ANALYSIS_RULE_TYPE_CUSTOM,
+        },
     }
 }
 

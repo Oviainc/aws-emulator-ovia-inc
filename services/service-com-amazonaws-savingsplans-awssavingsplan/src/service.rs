@@ -40,10 +40,55 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::envelope;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: its
+/// own modelled `ValidationException`, which the model declares with
+/// `@httpError 400`
+/// (`smithy_query(query="shape",shape="ValidationException")`). It is also the
+/// code the framework picks for a boundary refusal on restJson1, restated here
+/// because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The object this service roots a refused member's path at.
+///
+/// A savingsplans constraint-violation clause names the member path from the
+/// REQUEST OBJECT inwards — `originalRequest.<member>` — not from the member
+/// alone, so a caller parsing the clause to locate the offending member reads
+/// that prefix. Recorded behaviour of the live service, which no model records
+/// (fixture `savingsplans-tagging-error-paths-unknown-resource`: a malformed
+/// `resourceArn` is refused with `… at 'originalRequest.resourceArn' …`) — and
+/// exactly the kind of per-service wording `override_refusal` exists for.
+const REQUEST_ROOT: &str = "originalRequest";
+
+/// `violations` with every member path rooted at [`REQUEST_ROOT`].
+///
+/// ONLY the path is restated. The envelope, the requirement sentence and the
+/// echoed value stay the framework's own (`Violation::message` plus
+/// `aws_smithy_schema_server::envelope`), so this service cannot drift from the
+/// others in anything but the one thing it words differently. In particular a
+/// `@pattern` requirement keeps the model's expression VERBATIM, anchors and
+/// all, which is how savingsplans quotes it — so this deliberately does not
+/// delegate to `services/common`'s `aws_validation_refusal`, which quotes a
+/// wrapping `^…$` pair unanchored for the services that do that.
+fn rooted_at_request(violations: &[Violation]) -> Vec<Violation> {
+    violations
+        .iter()
+        .map(|violation| Violation {
+            path: if violation.path.is_empty() {
+                REQUEST_ROOT.to_owned()
+            } else {
+                format!("{REQUEST_ROOT}.{}", violation.path)
+            },
+            kind: violation.kind.clone(),
+            value: violation.value.clone(),
+        })
+        .collect()
+}
 
 /// The `com-amazonaws-savingsplans-awssavingsplan` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +143,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // savingsplans states the member path rooted at the request object —
+        // `originalRequest.<member>` — for EVERY constraint class and every
+        // operation, because that root is a property of the service's validator
+        // and not of one member. The code stays the modelled
+        // `ValidationException` (HTTP 400), which is what the framework would
+        // have answered, so only the path changes; a refusal that is not a
+        // constraint violation (an unauthenticated caller) keeps the
+        // framework's own code and wording.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_owned(),
+                message: envelope(&rooted_at_request(violations))?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

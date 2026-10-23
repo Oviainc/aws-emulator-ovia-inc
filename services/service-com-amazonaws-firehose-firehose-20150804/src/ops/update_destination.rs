@@ -210,12 +210,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "UpdateDestination",
             ));
         };
-        let _ = ctx;
 
         // Exactly as on the create path, the request carries ONE destination: the model
         // offers one `*DestinationUpdate` member per destination type and a destination has
         // exactly one type.
         let update = sole_update(&input)?;
+
+        // And exactly as on the create path, every `RoleARN` the update names is a role
+        // Firehose assumes, resolved against IAM before anything is written: an update
+        // that moves a destination onto a role Firehose cannot assume is an argument
+        // fault, not a destination that silently stops delivering.
+        let region = crate::state::request_region(ctx);
+        if let Some(message) = crate::state::unassumable_role(ctx, &region, &role_arns(&input)).await
+        {
+            return Err(invalid_argument(message));
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -302,6 +311,91 @@ fn invalid_argument(message: String) -> UpdateDestinationError {
         message: Some(message),
     })
     .into()
+}
+
+/// Every IAM role ARN the update names, each distinct ARN once.
+///
+/// The same rule as the create path's collection, over this operation's own
+/// `*DestinationUpdate` shapes: a role Firehose assumes is a role Firehose resolves,
+/// whichever member of whichever operation carried it. An update member that names no
+/// role contributes none — an update changes only what it carries, so a role it leaves
+/// alone was already resolved when it was written.
+fn role_arns(input: &UpdateDestinationInput) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+
+    if let Some(update) = input.s3_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+    }
+    if let Some(update) = input.extended_s3_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_backup_update.as_ref()));
+        found.extend(
+            update
+                .data_format_conversion_configuration
+                .as_ref()
+                .and_then(|conversion| conversion.schema_configuration.as_ref())
+                .and_then(|schema| schema.role_arn.as_deref()),
+        );
+    }
+    if let Some(update) = input.redshift_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+        found.extend(s3_update_role(update.s3_backup_update.as_ref()));
+        found.extend(crate::state::secrets_manager_role(
+            update.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(update) = input.elasticsearch_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.amazonopensearchservice_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.splunk_destination_update.as_ref() {
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+        found.extend(crate::state::secrets_manager_role(
+            update.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(update) = input.http_endpoint_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+        found.extend(crate::state::secrets_manager_role(
+            update.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(update) = input
+        .amazon_open_search_serverless_destination_update
+        .as_ref()
+    {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.snowflake_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(s3_update_role(update.s3_update.as_ref()));
+        found.extend(crate::state::secrets_manager_role(
+            update.secrets_manager_configuration.as_ref(),
+        ));
+    }
+    if let Some(update) = input.iceberg_destination_update.as_ref() {
+        found.extend(update.role_arn.as_deref());
+        found.extend(
+            update
+                .s3_configuration
+                .as_ref()
+                .map(|config| config.role_arn.as_str()),
+        );
+    }
+
+    crate::state::distinct_role_arns(found)
+}
+
+/// The role a nested `S3DestinationUpdate` names, when it names one.
+fn s3_update_role(update: Option<&S3DestinationUpdate>) -> Option<&str> {
+    update.and_then(|s3| s3.role_arn.as_deref())
 }
 
 /// Whether `supplied` names the stream's current version.

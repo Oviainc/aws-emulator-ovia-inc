@@ -186,8 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags: Vec<(String, ResourceTag)> = {
             let store = state.lock();
             let stored = store.exports.get(&input.resource_arn).ok_or_else(|| {
-                ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    crate::state::export_not_found(&input.resource_arn),
+                crate::state::tagged_resource_not_found_error(
+                    &input.resource_arn,
+                    ListTagsForResourceErrorModeled::ResourceNotFoundException,
                 )
             })?;
             crate::state::tag_list(&stored.tags)

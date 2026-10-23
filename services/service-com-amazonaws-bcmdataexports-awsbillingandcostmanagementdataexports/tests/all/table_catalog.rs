@@ -24,9 +24,9 @@ use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
     TablePropertySpec, TableSpec, PROPERTY_ANY_VALUE, PROPERTY_FALSE,
-    PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
-    PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
-    PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE, TABLE_CATALOG,
+    PROPERTY_INCLUDE_ALL_RECOMMENDATIONS, PROPERTY_INCLUDE_RESOURCES,
+    PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA, PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE,
+    TABLE_CATALOG,
 };
 
 use super::export_lifecycle::{error_code, Client};
@@ -50,7 +50,20 @@ const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 const FREE_FORM_VALUES: &[&str] = &["{}", "arn:aws:billing::123456789012:billingview/primary"];
 
 /// One request's `TableProperties`, as `(property, value)` pairs.
-type Properties = Vec<(&'static str, &'static str)>;
+///
+/// Owned strings rather than `&'static str`: a published value is not always fixed text
+/// — a billing-view-valued property publishes an ARN, which carries the account id.
+type Properties = Vec<(String, String)>;
+
+/// `pairs` as one request's [`Properties`].
+fn props(pairs: &[(&str, &str)]) -> Option<Properties> {
+    Some(
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect(),
+    )
+}
 
 /// The values a row sets `property` to: the ones the catalog publishes for it, or — for
 /// a free-form property — [`FREE_FORM_VALUES`].
@@ -69,7 +82,7 @@ fn property_requests(table: &TableSpec) -> Vec<Option<Properties>> {
     let mut requests: Vec<Option<Properties>> = vec![None, Some(Vec::new())];
     for property in table.properties {
         for value in exercised_values(property) {
-            requests.push(Some(vec![(property.name, *value)]));
+            requests.push(Some(vec![(property.name.to_string(), (*value).to_string())]));
         }
     }
     let mut combinations: Vec<Properties> = vec![Vec::new()];
@@ -78,7 +91,7 @@ fn property_requests(table: &TableSpec) -> Vec<Option<Properties>> {
         for combination in &combinations {
             for value in exercised_values(property) {
                 let mut row = combination.clone();
-                row.push((property.name, *value));
+                row.push((property.name.to_string(), (*value).to_string()));
                 extended.push(row);
             }
         }
@@ -108,12 +121,12 @@ fn expected_properties(
         // force only for a request that names it.
         .filter_map(|property| {
             property
-                .default_value
+                .default_value()
                 .map(|default| (property.name.to_string(), default.to_string()))
         })
         .collect();
     for (name, value) in requested.into_iter().flatten() {
-        effective.insert((*name).to_string(), (*value).to_string());
+        effective.insert(name.clone(), value.clone());
     }
     effective
 }
@@ -140,7 +153,7 @@ fn request_body(table: &str, requested: Option<&Properties>) -> Value {
         Some(pairs) => {
             let mut map = Map::new();
             for (name, value) in pairs {
-                map.insert((*name).to_string(), Value::String((*value).to_string()));
+                map.insert(name.clone(), Value::String(value.clone()));
             }
             json!({ "TableName": table, "TableProperties": Value::Object(map) })
         }
@@ -324,16 +337,37 @@ async fn published_columns_are_reported_with_their_published_types() {
     }
 }
 
-/// The default of every `COST_AND_USAGE_REPORT` table property (AWS Data Exports table
-/// dictionary), which a request naming no property must report.
+/// The default of every `COST_AND_USAGE_REPORT` table property except the billing view
+/// (AWS Data Exports table dictionary), which a request naming no property must report.
+/// The billing view's default is the ACCOUNT's primary billing view, so it carries the
+/// account id and is added by [`cost_and_usage_report_defaults`] instead of being pinned
+/// as text here.
 const COST_AND_USAGE_REPORT_DEFAULTS: &[(&str, &str)] = &[
-    ("BILLING_VIEW_ARN", ""),
     ("INCLUDE_CAPACITY_RESERVATION_DATA", "FALSE"),
     ("INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY", "FALSE"),
     ("INCLUDE_RESOURCES", "FALSE"),
     ("INCLUDE_SPLIT_COST_ALLOCATION_DATA", "FALSE"),
     ("TIME_GRANULARITY", "HOURLY"),
 ];
+
+/// The ARN of the account's PRIMARY billing view,
+/// `arn:aws:billing::<account>:billingview/primary`: the value `BILLING_VIEW_ARN` assumes
+/// when a request does not name a billing view. Built through `engine::emulator_arn`, so
+/// no account id is pinned in this suite.
+fn primary_billing_view() -> String {
+    engine::emulator_arn("billing", "", "billingview/primary")
+}
+
+/// Every `COST_AND_USAGE_REPORT` property default: the literal rows above plus the
+/// billing view's account-derived one.
+fn cost_and_usage_report_defaults() -> BTreeMap<String, String> {
+    let mut expected: BTreeMap<String, String> = COST_AND_USAGE_REPORT_DEFAULTS
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    expected.insert("BILLING_VIEW_ARN".to_string(), primary_billing_view());
+    expected
+}
 
 #[tokio::test]
 async fn a_request_naming_no_property_reports_the_published_defaults() {
@@ -343,10 +377,7 @@ async fn a_request_naming_no_property_reports_the_published_defaults() {
         .ok("GetTable", &json!({ "TableName": COST_AND_USAGE_REPORT }))
         .await;
     let reported = reported_properties("defaults", &body);
-    let expected: BTreeMap<String, String> = COST_AND_USAGE_REPORT_DEFAULTS
-        .iter()
-        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-        .collect();
+    let expected = cost_and_usage_report_defaults();
     assert_eq!(
         reported, expected,
         "case \"defaults\": expected the published defaults {expected:?}, got {reported:?}"
@@ -358,7 +389,7 @@ async fn a_request_naming_no_property_reports_the_published_defaults() {
         .await;
     assert_eq!(
         reported_properties("one property", &carbon),
-        BTreeMap::from([("BILLING_VIEW_ARN".to_string(), String::new())]),
+        BTreeMap::from([("BILLING_VIEW_ARN".to_string(), primary_billing_view())]),
         "case \"one property\": {CARBON_EMISSIONS} publishes the billing view property alone, got {carbon}"
     );
 }
@@ -500,55 +531,55 @@ fn refusals() -> Vec<Refusal> {
         Refusal {
             label: "a property no table publishes",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![("NOT_A_PROPERTY", PROPERTY_TRUE)]),
+            properties: props(&[("NOT_A_PROPERTY", PROPERTY_TRUE)]),
             field: "TableProperties",
         },
         Refusal {
             label: "a property another table publishes",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![(PROPERTY_INCLUDE_ALL_RECOMMENDATIONS, PROPERTY_TRUE)]),
+            properties: props(&[(PROPERTY_INCLUDE_ALL_RECOMMENDATIONS, PROPERTY_TRUE)]),
             field: "TableProperties",
         },
         Refusal {
             label: "a cost and usage property on the carbon emissions table",
             table: CARBON_EMISSIONS,
-            properties: Some(vec![(PROPERTY_INCLUDE_RESOURCES, PROPERTY_TRUE)]),
+            properties: props(&[(PROPERTY_INCLUDE_RESOURCES, PROPERTY_TRUE)]),
             field: "TableProperties",
         },
         Refusal {
             label: "a cost and usage property on a FOCUS table",
             table: FOCUS_1_0_AWS,
-            properties: Some(vec![(PROPERTY_INCLUDE_RESOURCES, PROPERTY_TRUE)]),
+            properties: props(&[(PROPERTY_INCLUDE_RESOURCES, PROPERTY_TRUE)]),
             field: "TableProperties",
         },
         Refusal {
             label: "a value outside a boolean property's valid values",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![(PROPERTY_INCLUDE_RESOURCES, "MAYBE")]),
+            properties: props(&[(PROPERTY_INCLUDE_RESOURCES, "MAYBE")]),
             field: "TableProperties",
         },
         Refusal {
             label: "a valid value in the wrong case",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![(PROPERTY_INCLUDE_RESOURCES, "true")]),
+            properties: props(&[(PROPERTY_INCLUDE_RESOURCES, "true")]),
             field: "TableProperties",
         },
         Refusal {
             label: "an empty property value",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![(PROPERTY_TIME_GRANULARITY, "")]),
+            properties: props(&[(PROPERTY_TIME_GRANULARITY, "")]),
             field: "TableProperties",
         },
         Refusal {
             label: "a granularity outside the published values",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![(PROPERTY_TIME_GRANULARITY, "WEEKLY")]),
+            properties: props(&[(PROPERTY_TIME_GRANULARITY, "WEEKLY")]),
             field: "TableProperties",
         },
         Refusal {
             label: "one valid property beside one invalid value",
             table: COST_AND_USAGE_REPORT,
-            properties: Some(vec![
+            properties: props(&[
                 (PROPERTY_INCLUDE_RESOURCES, PROPERTY_FALSE),
                 (PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA, "YES"),
             ]),
@@ -557,7 +588,7 @@ fn refusals() -> Vec<Refusal> {
         Refusal {
             label: "a property the recommendations table does not publish",
             table: COST_OPTIMIZATION_RECOMMENDATIONS,
-            properties: Some(vec![(PROPERTY_TIME_GRANULARITY, "DAILY")]),
+            properties: props(&[(PROPERTY_TIME_GRANULARITY, "DAILY")]),
             field: "TableProperties",
         },
     ]

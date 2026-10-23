@@ -153,9 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let stored = store.exports.get(&input.export_arn).ok_or_else(|| {
-            GetExportErrorModeled::ResourceNotFoundException(crate::state::export_not_found(
+            crate::state::export_not_found_error(
                 &input.export_arn,
-            ))
+                GetExportErrorModeled::ResourceNotFoundException,
+            )
         })?;
 
         Ok(GetExportOutput {

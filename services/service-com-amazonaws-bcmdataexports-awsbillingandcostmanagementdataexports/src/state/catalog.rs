@@ -109,6 +109,60 @@ pub const PROPERTY_FILTER: &str = "FILTER";
 /// than only the top one per resource.
 pub const PROPERTY_INCLUDE_ALL_RECOMMENDATIONS: &str = "INCLUDE_ALL_RECOMMENDATIONS";
 
+/// The value a table property assumes when a request does not name it.
+///
+/// A default is not always a fixed string: one of them names a RESOURCE OF THE ACCOUNT,
+/// so it is built from the account id rather than written as a literal — which is why this
+/// is an enum and not a `&'static str`. The catalog states WHICH default a property
+/// publishes; [`PropertyDefault::value`] is the one place each one is resolved.
+#[derive(Debug, Clone, Copy)]
+pub enum PropertyDefault {
+    /// A fixed value, the same for every account.
+    Literal(&'static str),
+    /// The ACCOUNT's primary billing view — see [`primary_billing_view_arn`].
+    PrimaryBillingView,
+    /// The catalog publishes NO default for this property: it assumes nothing, so it is
+    /// in force only for a request that names it and a request that does not name it
+    /// reports no value for it at all.
+    Unset,
+}
+
+impl PropertyDefault {
+    /// The value this default resolves to, or `None` for [`Self::Unset`].
+    pub fn value(self) -> Option<&'static str> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::PrimaryBillingView => Some(primary_billing_view_arn()),
+            Self::Unset => None,
+        }
+    }
+}
+
+/// The ARN of the account's PRIMARY billing view:
+/// `arn:aws:billing::<account>:billingview/primary`.
+///
+/// Every account has one — the view over the whole of its billing data — and it is what
+/// an export's billing view is scoped to when the definition names none: RECORDED AWS
+/// behaviour, where an export created without a `BILLING_VIEW_ARN` table property is read
+/// back carrying this ARN. The billing view is a resource of the ACCOUNT, so it is built
+/// through `engine::emulator_arn` (account segment = the one canonical emulator account,
+/// no region segment, as a billing view ARN is global) rather than written as a literal.
+/// Built once and kept, because the catalog hands out `&'static str` values.
+pub fn primary_billing_view_arn() -> &'static str {
+    static ARN: ::std::sync::OnceLock<String> = ::std::sync::OnceLock::new();
+    ARN.get_or_init(|| {
+        ::engine::emulator_arn(BILLING_VIEW_ARN_SERVICE, "", PRIMARY_BILLING_VIEW_RESOURCE)
+    })
+    .as_str()
+}
+
+/// The service segment of a billing view ARN: the billing service owns billing views,
+/// not data exports.
+const BILLING_VIEW_ARN_SERVICE: &str = "billing";
+
+/// The resource segment of the primary billing view's ARN.
+const PRIMARY_BILLING_VIEW_RESOURCE: &str = "billingview/primary";
+
 /// One table property of one table: its name, the values it accepts, and the value a
 /// request that does not name it assumes.
 ///
@@ -122,11 +176,10 @@ pub struct TablePropertySpec {
     /// [`PROPERTY_ANY_VALUE`] for a free-form property that publishes one, and empty for
     /// a free-form property the catalog publishes no list for. See [`Self::accepts`].
     pub valid_values: &'static [&'static str],
-    /// The value the property takes when a request does not name it, or `None` for a
-    /// property the catalog publishes NO default for: such a property is in force only
-    /// for a request that names it, so a request that does not name it reports no value
-    /// for it at all.
-    pub default_value: Option<&'static str>,
+    /// Which default the catalog publishes for this property — read through
+    /// [`Self::default_value`], never directly, so an account-derived default is resolved
+    /// in one place.
+    pub published_default: PropertyDefault,
     /// What the property changes about the table's data or schema.
     pub description: &'static str,
 }
@@ -140,6 +193,12 @@ impl TablePropertySpec {
         self.valid_values.is_empty()
             || self.valid_values.contains(&PROPERTY_ANY_VALUE)
             || self.valid_values.contains(&value)
+    }
+
+    /// The value this property takes when a request does not name it, or `None` for a
+    /// property the catalog publishes no default for.
+    pub fn default_value(&self) -> Option<&'static str> {
+        self.published_default.value()
     }
 }
 
@@ -305,7 +364,7 @@ impl TableSpec {
             .iter()
             .filter_map(|property| {
                 property
-                    .default_value
+                    .default_value()
                     .map(|default| (property.name.to_string(), default.to_string()))
             })
             .collect();
@@ -426,20 +485,20 @@ const COST_AND_USAGE_REPORT_PROPERTIES: &[TablePropertySpec] = &[
     TablePropertySpec {
         name: PROPERTY_INCLUDE_CAPACITY_RESERVATION_DATA,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: Some(PROPERTY_FALSE),
+        published_default: PropertyDefault::Literal(PROPERTY_FALSE),
         description: "Whether to include capacity reservation data.",
     },
     BILLING_VIEW_ARN_PROPERTY,
     TablePropertySpec {
         name: PROPERTY_INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: Some(PROPERTY_FALSE),
+        published_default: PropertyDefault::Literal(PROPERTY_FALSE),
         description: "Whether to simulate manual discounts for automated discount data.",
     },
     TablePropertySpec {
         name: PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: Some(PROPERTY_FALSE),
+        published_default: PropertyDefault::Literal(PROPERTY_FALSE),
         description: "Whether to include fission columns.",
     },
     TablePropertySpec {
@@ -447,13 +506,13 @@ const COST_AND_USAGE_REPORT_PROPERTIES: &[TablePropertySpec] = &[
         valid_values: BOOLEAN_PROPERTY_VALUES,
         // The catalog publishes NO default for this property: it is in force only for a
         // request that names it, so a request that names none reports no value for it.
-        default_value: None,
+        published_default: PropertyDefault::Unset,
         description: "Whether IAM principal columns should be included or not.",
     },
     TablePropertySpec {
         name: PROPERTY_INCLUDE_RESOURCES,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: Some(PROPERTY_FALSE),
+        published_default: PropertyDefault::Literal(PROPERTY_FALSE),
         description: "Whether to include resource IDs on line items.",
     },
 ];
@@ -464,7 +523,7 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_PROPERTIES: &[TablePropertySpec] = &[
     TablePropertySpec {
         name: PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
         valid_values: BOOLEAN_PROPERTY_VALUES,
-        default_value: Some(PROPERTY_FALSE),
+        published_default: PropertyDefault::Literal(PROPERTY_FALSE),
         description: "List of all recommendations for a resource, or a single recommendation if de-duped by resourceId.",
     },
     TablePropertySpec {
@@ -474,7 +533,7 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_PROPERTIES: &[TablePropertySpec] = &[
         // a client validating against the published list has to see that any value is
         // legal. The default is the empty filter: every row.
         valid_values: WILDCARD_PROPERTY_VALUES,
-        default_value: Some("{}"),
+        published_default: PropertyDefault::Literal("{}"),
         description: "The constraints that you want all returned recommendations to match. Expressed as a json of AWS Cost Optimization Hub's Filter SDK object. See COST_OPTIMIZATION_RECOMMENDATIONS table documentation for further details.",
     },
 ];
@@ -491,7 +550,7 @@ const FOCUS_PREVIEW_PROPERTIES: &[TablePropertySpec] = &[TablePropertySpec {
     // The only value this property takes for a preview table the catalog publishes as
     // deprecated: there is no configuration of it that is not deprecated.
     valid_values: &[PROPERTY_TRUE],
-    default_value: Some(PROPERTY_TRUE),
+    published_default: PropertyDefault::Literal(PROPERTY_TRUE),
     description: "This table has been deprecated. New exports for this table are no longer supported.",
 }];
 
@@ -507,11 +566,11 @@ const BILLING_VIEW_ONLY_PROPERTIES: &[TablePropertySpec] = &[BILLING_VIEW_ARN_PR
 const BILLING_VIEW_ARN_PROPERTY: TablePropertySpec = TablePropertySpec {
     name: PROPERTY_BILLING_VIEW_ARN,
     // Free-form: the value is a billing view ARN the caller owns, not a value the
-    // catalog can enumerate, and the catalog publishes no list for it at all. The
-    // default is the empty string: no billing view, so the table covers the whole of the
-    // account's data.
+    // catalog can enumerate. The default is the ACCOUNT's primary billing view — the view
+    // over the whole of its billing data — so a table a definition does not scope is
+    // scoped to that, which is what a reader of the definition reports.
     valid_values: FREE_FORM_PROPERTY_VALUES,
-    default_value: Some(""),
+    published_default: PropertyDefault::PrimaryBillingView,
     description: "The arn of the billing conductor group that this CUR2.0/ FOCUS Data Export is for.",
 };
 
@@ -520,7 +579,7 @@ const BILLING_VIEW_ARN_PROPERTY: TablePropertySpec = TablePropertySpec {
 const TIME_GRANULARITY_PROPERTY: TablePropertySpec = TablePropertySpec {
     name: PROPERTY_TIME_GRANULARITY,
     valid_values: &["DAILY", "MONTHLY", "HOURLY"],
-    default_value: Some("HOURLY"),
+    published_default: PropertyDefault::Literal("HOURLY"),
     description: "The granularity of the line-items in the table.",
 };
 

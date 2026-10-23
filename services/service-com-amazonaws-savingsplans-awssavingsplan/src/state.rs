@@ -444,20 +444,39 @@ pub fn savings_plan_arn(savings_plan_id: &str) -> String {
     )
 }
 
+/// Whether an ARN's partition field names an AWS partition.
+///
+/// The partition group of the `SavingsPlanArn` pattern is `aws([-a-z]*)?`, so
+/// `aws` and every suffixed partition — `aws-cn`, `aws-us-gov`, `aws-iso-b` —
+/// are all admitted, and this mirrors that group rather than naming the
+/// partitions one by one: a new partition is a new suffix, not a new rule.
+///
+/// The checked-in model used to carry a narrower `^arn:aws:` for that group,
+/// which refused a China or GovCloud plan ARN at the boundary validator. The
+/// live service accepts those and QUOTES the partition-tolerant expression in
+/// its own `ValidationException` (fixture
+/// `savingsplans-tagging-error-paths-unknown-resource`), so the model's pattern
+/// was corrected to the one AWS enforces and states.
+fn is_aws_partition(field: &str) -> bool {
+    match field.strip_prefix("aws") {
+        Some(suffix) => suffix.chars().all(|ch| ch == '-' || ch.is_ascii_lowercase()),
+        None => false,
+    }
+}
+
 /// The Savings Plan id inside a `SavingsPlanArn`, or `None` when the ARN names
 /// some other service or some other resource type.
 ///
 /// The model's `@pattern` already refused anything that is not ARN-shaped
 /// before the handler ran, so this only has to reject a well-formed ARN that is
-/// not one of ours. The partition is matched as `aws` because the model's own
-/// `SavingsPlanArn` pattern starts `^arn:aws:` — the boundary validator refuses
-/// `aws-cn` and `aws-us-gov` before a handler sees them, so matching a wider
-/// set here would be unreachable.
+/// not one of ours — which the partition never makes it: an ARN in any AWS
+/// partition is a Savings Plan ARN, and whether a plan with it exists is a
+/// question for the store (a 404), not for the shape of the ARN (a 400).
 pub fn savings_plan_id_from_arn(arn: &str) -> Option<&str> {
     let mut fields = arn.splitn(6, ':');
     let (
         Some("arn"),
-        Some("aws"),
+        Some(partition),
         Some(SERVICE_NAMESPACE),
         Some(_region),
         Some(_account),
@@ -473,7 +492,21 @@ pub fn savings_plan_id_from_arn(arn: &str) -> Option<&str> {
     else {
         return None;
     };
+    if !is_aws_partition(partition) {
+        return None;
+    }
     resource.strip_prefix("savingsplan/")
+}
+
+/// How this service states that the resource an operation was pointed at does
+/// not exist.
+///
+/// AWS builds this message FROM THE REQUEST, naming the `resourceArn` the
+/// caller sent — `Resource with resourceArn: <arn> doesn't exist` — so the
+/// template is part of the contract and lives in ONE place, shared by every
+/// operation that takes a `resourceArn`.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource with resourceArn: {resource_arn} doesn't exist")
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +935,18 @@ impl SavingsPlanRecord {
         check_tags(&merged)?;
         self.tags = merged;
         Ok(())
+    }
+
+    /// Remove the named tags from this plan, ignoring a key it does not carry.
+    ///
+    /// `UntagResource` states the keys the resource must END UP without, so a key
+    /// that was never there is already in the state the caller asked for: an
+    /// absent key is not an error, which is what makes a retried untag safe.
+    /// Nothing here can break [`check_tags`] — removal only shrinks the set.
+    pub fn remove_tags<'a>(&mut self, tag_keys: impl IntoIterator<Item = &'a str>) {
+        for key in tag_keys {
+            self.tags.remove(key);
+        }
     }
 
     /// Whether a `SavingsPlanFilter` admits this plan. `name` is a

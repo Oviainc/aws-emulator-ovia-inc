@@ -3,9 +3,10 @@
 //! @op CreateExport
 //!
 //! Persists a new data export and returns the ARN minted for it. The submitted `Export`
-//! is stored verbatim beside a fresh `ExportStatus` and the request's `ResourceTags`, so
-//! `GetExport`, `ListExports` and `ListTagsForResource` read back exactly what was
-//! created.
+//! is stored beside a fresh `ExportStatus` and the request's `ResourceTags` — with its
+//! `DataQuery` validated against the table catalog and normalised to the table
+//! configuration in force, the way the service reports it — so `GetExport`,
+//! `ListExports` and `ListTagsForResource` read back exactly what the service stored.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -210,6 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )?;
 
+        // The definition is stored with the table configuration IN FORCE for the tables
+        // it names: a property the request did not name takes the value the table
+        // publishes as its default, which is what every later reader reports.
+        let mut export = input.export;
+        export.data_query.table_configurations =
+            crate::state::effective_table_configurations(&export.data_query).map_err(
+                |refusal| match refusal {
+                    crate::state::QueryRefusal::Invalid(invalid) => {
+                        CreateExportErrorModeled::ValidationException(invalid)
+                    }
+                    crate::state::QueryRefusal::Internal(fault) => {
+                        CreateExportErrorModeled::InternalServerException(fault)
+                    }
+                },
+            )?;
         let created_at = crate::state::now();
 
         let mut store = state.lock();
@@ -222,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateExportErrorModeled::ValidationException(ValidationException {
                 message: format!(
                     "An export named {} already exists; export names must be unique.",
-                    input.export.name
+                    export.name
                 ),
                 reason: Some("fieldValidationFailed".to_string()),
                 fields: Some(vec![ValidationExceptionField {
@@ -257,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The ARN is server-assigned: whatever the request carried in
                 // `Export.ExportArn` is not this export's identity.
                 export_arn: Some(arn.clone()),
-                ..input.export
+                ..export
             },
             status: crate::state::fresh_status(created_at),
             tags,

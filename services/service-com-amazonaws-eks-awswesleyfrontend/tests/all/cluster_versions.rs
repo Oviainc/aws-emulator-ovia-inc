@@ -101,14 +101,19 @@ fn now_secs() -> f64 {
 }
 
 /// The support status the RULE gives for a row with these dates at `now`,
-/// as the `(versionStatus, status)` pair the two modelled enums spell it with.
+/// as the `(versionStatus, status)` pair the response reports.
+///
+/// Both reported members carry the CURRENT (`VersionStatus`) spelling: `status`
+/// "is deprecated. Use `versionStatus` instead, as that field matches for input
+/// and output of this action", so the deprecated member's output tokens are not
+/// the `ClusterVersionStatus` tokens its own filter accepts.
 fn expected_status(now: f64, end_of_standard: f64, end_of_extended: f64) -> (&'static str, &'static str) {
     if now < end_of_standard {
-        ("STANDARD_SUPPORT", "standard-support")
+        ("STANDARD_SUPPORT", "STANDARD_SUPPORT")
     } else if now < end_of_extended {
-        ("EXTENDED_SUPPORT", "extended-support")
+        ("EXTENDED_SUPPORT", "EXTENDED_SUPPORT")
     } else {
-        ("UNSUPPORTED", "unsupported")
+        ("UNSUPPORTED", "UNSUPPORTED")
     }
 }
 
@@ -327,10 +332,10 @@ async fn support_status_is_derived_from_the_clock() {
 
     // (row, expected versionStatus, expected deprecated status, reported at all)
     let cases = [
-        ("2.10", "UNSUPPORTED", "unsupported", true),
-        ("2.11", "EXTENDED_SUPPORT", "extended-support", true),
-        ("2.12", "STANDARD_SUPPORT", "standard-support", true),
-        ("2.13", "STANDARD_SUPPORT", "standard-support", false),
+        ("2.10", "UNSUPPORTED", "UNSUPPORTED", true),
+        ("2.11", "EXTENDED_SUPPORT", "EXTENDED_SUPPORT", true),
+        ("2.12", "STANDARD_SUPPORT", "STANDARD_SUPPORT", true),
+        ("2.13", "STANDARD_SUPPORT", "STANDARD_SUPPORT", false),
     ];
 
     let answer = describe_versions(&router, "").await;

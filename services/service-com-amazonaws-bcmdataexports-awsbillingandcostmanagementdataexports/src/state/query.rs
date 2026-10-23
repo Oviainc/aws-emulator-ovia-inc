@@ -52,7 +52,7 @@
 //! Beside them, [`MAX_QUERY_RELATIONS`] bounds the catalog work the resolved relations
 //! cause.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::visit_relations;
@@ -327,6 +327,61 @@ pub fn validate_data_query(
     Ok(())
 }
 
+/// The modelled `TableConfigurations` map: for each table name, that table's properties
+/// by name — the shape `DataQuery$TableConfigurations` carries (smithy_query shape
+/// `DataQuery`, member `TableConfigurations`).
+pub type TableConfigurations = HashMap<String, HashMap<String, String>>;
+
+/// The `TableConfigurations` an export definition is STORED with: for every table the
+/// query names, and every table the request configures, each table property that table
+/// publishes — at the requested value where the request names it and at the published
+/// default otherwise.
+///
+/// RECORDED AWS behaviour: a reader gets the export's EFFECTIVE table configuration. The
+/// recorded `GetExport` for a created export reports the queried table's property set
+/// filled in, not only the properties the create happened to name — the same rule
+/// `GetTable` already applies to a table request ("Each table property has a default
+/// value that it assumes if not specified" — the modelled doc for
+/// `GetTableRequest$TableProperties`). The effective configuration is therefore what the
+/// definition is STORED with, so every later reader reports it and a definition read back
+/// through `GetExport` and handed straight to `UpdateExport` keeps those properties
+/// (which is also what satisfies [`validate_data_query`]'s restatement rule for such a
+/// round trip).
+///
+/// `None` when no table the definition names publishes any property — there is no
+/// configuration to report then ("tables are not required to have any TableProperties" —
+/// the modelled doc for `CreateExport`).
+///
+/// Called AFTER [`validate_data_query`], whose refusals it repeats rather than hides: a
+/// table outside the catalog, a property the table does not publish, or a value outside
+/// the property's published values is the modelled 400 either way.
+pub fn effective_table_configurations(
+    query: &DataQuery,
+) -> Result<Option<TableConfigurations>, QueryRefusal> {
+    let requested = query.table_configurations.as_ref();
+    // The tables the statement reads, plus any table the request configures on its own:
+    // a configuration for a table the statement does not name is still the caller's, and
+    // its table and properties are still checked and reported.
+    let mut tables: BTreeSet<String> = query_tables(&query.query_statement)?
+        .into_iter()
+        .collect();
+    for table in requested.into_iter().flatten().map(|(name, _)| name) {
+        tables.insert(table.clone());
+    }
+
+    let mut effective: TableConfigurations = HashMap::new();
+    for table in &tables {
+        let spec = table_spec(table).ok_or_else(|| invalid_query_table(table))?;
+        let properties =
+            spec.effective_properties(requested.and_then(|configured| configured.get(table)))?;
+        if properties.is_empty() {
+            continue;
+        }
+        effective.insert(table.clone(), properties.into_iter().collect());
+    }
+    Ok((!effective.is_empty()).then_some(effective))
+}
+
 /// The modelled 400 for a `QueryStatement` that is not readable SQL.
 fn unreadable_query(statement: &str) -> ValidationException {
     ValidationException {
@@ -390,11 +445,13 @@ fn too_many_relations() -> ValidationException {
 
 /// The modelled 400 for a `QueryStatement` naming a table outside the catalog.
 ///
-/// The sentence names the offending table, which is the only part of the request the
-/// caller has to change; the table it must be one of is what `ListTables` reports.
+/// The sentence is built from the request and names the offending table, which is the
+/// only part of the request the caller has to change; the table it must be one of is what
+/// `ListTables` reports. RECORDED AWS wording for that rule: `Table name <name> is
+/// invalid`.
 fn invalid_query_table(table: &str) -> ValidationException {
     ValidationException {
-        message: format!("Table {} is invalid", clip_for_message(table)),
+        message: format!("Table name {} is invalid", clip_for_message(table)),
         reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: QUERY_STATEMENT_FIELD.to_string(),

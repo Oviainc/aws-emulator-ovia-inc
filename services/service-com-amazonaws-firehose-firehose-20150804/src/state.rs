@@ -27,8 +27,8 @@ use crate::ops::types::{
     DeliveryStreamEncryptionConfigurationInput, ElasticsearchDestinationConfiguration,
     ExtendedS3DestinationConfiguration, HttpEndpointDestinationConfiguration,
     IcebergDestinationConfiguration, ProcessingConfiguration, RedshiftDestinationConfiguration,
-    S3DestinationConfiguration, SnowflakeDestinationConfiguration, SourceDescription,
-    SplunkDestinationConfiguration, KEY_TYPE_VALUES,
+    S3DestinationConfiguration, SecretsManagerConfiguration, SnowflakeDestinationConfiguration,
+    SourceDescription, SplunkDestinationConfiguration, VpcConfiguration, KEY_TYPE_VALUES,
 };
 
 /// How long after the starting call a clock-owed stream transition
@@ -100,6 +100,13 @@ pub const DEFAULT_KEY_TYPE: &str = "AWS_OWNED_CMK";
 /// enable SSE for a Firehose stream only if it's a Firehose stream that uses DirectPut as
 /// its source" (`StartDeliveryStreamEncryption`).
 pub const DIRECT_PUT_STREAM_TYPE: &str = "DirectPut";
+
+/// The IAM service principal Firehose assumes a configuration's `RoleARN` as.
+///
+/// Every `RoleARN` a Firehose stream carries is a role Firehose itself assumes — to write
+/// to the destination, to read the source, to reach a VPC, to read a secret — so one
+/// principal answers for all of them.
+pub const FIREHOSE_SERVICE_PRINCIPAL: &str = "firehose.amazonaws.com";
 
 /// The modelled `ProcessorType` values that make up Firehose's CloudWatch Logs
 /// decompression pipeline: `Decompression`, which inflates the gzip payload CloudWatch
@@ -621,7 +628,7 @@ pub fn check_encryption_configuration_input(
     match (requested.key_type.as_str(), requested.key_arn.as_ref()) {
         ("CUSTOMER_MANAGED_CMK", None) => {
             return Err(EncryptionConfigRefusal::InvalidArgument(
-                "KeyARN is required when KeyType is CUSTOMER_MANAGED_CMK".to_string(),
+                "KeyARN has to be specified when KeyType is CUSTOMER_MANAGED_CMK".to_string(),
             ))
         }
         ("AWS_OWNED_CMK", Some(_)) => {
@@ -652,6 +659,144 @@ pub fn check_encryption_configuration_input(
         }
     }
     Ok(())
+}
+
+/// The first role of `role_arns` Firehose cannot assume, worded as the refusal states it.
+///
+/// Firehose does not take a configuration's `RoleARN` on trust: it assumes the role when
+/// the stream is written — not when a record is delivered — so a role this account does
+/// not hold, or one whose trust policy does not let the Firehose service principal assume
+/// it, is an ARGUMENT fault and the stream is never created. Every `RoleARN` the request
+/// carries is resolved, whichever configuration (destination, source, VPC, secret,
+/// schema) named it: they are all roles Firehose itself assumes.
+///
+/// IAM is reached the way any emulated service reaches another: through the in-process
+/// callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate names
+/// no other service crate. Nothing is refused that could not be grounded in IAM's own
+/// answer — with no IAM mounted to ask, nothing is known about the role and the request
+/// proceeds (worth a warning, because that is a deployment where this gate does not run).
+pub async fn unassumable_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arns: &[&str],
+) -> Option<String> {
+    let iam = iam_client(ctx, region);
+    for role_arn in role_arns {
+        // A value that names no role of THIS account cannot be assumed, and that is
+        // settled without asking IAM: there is nothing of this account to ask about. The
+        // reading is the one every service resolving a caller-supplied role shares
+        // (`service_common::iam_role`).
+        let Some(role_name) = ::service_common::iam_role::role_name(role_arn) else {
+            return Some(crate::service::unassumable_role_message(role_arn));
+        };
+        match iam.get_role().role_name(role_name).send().await {
+            Ok(output) => {
+                let trusted = output
+                    .role()
+                    .and_then(::aws_sdk_iam::types::Role::assume_role_policy_document)
+                    .is_some_and(trust_policy_admits);
+                if !trusted {
+                    return Some(crate::service::unassumable_role_message(role_arn));
+                }
+            }
+            // IAM says this account holds no such role: the refusal is grounded.
+            Err(error) if role_is_absent(&error) => {
+                return Some(crate::service::unassumable_role_message(role_arn))
+            }
+            // Any other answer is this emulator failing to ask, not IAM reporting a bad
+            // role, so it refuses nothing.
+            Err(error) => ::tracing::warn!(
+                %role_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the configuration's role could not be resolved against IAM"
+            ),
+        }
+    }
+    None
+}
+
+/// The IAM client this service resolves a role through: the AWS SDK driven over the
+/// emulator's own in-process transport.
+fn iam_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_iam::Client {
+    let config = ::aws_sdk_iam::Config::builder()
+        .behavior_version(::aws_sdk_iam::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_iam::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://iam.{region}.amazonaws.com"))
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_iam::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_iam::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_iam::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_iam::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_iam::Client::from_conf(config)
+}
+
+/// Whether an IAM trust-policy document lets Firehose assume the role.
+///
+/// The rule is IAM's, not this service's, so it is read through the ONE evaluator every
+/// service that resolves a caller-supplied role shares
+/// (`service_common::iam_trust_policy`): a statement is about the call when it names the
+/// principal and the assume-role action, an explicit `Deny` wins over any `Allow`, and the
+/// document is percent-decoded before it is parsed.
+///
+/// A document this emulator cannot read as a policy is not one Firehose can act on, so it
+/// does not admit the assume: the role was resolved and carries no grant this can read.
+fn trust_policy_admits(document: &str) -> bool {
+    ::service_common::iam_trust_policy::admits_service_principal(
+        document,
+        FIREHOSE_SERVICE_PRINCIPAL,
+    )
+    .unwrap_or(false)
+}
+
+/// Whether an IAM `GetRole` failure is IAM reporting that the role does not exist
+/// (`NoSuchEntity`), as opposed to the call not reaching IAM at all.
+fn role_is_absent(
+    error: &::aws_sdk_iam::error::SdkError<
+        ::aws_sdk_iam::operation::get_role::GetRoleError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception)
+}
+
+/// `role_arns` with the empty entries dropped and each distinct ARN kept once, so one
+/// role named by two members of a configuration is resolved against IAM once.
+#[must_use]
+pub fn distinct_role_arns(role_arns: Vec<&str>) -> Vec<&str> {
+    let mut distinct: Vec<&str> = Vec::with_capacity(role_arns.len());
+    for role_arn in role_arns {
+        if !role_arn.is_empty() && !distinct.contains(&role_arn) {
+            distinct.push(role_arn);
+        }
+    }
+    distinct
+}
+
+/// The role a `SecretsManagerConfiguration` names, when it names one.
+///
+/// Beside [`distinct_role_arns`] because the create and the update paths both read this
+/// shape out of their own input, and both resolve the role it names.
+#[must_use]
+pub fn secrets_manager_role(config: Option<&SecretsManagerConfiguration>) -> Option<&str> {
+    config.and_then(|secret| secret.role_arn.as_deref())
+}
+
+/// The role a `VpcConfiguration` names — the role Firehose reaches a VPC destination
+/// with, which it assumes exactly like the destination's own.
+#[must_use]
+pub fn vpc_role(config: Option<&VpcConfiguration>) -> Option<&str> {
+    config.map(|vpc| vpc.role_arn.as_str())
 }
 
 /// The Region a request was signed for, which is the Region a minted ARN names.

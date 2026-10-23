@@ -65,7 +65,7 @@ fn configurations_for(table: &str) -> Value {
     let mut properties = Map::new();
     if let Some(property) = spec.properties.first() {
         let value = property
-            .default_value
+            .default_value()
             .or_else(|| property.valid_values.first().copied())
             .unwrap_or("");
         properties.insert(property.name.to_string(), json!(value));
@@ -182,7 +182,7 @@ async fn a_create_accepts_only_a_query_over_published_tables() {
         );
         assert_eq!(
             body["Message"].as_str(),
-            Some(format!("Table {offending} is invalid").as_str()),
+            Some(format!("Table name {offending} is invalid").as_str()),
             "case {label:?}: the refusal must name the offending table, got {body}"
         );
         assert_eq!(
@@ -252,7 +252,7 @@ async fn a_create_accepts_only_a_query_over_published_tables() {
         );
         assert_eq!(
             body["Message"].as_str(),
-            Some(format!("Table {qualified} is invalid").as_str()),
+            Some(format!("Table name {qualified} is invalid").as_str()),
             "case {qualified:?}: the refusal must name the qualified relation, got {body}"
         );
     }
@@ -262,7 +262,7 @@ async fn a_create_accepts_only_a_query_over_published_tables() {
     // and not by the request. 64 is the bound; 64 distinct names are accepted as far as
     // the catalog check, which then refuses the first unpublished one.
     for (label, count, expected_message) in [
-        ("at the relation bound", 64, "Table t0 is invalid".to_string()),
+        ("at the relation bound", 64, "Table name t0 is invalid".to_string()),
         (
             "one past the relation bound",
             65,
@@ -298,7 +298,7 @@ async fn a_create_accepts_only_a_query_over_published_tables() {
         (
             "at the nesting bound",
             32,
-            "Table COST_AND_USAGE_REPORT_DEEP is invalid".to_string(),
+            "Table name COST_AND_USAGE_REPORT_DEEP is invalid".to_string(),
         ),
         (
             "one past the nesting bound",
@@ -348,7 +348,7 @@ async fn a_create_accepts_only_a_query_over_published_tables() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str(), body["Message"].as_str()),
-        (400, "ValidationException", Some("Table t is invalid")),
+        (400, "ValidationException", Some("Table name t is invalid")),
         "a CTE name is not a published table, got {status} with {body}"
     );
 
@@ -518,7 +518,7 @@ async fn an_update_must_restate_the_table_configurations_it_overwrites() {
         );
         assert_eq!(
             body["Message"].as_str(),
-            Some("Table NOT_A_REAL_TABLE_XYZ is invalid"),
+            Some("Table name NOT_A_REAL_TABLE_XYZ is invalid"),
             "case {name:?}: the refusal must name the offending table, got {body}"
         );
     }
