@@ -368,24 +368,25 @@ fn is_log_group_name_pattern_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '/' | '#')
 }
 
-/// The `LogGroupNameRegexPattern` `@pattern` as the service RENDERS it in a refusal:
-/// the modelled expression with its `^` / `$` anchors stripped. The message states the
-/// member's modelled constraint, so this is the modelled expression itself — including
-/// the per-alternative 24-character maximum the service accepts values past, which the
-/// emulator therefore does not enforce (see [`check_log_group_name_pattern`]).
-pub const LOG_GROUP_NAME_PATTERN_UNANCHORED: &str =
-    r"(\^?[\.\-_\/#A-Za-z0-9]{3,24})(\|\^?[\.\-_\/#A-Za-z0-9]{3,24}){0,4}";
+/// The `LogGroupNameRegexPattern` `@pattern` as the service states it in a refusal: the
+/// modelled expression itself, anchors included — the one pattern-rendering rule this
+/// service words every constraint refusal with, stated on `requirement` in
+/// `crate::service`. It includes the per-alternative 24-character maximum the service
+/// accepts values past, which the emulator therefore does not enforce (see
+/// [`check_log_group_name_pattern`]).
+pub const LOG_GROUP_NAME_REGEX_PATTERN: &str =
+    r"^(\^?[\.\-_\/#A-Za-z0-9]{3,24})(\|\^?[\.\-_\/#A-Za-z0-9]{3,24}){0,4}$";
 
 /// One refused member, worded on the template CloudWatch Logs words a constraint
 /// violation with: "N validation error detected: Value at '<member>' failed to satisfy
 /// constraint: <constraint>". The template is built from the request — the member that
-/// broke a constraint, and that member's modelled constraint — and carries NEITHER the
-/// submitted value nor a `@pattern`'s anchors.
+/// broke a constraint, and that member's modelled constraint — and carries NOTHING of the
+/// submitted value.
+///
+/// Delegates to `crate::service`, which owns that template for every refusal of this
+/// service, so a violation a handler finds and one the boundary walk finds read alike.
 pub fn validation_message(member: &str, constraint: &str) -> String {
-    format!(
-        "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
-         {constraint}"
-    )
+    crate::service::one_violation_message(member, constraint)
 }
 
 /// Judge a `logGroupNamePattern` — the member `ListLogGroups` and
@@ -434,7 +435,7 @@ pub fn check_log_group_name_pattern(pattern: &str) -> Result<(), String> {
         if !shaped {
             return refuse(format!(
                 "Member must satisfy regular expression pattern: \
-                 {LOG_GROUP_NAME_PATTERN_UNANCHORED}"
+                 {LOG_GROUP_NAME_REGEX_PATTERN}"
             ));
         }
     }

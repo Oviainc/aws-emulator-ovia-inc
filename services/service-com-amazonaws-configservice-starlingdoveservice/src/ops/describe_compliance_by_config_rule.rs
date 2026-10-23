@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeComplianceByConfigRuleErrorModeled::NoSuchConfigRuleException(
                         NoSuchConfigRuleException {
-                            message: Some(crate::state::no_such_config_rule_message(name)),
+                            message: Some(crate::state::NO_SUCH_CONFIG_RULES.to_string()),
                         },
                     )
                     .into(),
