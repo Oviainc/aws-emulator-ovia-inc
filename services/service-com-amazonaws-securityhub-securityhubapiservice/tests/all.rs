@@ -15,6 +15,9 @@
 // that list, and a suite declared here conflicts with none of them.
 #[path = "all/insight_lifecycle.rs"]
 mod insight_lifecycle;
+// Declared here for the same reason: a new suite conflicts with no other change.
+#[path = "all/member_deletion.rs"]
+mod member_deletion;
 #[path = "all/action_targets.rs"]
 mod action_targets;
 #[path = "all/automation_rules.rs"]
