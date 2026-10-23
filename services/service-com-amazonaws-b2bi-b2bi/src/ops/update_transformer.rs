@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTransformer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTransformer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies the members this request names to the stored transformer, leaving every member
+//! it omits as it was, stamps `modifiedAt`, and answers with the STORED record — so a
+//! later `GetTransformer` cannot disagree with the update.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTransformer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Partial update: only the members present in the request are written, which is what the
+//! model's own wording asks for ("Specify a new name for the transformer, if you want to
+//! update it", "To update, specify the InputConversion object").
+//!
+//! Two requests are refused instead of stored, both decided AFTER the record is resolved
+//! (so an unknown `transformerId` is answered for the missing resource) and before
+//! anything is written:
+//!
+//! * one naming BOTH the model's `@deprecated` configuration members and the members that
+//!   replace them — the same `ValidationException` rule `CreateTransformer` enforces, and
+//!   like there it is stated over the REQUEST, since nothing recorded says the service
+//!   refuses an update whose merge with the stored record spans the two styles;
+//! * one rewriting the configuration of a transformer that is currently `active` — the
+//!   modelled `ConflictException`, see [`active_configuration_is_immutable`]. `name` and
+//!   `status` are not configuration, so they stay updatable in either status, which is
+//!   what lets a caller toggle a transformer between `active` and `inactive`.
 //!
 //! ## Shape of an operation
 //!
@@ -183,6 +194,115 @@ impl From<UpdateTransformerErrorModeled> for UpdateTransformerError {
     }
 }
 
+/// Which of [`crate::ops::create_transformer::LEGACY_MEMBERS`] — the members this
+/// service's model marks `@deprecated` — this request names.
+fn legacy_members_present(input: &UpdateTransformerInput) -> Vec<&'static str> {
+    [
+        ("ediType", input.edi_type.is_some()),
+        ("fileFormat", input.file_format.is_some()),
+        ("mappingTemplate", input.mapping_template.is_some()),
+        ("sampleDocument", input.sample_document.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(member, _)| member)
+    .collect()
+}
+
+/// Which of [`crate::ops::create_transformer::CURRENT_MEMBERS`] — the members that
+/// replace the deprecated ones — this request names.
+fn current_members_present(input: &UpdateTransformerInput) -> Vec<&'static str> {
+    [
+        ("inputConversion", input.input_conversion.is_some()),
+        ("mapping", input.mapping.is_some()),
+        ("outputConversion", input.output_conversion.is_some()),
+        ("sampleDocuments", input.sample_documents.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, present)| *present)
+    .map(|(member, _)| member)
+    .collect()
+}
+
+/// The modelled refusal for a request that configures the transformer in BOTH styles at
+/// once — the same rule `CreateTransformer` enforces, stated over the same two member
+/// lists: the deprecated members and the ones that replace them describe one conversion
+/// two ways, so a record written from both would be ambiguous.
+///
+/// The HTTP status (400) and the error code (`ValidationException`) are the requirement;
+/// the message is built from the REQUEST — it names the members this caller sent in each
+/// style — so a caller can fix the request from the text alone.
+fn mixed_configuration_styles(
+    legacy: &[&'static str],
+    current: &[&'static str],
+) -> UpdateTransformerError {
+    UpdateTransformerErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "A transformer must be configured with the fields {} or with the legacy fields \
+             {}, not both: this request specifies {} and {}",
+            crate::ops::create_transformer::CURRENT_MEMBERS.join(", "),
+            crate::ops::create_transformer::LEGACY_MEMBERS.join(", "),
+            current.join(", "),
+            legacy.join(", "),
+        ),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request that rewrites the CONFIGURATION of a transformer
+/// that is currently `active`: the record's state forbids the change, so the request
+/// conflicts with the resource rather than being malformed — the modelled
+/// `ConflictException` (HTTP 409).
+///
+/// Source: the recorded AWS behaviour this issue's corpus carries for
+/// `b2bi.update-transformer-immutable-fields-once-active-rejected` — a transformer's
+/// configuration members are immutable once it is active — together with the model's own
+/// error set for this operation, which lists `ConflictException` as its only
+/// resource-state failure (`smithy_query(query="operation",operation="UpdateTransformer")`).
+/// The status and the code are the requirement; the message is built from the REQUEST, so
+/// it names the members this caller tried to rewrite and the status that refused them, and
+/// `status` / `name` are untouched by this rule: a caller deactivates the transformer,
+/// rewrites the configuration, and activates it again.
+fn active_configuration_is_immutable(
+    transformer_id: &str,
+    members: &[&'static str],
+) -> UpdateTransformerError {
+    UpdateTransformerErrorModeled::ConflictException(ConflictException {
+        message: format!(
+            "Transformer with transformerId {transformer_id} is {}: the fields {} cannot be \
+             updated until its status is {}",
+            crate::state::TRANSFORMER_STATUS_ACTIVE,
+            members.join(", "),
+            crate::state::TRANSFORMER_STATUS_INACTIVE,
+        ),
+    })
+    .into()
+}
+
+/// The response for the stored transformer — every member read back off the record, so
+/// the update and a later `GetTransformer` cannot disagree.
+///
+/// `modifiedAt` is a REQUIRED output member and this operation has just stamped it, so it
+/// is taken from the record; the fallback to `createdAt` only keeps the function total.
+fn stored_transformer_response(transformer: &crate::state::Transformer) -> UpdateTransformerOutput {
+    UpdateTransformerOutput {
+        transformer_id: transformer.transformer_id.clone(),
+        transformer_arn: transformer.transformer_arn.clone(),
+        name: transformer.name.clone(),
+        status: transformer.status.clone(),
+        created_at: transformer.created_at,
+        modified_at: transformer.modified_at.unwrap_or(transformer.created_at),
+        file_format: transformer.file_format.clone(),
+        mapping_template: transformer.mapping_template.clone(),
+        edi_type: transformer.edi_type.clone(),
+        sample_document: transformer.sample_document.clone(),
+        input_conversion: transformer.input_conversion.clone(),
+        mapping: transformer.mapping.clone(),
+        output_conversion: transformer.output_conversion.clone(),
+        sample_documents: transformer.sample_documents.clone(),
+    }
+}
+
 /// The `UpdateTransformer` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -219,18 +339,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTransformer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTransformerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTransformer"))
+        // The ARN and the id are the create's, so this request's signing region is not
+        // read: an update never re-mints either.
+        let _ = ctx;
+
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateTransformerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        let Some(transformer) = state.transformers.get_mut(&input.transformer_id) else {
+            return Err(UpdateTransformerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::transformer_not_found(&input.transformer_id),
+                },
+            )
+            .into());
+        };
+
+        // One configuration style per request, and a configuration a transformer in this
+        // status will accept: both are checked AFTER the record is resolved, so a request
+        // against an id this account does not hold is answered for the missing resource
+        // rather than for a member it also got wrong, and before anything is written, so
+        // a refused update changes nothing.
+        let legacy = legacy_members_present(&input);
+        let current = current_members_present(&input);
+        if !legacy.is_empty() && !current.is_empty() {
+            return Err(mixed_configuration_styles(&legacy, &current));
+        }
+
+        // A transformer's CONFIGURATION is immutable while it is active: the stored
+        // status, not the request, is what decides, so a caller deactivates it first.
+        // `name` and `status` themselves stay updatable in either status.
+        if transformer.status == crate::state::TRANSFORMER_STATUS_ACTIVE {
+            let configuration: Vec<&'static str> =
+                legacy.iter().chain(current.iter()).copied().collect();
+            if !configuration.is_empty() {
+                return Err(active_configuration_is_immutable(
+                    &input.transformer_id,
+                    &configuration,
+                ));
+            }
+        }
+
+        // Every member the request names is written; one it omits keeps its stored value.
+        if let Some(name) = input.name {
+            transformer.name = name;
+        }
+        if let Some(status) = input.status {
+            transformer.status = status;
+        }
+        if let Some(file_format) = input.file_format {
+            transformer.file_format = Some(file_format);
+        }
+        if let Some(mapping_template) = input.mapping_template {
+            transformer.mapping_template = Some(mapping_template);
+        }
+        if let Some(edi_type) = input.edi_type {
+            transformer.edi_type = Some(edi_type);
+        }
+        if let Some(sample_document) = input.sample_document {
+            transformer.sample_document = Some(sample_document);
+        }
+        if let Some(input_conversion) = input.input_conversion {
+            transformer.input_conversion = Some(input_conversion);
+        }
+        if let Some(mapping) = input.mapping {
+            transformer.mapping = Some(mapping);
+        }
+        if let Some(output_conversion) = input.output_conversion {
+            transformer.output_conversion = Some(output_conversion);
+        }
+        if let Some(sample_documents) = input.sample_documents {
+            transformer.sample_documents = Some(sample_documents);
+        }
+        transformer.modified_at = Some(crate::state::now());
+
+        Ok(stored_transformer_response(transformer))
     }
 }
