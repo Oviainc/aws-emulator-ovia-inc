@@ -194,13 +194,16 @@ fn seed_recommendations_job(
         .inference_recommendations_jobs
         .insert(
             name.to_string(),
-            sm::InferenceRecommendationsJob {
-                name: name.to_string(),
-                arn: sm::resource_arn(REGION, "inference-recommendations-job", name),
-                status: "COMPLETED".to_string(),
+            // The create path mints a job with no measured recommendation (nothing
+            // benchmarks one here), so a seeded record is built through the state
+            // slice's own constructor for a job whose results the store was given.
+            sm::InferenceRecommendationsJob::seeded(
+                name.to_string(),
+                sm::resource_arn(REGION, "inference-recommendations-job", name),
+                "COMPLETED".to_string(),
                 recommendations,
-                creation_time: SystemTime::now(),
-            },
+                SystemTime::now(),
+            ),
         );
 }
 

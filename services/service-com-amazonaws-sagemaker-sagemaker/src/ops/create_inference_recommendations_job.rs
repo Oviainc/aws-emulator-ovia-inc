@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInferenceRecommendationsJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInferenceRecommendationsJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: registers an Inference Recommender job in `crate::state` under its
+//! `JobName`, minting the `JobArn` from the request's region, after refusing the request
+//! shapes the model's prose rules out and the resources this service does not hold. The
+//! job is accepted in `PENDING`; the move out of it is owed by the clock
+//! (`crate::state::InferenceRecommendationsJob::settle_status`) and materialised by
+//! `DescribeInferenceRecommendationsJob`. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInferenceRecommendationsJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! No benchmark is RUN: this emulator serves no model inference container and generates
+//! no load, so the run ends in the modelled `FAILED` status with
+//! `crate::state::NO_INFERENCE_BENCHMARK_REASON` and no recommendation metrics are
+//! invented; see that constant for why nothing else would be honest. Everything around
+//! the run - accepting, validating, minting the ARN, replaying the job - is real.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +171,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInferenceRecommendationsJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInferenceRecommendationsJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInferenceRecommendationsJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The rules the model states in prose rather than in a constraint trait, so the
+        // centralized validation walk cannot have refused them already.
+        validate_input_config(&input.input_config)?;
+
+        let region = crate::state::request_region(ctx);
+        let arn =
+            crate::state::resource_arn(&region, "inference-recommendations-job", &input.job_name);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `JobName`'s doc: "The name must be unique within the Amazon Web Services Region
+        // and within your Amazon Web Services account." A name already in use is refused
+        // with the modelled `ResourceInUse`, never overwritten: otherwise the caller reads
+        // a 200 for a job it did not create and loses the one it did. Checked before the
+        // store's bound, so the per-name rule answers the same whatever the store holds.
+        if store.inference_recommendations_jobs.contains_key(&input.job_name) {
+            return Err(CreateInferenceRecommendationsJobErrorModeled::ResourceInUse(
+                ResourceInUse {
+                    message: Some(format!(
+                        "Inference recommendations job names must be unique within an Amazon \
+                         Web Services account and Region, and \"{}\" already exists.",
+                        input.job_name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The store is bounded, so a caller varying `JobName` cannot grow it without end.
+        // `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.inference_recommendations_jobs_below_quota() {
+            return Err(CreateInferenceRecommendationsJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for inference recommendations jobs \
+                         is {}, with current utilization of {} and a request delta of 1.",
+                        crate::state::INFERENCE_RECOMMENDATIONS_JOB_QUOTA,
+                        store.inference_recommendations_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // A job benchmarks resources the account already holds, so one naming a model or
+        // an endpoint this service does not hold is refused here rather than accepted and
+        // failed later, the way `CreateEndpoint` refuses an unknown endpoint
+        // configuration. `ModelPackageVersionArn` is NOT resolved against the store: an
+        // ARN names an account and a Region of its own, and a model package shared
+        // through the registry is routinely one this account's store does not hold, so
+        // its existence is not a fact this service can decide — while `ModelName` is
+        // necessarily a name in this account and Region.
+        if let Some(model_name) = &input.input_config.model_name {
+            if !store.models.contains_key(model_name) {
+                let model_arn = crate::state::resource_arn(&region, "model", model_name);
+                return Err(refuse(format!(
+                    "Could not find model \"{model_arn}\" named by InputConfig.ModelName."
+                )));
+            }
+        }
+        for endpoint in input.input_config.endpoints.as_deref().unwrap_or_default() {
+            // `EndpointInfo$EndpointName` is model-OPTIONAL (smithy_query
+            // shape=EndpointInfo), so the boundary walk admits an entry naming no
+            // endpoint; an entry that names none identifies nothing to benchmark.
+            let Some(endpoint_name) = &endpoint.endpoint_name else {
+                return Err(refuse(
+                    "InputConfig.Endpoints entries must name an existing endpoint through \
+                     EndpointName.",
+                ));
+            };
+            if !store.endpoints.contains_key(endpoint_name) {
+                let endpoint_arn = crate::state::resource_arn(&region, "endpoint", endpoint_name);
+                return Err(refuse(format!(
+                    "Could not find endpoint \"{endpoint_arn}\" named by \
+                     InputConfig.Endpoints."
+                )));
+            }
+        }
+
+        store.inference_recommendations_jobs.insert(
+            input.job_name.clone(),
+            crate::state::InferenceRecommendationsJob {
+                name: input.job_name.clone(),
+                arn: arn.clone(),
+                job_type: input.job_type,
+                role_arn: input.role_arn,
+                input_config: input.input_config,
+                job_description: input.job_description,
+                stopping_conditions: input.stopping_conditions,
+                output_config: input.output_config,
+                tags: input.tags.unwrap_or_default(),
+                // AWS answers `CreateInferenceRecommendationsJob` with an ARN while the
+                // job is still queued, so the move out of `PENDING` is owed by the clock
+                // rather than taken on this call.
+                status: crate::state::RECOMMENDATION_JOB_STATUS_PENDING.to_string(),
+                failure_reason: None,
+                creation_time: now,
+                last_modified_time: now,
+                completion_time: None,
+                ends_at: now + crate::state::RECOMMENDATION_JOB_SETTLES_AFTER,
+                // Nothing benchmarked this job, so it has measured no recommendation;
+                // `GetScalingConfigurationRecommendation` refuses rather than computing
+                // a configuration from an invented one.
+                recommendations: Vec::new(),
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateInferenceRecommendationsJobOutput { job_arn: arn })
     }
+}
+
+/// A 400 `ValidationException` naming the member and the constraint it broke.
+fn refuse(message: impl Into<String>) -> CreateInferenceRecommendationsJobError {
+    crate::scaffolded::Scaffolded::validation(message.into())
+}
+
+/// Refuse an input configuration that breaks one of the documented rules the modelled
+/// constraints cannot express.
+///
+/// * `RecommendationJobInputConfig$ModelPackageVersionArn` is "the Amazon Resource Name
+///   (ARN) of a versioned model package" and `$ModelName` is "the name of the created
+///   model": they are the two ways one request names the model under test, so a request
+///   must name exactly one of them — with neither there is nothing to benchmark, and with
+///   both the model under test is ambiguous.
+/// * `RecommendationJobInputConfig$JobDurationInSeconds`: "Specifies the maximum duration
+///   of the job, in seconds. The maximum value is 18,000 seconds." The model bounds the
+///   member only from below (`range 1..`), so the ceiling is refused here.
+fn validate_input_config(
+    config: &RecommendationJobInputConfig,
+) -> Result<(), CreateInferenceRecommendationsJobError> {
+    match (&config.model_package_version_arn, &config.model_name) {
+        (Some(_), Some(_)) => {
+            return Err(refuse(
+                "InputConfig must specify exactly one of ModelPackageVersionArn or ModelName, \
+                 but both were given.",
+            ));
+        }
+        (None, None) => {
+            return Err(refuse(
+                "InputConfig must specify exactly one of ModelPackageVersionArn or ModelName, \
+                 but neither was given.",
+            ));
+        }
+        _ => {}
+    }
+
+    if let Some(duration) = config.job_duration_in_seconds {
+        if duration > crate::state::MAX_RECOMMENDATION_JOB_DURATION_IN_SECONDS {
+            return Err(refuse(format!(
+                "InputConfig.JobDurationInSeconds must be at most {} seconds, but was \
+                 {duration}.",
+                crate::state::MAX_RECOMMENDATION_JOB_DURATION_IN_SECONDS
+            )));
+        }
+    }
+
+    Ok(())
 }
