@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScript
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScript`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScript::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a Realtime script record for the zip file the request provides — "if the call
+//! is successful, a new script record is created with a unique script ID" — and reports
+//! the stored record, which `DescribeScript` serves back unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +198,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScript` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScriptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScript"))
+        use crate::state::{DEFAULT_NODE_JS_VERSION, MAX_SCRIPTS_PER_ACCOUNT, NODE_JS_VERSIONS};
+
+        let invalid = |message: String| -> Self::Error {
+            CreateScriptErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "To create a new script record, specify a script name and provide the script
+        // file(s). The script files and all dependencies must be zipped into a single
+        // file. You can pull the zip file from either of these locations: A locally
+        // available directory. Use the ZipFile parameter for this option. An Amazon Simple
+        // Storage Service (Amazon S3) bucket under your Amazon Web Services account. Use
+        // the StorageLocation parameter for this option." The two members are the two
+        // alternatives of ONE choice, so a request names exactly one of them: with neither
+        // there is no script to record, and with both there are two sources for one
+        // script. Refused BEFORE any state is locked and before anything is stored.
+        let zip_file = input.zip_file.as_deref();
+        let requested_location = input.storage_location.as_ref();
+        match (zip_file, requested_location) {
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "ZipFile and StorageLocation are the two alternatives for providing the \
+                     script file; a request names exactly one of them."
+                        .to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(invalid(
+                    "Provide the script file either in ZipFile or in StorageLocation."
+                        .to_string(),
+                ))
+            }
+            _ => {}
+        }
+
+        // "The storage location must specify the Amazon S3 bucket name, the zip file name
+        // (the "key"), and a role ARN that allows Amazon GameLift Servers to access the
+        // Amazon S3 storage location." The modelled `S3Location` leaves all three members
+        // optional, so the documented requirement is enforced where the request is served.
+        if let Some(location) = requested_location {
+            for (member, value) in [
+                ("Bucket", &location.bucket),
+                ("Key", &location.key),
+                ("RoleArn", &location.role_arn),
+            ] {
+                if value.as_ref().is_none_or(|value| value.trim().is_empty()) {
+                    return Err(invalid(format!(
+                        "StorageLocation must specify {member}: a storage location names the S3 \
+                         bucket, the zip file key, and the role ARN that lets Amazon GameLift \
+                         Servers read it."
+                    )));
+                }
+            }
+        }
+
+        // `NodeJsVersion`: "The valid values are 10.x | 24.x. By default, NodeJsVersion is
+        // 10.x." The modelled pattern (`^[0-9]+\.(?:x|[0-9]+)$`) accepts any version
+        // string, so the documented catalog is what decides here — and a script created
+        // without the member carries the documented default, a decision the SERVICE made,
+        // which is why the stored record reports it.
+        let node_js_version = input
+            .node_js_version
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NODE_JS_VERSION.to_string());
+        if !NODE_JS_VERSIONS.contains(&node_js_version.as_str()) {
+            return Err(invalid(format!(
+                "NodeJsVersion {node_js_version} is not a Node.js version a Realtime script runs \
+                 on; the valid values are {}.",
+                NODE_JS_VERSIONS.join(" | ")
+            )));
+        }
+
+        // A resource's tags are a key-value MAP ("Tags are developer-defined key-value
+        // pairs"), so one key cannot carry two values; `TaggingFailedException`'s doc:
+        // "This may be due to invalid tag format". The modelled `TagList` length (0..200)
+        // and each tag's own lengths are refused by the boundary walk before this handler
+        // runs.
+        let tags = input.tags.clone().unwrap_or_default();
+        let mut keys = ::std::collections::HashSet::new();
+        if let Some(duplicate) = tags.iter().find(|tag| !keys.insert(tag.key.clone())) {
+            return Err(CreateScriptErrorModeled::TaggingFailedException(
+                TaggingFailedException {
+                    message: Some(format!(
+                        "Tags assigns the key {} more than once; a resource's tags carry each key \
+                         at most once.",
+                        duplicate.key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateScriptErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.tick(now);
+
+        // A script record lives until `DeleteScript` removes it, so the account's script
+        // quota is what keeps the store bounded as well as what makes a modelled refusal
+        // reachable: `CreateScript` models no `LimitExceededException`, and
+        // `ConflictException` is "the requested operation would cause a conflict with the
+        // current state of a service resource associated with the request" — the account's
+        // script collection being full is exactly such a state.
+        if state.scripts.len() >= MAX_SCRIPTS_PER_ACCOUNT {
+            return Err(CreateScriptErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "The account already holds the maximum of {MAX_SCRIPTS_PER_ACCOUNT} scripts; \
+                     delete a script before creating another."
+                )),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        // `ScriptId` matches the modelled `^script-\S+$`, and the ARN the form the model
+        // declares for `Script$ScriptArn` (`^arn:.*:script\/script-\S+$`), whose "resource
+        // ID matches the ScriptId value". "Script names do not need to be unique", so a
+        // name another script already carries is NOT refused here.
+        let script_id = format!(
+            "script-{}",
+            crate::state::mint_uuid(&mut state.minted_ids, "script")
+        );
+        let script_arn = crate::state::gamelift_arn(&region, &format!("script/{script_id}"));
+
+        // "(1) If the script was uploaded from an S3 bucket under your account, the storage
+        // location reflects the information that was provided in the CreateScript request;
+        // (2) If the script file was uploaded from a local zip file, the storage location
+        // reflects an S3 location controlled by the Amazon GameLift Servers service." And
+        // `SizeOnDisk` is "the file size of the uploaded Realtime script, expressed in
+        // bytes. When files are uploaded from an S3 location, this value remains at 0" —
+        // the service reads the caller's own bucket when a fleet deploys the script, not
+        // when the record is created, so it knows no size for it then. The uploaded bytes
+        // themselves are not kept: no operation serves a script's content back, and the
+        // record holds what every read of the script reports.
+        let (storage_location, size_on_disk) = match zip_file {
+            Some(zip) => (
+                crate::state::service_owned_script_location(&region, &script_id),
+                i64::try_from(zip.len()).unwrap_or(i64::MAX),
+            ),
+            None => (requested_location.cloned().unwrap_or_default(), 0),
+        };
+
+        let record = crate::state::ScriptRecord {
+            script_id: script_id.clone(),
+            script_arn,
+            name: input.name.clone(),
+            version: input.version.clone(),
+            size_on_disk,
+            creation_time: now,
+            storage_location,
+            node_js_version,
+            tags,
+            region,
+        };
+        state.scripts.insert(script_id.clone(), record);
+
+        // Report the STORED record, so this response and every later read of the same
+        // script can only agree.
+        let Some(stored) = state.scripts.get(&script_id) else {
+            return Err(CreateScriptErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the new script could not be read back".to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(CreateScriptOutput {
+            script: Some(stored.to_modelled()),
+        })
     }
 }
