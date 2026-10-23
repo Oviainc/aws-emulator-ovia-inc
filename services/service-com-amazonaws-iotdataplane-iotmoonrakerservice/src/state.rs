@@ -227,6 +227,15 @@ pub const MAX_RETAINED_TOPICS: usize = 1024;
 /// stored shadows. It is the top of the modelled `pageSize` range (1..100).
 pub const DEFAULT_SHADOW_PAGE_SIZE: usize = 100;
 
+/// The largest page `ListRetainedMessages` answers with, which is also the page size it
+/// uses when a request names no `maxResults`: the top of that member's modelled range.
+///
+/// Source: `smithy_query(query="operation", operation="ListRetainedMessages")` — its
+/// `maxResults` carries `range {min: 1, max: 200}`. Reusing the modelled ceiling as the
+/// default is what keeps one unparameterised request from returning a page that grows
+/// with the number of retained topics.
+pub const MAX_RETAINED_MESSAGE_PAGE_SIZE: usize = 200;
+
 /// One section (`desired` or `reported`) of a shadow document: the merged state and
 /// the metadata mirror that carries each leaf's last-written timestamp.
 #[derive(Debug, Clone, Default)]
