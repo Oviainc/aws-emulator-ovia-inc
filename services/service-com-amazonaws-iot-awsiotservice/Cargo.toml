@@ -28,11 +28,12 @@ service-common = { path = "../common" }
 # account id and the region with SHA-256 (see `state::derive_endpoint_identifier`).
 sha2 = { workspace = true }
 
+# Opaque `nextToken` continuation tokens: `ListThings` hex-encodes the listing's
+# filters and the last thing name it emitted (see `ops::list_things`).
+hex = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-hex = { workspace = true }
 
 [lints]
 workspace = true

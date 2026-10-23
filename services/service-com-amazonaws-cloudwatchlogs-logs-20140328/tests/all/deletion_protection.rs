@@ -333,7 +333,8 @@ async fn a_put_on_an_unknown_log_group_is_refused() {
     }
 
     // `LogGroupIdentifier`'s pattern admits no `*`, so the `LogGroup$arn` form is
-    // refused by the modelled constraint before this operation's own checks run.
+    // refused by the modelled constraint before this operation's own checks run — as
+    // this operation's own `InvalidParameterException`.
     let (status, body) = logs
         .call(
             "PutLogGroupDeletionProtection",
@@ -346,7 +347,7 @@ async fn a_put_on_an_unknown_log_group_is_refused() {
     );
     assert_eq!(
         crate::harness::error_code(&body),
-        "ValidationException",
+        "InvalidParameterException",
         "case the wildcard ARN form ({arn}): a modelled constraint refusal, got {body}"
     );
 

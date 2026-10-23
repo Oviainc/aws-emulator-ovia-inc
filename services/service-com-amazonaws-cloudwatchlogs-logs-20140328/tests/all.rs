@@ -25,6 +25,8 @@ mod log_group_auth_and_encryption;
 mod log_group_name_pattern_lists;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
+#[path = "all/refusal_error_codes.rs"]
+mod refusal_error_codes;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/resource_policies.rs"]

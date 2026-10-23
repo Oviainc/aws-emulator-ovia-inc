@@ -349,6 +349,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The new version's own resources are still being provisioned;
                 // it carries the connector's state once the update finishes.
                 state: crate::state::STATE_PENDING.to_string(),
+                // The event that put this version in that state is this
+                // configuration update, which is what `StateReason` explains.
+                state_reason: Some(crate::state::STATE_REASON_CONFIGURATION_UPDATE.to_string()),
                 pending: Some(crate::state::PendingTransition {
                     due: settles_at,
                     change: crate::state::PendingChange::State(

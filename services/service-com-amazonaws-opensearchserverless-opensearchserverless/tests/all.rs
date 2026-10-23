@@ -19,6 +19,8 @@ mod account_settings;
 mod collection_group_lifecycle;
 #[path = "all/collection_lifecycle.rs"]
 mod collection_lifecycle;
+#[path = "all/lifecycle_policy.rs"]
+mod lifecycle_policy;
 #[path = "all/security_configs.rs"]
 mod security_configs;
 #[path = "all/state_roundtrip.rs"]

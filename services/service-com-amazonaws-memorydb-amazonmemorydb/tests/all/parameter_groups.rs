@@ -24,6 +24,9 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::{
+    default_parameter_group_name, parameter_group_families,
+};
 use service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -205,6 +208,20 @@ fn group_names(body: &Value, case: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every name a full listing must report, in name order: the groups a row created plus
+/// the `default.<family>` groups MemoryDB itself provides in every account (one per
+/// family of the engine catalog), which exist without being created.
+fn expected_listing(created: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = created.iter().map(|name| name.to_string()).collect();
+    names.extend(
+        parameter_group_families()
+            .iter()
+            .map(|family| default_parameter_group_name(family)),
+    );
+    names.sort();
+    names
+}
+
 /// A create persists the group, and a later describe answers from that state: the same
 /// name, family, description and ARN come back, whichever members the request carried.
 #[tokio::test]
@@ -249,8 +266,7 @@ async fn a_created_parameter_group_is_reported_by_a_later_describe() {
 
     // And the unfiltered listing is every stored group, in name order.
     let listed = ok(&router, "DescribeParameterGroups", &json!({}), "all").await;
-    let mut expected: Vec<String> = CASES.iter().map(|case| case.name.to_string()).collect();
-    expected.sort();
+    let expected = expected_listing(&CASES.iter().map(|case| case.name).collect::<Vec<_>>());
     assert_eq!(
         group_names(&listed, "all"),
         expected,
@@ -349,7 +365,8 @@ async fn the_listing_pages_over_every_group_in_name_order() {
     for case in CASES {
         ok(&router, "CreateParameterGroup", &create_body(case), case.name).await;
     }
-    let mut expected: Vec<String> = CASES.iter().map(|case| case.name.to_string()).collect();
+    let mut expected: Vec<String> =
+        expected_listing(&CASES.iter().map(|case| case.name).collect::<Vec<_>>());
     expected.sort();
 
     // Every page size from 1 to one PAST the number of groups: a size larger than the

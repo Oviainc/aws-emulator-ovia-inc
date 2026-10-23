@@ -87,9 +87,10 @@ use crate::ops::types::{
     CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits, CreateUserOutput,
     DestinationDetails, Endpoint, Event, LogDeliveryConfiguration,
     LogDeliveryConfigurationRequest, NodeGroup, NodeGroupConfiguration, NodeGroupMember,
-    NodeSnapshot, NotificationConfiguration, Parameter, PendingModifiedValues, RecurringCharge,
-    ReplicationGroup, ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig,
-    SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
+    NodeSnapshot, NotificationConfiguration, Parameter, PendingModifiedValues,
+    ProcessedUpdateAction, RecurringCharge, ReplicationGroup, ReservedCacheNode,
+    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
+    ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -410,6 +411,38 @@ pub const SNAPSHOT_SOURCE_AUTOMATED: &str = "automated";
 pub const SNAPSHOT_SOURCE_FILTER_SYSTEM: &str = "system";
 /// See [`SNAPSHOT_SOURCE_FILTER_SYSTEM`].
 pub const SNAPSHOT_SOURCE_FILTER_USER: &str = "user";
+
+/// The stored snapshot source a `DescribeSnapshots$SnapshotSource` value
+/// selects, or the reason it names no creation source.
+///
+/// `SnapshotSource` is a plain string with NO modelled enum or pattern, so the
+/// vocabulary is enforced here, and it is a SUPERSET of the one the response
+/// emits: each source is named either by the filter's spelling the member
+/// documents ([`SNAPSHOT_SOURCE_FILTER_SYSTEM`] / [`SNAPSHOT_SOURCE_FILTER_USER`])
+/// or by the spelling `Snapshot$SnapshotSource` reports it under
+/// ([`SNAPSHOT_SOURCE_AUTOMATED`] / [`SNAPSHOT_SOURCE_MANUAL`]). That is what
+/// makes "read a snapshot's `SnapshotSource`, then list only the snapshots of
+/// that source" a round trip rather than a refusal. Matched ignoring ASCII
+/// case, as this service's other unconstrained filter vocabularies are (see
+/// [`canonical_offering_type`]): a creation source is a vocabulary word, not an
+/// identity.
+pub fn snapshot_source_filter(value: &str) -> Result<&'static str, String> {
+    for (filter_spelling, reported_spelling) in [
+        (SNAPSHOT_SOURCE_FILTER_SYSTEM, SNAPSHOT_SOURCE_AUTOMATED),
+        (SNAPSHOT_SOURCE_FILTER_USER, SNAPSHOT_SOURCE_MANUAL),
+    ] {
+        if value.eq_ignore_ascii_case(filter_spelling)
+            || value.eq_ignore_ascii_case(reported_spelling)
+        {
+            return Ok(reported_spelling);
+        }
+    }
+    Err(format!(
+        "Invalid value {value} for SnapshotSource: must be one of \
+         {SNAPSHOT_SOURCE_FILTER_SYSTEM} | {SNAPSHOT_SOURCE_AUTOMATED} | \
+         {SNAPSHOT_SOURCE_FILTER_USER} | {SNAPSHOT_SOURCE_MANUAL}."
+    ))
+}
 
 /// The node type ElastiCache cannot snapshot a Valkey / Redis OSS cluster on,
 /// from `SnapshotFeatureNotSupportedFault`: "Creating a snapshot of a Valkey or
@@ -4682,6 +4715,118 @@ pub fn published_service_updates(anchor: SystemTime) -> BTreeMap<String, Service
     catalog
 }
 
+/// `UpdateActionStatus`'s values (`smithy_query(query="shape",
+/// shape="UpdateActionStatus")`: `not-applied | waiting-to-start | in-progress
+/// | stopping | stopped | complete | scheduling | scheduled |
+/// not-applicable`).
+///
+/// `not-applied` is the status of an update action nothing has started, so no
+/// record is stored for one: it is derived from the absence of a record rather
+/// than kept. The four below it are the ones this slice moves through —
+/// `BatchApplyUpdateAction` starts an action, `BatchStopUpdateAction` stops one
+/// and the clock carries each transient status to the next. `scheduling` /
+/// `scheduled` belong to applying an update at a chosen time, which no
+/// operation in this API asks for, and `not-applicable` to an update that does
+/// not apply to the resource at all.
+pub const UPDATE_ACTION_NOT_APPLIED: &str = "not-applied";
+/// See [`UPDATE_ACTION_NOT_APPLIED`].
+pub const UPDATE_ACTION_WAITING_TO_START: &str = "waiting-to-start";
+/// See [`UPDATE_ACTION_NOT_APPLIED`].
+pub const UPDATE_ACTION_IN_PROGRESS: &str = "in-progress";
+/// See [`UPDATE_ACTION_NOT_APPLIED`].
+pub const UPDATE_ACTION_STOPPING: &str = "stopping";
+/// See [`UPDATE_ACTION_NOT_APPLIED`].
+pub const UPDATE_ACTION_STOPPED: &str = "stopped";
+/// See [`UPDATE_ACTION_NOT_APPLIED`].
+pub const UPDATE_ACTION_COMPLETE: &str = "complete";
+
+/// How long an update action stays in each transient status before the clock
+/// owes it the next one.
+///
+/// The same reasoning as [`CLUSTER_TRANSITION`]: a real service update takes
+/// minutes, the emulator chooses a span, and it is deliberately NOT zero, so a
+/// caller acting straight after `BatchApplyUpdateAction` still observes the
+/// action under way — and can stop it. Nothing sleeps: the due instant is
+/// stored on the record and materialised by whichever later call reads it.
+pub const UPDATE_ACTION_TRANSITION: Duration = Duration::from_millis(500);
+
+/// What `UnprocessedUpdateAction$ErrorType` carries when the resource an update
+/// action was named for is not one this account holds.
+///
+/// `ErrorType` is a plain string with no modelled vocabulary, so these are the
+/// names of the modelled fault shapes that refuse exactly those resources
+/// elsewhere in this service, rather than a second spelling of the same
+/// conditions.
+pub const CACHE_CLUSTER_NOT_FOUND_ERROR_TYPE: &str = "CacheClusterNotFoundFault";
+/// See [`CACHE_CLUSTER_NOT_FOUND_ERROR_TYPE`].
+pub const REPLICATION_GROUP_NOT_FOUND_ERROR_TYPE: &str = "ReplicationGroupNotFoundFault";
+/// See [`CACHE_CLUSTER_NOT_FOUND_ERROR_TYPE`]: what `ErrorType` carries when
+/// the resource is one this account holds but cannot take the command — the
+/// code of the only parameter-value error both batch operations model.
+pub const UPDATE_ACTION_INVALID_ERROR_TYPE: &str = "InvalidParameterValue";
+
+/// The status the clock owes an update action now in `status`, or `None` when
+/// `status` is where the action stops.
+fn next_update_action_status(status: &str) -> Option<&'static str> {
+    match status {
+        UPDATE_ACTION_WAITING_TO_START => Some(UPDATE_ACTION_IN_PROGRESS),
+        UPDATE_ACTION_IN_PROGRESS => Some(UPDATE_ACTION_COMPLETE),
+        UPDATE_ACTION_STOPPING => Some(UPDATE_ACTION_STOPPED),
+        _ => None,
+    }
+}
+
+/// True while an update action is still on its way through the update: the
+/// statuses an apply does not start over, because work is already under way.
+///
+/// The statuses OUTSIDE this set — `not-applied`, `stopped` and `complete` —
+/// all mean no work is under way on that resource, so an apply starts work from
+/// any of them: applying a service update is a request to run it now, and
+/// neither the model nor the ElastiCache documentation refuses one for a
+/// resource whose previous run finished or was stopped. The stop path is the
+/// mirror image and NOT symmetric for a reason: it needs work under way to act
+/// on, which is why it refuses exactly those three statuses (see
+/// [`update_action_stoppable`]).
+fn update_action_in_flight(status: &str) -> bool {
+    matches!(
+        status,
+        UPDATE_ACTION_WAITING_TO_START | UPDATE_ACTION_IN_PROGRESS | UPDATE_ACTION_STOPPING
+    )
+}
+
+/// True when a stop has something left to stop: an action already `stopping` is
+/// on its way to [`UPDATE_ACTION_STOPPED`], so stopping it again would move
+/// nothing — and must not push the due instant of that status out.
+fn update_action_stoppable(status: &str) -> bool {
+    matches!(
+        status,
+        UPDATE_ACTION_WAITING_TO_START | UPDATE_ACTION_IN_PROGRESS
+    )
+}
+
+/// Which of the two resource lists a batch update-action call named a resource
+/// in: `ProcessedUpdateAction` / `UnprocessedUpdateAction` report a cache
+/// cluster's id and a replication group's under different members, each kind is
+/// resolved against its own state, and the kind is part of an update action's
+/// stored key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UpdateActionResource {
+    /// A `CacheClusterIds` entry.
+    CacheCluster,
+    /// A `ReplicationGroupIds` entry.
+    ReplicationGroup,
+}
+
+impl UpdateActionResource {
+    /// How a message names this kind of resource.
+    fn label(self) -> &'static str {
+        match self {
+            Self::CacheCluster => "cache cluster",
+            Self::ReplicationGroup => "replication group",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RBAC users
 // ---------------------------------------------------------------------------
@@ -4869,6 +5014,117 @@ fn is_access_rule(rule: &str) -> bool {
     }
 }
 
+/// Which batch operation is driving an update action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateActionCommand {
+    /// `BatchApplyUpdateAction`: start the update on each named resource.
+    Apply,
+    /// `BatchStopUpdateAction`: stop the update under way on each named
+    /// resource.
+    Stop,
+}
+
+/// What a batch update-action call names: the service update, and the resources
+/// it acts on.
+///
+/// `BatchApplyUpdateAction` and `BatchStopUpdateAction` model the same three
+/// members, so both handlers hand the store this one request rather than
+/// carrying two copies of the accounting below.
+#[derive(Debug, Clone, Default)]
+pub struct BatchUpdateActionRequest {
+    /// "The unique ID of the service update", as sent.
+    pub service_update_name: String,
+    /// `CacheClusterIds` — "the cache cluster IDs".
+    pub cache_cluster_ids: Vec<String>,
+    /// `ReplicationGroupIds` — "the replication group IDs".
+    pub replication_group_ids: Vec<String>,
+}
+
+impl BatchUpdateActionRequest {
+    /// Why this request names no resource for `command` to act on, or `None`
+    /// when it names at least one.
+    ///
+    /// Both id lists are modelled `@length(min: 0)`, so the boundary validator
+    /// passes a request that names none — and there is then nothing for either
+    /// command to act on. The sentence is built here so both handlers refuse
+    /// the same condition in the same words and only map it onto their own
+    /// modelled error variant.
+    pub fn no_resource_refusal(&self, command: UpdateActionCommand) -> Option<String> {
+        if !self.cache_cluster_ids.is_empty() || !self.replication_group_ids.is_empty() {
+            return None;
+        }
+        let (verb, preposition) = match command {
+            UpdateActionCommand::Apply => ("apply", "to"),
+            UpdateActionCommand::Stop => ("stop", "on"),
+        };
+        Some(format!(
+            "CacheClusterIds or ReplicationGroupIds must name at least one resource to {verb} \
+             service update {} {preposition}.",
+            self.service_update_name
+        ))
+    }
+}
+
+/// The two lists `UpdateActionResultsMessage` reports: the update actions a
+/// batch call processed, and the ones it could not.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateActionResults {
+    /// "Update actions that have been processed successfully."
+    pub processed: Vec<ProcessedUpdateAction>,
+    /// "Update actions that haven't been processed successfully."
+    pub unprocessed: Vec<UnprocessedUpdateAction>,
+}
+
+/// One update action: the service update being applied, the resource it is
+/// being applied to, and how far it has got.
+#[derive(Debug, Clone)]
+pub struct UpdateActionRecord {
+    /// The `ServiceUpdateName` this action applies.
+    pub service_update_name: String,
+    /// The cache cluster the update is being applied to, when the action was
+    /// named through `CacheClusterIds`.
+    pub cache_cluster_id: Option<String>,
+    /// The replication group the update is being applied to, when the action
+    /// was named through `ReplicationGroupIds`.
+    pub replication_group_id: Option<String>,
+    /// One of `UpdateActionStatus`'s values — see [`UPDATE_ACTION_NOT_APPLIED`].
+    pub status: String,
+    /// The status change the clock owes this action, if any.
+    pub pending_status: Option<PendingTransition>,
+}
+
+impl UpdateActionRecord {
+    /// Materialise every status change the clock owes this action, up to `now`.
+    ///
+    /// An update action walks a chain of statuses rather than settling once, so
+    /// a record nobody read for several spans ends up where the clock has
+    /// carried it rather than one step along. This is the ONE write a reporting
+    /// operation may make; see [`CacheClusterRecord::settle`].
+    pub fn settle(&mut self, now: SystemTime) {
+        while let Some(pending) = self.pending_status.clone() {
+            if now < pending.due {
+                return;
+            }
+            self.status = pending.status;
+            self.pending_status =
+                next_update_action_status(&self.status).map(|next| PendingTransition {
+                    due: pending.due + UPDATE_ACTION_TRANSITION,
+                    status: next.to_string(),
+                });
+        }
+    }
+
+    /// This record as the modelled `ProcessedUpdateAction`.
+    pub fn to_processed(&self) -> ProcessedUpdateAction {
+        ProcessedUpdateAction {
+            replication_group_id: self.replication_group_id.clone(),
+            cache_cluster_id: self.cache_cluster_id.clone(),
+            service_update_name: Some(self.service_update_name.clone()),
+            update_action_status: Some(self.status.clone()),
+        }
+    }
+}
+
 /// Why `access_string` is not an access string, or `None` when it is one.
 ///
 /// The model constrains `AccessString` only with `@pattern "\S"` — any string
@@ -4995,6 +5251,25 @@ impl AuthenticationRecord {
         } else {
             USER_MIN_ENGINE_VERSION
         }
+    }
+}
+
+/// The modelled `UnprocessedUpdateAction` for one resource a batch call could
+/// not act on, carrying the id under the member its kind is reported by.
+fn unprocessed_update_action(
+    kind: UpdateActionResource,
+    id: &str,
+    service_update_name: &str,
+    error_type: &str,
+    error_message: String,
+) -> UnprocessedUpdateAction {
+    UnprocessedUpdateAction {
+        replication_group_id: (kind == UpdateActionResource::ReplicationGroup)
+            .then(|| id.to_string()),
+        cache_cluster_id: (kind == UpdateActionResource::CacheCluster).then(|| id.to_string()),
+        service_update_name: Some(service_update_name.to_string()),
+        error_type: Some(error_type.to_string()),
+        error_message: Some(error_message),
     }
 }
 
@@ -5237,6 +5512,16 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// rather than an account creating them, so the store holds the catalog
     /// from the moment it comes up — see [`published_service_updates`].
     pub service_updates: BTreeMap<String, ServiceUpdateRecord>,
+    /// Every update action a batch call started, keyed by
+    /// `(ServiceUpdateName, resource kind, resource key)` — the identity of an
+    /// update action in this API is the update together with the resource it is
+    /// being applied to, and the KIND is part of that key because a cache
+    /// cluster and a replication group may carry the same name while being
+    /// different resources. A `BTreeMap` keeps the stable total order a page of
+    /// them would index into. A key with no entry is an action nothing has
+    /// started, which is the `not-applied` status; see
+    /// [`UPDATE_ACTION_NOT_APPLIED`].
+    pub update_actions: BTreeMap<(String, UpdateActionResource, String), UpdateActionRecord>,
     /// Every event this service recorded, keyed by [`event_key`] so the map's
     /// order IS the chronological order `DescribeEvents` reports and its
     /// `Marker` indexes into. The log is kept beside the resources rather than
@@ -5305,6 +5590,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             cache_parameter_groups: default_parameter_groups(),
             snapshots: BTreeMap::new(),
             service_updates: published_service_updates(SystemTime::now()),
+            update_actions: BTreeMap::new(),
             events: BTreeMap::new(),
             event_seq: 0,
             users: built_in_users(),
@@ -5624,6 +5910,11 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                 ));
             }
         }
+        // An update action is not an event source either: `SourceType` has no
+        // member for one, so its settled status change records nothing.
+        for action in self.update_actions.values_mut() {
+            action.settle(now);
+        }
         // A reservation is not an event source: `SourceType` has no member for
         // one, so its settled state change records nothing.
         for reservation in self.reserved_cache_nodes.values_mut() {
@@ -5735,6 +6026,182 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             return;
         };
         self.events.retain(|_, event| event.at >= cutoff);
+    }
+
+    /// The resource a batch update-action call named, resolved against this
+    /// store: the key it is held under and the cache engine it runs, or the
+    /// `ErrorType` and message that say this account holds no such resource.
+    fn resolve_update_action_target(
+        &self,
+        kind: UpdateActionResource,
+        id: &str,
+    ) -> Result<(String, String), (&'static str, String)> {
+        match kind {
+            UpdateActionResource::CacheCluster => {
+                // `CacheClusterId` "is stored as a lowercase string", so the
+                // lookup lowercases too.
+                let key = id.to_ascii_lowercase();
+                match self.cache_clusters.get(&key) {
+                    Some(cluster) => Ok((key, cluster.engine.clone())),
+                    None => Err((
+                        CACHE_CLUSTER_NOT_FOUND_ERROR_TYPE,
+                        format!("Cache cluster {id} not found."),
+                    )),
+                }
+            }
+            UpdateActionResource::ReplicationGroup => {
+                // A `ReplicationGroupId` "is stored as a lowercase string" like
+                // every other identifier in this API, so the lookup lowercases
+                // too, and the group's own `Engine` is what decides whether the
+                // update applies to it.
+                let key = id.to_ascii_lowercase();
+                match self.replication_groups.get(&key) {
+                    Some(group) => Ok((key, group.engine.clone())),
+                    None => Err((
+                        REPLICATION_GROUP_NOT_FOUND_ERROR_TYPE,
+                        format!("Replication group {id} not found."),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Run `command` for the service update `request` names over each resource
+    /// it names, in request order, and report what came of each one — or `None`
+    /// when this account's published catalogue holds no such update, which is
+    /// the one condition these operations model a fault for.
+    ///
+    /// The accounting is per resource: a resource this account holds, that the
+    /// update applies to, and whose action the command can move, is reported
+    /// under `ProcessedUpdateActions` with the status it is now in; every other
+    /// named resource is reported under `UnprocessedUpdateActions` with the
+    /// reason, and neither refuses the whole call.
+    pub fn run_update_actions(
+        &mut self,
+        command: UpdateActionCommand,
+        request: &BatchUpdateActionRequest,
+        now: SystemTime,
+    ) -> Option<UpdateActionResults> {
+        let mut results = UpdateActionResults::default();
+        // `ServiceUpdate$Engine` is "the Elasticache engine to which the update
+        // applies", so an update released for one engine is no action on a
+        // resource running another. Resolving the name here is also what makes
+        // the not-found answer unmissable: there is no results message for an
+        // update this account does not hold.
+        let update_engine = self
+            .service_updates
+            .get(&request.service_update_name)
+            .map(|update| update.engine.clone())?;
+        let named: Vec<(UpdateActionResource, &String)> = request
+            .cache_cluster_ids
+            .iter()
+            .map(|id| (UpdateActionResource::CacheCluster, id))
+            .chain(
+                request
+                    .replication_group_ids
+                    .iter()
+                    .map(|id| (UpdateActionResource::ReplicationGroup, id)),
+            )
+            .collect();
+        for (kind, id) in named {
+            let name = request.service_update_name.clone();
+            let (key, engine) = match self.resolve_update_action_target(kind, id) {
+                Ok(target) => target,
+                Err((error_type, message)) => {
+                    results.unprocessed.push(unprocessed_update_action(
+                        kind,
+                        id,
+                        &name,
+                        error_type,
+                        message,
+                    ));
+                    continue;
+                }
+            };
+            if engine != update_engine {
+                let message = format!(
+                    "Service update {name} applies to {update_engine}, not to {} {id} running \
+                     {engine}.",
+                    kind.label()
+                );
+                results.unprocessed.push(unprocessed_update_action(
+                    kind,
+                    id,
+                    &name,
+                    UPDATE_ACTION_INVALID_ERROR_TYPE,
+                    message,
+                ));
+                continue;
+            }
+            let action_key = (name.clone(), kind, key.clone());
+            // The status the command acts on is the one the clock has carried
+            // the stored action to; a pair with no record has never been
+            // applied.
+            let status = match self.update_actions.get_mut(&action_key) {
+                Some(action) => {
+                    action.settle(now);
+                    action.status.clone()
+                }
+                None => UPDATE_ACTION_NOT_APPLIED.to_string(),
+            };
+            let next = match command {
+                UpdateActionCommand::Apply if update_action_in_flight(&status) => {
+                    let message = format!(
+                        "Update action for service update {name} on {} {id} is {status}, so it \
+                         is already under way.",
+                        kind.label()
+                    );
+                    results.unprocessed.push(unprocessed_update_action(
+                        kind,
+                        id,
+                        &name,
+                        UPDATE_ACTION_INVALID_ERROR_TYPE,
+                        message,
+                    ));
+                    continue;
+                }
+                UpdateActionCommand::Apply => UPDATE_ACTION_WAITING_TO_START,
+                UpdateActionCommand::Stop if !update_action_stoppable(&status) => {
+                    let message = format!(
+                        "Update action for service update {name} on {} {id} is {status}, so \
+                         there is nothing to stop.",
+                        kind.label()
+                    );
+                    results.unprocessed.push(unprocessed_update_action(
+                        kind,
+                        id,
+                        &name,
+                        UPDATE_ACTION_INVALID_ERROR_TYPE,
+                        message,
+                    ));
+                    continue;
+                }
+                UpdateActionCommand::Stop => UPDATE_ACTION_STOPPING,
+            };
+            let record = UpdateActionRecord {
+                service_update_name: name,
+                cache_cluster_id: (kind == UpdateActionResource::CacheCluster)
+                    .then(|| key.clone()),
+                replication_group_id: (kind == UpdateActionResource::ReplicationGroup)
+                    .then(|| key.clone()),
+                status: next.to_string(),
+                pending_status: next_update_action_status(next).map(|after| PendingTransition {
+                    due: now + UPDATE_ACTION_TRANSITION,
+                    status: after.to_string(),
+                }),
+            };
+            // The entry is read back out of the map, so the response reports
+            // the action this service persisted rather than a copy beside it.
+            let stored = match self.update_actions.entry(action_key) {
+                Entry::Vacant(slot) => slot.insert(record),
+                Entry::Occupied(mut slot) => {
+                    slot.insert(record);
+                    slot.into_mut()
+                }
+            };
+            results.processed.push(stored.to_processed());
+        }
+        Some(results)
     }
 
     /// How many CUSTOM cache parameter groups this account holds — the count

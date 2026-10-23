@@ -114,6 +114,10 @@ pub mod get_registry_types;
 pub mod get_resource_policy_types;
 pub mod get_token_vault_types;
 pub mod get_workload_identity_types;
+/// The harness shapes the scaffold declined (see `src/ops/SKIPPED_STUBS.md`), reached by
+/// `CreateHarness`, `GetHarness`, `UpdateHarness` and `DeleteHarness`. Hand-authored, so
+/// it is named for the RESOURCE rather than for one operation.
+pub mod harness_types;
 pub mod list_agent_runtime_endpoints_types;
 pub mod list_agent_runtime_versions_by_capacity_provider_types;
 pub mod list_agent_runtime_versions_types;
@@ -376,6 +380,8 @@ pub use get_resource_policy_types::*;
 pub use get_token_vault_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_workload_identity_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use harness_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_agent_runtime_endpoints_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

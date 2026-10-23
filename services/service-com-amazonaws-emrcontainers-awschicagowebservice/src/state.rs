@@ -618,7 +618,8 @@ impl SecurityConfigurationRecord {
 ///
 /// # Bounding the store
 ///
-/// Both record sets are CAPPED ([`MAX_VIRTUAL_CLUSTERS`], [`MAX_JOB_RUNS`]) and retired
+/// Every record set is CAPPED ([`MAX_VIRTUAL_CLUSTERS`], [`MAX_JOB_RUNS`],
+/// [`MAX_JOB_TEMPLATES`], [`MAX_SECURITY_CONFIGURATIONS`]) and retired
 /// records are reclaimed oldest-first when a cap is reached, so the store cannot grow
 /// with the number of requests served: a caller that creates resources in a loop ends up
 /// recycling the same bounded set of slots, and once every slot holds a LIVE resource the

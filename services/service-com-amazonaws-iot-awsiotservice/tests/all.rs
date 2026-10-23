@@ -19,6 +19,8 @@ mod job_targeting;
 mod state_roundtrip;
 #[path = "all/thing_group_hierarchy.rs"]
 mod thing_group_hierarchy;
+#[path = "all/thing_listing.rs"]
+mod thing_listing;
 #[path = "all/thing_registry_lifecycle.rs"]
 mod thing_registry_lifecycle;
 #[path = "all/topic_rule_registry.rs"]

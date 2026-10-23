@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. This service DOES reword one thing: a `@pattern` is
+//!   quoted without the `^` / `$` anchors the model spells it with. See the inline
+//!   note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +41,90 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The wire error code for a request this service refuses as invalid: the shape
+/// `com.amazonaws.bedrockagentcorecontrol#ValidationException`, which every operation of
+/// this service declares and whose `@httpError` is 400.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A `@pattern` expression without the anchors a model may spell it with.
+///
+/// Only a `^…$` PAIR bracketing the whole expression is dropped: `^` alone, or `$` alone,
+/// is an expression anchored at one end — a different language, not an anchored spelling
+/// of this one — and an anchor left INSIDE after the pair is removed means the pair
+/// bracketed one branch of an alternation (`^a$|^b$`) rather than the whole expression, so
+/// such a pattern is reported exactly as the model spells it. A `$` escaped by a backslash
+/// is a literal dollar sign, not the end anchor, so it stays.
+///
+/// Inlined here rather than shared: every service that states this rule carries its own
+/// copy, pinned by its own recordings (`grep -rln 'fn unanchored' services/*/src`), and
+/// `services/common/src/validation.rs` keeps the envelope-and-clause half with the service
+/// deliberately, because services do not agree on it.
+fn unanchored(pattern: &str) -> &str {
+    let Some(body) = pattern.strip_prefix('^') else {
+        return pattern;
+    };
+    let Some(body) = without_end_anchor(body) else {
+        return pattern;
+    };
+    if has_interior_anchor(body) {
+        return pattern;
+    }
+    body
+}
+
+/// `pattern` without its end anchor, or `None` when it carries none. A trailing `$`
+/// preceded by an ODD number of backslashes is escaped — a literal dollar sign inside the
+/// expression — so it is not an anchor.
+fn without_end_anchor(pattern: &str) -> Option<&str> {
+    let body = pattern.strip_suffix('$')?;
+    let escapes = body.len() - body.trim_end_matches('\\').len();
+    (escapes % 2 == 0).then_some(body)
+}
+
+/// Whether `expression` still carries an anchor of its own — a `^` or `$` that is neither
+/// escaped nor inside a character class — after the outer pair was stripped.
+///
+/// A character class is skipped because `^` is a NEGATION there (`[^:]`, which half of
+/// this model's ARN patterns are built from) and `$` an ordinary character, so neither
+/// anchors anything and an expression built from one must still have its outer anchors
+/// removed.
+fn has_interior_anchor(expression: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    for ch in expression.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '^' | '$' if !in_class => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The same violation with a `@pattern` reported unanchored; every other class is
+/// untouched, so the requirement each one words stays the framework's.
+fn as_stated(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            value: violation.value.clone(),
+        },
+        _ => violation.clone(),
+    }
+}
 
 /// The host-style endpoint this service is addressed by:
 /// `bedrock-agentcore-control.<region>.amazonaws.com`.
@@ -130,16 +211,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. This service states such a refusal in the framework's own envelope
+        // and the framework's own clause — the count, `Value '<what was sent>' at
+        // '<member>' failed to satisfy constraint: <requirement>`, the clauses joined by
+        // `"; "` — with ONE difference, which is RECORDED: the `@pattern` a clause quotes
+        // is the expression a value has to satisfy, NOT the `^` / `$` anchoring the model
+        // writes to make that match total. The anchoring is how Smithy turns a find into a
+        // whole-string match, not part of the character grammar the caller is told about,
+        // and a client that lifts the advertised expression into its own pre-flight check
+        // still has to anchor the match itself, exactly as it would against AWS.
+        //
+        // The code stays `ValidationException`, which is both what the framework would
+        // answer and the shape this service's model declares (`@httpError` 400), because a
+        // client branches on the code and `Refused` replaces the code and the message
+        // together.
+        match refusal {
+            Refusal::Invalid(violations) => {
+                let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: constraints::envelope(&stated)?,
+                })
+            }
+            // Authentication is the framework's to word: the request never reached a
+            // modelled constraint, so there is no clause of this service's to state.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -168,5 +266,52 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unanchored;
+
+    /// The anchoring a model spells a `@pattern` with is dropped only when the `^…$` pair
+    /// brackets the WHOLE expression; anything else is reported as the model writes it.
+    ///
+    /// The rows span this model's own pattern shapes (a character class, a class whose `^`
+    /// is a NEGATION, an alternation of groups) and the shapes the rule must leave alone
+    /// (one-end anchors, an escaped trailing dollar, individually anchored branches).
+    #[test]
+    fn only_a_whole_expression_anchor_pair_is_dropped() {
+        // (case, the model's expression, what a clause quotes)
+        let rows: [(&str, &str, &str); 9] = [
+            (
+                "HarnessName's character class",
+                "^[a-zA-Z][a-zA-Z0-9_]{0,39}$",
+                "[a-zA-Z][a-zA-Z0-9_]{0,39}",
+            ),
+            (
+                "RoleArn, whose class negation is not an anchor",
+                "^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$",
+                "arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+",
+            ),
+            (
+                "HarnessVersion's anchored group",
+                "^([1-9][0-9]{0,4})$",
+                "([1-9][0-9]{0,4})",
+            ),
+            ("anchored at the start only", "^arn:aws:", "^arn:aws:"),
+            ("anchored at the end only", "[0-9]{12}$", "[0-9]{12}$"),
+            ("no anchor at all", r"\d{3}", r"\d{3}"),
+            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
+            ("an escaped dollar before the anchor", r"^costs\$$", r"costs\$"),
+            ("an escaped backslash before the anchor", r"^path\\$", r"path\\"),
+        ];
+
+        for (case, modelled, expected) in rows {
+            let actual = unanchored(modelled);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?} from {modelled:?}, got {actual:?}"
+            );
+        }
     }
 }

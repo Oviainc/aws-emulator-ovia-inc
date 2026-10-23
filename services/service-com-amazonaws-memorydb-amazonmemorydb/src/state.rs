@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ops::types::{
     Authentication, AuthenticationMode, Cluster, Endpoint, EngineVersionInfo, Event, Node,
     Parameter, ParameterGroup, SecurityGroupMembership, Shard, Tag, User, ACL,
+    ACLPendingChanges,
 };
 
 /// The region an ARN or endpoint carries when the request is unsigned, matching the
@@ -524,6 +525,58 @@ pub fn family_parameters(family: &str) -> Vec<&'static EngineParameter> {
         .collect();
     parameters.sort_by_key(|parameter| parameter.name);
     parameters
+}
+
+/// Every parameter group family this service publishes, in catalog order and each one
+/// once.
+///
+/// DERIVED from [`ENGINE_VERSIONS`], exactly as [`family_generation`] resolves a family
+/// against the catalog: a family exists precisely when a published engine version names
+/// it, so the families this list reports and the families `DescribeEngineVersions`
+/// reports cannot disagree. Several versions of one engine's major version share a
+/// family ([`EngineVersion::parameter_group_family`]), so the duplicates are dropped.
+pub fn parameter_group_families() -> Vec<String> {
+    let mut families: Vec<String> = Vec::new();
+    for version in ENGINE_VERSIONS {
+        let family = version.parameter_group_family();
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    families
+}
+
+/// The name of the parameter group MemoryDB itself provides for `family`: the
+/// [`DEFAULT_PARAMETER_GROUP_PREFIX`] followed by the family name with its underscores
+/// written as hyphens (`memorydb_valkey7` → `default.memorydb-valkey7`).
+///
+/// The family is the only input, so the group's name, its family and the parameters it
+/// reports all follow the one engine catalog.
+pub fn default_parameter_group_name(family: &str) -> String {
+    format!(
+        "{DEFAULT_PARAMETER_GROUP_PREFIX}{}",
+        family.replace('_', "-")
+    )
+}
+
+/// `ParameterGroup$Description` of a group MemoryDB itself provides: the service's own
+/// wording for the family baseline, so a default group reports a description like every
+/// other stored group rather than an absent member.
+pub fn default_parameter_group_description(family: &str) -> String {
+    format!("Default parameter group for {family}")
+}
+
+/// Why a parameter group is not the caller's to change, or `None` when it is.
+///
+/// The `default.<family>` groups belong to MemoryDB, not to the caller
+/// ([`DEFAULT_PARAMETER_GROUP_PREFIX`] is the same rule the tag mutations refuse one
+/// with, see [`default_resource_rejection`]): they carry the family's engine defaults
+/// and are immutable, so every write path over a parameter group refuses one. The
+/// caller maps the refusal onto its own modelled `InvalidParameterValueException`.
+pub fn immutable_parameter_group_rejection(name: &str) -> Option<String> {
+    name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX).then(|| {
+        format!("Parameter group {name} is a default parameter group and cannot be modified.")
+    })
 }
 
 /// The engine default parameter of one family by name, or `None` when that family
@@ -1043,6 +1096,12 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
             if acl.settles_at.is_some_and(|due| now >= due) {
                 acl.status = acl_status::ACTIVE.to_string();
                 acl.settles_at = None;
+                // A change the ACL has finished applying is no longer pending: once the
+                // ACL is back to `active` its `PendingChanges` carries nothing, which is
+                // what makes the member a client can poll say whether the change has
+                // settled.
+                acl.pending_user_names_to_add.clear();
+                acl.pending_user_names_to_remove.clear();
             }
         }
         for user in self.users.values_mut() {
@@ -1093,8 +1152,9 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
 
     /// Materialise the resources this account ALREADY HAD before any call: MemoryDB
     /// creates the `default` user and the `open-access` ACL that holds it in every
-    /// account, so both are part of the store's initial contents rather than something
-    /// a caller made.
+    /// account, and owns one immutable `default.<family>` parameter group per parameter
+    /// group family, so all of them are part of the store's initial contents rather than
+    /// something a caller made.
     ///
     /// The engine hands every service an EMPTY store, so the built-ins are written on
     /// first touch instead of by a constructor; the flag makes that a one-off, so a
@@ -1129,9 +1189,36 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 status: acl_status::ACTIVE.to_string(),
                 settles_at: None,
                 user_names: vec![DEFAULT_USER_NAME.to_string()],
+                // An ACL nobody has asked to change has no change being applied to it.
+                pending_user_names_to_add: Vec::new(),
+                pending_user_names_to_remove: Vec::new(),
                 arn: acl_arn(region, OPEN_ACCESS_ACL_NAME),
             },
         );
+        // One default parameter group per parameter group family: MemoryDB provides the
+        // family baseline in every account, so a caller can read a family's engine
+        // defaults (and compare a custom group against them) without creating anything.
+        // The families come from the engine catalog
+        // ([`parameter_group_families`]), so the groups that exist here are exactly the
+        // families `DescribeEngineVersions` reports.
+        for family in parameter_group_families() {
+            let name = default_parameter_group_name(&family);
+            let description = default_parameter_group_description(&family);
+            let arn = parameter_group_arn(region, &name);
+            self.parameter_groups.insert(
+                name.clone(),
+                StoredParameterGroup {
+                    name,
+                    family,
+                    description,
+                    arn,
+                    // The family baseline overrides nothing: every parameter a default
+                    // group reports is its family's engine default, and the group is
+                    // immutable, so nothing can ever be stored here.
+                    parameter_values: BTreeMap::new(),
+                },
+            );
+        }
     }
 
     /// `ACL$MinimumEngineVersion` — "The minimum engine version supported for the ACL":
@@ -1400,6 +1487,15 @@ pub struct StoredAcl {
     /// When the clock owes this ACL `active`, or `None` once it is settled.
     pub settles_at: Option<Instant>,
     pub user_names: Vec<String>,
+    /// The members the change this ACL is still applying ADDS, in name order, or empty
+    /// when no change is in flight. Written by the operation that accepts a membership
+    /// change and cleared by [`settle`] when the ACL is back to
+    /// [`acl_status::ACTIVE`], which is what `ACL$PendingChanges` reports.
+    ///
+    /// [`settle`]: ComAmazonawsMemorydbAmazonmemorydbState::settle
+    pub pending_user_names_to_add: Vec<String>,
+    /// The members that same change REMOVES, held and cleared the same way.
+    pub pending_user_names_to_remove: Vec<String>,
     pub arn: String,
 }
 
@@ -1597,6 +1693,28 @@ impl StoredParameterGroup {
 }
 
 impl StoredAcl {
+    /// `ACL$PendingChanges` — "A list of updates being applied to the ACL": the members
+    /// the change this ACL is still applying adds and removes, or `None` once there is
+    /// no change in flight.
+    ///
+    /// Each list is ABSENT rather than empty when that side of the change names nobody,
+    /// so a caller reading `PendingChanges` sees only what is actually being applied;
+    /// the whole member is absent when the ACL has settled, which is how a client that
+    /// polls it learns the change is complete.
+    pub fn pending_changes(&self) -> Option<ACLPendingChanges> {
+        if self.pending_user_names_to_add.is_empty()
+            && self.pending_user_names_to_remove.is_empty()
+        {
+            return None;
+        }
+        Some(ACLPendingChanges {
+            user_names_to_add: (!self.pending_user_names_to_add.is_empty())
+                .then(|| self.pending_user_names_to_add.clone()),
+            user_names_to_remove: (!self.pending_user_names_to_remove.is_empty())
+                .then(|| self.pending_user_names_to_remove.clone()),
+        })
+    }
+
     /// The modelled `ACL` for this stored ACL. `clusters` is the derived membership
     /// list and `minimum_engine_version` the version its members require, both of
     /// which only the state as a whole can compute
@@ -1608,7 +1726,10 @@ impl StoredAcl {
             status: Some(self.status.clone()),
             user_names: Some(self.user_names.clone()),
             minimum_engine_version: Some(minimum_engine_version.to_string()),
-            pending_changes: None,
+            // BUILT FROM the stored pending lists, so the update that recorded the
+            // change and every later read report the same in-flight change — and it
+            // disappears once the clock has settled the ACL.
+            pending_changes: self.pending_changes(),
             clusters: Some(clusters),
             arn: Some(self.arn.clone()),
         }

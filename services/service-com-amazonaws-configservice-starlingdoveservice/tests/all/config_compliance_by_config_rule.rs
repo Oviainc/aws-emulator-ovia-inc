@@ -21,7 +21,12 @@
 //! seed them into the same shared state a handler reads — the state
 //! `PutEvaluations` will write once it lands. Everything else goes over the wire.
 
+use std::time::SystemTime;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_configservice_starlingdoveservice::state::{
+    EvaluationResultEntry, EVALUATION_MODE_DETECTIVE,
+};
 use service_com_amazonaws_configservice_starlingdoveservice::ComAmazonawsConfigserviceStarlingdoveserviceState as ConfigState;
 
 use crate::config_setup_and_rule_loop::{managed_rule, with_recorder_and_channel, Emulator};
@@ -70,14 +75,18 @@ fn record_results(emulator: &Emulator, name: &str, results: &[&str]) {
         .config_rules
         .get_mut(name)
         .unwrap_or_else(|| panic!("the rule {name:?} must have been created first"));
-    rule.resource_compliance = results
+    rule.evaluation_results = results
         .iter()
         .enumerate()
         .map(|(index, compliance)| {
-            (
-                format!("AWS::EC2::Volume/vol-{index:04}"),
-                (*compliance).to_string(),
-            )
+            let entry = EvaluationResultEntry::new(
+                "AWS::EC2::Volume",
+                &format!("vol-{index:04}"),
+                EVALUATION_MODE_DETECTIVE,
+                compliance,
+                SystemTime::UNIX_EPOCH,
+            );
+            (entry.key(), entry)
         })
         .collect();
 }

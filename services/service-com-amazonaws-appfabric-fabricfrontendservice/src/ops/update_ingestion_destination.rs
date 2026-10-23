@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIngestionDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIngestionDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIngestionDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPLACES the stored `destinationConfiguration` of one ingestion destination and
+//! PERSISTS it: the response is built from the stored record (see
+//! [`crate::state::IngestionDestinationRecord::to_ingestion_destination`]), so
+//! `GetIngestionDestination` answers from the same bytes this call wrote. Every other
+//! member of the record is left as it was, and `updatedAt` moves to now because this
+//! call is what changed the resource. A destination this emulator accepted is usable
+//! straight away, so it stays in the terminal `Active` state and the clock owes no
+//! transition.
 //!
 //! ## Shape of an operation
 //!
@@ -84,7 +83,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource does not exist.
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
 //! * `ThrottlingException` (HTTP 429) — The request rate exceeds the limit.
-//! * `ValidationException` (HTTP 400) — The request has invalid or missing parameters.
+//! * `ValidationException` (HTTP 400) — The request has invalid or missing parameters, which
+//!   is also how AppFabric refuses a write naming an ingestion or an ingestion destination
+//!   that does not exist (the reporting path answers HTTP 404 for the same identifier).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -163,18 +164,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIngestionDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIngestionDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIngestionDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateIngestionDestinationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the AppFabric emulator could not reach its state store"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `destinationConfiguration` is closed by the model (the `auditLog` union
+        // member, its `s3Bucket` / `firehoseStream` destinations and their length
+        // bounds), so the boundary validator has already refused a malformed
+        // configuration before this handler runs.
+
+        let mut store = state.lock();
+        let Some(bundle_key) = store.bundle_key(&input.app_bundle_identifier) else {
+            return Err(
+                UpdateIngestionDestinationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+                )
+                .into(),
+            );
+        };
+        let Some(ingestion) = store
+            .app_bundles
+            .get_mut(&bundle_key)
+            .and_then(|bundle| bundle.resolve_ingestion_mut(&input.ingestion_identifier))
+        else {
+            // AppFabric checks the ingestion-destination chain as INPUT validation
+            // on its write path: a named ingestion that does not exist is HTTP 400
+            // `ValidationException`, not the HTTP 404 the reporting path answers.
+            return Err(UpdateIngestionDestinationErrorModeled::ValidationException(
+                crate::state::ingestion_does_not_exist(),
+            )
+            .into());
+        };
+        let Some(destination) =
+            ingestion.resolve_destination_mut(&input.ingestion_destination_identifier)
+        else {
+            // The same rule one level down, for the destination this call updates.
+            return Err(UpdateIngestionDestinationErrorModeled::ValidationException(
+                crate::state::ingestion_destination_does_not_exist(),
+            )
+            .into());
+        };
+
+        // The update REPLACES the destination configuration and leaves every other
+        // member of the record as it was: `processingConfiguration` is not an input
+        // of this operation, and the identifiers, the ARN and `createdAt` belong to
+        // the resource rather than to the request. `updatedAt` moves to now,
+        // because this call is what changed the resource.
+        destination.destination_configuration = input.destination_configuration;
+        destination.updated_at = ::std::time::SystemTime::now();
+        // A destination this emulator accepted is usable, so an accepted update
+        // leaves it in the terminal `Active` state with no status reason; the
+        // `Failed` state is for a configuration the service could not accept.
+        destination.status = "Active".to_string();
+        destination.status_reason = None;
+
+        // Read the response back out of the store, so what the caller sees is
+        // exactly what a later Get or List will see.
+        let ingestion_destination = destination.to_ingestion_destination();
+        let destination_id = destination.id.clone();
+        crate::state::audit_resource_change(
+            ctx.parts(),
+            Self::NAME,
+            "IngestionDestination",
+            &destination_id,
+            "updated",
+        );
+        Ok(UpdateIngestionDestinationOutput {
+            ingestion_destination,
+        })
     }
 }

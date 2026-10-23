@@ -180,21 +180,24 @@ async fn log_group_creation_refuses_values_outside_the_documented_rules() {
             "InvalidParameterException",
         ),
         (
-            // `logGroupClass` is a modelled enum, so this is refused at the boundary.
+            // `logGroupClass` is a modelled enum, so this is refused at the boundary —
+            // and a boundary refusal carries the SERVED OPERATION's own refusal error,
+            // which for `CreateLogGroup` is `InvalidParameterException` (the operation
+            // does not declare `ValidationException` at all).
             "a class outside the enum",
             json!({"logGroupName": "classy", "logGroupClass": "GLACIER"}),
-            "ValidationException",
+            "InvalidParameterException",
         ),
         (
             // `logGroupName` is `len 1..512, pattern ^[\.\-_/#A-Za-z0-9]+$`.
             "a name outside the modelled pattern",
             json!({"logGroupName": "has spaces"}),
-            "ValidationException",
+            "InvalidParameterException",
         ),
         (
             "an empty name",
             json!({"logGroupName": ""}),
-            "ValidationException",
+            "InvalidParameterException",
         ),
     ];
     for (case, request, expected) in &cases {
@@ -1022,10 +1025,14 @@ async fn a_log_group_is_reachable_by_name_and_by_either_arn_form() {
         ),
     ];
     for (case, request) in &refusals {
+        // The log-group selector pair is checked ACROSS two members, which no single
+        // member's constraint can express, and the service answers that check with
+        // `ValidationException` (400) rather than with this operation's
+        // `InvalidParameterException` — see `crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`.
         let code = logs.err("GetLogEvents", request).await;
         assert_eq!(
-            code, "InvalidParameterException",
-            "case {case:?}: expected InvalidParameterException, got {code}"
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code}"
         );
     }
 }

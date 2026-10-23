@@ -4,7 +4,8 @@
 //!
 //! This holds the resources this slice serves — the OpenSearch Serverless
 //! **collection**, the **collection group**, the **security policy**, the **data access
-//! policy** and the **security configuration** — plus everything more than one handler of
+//! policy**, the **lifecycle policy** and the **security configuration** — plus everything
+//! more than one handler of
 //! those resources needs: the server-derived fields (the minted ids, the ARNs, the
 //! endpoints derived from a collection id, the epoch-millisecond timestamps), the
 //! clock-owed `CREATING -> ACTIVE` transition a just-created collection settles through,
@@ -23,8 +24,9 @@ use crate::ops::types::{
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
     CollectionGroupErrorDetail, CollectionSummary, CreateCollectionDetail,
     CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail, FipsEndpoints,
-    IamFederationConfigOptions, IamIdentityCenterConfigOptions, SamlConfigOptions,
-    SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail, Tag, VectorOptions,
+    IamFederationConfigOptions, IamIdentityCenterConfigOptions, LifecyclePolicyDetail,
+    LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary,
+    SecurityPolicyDetail, Tag, VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -119,6 +121,13 @@ pub const ERROR_CODE_NOT_FOUND: &str = "NOT_FOUND";
 /// For example, `The specified Collection is not found.`"
 pub const ERROR_MESSAGE_NOT_FOUND: &str = "The specified Collection is not found.";
 
+/// The `errorMessage` a `LifecyclePolicyErrorDetail` carries for an identifier that names
+/// no lifecycle policy, from `LifecyclePolicyErrorDetail$errorMessage`'s own
+/// documentation: "A description of the error. For example, `The specified Lifecycle Policy
+/// is not found`."
+pub const ERROR_MESSAGE_LIFECYCLE_POLICY_NOT_FOUND: &str =
+    "The specified Lifecycle Policy is not found.";
+
 /// How long after `CreateCollection` the `CREATING -> ACTIVE` transition falls due.
 ///
 /// A span this emulator chooses, not a duration the service documents: a collection is
@@ -165,6 +174,18 @@ pub const DEFAULT_IDENTITY_CENTER_GROUP_ATTRIBUTE: &str = "GroupId";
 /// request, so this is the DEFAULT quota). `AccessPolicyType` has the single value `data`,
 /// so this bounds the whole map.
 pub const MAX_ACCESS_POLICIES: usize = 100;
+
+/// The most lifecycle policies this emulator stores for one account in one Region.
+///
+/// Emulator resource guard, NOT a quota AWS publishes: the "Quotas for Amazon OpenSearch
+/// Serverless" page lists rows for collections, security policies and data access policies
+/// but none for data lifecycle policies, so this bound exists only to keep the store
+/// finite. It is answered with the modelled `ServiceQuotaExceededException` because that is
+/// the error `CreateLifecyclePolicy` declares for "more resources than the service allows",
+/// and it is set at the data-access-policy figure above, the other per-account policy cap
+/// this service carries. `LifecyclePolicyType` has the single value `retention`, so this
+/// bounds the whole map.
+pub const MAX_LIFECYCLE_POLICIES: usize = MAX_ACCESS_POLICIES;
 
 /// The most collection groups this emulator stores for one account in one Region.
 ///
@@ -768,6 +789,201 @@ impl AccessPolicyRecord {
     }
 }
 
+/// The `LifecyclePolicyType` whose documents carry retention rules: `retention`, the one
+/// value the model's own `LifecyclePolicyType` lists
+/// (`smithy_query(query="shape", shape="LifecyclePolicyType")`). The document syntax
+/// [`validate_retention_policy`] checks is this type's, so the check is keyed on it.
+pub const LIFECYCLE_POLICY_RETENTION: &str = "retention";
+
+/// The shortest `MinIndexRetention` a retention rule may name, in hours.
+///
+/// From AWS's "Amazon OpenSearch Serverless data lifecycle policies", which documents a
+/// rule's minimum retention period as a number of hours or days with "a minimum of 24
+/// hours" — so a rule asking for less names a window the service does not serve.
+pub const MIN_INDEX_RETENTION_HOURS: u64 = 24;
+
+/// The longest `MinIndexRetention` a retention rule may name, in hours: the same page's
+/// maximum of 3650 days (ten years), expressed in the hours a window is compared in.
+pub const MAX_INDEX_RETENTION_HOURS: u64 = 3650 * 24;
+
+/// The `MinIndexRetention` window `value` names, in hours, or why it names none.
+///
+/// AWS's data-lifecycle-policy syntax writes the window as a count followed by a unit —
+/// `24h` for hours or `7d` for days — so anything else is not a retention period at all.
+fn retention_hours(value: &str) -> Result<u64, String> {
+    let (count, unit_hours) = match value.as_bytes().last() {
+        Some(b'h') => (&value[..value.len() - 1], 1),
+        Some(b'd') => (&value[..value.len() - 1], 24),
+        _ => {
+            return Err(format!(
+                "{value:?} must be a count of hours or days, as in \"24h\" or \"7d\""
+            ))
+        }
+    };
+    // `str::parse` accepts a leading `+`, which the documented syntax does not: the count
+    // is a run of digits and nothing else.
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "{value:?} must be a count of hours or days, as in \"24h\" or \"7d\""
+        ));
+    }
+    let count: u64 = count
+        .parse()
+        .map_err(|_| format!("{value:?} names more hours than a retention window can hold"))?;
+    count
+        .checked_mul(unit_hours)
+        .ok_or_else(|| format!("{value:?} names more hours than a retention window can hold"))
+}
+
+/// Check a `retention` lifecycle policy document against the rule syntax AWS documents,
+/// answering the `ValidationException` message for the first thing wrong with it.
+///
+/// What the model cannot express: `PolicyDocument` is text with a character class, so the
+/// boundary validator says nothing about the document's CONTENT. AWS's "Amazon OpenSearch
+/// Serverless data lifecycle policies" documents that content — a `Rules` list, each rule
+/// naming `ResourceType`, the `Resource` entries it applies to, and either a
+/// `MinIndexRetention` window or `NoMinIndexRetention` for unlimited retention, never both
+/// — and this service's own model confirms the pair a read reports them as
+/// (`EffectiveLifecyclePolicyDetail$retentionPeriod`, "the minimum number of index
+/// retention in days or hours", beside `$noMinRetentionPeriod`, "`true` if the minimum
+/// number of days or hours is not set") and the single `ResourceType` value, `index`.
+pub fn validate_retention_policy(document: &serde_json::Value) -> Result<(), String> {
+    let Some(rules) = document.get("Rules") else {
+        return Err("policy must carry a Rules list".to_string());
+    };
+    let Some(rules) = rules.as_array() else {
+        return Err("policy.Rules must be a list of rules".to_string());
+    };
+    if rules.is_empty() {
+        return Err("policy.Rules must name at least one rule".to_string());
+    }
+    for (index, rule) in rules.iter().enumerate() {
+        let at = format!("policy.Rules[{index}]");
+        if !rule.is_object() {
+            return Err(format!("{at} must be an object"));
+        }
+
+        // `ResourceType`'s own value list in this service's model is the single value
+        // `index` (`smithy_query(query="shape", shape="ResourceType")`).
+        let resource_type = rule.get("ResourceType").and_then(serde_json::Value::as_str);
+        match resource_type {
+            Some(resource_type)
+                if crate::ops::types::RESOURCE_TYPE_VALUES.contains(&resource_type) => {}
+            Some(resource_type) => {
+                return Err(format!(
+                    "{at}.ResourceType must be one of [{}], got {resource_type:?}",
+                    crate::ops::types::RESOURCE_TYPE_VALUES.join(", ")
+                ))
+            }
+            None => return Err(format!("{at}.ResourceType must name a resource type")),
+        }
+
+        let Some(resources) = rule.get("Resource").and_then(serde_json::Value::as_array) else {
+            return Err(format!("{at}.Resource must be a list of resource names"));
+        };
+        if resources.is_empty() {
+            return Err(format!("{at}.Resource must name at least one resource"));
+        }
+        for resource in resources {
+            match resource.as_str() {
+                Some(resource) if !resource.is_empty() => {}
+                _ => {
+                    return Err(format!(
+                        "{at}.Resource entries must be non-empty resource names"
+                    ))
+                }
+            }
+        }
+
+        let no_minimum = match rule.get("NoMinIndexRetention") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                format!("{at}.NoMinIndexRetention must be true or false")
+            })?,
+        };
+        let minimum = rule.get("MinIndexRetention");
+        match (minimum, no_minimum) {
+            (Some(_), true) => {
+                return Err(format!(
+                    "{at} must name either MinIndexRetention or NoMinIndexRetention, not both"
+                ))
+            }
+            (None, false) => {
+                return Err(format!(
+                    "{at} must name either MinIndexRetention or NoMinIndexRetention"
+                ))
+            }
+            (None, true) => {}
+            (Some(minimum), false) => {
+                let Some(minimum) = minimum.as_str() else {
+                    return Err(format!(
+                        "{at}.MinIndexRetention must be a retention window, as in \"24h\""
+                    ));
+                };
+                let hours = retention_hours(minimum)
+                    .map_err(|why| format!("{at}.MinIndexRetention {why}"))?;
+                if !(MIN_INDEX_RETENTION_HOURS..=MAX_INDEX_RETENTION_HOURS).contains(&hours) {
+                    return Err(format!(
+                        "{at}.MinIndexRetention must be between {MIN_INDEX_RETENTION_HOURS}h \
+                         and {MAX_INDEX_RETENTION_HOURS}h, got {minimum:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One stored lifecycle policy, keyed by its `(type, name)` pair.
+///
+/// Held beside [`AccessPolicyRecord`] and [`SecurityPolicyRecord`] rather than sharing
+/// either: a lifecycle policy is its own resource with its own detail shape, its own `type`
+/// value list and its own reader, so `BatchGetLifecyclePolicy` must not be able to read a
+/// security or data access policy just because the names coincide.
+#[derive(Debug, Clone)]
+pub struct LifecyclePolicyRecord {
+    /// The `LifecyclePolicyType` wire value; named `kind` because `type` is a keyword.
+    pub kind: String,
+    pub name: String,
+    /// The `PolicyVersion` token, re-minted on every write; see
+    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    pub policy_version: String,
+    pub description: Option<String>,
+    /// The policy document, held PARSED so a read answers "the JSON policy document
+    /// without any whitespaces" (`LifecyclePolicyDetail$policy`) rather than the caller's
+    /// own formatting.
+    pub policy: ::aws_smithy_types::Document,
+    pub created_date: i64,
+    pub last_modified_date: i64,
+}
+
+impl LifecyclePolicyRecord {
+    /// The `LifecyclePolicyDetail` body for this record — the one place this crate renders
+    /// that shape, so a create cannot report a record differently from a later read.
+    pub fn detail(&self) -> LifecyclePolicyDetail {
+        LifecyclePolicyDetail {
+            r#type: Some(self.kind.clone()),
+            name: Some(self.name.clone()),
+            policy_version: Some(self.policy_version.clone()),
+            description: self.description.clone(),
+            policy: Some(self.policy.clone()),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+}
+
+/// A `LifecyclePolicyErrorDetail` for an `identifiers` entry that names no stored lifecycle
+/// policy.
+pub fn lifecycle_policy_error_for(kind: &str, name: &str) -> LifecyclePolicyErrorDetail {
+    LifecyclePolicyErrorDetail {
+        r#type: Some(kind.to_string()),
+        name: Some(name.to_string()),
+        error_message: Some(ERROR_MESSAGE_LIFECYCLE_POLICY_NOT_FOUND.to_string()),
+        error_code: Some(ERROR_CODE_NOT_FOUND.to_string()),
+    }
+}
+
 /// A `CollectionErrorDetail` for an `ids` entry that names no stored collection.
 pub fn collection_error_for_id(id: &str) -> CollectionErrorDetail {
     CollectionErrorDetail {
@@ -845,6 +1061,11 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Data access policies by `(AccessPolicyType, PolicyName)`, the pair that identifies
     /// one, exactly as `security_policies` is keyed.
     pub access_policies: BTreeMap<(String, String), AccessPolicyRecord>,
+    /// Lifecycle policies by `(LifecyclePolicyType, PolicyName)`, the pair
+    /// `BatchGetLifecyclePolicy`'s own `LifecyclePolicyIdentifier` addresses one by — and
+    /// a `BTreeMap`, so `ListLifecyclePolicies` walks one deterministic order a page token
+    /// can resume.
+    pub lifecycle_policies: BTreeMap<(String, String), LifecyclePolicyRecord>,
     /// `<operation>:<clientToken>` -> the key of the record that token's first call
     /// created, so a replayed `clientToken` on an `@idempotent` create answers the
     /// original record instead of creating a second one.
@@ -1127,6 +1348,26 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     pub fn access_policy_count(&self) -> usize {
         self.access_policies.len()
     }
+
+    /// The lifecycle policy a replayed `clientToken` on `operation` already created, if
+    /// any; see [`Self::replayed_collection`] for why a stale token answers `None`.
+    pub fn replayed_lifecycle_policy(
+        &self,
+        operation: &str,
+        token: &str,
+    ) -> Option<&LifecyclePolicyRecord> {
+        let key = self
+            .idempotency_tokens
+            .get(&idempotency_key(operation, token))?;
+        let (kind, name) = key.split_once('/')?;
+        self.lifecycle_policies
+            .get(&(kind.to_string(), name.to_string()))
+    }
+
+    /// The number of stored lifecycle policies, which [`MAX_LIFECYCLE_POLICIES`] bounds.
+    pub fn lifecycle_policy_count(&self) -> usize {
+        self.lifecycle_policies.len()
+    }
 }
 
 /// The `idempotency_tokens` key for `token` replayed against `operation`. The operation
@@ -1390,6 +1631,12 @@ pub fn audit(
 /// resource's records name their own.
 pub fn audit_access_policy_resource(kind: &str, name: &str) -> String {
     format!("access-policy/{kind}/{name}")
+}
+
+/// The `resource` field naming one lifecycle policy: its type and name, which is its
+/// identity in this API (`LifecyclePolicyIdentifier` is exactly that pair).
+pub fn audit_lifecycle_policy_resource(kind: &str, name: &str) -> String {
+    format!("lifecycle-policy/{kind}/{name}")
 }
 
 /// The `resource` field naming the account's own settings, which `UpdateAccountSettings`

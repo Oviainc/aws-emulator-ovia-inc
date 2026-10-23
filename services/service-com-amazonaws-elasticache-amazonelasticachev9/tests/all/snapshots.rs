@@ -303,7 +303,7 @@ async fn describe_filters_select_the_stored_snapshots() {
 
     // Each row: the filter, and the snapshots it selects — in the stable total
     // order the describe reports, which is by stored name.
-    let cases: [FilterCase; 9] = [
+    let cases: [FilterCase; 13] = [
         ("no filter", &[], vec!["snap-a", "snap-b", "snap-c"]),
         (
             "CacheClusterId",
@@ -333,6 +333,26 @@ async fn describe_filters_select_the_stored_snapshots() {
         (
             "SnapshotSource=system shows the automatic ones",
             &[("SnapshotSource", "system")],
+            vec![],
+        ),
+        (
+            "SnapshotSource=manual is the spelling the response reports",
+            &[("SnapshotSource", "manual")],
+            vec!["snap-a", "snap-b", "snap-c"],
+        ),
+        (
+            "SnapshotSource=automated is the spelling the response reports",
+            &[("SnapshotSource", "automated")],
+            vec![],
+        ),
+        (
+            "SnapshotSource is not case sensitive",
+            &[("SnapshotSource", "Manual")],
+            vec!["snap-a", "snap-b", "snap-c"],
+        ),
+        (
+            "a SnapshotName the store does not hold selects nothing",
+            &[("SnapshotName", "no-such-snap")],
             vec![],
         ),
         (
@@ -400,13 +420,7 @@ async fn a_describe_naming_what_the_store_does_not_hold_is_refused() {
     // Each row: the filter, and the HTTP status plus `awsQuery` error code it
     // must be answered with. `MaxRecords` walks its published bounds
     // ("Default: 50. Constraints: minimum 20; maximum 50") and one past each.
-    let cases: [RefusalCase; 10] = [
-        (
-            "unknown snapshot name",
-            &[("SnapshotName", "no-such-snap")],
-            404,
-            "SnapshotNotFoundFault",
-        ),
+    let cases: [RefusalCase; 9] = [
         (
             "unknown cluster id",
             &[("CacheClusterId", "no-such-cluster")],
@@ -414,8 +428,8 @@ async fn a_describe_naming_what_the_store_does_not_hold_is_refused() {
             "CacheClusterNotFound",
         ),
         (
-            "a SnapshotSource that names no creation source",
-            &[("SnapshotSource", "automated")],
+            "a SnapshotSource in neither vocabulary",
+            &[("SnapshotSource", "scheduled")],
             400,
             "InvalidParameterValue",
         ),
@@ -848,4 +862,321 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
         "a snapshot must outlive its source cluster, got {}",
         survivors.body
     );
+}
+
+#[tokio::test]
+async fn a_snapshot_name_the_store_does_not_hold_selects_an_empty_page() {
+    let emulator = Emulator::new();
+    create_available_cluster(&emulator, "probed", &[]).await;
+    for name in ["held-snap", "other-snap"] {
+        let created = create_snapshot(&emulator, name, "probed", &[]).await;
+        assert_eq!(
+            created.status, 200,
+            "case {name}: create must succeed, got {}",
+            created.body
+        );
+        // Taking a snapshot leaves the source cluster `snapshotting`.
+        std::thread::sleep(PAST_TRANSITION);
+    }
+
+    // `SnapshotName` NARROWS the page, so the axis is how the name relates to
+    // the stored set: one that matches, one that matches but for its case, a
+    // name no snapshot carries, a name that is a prefix or an extension of a
+    // stored one, a name of a different form, the empty name, and the longest
+    // name the service accepts.
+    let long_name = "n".repeat(255);
+    let rows: [(&str, &str, Vec<&str>); 8] = [
+        ("a stored name", "held-snap", vec!["held-snap"]),
+        ("a stored name in another case", "HELD-SNAP", vec!["held-snap"]),
+        ("the other stored name", "other-snap", vec!["other-snap"]),
+        ("a name nothing was created under", "no-such-snap", vec![]),
+        ("a prefix of a stored name", "held", vec![]),
+        ("an extension of a stored name", "held-snap-2", vec![]),
+        ("the empty name", "", vec![]),
+        ("the longest name the service accepts", long_name.as_str(), vec![]),
+    ];
+    for (case, name, expected) in rows {
+        let reply = describe_snapshots(&emulator, &[("SnapshotName", name)]).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: a name filter is answered with a page, not a fault; expected HTTP \
+             200, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "",
+            "case {case}: no error may be reported, got {}",
+            reply.body
+        );
+        assert_eq!(
+            reported_names(&reply),
+            expected,
+            "case {case}: expected {expected:?}, got {}",
+            reply.body
+        );
+        assert!(
+            reply.marker().is_none(),
+            "case {case}: a single-name page paginates nothing, got {}",
+            reply.body
+        );
+    }
+
+    // The probe changed nothing: the store still holds both snapshots, so a
+    // caller that polled for one that does not exist yet sees the same set.
+    let all = describe_snapshots(&emulator, &[]).await;
+    assert_eq!(
+        reported_names(&all),
+        vec!["held-snap", "other-snap"],
+        "case after probing: a describe must not change what a later caller sees, got {}",
+        all.body
+    );
+}
+
+#[tokio::test]
+async fn the_snapshot_source_filter_takes_the_spelling_the_response_reports() {
+    let emulator = Emulator::new();
+    create_available_cluster(&emulator, "sourced", &[]).await;
+    let created = create_snapshot(&emulator, "sourced-snap", "sourced", &[]).await;
+    assert_eq!(
+        created.status, 200,
+        "the snapshot must be created, got {}",
+        created.body
+    );
+
+    // The round trip the rule is about: read a snapshot's own
+    // `SnapshotSource`, then list only the snapshots of that source.
+    let reported_source = created
+        .text("Snapshot/SnapshotSource")
+        .unwrap_or_else(|| panic!("a snapshot reports its SnapshotSource: {}", created.body))
+        .to_string();
+    let round_trip = describe_snapshots(&emulator, &[("SnapshotSource", &reported_source)]).await;
+    assert_eq!(
+        round_trip.status, 200,
+        "case round trip {reported_source}: the spelling the API gave back must be accepted, \
+         got {} {}",
+        round_trip.status, round_trip.body
+    );
+    assert_eq!(
+        reported_names(&round_trip),
+        vec!["sourced-snap"],
+        "case round trip {reported_source}: the filter must select the snapshot that reported \
+         that source, got {}",
+        round_trip.body
+    );
+
+    // The accepted vocabulary, from the member's documentation ("If set to
+    // system … If set to user …") and from what `Snapshot$SnapshotSource`
+    // reports (`automated` / `manual`). The axis is which spelling of which
+    // source, and its case; the stored snapshot is manually created, so the
+    // manual spellings select it and the automatic ones select nothing.
+    let accepted: [(&str, Vec<&str>); 8] = [
+        ("user", vec!["sourced-snap"]),
+        ("manual", vec!["sourced-snap"]),
+        ("User", vec!["sourced-snap"]),
+        ("MANUAL", vec!["sourced-snap"]),
+        ("system", vec![]),
+        ("automated", vec![]),
+        ("System", vec![]),
+        ("AUTOMATED", vec![]),
+    ];
+    for (source, expected) in accepted {
+        let reply = describe_snapshots(&emulator, &[("SnapshotSource", source)]).await;
+        assert_eq!(
+            reply.status, 200,
+            "case SnapshotSource={source}: expected HTTP 200, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reported_names(&reply),
+            expected,
+            "case SnapshotSource={source}: expected {expected:?}, got {}",
+            reply.body
+        );
+    }
+
+    // A value in NEITHER vocabulary is still the modelled refusal. The axis is
+    // how it misses: another `UpdateActionStatus`-shaped word, a status of a
+    // snapshot rather than its source, a near miss, and the empty value.
+    for source in ["scheduled", "creating", "manually", "users", ""] {
+        let reply = describe_snapshots(&emulator, &[("SnapshotSource", source)]).await;
+        assert_eq!(
+            reply.status, 400,
+            "case SnapshotSource={source:?}: expected HTTP 400, got {} {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "InvalidParameterValue",
+            "case SnapshotSource={source:?}: expected InvalidParameterValue, got {}",
+            reply.body
+        );
+    }
+}
+
+/// One settings-change row: the case name, the cluster it runs on, the form
+/// pairs the immediate modify sends, and the element plus value that must
+/// report the change.
+type SettingsModifyCase = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+    &'static str,
+);
+
+/// One node-change row: the case name, the cluster it runs on, and the form
+/// pairs the immediate modify sends.
+type NodeModifyCase = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+#[tokio::test]
+async fn an_immediate_settings_modify_leaves_the_cluster_snapshotable() {
+    let emulator = Emulator::new();
+
+    // The axis: which member outside `PendingModifiedValues` the immediate
+    // modify changes. None of them is node work, so each is applied
+    // synchronously and the cluster stays settled — the applied value and a
+    // usable cluster state become visible together.
+    let rows: [SettingsModifyCase; 6] = [
+        (
+            "SnapshotRetentionLimit",
+            "settled-retention",
+            &[("SnapshotRetentionLimit", "3")],
+            "CacheCluster/SnapshotRetentionLimit",
+            "3",
+        ),
+        (
+            "SnapshotWindow",
+            "settled-window",
+            &[("SnapshotWindow", "04:00-05:00")],
+            "CacheCluster/SnapshotWindow",
+            "04:00-05:00",
+        ),
+        (
+            "PreferredMaintenanceWindow",
+            "settled-maintenance",
+            &[("PreferredMaintenanceWindow", "thu:07:00-thu:08:00")],
+            "CacheCluster/PreferredMaintenanceWindow",
+            "thu:07:00-thu:08:00",
+        ),
+        (
+            "AutoMinorVersionUpgrade",
+            "settled-upgrade",
+            &[("AutoMinorVersionUpgrade", "false")],
+            "CacheCluster/AutoMinorVersionUpgrade",
+            "false",
+        ),
+        (
+            "IpDiscovery",
+            "settled-discovery",
+            &[("IpDiscovery", "ipv6")],
+            "CacheCluster/IpDiscovery",
+            "ipv6",
+        ),
+        (
+            "NotificationTopicArn",
+            "settled-topic",
+            &[("NotificationTopicArn", "arn:aws:sns:us-east-1:000000000000:ec")],
+            "NotificationConfiguration/TopicArn",
+            "arn:aws:sns:us-east-1:000000000000:ec",
+        ),
+    ];
+
+    for (case, cluster, extra, element, expected) in rows {
+        create_available_cluster(&emulator, cluster, &[("Engine", "redis")]).await;
+        let mut pairs = params(&[("CacheClusterId", cluster), ("ApplyImmediately", "true")]);
+        pairs.extend(params(extra));
+        let modified = emulator.call("ModifyCacheCluster", &pairs).await;
+        assert_eq!(
+            modified.status, 200,
+            "case {case}: the modify must answer 200, got {}",
+            modified.body
+        );
+
+        // The documented way to confirm a modify landed: read the field back.
+        let described = describe_cluster(&emulator, cluster).await;
+        assert_eq!(
+            described.text(element),
+            Some(expected),
+            "case {case}: {element} must report the applied value, got {:?}",
+            described.text(element)
+        );
+        assert_eq!(
+            described.text("CacheCluster/CacheClusterStatus"),
+            Some("available"),
+            "case {case}: a settings change is no node work, so the cluster stays available, \
+             got {:?}",
+            described.text("CacheCluster/CacheClusterStatus")
+        );
+
+        // And the state-gated operation on that cluster is accepted straight
+        // away, with no wait between reading the value back and calling it.
+        let snapshot = create_snapshot(&emulator, &format!("{cluster}-snap"), cluster, &[]).await;
+        assert_eq!(
+            snapshot.status, 200,
+            "case {case}: CreateSnapshot must be accepted once the modified value is \
+             observable, got {} {}",
+            snapshot.status, snapshot.body
+        );
+        assert_eq!(
+            snapshot.error_code(),
+            "",
+            "case {case}: CreateSnapshot must report no error, got {}",
+            snapshot.body
+        );
+    }
+
+    // The contrast, on the same axis: a member `PendingModifiedValues` DOES
+    // model is node work, so an immediate modify of one leaves the cluster in
+    // the transient status and the state-gated call is refused until the clock
+    // settles it.
+    let node_rows: [NodeModifyCase; 2] = [
+        (
+            "EngineVersion",
+            "moving-version",
+            &[("EngineVersion", "7.0")],
+        ),
+        (
+            "CacheNodeType",
+            "moving-type",
+            &[("CacheNodeType", "cache.m7g.large")],
+        ),
+    ];
+    for (case, cluster, extra) in node_rows {
+        create_available_cluster(&emulator, cluster, &[("Engine", "redis")]).await;
+        let mut pairs = params(&[("CacheClusterId", cluster), ("ApplyImmediately", "true")]);
+        pairs.extend(params(extra));
+        let modified = emulator.call("ModifyCacheCluster", &pairs).await;
+        assert_eq!(
+            modified.status, 200,
+            "case {case}: the modify must answer 200, got {}",
+            modified.body
+        );
+        let described = describe_cluster(&emulator, cluster).await;
+        assert_eq!(
+            described.text("CacheCluster/CacheClusterStatus"),
+            Some("modifying"),
+            "case {case}: node work leaves the cluster transient, got {:?}",
+            described.text("CacheCluster/CacheClusterStatus")
+        );
+        let refused = create_snapshot(&emulator, &format!("{cluster}-snap"), cluster, &[]).await;
+        assert_eq!(
+            refused.error_code(),
+            "InvalidCacheClusterState",
+            "case {case}: a cluster doing node work refuses the state-gated call, got {} {}",
+            refused.status, refused.body
+        );
+        // The clock then owes it `available`, and the same call is accepted.
+        std::thread::sleep(PAST_TRANSITION);
+        let accepted = create_snapshot(&emulator, &format!("{cluster}-snap"), cluster, &[]).await;
+        assert_eq!(
+            accepted.status, 200,
+            "case {case}: once settled the state-gated call is accepted, got {} {}",
+            accepted.status, accepted.body
+        );
+    }
 }

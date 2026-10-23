@@ -283,9 +283,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connector_type,
             state: crate::state::STATE_PENDING.to_string(),
             pending: Some(provisioned.clone()),
-            // Both reason members explain a FAILED state, which a connector
-            // this emulator provisions never reaches.
-            state_reason: None,
+            // `StateReason` is the human-readable explanation of the state
+            // this call put the connector in, so it names the event: this
+            // creation. It is kept across the provisioning the clock owes,
+            // because that same creation is why the connector becomes ACTIVE.
+            state_reason: Some(crate::state::STATE_REASON_INITIAL_CREATION.to_string()),
+            // `StateReasonCode`'s values all name a provisioning FAILURE
+            // (`InvalidSubnet`, `InternalError`, …), which a connector this
+            // emulator provisions never reaches, so none of them describes
+            // this state.
             state_reason_code: None,
             // The update members report "the most recent update"; this
             // connector has never been updated.
@@ -304,6 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     configuration: input.configuration,
                     operator_role: input.operator_role,
                     state: crate::state::STATE_PENDING.to_string(),
+                    state_reason: Some(
+                        crate::state::STATE_REASON_INITIAL_CREATION.to_string(),
+                    ),
                     pending: Some(provisioned),
                     last_modified: now,
                 },

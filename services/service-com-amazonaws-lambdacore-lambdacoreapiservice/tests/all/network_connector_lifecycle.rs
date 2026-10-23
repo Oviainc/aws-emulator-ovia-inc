@@ -8,6 +8,10 @@
 //! resource: a connector's members are whatever the create, or a later configuration
 //! change, stored, every operation computes its answer from that record, and "each
 //! configuration update creates a new immutable version".
+//!
+//! The harness below (router, request helpers, the clock wait) is `pub(crate)` so the
+//! sibling suite `timestamp_and_state_reason_wire.rs` drives the emulator the same way
+//! rather than keeping a second copy of it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +25,7 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The URI prefix every operation of this service is bound under.
-const PREFIX: &str = "/2026-04-04/network-connectors";
+pub(crate) const PREFIX: &str = "/2026-04-04/network-connectors";
 
 /// A SigV4 credential scope naming this service's signing name (`lambda`). It is what
 /// routes a request here, and its region is what a connector ARN is built for.
@@ -37,12 +41,12 @@ const REGION: &str = "eu-west-1";
 const ACCOUNT: &str = "000000000000";
 
 /// The unqualified ARN the service must build for a connector named `name`.
-fn expected_arn(name: &str) -> String {
+pub(crate) fn expected_arn(name: &str) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT}:network-connector:{name}")
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
@@ -57,9 +61,9 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
@@ -74,7 +78,12 @@ impl Answer {
     }
 }
 
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let mut builder = ::http::Request::builder()
         .method(method)
@@ -104,19 +113,19 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
     Answer { status, body }
 }
 
-async fn create(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "POST", PREFIX, Some(request)).await
 }
 
-async fn get(router: &MultiServiceRouter, identifier: &str) -> Answer {
+pub(crate) async fn get(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(router, "GET", &format!("{PREFIX}/{identifier}"), None).await
 }
 
-async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
     call(router, "GET", &format!("{PREFIX}{query}"), None).await
 }
 
-async fn update(router: &MultiServiceRouter, identifier: &str, request: Value) -> Answer {
+pub(crate) async fn update(router: &MultiServiceRouter, identifier: &str, request: Value) -> Answer {
     call(
         router,
         "PUT",
@@ -126,11 +135,15 @@ async fn update(router: &MultiServiceRouter, identifier: &str, request: Value) -
     .await
 }
 
-async fn delete(router: &MultiServiceRouter, identifier: &str) -> Answer {
+pub(crate) async fn delete(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(router, "DELETE", &format!("{PREFIX}/{identifier}"), None).await
 }
 
-async fn list_versions(router: &MultiServiceRouter, identifier: &str, query: &str) -> Answer {
+pub(crate) async fn list_versions(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    query: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -140,11 +153,11 @@ async fn list_versions(router: &MultiServiceRouter, identifier: &str, query: &st
     .await
 }
 
-fn at(value: &Value, pointer: &str) -> Value {
+pub(crate) fn at(value: &Value, pointer: &str) -> Value {
     value.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
-fn text(value: &Value, pointer: &str) -> String {
+pub(crate) fn text(value: &Value, pointer: &str) -> String {
     at(value, pointer).as_str().unwrap_or_default().to_string()
 }
 
@@ -180,7 +193,7 @@ fn listed_versions(answer: &Answer) -> Vec<i64> {
 
 /// Wait out the span the clock owes an asynchronous transition, then a margin. Nothing is
 /// called here: the transition is owed by the clock, not by a request.
-fn wait_for_the_clock() {
+pub(crate) fn wait_for_the_clock() {
     std::thread::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(250));
 }
 
@@ -189,7 +202,7 @@ fn wait_for_the_clock() {
 /// `NetworkConnectorVpcEgressConfiguration` (SubnetIds 1..16, SecurityGroupIds 0..16,
 /// NetworkProtocol one of `IPv4` / `DualStack`, AssociatedComputeResourceTypes exactly one
 /// of `MicroVm` / `WebFunction`).
-fn vpc_egress(
+pub(crate) fn vpc_egress(
     subnets: &[&str],
     security_groups: &[&str],
     protocol: Option<&str>,
@@ -206,7 +219,7 @@ fn vpc_egress(
 }
 
 /// The simplest configuration a create can carry: one subnet, no security groups.
-fn minimal_configuration() -> Value {
+pub(crate) fn minimal_configuration() -> Value {
     vpc_egress(&["subnet-0123456789abcdef0"], &[], None, None)
 }
 

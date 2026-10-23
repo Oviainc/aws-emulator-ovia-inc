@@ -248,9 +248,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A stage AWS has just created holds no session yet.
             active_session_id: None,
             tags: input.tags.unwrap_or_default(),
-            auto_participant_recording_configuration: input
-                .auto_participant_recording_configuration,
-            endpoints: None,
+            // The configuration's documented defaults are applied in one place, so the
+            // stage a create attaches one to and the stage an update attaches one to
+            // report the same members.
+            auto_participant_recording_configuration:
+                crate::state::effective_recording_configuration(
+                    input.auto_participant_recording_configuration,
+                ),
+            // Assigned at creation, which is where the model's `StageEndpoints` doc
+            // tells a caller to cache them.
+            endpoints: crate::state::stage_endpoints(&arn),
             created_at: ::std::time::SystemTime::now(),
             sequence,
         };
