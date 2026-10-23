@@ -26,6 +26,8 @@ mod permission_policy;
 mod rate_based_rule_lifecycle;
 #[path = "all/regex_pattern_set.rs"]
 mod regex_pattern_set;
+#[path = "all/regex_pattern_set_updates.rs"]
+mod regex_pattern_set_updates;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rule_group_lifecycle.rs"]

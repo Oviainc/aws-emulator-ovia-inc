@@ -2,24 +2,25 @@
 
 //! Engine state for the com-amazonaws-amplify-amplify service.
 //!
-//! The persisted record for an app IS the modelled [`App`] structure, and the
-//! persisted record for a branch IS the modelled [`Branch`] structure. Keeping one
-//! copy of each resource — rather than a parallel struct with the same ~30 members
+//! The persisted record for a resource IS the modelled structure this service hands
+//! back for it: [`App`] for an app, [`Branch`] for a branch, [`Webhook`] for a
+//! webhook. Keeping one copy of each resource — rather than a parallel struct with the same ~30 members
 //! plus a conversion — is what makes `GetApp` after `CreateApp` return the created
 //! record field-for-field: a reader clones what the writer stored, so the two cannot
 //! drift.
 //!
-//! Branches live INSIDE their owning app, so `DeleteApp` removes them transitively
-//! and `ListBranches` can never reach another app's branches.
+//! Branches and webhooks live INSIDE their owning app, so `DeleteApp` removes them
+//! transitively and `ListBranches` / `ListWebhooks` can never reach another app's
+//! records.
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{App, Branch};
+use crate::ops::types::{App, Branch, Webhook};
 
 /// One Amplify app as this service persists it: the modelled record it hands back,
-/// plus the branches created on it, keyed by branch name.
+/// plus the branches and webhooks created on it.
 ///
-/// The maps are `BTreeMap`s, not `HashMap`s, because both list operations are
+/// The maps are `BTreeMap`s, not `HashMap`s, because the list operations are
 /// `@paginated` and a page boundary is only meaningful over a stable order: the
 /// `nextToken` a page returns is the key of the first record it did NOT return, so
 /// the next call resumes at that key.
@@ -29,14 +30,21 @@ pub struct AmplifyApp {
     pub app: App,
     /// The branches of this app, keyed by `branchName`.
     pub branches: BTreeMap<String, Branch>,
+    /// The webhooks of this app, keyed by `webhookId`.
+    ///
+    /// A webhook is created under an app (`POST /apps/{appId}/webhooks`) and is
+    /// addressed afterwards by its own id alone (`GET /webhooks/{webhookId}`), which
+    /// [`ComAmazonawsAmplifyAmplifyState::webhook`] resolves across the apps.
+    pub webhooks: BTreeMap<String, Webhook>,
 }
 
 impl AmplifyApp {
-    /// A newly created app with no branches.
+    /// A newly created app with no branches and no webhooks.
     pub fn new(app: App) -> Self {
         Self {
             app,
             branches: BTreeMap::new(),
+            webhooks: BTreeMap::new(),
         }
     }
 }
@@ -53,6 +61,8 @@ pub struct ComAmazonawsAmplifyAmplifyState {
     pub apps: BTreeMap<String, AmplifyApp>,
     /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_app_id`].
     pub next_app_id_seq: u64,
+    /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_webhook_id`].
+    pub next_webhook_id_seq: u64,
 }
 
 impl ComAmazonawsAmplifyAmplifyState {
@@ -70,16 +80,80 @@ impl ComAmazonawsAmplifyAmplifyState {
     pub fn mint_app_id(&mut self) -> String {
         loop {
             self.next_app_id_seq = self.next_app_id_seq.wrapping_add(1);
-            let clock = ::std::time::SystemTime::now()
-                .duration_since(::std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
-            let mixed = splitmix64(self.next_app_id_seq ^ clock.rotate_left(17));
-            let candidate = format!("d{}", base36_digits(mixed));
+            let candidate = format!("d{}", base36_digits(mixed(self.next_app_id_seq)));
             if !self.apps.contains_key(&candidate) {
                 return candidate;
             }
         }
     }
+
+    /// Mint a `webhookId` no webhook in state is using, and the opaque token that
+    /// authorises the webhook's own URL.
+    ///
+    /// `WebhookId` is modelled `length 0..255, pattern ^(?s)`
+    /// (`smithy_query(query="shape",shape="Webhook")`), so the format is the
+    /// service's rather than the model's: Amplify hands back a UUID, which is what
+    /// [`uuid_v4`] renders — 36 characters, inside the modelled bound.
+    ///
+    /// The token is minted in the same call because it is part of the same secret:
+    /// knowing a webhook's id is not enough to trigger it, so the URL carries a
+    /// second unguessable value. Both come from the same mixer that mints an app id,
+    /// so neither exposes the counter behind it, and the loop re-mints on a
+    /// collision, so two creates can never be handed the same id.
+    pub fn mint_webhook_id(&mut self) -> (String, String) {
+        loop {
+            self.next_webhook_id_seq = self.next_webhook_id_seq.wrapping_add(1);
+            let (high, low) = mixed_pair(self.next_webhook_id_seq);
+            let candidate = uuid_v4(high, low);
+            if self.webhook(&candidate).is_none() {
+                let (token_high, token_low) = mixed_pair(low ^ high);
+                return (candidate, format!("{token_high:016x}{token_low:016x}"));
+            }
+        }
+    }
+
+    /// The webhook `webhook_id` names, whichever app holds it.
+    ///
+    /// `GetWebhook`, `UpdateWebhook` and `DeleteWebhook` address a webhook by its id
+    /// alone, and an id is unique across the store (see [`Self::mint_webhook_id`]), so
+    /// the lookup is a scan of the apps for the one holding that id.
+    pub fn webhook(&self, webhook_id: &str) -> Option<&Webhook> {
+        self.apps
+            .values()
+            .find_map(|app| app.webhooks.get(webhook_id))
+    }
+}
+
+/// A counter value mixed with the wall clock through the SplitMix64 finaliser: the
+/// entropy every minted identifier in this service is built from, so an id does not
+/// expose a guessable sequence.
+fn mixed(seq: u64) -> u64 {
+    let clock = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+    splitmix64(seq ^ clock.rotate_left(17))
+}
+
+/// 128 bits of [`mixed`] entropy, for an identifier wider than a `u64`.
+fn mixed_pair(seq: u64) -> (u64, u64) {
+    let high = mixed(seq);
+    let low = splitmix64(high.rotate_left(32) ^ seq);
+    (high, low)
+}
+
+/// `high`/`low` rendered as a version-4 UUID: 32 hexadecimal digits in the 8-4-4-4-12
+/// grouping, with RFC 4122's version nibble (`4`) and variant bits (`10`) set.
+fn uuid_v4(high: u64, low: u64) -> String {
+    let high = (high & 0xFFFF_FFFF_FFFF_0FFF) | 0x0000_0000_0000_4000;
+    let low = (low & 0x3FFF_FFFF_FFFF_FFFF) | 0x8000_0000_0000_0000;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xFFFF,
+        high & 0xFFFF,
+        low >> 48,
+        low & 0xFFFF_FFFF_FFFF,
+    )
 }
 
 /// The SplitMix64 finaliser: an invertible bit mixer, so distinct inputs give
@@ -217,6 +291,9 @@ pub const APP_ENTITY: &str = "App";
 
 /// The entity name [`not_found_message`] uses for a branch addressed by `branchName`.
 pub const BRANCH_ENTITY: &str = "Branch";
+
+/// The entity name [`not_found_message`] uses for a webhook addressed by `webhookId`.
+pub const WEBHOOK_ENTITY: &str = "Webhook";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

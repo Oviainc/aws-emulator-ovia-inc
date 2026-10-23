@@ -33,6 +33,8 @@ mod coip_pools;
 mod copy_volumes;
 #[path = "all/create_security_group.rs"]
 mod create_security_group;
+#[path = "all/dedicated_hosts.rs"]
+mod dedicated_hosts;
 #[path = "all/default_network.rs"]
 mod default_network;
 #[path = "all/delete_vpc.rs"]
