@@ -6,6 +6,10 @@
 //! creates or updates a parameter and `GetParameter` reads one back. Both reach the one
 //! store below, so whatever a put persisted is what a later get reports.
 //!
+//! The second slice is the **managed-node inventory** the node describes report: one
+//! record per node that registered with this Region's Systems Manager endpoint
+//! ([`ManagedNodeRecord`]).
+//!
 //! A parameter lives at a name that is unique *within a Region* (the `PutParameter`
 //! `Name` doc: "A parameter name must be unique within an Amazon Web Services Region"),
 //! so the store is keyed by `(region, canonical name)`. Each parameter holds its
@@ -13,18 +17,23 @@
 //! version rather than replacing the old one, which is what lets a `name:version`
 //! selector resolve an earlier value.
 //!
-//! The second is the **managed nodes** the console-facing describes report
-//! ([`ManagedNodeRecord`]), keyed by `(region, node id)` and filtered by the keys
-//! [`is_node_filter_key`] accepts.
+//! The second is the **managed nodes** the node describes report
+//! ([`ManagedNodeRecord`]), keyed by `(region, node id)`: `DescribeInstanceProperties`
+//! projects a node's `properties` and `DescribeInstanceInformation` projects the same
+//! record through [`ManagedNodeRecord::to_instance_information`], so both report the one
+//! stored node. A node enters the store only by registering — nothing here invents one —
+//! so an account that has registered none is reported as holding none. The filter keys a
+//! describe accepts are [`is_node_filter_key`] (the property describe) and
+//! [`is_instance_information_filter_key`] (the string-filter describe).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    InstanceProperty, Parameter, Tag, ASSOCIATION_STATUS_NAME_VALUES,
-    INSTANCE_PROPERTY_FILTER_KEY_VALUES, PING_STATUS_VALUES, PLATFORM_TYPE_VALUES,
-    RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
+    InstanceInformation, InstanceProperty, Parameter, Tag, ASSOCIATION_STATUS_NAME_VALUES,
+    INSTANCE_INFORMATION_FILTER_KEY_VALUES, INSTANCE_PROPERTY_FILTER_KEY_VALUES,
+    PING_STATUS_VALUES, PLATFORM_TYPE_VALUES, RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
@@ -468,6 +477,155 @@ pub fn parse_parameter_query(name: &str) -> Option<ParameterQuery<'_>> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The string filters `DescribeInstanceInformation` accepts
+// ---------------------------------------------------------------------------
+//
+// The same managed nodes as the property describe reaches, through the filter vocabulary
+// `DescribeInstanceInformation`'s own `Filters` member publishes.
+
+/// The filter keys `DescribeInstanceInformation`'s `Filters` accepts beside the two tag
+/// forms: "Valid filter key values: ActivationIds | AgentVersion | AssociationStatus |
+/// IamRole | InstanceIds | PingStatus | PlatformTypes | ResourceType | SourceIds |
+/// SourceTypes | "tag-key" | "tag:{keyname}"" (the `InstanceInformationStringFilter$Key`
+/// doc). It is the property describe's set ([`is_node_filter_key`]) without
+/// `DocumentName`, which that operation's filter publishes and this one's does not.
+pub const INSTANCE_INFORMATION_FILTER_KEYS: &[&str] = &[
+    "ActivationIds",
+    "AgentVersion",
+    "AssociationStatus",
+    "IamRole",
+    "InstanceIds",
+    "PingStatus",
+    "PlatformTypes",
+    "ResourceType",
+    "SourceIds",
+    "SourceTypes",
+];
+
+/// Whether `key` names a tag rather than a property of a node ([`TAG_KEY_FILTER_KEY`] or
+/// a [`TAG_FILTER_KEY_PREFIX`] key).
+pub fn is_tag_filter_key(key: &str) -> bool {
+    key == TAG_KEY_FILTER_KEY || key.starts_with(TAG_FILTER_KEY_PREFIX)
+}
+
+/// Whether `key` is a filter key `DescribeInstanceInformation`'s `Filters` documents.
+///
+/// `tag:` must name a tag key after the colon, so `tag:` alone is not one. The
+/// comparison is exact, as it is for the property describe: a filter key is a name, so
+/// neither a different spelling nor a different case names a property of a node.
+pub fn is_instance_information_filter_key(key: &str) -> bool {
+    if let Some(tag_key) = key.strip_prefix(TAG_FILTER_KEY_PREFIX) {
+        return !tag_key.is_empty();
+    }
+    key == TAG_KEY_FILTER_KEY || INSTANCE_INFORMATION_FILTER_KEYS.contains(&key)
+}
+
+/// Whether `key` is a key the legacy `InstanceInformationFilterList` accepts — the
+/// modelled `InstanceInformationFilterKey` enum, which carries no tag form ("The
+/// `InstanceInformationFilterList` method is a legacy method and doesn't support tags").
+pub fn is_legacy_node_filter_key(key: &str) -> bool {
+    INSTANCE_INFORMATION_FILTER_KEY_VALUES.contains(&key)
+}
+
+/// Whether `id` is an activation id — the modelled `ActivationId` pattern
+/// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
+pub fn is_activation_id(id: &str) -> bool {
+    let mut groups = id.split('-');
+    for width in [8usize, 4, 4, 4, 12] {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// Whether `version` is an SSM Agent version — the modelled `Version` pattern
+/// `^[0-9]{1,6}(\.[0-9]{1,6}){2,3}$`: three or four dot-separated runs of 1..6 digits.
+pub fn is_agent_version(version: &str) -> bool {
+    let groups: Vec<&str> = version.split('.').collect();
+    (3..=4).contains(&groups.len())
+        && groups
+            .iter()
+            .all(|group| (1..=6).contains(&group.len()) && group.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Why `value` is not a value the node attribute `key` filters could hold, or `None`
+/// when it could be one.
+///
+/// The rule is one sentence: a filter value has to be a legal value of the member it
+/// filters, as the model constrains that member — one of its enum's values
+/// ([`node_filter_key_value_set`]), or a string matching its pattern. A key whose member
+/// the model leaves unconstrained (`IamRole`, `SourceIds`, a tag) constrains nothing
+/// here, and a node id is checked by its caller, which answers it with the operation's
+/// own `InvalidInstanceId` rather than with a filter-value error.
+pub fn node_filter_value_rejection(key: &str, value: &str) -> Option<String> {
+    if let Some(catalog) = node_filter_key_value_set(key) {
+        if !catalog.contains(&value) {
+            return Some(format!(
+                "Value '{value}' for filter key '{key}' is not valid: valid values are {}",
+                catalog.join(" | ")
+            ));
+        }
+        return None;
+    }
+    match key {
+        "ActivationIds" if !is_activation_id(value) => Some(format!(
+            "Value '{value}' for filter key '{key}' is not an activation id"
+        )),
+        "AgentVersion" if !is_agent_version(value) => Some(format!(
+            "Value '{value}' for filter key '{key}' is not an SSM Agent version"
+        )),
+        _ => None,
+    }
+}
+
+/// The `PingStatus` a node that has just pinged the service carries (from the modelled
+/// enum, `crate::ops::types::PING_STATUS_VALUES`).
+pub const PING_STATUS_ONLINE: &str = "Online";
+
+/// The `ResourceType` of a node that is an EC2 instance (from the modelled enum,
+/// `crate::ops::types::RESOURCE_TYPE_VALUES`).
+pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "EC2Instance";
+
+/// The `ResourceType` of a node registered through a hybrid activation (same enum).
+pub const RESOURCE_TYPE_MANAGED_INSTANCE: &str = "ManagedInstance";
+
+// ---------------------------------------------------------------------------
+// Paging a node report
+// ---------------------------------------------------------------------------
+
+/// How many nodes a page holds when the request names no `MaxResults`: "The default
+/// value is 10 items" (`DescribeInstanceInformationRequest$MaxResults`).
+pub const DEFAULT_NODE_PAGE_SIZE: i32 = 10;
+
+/// The bounds the modelled `MaxResultsEC2Compatible` carries (range 5..50).
+pub const MIN_NODE_PAGE_SIZE: i32 = 5;
+
+/// See [`MIN_NODE_PAGE_SIZE`].
+pub const MAX_NODE_PAGE_SIZE: i32 = 50;
+
+/// The page size a node report serves, or the refusal message for a `MaxResults` outside
+/// the modelled range — which the protocol's boundary validator already refuses, so this
+/// is a backstop rather than the first line of defence.
+pub fn node_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    let requested = max_results.unwrap_or(DEFAULT_NODE_PAGE_SIZE);
+    if !(MIN_NODE_PAGE_SIZE..=MAX_NODE_PAGE_SIZE).contains(&requested) {
+        return Err(format!(
+            "Value '{requested}' at 'maxResults' failed to satisfy constraint: Member must be \
+             between {MIN_NODE_PAGE_SIZE} and {MAX_NODE_PAGE_SIZE}"
+        ));
+    }
+    Ok(requested as usize)
+}
+
+/// How this service states a `NextToken` it did not issue. `InvalidNextToken`'s own
+/// documentation is "The specified token isn't valid".
+pub const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
+
 /// Per-service state for com-amazonaws-ssm-amazonssm. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsmAmazonssmState {
@@ -478,8 +636,9 @@ pub struct ComAmazonawsSsmAmazonssmState {
 
     /// Every managed node, keyed by `(region, node id)`: a node is registered with the
     /// Systems Manager endpoint of one Region and is identified there by its node id. A
-    /// `BTreeMap` so a describe walks a stable, total order and can resume a page from
-    /// the id it stopped at.
+    /// `BTreeMap` so a describe walks a stable, total order — ascending by node id
+    /// within one Region, whatever order its nodes registered in — and can resume a page
+    /// from the id it stopped at rather than from an offset.
     ///
     /// Nothing registers a node yet: registration is the SSM Agent's own call, which
     /// this service's model does not expose, and every operation that would admit one
@@ -521,7 +680,8 @@ impl ComAmazonawsSsmAmazonssmState {
     }
 
     /// Every managed node `region` holds, in ascending node-id order, as
-    /// `(node id, record)`.
+    /// `(node id, record)`. The order is what makes a describe's resume cursor total: it
+    /// is a node id, not an offset into a list that may have changed.
     pub fn managed_nodes_in_region<'a>(
         &'a self,
         region: &'a str,
@@ -699,17 +859,24 @@ pub fn operator_matches(operator: &str, held: &str, wanted: &str) -> bool {
     }
 }
 
-/// One managed node, as the console-facing describes report it.
+/// One managed node, as the node describes report it.
 ///
 /// `properties` is the modelled `InstanceProperty` itself, so a describe reports what
 /// was persisted rather than a second copy of it; `tags` is what the `tag-key` and
-/// `tag:<name>` filter keys match against, which no response member carries.
+/// `tag:<name>` filter keys match against, which no response member carries;
+/// `is_latest_version` is the one member `InstanceInformation` reports that
+/// `InstanceProperty` has no place for, so the record holds it beside them rather than
+/// in a second node store.
 #[derive(Debug, Clone, Default)]
 pub struct ManagedNodeRecord {
     /// Everything a describe reports about this node.
     pub properties: InstanceProperty,
     /// The node's tags, keyed by tag key.
     pub tags: BTreeMap<String, String>,
+    /// Whether the node runs the latest SSM Agent, as the agent last reported
+    /// (`InstanceInformation$IsLatestVersion`). `None` for a node that has reported no
+    /// agent version, rather than a guess either way.
+    pub is_latest_version: Option<bool>,
 }
 
 impl ManagedNodeRecord {
@@ -767,6 +934,68 @@ impl ManagedNodeRecord {
                 .iter()
                 .any(|wanted| operator_matches(operator, held, wanted))
         })
+    }
+
+    /// A node registering now: the id it registered under and which kind of node it is
+    /// (a `ResourceType` value).
+    ///
+    /// A node that has just completed registration pinged the service to do it, so it
+    /// starts `Online` with that ping and that registration date recorded; every other
+    /// property is left for whatever registered it to fill in.
+    pub fn registering(
+        instance_id: impl Into<String>,
+        resource_type: impl Into<String>,
+        at: SystemTime,
+    ) -> Self {
+        let at = ::aws_smithy_types::DateTime::from(at);
+        Self {
+            properties: InstanceProperty {
+                instance_id: Some(instance_id.into()),
+                resource_type: Some(resource_type.into()),
+                ping_status: Some(PING_STATUS_ONLINE.to_string()),
+                last_ping_date_time: Some(at),
+                registration_date: Some(at),
+                ..InstanceProperty::default()
+            },
+            tags: BTreeMap::new(),
+            is_latest_version: None,
+        }
+    }
+
+    /// The modelled `InstanceInformation` for this node — the same stored node
+    /// `properties` reports, through the members `DescribeInstanceInformation` answers
+    /// with.
+    ///
+    /// Every member is copied from what was persisted; the ones `InstanceProperty` does
+    /// not carry (`IsLatestVersion`) come from the record's own field, and the ones
+    /// neither carries are left unset rather than invented.
+    pub fn to_instance_information(&self) -> InstanceInformation {
+        let held = &self.properties;
+        InstanceInformation {
+            instance_id: held.instance_id.clone(),
+            ping_status: held.ping_status.clone(),
+            last_ping_date_time: held.last_ping_date_time,
+            agent_version: held.agent_version.clone(),
+            is_latest_version: self.is_latest_version,
+            platform_type: held.platform_type.clone(),
+            platform_name: held.platform_name.clone(),
+            platform_version: held.platform_version.clone(),
+            activation_id: held.activation_id.clone(),
+            iam_role: held.iam_role.clone(),
+            registration_date: held.registration_date,
+            resource_type: held.resource_type.clone(),
+            name: held.name.clone(),
+            ip_address: held.ip_address.clone(),
+            computer_name: held.computer_name.clone(),
+            association_status: held.association_status.clone(),
+            last_association_execution_date: held.last_association_execution_date,
+            last_successful_association_execution_date: held
+                .last_successful_association_execution_date,
+            association_overview: held.association_overview.clone(),
+            source_id: held.source_id.clone(),
+            source_type: held.source_type.clone(),
+            source_location: held.source_location.clone(),
+        }
     }
 }
 

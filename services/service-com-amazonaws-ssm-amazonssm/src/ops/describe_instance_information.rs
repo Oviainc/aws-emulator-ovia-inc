@@ -1,15 +1,62 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceInformation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceInformation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the managed nodes this Region's Systems Manager endpoint holds — the ones that
+//! registered with it — narrowed by the request's filters and served one page at a time.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceInformation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the node inventory in [`crate::state`]
+//! (`ComAmazonawsSsmAmazonssmState::managed_nodes`), which a node enters only by
+//! registering: an EC2 instance whose SSM Agent registers, or a hybrid node installed
+//! with an activation code. Nothing here invents a node, so an account that has
+//! registered none is reported as holding none — the same answer AWS gives for an
+//! instance that never came under Systems Manager management. Nothing here writes
+//! either: a report must not change what a later caller sees.
+//!
+//! ## Which requests are refused, and with which modelled error
+//!
+//! * A filter key the operation does not document — anything outside
+//!   [`crate::state::INSTANCE_INFORMATION_FILTER_KEYS`] and the two tag forms — is
+//!   `InvalidFilterKey` ("The specified key isn't valid"). The shape models no `message`
+//!   member, so the refusal is bare; that is the model's choice, not a lost message.
+//! * A tag filter combined with a filter of any other type is the same
+//!   `InvalidFilterKey`: "Tag filters can't be combined with other filter types"
+//!   (`DescribeInstanceInformationRequest$Filters`), so in that combination the key is
+//!   not one the operation accepts.
+//! * A value that could not be a value of the node attribute its key filters is
+//!   `InvalidInstanceInformationFilterValue` ("The specified filter value isn't valid"),
+//!   except for a node id, where the operation documents its own error: "If you specify
+//!   a node ID that isn't valid … you receive an error" → `InvalidInstanceId`. A node id
+//!   that is well formed but names no registered node is NOT a refusal: it simply
+//!   matches nothing, which is how a caller asks whether an instance is managed.
+//! * `Filters` and `InstanceInformationFilterList` together are a `ValidationException`:
+//!   "Attempting to use InstanceInformationFilterList and Filters leads to an exception
+//!   error" (`DescribeInstanceInformationRequest$InstanceInformationFilterList`), which
+//!   this operation models no error for.
+//! * A `NextToken` this service did not issue is `InvalidNextToken`.
+//!
+//! ## Filtering and paging
+//!
+//! Filters intersect and each filter's values union: a node is reported when, for every
+//! filter, one of that filter's values is one of the node's values for that key. A page
+//! holds `MaxResults` nodes (default 10, the modelled range 5..50), and the `NextToken`
+//! is the id of the node the next page starts at — the same cursor the sibling
+//! `DescribeInstanceProperties` hands out — so a page resumes at an id rather than at an
+//! offset into a list that may have changed. That cursor is total because the inventory
+//! is keyed by `(region, node id)` and therefore walked in ascending node-id order,
+//! whatever order its nodes registered in
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::managed_nodes_in_region`]).
+//!
+//! ## Nodes this report leaves out
+//!
+//! "This operation does not return information for nodes that are either Stopped or
+//! Terminated" — an instance lifecycle state the inventory does not model, because the
+//! inventory records REGISTRATIONS rather than instances and no operation of this
+//! emulator registers or deregisters one yet (`DeregisterManagedInstance` is still a
+//! scaffold, as is every other node API). So no node is dropped for its state here;
+//! whatever registered is what is reported. The exclusion becomes implementable with the
+//! registration path, which is that operation's own issue — inventing a lifecycle state
+//! for a node nothing registered would be inventing the node.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +219,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceInformation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceInformationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceInformation"))
+        use crate::state::{
+            is_instance_information_filter_key, is_legacy_node_filter_key, is_tag_filter_key,
+            managed_node_id_is_well_formed, node_page_size, request_region, INVALID_NEXT_TOKEN,
+            OPERATOR_EQUAL,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeInstanceInformationErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let string_filters = input.filters.as_deref().unwrap_or_default();
+        let legacy_filters = input
+            .instance_information_filter_list
+            .as_deref()
+            .unwrap_or_default();
+
+        // "Attempting to use InstanceInformationFilterList and Filters leads to an
+        // exception error" — the two members are alternatives, not a union.
+        if !string_filters.is_empty() && !legacy_filters.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters and InstanceInformationFilterList can't be used in the same request: \
+                 use Filters, which supersedes the legacy InstanceInformationFilterList",
+            ));
+        }
+
+        // "Tag filters can't be combined with other filter types."
+        let tag_filters = string_filters
+            .iter()
+            .filter(|filter| is_tag_filter_key(&filter.key))
+            .count();
+        if tag_filters != 0 && tag_filters != string_filters.len() {
+            return Err(invalid_filter_key());
+        }
+
+        for filter in string_filters {
+            if !is_instance_information_filter_key(&filter.key) {
+                return Err(invalid_filter_key());
+            }
+            check_filter_values(&filter.key, &filter.values)?;
+        }
+        for filter in legacy_filters {
+            // The legacy list's key is the modelled `InstanceInformationFilterKey` enum,
+            // which carries no tag form: "The InstanceInformationFilterList method is a
+            // legacy method and doesn't support tags". The boundary validator refuses a
+            // key outside that enum before this handler runs, so this is a backstop.
+            if !is_legacy_node_filter_key(&filter.key) {
+                return Err(invalid_filter_key());
+            }
+            check_filter_values(&filter.key, &filter.value_set)?;
+        }
+
+        let page_size = node_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the node the next page starts
+        // at — the sibling node describe's cursor — so a token that is not shaped like a
+        // node id was not one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if managed_node_id_is_well_formed(token) => Some(token),
+            Some(_) => {
+                return Err(DescribeInstanceInformationErrorModeled::InvalidNextToken(
+                    InvalidNextToken {
+                        message: Some(INVALID_NEXT_TOKEN.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Systems Manager is regional: a node is reported through the endpoint it
+        // registered with, which is the Region this request was signed for. The
+        // inventory yields that Region's nodes in ascending node-id order, which is what
+        // makes the resume cursor total.
+        let region = request_region(ctx.parts());
+        let store = state.lock();
+        let mut instance_information_list = Vec::new();
+        let mut next_token = None;
+        for (id, node) in store.managed_nodes_in_region(&region) {
+            if resume_from.is_some_and(|from| id < from) {
+                continue;
+            }
+            // A string filter compares whole values and carries no operator, so every
+            // filter of either list is served with `Equal`.
+            if !string_filters
+                .iter()
+                .all(|filter| node.matches_filter(&filter.key, &filter.values, OPERATOR_EQUAL))
+            {
+                continue;
+            }
+            if !legacy_filters
+                .iter()
+                .all(|filter| node.matches_filter(&filter.key, &filter.value_set, OPERATOR_EQUAL))
+            {
+                continue;
+            }
+            if instance_information_list.len() == page_size {
+                // The page is full and a node is still waiting: hand the caller the id it
+                // resumes at, so the next request continues where this one stopped.
+                next_token = Some(id.to_string());
+                break;
+            }
+            instance_information_list.push(node.to_instance_information());
+        }
+
+        Ok(DescribeInstanceInformationOutput {
+            instance_information_list: Some(instance_information_list),
+            next_token,
+        })
     }
+}
+
+/// The modelled refusal for a filter key this operation does not accept: "The specified
+/// key isn't valid". The shape declares no members, so it carries no message.
+fn invalid_filter_key() -> DescribeInstanceInformationError {
+    DescribeInstanceInformationErrorModeled::InvalidFilterKey(InvalidFilterKey {}).into()
+}
+
+/// Refuse every value of one filter that could not be a value of the node attribute its
+/// key filters.
+///
+/// A node id has its own modelled error — "If you specify a node ID that isn't valid …
+/// you receive an error" — and every other key's bad value is the filter-value error.
+fn check_filter_values(key: &str, values: &[String]) -> Result<(), DescribeInstanceInformationError> {
+    for value in values {
+        if key == "InstanceIds" {
+            if !crate::state::managed_node_id_is_well_formed(value) {
+                return Err(DescribeInstanceInformationErrorModeled::InvalidInstanceId(
+                    InvalidInstanceId {
+                        message: Some(format!(
+                            "Value '{value}' for filter key '{key}' is not a managed node ID: a \
+                             node ID is 'i-' and 8 or 17 characters, or 'mi-' and 17 characters"
+                        )),
+                    },
+                )
+                .into());
+            }
+            continue;
+        }
+        if let Some(reason) = crate::state::node_filter_value_rejection(key, value) {
+            return Err(
+                DescribeInstanceInformationErrorModeled::InvalidInstanceInformationFilterValue(
+                    InvalidInstanceInformationFilterValue {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
+        }
+    }
+    Ok(())
 }
