@@ -17,6 +17,8 @@ mod account_configuration;
 mod account_configuration_tokens;
 #[path = "all/acme_endpoint_lifecycle.rs"]
 mod acme_endpoint_lifecycle;
+#[path = "all/acme_endpoint_update.rs"]
+mod acme_endpoint_update;
 #[path = "all/certificate_detail_projection.rs"]
 mod certificate_detail_projection;
 #[path = "all/certificate_domain_validations.rs"]
