@@ -16,7 +16,7 @@
 //! ladder the names encode.
 //!
 //! The inputs are the axes that rule generalises over — the current node type's
-//! position on the ladder (floor, middle, ceiling, unplaceable, absent), its
+//! position on the ladder (floor, middle, ceiling, absent), its
 //! generation, and the engine and engine version that decide which families the
 //! cluster can run. The catalogue is finite and published, so the invariant
 //! test ENUMERATES it rather than sampling it with a generator crate.
@@ -216,17 +216,6 @@ async fn the_lists_are_the_catalogue_split_around_the_stored_node_type() {
             down_is_empty: true,
         },
         Case {
-            // A node type whose size is not one the catalogue's names encode:
-            // unplaceable for the same reason.
-            id: "unplaceable-node-type",
-            extra: &[("CacheNodeType", "cache.m5.enormous")],
-            up: &[],
-            down: &[],
-            absent: &["cache.m5.large", "cache.m5.24xlarge"],
-            up_is_empty: true,
-            down_is_empty: true,
-        },
-        Case {
             // A cluster RUNNING a previous-generation type still scales, onto
             // the current-generation types above and below its size.
             id: "previous-generation-cluster",
@@ -241,18 +230,6 @@ async fn the_lists_are_the_catalogue_split_around_the_stored_node_type() {
             ],
             up_is_empty: false,
             down_is_empty: false,
-        },
-        Case {
-            // A size multiplier past the end of the rank range: no size the
-            // catalogue names, so the name is unplaceable rather than a rank
-            // the arithmetic had to wrap to produce.
-            id: "overflowing-node-type",
-            extra: &[("CacheNodeType", "cache.m5.4294967295xlarge")],
-            up: &[],
-            down: &[],
-            absent: &["cache.m5.large", "cache.m5.24xlarge"],
-            up_is_empty: true,
-            down_is_empty: true,
         },
         Case {
             // A node type name is read case-insensitively: the catalogue spells
@@ -326,6 +303,31 @@ async fn the_lists_are_the_catalogue_split_around_the_stored_node_type() {
         shouted.body,
         as_created.body
     );
+}
+
+#[test]
+fn a_node_type_outside_the_catalogue_has_no_position_to_scale_from() {
+    // A node type the catalogue does not name cannot reach the store any more —
+    // every operation that persists one refuses it — so the split's own
+    // unplaceable branch is asserted on the function the handler calls. The axis
+    // is the FORM of the unplaceable name: a size no family names, a size
+    // multiplier past the end of the rank range, a name with no size segment at
+    // all, and one with too many.
+    for node_type in [
+        "cache.m5.enormous",
+        "cache.m5.4294967295xlarge",
+        "cache.m5",
+        "cache.m5.large.extra",
+        "m5.large",
+    ] {
+        let allowed = op::allowed_node_type_modifications("redis", "7.1", Some(node_type));
+        assert_eq!(
+            allowed,
+            op::AllowedNodeTypeModifications::default(),
+            "case {node_type}: an unplaceable node type must be scaled from in neither direction, \
+             got {allowed:?}"
+        );
+    }
 }
 
 /// Every node type in the catalogue, with the family flags it carries.

@@ -457,6 +457,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The node type a modify moves the cluster onto must be one the service
+        // publishes, the same catalogue `CreateCacheCluster` checks against — a
+        // cluster cannot be modified onto a shape it could not be created with.
+        // Checked after the cluster is resolved and before anything is written,
+        // so an absent cluster is still answered `CacheClusterNotFound` and a
+        // refused modify leaves the stored record untouched.
+        if let Some(node_type) = input.cache_node_type.as_deref() {
+            if let Err(message) =
+                crate::ops::list_allowed_node_type_modifications::validate_node_type(node_type)
+            {
+                return Err(
+                    ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // `CacheNodeIdsToRemove` and `NewAvailabilityZones` only mean anything
         // beside a `NumCacheNodes` that removes / adds nodes, so a request that
         // names one without it is refused rather than answered 200 with the

@@ -82,7 +82,10 @@ fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
 /// built through the state module the handler would use; the status is settled
 /// here rather than slept for, because the transition this test is about is the
 /// one each MUTATION starts.
-fn seed_global_datastore(
+///
+/// `pub(crate)` so the sibling suites of this target seed the one store the same
+/// way instead of carrying a second copy of this.
+pub(crate) fn seed_global_datastore(
     emulator: &Emulator,
     id: &str,
     node_groups: i32,

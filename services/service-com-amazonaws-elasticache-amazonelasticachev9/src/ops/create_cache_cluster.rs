@@ -368,6 +368,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `CacheNodeType` carries no modelled enum or `@pattern`, so the
+        // catalogue the member's own documentation publishes is what says which
+        // names exist; a name outside it is no node type the service could ever
+        // run, so the create is refused rather than persisting a cluster shape
+        // that cannot exist. Checked before anything is written.
+        if let Some(node_type) = input.cache_node_type.as_deref() {
+            if let Err(message) =
+                crate::ops::list_allowed_node_type_modifications::validate_node_type(node_type)
+            {
+                return Err(CreateCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // A port is a TCP port: the member is an `IntegerOptional` with no
         // modelled range, so the bound is enforced here.
         if let Some(port) = input.port {

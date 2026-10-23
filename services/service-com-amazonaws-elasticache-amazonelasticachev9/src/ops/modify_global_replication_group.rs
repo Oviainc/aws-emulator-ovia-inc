@@ -242,6 +242,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The node type the datastore moves to must be one the service
+        // publishes, the same catalogue `CreateCacheCluster` and
+        // `ModifyCacheCluster` check against. Checked after the datastore is
+        // resolved and its state gate evaluated, and before anything is
+        // written, so an absent datastore is still answered
+        // `GlobalReplicationGroupNotFound` and a refused modify leaves the
+        // stored record untouched.
+        if let Some(node_type) = input.cache_node_type.as_deref() {
+            if let Err(message) =
+                crate::ops::list_allowed_node_type_modifications::validate_node_type(node_type)
+            {
+                return Err(
+                    ModifyGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // Every member the request names is persisted, so the datastore reports
         // what was asked for and not what it had.
         if let Some(engine) = engine {

@@ -126,8 +126,16 @@ impl From<ListAllowedNodeTypeModificationsErrorModeled> for ListAllowedNodeTypeM
 //
 // A node type is not an account resource: it is an item of the catalogue the
 // service publishes, which every account sees the same and which no operation
-// creates or changes. It therefore lives here, beside the one operation that
-// reads it, rather than in `crate::state`, which holds what requests persist.
+// creates or changes. It therefore lives here, beside the operation that
+// SPLITS it, rather than in `crate::state`, which holds what requests persist.
+//
+// It is also the one statement of which node types exist, so it is what the
+// operations that PERSIST a supplied node type check against
+// (`is_published_node_type` / `validate_node_type` below, reached from
+// `CreateCacheCluster`, `ModifyCacheCluster`, `CreateReplicationGroup` and
+// `ModifyGlobalReplicationGroup`):
+// a second hand-written list of node type names could only come to disagree
+// with this one.
 // ---------------------------------------------------------------------------
 
 /// The sizes `CacheNodeType`'s catalogue names for the M7g, M6g, R7g and R6g
@@ -352,6 +360,78 @@ pub fn node_type_size_rank(node_type: &str) -> Option<u32> {
             // rather than overflowing it.
             4u32.checked_add(factor)
         }
+    }
+}
+
+/// The sizes the R6gd family names, which `CacheNodeType`'s own catalogue omits:
+/// `cache.r6gd.xlarge` through `cache.r6gd.16xlarge` — the family has no `large`
+/// size. The FAMILY is published by this service's model all the same, through
+/// `DataTieringEnabled`: "Data tiering is only supported for replication groups
+/// using the r6gd node type. This parameter must be set to true when using r6gd
+/// nodes." (`smithy_query(query="doc", shape="CreateReplicationGroupMessage",
+/// member="DataTieringEnabled")`).
+const SIZES_R6GD: &[&str] = &[
+    "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+
+/// The data-tiering node type family, held apart from [`NODE_TYPE_FAMILIES`].
+///
+/// It is a node type this service publishes — a request may carry it, so
+/// [`is_published_node_type`] accepts it — but it is NOT a type a cluster can be
+/// scaled onto by this operation: data tiering "is only supported for
+/// replication groups using the r6gd node type" and only with
+/// `DataTieringEnabled` set, so it is reachable through that member rather than
+/// by scaling an ordinary cluster onto it.
+///
+/// The family paired here is the one `crate::state::DATA_TIERING_NODE_TYPE`
+/// names — the constant `CreateReplicationGroup` matches a node type against to
+/// apply the data-tiering rule — so the prefix below is `cache.` plus that
+/// constant, and the test suite asserts the two cannot drift apart.
+pub const DATA_TIERING_NODE_TYPE_FAMILIES: &[NodeTypeFamily] = &[NodeTypeFamily {
+    prefix: "cache.r6gd",
+    sizes: SIZES_R6GD,
+    current_generation: true,
+    version_gated: false,
+}];
+
+/// True when `node_type` names one of the cache node types this service
+/// publishes — a `cache.<family>.<size>` name whose family is one the catalogue
+/// lists and whose size is one that family names.
+///
+/// This is the one place a node type supplied by a request is checked against
+/// the catalogue, so every operation that persists one refuses the same set of
+/// names. Both generations are published names: a previous-generation family is
+/// listed by the catalogue and is what an existing cluster may be running, so it
+/// is a real node type even where creating new nodes on it is discouraged.
+///
+/// The name is read case-insensitively, like [`node_type_size_rank`]: the
+/// catalogue spells every node type in lowercase and a supplied node type is
+/// whatever the request wrote.
+pub fn is_published_node_type(node_type: &str) -> bool {
+    let lowered = node_type.to_ascii_lowercase();
+    NODE_TYPE_FAMILIES
+        .iter()
+        .chain(DATA_TIERING_NODE_TYPE_FAMILIES)
+        .any(|family| {
+            lowered
+                .strip_prefix(family.prefix)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .is_some_and(|size| family.sizes.contains(&size))
+        })
+}
+
+/// `Err(message)` when `node_type` is not a node type this service publishes.
+///
+/// The message names the value the request supplied, which is what makes the
+/// refusal diagnosable: the member carries no modelled enum or `@pattern`, so
+/// the catalogue is the only statement of which values it may take, and a
+/// request outside it is refused with `InvalidParameterValue` (HTTP 400) by
+/// every operation that would otherwise persist the name.
+pub fn validate_node_type(node_type: &str) -> Result<(), String> {
+    if is_published_node_type(node_type) {
+        Ok(())
+    } else {
+        Err(format!("Invalid Cache Node Type: {node_type}."))
     }
 }
 

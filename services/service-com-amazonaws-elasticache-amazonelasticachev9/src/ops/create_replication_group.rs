@@ -890,6 +890,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|cluster| cluster.cache_node_type.clone())
         });
+        // The same catalogue check `CreateCacheCluster` applies: a node type the
+        // service does not publish is no shape this group's clusters could run,
+        // so the create is refused before anything is written. The data-tiering
+        // family `DataTieringEnabled` names is a published node type, so it
+        // passes here and is governed by the rule below.
+        if let Some(node_type) = cache_node_type.as_deref() {
+            if let Err(message) =
+                crate::ops::list_allowed_node_type_modifications::validate_node_type(node_type)
+            {
+                return Err(invalid_value(message));
+            }
+        }
 
         // "Data tiering is only supported for replication groups using the r6gd
         // node type. This parameter must be set to true when using r6gd nodes."

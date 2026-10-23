@@ -102,3 +102,7 @@ mod cache_cluster_gates_and_messages;
 // suite.
 #[path = "all/rbac_user_access_string_and_deletion.rs"]
 mod rbac_user_access_string_and_deletion;
+
+// Appended for the same reason: the `CacheNodeType` catalogue-validation suite.
+#[path = "all/cache_node_type_validation.rs"]
+mod cache_node_type_validation;
