@@ -17,6 +17,8 @@ mod cache_cluster_lifecycle;
 mod cache_engine_versions;
 #[path = "all/cache_parameter_groups.rs"]
 mod cache_parameter_groups;
+#[path = "all/rbac_users.rs"]
+mod rbac_users;
 #[path = "all/reserved_cache_nodes_offerings.rs"]
 mod reserved_cache_nodes_offerings;
 #[path = "all/service_updates.rs"]
