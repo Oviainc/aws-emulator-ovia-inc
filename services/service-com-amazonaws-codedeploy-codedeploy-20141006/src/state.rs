@@ -208,6 +208,24 @@ pub const DEPLOYMENT_CREATOR_USER: &str = "user";
 /// (`smithy_query(query="shape",shape="DeploymentType")`: IN_PLACE | BLUE_GREEN).
 pub const DEPLOYMENT_TYPE_BLUE_GREEN: &str = "BLUE_GREEN";
 
+/// The `DeploymentType` a deployment group gets when nothing asked for one
+/// (`smithy_query(query="shape",shape="DeploymentType")`: IN_PLACE |
+/// BLUE_GREEN) — see [`effective_deployment_style`].
+pub const DEPLOYMENT_TYPE_IN_PLACE: &str = "IN_PLACE";
+
+/// The `DeploymentOption` a deployment group gets when nothing asked for one
+/// (`smithy_query(query="shape",shape="DeploymentOption")`: WITH_TRAFFIC_CONTROL
+/// | WITHOUT_TRAFFIC_CONTROL) — see [`effective_deployment_style`].
+pub const DEPLOYMENT_OPTION_WITHOUT_TRAFFIC_CONTROL: &str = "WITHOUT_TRAFFIC_CONTROL";
+
+/// The `OutdatedInstancesStrategy` a deployment group behaves by when the
+/// request left the member unset: the model's own documentation for it says "If
+/// this option is set to `UPDATE` or is unspecified, CodeDeploy initiates one or
+/// more 'auto-update outdated instances' deployments"
+/// (`smithy_query(query="doc",shape="DeploymentGroupInfo",member="outdatedInstancesStrategy")`),
+/// so an unspecified strategy IS `UPDATE` and the group reports it as such.
+pub const OUTDATED_INSTANCES_STRATEGY_UPDATE: &str = "UPDATE";
+
 /// The `InstanceAction` that terminates the original environment's instances
 /// after a successful blue/green deployment
 /// (`smithy_query(query="shape",shape="InstanceAction")`: TERMINATE |
@@ -380,6 +398,38 @@ pub const MAX_INSTANCE_NAMES_PER_CALL: usize = 100;
 /// uses; enforcing it is also what keeps a stored instance from growing without
 /// limit on repeated `AddTagsToOnPremisesInstances` calls.
 pub const MAX_TAGS_PER_ON_PREMISES_INSTANCE: usize = 50;
+
+/// The `deploymentStyle` a deployment group HAS, given what a request asked for.
+///
+/// A deployment group always runs one type of deployment with one traffic
+/// option, so the member is never unset on a stored group: a request that
+/// names neither gets CodeDeploy's own default — an in-place deployment with no
+/// traffic control — and a request that names only one member gets the default
+/// for the other. Materialised when the group is written rather than when it is
+/// read, so every operation that acts on the group (a deployment resolving its
+/// style, the blue/green waits) sees the same effective value the reader
+/// reports.
+pub fn effective_deployment_style(requested: Option<DeploymentStyle>) -> Option<DeploymentStyle> {
+    let requested = requested.unwrap_or_default();
+    Some(DeploymentStyle {
+        deployment_type: Some(
+            requested
+                .deployment_type
+                .unwrap_or_else(|| DEPLOYMENT_TYPE_IN_PLACE.to_string()),
+        ),
+        deployment_option: Some(requested.deployment_option.unwrap_or_else(|| {
+            DEPLOYMENT_OPTION_WITHOUT_TRAFFIC_CONTROL.to_string()
+        })),
+    })
+}
+
+/// The `outdatedInstancesStrategy` a deployment group HAS, given what a request
+/// asked for: see [`OUTDATED_INSTANCES_STRATEGY_UPDATE`] for why an unspecified
+/// strategy is `UPDATE`, and [`effective_deployment_style`] for why the default
+/// is materialised at write time.
+pub fn effective_outdated_instances_strategy(requested: Option<String>) -> Option<String> {
+    Some(requested.unwrap_or_else(|| OUTDATED_INSTANCES_STRATEGY_UPDATE.to_string()))
+}
 
 /// A tag's key and value, or `None` when the tag is not one CodeDeploy accepts.
 ///
@@ -680,8 +730,10 @@ pub struct DeploymentConfig {
 ///
 /// The record OUTLIVES its registration: CodeDeploy keeps a deregistered
 /// instance, with the instant it was deregistered, which is what lets
-/// `ListOnPremisesInstances` answer the `Deregistered` registration status and
-/// `GetOnPremisesInstance` report a `deregisterTime`.
+/// `ListOnPremisesInstances` answer the `Deregistered` registration status and a
+/// batch read report a `deregisterTime`. The single-instance reader
+/// (`GetOnPremisesInstance`) reports only an instance that is still registered:
+/// a name whose registration is gone is its `InstanceNotRegisteredException`.
 #[derive(Debug, Clone)]
 pub struct OnPremisesInstance {
     pub instance_name: String,
@@ -723,6 +775,23 @@ impl OnPremisesInstance {
             .filter(|key| !known.contains(key))
             .collect();
         self.tags.len() + added.len()
+    }
+
+    /// Drop the tag `key` holding exactly `value`, answering whether the
+    /// instance carried it.
+    ///
+    /// A tag is identified by the PAIR the caller named — "the tag key-value
+    /// pairs to remove"
+    /// (`smithy_query(query="doc",shape="RemoveTagsFromOnPremisesInstancesInput",member="tags")`)
+    /// — so a pair whose value is not the one the instance holds for that key
+    /// names no tag of this instance and removes nothing. Matching is over the
+    /// stored bytes, so a key or a value outside ASCII is removed by the same
+    /// rule as any other.
+    pub fn remove_tag(&mut self, key: &str, value: &str) -> bool {
+        let before = self.tags.len();
+        self.tags
+            .retain(|tag| !(tag.key.as_deref() == Some(key) && tag.value.as_deref() == Some(value)));
+        self.tags.len() != before
     }
 
     /// Set `key` to `value`, replacing the value of a key already present so an
@@ -1595,7 +1664,12 @@ pub fn instance_info(instance: &OnPremisesInstance) -> crate::ops::types::Instan
         instance_arn: Some(instance.instance_arn.clone()),
         register_time: Some(timestamp(instance.register_time_ms)),
         deregister_time: instance.deregister_time_ms.map(timestamp),
-        tags: non_empty(&instance.tags),
+        // The tags an instance carries are reported as the list it HOLDS, empty
+        // included: an instance registered with no tags and one whose tags were
+        // all removed hold the same thing, so they read back the same way and a
+        // client can index the member instead of handling absent and empty
+        // separately.
+        tags: Some(instance.tags.clone()),
     }
 }
 
