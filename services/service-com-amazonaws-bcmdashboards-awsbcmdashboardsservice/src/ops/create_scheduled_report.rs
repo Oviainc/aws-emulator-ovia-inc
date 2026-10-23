@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScheduledReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScheduledReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScheduledReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a scheduled-report ARN and stores the report (the supplied configuration with
+//! `scheduleConfig.state` resolved to `ENABLED` when the request left it unset, the
+//! supplied tags, and `createdAt`/`updatedAt` taken at the moment of the call) in this
+//! service's state, then returns the ARN it stored the record under.
+//!
+//! Three refusals come before the write, all of them modelled:
+//!
+//! * a `scheduledReport.dashboardArn` no stored dashboard answers to is refused with
+//!   `ValidationException` (400) — a report can only be scheduled on a dashboard that
+//!   exists, and this operation models no `ResourceNotFoundException`;
+//! * a `clientToken` an earlier successful create already used is refused with
+//!   `ConflictException` (409): the token is an at-most-once create key, so a retry or
+//!   a racing duplicate never mints a second report;
+//! * past the stored-report quota, `ServiceQuotaExceededException` (402).
+//!
+//! Being state-changing, it emits the audit record `crate::state::record_state_change`
+//! writes on every one of those paths as well as on success.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +173,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScheduledReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScheduledReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScheduledReport"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateScheduledReportErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let requested = input.scheduled_report;
+
+        // A scheduled report reports on a dashboard, so the dashboard it names has to
+        // be one this account stores. This operation models no
+        // `ResourceNotFoundException`, so the refusal is its modelled
+        // `ValidationException` (400), with the offending ARN in the message.
+        if !state.dashboards.contains_key(&requested.dashboard_arn) {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateScheduledReportErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("Dashboard not found: {}", requested.dashboard_arn),
+                },
+            )
+            .into());
+        }
+
+        // The `@idempotencyToken` is an at-most-once create key: the first call that
+        // presents a token creates the report, and every later call presenting the same
+        // token is refused with the modelled `ConflictException` (409) rather than
+        // minting a second report or mirroring the first one's answer. The check and the
+        // insert below both happen under one lock, so concurrent callers sharing a token
+        // produce exactly one winner. Only a call that got as far as creating records
+        // its token: a refused request created nothing, so its token stays free.
+        if let Some(token) = input.client_token.as_deref() {
+            if state.scheduled_report_client_tokens.contains_key(token) {
+                crate::state::record_state_change(ctx, Self::NAME, "-", "ConflictException");
+                return Err(CreateScheduledReportErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "A scheduled report creation is already in progress for client token {token}"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Every scheduled report is a stored record, so the number a caller can create
+        // is bounded, as it is on the real service: past the quota this operation
+        // answers its modelled `ServiceQuotaExceededException` (HTTP 402).
+        if state.scheduled_reports.len() >= crate::state::MAX_SCHEDULED_REPORTS {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ServiceQuotaExceededException");
+            return Err(
+                CreateScheduledReportErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the maximum number of scheduled reports ({}) for this account",
+                            crate::state::MAX_SCHEDULED_REPORTS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A fresh ARN per call, and the ARN is the key the record is stored under.
+        let arn = state.mint_scheduled_report_arn();
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::ScheduledReportRecord {
+            arn: arn.clone(),
+            name: requested.name,
+            dashboard_arn: requested.dashboard_arn,
+            execution_role_arn: requested.scheduled_report_execution_role_arn,
+            schedule_config: crate::state::resolve_schedule_config(requested.schedule_config),
+            description: requested.description,
+            widget_ids: requested.widget_ids,
+            widget_date_range_override: requested.widget_date_range_override,
+            created_at: now,
+            updated_at: now,
+            // Nothing has executed this report yet, so there is no execution time and no
+            // health to report: both stay unset until an execution sets them.
+            last_execution_at: None,
+            health_status: None,
+            // Persisted at create time so the tagging operations have state to read.
+            resource_tags: input.resource_tags.unwrap_or_default(),
+        };
+        state.scheduled_reports.insert(arn.clone(), record);
+        if let Some(token) = input.client_token {
+            state
+                .scheduled_report_client_tokens
+                .insert(token, arn.clone());
+        }
+
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &arn, "SUCCESS");
+
+        Ok(CreateScheduledReportOutput { arn })
     }
 }
