@@ -146,17 +146,64 @@ enum Flavor {
 /// `documents` are the policies in force on the caller — its inline policies and the
 /// documents of the managed policies attached to it — in any order: the result does not
 /// depend on it, because a `Deny` in any of them wins.
+///
+/// Each document is READ here, so a caller asking about SEVERAL requests over the same
+/// documents (one action on each of the resources it reaches, say) reads them once with
+/// [`prepare_documents`] and asks through [`identity_decision_prepared`] instead, which
+/// keeps the cost of n requests n statement walks rather than n parses.
 pub fn identity_decision(documents: &[String], request: &Request<'_>) -> Decision {
+    identity_decision_prepared(&prepare_documents(documents), request)
+}
+
+/// One policy document READ ONCE, for a caller that decides several requests against the
+/// same documents.
+///
+/// A document this cannot read as a policy — one past [`MAX_POLICY_BYTES`], or one that is
+/// not a policy at all — is held as "states nothing", which is exactly what deciding it
+/// would have answered; the operation that accepted the document is what refuses a
+/// malformed one.
+#[derive(Debug, Clone)]
+pub struct PreparedDocument {
+    policy: Option<::serde_json::Value>,
+}
+
+impl PreparedDocument {
+    /// Read `document` once.
+    #[must_use]
+    pub fn read(document: &str) -> Self {
+        let policy = (document.len() <= MAX_POLICY_BYTES)
+            .then(|| super::iam_trust_policy::parse_policy(document))
+            .flatten();
+        Self { policy }
+    }
+}
+
+/// Every document of `documents`, read once each. See [`PreparedDocument`].
+#[must_use]
+pub fn prepare_documents(documents: &[String]) -> Vec<PreparedDocument> {
+    documents
+        .iter()
+        .map(|document| PreparedDocument::read(document))
+        .collect()
+}
+
+/// [`identity_decision`] over documents already read: the SAME rule, and the same answer
+/// for the same documents — the reading is all that is hoisted out.
+#[must_use]
+pub fn identity_decision_prepared(
+    documents: &[PreparedDocument],
+    request: &Request<'_>,
+) -> Decision {
     combine(
         documents
             .iter()
-            .map(|document| decision(document, request, Flavor::Identity)),
+            .map(|document| decide(document, request, Flavor::Identity)),
     )
 }
 
 /// What the resource's own resource-based policy says about the request.
 pub fn resource_decision(document: &str, request: &Request<'_>) -> Decision {
-    decision(document, request, Flavor::Resource)
+    decide(&PreparedDocument::read(document), request, Flavor::Resource)
 }
 
 /// Whether the request is allowed, given the two decisions.
@@ -229,13 +276,9 @@ pub fn wildcard_match(pattern: &str, value: &str, case_sensitive: bool) -> bool 
 }
 
 /// The decision ONE document reaches about the request.
-fn decision(document: &str, request: &Request<'_>, flavor: Flavor) -> Decision {
-    if document.len() > MAX_POLICY_BYTES {
-        return Decision::NotStated;
-    }
-    let Some(policy) = super::iam_trust_policy::parse_policy(document) else {
-        // Not a policy this can be read out of: it states nothing. The operation that
-        // accepted the document is what refuses a malformed one.
+fn decide(document: &PreparedDocument, request: &Request<'_>, flavor: Flavor) -> Decision {
+    let Some(policy) = document.policy.as_ref() else {
+        // Not a policy this can be read out of: it states nothing.
         return Decision::NotStated;
     };
     let statement = &policy["Statement"];

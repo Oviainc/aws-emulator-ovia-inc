@@ -271,13 +271,43 @@ fn account_id_of(len: usize) -> String {
     }
 }
 
-/// An IAM role ARN of exactly `len` characters, padded in the role name.
+/// One member-bounds row of the update suite: the case, the account it configures, the
+/// `roleArn` the update carries, the `description` it carries, and the HTTP status
+/// expected of it.
+type UpdateBoundRow = (String, &'static str, Option<String>, Option<String>, u16);
+
+/// A `roleArn` the account `account_id` may be configured with: a role of THAT account
+/// when `account_id` is an account number, and a role of this emulator's own account when
+/// it is not.
+///
+/// The account-ownership rule compares the ARN's account field with the `accountId` being
+/// configured, and an `accountId` that is no account number at all (a 48-character value,
+/// say, which `TargetAccountId`'s `@length(12..48)` still admits) names no account for a
+/// role to belong to — so such a row carries a well-formed role ARN of any account, and the
+/// bound it is really about is the one it is testing.
+fn owned_role_arn(account_id: &str, role_name: &str) -> String {
+    let account = if account_id.len() == 12 && account_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        account_id
+    } else {
+        "000000000000"
+    };
+    format!("arn:aws:iam::{account}:role/{role_name}")
+}
+
+/// An IAM role ARN of exactly `len` characters, in the account `account_id`, padded in the
+/// role name.
+///
+/// The account is the CONFIGURED one because a target account configuration's `roleArn`
+/// has to name a role of the account it configures — which is the rule
+/// `target_account_role_ownership.rs` asserts — so every well-formed value this builds
+/// belongs to the row's own account.
 ///
 /// WELL-FORMED only from [`SHORTEST_ROLE_ARN`] characters up: under that length the value
 /// is still `arn:`-shaped (and still satisfies `pattern ^[\S]+$`) but is not an IAM role
 /// ARN, which is exactly what the rows at and below `RoleArn`'s modelled floor need.
-fn role_arn_of(len: usize) -> String {
-    let prefix = "arn:aws:iam::000000000000:role/";
+fn role_arn_of(account_id: &str, len: usize) -> String {
+    let prefix = format!("arn:aws:iam::{account_id}:role/");
     if len <= prefix.len() {
         // Still an `arn:`-shaped value, just a shorter one: used for the published floor
         // and the value one character under it.
@@ -309,7 +339,10 @@ fn rows() -> Vec<Row> {
         Row {
             case: "no-description-no-token",
             account_id: account_id_of(ACCOUNT_ID_FLOOR),
-            role_arn: "arn:aws:iam::123456789012:role/FisTargetAccount".to_string(),
+            role_arn: format!(
+                "arn:aws:iam::{}:role/FisTargetAccount",
+                account_id_of(ACCOUNT_ID_FLOOR)
+            ),
             description: None,
             client_token: None,
         },
@@ -323,7 +356,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "plain-description-role-arn-at-the-shortest-well-formed-length",
             account_id: "333333333333".to_string(),
-            role_arn: role_arn_of(SHORTEST_ROLE_ARN),
+            role_arn: role_arn_of("333333333333", SHORTEST_ROLE_ARN),
             description: Some("the staging account".to_string()),
             client_token: Some("token-floor-role".to_string()),
         },
@@ -337,7 +370,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "description-at-the-ceiling-account-id-at-the-ceiling",
             account_id: account_id_of(ACCOUNT_ID_CEILING),
-            role_arn: role_arn_of(ROLE_ARN_CEILING),
+            role_arn: role_arn_of("000000000000", ROLE_ARN_CEILING),
             description: Some("d".repeat(DESCRIPTION_CEILING)),
             client_token: Some("token-ceiling".to_string()),
         },
@@ -478,7 +511,7 @@ async fn a_template_counts_the_configurations_it_holds_and_an_experiment_snapsho
                 &template_id,
                 &account_id,
                 create_body(
-                    "arn:aws:iam::555555555555:role/fis-counted",
+                    &format!("arn:aws:iam::{account_id}:role/fis-counted"),
                     Some(&format!("account {index}")),
                     Some(&format!("token-count-{case}-{index}")),
                 ),
@@ -590,7 +623,11 @@ async fn a_second_create_for_one_account_conflicts_unless_it_replays_the_token()
                 &template_id,
                 &row.account_id,
                 create_body(
-                    "arn:aws:iam::000000000000:role/fis-overwrite-attempt",
+                    // The row's own `roleArn`: a configuration's role has to belong to the
+                    // account it configures, so a second create for that account carries a
+                    // role of it too. What makes this a second create rather than a replay
+                    // is the token, and the description is what would be overwritten.
+                    &row.role_arn,
                     Some("a second create for the same account"),
                     token,
                 ),
@@ -771,7 +808,9 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
             &template_id,
             &account_id,
             create_body(
-                "arn:aws:iam::000000000000:role/fis-bounds",
+                // A role the account being configured may carry: the two members have to
+                // agree about which account the role belongs to.
+                &owned_role_arn(&account_id, "fis-bounds"),
                 description.as_deref(),
                 Some("token-bounds"),
             ),
@@ -803,7 +842,7 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
         ("roleArn above the ceiling", ROLE_ARN_CEILING + 1, 400),
     ] {
         let template_id = template(&router, case).await;
-        let role_arn = role_arn_of(len);
+        let role_arn = role_arn_of("151515151515", len);
         assert_eq!(
             role_arn.chars().count(),
             len,
@@ -824,14 +863,21 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
     }
 }
 
-/// The `roleArn` every configuration the update suite touches is CREATED with, so what an
-/// update left alone is distinguishable from what it replaced.
-const BASELINE_ROLE_ARN: &str = "arn:aws:iam::900000000000:role/fis-update-baseline";
+/// The `roleArn` a configuration the update suite touches is CREATED with: a role of the
+/// account it configures, so what an update left alone is distinguishable from what it
+/// replaced.
+fn baseline_role_arn(account_id: &str) -> String {
+    owned_role_arn(account_id, "fis-update-baseline")
+}
 
 /// One partial-update row: what the configuration was created with, and what the update
 /// request then carries for it.
 struct UpdateRow {
     case: &'static str,
+    /// The account this row's configuration is created under — one per row, so no row's
+    /// update can touch another's record. Twelve characters, `TargetAccountId`'s published
+    /// floor, and an account number, so the row's `roleArn` can belong to it.
+    account_id: &'static str,
     /// The `description` the CREATE carried, so a row can start from a record that has
     /// one and a row can start from a record that has none.
     baseline_description: Option<String>,
@@ -847,7 +893,7 @@ impl UpdateRow {
     fn expected_role_arn(&self) -> String {
         self.role_arn
             .clone()
-            .unwrap_or_else(|| BASELINE_ROLE_ARN.to_string())
+            .unwrap_or_else(|| baseline_role_arn(self.account_id))
     }
 
     /// See [`UpdateRow::expected_role_arn`] — and an absent `description` stays absent
@@ -871,56 +917,65 @@ fn update_rows() -> Vec<UpdateRow> {
     vec![
         UpdateRow {
             case: "carries-nothing",
+            account_id: "900000000000",
             baseline_description: Some("the record the update leaves alone".to_string()),
             role_arn: None,
             description: None,
         },
         UpdateRow {
             case: "carries-nothing-onto-a-record-with-no-description",
+            account_id: "900000000001",
             baseline_description: None,
             role_arn: None,
             description: None,
         },
         UpdateRow {
             case: "role-arn-only",
+            account_id: "900000000002",
             baseline_description: Some("kept while only the roleArn moves".to_string()),
-            role_arn: Some("arn:aws:iam::900000000000:role/service-role/fis-updated".to_string()),
+            role_arn: Some("arn:aws:iam::900000000002:role/service-role/fis-updated".to_string()),
             description: None,
         },
         UpdateRow {
             case: "role-arn-only-at-the-shortest-well-formed-length",
+            account_id: "900000000003",
             baseline_description: None,
-            role_arn: Some(role_arn_of(SHORTEST_ROLE_ARN)),
+            role_arn: Some(role_arn_of("900000000003", SHORTEST_ROLE_ARN)),
             description: None,
         },
         UpdateRow {
             case: "description-only",
+            account_id: "900000000004",
             baseline_description: Some("the description before the update".to_string()),
             role_arn: None,
             description: Some("the description after the update".to_string()),
         },
         UpdateRow {
             case: "description-only-onto-a-record-that-had-none",
+            account_id: "900000000005",
             baseline_description: None,
             role_arn: None,
             description: Some("a description the create never carried".to_string()),
         },
         UpdateRow {
             case: "empty-description",
+            account_id: "900000000006",
             baseline_description: Some("about to become empty".to_string()),
             role_arn: None,
             description: Some(String::new()),
         },
         UpdateRow {
             case: "both-members-non-ascii-description",
+            account_id: "900000000007",
             baseline_description: Some("説明の前".to_string()),
-            role_arn: Some("arn:aws-cn:iam::900000000000:role/fis-目标账户-updated".to_string()),
+            role_arn: Some("arn:aws-cn:iam::900000000007:role/fis-目标账户-updated".to_string()),
             description: Some("説明 — ünïcødé ✅ описание".to_string()),
         },
         UpdateRow {
             case: "both-members-at-their-ceilings",
+            account_id: "900000000008",
             baseline_description: None,
-            role_arn: Some(role_arn_of(ROLE_ARN_CEILING)),
+            role_arn: Some(role_arn_of("900000000008", ROLE_ARN_CEILING)),
             description: Some("u".repeat(DESCRIPTION_CEILING)),
         },
     ]
@@ -932,17 +987,16 @@ async fn an_update_replaces_the_members_it_carries_and_keeps_the_rest() {
     let template_id = template(&router, "partial-update").await;
     let rows = update_rows();
 
-    for (index, row) in rows.iter().enumerate() {
-        // One account per row, 12 characters: `TargetAccountId`'s published floor.
-        let account_id = format!("9000000000{index:02}");
+    for row in &rows {
+        let account_id = row.account_id;
         let created = create_configuration(
             &router,
             &template_id,
-            &account_id,
+            account_id,
             create_body(
-                BASELINE_ROLE_ARN,
+                &baseline_role_arn(account_id),
                 row.baseline_description.as_deref(),
-                Some(&format!("token-update-{index}")),
+                Some(&format!("token-update-{account_id}")),
             ),
         )
         .await;
@@ -956,8 +1010,7 @@ async fn an_update_replaces_the_members_it_carries_and_keeps_the_rest() {
         let expected_description = row.expected_description();
         let body = update_body(row.role_arn.as_deref(), row.description.as_deref());
 
-        let updated =
-            update_configuration(&router, &template_id, &account_id, body.clone()).await;
+        let updated = update_configuration(&router, &template_id, account_id, body.clone()).await;
         assert_eq!(
             updated.status, 200,
             "case {:?}: expected HTTP 200 from UpdateTargetAccountConfiguration, got {} \
@@ -967,7 +1020,7 @@ async fn an_update_replaces_the_members_it_carries_and_keeps_the_rest() {
         assert_configuration(
             row.case,
             "the update answer",
-            &account_id,
+            account_id,
             &expected_role_arn,
             expected_description.as_deref(),
             updated.configuration(),
@@ -975,7 +1028,7 @@ async fn an_update_replaces_the_members_it_carries_and_keeps_the_rest() {
 
         // The round trip: the read reports the record the update returned, so the update
         // persisted what it answered.
-        let fetched = get_configuration(&router, &template_id, &account_id).await;
+        let fetched = get_configuration(&router, &template_id, account_id).await;
         assert_eq!(
             fetched.status, 200,
             "case {:?}: expected HTTP 200 from GetTargetAccountConfiguration, got {} with {:?}",
@@ -991,14 +1044,14 @@ async fn an_update_replaces_the_members_it_carries_and_keeps_the_rest() {
         assert_configuration(
             row.case,
             "the read after the update",
-            &account_id,
+            account_id,
             &expected_role_arn,
             expected_description.as_deref(),
             fetched.configuration(),
         );
 
         // Idempotent: the same update applied again reports the same record.
-        let again = update_configuration(&router, &template_id, &account_id, body).await;
+        let again = update_configuration(&router, &template_id, account_id, body).await;
         assert_eq!(
             again.configuration(),
             updated.configuration(),
@@ -1020,13 +1073,12 @@ async fn an_update_replaces_the_members_it_carries_and_keeps_the_rest() {
     );
 
     // One row's update left every other row's record alone.
-    for (index, row) in rows.iter().enumerate() {
-        let account_id = format!("9000000000{index:02}");
-        let fetched = get_configuration(&router, &template_id, &account_id).await;
+    for row in &rows {
+        let fetched = get_configuration(&router, &template_id, row.account_id).await;
         assert_configuration(
             row.case,
             "the read after every other row was updated",
-            &account_id,
+            row.account_id,
             &row.expected_role_arn(),
             row.expected_description().as_deref(),
             fetched.configuration(),
@@ -1045,7 +1097,7 @@ async fn an_update_naming_a_configuration_the_store_does_not_hold_answers_resour
         &configured,
         account_id,
         create_body(
-            BASELINE_ROLE_ARN,
+            &baseline_role_arn(account_id),
             Some("configured on one template only"),
             Some("token-update-isolated"),
         ),
@@ -1075,7 +1127,9 @@ async fn an_update_naming_a_configuration_the_store_does_not_hold_answers_resour
             template_id,
             account,
             update_body(
-                Some("arn:aws:iam::900000000000:role/fis-no-such-record"),
+                // A role of the account the request names, so what the refusal is about is
+                // the record that does not exist and not the role.
+                Some(&owned_role_arn(account, "fis-no-such-record")),
                 Some("an update of a record that does not exist"),
             ),
         )
@@ -1100,7 +1154,7 @@ async fn an_update_naming_a_configuration_the_store_does_not_hold_answers_resour
         "configured",
         "the read after four refused updates",
         account_id,
-        BASELINE_ROLE_ARN,
+        &baseline_role_arn(account_id),
         Some("configured on one template only"),
         fetched.configuration(),
     );
@@ -1137,7 +1191,11 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
                 &router,
                 &template_id,
                 &account_id,
-                create_body(BASELINE_ROLE_ARN, None, Some("token-update-account-bounds")),
+                create_body(
+                    &baseline_role_arn(&account_id),
+                    None,
+                    Some("token-update-account-bounds"),
+                ),
             )
             .await;
             assert_eq!(
@@ -1151,7 +1209,7 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
             &router,
             &template_id,
             &account_id,
-            update_body(Some("arn:aws:iam::900000000000:role/fis-bounds"), None),
+            update_body(Some(&owned_role_arn(&account_id, "fis-bounds")), None),
         )
         .await;
         assert_eq!(
@@ -1163,68 +1221,76 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
 
     // `roleArn` and `description` on each of their published bounds, and one past each,
     // carried by the UPDATE. A refused update must leave the stored record exactly as the
-    // create left it.
+    // create left it. Each row states the account it configures, because a `roleArn` the
+    // update carries has to name a role of that account.
     let template_id = template(&router, "update-member-bounds").await;
-    let cases: Vec<(String, Option<String>, Option<String>, u16)> = vec![
+    let cases: Vec<UpdateBoundRow> = vec![
         (
             format!("roleArn at the shortest well-formed ARN ({SHORTEST_ROLE_ARN})"),
-            Some(role_arn_of(SHORTEST_ROLE_ARN)),
+            "910000000000",
+            Some(role_arn_of("910000000000", SHORTEST_ROLE_ARN)),
             None,
             200,
         ),
         (
             format!("roleArn at the ceiling ({ROLE_ARN_CEILING})"),
-            Some(role_arn_of(ROLE_ARN_CEILING)),
+            "910000000001",
+            Some(role_arn_of("910000000001", ROLE_ARN_CEILING)),
             None,
             200,
         ),
         (
             format!("roleArn at the floor ({ROLE_ARN_FLOOR}), too short to be an ARN"),
-            Some(role_arn_of(ROLE_ARN_FLOOR)),
+            "910000000002",
+            Some(role_arn_of("910000000002", ROLE_ARN_FLOOR)),
             None,
             400,
         ),
         (
             "roleArn below the floor".to_string(),
-            Some(role_arn_of(ROLE_ARN_FLOOR - 1)),
+            "910000000003",
+            Some(role_arn_of("910000000003", ROLE_ARN_FLOOR - 1)),
             None,
             400,
         ),
         (
             "roleArn above the ceiling".to_string(),
-            Some(role_arn_of(ROLE_ARN_CEILING + 1)),
+            "910000000004",
+            Some(role_arn_of("910000000004", ROLE_ARN_CEILING + 1)),
             None,
             400,
         ),
         (
             format!("description at the floor ({DESCRIPTION_FLOOR})"),
+            "910000000005",
             None,
             Some("d".repeat(DESCRIPTION_FLOOR)),
             200,
         ),
         (
             format!("description at the ceiling ({DESCRIPTION_CEILING})"),
+            "910000000006",
             None,
             Some("d".repeat(DESCRIPTION_CEILING)),
             200,
         ),
         (
             "description above the ceiling".to_string(),
+            "910000000007",
             None,
             Some("d".repeat(DESCRIPTION_CEILING + 1)),
             400,
         ),
     ];
-    for (index, (case, role_arn, description, expected)) in cases.into_iter().enumerate() {
-        let account_id = format!("9100000000{index:02}");
+    for (case, account_id, role_arn, description, expected) in cases {
         let created = create_configuration(
             &router,
             &template_id,
-            &account_id,
+            account_id,
             create_body(
-                BASELINE_ROLE_ARN,
+                &baseline_role_arn(account_id),
                 Some("the record a refused update must not touch"),
-                Some(&format!("token-member-bounds-{index}")),
+                Some(&format!("token-member-bounds-{account_id}")),
             ),
         )
         .await;
@@ -1237,7 +1303,7 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
         let answer = update_configuration(
             &router,
             &template_id,
-            &account_id,
+            account_id,
             update_body(role_arn.as_deref(), description.as_deref()),
         )
         .await;
@@ -1248,12 +1314,12 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
         );
 
         if expected == 400 {
-            let fetched = get_configuration(&router, &template_id, &account_id).await;
+            let fetched = get_configuration(&router, &template_id, account_id).await;
             assert_configuration(
                 &case,
                 "the read after a refused update",
-                &account_id,
-                BASELINE_ROLE_ARN,
+                account_id,
+                &baseline_role_arn(account_id),
                 Some("the record a refused update must not touch"),
                 fetched.configuration(),
             );
