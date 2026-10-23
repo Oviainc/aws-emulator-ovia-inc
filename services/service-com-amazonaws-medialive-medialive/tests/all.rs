@@ -59,6 +59,9 @@ mod input_security_group_listing;
 #[path = "all/input_update.rs"]
 mod input_update;
 
+#[path = "all/multiplex_deletion.rs"]
+mod multiplex_deletion;
+
 #[path = "all/multiplex_lifecycle.rs"]
 mod multiplex_lifecycle;
 

@@ -140,29 +140,18 @@ const NEXT_TOKEN_PREFIX: &str = "invoice-summaries:";
 
 /// The `NextToken` that resumes the walk at `invoice_id`.
 fn encode_next_token(invoice_id: &str) -> String {
-    hex::encode(format!("{NEXT_TOKEN_PREFIX}{invoice_id}"))
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, invoice_id)
 }
 
 /// The invoice id a caller's `NextToken` resumes at, or `None` when it asked for the
 /// first page. A token this operation did not mint is refused with the model's own
-/// `invalidNextToken` reason.
+/// `invalidNextToken` reason — the one rendering every paginated walk of this service
+/// answers with.
 fn decode_next_token(
     token: Option<&str>,
 ) -> Result<Option<String>, ListInvoiceSummariesErrorModeled> {
-    let Some(token) = token else {
-        return Ok(None);
-    };
-    let resume = hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|plain| plain.strip_prefix(NEXT_TOKEN_PREFIX).map(str::to_string));
-    resume.map(Some).ok_or_else(|| {
-        // `invalidNextToken` is one of the model's `ValidationExceptionReason` values.
-        ListInvoiceSummariesErrorModeled::ValidationException(ValidationException {
-            message: Some("The NextToken provided is not valid".to_string()),
-            reason: Some("invalidNextToken".to_string()),
-            ..Default::default()
-        })
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token).map_err(|_| {
+        ListInvoiceSummariesErrorModeled::ValidationException(crate::state::invalid_next_token())
     })
 }
 
