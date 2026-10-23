@@ -253,11 +253,16 @@ enum Reached {
 fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Reached)> {
     vec![
         (
+            // Implemented: it answers the modelled `NotFoundException` (404) for a bridge
+            // ARN this store does not hold.
             "UpdateBridge",
             "PUT",
             format!("/v1/bridges/{BRIDGE_ARN}"),
             "{}",
-            Reached::ScaffoldedStub,
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
         ),
         (
             "UpdateBridgeOutput",

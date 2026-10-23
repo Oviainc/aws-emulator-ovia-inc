@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBridge
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBridge`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBridge::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the bridge-level settings the request carries to the STORED bridge and answers
+//! with the stored record read back, so DescribeBridge afterwards reports exactly what
+//! this operation wrote.
+//!
+//! The operation is a PARTIAL update (`@idempotent`, every input member but `BridgeArn`
+//! optional), exactly like UpdateFlow: a member the request carries replaces that setting
+//! on the stored bridge and a member it omits leaves the stored setting untouched. The
+//! request-only wrapper shapes are merged member by member into the shape the bridge
+//! holds: `UpdateEgressGatewayBridgeRequest` / `UpdateIngressGatewayBridgeRequest` into
+//! the `EgressGatewayBridge` / `IngressGatewayBridge`, whose `InstanceId` has no
+//! counterpart in the request shape (it is "the ID of the instance running this bridge",
+//! the service's own) and so is carried over, and `UpdateFailoverConfig` into the
+//! `FailoverConfig` through [`crate::state::merged_failover_config`], the same merge
+//! UpdateFlow applies to the same pair of shapes.
+//!
+//! A bridge is EITHER a cloud-to-ground (egress) bridge or a ground-to-cloud (ingress)
+//! bridge (`ListedBridge$BridgeType` reports exactly one type per bridge), so a request
+//! that names both wrappers is refused as self-contradictory, and one that names the
+//! wrapper for the type the addressed bridge is NOT is refused because that bridge has no
+//! such settings to update. Both are `BadRequestException` (HTTP 400), the error the model
+//! describes as the one for "a semantic error" in the request.
+//!
+//! The model gives UpdateBridge no state member and documents no state change for it
+//! (`Bridge$BridgeState` is "the state of the bridge", and the transient bridge states
+//! belong to UpdateBridgeState / DeleteBridge), so this operation leaves the bridge's
+//! state alone: it only settles a transition the clock had already made due, exactly as
+//! DescribeBridge and UpdateFlow do.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +105,39 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable about the REQUEST's content; the message carries it inside this service's
+/// refusal envelope ([`crate::state::validation_failed_message`]), the one every refusal
+/// about a request's content carries.
+fn bad_request(detail: impl Into<String>) -> UpdateBridgeError {
+    UpdateBridgeErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse a WELL-FORMED request the addressed bridge itself does not admit, with the same
+/// `BadRequestException` (HTTP 400) under the other envelope
+/// ([`crate::state::bad_request_message`]): the request is not malformed, the bridge just
+/// has no such setting to update.
+fn refused_by_bridge(detail: impl Into<String>) -> UpdateBridgeError {
+    UpdateBridgeErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources in
+/// the request does not exist in the system" — the bridge `identifier` addressed, in this
+/// service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateBridgeError {
+    UpdateBridgeErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +212,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBridge` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBridgeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBridge"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBridgeErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A bridge is one type or the other, so a request naming both wrappers describes
+        // no update at all. This is about the REQUEST's content, so it is checked before
+        // the bridge it addresses is resolved.
+        if input.egress_gateway_bridge.is_some() && input.ingress_gateway_bridge.is_some() {
+            return Err(bad_request(
+                "An update bridge request may name at most one of EgressGatewayBridge (a \
+                 cloud-to-ground bridge) and IngressGatewayBridge (a ground-to-cloud \
+                 bridge): a bridge is one type or the other.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a state change the clock
+        // already made due is materialised before the bridge is read or written.
+        store.settle_due_transitions(now);
+
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+
+        // What each setting becomes once this request is applied: the request's value where
+        // it carries one, the stored value where it does not. A wrapper the addressed
+        // bridge has no counterpart for is refused rather than silently ignored, and
+        // refused before anything is written, so a refused update leaves the bridge as it
+        // was.
+        let egress_gateway_bridge = match input.egress_gateway_bridge.as_ref() {
+            Some(update) => {
+                let Some(stored) = bridge.egress_gateway_bridge.as_ref() else {
+                    return Err(refused_by_bridge(
+                        "EgressGatewayBridge cannot be updated on a ground-to-cloud \
+                         (ingress) bridge.",
+                    ));
+                };
+                Some(EgressGatewayBridge {
+                    // `EgressGatewayBridge$InstanceId` is "the ID of the instance running
+                    // this bridge" and the request shape has no member for it, so it is
+                    // the service's own and is carried over untouched.
+                    instance_id: stored.instance_id.clone(),
+                    max_bitrate: update.max_bitrate.unwrap_or(stored.max_bitrate),
+                })
+            }
+            None => bridge.egress_gateway_bridge.clone(),
+        };
+        let ingress_gateway_bridge = match input.ingress_gateway_bridge.as_ref() {
+            Some(update) => {
+                let Some(stored) = bridge.ingress_gateway_bridge.as_ref() else {
+                    return Err(refused_by_bridge(
+                        "IngressGatewayBridge cannot be updated on a cloud-to-ground \
+                         (egress) bridge.",
+                    ));
+                };
+                Some(IngressGatewayBridge {
+                    instance_id: stored.instance_id.clone(),
+                    max_bitrate: update.max_bitrate.unwrap_or(stored.max_bitrate),
+                    max_outputs: update.max_outputs.unwrap_or(stored.max_outputs),
+                })
+            }
+            None => bridge.ingress_gateway_bridge.clone(),
+        };
+        let source_failover_config = match input.source_failover_config.as_ref() {
+            Some(update) => Some(crate::state::merged_failover_config(
+                bridge.source_failover_config.as_ref(),
+                update,
+            )),
+            None => bridge.source_failover_config.clone(),
+        };
+
+        bridge.egress_gateway_bridge = egress_gateway_bridge;
+        bridge.ingress_gateway_bridge = ingress_gateway_bridge;
+        bridge.source_failover_config = source_failover_config;
+
+        // The response is the STORED record: `bridge` is the record in the store, so this
+        // reads back exactly what was just written, never the request.
+        Ok(UpdateBridgeResponse {
+            bridge: Some(bridge.to_bridge()),
+        })
     }
 }

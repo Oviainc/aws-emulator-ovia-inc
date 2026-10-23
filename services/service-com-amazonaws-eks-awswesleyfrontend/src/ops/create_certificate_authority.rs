@@ -188,11 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = guard.clusters.get_mut(&key) else {
             return Err(
                 CreateCertificateAuthorityErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(cluster_name.clone()),
-                        message: Some(format!("No cluster found for name: {cluster_name}.")),
-                        ..Default::default()
-                    },
+                    crate::state::cluster_not_found(&cluster_name),
                 )
                 .into(),
             );

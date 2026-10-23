@@ -154,13 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        let not_found = |message: String| {
+        // This delete addresses ONE resource — the `(cluster, capability)` pair — so a
+        // miss of either half is the service's generic, memberless not-found payload:
+        // [`crate::state::resource_not_found`].
+        let not_found = || {
             DeleteCapabilityError::from(DeleteCapabilityErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    message: Some(message),
-                    ..Default::default()
-                },
+                crate::state::resource_not_found(),
             ))
         };
 
@@ -175,18 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clusters
             .contains_key(&(region.clone(), input.cluster_name.clone()))
         {
-            return Err(not_found(format!(
-                "No cluster found for name: {}.",
-                input.cluster_name
-            )));
+            return Err(not_found());
         }
 
         let key = (region, input.cluster_name.clone(), input.capability_name.clone());
         let Some(mut record) = guard.capabilities.remove(&key) else {
-            return Err(not_found(format!(
-                "No capability found for name: {} in cluster: {}.",
-                input.capability_name, input.cluster_name
-            )));
+            return Err(not_found());
         };
 
         // The answer reports "its final status": the capability is on its way out.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MoveByoipCidrToIpam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MoveByoipCidrToIpam`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MoveByoipCidrToIpam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: moves the stored BYOIPv4 address range the request names into the IPAM
+//! pool it names, and answers with the range as it now stands. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +134,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MoveByoipCidrToIpam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MoveByoipCidrToIpamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MoveByoipCidrToIpam"))
+        // `ctx` carries request metadata only; this operation reads none of it — the pool
+        // and the range are each named in the request. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The BYOIP CIDR" (`Cidr`): a value that is not a CIDR block names no range. The
+        // range is canonicalised so one range cannot be named two ways.
+        let cidr = state::canonical_byoip_cidr(&input.cidr).map_err(|_| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{cidr}' for Cidr. It must be an address range in CIDR notation",
+                cidr = input.cidr,
+            ))
+        })?;
+        // "The Amazon Web Services account ID of the owner of the IPAM pool"
+        // (`IpamPoolOwner`) — an account id is twelve digits, so anything else names no
+        // account.
+        if !state::aws_account_id_is_well_formed(&input.ipam_pool_owner) {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{owner}' for IpamPoolOwner. It must be a 12-digit Amazon Web \
+                 Services account ID",
+                owner = input.ipam_pool_owner,
+            )));
+        }
+
+        // The pool id's own form next, for the same reason: "not an IPAM pool id" is a
+        // malformed request rather than an unknown pool, and is never answered by the
+        // DryRun arm below either.
+        let pool_id = input.ipam_pool_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_POOL_ID_PREFIX,
+            pool_id,
+            state::INVALID_IPAM_POOL_ID_MALFORMED,
+        )?;
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The DESTINATION of the move is resolved first: a pool id this account holds no
+        // pool for is refused with the pool's own `NotFound` code, whatever the range turns
+        // out to be, so a client can tell "no such pool" from every other reason the move
+        // could fail.
+        let pool = store.ipam_pools.get(pool_id).cloned().ok_or_else(|| {
+            state::id_not_found(
+                state::INVALID_IPAM_POOL_ID_NOT_FOUND,
+                "IPAM pool ID",
+                pool_id,
+            )
+        })?;
+        // "The Amazon Web Services account ID of the OWNER of the IPAM pool": an account
+        // that does not own the pool names a pool it cannot move a range into.
+        let owner = pool.owner_id.as_deref().unwrap_or_default();
+        if owner != input.ipam_pool_owner {
+            return Err(state::invalid_parameter_value(format!(
+                "The IPAM pool '{pool_id}' is owned by '{owner}', not by '{requested}'",
+                requested = input.ipam_pool_owner,
+            )));
+        }
+        // "Move a BYOIPv4 CIDR to IPAM FROM A PUBLIC IPv4 POOL", and a pool's public IP
+        // source is "only used for provisioning IP address CIDRs to pools in the PUBLIC
+        // scope" (`IpamPool$PublicIpSource`): a pool in the private scope holds the
+        // account's own internal space, so a publicly routable BYOIP range does not belong
+        // in it.
+        let scope = pool.ipam_scope_type.as_deref().unwrap_or_default();
+        if scope != state::IPAM_SCOPE_TYPE_PUBLIC {
+            return Err(state::invalid_parameter_value(format!(
+                "The IPAM pool '{pool_id}' is in the '{scope}' scope; a BYOIP address range \
+                 can only be moved into a pool in the '{public}' scope",
+                public = state::IPAM_SCOPE_TYPE_PUBLIC,
+            )));
+        }
+        // "You cannot move an IPv6 CIDR to IPAM" — the operation moves a BYOIPv4 CIDR, and
+        // a pool only holds CIDRs of its own address family.
+        let family = state::byoip_cidr_address_family(&cidr);
+        if family != state::ADDRESS_FAMILY_IPV4 {
+            return Err(state::invalid_parameter_value(format!(
+                "The address range '{cidr}' is an {family} range; only an \
+                 {ipv4} range can be moved to IPAM",
+                ipv4 = state::ADDRESS_FAMILY_IPV4,
+            )));
+        }
+        let pool_family = pool.address_family.as_deref().unwrap_or_default();
+        if pool_family != family {
+            return Err(state::invalid_parameter_value(format!(
+                "The IPAM pool '{pool_id}' holds {pool_family} CIDRs, so the {family} range \
+                 '{cidr}' cannot be moved into it"
+            )));
+        }
+
+        // "If you ALREADY HAVE a BYOIPv4 CIDR with Amazon Web Services, you can move the
+        // CIDR to IPAM from a public IPv4 pool": a range this account has not brought to AWS
+        // is no range of its own to move, which is EC2's `InvalidCidr.NotFound`.
+        let record = store
+            .byoip_cidrs
+            .get_mut(&cidr)
+            .ok_or_else(|| state::invalid_cidr_not_found(&cidr))?;
+        // A range IPAM already manages has already been moved; moving it again would name
+        // a second pool for one range.
+        if let Some(held_by) = record.byoip_cidr.ipam_pool_id.as_deref() {
+            return Err(state::incorrect_state(format!(
+                "The address range '{cidr}' is already managed by the IPAM pool '{held_by}'"
+            )));
+        }
+
+        // The move itself: the range leaves the public IPv4 pool it was in and is managed
+        // by the IPAM pool from here on. Its state is untouched — a range that was being
+        // advertised goes on being advertised across the move.
+        record.byoip_cidr.ipam_pool_id = Some(pool_id.to_string());
+        record.byoip_cidr.pool_id = None;
+
+        Ok(MoveByoipCidrToIpamOutput {
+            byoip_cidr: Some(record.byoip_cidr.clone()),
+        })
     }
 }

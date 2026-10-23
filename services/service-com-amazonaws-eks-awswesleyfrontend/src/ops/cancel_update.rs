@@ -183,13 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         };
-        let not_found = |message: String| {
+        // The two halves report DIFFERENT resources, so they carry different
+        // payloads: an absent cluster is reported as the cluster (named, with
+        // `clusterName` set), an absent update as the update (named by its id, with
+        // no identity member) — see [`crate::state::cluster_not_found`].
+        let not_found = |exception: ResourceNotFoundException| {
             CancelUpdateError::from(CancelUpdateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(message),
-                    ..Default::default()
-                },
+                exception,
             ))
         };
 
@@ -201,10 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request naming a cluster this region does not hold is a not-found about the
         // CLUSTER, whatever the update id looks like.
         let Some(cluster) = guard.clusters.get_mut(&(region, input.name.clone())) else {
-            return Err(not_found(format!(
-                "No cluster found for name: {}.",
-                input.name
-            )));
+            return Err(not_found(crate::state::cluster_not_found(&input.name)));
         };
         // "Currently, this is supported for VersionRollback update types on EKS Auto
         // Mode clusters": a cluster whose compute capability EKS does not manage rolls
@@ -213,10 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_status = cluster.status.clone();
 
         let Some(update) = cluster.updates.get_mut(&input.update_id) else {
-            return Err(not_found(format!(
+            return Err(not_found(crate::state::child_resource_not_found(format!(
                 "No update found for ID: {}.",
                 input.update_id
-            )));
+            ))));
         };
 
         // `clientRequestToken` is the request's idempotency token, so a retry of the

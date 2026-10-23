@@ -244,16 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // FIRST and reported as the modelled 404.
         let cluster_key = (region.clone(), input.cluster_name.clone());
         let Some(cluster) = guard.clusters.get(&cluster_key) else {
+            // The cluster is the resource this reports missing, so the payload names
+            // it and nothing else: the requested add-on's name is NOT echoed into
+            // the exception ([`crate::state::cluster_not_found`]).
             return Err(CreateAddonErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    addon_name: Some(input.addon_name.clone()),
-                    message: Some(format!(
-                        "No cluster found for name: {}.",
-                        input.cluster_name
-                    )),
-                    ..Default::default()
-                },
+                crate::state::cluster_not_found(&input.cluster_name),
             )
             .into());
         };

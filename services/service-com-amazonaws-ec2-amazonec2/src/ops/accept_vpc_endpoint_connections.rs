@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptVpcEndpointConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptVpcEndpointConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptVpcEndpointConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: accepts the pending connections to the account's own VPC endpoint service
+//! that the request names, moving each out of `PendingAcceptance` towards `Available`, and
+//! answers with the endpoints it could not accept. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +131,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptVpcEndpointConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptVpcEndpointConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptVpcEndpointConnections"))
+        // `ctx` carries request metadata only; this operation reads none of it — a service
+        // and an endpoint are each named by id. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The IDs of the interface VPC endpoints" (`VpcEndpointIds`, `@required`): the
+        // model refuses a request that omits the member, and a request carrying an EMPTY
+        // list names no endpoint to accept, which is the same missing parameter.
+        if input.vpc_endpoint_ids.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain at least one VpcEndpointId",
+            ));
+        }
+        // The model publishes no bound on the list either, and every id costs a store
+        // lookup and may add an `Unsuccessful` item to the answer, so the number of ids one
+        // request may name is capped here — the same ceiling the rest of this crate puts on
+        // a caller-chosen id list — before any per-id work is done.
+        if input.vpc_endpoint_ids.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "VpcEndpointIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = input.vpc_endpoint_ids.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        // The service id's own form next: an id that is not a VPC endpoint service id at
+        // all is refused as malformed, so "not an id of this kind" never reads as "no such
+        // service" and is never answered by the DryRun arm below either.
+        let service_id = input.service_id.as_str();
+        state::require_well_formed_id(
+            state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
+            service_id,
+            state::INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked
+        // and before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A connection whose own move has fallen due is already `Available`, so whether
+        // each acceptance is admissible is asked of the state the connection is ACTUALLY
+        // in.
+        store.materialize_due_transitions();
+
+        // "Accepts connection requests to YOUR VPC endpoint service": the service the
+        // request names must be one of the account's own, so a `ServiceId` naming none is
+        // refused outright — the whole call is about that one service, so this is not a
+        // per-endpoint failure that belongs in `Unsuccessful`.
+        if !store.vpc_endpoint_services.contains_key(service_id) {
+            return Err(state::id_not_found(
+                state::INVALID_VPC_ENDPOINT_SERVICE_ID_NOT_FOUND,
+                "VPC endpoint service ID",
+                service_id,
+            ));
+        }
+
+        // Each endpoint is judged on its own and reported in `Unsuccessful` when it cannot
+        // be accepted — "information about the interface endpoints that were not accepted"
+        // — so one bad id does not refuse the endpoints beside it. The reason carried is the
+        // code this service answers that same cause with elsewhere, so a client reads one
+        // code per cause whether it comes back as an error or as an unsuccessful item.
+        let mut unsuccessful: Vec<UnsuccessfulItem> = Vec::new();
+        let mut accepted: Vec<String> = Vec::new();
+        for endpoint_id in &input.vpc_endpoint_ids {
+            let refusal = if !state::vpc_endpoint_id_is_well_formed(endpoint_id) {
+                Some((
+                    state::INVALID_VPC_ENDPOINT_ID_MALFORMED,
+                    format!("Invalid id: '{endpoint_id}'"),
+                ))
+            } else {
+                match store.vpc_endpoint_connections.get(endpoint_id) {
+                    // A connection to ANOTHER service is as absent from this service's
+                    // connections as one that does not exist at all.
+                    None => Some((
+                        state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+                        format!(
+                            "The VPC endpoint ID '{endpoint_id}' does not name a connection to \
+                             the service '{service_id}'"
+                        ),
+                    )),
+                    Some(connection)
+                        if connection.service_id.as_deref() != Some(service_id) =>
+                    {
+                        Some((
+                            state::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+                            format!(
+                                "The VPC endpoint ID '{endpoint_id}' does not name a connection \
+                                 to the service '{service_id}'"
+                            ),
+                        ))
+                    }
+                    Some(connection)
+                        if connection.vpc_endpoint_state.as_deref()
+                            != Some(state::VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE) =>
+                    {
+                        Some((
+                            state::INCORRECT_STATE,
+                            format!(
+                                "The VPC endpoint '{endpoint_id}' is in state '{current}'; only \
+                                 a connection in state '{pending_acceptance}' can be accepted",
+                                current = connection
+                                    .vpc_endpoint_state
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                                pending_acceptance =
+                                    state::VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE,
+                            ),
+                        ))
+                    }
+                    Some(_) => None,
+                }
+            };
+            match refusal {
+                Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
+                    resource_id: Some(endpoint_id.clone()),
+                    error: Some(UnsuccessfulItemError {
+                        code: Some(code.to_string()),
+                        message: Some(message),
+                    }),
+                }),
+                None => accepted.push(endpoint_id.clone()),
+            }
+        }
+
+        // Every accepted connection moves to the non-terminal `Pending` now, with the clock
+        // owing it `Available`; the span is never zero, so a caller describing the
+        // connections straight after this call still sees the transient state.
+        for endpoint_id in accepted {
+            if let Some(connection) = store.vpc_endpoint_connections.get_mut(&endpoint_id) {
+                connection.vpc_endpoint_state =
+                    Some(state::VPC_ENDPOINT_STATE_PENDING.to_string());
+            }
+            store.vpc_endpoint_connection_moves.insert(
+                endpoint_id,
+                state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
+            );
+        }
+
+        Ok(AcceptVpcEndpointConnectionsOutput {
+            unsuccessful: Some(unsuccessful),
+        })
     }
 }

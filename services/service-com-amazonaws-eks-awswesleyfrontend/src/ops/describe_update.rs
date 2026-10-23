@@ -152,11 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads are the ones of the cluster in the region the request is signed for.
         let Some(record) = guard.clusters.get(&(region, input.name.clone())) else {
             return Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!("No cluster found for name: {}.", input.name)),
-                    ..Default::default()
-                },
+                crate::state::cluster_not_found(&input.name),
             )
             .into());
         };
@@ -172,17 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("capabilityName", input.capability_name.as_deref()),
         ] {
             if let Some(value) = value {
+                // The UPDATE is the resource reported missing, so the message names it
+                // and the member that scoped the lookup; the exception's identity
+                // members stay unset — EKS does not echo the request's
+                // `nodegroupName`/`addonName` into a not-found payload (see
+                // [`crate::state::child_resource_not_found`]).
                 return Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.name.clone()),
-                        nodegroup_name: (member == "nodegroupName").then(|| value.to_string()),
-                        addon_name: (member == "addonName").then(|| value.to_string()),
-                        message: Some(format!(
-                            "No update found for ID: {} with {member}: {value}.",
-                            input.update_id
-                        )),
-                        ..Default::default()
-                    },
+                    crate::state::child_resource_not_found(format!(
+                        "No update found for ID: {} with {member}: {value}.",
+                        input.update_id
+                    )),
                 )
                 .into());
             }
@@ -193,11 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 update: Some(update.to_update()),
             }),
             None => Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!("No update found for ID: {}.", input.update_id)),
-                    ..Default::default()
-                },
+                crate::state::child_resource_not_found(format!(
+                    "No update found for ID: {}.",
+                    input.update_id
+                )),
             )
             .into()),
         }

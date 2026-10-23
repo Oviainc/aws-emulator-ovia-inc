@@ -147,21 +147,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.materialize_due_transitions(SystemTime::now());
 
         // The cluster first: an add-on exists only inside one, and a cluster name
-        // identifies a cluster only within the region the request is signed for.
+        // identifies a cluster only within the region the request is signed for. This
+        // read addresses ONE resource — the `(cluster, add-on)` pair — so neither half
+        // is named and no identity member is serialized
+        // ([`crate::state::resource_not_found`]).
         if !guard
             .clusters
             .contains_key(&(region.clone(), input.cluster_name.clone()))
         {
             return Err(DescribeAddonErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    addon_name: Some(input.addon_name.clone()),
-                    message: Some(format!(
-                        "No cluster found for name: {}.",
-                        input.cluster_name
-                    )),
-                    ..Default::default()
-                },
+                crate::state::resource_not_found(),
             )
             .into());
         }
@@ -172,15 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 addon: Some(record.to_addon()),
             }),
             None => Err(DescribeAddonErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    addon_name: Some(input.addon_name.clone()),
-                    message: Some(format!(
-                        "No addon: {} found in cluster: {}",
-                        input.addon_name, input.cluster_name
-                    )),
-                    ..Default::default()
-                },
+                crate::state::resource_not_found(),
             )
             .into()),
         }

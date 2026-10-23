@@ -243,15 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 
-        let not_found = |message: String| {
+        // The two halves report DIFFERENT resources, so they carry different
+        // payloads: an absent cluster is reported as the cluster (named, with
+        // `clusterName` set), an absent association as the association (named by its
+        // id, with no identity member) — see [`crate::state::cluster_not_found`].
+        let not_found = |exception: ResourceNotFoundException| {
             UpdatePodIdentityAssociationError::from(
-                UpdatePodIdentityAssociationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(message),
-                        ..Default::default()
-                    },
-                ),
+                UpdatePodIdentityAssociationErrorModeled::ResourceNotFoundException(exception),
             )
         };
 
@@ -259,9 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clusters
             .contains_key(&(region.clone(), input.cluster_name.clone()))
         {
-            return Err(not_found(format!(
-                "No cluster found for name: {}.",
-                input.cluster_name
+            return Err(not_found(crate::state::cluster_not_found(
+                &input.cluster_name,
             )));
         }
 
@@ -271,10 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.association_id.clone(),
         );
         let Some(record) = guard.pod_identity_associations.get_mut(&key) else {
-            return Err(not_found(format!(
+            return Err(not_found(crate::state::child_resource_not_found(format!(
                 "No pod identity association found for ID: {}.",
                 input.association_id
-            )));
+            ))));
         };
 
         // "When using this policy, disableSessionTags must be set to true" — the

@@ -171,11 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = guard.clusters.get(&key) else {
             return Err(
                 AssociateEncryptionConfigErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(cluster_name.clone()),
-                        message: Some(format!("No cluster found for name: {cluster_name}.")),
-                        ..Default::default()
-                    },
+                    crate::state::cluster_not_found(&cluster_name),
                 )
                 .into(),
             );

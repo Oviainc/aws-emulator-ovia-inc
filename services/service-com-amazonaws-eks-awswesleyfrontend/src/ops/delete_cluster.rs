@@ -153,11 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || {
             DeleteClusterError::from(DeleteClusterErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    cluster_name: Some(input.name.clone()),
-                    message: Some(format!("No cluster found for name: {}.", input.name)),
-                    ..Default::default()
-                },
+                crate::state::cluster_not_found(&input.name),
             ))
         };
 

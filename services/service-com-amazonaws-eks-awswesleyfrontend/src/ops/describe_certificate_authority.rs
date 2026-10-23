@@ -150,14 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = guard.clusters.get_mut(&(region, input.cluster_name.clone())) else {
             return Err(
                 DescribeCertificateAuthorityErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "No cluster found for name: {}.",
-                            input.cluster_name
-                        )),
-                        ..Default::default()
-                    },
+                    crate::state::cluster_not_found(&input.cluster_name),
                 )
                 .into(),
             );
@@ -176,14 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => Err(
                 DescribeCertificateAuthorityErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "No certificate authority found with id: {} for cluster: {}.",
-                            input.certificate_authority_id, input.cluster_name
-                        )),
-                        ..Default::default()
-                    },
+                    // The certificate authority is the resource reported missing, so
+                    // the payload names no cluster: see
+                    // [`crate::state::child_resource_not_found`].
+                    crate::state::child_resource_not_found(format!(
+                        "No certificate authority found with id: {} for cluster: {}.",
+                        input.certificate_authority_id, input.cluster_name
+                    )),
                 )
                 .into(),
             ),

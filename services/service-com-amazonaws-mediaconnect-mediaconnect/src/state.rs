@@ -22,7 +22,8 @@ use crate::ops::types::{
     ListedGateway,
     Maintenance, MediaStream, MediaStreamAttributes, MediaStreamAttributesRequest,
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest, MonitoringConfig,
-    NdiConfig, Output, SetSourceRequest, Source, Transport, VpcInterface, VpcInterfaceAttachment,
+    NdiConfig, Output, SetSourceRequest, Source, Transport, UpdateFailoverConfig, VpcInterface,
+    VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -534,6 +535,38 @@ pub fn resolved_failover_config(config: FailoverConfig) -> FailoverConfig {
         ),
         ..config
     }
+}
+
+/// The failover setting a resource holds after `update` is applied to `stored`.
+///
+/// `UpdateFailoverConfig` mirrors `FailoverConfig` member for member and every member of
+/// it is optional, so applying one is a member-wise merge: a member the request carries
+/// replaces its counterpart, one it omits keeps the stored value. The merged result is
+/// resolved through [`resolved_failover_config`], so the window MediaConnect assigns a
+/// config that names none is the same here as on a create path.
+///
+/// Shared by every operation that applies an `UpdateFailoverConfig` — UpdateFlow's
+/// `SourceFailoverConfig` and UpdateBridge's, which target the same request shape and the
+/// same stored `FailoverConfig` — so one request shape always becomes the same stored
+/// config.
+pub fn merged_failover_config(
+    stored: Option<&FailoverConfig>,
+    update: &UpdateFailoverConfig,
+) -> FailoverConfig {
+    let mut merged = stored.cloned().unwrap_or_default();
+    if let Some(mode) = update.failover_mode.clone() {
+        merged.failover_mode = Some(mode);
+    }
+    if let Some(window) = update.recovery_window {
+        merged.recovery_window = Some(window);
+    }
+    if let Some(priority) = update.source_priority.clone() {
+        merged.source_priority = Some(priority);
+    }
+    if let Some(state) = update.state.clone() {
+        merged.state = Some(state);
+    }
+    resolved_failover_config(merged)
 }
 
 /// A status change the clock owes: at `due_at` the flow's status becomes `status`.

@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    CAPABILITY_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY, MAX_CAPABILITIES_PER_CLUSTER,
+    cluster_not_found_message, CAPABILITY_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY,
+    MAX_CAPABILITIES_PER_CLUSTER, RESOURCE_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -654,18 +655,38 @@ async fn every_capability_operation_refuses_an_unknown_cluster() {
              token, got {with_token:?}"
         );
 
-        // Every one of them names the cluster that was not found, so a caller can
-        // tell WHICH name failed.
-        for (operation, answer) in [
-            ("CreateCapability", &create),
-            ("DescribeCapability", &describe),
-            ("DeleteCapability", &delete),
-            ("ListCapabilities", &listed),
-        ] {
+        // The two that only VALIDATE the cluster — the create and the listing — report
+        // the cluster as the resource they could not resolve, so they name it.
+        for (operation, answer) in [("CreateCapability", &create), ("ListCapabilities", &listed)] {
             assert_eq!(
                 answer.body["clusterName"],
                 serde_json::json!(cluster),
                 "case {cluster:?}: {operation} must name the missing cluster, got {answer:?}"
+            );
+            assert_eq!(
+                answer.body["message"],
+                serde_json::json!(cluster_not_found_message(cluster)),
+                "case {cluster:?}: {operation} must report the cluster it could not \
+                 resolve, got {answer:?}"
+            );
+        }
+
+        // The two that address ONE resource — the `(cluster, capability)` pair — report
+        // the miss generically: no identity member at all, so a caller is not told
+        // which half was absent.
+        for (operation, answer) in [("DescribeCapability", &describe), ("DeleteCapability", &delete)]
+        {
+            assert_eq!(
+                answer.body["message"],
+                serde_json::json!(RESOURCE_NOT_FOUND_MESSAGE),
+                "case {cluster:?}: {operation} must report the generic not-found \
+                 sentence, got {answer:?}"
+            );
+            assert_eq!(
+                answer.body["clusterName"],
+                serde_json::Value::Null,
+                "case {cluster:?}: {operation} must not echo the cluster it was asked \
+                 for, got {answer:?}"
             );
         }
 
