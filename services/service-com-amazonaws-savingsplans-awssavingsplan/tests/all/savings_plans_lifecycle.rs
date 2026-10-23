@@ -21,31 +21,34 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// One answer from the emulator: the HTTP status, the wire error code (empty on
 /// success) and the parsed body.
-struct Answer {
-    status: u16,
-    code: String,
-    body: Value,
+///
+/// `pub(crate)` so a sibling suite in this test crate drives the emulator
+/// through the same harness rather than standing up a second one.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) code: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The body member `name`, or `Value::Null`.
-    fn get(&self, name: &str) -> &Value {
+    pub(crate) fn get(&self, name: &str) -> &Value {
         self.body.get(name).unwrap_or(&Value::Null)
     }
 
     /// The body member `name` as an array.
-    fn list(&self, name: &str) -> &[Value] {
+    pub(crate) fn list(&self, name: &str) -> &[Value] {
         self.get(name).as_array().map_or(&[], Vec::as_slice)
     }
 }
 
 /// The emulator, with this one service mounted on the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing, so take the authenticator out: this suite is
@@ -57,7 +60,7 @@ impl Emulator {
 
     /// `POST /<operation>` with a JSON body, routed by the SigV4 credential
     /// scope the way an SDK request routes.
-    async fn call(&self, operation: &str, body: Value) -> Answer {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> Answer {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("/{operation}"))
@@ -107,7 +110,7 @@ impl Emulator {
     /// An offering with this plan type, payment option and term. Plan types
     /// that are scoped to a region have one per region; the first is as good as
     /// any for a purchase.
-    async fn offering(&self, plan_type: &str, payment_option: &str, duration: i64) -> Value {
+    pub(crate) async fn offering(&self, plan_type: &str, payment_option: &str, duration: i64) -> Value {
         let answer = self
             .call(
                 "DescribeSavingsPlansOfferings",
@@ -129,7 +132,7 @@ impl Emulator {
     }
 
     /// Purchase `offering_id`, asserting the purchase succeeded.
-    async fn purchase(&self, request: Value) -> String {
+    pub(crate) async fn purchase(&self, request: Value) -> String {
         let answer = self.call("CreateSavingsPlan", request.clone()).await;
         assert_eq!(
             answer.status, 200,
@@ -144,7 +147,7 @@ impl Emulator {
     }
 
     /// Describe the one plan with this id.
-    async fn plan(&self, savings_plan_id: &str) -> Value {
+    pub(crate) async fn plan(&self, savings_plan_id: &str) -> Value {
         let answer = self
             .call(
                 "DescribeSavingsPlans",
@@ -163,7 +166,7 @@ impl Emulator {
 }
 
 /// A string member of a JSON object, or `""`.
-fn text(value: &Value, name: &str) -> String {
+pub(crate) fn text(value: &Value, name: &str) -> String {
     value
         .get(name)
         .and_then(Value::as_str)
@@ -178,9 +181,9 @@ fn amount(value: &Value, name: &str) -> f64 {
 }
 
 /// The terms the catalog is seeded with, in seconds.
-const ONE_YEAR: i64 = 31_536_000;
+pub(crate) const ONE_YEAR: i64 = 31_536_000;
 /// See [`ONE_YEAR`].
-const THREE_YEARS: i64 = 94_608_000;
+pub(crate) const THREE_YEARS: i64 = 94_608_000;
 
 // ---------------------------------------------------------------------------
 // The offering catalog
@@ -552,10 +555,11 @@ async fn a_purchase_round_trips_through_describe() {
         ("savingsPlanType", "Compute".to_string()),
         ("paymentOption", "No Upfront".to_string()),
         ("currency", "USD".to_string()),
-        // 0.1 an hour, nothing up front: the whole commitment recurs.
-        ("commitment", "0.1".to_string()),
-        ("upfrontPaymentAmount", "0.0".to_string()),
-        ("recurringPaymentAmount", "0.1".to_string()),
+        // 0.1 an hour, nothing up front: the whole commitment recurs. Every
+        // `Amount` is rendered at the service's one fixed scale.
+        ("commitment", "0.10000000".to_string()),
+        ("upfrontPaymentAmount", "0.00000000".to_string()),
+        ("recurringPaymentAmount", "0.10000000".to_string()),
     ] {
         assert_eq!(
             text(&plan, member),
@@ -1312,16 +1316,25 @@ async fn returning_a_plan_moves_it_out_of_its_returnable_state() {
 
     // (case, purchaseTime offset in seconds, expected status, the states the
     // plan may be in afterwards — a refused return leaves the plan where it
-    // was, which is payment-pending until its own activation span elapses)
-    let cases: [(&str, Option<i64>, u16, &[&str]); 5] = [
-        ("bought now", None, 200, &["returned"]),
-        ("bought a minute ago", Some(-60), 200, &["returned"]),
-        // Outside the one-hour window AWS documents for a return.
+    // was, which is payment-pending until its own activation span elapses —
+    // and whether `returnableUntil` falls back to the plan's start time)
+    type ReturnCase = (
+        &'static str,
+        Option<i64>,
+        u16,
+        &'static [&'static str],
+        bool,
+    );
+    let cases: [ReturnCase; 5] = [
+        ("bought now", None, 200, &["returned"], true),
+        ("bought a minute ago", Some(-60), 200, &["returned"], true),
+        // Outside the 7-day (168-hour) window AWS documents for a return.
         (
-            "bought two hours ago",
-            Some(-7200),
+            "bought eight days ago",
+            Some(-8 * 86_400),
             400,
             &["payment-pending", "active"],
+            true,
         ),
         // Past the end of its one-year term, so the clock already retired it.
         (
@@ -1329,12 +1342,15 @@ async fn returning_a_plan_moves_it_out_of_its_returnable_state() {
             Some(-2 * 365 * 86_400),
             400,
             &["retired"],
+            true,
         ),
-        // Not paid for yet, so the purchase is cancelled instead.
-        ("queued for tomorrow", Some(86_400), 200, &["queued-deleted"]),
+        // Not started yet: a queued purchase is cancelled through
+        // DeleteQueuedSavingsPlan, not returned, so the return is refused and
+        // the plan keeps the window its start will open.
+        ("queued for tomorrow", Some(86_400), 400, &["queued"], false),
     ];
 
-    for (case, offset, expected_status, expected_states) in cases {
+    for (case, offset, expected_status, expected_states, returnable_until_is_start) in cases {
         let mut request = json!({
             "savingsPlanOfferingId": offering_id,
             "commitment": "0.1",
@@ -1375,14 +1391,23 @@ async fn returning_a_plan_moves_it_out_of_its_returnable_state() {
             expected_states.contains(&state.as_str()),
             "case {case:?}: expected the plan to be one of {expected_states:?}, got {state:?}"
         );
-        // None of these plans can be returned any more — three have been and
-        // one is past its window — so `returnableUntil` falls back to the
-        // plan's start time.
-        assert_eq!(
-            text(&plan, "returnableUntil"),
-            text(&plan, "start"),
-            "case {case:?}: a plan that cannot be returned reports its start time, got {plan:?}"
-        );
+        // A plan that cannot be returned any more — two have been and two are
+        // outside the states a return is accepted from — reports its start
+        // time; one whose window is still ahead of it reports when that window
+        // closes.
+        if returnable_until_is_start {
+            assert_eq!(
+                text(&plan, "returnableUntil"),
+                text(&plan, "start"),
+                "case {case:?}: a plan that cannot be returned reports its start time, got {plan:?}"
+            );
+        } else {
+            assert!(
+                text(&plan, "returnableUntil") > text(&plan, "start"),
+                "case {case:?}: a plan whose return window is still open reports when it \
+                 closes, got {plan:?}"
+            );
+        }
     }
 }
 
@@ -1591,12 +1616,17 @@ async fn describe_plans_filters_and_pages() {
         (
             "filter on commitment",
             json!({ "filters": [{ "name": "commitment", "values": ["0.1"] }] }),
-            Box::new(|p: &Value| text(p, "commitment") == "0.1"),
+            Box::new(|p: &Value| text(p, "commitment") == "0.10000000"),
         ),
         (
             "filter on commitment spelled differently",
             json!({ "filters": [{ "name": "commitment", "values": ["0.100"] }] }),
-            Box::new(|p: &Value| text(p, "commitment") == "0.1"),
+            Box::new(|p: &Value| text(p, "commitment") == "0.10000000"),
+        ),
+        (
+            "filter on commitment spelled at the scale the service renders",
+            json!({ "filters": [{ "name": "commitment", "values": ["0.10000000"] }] }),
+            Box::new(|p: &Value| text(p, "commitment") == "0.10000000"),
         ),
         (
             "filter on start",
@@ -1774,8 +1804,9 @@ fn a_purchase_becomes_active_only_once_the_clock_owes_it() {
         let record = state::purchase(
             &offering,
             savings_plan_id.clone(),
-            "0.1",
-            // Nothing up front, 0.1 an hour recurring, in AMOUNT_SCALE units.
+            // 0.1 an hour, nothing up front, 0.1 an hour recurring, in
+            // AMOUNT_SCALE units.
+            state::AMOUNT_SCALE / 10,
             0,
             state::AMOUNT_SCALE / 10,
             purchase_millis,

@@ -11,4 +11,4 @@
 //! Declared in `tests/all.rs` like any other file under `tests/all/`, as the
 //! layout rule requires; it holds no tests of its own.
 
-pub(crate) use crate::lifecycle::{instant, Answer, Emulator, PAST_DUE};
+pub(crate) use crate::lifecycle::{instant, Answer, Emulator, PAST_DUE, SOLUTION_STACK};

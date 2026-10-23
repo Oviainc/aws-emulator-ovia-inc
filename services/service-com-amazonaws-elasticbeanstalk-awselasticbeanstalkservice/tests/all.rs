@@ -37,6 +37,8 @@ mod operations_role;
 mod platform_branches;
 #[path = "all/platform_versions.rs"]
 mod platform_versions;
+#[path = "all/rejection_rules.rs"]
+mod rejection_rules;
 #[path = "all/request_refusals.rs"]
 mod request_refusals;
 #[path = "all/resource_tags.rs"]

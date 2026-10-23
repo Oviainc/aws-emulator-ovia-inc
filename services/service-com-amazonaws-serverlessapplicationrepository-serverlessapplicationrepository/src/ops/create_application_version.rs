@@ -183,6 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // The endpoint this request arrived on, which the locator minted for an inline
+        // template body announces; see `crate::state::minted_artifact_url`.
+        let host = crate::state::request_host(ctx, &region);
         // The semantic version is the key this version is stored under and is echoed
         // back, so it must be one: "The semantic version of the new version" per
         // https://semver.org/.
@@ -249,6 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::now_iso8601(),
             template_url: input.template_url.clone().unwrap_or_else(|| {
                 crate::state::minted_artifact_url(
+                    &host,
                     &region,
                     &application.name,
                     Some(&input.semantic_version),

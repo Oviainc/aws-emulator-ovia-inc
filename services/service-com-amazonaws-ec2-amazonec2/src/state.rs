@@ -937,6 +937,23 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ([`VpcAttributes::for_vpc`]), so a describe never has to invent a default for a
     /// VPC nobody has modified.
     pub vpc_attributes: BTreeMap<String, VpcAttributes>,
+    /// Every association between a local gateway route table and a virtual interface group
+    /// the account holds, by `LocalGatewayRouteTableVirtualInterfaceGroupAssociationId`, as
+    /// the modelled `LocalGatewayRouteTableVirtualInterfaceGroupAssociation` shape itself —
+    /// so a member a writer sets round-trips through
+    /// `DescribeLocalGatewayRouteTableVirtualInterfaceGroupAssociations` without a
+    /// field-by-field copy, the way the VPC and subnet stores hold their shapes. Ordered by
+    /// id, which is the order that describe reports and pages over.
+    ///
+    /// Starts EMPTY, unlike the stores above it: a local gateway and the route tables and
+    /// virtual interface groups on it exist only on an Outpost, which no EC2 call creates,
+    /// so an account without one has no association to report.
+    /// [`Self::insert_local_gateway_route_table_virtual_interface_group_association`] is the
+    /// one way an association is stored.
+    pub local_gateway_route_table_virtual_interface_group_associations: BTreeMap<
+        String,
+        crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
+    >,
     /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
     /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
@@ -1087,6 +1104,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_attributes: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
+            local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
@@ -3191,6 +3209,97 @@ pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
         412,
         "Request would have succeeded, but DryRun flag is set.",
     )
+}
+
+// =============================================================================
+// Local gateway route table / virtual interface group associations
+// =============================================================================
+
+/// The id prefix EC2 mints an association between a local gateway route table and a
+/// virtual interface group with: `lgw-vif-grp-assoc-`, as the AWS Outposts and EC2
+/// documentation's own ids read (for example `lgw-vif-grp-assoc-074f1e8e9bEXAMPLE`). The
+/// model puts no pattern on
+/// `LocalGatewayRouteTableVirtualInterfaceGroupAssociationId`, so the prefix is the one
+/// thing that says which resource an id names.
+pub const LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_ID_PREFIX: &str = "lgw-vif-grp-assoc";
+
+/// The ARN resource path of a local gateway route table:
+/// `arn:aws:ec2:<region>:<account>:local-gateway-route-table/<id>`, the form
+/// `LocalGatewayRouteTableVirtualInterfaceGroupAssociation$LocalGatewayRouteTableArn`
+/// carries ("The Amazon Resource Name (ARN) of the local gateway route table for the
+/// virtual interface group").
+pub fn local_gateway_route_table_arn(region: &str, route_table_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ec2",
+        region,
+        &format!("local-gateway-route-table/{route_table_id}"),
+    )
+}
+
+/// What one association between a local gateway route table and a virtual interface group
+/// is written with: the two resources it joins, the local gateway they belong to, the
+/// Region whose ARN namespace the route table's ARN names, the association's state, and
+/// its tags.
+///
+/// Every member the service itself owns — the association id, the route table ARN built
+/// from the Region and the route table id, and the owning account — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_virtual_interface_group_association`]
+/// rather than taken from the caller, so two writers cannot report one association
+/// differently.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec {
+    /// "The ID of the local gateway route table" the association is made in.
+    pub local_gateway_route_table_id: String,
+    /// "The ID of the virtual interface group" the route table is associated with.
+    pub local_gateway_virtual_interface_group_id: String,
+    /// "The ID of the local gateway" both belong to.
+    pub local_gateway_id: String,
+    /// The Region the route table's ARN names.
+    pub region: String,
+    /// "The state of the association"
+    /// (`LocalGatewayRouteTableVirtualInterfaceGroupAssociation$State`), which the model
+    /// leaves an unconstrained string.
+    pub state: String,
+    /// "The tags assigned to the association".
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store one association between a local gateway route table and a virtual interface
+    /// group, and answer the id it was given.
+    ///
+    /// Like [`Self::insert_vpc`], the caller-chosen bytes of `spec.tags` are charged
+    /// against the store's byte budget here, so no writer can store them uncharged.
+    pub fn insert_local_gateway_route_table_virtual_interface_group_association(
+        &mut self,
+        spec: LocalGatewayRouteTableVirtualInterfaceGroupAssociationSpec,
+    ) -> String {
+        let association_id = self.next_id(LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_ID_PREFIX);
+        let association =
+            crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation {
+                local_gateway_route_table_virtual_interface_group_association_id: Some(
+                    association_id.clone(),
+                ),
+                local_gateway_virtual_interface_group_id: Some(
+                    spec.local_gateway_virtual_interface_group_id,
+                ),
+                local_gateway_id: Some(spec.local_gateway_id),
+                local_gateway_route_table_arn: Some(local_gateway_route_table_arn(
+                    &spec.region,
+                    &spec.local_gateway_route_table_id,
+                )),
+                local_gateway_route_table_id: Some(spec.local_gateway_route_table_id),
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                state: Some(spec.state),
+                tags: Some(spec.tags),
+            };
+        self.add_stored_bytes(tag_list_bytes(
+            association.tags.as_deref().unwrap_or_default(),
+        ));
+        self.local_gateway_route_table_virtual_interface_group_associations
+            .insert(association_id.clone(), association);
+        association_id
+    }
 }
 
 // =============================================================================

@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "savingsPlanOfferingId".to_string(),
                 input.savings_plan_offering_id.clone(),
             ),
-            ("commitment".to_string(), stored_commitment.clone()),
+            ("commitment".to_string(), stored_commitment),
             (
                 "upfrontPaymentAmount".to_string(),
                 input.upfront_payment_amount.clone().unwrap_or_default(),
@@ -331,10 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::purchase(
             &offering,
             savings_plan_id.clone(),
-            // The commitment as the service holds it: the parsed decimal
-            // rendered in the `Amount` form every other amount uses, not the
-            // request's spelling of it.
-            &stored_commitment,
+            // The commitment as the service holds it: the parsed decimal, not
+            // the request's spelling of it, so it is rendered in the one
+            // `Amount` form every other amount is rendered in.
+            commitment,
             upfront,
             recurring,
             purchase_millis,

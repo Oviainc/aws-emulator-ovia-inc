@@ -13,7 +13,7 @@
 //! Every assertion goes through `DescribeEnvironments`, so a swap that answers
 //! 200 without writing the store fails here.
 
-use crate::harness::{Answer, Emulator, PAST_DUE};
+use crate::harness::{Answer, Emulator, PAST_DUE, SOLUTION_STACK};
 
 /// The DNS suffix every environment CNAME this service derives ends in —
 /// `<prefix>.<region>.elasticbeanstalk.com`, so the suffix below is the
@@ -52,6 +52,7 @@ async fn create_environment(
     let mut params: Vec<(&str, &str)> = vec![
         ("ApplicationName", APPLICATION),
         ("EnvironmentName", environment_name),
+        ("SolutionStackName", SOLUTION_STACK.as_str()),
     ];
     if let Some(prefix) = cname_prefix {
         params.push(("CNAMEPrefix", prefix));

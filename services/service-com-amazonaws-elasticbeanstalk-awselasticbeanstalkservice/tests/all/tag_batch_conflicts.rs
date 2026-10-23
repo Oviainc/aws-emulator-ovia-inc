@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::lifecycle::{account, Emulator, TEST_REGION};
+use crate::lifecycle::{account, Emulator, SOLUTION_STACK, TEST_REGION};
 
 /// The application every case is created under.
 const APPLICATION: &str = "tagged-app";
@@ -84,6 +84,10 @@ async fn seed(emulator: &Emulator, kind: ResourceKind, initial: &[(&str, &str)])
             let mut params = vec![
                 ("ApplicationName".to_string(), APPLICATION.to_string()),
                 ("EnvironmentName".to_string(), ENVIRONMENT.to_string()),
+                // `CreateEnvironment` refuses a request that names no configuration
+                // template, no solution stack and no platform version, so the fixture
+                // names one from the service's own published catalogue.
+                ("SolutionStackName".to_string(), SOLUTION_STACK.to_string()),
             ];
             params.extend(tag_params("Tags", initial));
             expect_ok(emulator, "CreateEnvironment", &params, "seed").await;

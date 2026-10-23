@@ -416,6 +416,471 @@ pub fn tag_set_from_header(
     Ok(tags)
 }
 
+// ---------------------------------------------------------------------------
+// Access control lists.
+//
+// ONE type for every ACL S3 holds, the way `ResourceTag` is one tag for every tag set:
+// an ACL is "a list of grants" (`AccessControlPolicy$Grants`) in a bucket's record and
+// in an object's alike, so the grant, the grantee and the rules they are judged against
+// live here once rather than in each handler.
+// ---------------------------------------------------------------------------
+
+/// Every value the `Permission` enum publishes: the access an ACL grant may give, and so
+/// the only values a grant may name. Re-exported from the model-generated value list,
+/// like [`EVENT_VALUES`].
+pub use crate::ops::types::PERMISSION_VALUES;
+
+/// Every value the `Type` enum publishes: how an ACL grantee may be named. Re-exported
+/// from the model-generated value list, like [`PERMISSION_VALUES`].
+pub use crate::ops::types::TYPE_VALUES;
+
+/// The `Grantee$Type` of a grantee named by its canonical user id — `TYPE_VALUES[1]`.
+pub const GRANTEE_CANONICAL_USER: &str = "CanonicalUser";
+
+/// The `Grantee$Type` of a grantee named by a predefined group's URI — `TYPE_VALUES[2]`.
+pub const GRANTEE_GROUP: &str = "Group";
+
+/// The `Grantee$Type` of a grantee named by the email address of an account —
+/// `TYPE_VALUES[0]`.
+pub const GRANTEE_BY_EMAIL: &str = "AmazonCustomerByEmail";
+
+/// `Permission` `FULL_CONTROL`: "the read, write, read ACP, and write ACP permissions"
+/// (`PutBucketAclRequest$GrantFullControl`).
+pub const PERMISSION_FULL_CONTROL: &str = "FULL_CONTROL";
+/// `Permission` `READ`: "Allows grantee to list the objects in the bucket"
+/// (`PutBucketAclRequest$GrantRead`).
+pub const PERMISSION_READ: &str = "READ";
+/// `Permission` `READ_ACP`: "Allows grantee to read the bucket ACL"
+/// (`PutBucketAclRequest$GrantReadACP`).
+pub const PERMISSION_READ_ACP: &str = "READ_ACP";
+/// `Permission` `WRITE`: "Allows grantee to create new objects in the bucket"
+/// (`PutBucketAclRequest$GrantWrite`).
+pub const PERMISSION_WRITE: &str = "WRITE";
+/// `Permission` `WRITE_ACP`: "Allows grantee to write the ACL for the applicable bucket"
+/// (`PutBucketAclRequest$GrantWriteACP`).
+pub const PERMISSION_WRITE_ACP: &str = "WRITE_ACP";
+
+/// The URI of the predefined group *All Users* — "anyone in the world", which is what
+/// makes a grant to it a PUBLIC grant.
+///
+/// The three URIs below are the predefined groups the Amazon S3 User Guide publishes
+/// ("Amazon S3 predefined groups"), and they are the only URIs an ACL grantee of type
+/// `Group` may name.
+pub const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
+
+/// The URI of the predefined group *Authenticated Users* — every AWS account.
+pub const AUTHENTICATED_USERS_GROUP_URI: &str =
+    "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+
+/// The URI of the predefined group *Log Delivery* — the group S3 server access logging
+/// and other AWS log producers write through, so a grant to it is what lets logs land in
+/// the bucket.
+pub const LOG_DELIVERY_GROUP_URI: &str = "http://acs.amazonaws.com/groups/s3/LogDelivery";
+
+/// Every predefined group URI an ACL grantee of type [`GRANTEE_GROUP`] may name. See
+/// [`ALL_USERS_GROUP_URI`] for the source.
+pub const PREDEFINED_GROUP_URIS: [&str; 3] = [
+    ALL_USERS_GROUP_URI,
+    AUTHENTICATED_USERS_GROUP_URI,
+    LOG_DELIVERY_GROUP_URI,
+];
+
+/// The Regions in which S3 has discontinued Email Grantee ACLs.
+///
+/// From `PutBucketAcl`'s own documentation: "As of October 1, 2025, Amazon S3 has
+/// discontinued support for Email Grantee Access Control Lists (ACLs). If you attempt to
+/// use an Email Grantee ACL in a request after October 1, 2025, the request will receive
+/// an HTTP 405 (Method Not Allowed) error. This change affects the following Amazon Web
+/// Services Regions: US East (N. Virginia), US West (N. California), US West (Oregon),
+/// Asia Pacific (Singapore), Asia Pacific (Sydney), Asia Pacific (Tokyo), Europe
+/// (Ireland), and South America (São Paulo)" — those eight Regions by their codes.
+pub const EMAIL_GRANTEE_DISCONTINUED_REGIONS: [&str; 8] = [
+    "us-east-1",
+    "us-west-1",
+    "us-west-2",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-northeast-1",
+    "eu-west-1",
+    "sa-east-1",
+];
+
+/// How many grants one ACL may carry.
+///
+/// Published, unlike [`MAX_OWNERSHIP_CONTROLS_RULES`]: "An ACL can have up to 100 grants"
+/// (Amazon S3 User Guide, *Access control list (ACL) overview*). Nothing in the model
+/// bounds `Grants` (`smithy_query(query="shape",shape="Grants")` carries no `@length`), so
+/// this is also what bounds the grants one bucket can park in this process's memory; an
+/// ACL past it is refused rather than recorded.
+pub const MAX_ACL_GRANTS: usize = 100;
+
+/// Who an ACL grant gives its permission to: the `Grantee` of one `Grant`.
+///
+/// Which member carries the grantee depends on [`Self::grantee_type`], exactly as the
+/// wire shape does (`smithy_query(query="shape",shape="Grantee")`): a `CanonicalUser` is
+/// named by `ID`, a `Group` by `URI` and an `AmazonCustomerByEmail` by `EmailAddress`.
+/// Held separately from the modelled `Grantee` shape so this store owns no wire type, the
+/// way [`ResourceTag`] is held separately from `Tag`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclGrantee {
+    /// A `Type` value ([`TYPE_VALUES`]): [`GRANTEE_CANONICAL_USER`], [`GRANTEE_GROUP`]
+    /// or [`GRANTEE_BY_EMAIL`].
+    pub grantee_type: String,
+    /// `Grantee$ID`, the canonical user id of the grantee — present exactly when the
+    /// type is [`GRANTEE_CANONICAL_USER`].
+    pub id: Option<String>,
+    /// `Grantee$URI`, the predefined group's URI — present exactly when the type is
+    /// [`GRANTEE_GROUP`], and then one of [`PREDEFINED_GROUP_URIS`].
+    pub uri: Option<String>,
+    /// `Grantee$EmailAddress` — present exactly when the type is [`GRANTEE_BY_EMAIL`].
+    pub email_address: Option<String>,
+}
+
+impl AclGrantee {
+    /// The grantee that is the account whose canonical user id is `id`.
+    pub fn canonical_user(id: impl Into<String>) -> Self {
+        Self {
+            grantee_type: GRANTEE_CANONICAL_USER.to_string(),
+            id: Some(id.into()),
+            uri: None,
+            email_address: None,
+        }
+    }
+
+    /// The grantee that is the predefined group named by `uri`.
+    pub fn group(uri: impl Into<String>) -> Self {
+        Self {
+            grantee_type: GRANTEE_GROUP.to_string(),
+            id: None,
+            uri: Some(uri.into()),
+            email_address: None,
+        }
+    }
+}
+
+/// One grant of an ACL: who, and what they may do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclGrant {
+    /// Who the permission is given to.
+    pub grantee: AclGrantee,
+    /// A `Permission` value ([`PERMISSION_VALUES`]).
+    pub permission: String,
+}
+
+impl AclGrant {
+    /// The grant giving `permission` to the account whose canonical user id is `id`.
+    pub fn to_canonical_user(id: impl Into<String>, permission: &str) -> Self {
+        Self {
+            grantee: AclGrantee::canonical_user(id),
+            permission: permission.to_string(),
+        }
+    }
+
+    /// The grant giving `permission` to the predefined group named by `uri`.
+    pub fn to_group(uri: &str, permission: &str) -> Self {
+        Self {
+            grantee: AclGrantee::group(uri),
+            permission: permission.to_string(),
+        }
+    }
+}
+
+/// The ACL a bucket carries until a `PutBucketAcl` sets another one: the owner's
+/// `FULL_CONTROL` and nothing else.
+///
+/// The canned ACL `private` — "Owner gets FULL_CONTROL. No one else has access rights
+/// (default)" (Amazon S3 User Guide, *Canned ACL*) — which is the ACL `CreateBucket`
+/// applies when its request names none (`CreateBucketRequest$ACL` defaults to nothing,
+/// and S3 documents `private` as the default canned ACL). Derived on read rather than
+/// written at create time, so a reader reports it without changing anything.
+pub fn default_acl_grants() -> Vec<AclGrant> {
+    vec![AclGrant::to_canonical_user(
+        canonical_user_id(),
+        PERMISSION_FULL_CONTROL,
+    )]
+}
+
+/// The grants a `BucketCannedACL` value stands for, or `None` for a value outside
+/// `BUCKET_CANNED_A_C_L_VALUES`.
+///
+/// "Amazon S3 supports a set of predefined ACLs, known as canned ACLs. Each canned ACL has
+/// a predefined set of grantees and permissions" (`PutBucketAcl`'s own documentation); the
+/// four expansions are the bucket rows of the published *Canned ACL* table:
+///
+/// * `private` — owner `FULL_CONTROL`, nobody else;
+/// * `public-read` — owner `FULL_CONTROL`, `AllUsers` `READ`;
+/// * `public-read-write` — owner `FULL_CONTROL`, `AllUsers` `READ` and `WRITE`;
+/// * `authenticated-read` — owner `FULL_CONTROL`, `AuthenticatedUsers` `READ`.
+pub fn canned_acl_grants(canned: &str) -> Option<Vec<AclGrant>> {
+    let owner = AclGrant::to_canonical_user(canonical_user_id(), PERMISSION_FULL_CONTROL);
+    let grants = match canned {
+        "private" => vec![owner],
+        "public-read" => vec![
+            owner,
+            AclGrant::to_group(ALL_USERS_GROUP_URI, PERMISSION_READ),
+        ],
+        "public-read-write" => vec![
+            owner,
+            AclGrant::to_group(ALL_USERS_GROUP_URI, PERMISSION_READ),
+            AclGrant::to_group(ALL_USERS_GROUP_URI, PERMISSION_WRITE),
+        ],
+        "authenticated-read" => vec![
+            owner,
+            AclGrant::to_group(AUTHENTICATED_USERS_GROUP_URI, PERMISSION_READ),
+        ],
+        _ => return None,
+    };
+    Some(grants)
+}
+
+/// Why an ACL cannot be stored on a bucket or an object.
+///
+/// Each variant is one rule the API publishes for an ACL; the caller maps it to the wire
+/// code and status S3 answers it with, the way a [`TagSetRejection`] is rendered by its
+/// caller — this store owns no wire concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclRejection {
+    /// The ACL carries more than [`MAX_ACL_GRANTS`] grants.
+    TooManyGrants { count: usize },
+    /// A grant names a `Permission` outside [`PERMISSION_VALUES`].
+    UnknownPermission { permission: String },
+    /// A grantee names a `Type` outside [`TYPE_VALUES`].
+    UnknownGranteeType { grantee_type: String },
+    /// A grantee's `Type` and its members disagree: the member that type is named by is
+    /// missing or empty.
+    GranteeMemberMissing {
+        grantee_type: String,
+        member: &'static str,
+    },
+    /// A `Group` grantee names a URI that is not one of [`PREDEFINED_GROUP_URIS`].
+    UnknownGroupUri { uri: String },
+    /// An `AmazonCustomerByEmail` grantee in a Region where S3 has discontinued Email
+    /// Grantee ACLs ([`EMAIL_GRANTEE_DISCONTINUED_REGIONS`]).
+    EmailGranteeDiscontinued { region: String },
+    /// An `AmazonCustomerByEmail` grantee anywhere else: this emulator serves ONE account
+    /// and holds no email address for it, so no email address it is given can match an
+    /// account on record.
+    EmailGranteeUnresolvable { email_address: String },
+}
+
+impl std::fmt::Display for AclRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyGrants { count } => write!(
+                f,
+                "the access control list carries {count} grants, more than the \
+                 {MAX_ACL_GRANTS} grants one ACL may hold"
+            ),
+            Self::UnknownPermission { permission } => write!(
+                f,
+                "Grant.Permission must be one of {PERMISSION_VALUES:?}, got {permission:?}"
+            ),
+            Self::UnknownGranteeType { grantee_type } => write!(
+                f,
+                "Grant.Grantee.Type must be one of {TYPE_VALUES:?}, got {grantee_type:?}"
+            ),
+            Self::GranteeMemberMissing {
+                grantee_type,
+                member,
+            } => write!(
+                f,
+                "a Grant.Grantee of type {grantee_type:?} is named by its {member}, which \
+                 this grant does not carry"
+            ),
+            Self::UnknownGroupUri { uri } => write!(
+                f,
+                "Grant.Grantee.URI must be one of the predefined group URIs \
+                 {PREDEFINED_GROUP_URIS:?}, got {uri:?}"
+            ),
+            Self::EmailGranteeDiscontinued { region } => write!(
+                f,
+                "Email Grantee ACLs are no longer supported in {region}; name the grantee \
+                 by its canonical user ID instead"
+            ),
+            Self::EmailGranteeUnresolvable { email_address } => write!(
+                f,
+                "the email address {email_address:?} does not match any account on record"
+            ),
+        }
+    }
+}
+
+/// Whether `grants` may be stored as the ACL of a resource in `region`, reporting the
+/// first published rule it breaks.
+///
+/// ONE rule for every ACL S3 holds. The count is judged before the per-grant rules so an
+/// enormous list is refused for what it is rather than for whichever grant happens to come
+/// first, and each grant is then judged on its `Permission` and on whether its grantee's
+/// `Type` and members agree — the agreement the wire shape leaves open, because `Grantee`
+/// makes only `Type` required and every id-carrying member optional.
+///
+/// `region` decides only how an email grantee is refused: see
+/// [`EMAIL_GRANTEE_DISCONTINUED_REGIONS`].
+pub fn validate_acl_grants(grants: &[AclGrant], region: &str) -> Result<(), AclRejection> {
+    if grants.len() > MAX_ACL_GRANTS {
+        return Err(AclRejection::TooManyGrants {
+            count: grants.len(),
+        });
+    }
+    for grant in grants {
+        if !PERMISSION_VALUES.contains(&grant.permission.as_str()) {
+            return Err(AclRejection::UnknownPermission {
+                permission: grant.permission.clone(),
+            });
+        }
+        let grantee = &grant.grantee;
+        let named = |member: Option<&String>| -> Option<String> {
+            member
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        match grantee.grantee_type.as_str() {
+            GRANTEE_CANONICAL_USER => {
+                // The id is recorded as given: S3 resolves a canonical user id against
+                // the account namespace, which an emulator serving one account cannot do,
+                // so it refuses only an id that is not there at all.
+                if named(grantee.id.as_ref()).is_none() {
+                    return Err(AclRejection::GranteeMemberMissing {
+                        grantee_type: grantee.grantee_type.clone(),
+                        member: "ID",
+                    });
+                }
+            }
+            GRANTEE_GROUP => {
+                let Some(uri) = named(grantee.uri.as_ref()) else {
+                    return Err(AclRejection::GranteeMemberMissing {
+                        grantee_type: grantee.grantee_type.clone(),
+                        member: "URI",
+                    });
+                };
+                if !PREDEFINED_GROUP_URIS.contains(&uri.as_str()) {
+                    return Err(AclRejection::UnknownGroupUri { uri });
+                }
+            }
+            GRANTEE_BY_EMAIL => {
+                let Some(email_address) = named(grantee.email_address.as_ref()) else {
+                    return Err(AclRejection::GranteeMemberMissing {
+                        grantee_type: grantee.grantee_type.clone(),
+                        member: "EmailAddress",
+                    });
+                };
+                if EMAIL_GRANTEE_DISCONTINUED_REGIONS.contains(&region) {
+                    return Err(AclRejection::EmailGranteeDiscontinued {
+                        region: region.to_string(),
+                    });
+                }
+                return Err(AclRejection::EmailGranteeUnresolvable { email_address });
+            }
+            unknown => {
+                return Err(AclRejection::UnknownGranteeType {
+                    grantee_type: unknown.to_string(),
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The grantee one `type=value` pair of an `x-amz-grant-*` header names, or `None` when
+/// the pair is not one of the published forms.
+///
+/// "You specify each grantee as a type=value pair, where the type is one of the following:
+/// id – if the value specified is the canonical user ID of an Amazon Web Services account[;]
+/// uri – if you are granting permissions to a predefined group[;] emailAddress – if the
+/// value specified is the email address of an [account]" (`PutBucketAcl`'s own
+/// documentation). The value may be quoted — the documented examples spell it
+/// `emailAddress="xyz@amazon.com"` — so one pair of surrounding double quotes is stripped,
+/// and the type is matched without regard to case, the way an HTTP header's token is read.
+pub fn acl_grantee_from_pair(pair: &str) -> Option<AclGrantee> {
+    let (grantee_type, value) = pair.split_once('=')?;
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(value)
+        .trim();
+    if value.is_empty() {
+        return None;
+    }
+    match grantee_type.trim().to_ascii_lowercase().as_str() {
+        "id" => Some(AclGrantee::canonical_user(value)),
+        "uri" => Some(AclGrantee::group(value)),
+        "emailaddress" => Some(AclGrantee {
+            grantee_type: GRANTEE_BY_EMAIL.to_string(),
+            id: None,
+            uri: None,
+            email_address: Some(value.to_string()),
+        }),
+        _ => None,
+    }
+}
+
+/// The grants one `x-amz-grant-*` header names, or the pair that is not a grantee.
+///
+/// The header carries a comma-separated list of the pairs [`acl_grantee_from_pair`] reads
+/// ("x-amz-grant-read: emailAddress="xyz@amazon.com", emailAddress="abc@amazon.com"" —
+/// `PutBucketAcl`'s documented example), and every grantee in it is granted the one
+/// `permission` that header stands for.
+pub fn acl_grants_from_header(header: &str, permission: &str) -> Result<Vec<AclGrant>, String> {
+    let mut grants: Vec<AclGrant> = Vec::new();
+    for pair in header.split(',').map(str::trim).filter(|pair| !pair.is_empty()) {
+        let Some(grantee) = acl_grantee_from_pair(pair) else {
+            return Err(pair.to_string());
+        };
+        grants.push(AclGrant {
+            grantee,
+            permission: permission.to_string(),
+        });
+    }
+    Ok(grants)
+}
+
+/// The code S3 answers an ACL request whose ACL does not validate against the schema the
+/// API publishes for it: "MalformedACLError - The XML that you provided was not well
+/// formed or did not validate against our published schema", HTTP 400 (Amazon S3 "Error
+/// responses", list of error codes).
+pub const MALFORMED_ACL_CODE: &str = "MalformedACLError";
+
+/// The code S3 answers a request that carries no body where one is required: "This happens
+/// when the user sends an empty XML document as a request. The error message is, 'Request
+/// body is empty'", HTTP 400 (same list) — what an ACL request that names no ACL at all
+/// gets, since the ACL travels either in the body or in the request headers.
+pub const MISSING_REQUEST_BODY_CODE: &str = "MissingRequestBodyError";
+/// See [`MISSING_REQUEST_BODY_CODE`].
+pub const MISSING_REQUEST_BODY_MESSAGE: &str = "Request body is empty";
+
+/// The code S3 answers an attempt to set an ACL on a bucket whose Object Ownership setting
+/// is `BucketOwnerEnforced`: "AccessControlListNotSupported - The bucket does not allow
+/// ACLs", HTTP 400 (same list).
+///
+/// The case `PutBucketAcl`'s own documentation describes: "If your bucket uses the bucket
+/// owner enforced setting for S3 Object Ownership, ACLs are disabled and no longer affect
+/// permissions. … Requests to set ACLs or update ACLs fail and return the
+/// AccessControlListNotSupported error code. Requests to read ACLs are still supported."
+pub const ACL_NOT_SUPPORTED_CODE: &str = "AccessControlListNotSupported";
+/// See [`ACL_NOT_SUPPORTED_CODE`].
+pub const ACL_NOT_SUPPORTED_MESSAGE: &str = "The bucket does not allow ACLs";
+
+/// The code S3 answers an ACL naming a grantee by an email address that resolves to no
+/// account: "UnresolvableGrantByEmailAddress - The email address that you provided does
+/// not match any account on record", HTTP 400 (same list).
+pub const UNRESOLVABLE_GRANT_BY_EMAIL_CODE: &str = "UnresolvableGrantByEmailAddress";
+
+/// The code S3 answers a request the resource does not allow at all: "MethodNotAllowed -
+/// The specified method is not allowed against this resource", HTTP 405 (same list) — what
+/// an Email Grantee ACL gets in the Regions where S3 has discontinued it
+/// ([`EMAIL_GRANTEE_DISCONTINUED_REGIONS`]).
+pub const METHOD_NOT_ALLOWED_CODE: &str = "MethodNotAllowed";
+/// The HTTP status [`METHOD_NOT_ALLOWED_CODE`] is rendered with: 405, from the same list
+/// and from `PutBucketAcl`'s own documentation ("the request will receive an HTTP 405
+/// (Method Not Allowed) error").
+pub const METHOD_NOT_ALLOWED_STATUS: u16 = 405;
+
+/// The `ObjectOwnership` value that DISABLES ACLs on a bucket: "ACLs are disabled and no
+/// longer affect permissions" (`PutBucketAcl`'s documentation), so a request to set one is
+/// refused with [`ACL_NOT_SUPPORTED_CODE`] while a request to read one still answers.
+pub const BUCKET_OWNER_ENFORCED: &str = "BucketOwnerEnforced";
+
 /// The versioning state a bucket carries once `PutBucketVersioning` has set one.
 ///
 /// A bucket that has never had the subresource set carries NO value of this at all —
@@ -898,6 +1363,22 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the pair of accessors below is the only way in or out.
     ownership_controls: Option<Vec<String>>,
+    /// The access control list `PutBucketAcl` last set on the bucket — one entry per
+    /// `Grant` of the `AccessControlPolicy` it applied, in the order that ACL names them
+    /// — or `None` while no ACL has ever been set on it.
+    ///
+    /// `None` is NOT "no access": a bucket that has never had an ACL set carries the
+    /// canned `private` ACL ([`default_acl_grants`]), which is what a read of it reports.
+    /// Keeping that case as `None` rather than as a stored copy of the default is what
+    /// lets `GetBucketAcl` report it without writing — the same distinction
+    /// [`Self::encryption`] keeps for a never-configured bucket.
+    ///
+    /// The OWNER is not stored beside the grants: an ACL cannot transfer a bucket, so the
+    /// owner a reader reports is always the account that created it
+    /// ([`canonical_user_id`]), whatever `AccessControlPolicy$Owner` a request carries.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    acl: Option<Vec<AclGrant>>,
     /// The bucket's event notification configuration, as
     /// `PutBucketNotificationConfiguration` last set it.
     ///
@@ -1063,6 +1544,46 @@ impl Bucket {
     /// request names becomes the bucket's controls in full.
     pub fn set_ownership_controls(&mut self, rules: Vec<String>) {
         self.ownership_controls = Some(rules);
+    }
+
+    /// Whether ACLs are DISABLED on the bucket, i.e. its ownership controls name
+    /// [`BUCKET_OWNER_ENFORCED`].
+    ///
+    /// "If your bucket uses the bucket owner enforced setting for S3 Object Ownership,
+    /// ACLs are disabled and no longer affect permissions" (`PutBucketAcl`'s own
+    /// documentation): a request to SET an ACL on such a bucket is refused with
+    /// [`ACL_NOT_SUPPORTED_CODE`], while a request to READ one still answers — with the
+    /// bucket-owner-full-control ACL, which is [`default_acl_grants`].
+    pub fn acls_disabled(&self) -> bool {
+        self.ownership_controls
+            .as_deref()
+            .is_some_and(|rules| rules.iter().any(|rule| rule == BUCKET_OWNER_ENFORCED))
+    }
+
+    /// The grants of the bucket's access control list: the ACL last set on it, or the
+    /// canned `private` ACL every bucket starts with ([`default_acl_grants`]).
+    ///
+    /// Derived rather than stored for a bucket that has never had an ACL set, so a read
+    /// reports the default without writing one. A bucket whose ACLs are disabled
+    /// ([`Self::acls_disabled`]) reports the default too: "requests to read ACLs are
+    /// still supported and return the bucket-owner-full-control ACL with the owner being
+    /// the account that created the bucket" (`GetBucketAcl`'s own documentation).
+    pub fn acl_grants(&self) -> Vec<AclGrant> {
+        match self.acl.as_deref() {
+            Some(grants) if !self.acls_disabled() => grants.to_vec(),
+            _ => default_acl_grants(),
+        }
+    }
+
+    /// Associate `grants` with the bucket as its whole access control list.
+    ///
+    /// A replacement, not a merge: `PutBucketAcl` "sets the permissions on an existing
+    /// bucket using access control lists" (that operation's own documentation) from the
+    /// one ACL the request names — a canned ACL, the `x-amz-grant-*` headers or an
+    /// `AccessControlPolicy` body — so what the request names becomes the bucket's ACL in
+    /// full, the way [`Bucket::set_ownership_controls`] replaces the ownership controls.
+    pub fn set_acl_grants(&mut self, grants: Vec<AclGrant>) {
+        self.acl = Some(grants);
     }
 
     /// The bucket's event notification configuration — empty when the bucket has no event

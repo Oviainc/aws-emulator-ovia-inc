@@ -499,7 +499,9 @@ async fn a_policy_belongs_to_its_application() {
 /// The rows differ along which part of the contract the statement breaks: the permission
 /// catalogue, the principal form, the organization-id form, the `statementId`'s
 /// uniqueness and length, the required-ness of the two lists, and the emulator's own
-/// ceiling on how large a policy it retains.
+/// ceiling on how large a policy it retains. Each row states the wording its refusal must
+/// carry: the member and the rejected VALUE where one entry of a list is outside its
+/// member's vocabulary, and the member alone where the whole list is the problem.
 #[tokio::test]
 async fn a_refused_policy_leaves_the_stored_policy_as_it_was() {
     let repo = Repo::new();
@@ -805,10 +807,15 @@ async fn the_applications_own_owner_cannot_be_a_principal() {
         );
     }
 
-    // The public principal is NOT the owner, and every other account is still grantable.
+    // The public principal is NOT the owner, and every other account is still grantable —
+    // including one that merely resembles the owner's account id.
     for (case, principals) in [
         ("the public principal", json!(["*"])),
         ("another account", json!(["210987654321"])),
+        (
+            "an account id that merely resembles the owner's",
+            json!([format!("1{}", &owner[1..])]),
+        ),
     ] {
         let accepted = put_policy(
             &repo,
@@ -820,6 +827,13 @@ async fn the_applications_own_owner_cannot_be_a_principal() {
             accepted.status, 200,
             "case {case:?}: expected 200, got {} with {}",
             accepted.status, accepted.body
+        );
+        let got = get_policy(&repo, &application_id).await;
+        assert_eq!(
+            statements_of(&got),
+            statements_of(&accepted),
+            "case {case:?}: the accepted policy is what the next read answers, got {}",
+            got.body
         );
     }
 }

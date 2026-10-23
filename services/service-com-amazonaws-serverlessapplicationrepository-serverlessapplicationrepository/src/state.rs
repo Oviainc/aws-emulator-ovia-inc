@@ -16,8 +16,14 @@
 //!
 //! A *prepared CloudFormation template* of one version lives in its own map keyed by the
 //! `TemplateId` that minted it ([`CloudFormationTemplate`]), because it is a resource with
-//! a life of its own: it is prepared from a published version and expires an hour later,
-//! and both template operations report it out of that one record.
+//! a life of its own: it is prepared from a published version and expires
+//! [`TEMPLATE_LIFETIME`] later, and both template operations report it out of that one
+//! record.
+//!
+//! The bodies a publisher supplies INLINE are retained on those same records, and the
+//! locator this service announces for one ([`minted_artifact_url`]) is an address on the
+//! emulator's own endpoint that `crate::service` serves them at — a `TemplateUrl` is a
+//! link a CloudFormation client deploys from, so it has to be fetchable.
 //!
 //! An application also carries its permission policy — the `policy_statements` list
 //! `PutApplicationPolicy` replaces and `GetApplicationPolicy` reports — so a policy is
@@ -308,7 +314,8 @@ impl Artifact {
         }
     }
 
-    /// The file name the minted locator ends in.
+    /// The file name the minted locator ends in, and the name the document plane reads
+    /// back out of it ([`Artifact::from_file_name`]).
     const fn file_name(self) -> &'static str {
         match self {
             Self::Template => "template.yaml",
@@ -316,16 +323,74 @@ impl Artifact {
             Self::Readme => "readme.md",
         }
     }
+
+    /// Which artefact the last segment of an announced locator names, or `None` for a
+    /// name this service never minted. The inverse of [`Artifact::file_name`], so the
+    /// address announced and the address served cannot drift apart.
+    pub fn from_file_name(file_name: &str) -> Option<Self> {
+        [Self::Template, Self::License, Self::Readme]
+            .into_iter()
+            .find(|artifact| artifact.file_name() == file_name)
+    }
+
+    /// The media type the document plane serves `body` — the publisher's own retained
+    /// bytes — as.
+    ///
+    /// A template is published as a packaged CloudFormation/SAM document, which may be
+    /// either JSON or YAML, and this emulator retains exactly the bytes it was handed:
+    /// the type is therefore read off those bytes rather than assumed, and the JSON a
+    /// publisher sent is labelled JSON (which a YAML reader parses too, YAML being a
+    /// superset). A license is plain text and a readme is Markdown, the forms the two
+    /// members document. The parse is bounded by [`MAX_TEMPLATE_BYTES`], which the
+    /// publish already held the body to.
+    pub fn content_type(self, body: &str) -> &'static str {
+        match self {
+            Self::Template => {
+                if ::serde_json::from_str::<::serde_json::Value>(body).is_ok() {
+                    "application/json"
+                } else {
+                    "application/x-yaml"
+                }
+            }
+            Self::License => "text/plain; charset=utf-8",
+            Self::Readme => "text/markdown; charset=utf-8",
+        }
+    }
 }
 
-/// The link reported for content the caller supplied INLINE.
+// ---------------------------------------------------------------------------
+// The artifact document plane.
+//
+// `Version$TemplateUrl` is "A link to the template that can be used to deploy the
+// application using AWS CloudFormation", and both CloudFormation template operations
+// report that same link for the template they prepare: the member is a PROMISE that a
+// caller can FOLLOW it, because fetching it and deploying the bytes is what a
+// CloudFormation client does with it. The locator this service mints for a body a
+// publisher supplied inline is therefore an address on the emulator's OWN endpoint,
+// under a path space that names no modelled operation, and `crate::service` serves the
+// retained body there — so the address announced and the address served are one address.
+// ---------------------------------------------------------------------------
+
+/// The path space the artifact document plane is served under.
+///
+/// The prefix names this service and this kind of object, so it cannot collide with
+/// another service's modelled URI space, and it is not in this service's own model —
+/// which is what routes a fetch of it to [`crate::service`]'s document seam.
+pub const ARTIFACT_PATH_PREFIX: &str = "/serverlessrepo-artifacts";
+
+/// The link reported for content the caller supplied INLINE: an address on the emulator's
+/// own endpoint that [`ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryState::artifact_body`]
+/// serves the retained bytes at.
 ///
 /// The real service copies an inline body into an S3 object it owns and reports that
-/// object's URL; this emulator holds the body in its own state, so it reports the
-/// same-shaped locator derived from the stored application, its version and the
-/// artefact. Like an ARN it is an identifier of stored state, not a fetchable
-/// endpoint: an emulator makes no outbound connections and serves no object.
+/// object's URL. This emulator holds the body in its own state and serves it itself, so
+/// the locator carries the same four facts an S3 key would — the region and the account
+/// that published it, the application, and the version for an artefact a version
+/// published — under `host`, the endpoint the publishing request arrived on. A literal
+/// AWS hostname would send the next client out of the emulator entirely, so it is never
+/// announced here.
 pub fn minted_artifact_url(
+    host: &str,
     region: &str,
     application_name: &str,
     semantic_version: Option<&str>,
@@ -337,9 +402,57 @@ pub fn minted_artifact_url(
         None => application_name.to_string(),
     };
     format!(
-        "https://awsserverlessrepo-{region}.s3.{region}.amazonaws.com/{account}/{path}/{}",
+        "https://{host}{ARTIFACT_PATH_PREFIX}/{region}/{account}/{path}/{}",
         artifact.file_name()
     )
+}
+
+/// Which stored artefact a request to the document plane addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactTarget {
+    /// The region the addressed application is catalogued in.
+    pub region: String,
+    /// The account that published it, which is the one account this emulator serves.
+    pub account_id: String,
+    pub application_name: String,
+    /// The version that published the body, for an artefact a VERSION publishes (a
+    /// template); `None` for one the application carries (a license, a readme).
+    pub semantic_version: Option<String>,
+    pub artifact: Artifact,
+}
+
+/// The artefact a document-plane request path addresses, or `None` when the path is not
+/// one [`minted_artifact_url`] announces.
+///
+/// Every segment is read back out of the announced locator, so a fetch resolves by what
+/// the URL NAMES rather than by string equality with a stored field: a client that was
+/// handed the URL through one endpoint host reaches the same artefact through any other
+/// endpoint this emulator answers on.
+pub fn parse_artifact_path(path: &str) -> Option<ArtifactTarget> {
+    let rest = path.strip_prefix(ARTIFACT_PATH_PREFIX)?.strip_prefix('/')?;
+    let segments: Vec<&str> = rest.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    let (region, account_id, application_name, semantic_version, file_name) =
+        match segments.as_slice() {
+            [region, account_id, name, file_name] => (*region, *account_id, *name, None, *file_name),
+            [region, account_id, name, semantic_version, file_name] => (
+                *region,
+                *account_id,
+                *name,
+                Some((*semantic_version).to_string()),
+                *file_name,
+            ),
+            _ => return None,
+        };
+    Some(ArtifactTarget {
+        region: region.to_string(),
+        account_id: account_id.to_string(),
+        application_name: application_name.to_string(),
+        semantic_version,
+        artifact: Artifact::from_file_name(file_name)?,
+    })
 }
 
 /// The link stored for a `*Body`/`*Url` pair: the caller's URL, or a minted locator
@@ -347,6 +460,7 @@ pub fn minted_artifact_url(
 pub fn resolve_artifact_url(
     body: Option<&String>,
     url: Option<&String>,
+    host: &str,
     region: &str,
     application_name: &str,
     semantic_version: Option<&str>,
@@ -355,6 +469,7 @@ pub fn resolve_artifact_url(
     match (body, url) {
         (_, Some(url)) => Some(url.clone()),
         (Some(_), None) => Some(minted_artifact_url(
+            host,
             region,
             application_name,
             semantic_version,
@@ -378,6 +493,30 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The endpoint this emulator was reached on for this request: its `Host` header, or the
+/// `:authority` an HTTP/2 request carries on the URI instead of one.
+///
+/// An address a caller must be able to FOLLOW — the locator of a published artefact, see
+/// [`minted_artifact_url`] — has to be built from this, never from a literal AWS
+/// hostname, which would send the next client out of the emulator (and out of a sandboxed
+/// run) entirely. A request that names no host at all leaves nothing of the emulator to
+/// announce, and then the real service's own endpoint for `region` is reported: the only
+/// honest answer, and one whose first label is this service's signing name, so a client
+/// that does send it back here is still routed to this service.
+pub fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> String {
+    let parts = ctx.parts();
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
+        .filter(|host| !host.is_empty())
+        .map_or_else(
+            || format!("{ARN_NAMESPACE}.{region}.amazonaws.com"),
+            str::to_string,
+        )
 }
 
 /// The key an application's name is unique under.
@@ -1387,11 +1526,19 @@ fn boolean_of(value: &::serde_json::Value) -> Option<bool> {
 // the clock, so neither read moves anything.
 // ---------------------------------------------------------------------------
 
-/// How long a prepared template lives: "The date and time this template expires.
-/// Templates expire 1 hour after creation."
+/// How long a prepared template lives: SIX hours from the instant it was created.
+///
+/// Recorded behavior: an `ACTIVE` prepared template reports an `ExpirationTime` exactly
+/// six hours after its `CreationTime`. The model's doc sentence on the member — "The date
+/// and time this template expires. Templates expire 1 hour after creation."
 /// (`smithy_query(query="doc", shape="CreateCloudFormationTemplateResponse",
-/// member="ExpirationTime")`).
-pub const TEMPLATE_LIFETIME: Duration = Duration::from_secs(60 * 60);
+/// member="ExpirationTime")`) — is contradicted by the service itself, and the window a
+/// client observes is the one it depends on: a client that caches the prepared artifact,
+/// or schedules a re-prepare from the reported instant, must not treat it as dead five
+/// hours early. The window is the service's own published duration, not a span this
+/// emulator chose, so it is this constant alone that every `expires_at` and every
+/// `status_at` is derived from.
+pub const TEMPLATE_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// How long a prepared template reports [`TEMPLATE_PREPARING`] before the clock owes it
 /// [`TEMPLATE_ACTIVE`].
@@ -1565,6 +1712,37 @@ impl ComAmazonawsServerlessapplicationrepositoryServerlessapplicationrepositoryS
         self.templates
             .get(template_id)
             .filter(|template| template.application_id == application_id)
+    }
+
+    /// The retained bytes the artefact `target` addresses, or `None` when this store holds
+    /// nothing published there.
+    ///
+    /// This is the READ behind the document plane (`crate::service`): every segment of the
+    /// announced locator has to agree with the stored record — the account that published
+    /// it, the region and name the application is catalogued under, and, for an artefact a
+    /// version publishes, the version that published the body. A locator whose application
+    /// has since been deleted, whose version was never published, or whose body was named
+    /// by a `*Url` the publisher supplied instead of being supplied inline, addresses
+    /// nothing. Nothing is written, so following a locator twice answers the same bytes.
+    pub fn artifact_body(&self, target: &ArtifactTarget) -> Option<&String> {
+        if target.account_id != ::engine::emulator_account_id() {
+            return None;
+        }
+        let application_id = self
+            .name_index
+            .get(&name_key(&target.region, &target.application_name))?;
+        let application = self.applications.get(application_id)?;
+        match (target.artifact, target.semantic_version.as_deref()) {
+            (Artifact::License, None) => application.license_body.as_ref(),
+            (Artifact::Readme, None) => application.readme_body.as_ref(),
+            (Artifact::Template, Some(semantic_version)) => application
+                .version_named(semantic_version)
+                .and_then(|version| version.template_body.as_ref()),
+            // A template's locator is minted version-scoped and a license's or a readme's
+            // application-scoped ([`minted_artifact_url`]), so a crossed pair is a path
+            // this service never announced and addresses nothing.
+            _ => None,
+        }
     }
 }
 

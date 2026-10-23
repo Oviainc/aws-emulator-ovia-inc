@@ -108,14 +108,14 @@ fn refused(
     match refusal {
         crate::state::ResourceArnRefusal::NotThisService => {
             UpdateTagsForResourceError::invalid_parameter_value(format!(
-                "Resource ARN {resource_arn} is not an Elastic Beanstalk resource ARN."
+                "Resource ARN '{resource_arn}' is not an Elastic Beanstalk resource ARN."
             ))
         }
         crate::state::ResourceArnRefusal::UnsupportedType => {
             UpdateTagsForResourceErrorModeled::ResourceTypeNotSupportedException(
                 ResourceTypeNotSupportedException {
                     message: Some(format!(
-                        "The type of the resource ARN {resource_arn} is not supported for tagging."
+                        "The type of the resource ARN '{resource_arn}' is not supported for tagging."
                     )),
                 },
             )
@@ -124,7 +124,7 @@ fn refused(
         crate::state::ResourceArnRefusal::NotFound => {
             UpdateTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Resource not found for ARN {resource_arn}.")),
+                    message: Some(format!("Resource not found for ARN '{resource_arn}'.")),
                 },
             )
             .into()
@@ -306,10 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if longest > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(UpdateTagsForResourceErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "The request carries {longest} tags, which exceeds the limit of {} that each resource can have.",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    message: Some(crate::state::too_many_tags_message()),
                 },
             )
             .into());
@@ -356,10 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if updated.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(UpdateTagsForResourceErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "The number of tags for the resource would exceed the limit of {}.",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    message: Some(crate::state::too_many_tags_message()),
                 },
             )
             .into());

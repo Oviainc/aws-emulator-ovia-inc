@@ -16,7 +16,7 @@
 //! speaks to the service over the same router and in the same dialect the rest of
 //! the crate's tests do.
 
-use crate::lifecycle::{Emulator, PAST_DUE};
+use crate::lifecycle::{Emulator, PAST_DUE, SOLUTION_STACK};
 
 /// `VersionLabel`'s modelled length bound is 1..100
 /// (`smithy_query(query="operation",operation="DeleteApplicationVersion")`), so a
@@ -276,6 +276,7 @@ async fn a_deleted_version_is_gone_from_the_store_not_just_from_the_listing() {
             &[
                 ("ApplicationName", "app"),
                 ("EnvironmentName", "app-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("VersionLabel", "v1"),
             ],
         )
@@ -375,6 +376,7 @@ async fn a_version_that_cannot_be_deleted_is_refused_with_the_services_own_codes
             &[
                 ("ApplicationName", "app"),
                 ("EnvironmentName", "app-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("VersionLabel", "v1"),
             ],
         )
@@ -492,6 +494,7 @@ async fn a_version_becomes_deletable_once_its_environment_has_terminated() {
             &[
                 ("ApplicationName", "app"),
                 ("EnvironmentName", "app-env"),
+                ("SolutionStackName", SOLUTION_STACK.as_str()),
                 ("VersionLabel", "v1"),
             ],
         )

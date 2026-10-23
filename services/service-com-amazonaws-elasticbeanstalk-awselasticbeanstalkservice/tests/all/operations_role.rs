@@ -16,7 +16,7 @@
 //! owns — the router this service is mounted in, spoken to with a
 //! form-urlencoded `Action=…` body.
 
-use crate::lifecycle::{Emulator, PAST_DUE};
+use crate::lifecycle::{Emulator, PAST_DUE, SOLUTION_STACK};
 
 /// One environment the table below creates: the name it is created under, and
 /// the operations role it is created with (`None` — created without one, so
@@ -116,6 +116,7 @@ async fn disassociating_clears_only_the_named_environments_operations_role() {
         let mut params: Vec<(&str, &str)> = vec![
             ("ApplicationName", APPLICATION),
             ("EnvironmentName", case.name.as_str()),
+            ("SolutionStackName", SOLUTION_STACK.as_str()),
         ];
         if let Some(role) = case.role.as_deref() {
             params.push(("OperationsRole", role));
@@ -227,6 +228,7 @@ async fn disassociate_refuses_a_name_that_names_no_live_environment() {
                 &[
                     ("ApplicationName", APPLICATION),
                     ("EnvironmentName", "dead-env"),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
                     (
                         "OperationsRole",
                         &format!(

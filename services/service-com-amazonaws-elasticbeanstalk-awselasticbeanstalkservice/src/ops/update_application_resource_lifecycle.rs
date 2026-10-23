@@ -135,6 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateApplicationResourceLifecycleError::internal_failure(
                 "the Elastic Beanstalk store is unavailable",
@@ -152,17 +153,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // "The `ServiceRole` property is required the first time that you
-        // provide a `VersionLifecycleConfig` for the application … After you
-        // provide it once … Elastic Beanstalk persists the Service Role with the
-        // application, and you don't need to specify it again."
-        if crate::state::version_lifecycle_service_role_missing(
+        // "ServiceRole: The ARN of an IAM service role that Elastic Beanstalk has
+        // permission to assume", required where this call needs one and the
+        // application carries none. A request this member cannot serve — a value
+        // that is not a role ARN, or none where one is needed — is refused on the
+        // member, naming it and the constraint its value failed.
+        //
+        // ONE refusal for both, including the ABSENT case, because that is what the
+        // recorded rejection of this operation carries: its message is the
+        // member-and-constraint sentence, on a request this emulator's own
+        // presence-only check used to answer "the ServiceRole property is required
+        // the first time …" — a sentence it could only reach when no usable value
+        // arrived at all. The status (400) and the code (`InvalidParameterValue`)
+        // are unchanged either way.
+        if crate::state::service_role_unusable(
             application.resource_lifecycle_config.as_ref(),
             &input.resource_lifecycle_config,
         ) {
             return Err(
                 UpdateApplicationResourceLifecycleError::invalid_parameter_value(
-                    "The ServiceRole property is required the first time that you provide a VersionLifecycleConfig for an application.",
+                    crate::state::invalid_parameter_message(
+                        "ServiceRole",
+                        crate::state::IAM_ROLE_ARN_REQUIREMENT,
+                    ),
                 ),
             );
         }
