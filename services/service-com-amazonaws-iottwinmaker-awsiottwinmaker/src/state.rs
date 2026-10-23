@@ -44,21 +44,30 @@ pub const STATE_DELETING: &str = "DELETING";
 /// this non-terminal state by the call that creates it and settles in
 /// [`STATE_ACTIVE`] once [`COMPONENT_TYPE_SETTLE_SPAN`] has elapsed.
 pub const STATE_CREATING: &str = "CREATING";
+/// See [`STATE_ACTIVE`]. The non-terminal state an UPDATE in flight leaves a
+/// component type in: `UpdateComponentType` answers with it, and the clock
+/// settles the component type back in [`STATE_ACTIVE`] once
+/// [`COMPONENT_TYPE_SETTLE_SPAN`] has elapsed, exactly as it does after a
+/// create.
+pub const STATE_UPDATING: &str = "UPDATING";
 
-/// How long a component type stays in [`STATE_CREATING`] before the clock makes
+/// How long a component type stays in a non-terminal state — [`STATE_CREATING`]
+/// after a create, [`STATE_UPDATING`] after an update — before the clock makes
 /// its transition to [`STATE_ACTIVE`] due.
 ///
 /// `CreateComponentType` answers with the component type's `state`, and the
 /// state of a component type the service has just accepted is the non-terminal
 /// `CREATING` — so there IS a provisioning window here, unlike an entity, which
-/// is reported `ACTIVE` by its own create. AWS documents no duration for that
-/// window, so this span is CHOSEN by this emulator; it is deliberately non-zero,
-/// so a caller that reads the component type back in the same breath as the
-/// create still observes `CREATING`, and deliberately short, so a client that
-/// polls reaches `ACTIVE` without a long wait. Nothing sleeps for it: the
-/// instant it is due is stored on the record (see
-/// [`ComponentType::settles_at`]) and a reader materialises the transition the
-/// clock already owed.
+/// is reported `ACTIVE` by its own create. `UpdateComponentType` opens the same
+/// window with `UPDATING`: the call reports the change as in flight and the
+/// component type is `ACTIVE` again once it has landed. AWS documents no
+/// duration for either window, so this span is CHOSEN by this emulator; it is
+/// deliberately non-zero, so a caller that reads the component type back in the
+/// same breath as the create or the update still observes the transient state,
+/// and deliberately short, so a client that polls reaches `ACTIVE` without a
+/// long wait. Nothing sleeps for it: the instant it is due is stored on the
+/// record (see [`ComponentType::settles_at`]) and a reader materialises the
+/// transition the clock already owed.
 pub const COMPONENT_TYPE_SETTLE_SPAN: Duration = Duration::from_millis(500);
 
 /// The name of the function whose presence makes a component type's schema
@@ -311,13 +320,14 @@ pub struct ComponentType {
     pub creation_date_time: SystemTime,
     pub update_date_time: SystemTime,
     /// The component type's `State`, as STORED: [`STATE_CREATING`] from the
-    /// create until [`settles_at`](Self::settles_at) passes, then
-    /// [`STATE_ACTIVE`].
+    /// create (or [`STATE_UPDATING`] from an update) until
+    /// [`settles_at`](Self::settles_at) passes, then [`STATE_ACTIVE`].
     pub state: String,
-    /// The instant the transition out of [`STATE_CREATING`] falls due —
-    /// the create's instant plus [`COMPONENT_TYPE_SETTLE_SPAN`]. Stored, never
-    /// slept for, so a reader can materialise a transition the clock already
-    /// owed without any caller having had to poll.
+    /// The instant the transition out of [`STATE_CREATING`] or
+    /// [`STATE_UPDATING`] falls due — the instant of the call that opened the
+    /// window plus [`COMPONENT_TYPE_SETTLE_SPAN`]. Stored, never slept for, so
+    /// a reader can materialise a transition the clock already owed without any
+    /// caller having had to poll.
     pub settles_at: SystemTime,
 }
 
@@ -325,15 +335,30 @@ impl ComponentType {
     /// Materialise the lifecycle transition the CLOCK has already made due.
     ///
     /// Called by a reader before it reports this component type: the
-    /// `CREATING` -> `ACTIVE` transition was owed at
+    /// `CREATING` -> `ACTIVE` (or `UPDATING` -> `ACTIVE`) transition was owed at
     /// [`settles_at`](Self::settles_at) whether or not anybody called, so
     /// writing it here is making the record say what was already true, not a
     /// change a read caused. Idempotent, and a no-op before the instant falls
     /// due.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.state == STATE_CREATING && now >= self.settles_at {
+        let in_flight = self.state == STATE_CREATING || self.state == STATE_UPDATING;
+        if in_flight && now >= self.settles_at {
             self.state = STATE_ACTIVE.to_string();
         }
+    }
+
+    /// Open the provisioning window an UPDATE owes.
+    ///
+    /// The update has landed in the store by the time this is called, so the
+    /// record's `updateDateTime` moves to the instant of the call that made the
+    /// change; its state leaves [`STATE_ACTIVE`] for the non-terminal
+    /// [`STATE_UPDATING`] the update answers with, and the instant the clock
+    /// owes the return to [`STATE_ACTIVE`] is stored beside it — the same span a
+    /// create opens, and never slept for. See [`settle`](Self::settle).
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.update_date_time = now;
+        self.state = STATE_UPDATING.to_string();
+        self.settles_at = now + COMPONENT_TYPE_SETTLE_SPAN;
     }
 
     /// The component type's modelled `Status`: its stored state plus the
@@ -346,8 +371,9 @@ impl ComponentType {
     /// initializer has run" (the `isSchemaInitialized` member's own
     /// documentation): it has one when its `functions` carry
     /// [`SCHEMA_INITIALIZER_FUNCTION`], and that initializer has run once the
-    /// create has settled, which is exactly when the stored state is
-    /// [`STATE_ACTIVE`].
+    /// component type has settled, which is exactly when the stored state is
+    /// [`STATE_ACTIVE`]: neither a create nor an update still in flight has
+    /// finished running it.
     pub fn is_schema_initialized(&self) -> bool {
         self.functions.contains_key(SCHEMA_INITIALIZER_FUNCTION) && self.state == STATE_ACTIVE
     }
@@ -378,6 +404,24 @@ pub fn status(state: &str) -> crate::ops::types::Status {
 /// request, so a group stored without one is reported with the only value the
 /// model admits rather than with an invented string.
 pub const TABULAR_GROUP_TYPE: &str = "TABULAR";
+
+/// Whether storing this property definition would leave a component type that
+/// `extends_from` these parents holding a definition no read can report.
+///
+/// `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on the
+/// `PropertyDefinitionResponse` a read reports (see
+/// [`property_definition_response`]), so a definition may omit it only where it
+/// refines one it inherits. A component type that extends nothing inherits
+/// nothing, so each of its own definitions must carry one, and a writer refuses
+/// the request rather than storing a definition a reader would have to drop.
+/// Shared by every writer of a definition so a create and an update hold one
+/// definition to one rule.
+pub fn property_definition_needs_data_type(
+    extends_from: &[String],
+    definition: &crate::ops::types::PropertyDefinitionRequest,
+) -> bool {
+    extends_from.is_empty() && definition.data_type.is_none()
+}
 
 /// One stored `PropertyDefinitionRequest` as the modelled
 /// `PropertyDefinitionResponse` a read reports.
@@ -474,11 +518,30 @@ impl PropertyRecord {
     }
 }
 
-/// One property group of a component.
+/// One property group of a component or of a component type.
 #[derive(Debug, Clone, Default)]
 pub struct PropertyGroupRecord {
     pub group_type: Option<String>,
     pub property_names: Vec<String>,
+}
+
+impl PropertyGroupRecord {
+    /// One modelled `PropertyGroupRequest` as the record the store holds.
+    ///
+    /// Shared by every writer of a COMPONENT TYPE's property groups
+    /// (`CreateComponentType`, `UpdateComponentType`), so one shape has one
+    /// conversion. `propertyNames` is stored RESOLVED, so an absent list is an
+    /// empty one rather than a missing collection every reader has to guard
+    /// against. An entity component's groups are a different modelled shape
+    /// (`ComponentPropertyGroupRequest`, which also carries the `updateType`
+    /// that says what to do with the group), so `CreateEntity` builds its
+    /// records from that shape instead.
+    pub fn from_request(request: crate::ops::types::PropertyGroupRequest) -> Self {
+        Self {
+            group_type: request.group_type,
+            property_names: request.property_names.unwrap_or_default(),
+        }
+    }
 }
 
 impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
