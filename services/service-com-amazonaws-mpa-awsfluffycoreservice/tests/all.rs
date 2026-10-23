@@ -19,6 +19,8 @@ mod authorization_gate;
 mod policy_catalog;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
