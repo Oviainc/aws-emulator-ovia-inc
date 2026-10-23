@@ -596,6 +596,67 @@ fn clamped_lists(input: &CreateTableInput) -> Result<(), crate::state::RequestEr
     Ok(())
 }
 
+/// The English ordinal DynamoDB names a `KeySchemaElement` by, for every position a key
+/// schema can hold — [`crate::state::MAX_INDEX_KEY_ELEMENTS`] is the widest key schema
+/// this service accepts, and a table's primary key is narrower still.
+const ELEMENT_ORDINALS: [&str; crate::state::MAX_INDEX_KEY_ELEMENTS] = [
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+];
+
+/// How DynamoDB refers to the element at `position` (0-based) of a key schema.
+///
+/// Every position a key schema can hold has a word: [`clamped_lists`] bounds an index
+/// key to [`crate::state::MAX_INDEX_KEY_ELEMENTS`] elements and a table's primary key is
+/// narrower still, so the bare position past the table above is unreachable and is there
+/// only so this never has to panic.
+fn element_ordinal(position: usize) -> String {
+    ELEMENT_ORDINALS
+        .get(position)
+        .map_or_else(|| (position + 1).to_string(), |word| (*word).to_string())
+}
+
+/// Refuse a key schema whose element at some position does not carry the key type that
+/// position requires, naming that element the way DynamoDB does.
+///
+/// A key schema is validated element by element, in the order the request lists it: the
+/// partition keys lead and the sort keys follow, so the first element is always a `HASH`
+/// element, a `HASH` is in place only while the leading run of at most `partition_keys`
+/// partition keys is still open, and every other position must be `RANGE`. The first
+/// element that breaks that is refused with its ordinal position and the key type its
+/// position required — `Invalid KeySchema: The second KeySchemaElement is not a RANGE key
+/// type` — so a caller is told WHICH element to fix rather than the whole rule.
+///
+/// `index_name` is `None` for a table's own primary key and the index's name for an
+/// index key, which DynamoDB scopes its refusal to.
+fn validated_key_type_order(
+    index_name: Option<&str>,
+    key_schema: &[KeySchemaElement],
+    partition_keys: usize,
+) -> Result<(), crate::state::RequestError> {
+    let mut hash_keys = 0usize;
+    let mut saw_sort_key = false;
+    for (position, element) in key_schema.iter().enumerate() {
+        let hash_allowed = !saw_sort_key && hash_keys < partition_keys;
+        match element.key_type.as_str() {
+            "HASH" if hash_allowed => hash_keys += 1,
+            // Only partition keys may lead a key schema, so the first element is never a
+            // sort key.
+            "RANGE" if position > 0 => saw_sort_key = true,
+            _ => {
+                let expected = if hash_allowed { "HASH" } else { "RANGE" };
+                let scope =
+                    index_name.map_or_else(String::new, |name| format!(" for index {name}"));
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid KeySchema{scope}: The {} KeySchemaElement is not a {expected} key \
+                     type",
+                    element_ordinal(position)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The table's key schema, refused unless it is one `HASH` attribute optionally
 /// followed by one `RANGE` attribute, each defined in `AttributeDefinitions` as a
 /// scalar type — "The attributes in KeySchema must also be defined in the
@@ -612,26 +673,18 @@ fn validated_key_schema(
         ));
     }
     let definitions = input.attribute_definitions.clone().unwrap_or_default();
-    let hash_keys = key_schema
-        .iter()
-        .filter(|element| element.key_type == "HASH")
-        .count();
-    let range_keys = key_schema
-        .iter()
-        .filter(|element| element.key_type == "RANGE")
-        .count();
-    if hash_keys != 1 || range_keys > 1 || key_schema.len() != hash_keys + range_keys {
+    if key_schema.len() > crate::state::MAX_TABLE_KEY_ELEMENTS {
         return Err(crate::state::RequestError::Validation(format!(
-            "Invalid KeySchema: a table's primary key must be one HASH attribute and at most \
-             one RANGE attribute, got {} element(s)",
+            "Invalid KeySchema: a table's primary key may declare at most {} \
+             KeySchemaElement(s), got {}",
+            crate::state::MAX_TABLE_KEY_ELEMENTS,
             key_schema.len()
         )));
     }
-    if key_schema[0].key_type != "HASH" {
-        return Err(crate::state::RequestError::Validation(
-            "Invalid KeySchema: the HASH key attribute must come first".to_string(),
-        ));
-    }
+    // A table's primary key is "one KeySchemaElement (for the partition key)" and, when
+    // composite, "another KeySchemaElement for the sort key": position 1 holds the only
+    // HASH element and position 2, when present, the only RANGE one.
+    validated_key_type_order(None, &key_schema, crate::state::MAX_TABLE_PARTITION_KEYS)?;
     for element in &key_schema {
         let name = element.attribute_name.as_str();
         let Some(definition) = definitions
@@ -798,30 +851,36 @@ fn validated_local_indexes(
 
 /// One index's key schema: at least one `HASH` element, within the documented key
 /// counts, with every attribute declared in `AttributeDefinitions` as a scalar type.
+///
+/// An index key is validated by position like a table's: "Each global secondary index
+/// supports up to 4 partition keys and up to 4 sort keys"
+/// (`CreateTable$GlobalSecondaryIndexes`), so the leading positions hold the partition
+/// keys and the sort keys follow, and an element out of place is named by its ordinal.
 pub(crate) fn validated_index_key_schema(
     index_name: &str,
     key_schema: &[KeySchemaElement],
     definitions: &[AttributeDefinition],
 ) -> Result<(), crate::state::RequestError> {
-    let hash_keys = key_schema
-        .iter()
-        .filter(|element| element.key_type == "HASH")
-        .count();
+    if key_schema.is_empty() {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid KeySchema for index {index_name}: an index key must declare a HASH key \
+             attribute"
+        )));
+    }
+    validated_key_type_order(
+        Some(index_name),
+        key_schema,
+        crate::state::MAX_INDEX_PARTITION_KEYS,
+    )?;
     let range_keys = key_schema
         .iter()
         .filter(|element| element.key_type == "RANGE")
         .count();
-    if hash_keys == 0
-        || hash_keys > crate::state::MAX_INDEX_PARTITION_KEYS
-        || range_keys > crate::state::MAX_INDEX_SORT_KEYS
-        || key_schema.len() != hash_keys + range_keys
-    {
+    if range_keys > crate::state::MAX_INDEX_SORT_KEYS {
         return Err(crate::state::RequestError::Validation(format!(
-            "Invalid KeySchema for index {index_name}: an index key must be 1 to {} HASH \
-             attribute(s) and at most {} RANGE attribute(s), got {} element(s)",
-            crate::state::MAX_INDEX_PARTITION_KEYS,
-            crate::state::MAX_INDEX_SORT_KEYS,
-            key_schema.len()
+            "Invalid KeySchema for index {index_name}: an index key may declare at most {} RANGE \
+             attribute(s), got {range_keys}",
+            crate::state::MAX_INDEX_SORT_KEYS
         )));
     }
     for element in key_schema {
