@@ -70,6 +70,17 @@ pub struct Dashboard {
     /// The tags supplied at create time, read back by `ListTagsForResource` (and
     /// state for the other tagging operations once they are implemented).
     pub resource_tags: Vec<ResourceTag>,
+    /// The resource-based policy document attached to this dashboard, or `None`
+    /// while no policy is attached — the two are distinct, and `GetResourcePolicy`
+    /// projects the stored document rather than deriving one from the request.
+    ///
+    /// This service's model declares no operation that attaches a policy (there is
+    /// no `PutResourcePolicy` among its 15 operations), so a dashboard created
+    /// through this API keeps `None` and reads back the empty document the modelled
+    /// `policyDocument` length (0..1024) admits. The field is the single place a
+    /// policy would live once an operation can write one, so the reader needs no
+    /// second map beside the dashboards.
+    pub resource_policy: Option<String>,
 }
 
 impl Dashboard {
@@ -244,6 +255,19 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
         self.scheduled_reports
             .get(resource_arn)
             .map(|report| report.resource_tags.as_slice())
+    }
+
+    /// The resource-based policy document attached to the dashboard `resource_arn`
+    /// names, or `None` when this service holds no dashboard under that ARN (the
+    /// caller answers that with its modelled `ResourceNotFoundException`).
+    ///
+    /// A dashboard with no policy attached resolves to the empty document, which is
+    /// what the modelled `policyDocument` member's 0-character minimum admits: a
+    /// missing policy is not a missing resource.
+    pub fn dashboard_resource_policy(&self, resource_arn: &str) -> Option<&str> {
+        self.dashboards
+            .get(resource_arn)
+            .map(|dashboard| dashboard.resource_policy.as_deref().unwrap_or_default())
     }
 
     /// Mint a fresh widget id: 32 lowercase hex characters, as `WidgetId`'s
