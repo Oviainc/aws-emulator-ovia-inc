@@ -17,6 +17,8 @@ mod invoice_profiles;
 mod invoice_summaries;
 #[path = "all/invoice_unit_lifecycle.rs"]
 mod invoice_unit_lifecycle;
+#[path = "all/procurement_portal_preferences.rs"]
+mod procurement_portal_preferences;
 #[path = "all/retired_units_and_portal_validation.rs"]
 mod retired_units_and_portal_validation;
 #[path = "all/state_roundtrip.rs"]
