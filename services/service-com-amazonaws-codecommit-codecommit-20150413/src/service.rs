@@ -205,7 +205,27 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidContinuationTokenException",
             "The specified continuation token is not valid.",
         ),
+        ("tags", _) if missing => (
+            "TagsMapRequiredException",
+            "A map of tags is required.",
+        ),
         ("tags", _) => ("InvalidTagsMapException", "The map of tags is not valid."),
+        ("tagKeys", _) if missing => (
+            "TagKeysListRequiredException",
+            "A list of tag keys is required. The list cannot be empty or null.",
+        ),
+        ("tagKeys", _) => (
+            "InvalidTagKeysListException",
+            "The list of tags is not valid.",
+        ),
+        ("resourceArn", _) if missing => (
+            "ResourceArnRequiredException",
+            "A valid Amazon Resource Name (ARN) for an CodeCommit resource is required.",
+        ),
+        ("resourceArn", _) => (
+            "InvalidResourceArnException",
+            "The value for the resource ARN is not valid.",
+        ),
         // Everything else keeps the framework's own wording.
         _ => return None,
     };

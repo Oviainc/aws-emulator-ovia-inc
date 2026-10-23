@@ -210,11 +210,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The specified tag is not valid. Key names cannot be prefixed with aws:."
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.clone().unwrap_or_default().into_iter().collect();
-        if let Some(key) = tags.keys().find(|key| key.starts_with("aws:")) {
+        if let Some(key) = tags.keys().find(|key| crate::state::is_system_tag_key(key)) {
             return Err(CreateRepositoryErrorModeled::InvalidSystemTagUsageException(
                 InvalidSystemTagUsageException {
                     message: Some(format!(
                         "the tag key {key} is not valid: key names cannot be prefixed with aws:"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The same `TagsMap` rule the tagging operations apply: every key and
+        // value must satisfy `TagKey` / `TagValue`'s modelled length, which the
+        // boundary validator applies to the `tags` MEMBER rather than to the
+        // pairs inside the map. "The map of tags is not valid."
+        if let Some((key, value)) = tags
+            .iter()
+            .find(|(key, value)| !crate::state::is_tag_key(key) || !crate::state::is_tag_value(value))
+        {
+            return Err(CreateRepositoryErrorModeled::InvalidTagsMapException(
+                InvalidTagsMapException {
+                    message: Some(format!(
+                        "the map of tags is not valid: the key must be {}-{} characters and its value at most {} characters, got a key of {} and a value of {}",
+                        crate::state::TAG_KEY_MIN_LENGTH,
+                        crate::state::TAG_KEY_MAX_LENGTH,
+                        crate::state::TAG_VALUE_MAX_LENGTH,
+                        key.chars().count(),
+                        value.chars().count()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A repository is created with at most the per-resource tag limit, the
+        // same limit `TagResource` holds a resource's tag set to.
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateRepositoryErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "the maximum number of tags for a CodeCommit resource ({}) has been exceeded: the request carries {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        tags.len()
                     )),
                 },
             )

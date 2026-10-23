@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let repository_name = repository_name_of(&input.resource_arn)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let repository = store.repositories.get(repository_name).ok_or_else(|| {
+            ListTagsForResourceError::from(
+                ListTagsForResourceErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            repository_name,
+                        )),
+                    },
+                ),
+            )
+        })?;
+
+        // The stored tags' keys in key order, paged by the service's single
+        // pagination rule ([`crate::state::page_of`]), so the token this operation
+        // hands out is the same opaque token every other listing in this service
+        // issues and a decimal offset a caller invents is not one. This is a read:
+        // nothing in the store changes.
+        let ordered: Vec<String> = repository.tags.keys().cloned().collect();
+        let (keys, next_token) = crate::state::page_of(
+            &format!("{}:{repository_name}", Self::NAME),
+            &ordered,
+            input.next_token.as_deref(),
+            // This operation models no `maxResults`, so every page is the
+            // service's default size.
+            None,
+        )
+        .map_err(|problem| match problem {
+            // The operation models neither `InvalidMaxResultsException` nor
+            // `InvalidContinuationTokenException`, so a token it never issued is
+            // refused as the bad request it is rather than serving the first page.
+            crate::state::PageProblem::InvalidMaxResults(message)
+            | crate::state::PageProblem::InvalidContinuationToken(message) => {
+                crate::scaffolded::Scaffolded::validation(message)
+            }
+        })?;
+        // Each paged key with the value stored beside it. The keys came from this
+        // same map under the lock still held, so the pair is always there — the
+        // paging decides WHICH keys, never whether they exist.
+        let tags: std::collections::HashMap<String, String> = keys
+            .into_iter()
+            .map(|key| {
+                let value = repository.tags.get(&key).cloned().unwrap_or_default();
+                (key, value)
+            })
+            .collect();
+
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags),
+            next_token,
+        })
     }
+}
+
+/// The repository the request's `resourceArn` names, or the modelled error for
+/// why that ARN addresses no CodeCommit resource.
+fn repository_name_of(resource_arn: &str) -> Result<&str, ListTagsForResourceError> {
+    crate::state::repository_name_of_resource_arn(resource_arn).map_err(|problem| {
+        match problem {
+            crate::state::ResourceArnProblem::Missing => {
+                ListTagsForResourceErrorModeled::ResourceArnRequiredException(
+                    ResourceArnRequiredException {
+                        message: Some(
+                            "A valid Amazon Resource Name (ARN) for an CodeCommit resource is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+            }
+            crate::state::ResourceArnProblem::Invalid => {
+                ListTagsForResourceErrorModeled::InvalidResourceArnException(
+                    InvalidResourceArnException {
+                        message: Some(format!(
+                            "the value for the resource ARN {resource_arn} is not valid"
+                        )),
+                    },
+                )
+            }
+            crate::state::ResourceArnProblem::RepositoryName => {
+                ListTagsForResourceErrorModeled::InvalidRepositoryNameException(
+                    InvalidRepositoryNameException {
+                        message: Some(format!(
+                            "the repository name in the resource ARN {resource_arn} is not valid"
+                        )),
+                    },
+                )
+            }
+        }
+        .into()
+    })
 }
