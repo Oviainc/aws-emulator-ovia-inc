@@ -257,13 +257,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let key = (input.r#type.clone(), input.name.clone());
         let mut store = state.lock();
 
         // A replayed `clientToken` is a retry of the call that created the policy, so it
-        // answers that policy instead of creating or conflicting with a second one.
+        // answers that policy instead of creating or conflicting with a second one. The
+        // replay is scoped to the pair THIS request names: a token spent again on a
+        // different `(type, name)` is a request for another policy, which is still created
+        // rather than answered with the first one.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(record) = store.replayed_lifecycle_policy(Self::NAME, token) {
-                let detail = record.detail();
+            let replayed = store
+                .replayed_lifecycle_policy(Self::NAME, token)
+                .filter(|record| record.kind == key.0 && record.name == key.1)
+                .map(crate::state::LifecyclePolicyRecord::detail);
+            if let Some(detail) = replayed {
                 crate::state::audit(
                     Self::NAME,
                     ctx,
@@ -276,7 +283,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let key = (input.r#type.clone(), input.name.clone());
         if store.lifecycle_policies.contains_key(&key) {
             crate::state::audit(Self::NAME, ctx, AuditOutcome::AlreadyExists, Some(&resource));
             return Err(CreateLifecyclePolicyErrorModeled::ConflictException(
