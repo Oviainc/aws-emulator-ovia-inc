@@ -8,9 +8,20 @@
 //! body in, `<{Operation}Response>` XML out — so these tests exercise the wire
 //! protocol as well as the handlers, and every assertion is made on what a later
 //! read reports rather than on what the create answered.
+//!
+//! This module also carries the harness every suite in this crate shares: the router
+//! over one engine ([`emulator`]), the awsQuery request helpers, the XML readers, and
+//! the seeding of a resource whose create is still a scaffold stub
+//! ([`seed_trust_store`]).
 
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
+    ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, TrustStoreRecord,
+    TRUST_STORE_CREATING,
+};
 use smithy_server_runtime::MultiServiceRouter;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 /// The region every request below is signed for; the ARNs and DNS names the service
 /// mints belong to it.
@@ -24,18 +35,96 @@ pub(crate) fn account() -> &'static str {
     emulator_server::emulator_account_id()
 }
 
-/// A router carrying only this service, over one shared engine — what the production
-/// router mounts, minus the other services.
-fn router() -> MultiServiceRouter {
+/// A router carrying this service over one shared engine, plus that engine — what the
+/// production router mounts, minus the other services, with the store reachable so a
+/// suite can seed the record of a resource whose create is still a scaffold stub.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ),
     );
-    router
+    (router, engine)
+}
+
+/// One trust store to seed: its name, how many CA certificates its bundle held, how
+/// many revoked entries its revocation lists hold, whether the clock still owes it its
+/// move to `ACTIVE`, and the tags it carries.
+#[derive(Default)]
+pub(crate) struct TrustStoreSeed<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) certificates: i32,
+    pub(crate) revoked: i64,
+    pub(crate) settled: bool,
+    pub(crate) tags: &'a [(String, String)],
+}
+
+/// The instant seeded records are ordered from, so creation order is exact rather than
+/// dependent on how fast a suite runs.
+fn seed_epoch() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// Put one trust store in the store at creation position `index` and answer its ARN.
+///
+/// A suite seeds rather than creates because `CreateTrustStore` is still a scaffold stub
+/// with its own issue: reads and writes go through
+/// `service_..._v10::state::service_state`'s store, exactly as a handler's do, so a
+/// seeded record is the same record the handler serves. Seeding is also what lets the
+/// clock-owed `CREATING -> ACTIVE` move be asserted exactly — by placing the instant it
+/// is owed at either side of now — instead of sleeping for it.
+///
+/// The ARN is minted the way the service mints one — `emulator_arn` over this service's
+/// own namespace, with a 16-hex resource id — so a seeded record carries the same
+/// identifier a create would give it.
+pub(crate) fn seed_trust_store(
+    engine: &Arc<engine::InMemoryEngine>,
+    index: usize,
+    seed: &TrustStoreSeed<'_>,
+) -> String {
+    let id = format!("{:016x}", 0x5100_0000_0000_0000u64 + index as u64);
+    let arn = emulator_server::emulator_arn(
+        "elasticloadbalancing",
+        REGION,
+        &format!("truststore/{}/{id}", seed.name),
+    );
+    let now = SystemTime::now();
+    let record = TrustStoreRecord {
+        arn: arn.clone(),
+        name: seed.name.to_string(),
+        status: TRUST_STORE_CREATING.to_string(),
+        // A settled record is one whose move to `ACTIVE` the clock already owed; an
+        // unsettled one is still inside its settling span.
+        active_at: if seed.settled {
+            now - Duration::from_secs(1)
+        } else {
+            now + Duration::from_secs(3600)
+        },
+        created_at: seed_epoch() + Duration::from_secs(index as u64),
+        number_of_ca_certificates: seed.certificates,
+        total_revoked_entries: seed.revoked,
+        tags: seed
+            .tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<String, String>>(),
+    };
+    let state = engine.state::<ElbState>();
+    let mut store = state.lock();
+    store
+        .name_to_trust_store_arn
+        .insert(record.name.clone(), arn.clone());
+    store.trust_stores.insert(arn.clone(), record);
+    arn
+}
+
+/// A router carrying only this service, over one shared engine — what the production
+/// router mounts, minus the other services.
+fn router() -> MultiServiceRouter {
+    emulator().0
 }
 
 /// One answer from the emulator.

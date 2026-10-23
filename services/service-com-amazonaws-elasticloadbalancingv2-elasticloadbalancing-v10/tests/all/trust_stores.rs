@@ -9,8 +9,9 @@
 //!
 //! The records are SEEDED through the shared engine, the way a suite does for an
 //! operation whose creating sibling is still a scaffold stub (`CreateTrustStore` is
-//! one, with its own issue): reads and writes go through
-//! `service_..._v10::state::service_state`'s store, exactly as a handler's do, so a
+//! one, with its own issue): the harness that does it lives beside the other shared
+//! helpers in `provisioning_loop`, so reads and writes go through
+//! `service_..._v10::state::service_state`'s store, exactly as a handler's do, and a
 //! seeded record is the same record the handler serves. Seeding is also what lets the
 //! clock-owed `CREATING -> ACTIVE` move be asserted exactly — by placing the instant it
 //! is owed at either side of now — instead of sleeping for it.
@@ -21,82 +22,14 @@
 //! store carries is the modelled `TrustStoreNotFound`. So each suite below spans a set
 //! of records, identifier lists and page sizes rather than asserting one answer.
 
-use crate::provisioning_loop::{action, call, first_text, members, p, Reply, REGION};
+use crate::provisioning_loop::{
+    action, call, emulator, first_text, members, p, seed_trust_store, Reply, TrustStoreSeed as Seed,
+    REGION,
+};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::{
-    ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState, TrustStoreRecord,
     TRUST_STORE_ACTIVE, TRUST_STORE_CREATING,
 };
 use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
-/// A router carrying this service over one shared engine, plus that engine — what the
-/// production router mounts, minus the other services, with the store reachable so a
-/// suite can seed it.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    (router, engine)
-}
-
-/// One trust store to seed: its name, how many CA certificates its bundle held, how
-/// many revoked entries its revocation lists hold, and whether the clock still owes it
-/// its move to `ACTIVE`.
-struct Seed<'a> {
-    name: &'a str,
-    certificates: i32,
-    revoked: i64,
-    settled: bool,
-}
-
-/// The instant the seeded records are ordered from, so creation order is exact rather
-/// than dependent on how fast the suite runs.
-fn seed_epoch() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
-}
-
-/// Put one trust store in the store and answer its ARN.
-///
-/// The ARN is minted the way the service does — `emulator_arn` over this service's own
-/// namespace, with a 16-hex resource id — so the records a describe reports carry the
-/// same identifiers a create would give them.
-fn seed_trust_store(engine: &Arc<engine::InMemoryEngine>, index: usize, seed: &Seed<'_>) -> String {
-    let id = format!("{:016x}", 0x5100_0000_0000_0000u64 + index as u64);
-    let arn = emulator_server::emulator_arn(
-        "elasticloadbalancing",
-        REGION,
-        &format!("truststore/{}/{id}", seed.name),
-    );
-    let now = SystemTime::now();
-    let record = TrustStoreRecord {
-        arn: arn.clone(),
-        name: seed.name.to_string(),
-        status: TRUST_STORE_CREATING.to_string(),
-        // A settled record is one whose move to `ACTIVE` the clock already owed; an
-        // unsettled one is still inside its settling span.
-        active_at: if seed.settled {
-            now - Duration::from_secs(1)
-        } else {
-            now + Duration::from_secs(3600)
-        },
-        created_at: seed_epoch() + Duration::from_secs(index as u64),
-        number_of_ca_certificates: seed.certificates,
-        total_revoked_entries: seed.revoked,
-    };
-    let state = engine.state::<ElbState>();
-    let mut store = state.lock();
-    store
-        .name_to_trust_store_arn
-        .insert(record.name.clone(), arn.clone());
-    store.trust_stores.insert(arn.clone(), record);
-    arn
-}
 
 /// `DescribeTrustStores` with the extra form fields `fields`.
 async fn describe(router: &MultiServiceRouter, fields: &[(String, String)]) -> Reply {
@@ -146,6 +79,7 @@ async fn a_stored_trust_store_is_reported_by_arn_and_by_name() {
                 certificates: 1,
                 revoked: 0,
                 settled: true,
+                tags: &[],
             },
             TRUST_STORE_ACTIVE,
         ),
@@ -156,6 +90,7 @@ async fn a_stored_trust_store_is_reported_by_arn_and_by_name() {
                 certificates: 2,
                 revoked: 0,
                 settled: false,
+                tags: &[],
             },
             TRUST_STORE_CREATING,
         ),
@@ -166,6 +101,7 @@ async fn a_stored_trust_store_is_reported_by_arn_and_by_name() {
                 certificates: 3,
                 revoked: 7,
                 settled: true,
+                tags: &[],
             },
             TRUST_STORE_ACTIVE,
         ),
@@ -176,6 +112,7 @@ async fn a_stored_trust_store_is_reported_by_arn_and_by_name() {
                 certificates: 42,
                 revoked: 123_456,
                 settled: true,
+                tags: &[],
             },
             TRUST_STORE_ACTIVE,
         ),
@@ -271,6 +208,7 @@ async fn every_trust_store_is_reported_and_paged_in_one_stable_order() {
                 certificates: index as i32 + 1,
                 revoked: index as i64,
                 settled: true,
+                tags: &[],
             },
         ));
     }
@@ -366,6 +304,7 @@ async fn an_identifier_no_trust_store_carries_is_refused() {
             certificates: 2,
             revoked: 0,
             settled: true,
+            tags: &[],
         },
     );
 
@@ -439,6 +378,7 @@ async fn the_clock_moves_a_trust_store_to_active_when_the_span_has_passed() {
             certificates: 1,
             revoked: 0,
             settled: true,
+            tags: &[],
         },
     );
     let pending = seed_trust_store(
@@ -449,6 +389,7 @@ async fn the_clock_moves_a_trust_store_to_active_when_the_span_has_passed() {
             certificates: 1,
             revoked: 0,
             settled: false,
+            tags: &[],
         },
     );
 
