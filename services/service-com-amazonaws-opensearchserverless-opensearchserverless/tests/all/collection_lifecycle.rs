@@ -145,7 +145,7 @@ pub(crate) fn is_collection_id(id: &str) -> bool {
 
 /// True when `version` satisfies `PolicyVersion`'s modelled `@length(min: 20, max: 36)` and
 /// `^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$`.
-fn is_policy_version(version: &str) -> bool {
+pub(crate) fn is_policy_version(version: &str) -> bool {
     if !(20..=36).contains(&version.len()) || !version.len().is_multiple_of(4) {
         return false;
     }

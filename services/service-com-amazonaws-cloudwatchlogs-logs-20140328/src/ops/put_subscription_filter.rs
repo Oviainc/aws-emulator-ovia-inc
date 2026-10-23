@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
             return Err(PutSubscriptionFilterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The specified log group does not exist.".to_string()),
+                    message: Some(crate::state::resource_not_found_message("log group")),
                 },
             )
             .into());
@@ -312,15 +312,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Valid values are @aws.account, @aws.region, and @source.log" — the modelled
         // `SystemField` is a plain string, so the boundary validator does not hold the
-        // list to that catalogue.
+        // list to that catalogue. Same rule as `retentionInDays`: the refusal lists the
+        // documented set rather than only saying the value was wrong.
         if let Some(fields) = input.emit_system_fields.as_deref() {
-            if let Some(unknown) = fields
+            if fields
                 .iter()
-                .find(|field| !crate::state::SUBSCRIPTION_SYSTEM_FIELDS.contains(&field.as_str()))
+                .any(|field| !crate::state::SUBSCRIPTION_SYSTEM_FIELDS.contains(&field.as_str()))
             {
-                return Err(invalid(format!(
-                    "emitSystemFields value {unknown} is not one of {}",
-                    crate::state::SUBSCRIPTION_SYSTEM_FIELDS.join(", ")
+                return Err(invalid(crate::state::invalid_value_message(
+                    "emitSystemFields",
+                    crate::state::SUBSCRIPTION_SYSTEM_FIELDS,
                 )));
             }
         }

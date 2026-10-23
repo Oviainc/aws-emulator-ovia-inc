@@ -217,21 +217,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let group_name =
                     crate::state::log_group_name_from_identifier(resource_arn).to_string();
                 let Some(group) = store.log_groups.get_mut(&group_name) else {
-                    return Err(not_found("The specified log group does not exist."));
+                    return Err(not_found(&crate::state::resource_not_found_message(
+                        "log group",
+                    )));
                 };
+                let requested = input.policy_name.as_deref();
                 let Some(policy) = group.resource_policy.as_ref() else {
-                    return Err(not_found(
-                        "The specified resource has no resource policy attached",
-                    ));
+                    // Nothing is attached, so a policy the request names is not there;
+                    // with no name in the request there is no request member to build
+                    // the refusal from.
+                    return Err(match requested {
+                        Some(name) => not_found(&crate::state::policy_not_found_message(name)),
+                        None => not_found(&crate::state::resource_not_found_message(
+                            "resource policy",
+                        )),
+                    });
                 };
                 // A `policyName` that names a different policy names nothing attached
-                // to this resource.
-                if input
-                    .policy_name
-                    .as_deref()
-                    .is_some_and(|name| name != policy.policy_name)
-                {
-                    return Err(not_found("The specified resource policy does not exist."));
+                // to this resource, and the refusal names the policy the caller asked
+                // for rather than a string that identifies nothing.
+                if let Some(name) = requested.filter(|name| *name != policy.policy_name) {
+                    return Err(not_found(&crate::state::policy_not_found_message(name)));
                 }
                 // "Required when deleting a resource-scoped policy to prevent concurrent
                 // modifications."
@@ -276,7 +282,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .remove(policy_name)
                     .is_none()
                 {
-                    return Err(not_found("The specified resource policy does not exist."));
+                    // The refusal is built from the request: the policy name the caller
+                    // asked for is the only identity such a policy has.
+                    return Err(not_found(&crate::state::policy_not_found_message(
+                        policy_name,
+                    )));
                 }
             }
         }
