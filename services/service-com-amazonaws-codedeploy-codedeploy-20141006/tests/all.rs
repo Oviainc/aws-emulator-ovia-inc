@@ -45,6 +45,8 @@ mod lifecycle_event_hook_status;
 mod list_deployment_configs;
 #[path = "all/list_deployment_groups.rs"]
 mod list_deployment_groups;
+#[path = "all/list_deployment_instances.rs"]
+mod list_deployment_instances;
 #[path = "all/list_deployment_targets.rs"]
 mod list_deployment_targets;
 #[path = "all/list_on_premises_instances.rs"]

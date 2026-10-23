@@ -248,6 +248,41 @@ pub const INSTANCE_TYPE_ON_IN_PLACE_DEPLOYMENT: &str =
     "An instance type was specified for an in-place deployment. Instance types are supported \
      for blue/green deployments only";
 
+/// Whether a deployment on `compute_platform` has INSTANCES to report.
+///
+/// The instance-shaped readers of a deployment's targets — the deprecated
+/// `ListDeploymentInstances`, `GetDeploymentInstance` and
+/// `BatchGetDeploymentInstances` — report instances, which only the EC2/
+/// on-premises and Lambda compute platforms have: the model says so on the
+/// operation itself
+/// (`smithy_query(query="doc",shape="ListDeploymentInstances")`:
+/// "ListDeploymentInstances throws an exception if it is used with a compute
+/// platform other than EC2/On-premises or Lambda", and "The newer
+/// BatchGetDeploymentTargets should be used instead because it works with all
+/// compute types"). `ComputePlatform`
+/// (`smithy_query(query="shape",shape="ComputePlatform")`: Server | Lambda |
+/// ECS) is the catalogue, so `ECS` is the member this answers `false` for —
+/// stated POSITIVELY so a platform outside the enum, which this emulator can
+/// target no instance of either, is answered the same way.
+pub fn platform_reports_instances(compute_platform: &str) -> bool {
+    matches!(compute_platform, "Server" | "Lambda")
+}
+
+/// `InvalidComputePlatformException` (HTTP 400): the shape's own sentence, with
+/// the platform of the deployment the request named.
+///
+/// What makes the platform invalid here is the OPERATION, not the deployment: an
+/// Amazon ECS deployment is a perfectly good deployment that simply has no
+/// instances, so the sentence says which platforms the call serves. See
+/// [`platform_reports_instances`].
+pub fn instances_not_reported_for_platform(compute_platform: &str) -> String {
+    format!(
+        "The computePlatform is invalid: instances are reported only for deployments on the \
+         EC2/On-premises or Lambda compute platform, and the specified deployment is on {}",
+        echoed(compute_platform)
+    )
+}
+
 /// `DeploymentConfigDoesNotExistException` (HTTP 400): the configuration name
 /// after the delimiter, in the same form as the other not-found sentences. Only
 /// the delimited name is a measured requirement here; the noun phrase follows
