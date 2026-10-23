@@ -1042,10 +1042,19 @@ async fn a_disconnected_sessions_record_is_reported_for_the_documented_window() 
     let harness = Harness::new();
 
     // The window is the one `GetConnectionResponse$disconnectedSince` documents, so the
-    // rows are its published bound and one past it.
+    // rows are its published bound and one past it. The "inside" row sits a full second
+    // inside that bound rather than one millisecond: the session's age is measured from
+    // the wall clock when the row is built, so a margin smaller than this test's own
+    // run time would expire between `connect` and `get_connection` and make the row a
+    // race rather than an assertion about the bound (the bound itself is pinned by the
+    // `== window` row below, which must NOT be reported).
     for (case, ago_millis, reported) in [
         ("disconnected a moment ago", 1_000_i64, true),
-        ("disconnected just inside the window", DISCONNECT_INFORMATION_RETENTION_MILLIS - 1, true),
+        (
+            "disconnected just inside the window",
+            DISCONNECT_INFORMATION_RETENTION_MILLIS - 1_000,
+            true,
+        ),
         ("disconnected exactly at the window", DISCONNECT_INFORMATION_RETENTION_MILLIS, false),
         ("disconnected well past the window", 4 * DISCONNECT_INFORMATION_RETENTION_MILLIS, false),
     ] {
