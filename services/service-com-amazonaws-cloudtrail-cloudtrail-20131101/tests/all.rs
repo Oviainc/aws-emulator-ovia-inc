@@ -47,5 +47,7 @@ mod target_prefix_routing;
 mod target_routing;
 #[path = "all/trail_lifecycle.rs"]
 mod trail_lifecycle;
+#[path = "all/trail_refusals.rs"]
+mod trail_refusals;
 #[path = "all/trail_update.rs"]
 mod trail_update;

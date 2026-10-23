@@ -231,13 +231,7 @@ fn member(reply: &Reply, name: &str) -> Option<String> {
 
 /// The error `Message` a reply carries, or `""`.
 fn message(reply: &Reply) -> String {
-    reply
-        .body
-        .get("Message")
-        .or_else(|| reply.body.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+    reply.message().to_string()
 }
 
 #[tokio::test]

@@ -15,6 +15,8 @@
 mod activity_type_registration;
 #[path = "all/count_open_workflow_executions.rs"]
 mod count_open_workflow_executions;
+#[path = "all/count_pending_decision_tasks.rs"]
+mod count_pending_decision_tasks;
 #[path = "all/deprecate_workflow_type.rs"]
 mod deprecate_workflow_type;
 #[path = "all/domain_deprecation.rs"]

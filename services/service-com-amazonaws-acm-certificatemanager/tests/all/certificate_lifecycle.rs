@@ -67,13 +67,15 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
     (router, engine)
 }
 
-/// Hold every stored certificate in `PENDING_VALIDATION` for the rest of the test by
-/// moving the instant its validation outcome falls due an hour out.
+/// Hold every stored certificate in the state its request created for the rest of the
+/// test, by moving each transition the clock owes it — the validation outcome and the
+/// initial domain-validation email — an hour out.
 ///
-/// This writes only the due instant the emulator itself stores; the transition is
+/// This writes only the due instants the emulator itself stores; each transition is
 /// still materialised by `materialize_due` on the next request, exactly as in
-/// production. A test about the pending state therefore cannot be made flaky by the
-/// [`state::VALIDATION_SETTLE_DELAY`] span elapsing mid-test.
+/// production. A test about the state a request creates therefore cannot be made flaky
+/// by the [`state::VALIDATION_SETTLE_DELAY`] or
+/// [`state::VALIDATION_EMAIL_DISPATCH_DELAY`] span elapsing mid-test.
 pub(crate) fn hold_pending_validations(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
@@ -81,6 +83,27 @@ pub(crate) fn hold_pending_validations(engine: &Arc<engine::InMemoryEngine>) {
     for certificate in store.certificates.values_mut() {
         if let Some(pending) = certificate.pending_validation.as_mut() {
             pending.due_at = held;
+        }
+        if certificate.pending_validation_email.is_some() {
+            certificate.pending_validation_email = Some(held);
+        }
+    }
+}
+
+/// Move the initial domain-validation email every stored certificate is still owed
+/// into the past, so the next request dispatches it.
+///
+/// Like [`hold_pending_validations`] this writes only the due instant the emulator
+/// stores: the mail is still sent by `materialize_due`, so a test that needs the
+/// dispatched state does not have to wait out
+/// [`state::VALIDATION_EMAIL_DISPATCH_DELAY`] on the wall clock.
+pub(crate) fn dispatch_validation_mail_now(engine: &Arc<engine::InMemoryEngine>) {
+    let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
+    let mut store = store.lock();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_millis(1);
+    for certificate in store.certificates.values_mut() {
+        if certificate.pending_validation_email.is_some() {
+            certificate.pending_validation_email = Some(past);
         }
     }
 }
@@ -450,12 +473,13 @@ async fn describe_reports_what_request_certificate_stored() {
                         "case {case}: expected ACM to mail {target}, got {validation}"
                     );
                     // The mailbox list of an email-validated name names the messages
-                    // ACM has SENT; nothing here sends mail, so it is empty rather
-                    // than carrying invented addresses.
+                    // ACM has SENT. The initial dispatch is still held out above, so
+                    // nothing has been mailed yet and the list is empty rather than
+                    // carrying addresses no message went to.
                     assert_eq!(
                         validation["ValidationEmails"],
                         json!([]),
-                        "case {case}: no validation email has been sent, got {validation}"
+                        "case {case}: no validation email has been sent yet, got {validation}"
                     );
                     assert!(
                         validation["ResourceRecord"].is_null(),

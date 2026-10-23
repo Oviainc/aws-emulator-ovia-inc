@@ -447,13 +447,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            crate::state::TrailForMutation::Absent => {
-                return Err(UpdateTrailErrorModeled::TrailNotFoundException(
-                    TrailNotFoundException {
-                        message: Some(crate::state::unknown_trail_message(&input.name)),
-                    },
-                )
-                .into());
+            crate::state::TrailForMutation::Absent { name } => {
+                // `UpdateTrail` resolves the identifier to one Region's trail, so the
+                // refusal names that trail's ARN; the model says 404 for a not-found
+                // trail and CloudTrail answers 400 (see
+                // `crate::state::TRAIL_NOT_FOUND_STATUS`).
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    UpdateTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                        message: Some(crate::state::trail_not_found_arn_message(&region, &name)),
+                    }),
+                    crate::state::TRAIL_NOT_FOUND_STATUS,
+                ));
             }
         };
 

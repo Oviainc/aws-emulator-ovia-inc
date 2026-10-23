@@ -109,34 +109,13 @@ pub fn now_zoned_date_time() -> String {
 /// Split a `ZonedDateTime` into its civil part and the UTC offset it declares, in
 /// seconds.
 ///
-/// The model's pattern admits exactly two forms for that suffix — `Z` or `±hh:mm` — so
-/// those are the two read here; `None` for anything else.
+/// The rule is RFC 3339's, not this service's, so it is read through the ONE reader every
+/// service with a string-typed timestamp shares
+/// (`service_common::rfc3339::split_utc_offset`): the model's pattern admits two of the
+/// forms that reader knows — `Z` or `±hh:mm` — and a value reaching a handler has already
+/// been checked against that pattern, so the wider set it accepts is unreachable here.
 fn split_utc_offset(value: &str) -> Option<(&str, i64)> {
-    if !value.is_ascii() {
-        return None;
-    }
-    if let Some(civil) = value
-        .strip_suffix('Z')
-        .or_else(|| value.strip_suffix('z'))
-    {
-        return Some((civil, 0));
-    }
-    let (civil, offset) = value.split_at(value.len().checked_sub(6)?);
-    let bytes = offset.as_bytes();
-    if bytes[3] != b':' {
-        return None;
-    }
-    let sign: i64 = match bytes[0] {
-        b'+' => 1,
-        b'-' => -1,
-        _ => return None,
-    };
-    let hours: i64 = offset.get(1..3)?.parse().ok()?;
-    let minutes: i64 = offset.get(4..6)?.parse().ok()?;
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    Some((civil, sign * (hours * 3600 + minutes * 60)))
+    ::service_common::rfc3339::split_utc_offset(value)
 }
 
 /// The calendar fields a `ZonedDateTime` member carries, READ IN THE OFFSET THE CALLER
