@@ -146,11 +146,17 @@
 //! the one order the describe reports and pages over. A fresh account has created no
 //! endpoint service, so it has no connection either and the store starts empty.
 //! [`ComAmazonawsEc2Amazonec2State::insert_vpc_endpoint_connection`] is the one way a
-//! connection is stored, so the id it carries and the bytes it charges cannot be minted two
-//! ways. A connection sits in `PendingAcceptance` until the SERVICE OWNER accepts or
-//! rejects it (`AcceptVpcEndpointConnections` / `RejectVpcEndpointConnections`), which is
-//! an action rather than an instant, so — unlike a `pending` VPC — nothing beside it
-//! records a clock-owed transition.
+//! connection is stored, so the id it carries, the bytes it charges and the ceiling it
+//! fits inside cannot be decided two ways: a connection is keyed by a REQUEST-SUPPLIED
+//! endpoint id and nothing here reclaims one, so the insert refuses past
+//! [`MAX_STORED_VPC_ENDPOINT_CONNECTIONS`] (a writer asks
+//! [`ComAmazonawsEc2Amazonec2State::has_vpc_endpoint_connection_capacity`] first and
+//! refuses with EC2's own quota code) and every record costs at least
+//! [`VPC_ENDPOINT_CONNECTION_RECORD_BYTES`] against the byte budget, so repeated writes
+//! cannot grow the store for free. A connection sits in `PendingAcceptance` until the
+//! SERVICE OWNER accepts or rejects it (`AcceptVpcEndpointConnections` /
+//! `RejectVpcEndpointConnections`), which is an action rather than an instant, so —
+//! unlike a `pending` VPC — nothing beside it records a clock-owed transition.
 //!
 //! ## AMIs: the published catalog, plus whatever a writer stores
 //!
@@ -1939,6 +1945,12 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// A fresh, unused `i-` instance id.
+    ///
+    /// The long form every instance id EC2 issues takes: `i-` and 17 lowercase
+    /// hexadecimal digits of a counter that starts at one, so the id is never the null
+    /// id and its leading digit is `0` — the form [`instance_id_is_well_formed`] reads,
+    /// which is what lets an id outside it be answered as malformed rather than looked
+    /// up.
     pub fn mint_instance_id(&mut self) -> String {
         self.next_instance += 1;
         format!("i-{:017x}", self.next_instance)
@@ -2444,20 +2456,75 @@ pub fn validate_tag_size<E>(
     Ok(())
 }
 
-/// Whether `id` is a well-formed EC2 instance id.
+/// How many hexadecimal digits the LONG EC2 resource id form carries, the form every
+/// id this service mints uses (`i-00000000000000001`): "the form
+/// `i-xxxxxxxxxxxxxxxxx`" of AWS's `InvalidInstanceID.Malformed` error-code entry,
+/// seventeen digits.
+pub const LONG_RESOURCE_ID_DIGITS: usize = 17;
+
+/// Whether `id` is a well-formed EC2 instance id — one EC2 could have ISSUED.
 ///
-/// An instance id is `i-` followed by 8 or 17 lowercase hexadecimal digits — the
-/// short and the long id form. EC2 answers `InvalidInstanceID.Malformed` for
-/// anything else, BEFORE it looks the id up, which is a different answer from
-/// `InvalidInstanceID.NotFound` for a well-formed id nothing was launched for.
+/// An instance id is `i-` followed by 17 lowercase hexadecimal digits — "the full
+/// instance ID in the request, in the form `i-xxxxxxxxxxxxxxxxx`", as AWS's
+/// `InvalidInstanceID.Malformed` error-code entry spells the only form it accepts —
+/// of which the leading digit is `0` and not all are `0`. EC2 answers
+/// `InvalidInstanceID.Malformed` for anything else, BEFORE it looks the id up, which
+/// is a different answer from `InvalidInstanceID.NotFound` for a well-formed id
+/// nothing was launched for: a client that cannot tell a typo from a missing instance
+/// goes on polling for an instance that can never appear.
+///
+/// Three things put an id outside the form EC2 issues, so that it is malformed rather
+/// than missing:
+///
+/// * The 8-digit SHORT id form. EC2 stopped issuing short resource ids when longer ids
+///   were introduced and the short form was retired for instances, so the only
+///   instance id form left is the 17-digit one AWS's error text names. Other EC2
+///   resource kinds here still read both forms ([`volume_id_is_well_formed`] and the
+///   rest): this is the instance id's own documented form, not a rule about every id.
+/// * A LEADING DIGIT ABOVE ZERO. The long form carries 17 hexadecimal digits — 68 bits
+///   — for a 64-bit internal identifier, so its leading digit is always `0`: every
+///   instance id EC2 issues reads `i-0…`, which is also what this service's own mint
+///   produces ([`ComAmazonawsEc2Amazonec2State::mint_instance_id`]) and what every
+///   instance id seeded elsewhere in this emulator looks like. AWS answers an id whose
+///   leading digit is above zero — the `i-1234567890abcdef0` shape that documentation
+///   examples and hand-written probes use — with `InvalidInstanceID.Malformed`.
+/// * The ALL-ZERO id, the value every client reaches for as a placeholder: AWS answers
+///   `i-00000000000000000` with `InvalidInstanceID.Malformed` too, and the mint counts
+///   from one, so no instance can ever hold the null id.
+///
+/// The structural part of this is the INSTANCE id's rule, not a rule about every EC2
+/// id: the same all-zero suffix on a network interface (`eni-00000000000000000`) IS
+/// answered `NotFound`, so it is not generalised to the other id readers here.
+///
+/// ## Where each clause's evidence is, so the rule can be re-checked
+///
+/// * The 17-digit form: AWS's `InvalidInstanceID.Malformed` error-code entry ("Ensure
+///   that you provide the full instance ID in the request, in the form
+///   `i-xxxxxxxxxxxxxxxxx`").
+/// * The LEADING DIGIT: the recorded unit `ec2.op-contract-get-password-data` (run#12,
+///   `assert code == "InvalidInstanceID.Malformed"`) probes a 17-hexadecimal-digit id
+///   that is neither the short form nor the null id — an id whose leading digit is
+///   above zero, the `i-1234567890abcdef0` shape — and AWS answered it
+///   `InvalidInstanceID.Malformed`. With only the two other clauses the replay of that
+///   unit still diverged with `InvalidInstanceID.NotFound`; this clause is what makes
+///   the recorded answer match. The `tests/all/get_password_data.rs` rows "a leading
+///   digit above zero" and "every digit above zero" pin it.
+/// * The NULL id: the recorded units behind
+///   `issues/.../20261022T235108Z-ec2-misclassifies-rejections-and-skips-validation-malformed-ids.md`
+///   (cause 5, `i-00000000000000000` -> `InvalidInstanceID.Malformed`) and
+///   `issues/.../20261022T235108Z-ec2-sql-ha-application-status-check-fast-launch.md`
+///   (cause 1, the same id under `DryRun`), whose cause 7 is also where the
+///   `eni-00000000000000000` -> `NotFound` counter-example comes from.
 pub fn instance_id_is_well_formed(id: &str) -> bool {
     let Some(suffix) = id.strip_prefix("i-") else {
         return false;
     };
-    matches!(suffix.len(), 8 | 17)
+    suffix.len() == LONG_RESOURCE_ID_DIGITS
         && suffix
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && suffix.starts_with('0')
+        && suffix.bytes().any(|byte| byte != b'0')
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -6745,16 +6812,59 @@ pub struct VpcEndpointConnectionSpec {
     pub tags: Vec<Tag>,
 }
 
+/// How many VPC endpoint connections this emulator stores before a writer is refused.
+///
+/// CHOSEN, like [`MAX_STORED_DEDICATED_HOSTS`] and for the same reason: nothing in this
+/// emulator reclaims a stored connection, and each one is keyed by a REQUEST-SUPPLIED
+/// `VpcEndpointId`, so without a count ceiling repeated writes with fresh endpoint ids
+/// would grow memory without bound. It is well above any published per-VPC VPC endpoint
+/// quota a test would exercise. A count ceiling is no bound on the bytes each record
+/// holds, so those are charged against [`MAX_STORED_BYTES`] too
+/// ([`vpc_endpoint_connection_payload_bytes`]).
+pub const MAX_STORED_VPC_ENDPOINT_CONNECTIONS: usize = 4096;
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` VPC endpoint connections fit inside the store's ceiling
+    /// ([`MAX_STORED_VPC_ENDPOINT_CONNECTIONS`]).
+    ///
+    /// A writer asks this BEFORE storing anything and refuses the request with EC2's own
+    /// quota code when it answers `false`, the way [`Self::has_dedicated_host_capacity`]
+    /// gates `AllocateHosts`. [`Self::insert_vpc_endpoint_connection`] asks it again for
+    /// itself, so no path can get past the ceiling by forgetting to.
+    pub fn has_vpc_endpoint_connection_capacity(&self, count: usize) -> bool {
+        self.vpc_endpoint_connections
+            .len()
+            .saturating_add(count)
+            <= MAX_STORED_VPC_ENDPOINT_CONNECTIONS
+    }
+
     /// Store a connection to one of the account's own VPC endpoint services, and answer
-    /// the `VpcEndpointConnectionId` it was given.
+    /// the `VpcEndpointConnectionId` it was given — or `None` when the store is full.
     ///
     /// The connection id is minted here rather than taken from `spec`, the way
     /// [`Self::insert_subnet`] mints a `SubnetId`, and the record is keyed by its
-    /// `VpcEndpointId` because one endpoint connects to exactly one service. The
-    /// caller-chosen bytes it holds are charged against the store's byte budget here, so no
-    /// path can store them uncharged.
-    pub fn insert_vpc_endpoint_connection(&mut self, spec: VpcEndpointConnectionSpec) -> String {
+    /// `VpcEndpointId` because one endpoint connects to exactly one service. The bytes it
+    /// holds are charged against the store's byte budget here, so no path can store them
+    /// uncharged.
+    ///
+    /// `None` means the store is at [`MAX_STORED_VPC_ENDPOINT_CONNECTIONS`] and NOTHING
+    /// was stored: the ceiling is enforced here as well as by
+    /// [`Self::has_vpc_endpoint_connection_capacity`], so a writer that forgets the gate
+    /// cannot grow the store without bound either. A writer that sees `None` refuses the
+    /// request with EC2's own quota code rather than reporting a connection it does not
+    /// hold.
+    pub fn insert_vpc_endpoint_connection(
+        &mut self,
+        spec: VpcEndpointConnectionSpec,
+    ) -> Option<String> {
+        // A write that REPLACES the connection of an endpoint already stored adds no
+        // record, so only a new key has to fit inside the ceiling.
+        let replaces_existing = self
+            .vpc_endpoint_connections
+            .contains_key(&spec.vpc_endpoint_id);
+        if !replaces_existing && !self.has_vpc_endpoint_connection_capacity(1) {
+            return None;
+        }
         let vpc_endpoint_connection_id = self.next_id(VPC_ENDPOINT_CONNECTION_ID_PREFIX);
         let connection = VpcEndpointConnection {
             service_id: Some(spec.service_id),
@@ -6775,14 +6885,19 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(vpc_endpoint_connection_payload_bytes(&connection));
         self.vpc_endpoint_connections
             .insert(vpc_endpoint_id, connection);
-        vpc_endpoint_connection_id
+        Some(vpc_endpoint_connection_id)
     }
 }
 
-/// The caller-chosen bytes one stored VPC endpoint connection holds: its tags, the load
+/// The bytes one stored VPC endpoint connection holds: the fixed overhead of the record
+/// and the key it is stored under, plus the caller-chosen parts — its tags, the load
 /// balancer ARNs of the service it connects to, and its DNS entries. The ids, the state,
 /// the timestamp and the Region are derived by this module or bounded by the model, so they
-/// are fixed-size.
+/// are fixed-size, which is what the overhead constant stands for.
+///
+/// The overhead is charged so that a connection created with no tags, no ARNs and no DNS
+/// entries is NOT free against the byte budget: every stored record costs something, so
+/// repeated writes advance the budget whatever they carry.
 ///
 /// The ONE definition of that charge, the way [`address_payload_bytes`] is for an address:
 /// a writer charges exactly it, and a removal path must give back the same number.
@@ -6799,11 +6914,27 @@ pub fn vpc_endpoint_connection_payload_bytes(connection: &VpcEndpointConnection)
                 + entry.hosted_zone_id.as_deref().unwrap_or_default().len()
         })
         .sum();
-    tag_list_bytes(connection.tags.as_deref().unwrap_or_default())
-        + arn_bytes(connection.network_load_balancer_arns.as_ref())
-        + arn_bytes(connection.gateway_load_balancer_arns.as_ref())
-        + dns_bytes
+    VPC_ENDPOINT_CONNECTION_RECORD_BYTES
+        .saturating_add(
+            connection
+                .vpc_endpoint_id
+                .as_deref()
+                .unwrap_or_default()
+                .len(),
+        )
+        .saturating_add(tag_list_bytes(
+            connection.tags.as_deref().unwrap_or_default(),
+        ))
+        .saturating_add(arn_bytes(connection.network_load_balancer_arns.as_ref()))
+        .saturating_add(arn_bytes(connection.gateway_load_balancer_arns.as_ref()))
+        .saturating_add(dns_bytes)
 }
+
+/// The fixed overhead one stored VPC endpoint connection costs whatever it carries: the
+/// modelled record itself and the entry holding it, as a CHOSEN constant in the same
+/// spirit as the count ceilings — the point is that a zero-tag connection is not free
+/// against [`MAX_STORED_BYTES`], not that it is byte-exact.
+pub const VPC_ENDPOINT_CONNECTION_RECORD_BYTES: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Block public access for snapshots
