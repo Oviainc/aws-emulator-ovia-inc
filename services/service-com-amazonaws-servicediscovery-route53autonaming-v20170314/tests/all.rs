@@ -43,3 +43,5 @@ mod state_roundtrip;
 mod tagging;
 #[path = "all/update_http_namespace.rs"]
 mod update_http_namespace;
+#[path = "all/update_service.rs"]
+mod update_service;
