@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAddClusterNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAddClusterNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAddClusterNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `ClusterName` (name or ARN) in `crate::state`, refuses a
+//! cluster that does not exist with the modelled `ResourceNotFound`, replays a
+//! `ClientToken` the cluster already remembers, and otherwise adds the requested nodes
+//! to each named instance group — reporting a group it cannot add to in `Failed` with
+//! the modelled error code rather than failing the whole batch. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +119,71 @@ impl From<BatchAddClusterNodesErrorModeled> for BatchAddClusterNodesError {
     }
 }
 
+/// `BatchAddClusterNodesErrorCode`'s members this operation can report, from the model's
+/// enum of the same name.
+///
+/// The remaining member, `InvalidInstanceGroupStatus`, describes a group state this
+/// emulator does not model, so nothing reports it.
+const ERROR_INSTANCE_GROUP_NOT_FOUND: &str = "InstanceGroupNotFound";
+/// See [`ERROR_INSTANCE_GROUP_NOT_FOUND`].
+const ERROR_INCOMPATIBLE_INSTANCE_TYPES: &str = "IncompatibleInstanceTypes";
+
+/// The response a recorded outcome renders as: one `Successful` entry per node the call
+/// added, carrying that node's CURRENT instance group, status and placement, plus the
+/// per-group failures the call reported.
+///
+/// Shared by the first call and by a `ClientToken` replay, so a replay answers the same
+/// nodes rather than a second batch of them.
+fn replay(
+    cluster: &crate::state::Cluster,
+    record: &crate::state::NodeAdditionRecord,
+) -> BatchAddClusterNodesOutput {
+    let successful = record
+        .added
+        .iter()
+        .filter_map(|logical_id| {
+            let node = cluster.nodes.get(logical_id)?;
+            Some(NodeAdditionResult {
+                node_logical_id: node.logical_id.clone(),
+                instance_group_name: node.instance_group_name.clone(),
+                status: node.status.clone(),
+                availability_zones: node.availability_zone.clone().map(|zone| vec![zone]),
+                instance_types: node.instance_type.clone().map(|held| vec![held]),
+            })
+        })
+        .collect();
+    let failed = record
+        .failed
+        .iter()
+        .map(|failure| BatchAddClusterNodesError2 {
+            instance_group_name: failure.instance_group_name.clone(),
+            error_code: failure.error_code.clone(),
+            failed_count: failure.failed_count,
+            availability_zones: failure.availability_zones.clone(),
+            instance_types: failure.instance_types.clone(),
+            message: failure.message.clone(),
+        })
+        .collect();
+    BatchAddClusterNodesOutput { successful, failed }
+}
+
+/// The `Failed` entry for a specification this cluster cannot satisfy: the group it
+/// named, why, and how many of its requested nodes were therefore not added.
+fn failure(
+    spec: &AddClusterNodeSpecification,
+    error_code: &str,
+    message: String,
+) -> crate::state::NodeAdditionFailure {
+    crate::state::NodeAdditionFailure {
+        instance_group_name: spec.instance_group_name.clone(),
+        error_code: error_code.to_string(),
+        failed_count: spec.increment_target_count_by,
+        availability_zones: spec.availability_zones.clone(),
+        instance_types: spec.instance_types.clone(),
+        message: Some(message),
+    }
+}
+
 /// The `BatchAddClusterNodes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +220,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAddClusterNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAddClusterNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAddClusterNodes"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The cluster is this call's subject, so a name or ARN this account holds no
+        // cluster for is the modelled `ResourceNotFound` and no node is added.
+        let Some(cluster) = store.cluster_by_name_or_arn_mut(&input.cluster_name) else {
+            return Err(BatchAddClusterNodesErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Cluster {} does not exist.", input.cluster_name)),
+            })
+            .into());
+        };
+        // Transitions the clock already owes this cluster and its nodes, so the statuses
+        // this call reports are the ones a describe would report at the same instant.
+        cluster.settle_status(now);
+        for node in cluster.nodes.values_mut() {
+            node.settle_status(now);
+        }
+
+        // `ClientToken` is the operation's idempotency token: a token this cluster
+        // remembers answers what the first call carrying it answered, and adds nothing.
+        if let Some(record) = input
+            .client_token
+            .as_ref()
+            .and_then(|token| cluster.node_additions.get(token))
+            .cloned()
+        {
+            return Ok(replay(cluster, &record));
+        }
+
+        // The whole batch is sized against the per-cluster bound BEFORE anything is
+        // added, so a refused batch adds no node at all.
+        let requested: usize = input
+            .nodes_to_add
+            .iter()
+            .map(|spec| usize::try_from(spec.increment_target_count_by).unwrap_or_default())
+            .sum();
+        if cluster.nodes.len() + requested > crate::state::CLUSTER_NODE_QUOTA {
+            return Err(BatchAddClusterNodesErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The service limit for nodes in cluster {} is {}, with current \
+                         utilization of {} and a request delta of {requested}.",
+                        cluster.arn,
+                        crate::state::CLUSTER_NODE_QUOTA,
+                        cluster.nodes.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut record = crate::state::NodeAdditionRecord {
+            added: Vec::new(),
+            failed: Vec::new(),
+            issued_at: now,
+        };
+        for spec in &input.nodes_to_add {
+            // Cloned so the group's settings can be read while the cluster's nodes and
+            // the group's own instance count are written below.
+            let Some(group) = cluster.instance_group(&spec.instance_group_name).cloned() else {
+                record.failed.push(failure(
+                    spec,
+                    ERROR_INSTANCE_GROUP_NOT_FOUND,
+                    format!(
+                        "Cluster {} has no instance group {:?}.",
+                        cluster.arn, spec.instance_group_name
+                    ),
+                ));
+                continue;
+            };
+            // A node joins the instance types its group admits — the one its
+            // specification names, or the list its `InstanceRequirements` names — so a
+            // request that targets only other types cannot be satisfied by this group,
+            // and the failure says which types it runs.
+            let admitted = crate::state::instance_group_types(&group);
+            let requested_types = spec.instance_types.clone().unwrap_or_default();
+            if !requested_types.is_empty()
+                && !admitted.is_empty()
+                && !admitted.iter().any(|held| requested_types.contains(held))
+            {
+                record.failed.push(failure(
+                    spec,
+                    ERROR_INCOMPATIBLE_INSTANCE_TYPES,
+                    format!(
+                        "Instance group {:?} runs {admitted:?}.",
+                        group.instance_group_name
+                    ),
+                ));
+                continue;
+            }
+
+            // `IncrementTargetCountBy` is modelled `@range 1..50`, so the boundary
+            // validator has already refused a value outside it; clamped anyway so the
+            // group's instance count can only ever move with the nodes that were added.
+            let increment = spec.increment_target_count_by.max(0);
+            // The type the added nodes run: the one the request targeted when it named
+            // any the group admits, otherwise the first the group admits.
+            let instance_type = admitted
+                .iter()
+                .find(|held| requested_types.contains(held))
+                .or_else(|| admitted.first())
+                .or_else(|| requested_types.first())
+                .cloned();
+            // Where they are placed: the first zone the request targeted. A group's own
+            // zones follow from the subnets of its VPC configuration, which this
+            // emulator does not resolve, so a request that targets none records none.
+            let zone = spec
+                .availability_zones
+                .as_ref()
+                .and_then(|zones| zones.first())
+                .cloned();
+            for _ in 0..increment {
+                let logical_id = crate::state::mint_node_logical_id();
+                cluster.nodes.insert(
+                    logical_id.clone(),
+                    crate::state::ClusterNode {
+                        logical_id: logical_id.clone(),
+                        // Minted with the `Pending` -> `Running` transition, not before.
+                        instance_id: None,
+                        instance_group_name: group.instance_group_name.clone(),
+                        instance_type: instance_type.clone(),
+                        status: crate::state::NODE_STATUS_PENDING.to_string(),
+                        availability_zone: zone.clone(),
+                        threads_per_core: group.threads_per_core,
+                        launch_time: now,
+                        running_at: now + crate::state::TRANSIENT_STATE_SETTLES_AFTER,
+                        volume_attachments: ::std::collections::BTreeMap::new(),
+                    },
+                );
+                record.added.push(logical_id);
+            }
+            // `IncrementTargetCountBy` "the number of nodes to add to the specified
+            // instance group": the group's own target count moves with them.
+            if let Some(group) = cluster.instance_group_mut(&spec.instance_group_name) {
+                group.instance_count = group.instance_count.saturating_add(increment);
+            }
+        }
+
+        let answer = replay(cluster, &record);
+        // Whether this call changed the cluster at all: a batch whose every
+        // specification landed in `Failed` added no node and moved no target count.
+        let added_nodes = !record.added.is_empty();
+        if let Some(token) = input.client_token {
+            cluster.remember_node_addition(token, record);
+        }
+        let arn = cluster.arn.clone();
+        drop(store);
+
+        // Recorded only when a node was actually added, so the change log does not
+        // report a mutation that never happened. A batch whose every specification
+        // failed still remembers its `ClientToken` — that record is the idempotency
+        // answer, not a change to the cluster's resources.
+        if added_nodes {
+            crate::state::record_state_change(Self::NAME, &arn, ctx);
+        }
+        Ok(answer)
     }
 }

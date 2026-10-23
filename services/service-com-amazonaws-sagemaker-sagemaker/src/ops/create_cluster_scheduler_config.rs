@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterSchedulerConfig
-//! IMPLEMENTED: mints a cluster policy in `crate::state` and answers its ARN and id.
-//! This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: validates the `ClusterArn` against `crate::state` BEFORE any
+//! name-conflict arbitration — a cluster this account does not hold is a 400
+//! `ValidationException`, since this operation models no not-found error, so every
+//! racer of a create against a missing cluster is refused the same way — then refuses a
+//! policy name already in use in that cluster as a `ConflictException` and otherwise
+//! mints the policy `Creating` in `crate::state` and answers its ARN and id. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!

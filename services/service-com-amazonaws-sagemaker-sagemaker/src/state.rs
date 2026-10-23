@@ -57,19 +57,18 @@ use crate::ops::types::{
     AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
     AsyncInferenceConfig, AutoMLComputeConfig, AutoMLDataSplitConfig, AutoMLJobChannel,
     AutoMLJobObjective, AutoMLOutputDataConfig, AutoMLProblemTypeConfig, AutoMLSecurityConfig,
-    BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig,
-    DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
-    InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
-    KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
-    ModelCardExportOutputConfig, ModelCardSecurityConfig, ModelClientConfig, ModelDeployConfig,
-    ModelLifeCycle, ModelMetrics,
-    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
+    BatchDataCaptureConfig, CodeEditorAppImageConfig,
+    ContainerDefinition, DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig,
+    ExplainerConfig, GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
+    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
+    MetricsConfig, ModelCardExportOutputConfig, ModelCardSecurityConfig, ModelClientConfig,
+    ModelDeployConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard,
+    ModelPackageSecurityConfig, ModelPackageStatusDetails,
     ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
     ParallelismConfiguration, Parameter, ProcessingInput, ProcessingOutputConfig,
     ProcessingResources, ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary,
     ResourceSpec, SelectiveExecutionConfig, SourceAlgorithmSpecification, Tag,
-    TransformInput,
-    TransformOutput, TransformResources, UserContext, VpcConfig,
+    TransformInput, TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
@@ -135,6 +134,11 @@ pub const MLFLOW_APP_QUOTA: usize = 1_000;
 /// mints and `DeleteModelPackage` releases.
 pub const MODEL_PACKAGE_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
+pub const TRIAL_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds the compute-allocation store, and is what
+/// `CreateComputeQuota` answers `ResourceLimitExceeded` past.
+pub const COMPUTE_QUOTA_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
 pub const PIPELINE_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const APP_IMAGE_CONFIG_QUOTA: usize = 1_000;
@@ -144,6 +148,8 @@ pub const CODE_REPOSITORY_QUOTA: usize = 1_000;
 pub const APP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const MODEL_PACKAGE_GROUP_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`] — this one is per cluster, the resource that holds the nodes.
+pub const CLUSTER_NODE_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the lineage-artifact store the same way, and is what
 /// `CreateArtifact` answers `ResourceLimitExceeded` past.
 pub const ARTIFACT_QUOTA: usize = 1_000;
@@ -166,6 +172,33 @@ pub const PROCESSING_JOB_QUOTA: usize = 1_000;
 /// two accessors at the END of this file, so a service growing another store does not
 /// collide with the lineage-group one.
 pub const LINEAGE_GROUP_QUOTA: usize = 1_000;
+
+/// The most `BatchAddClusterNodes` client tokens one cluster remembers. See
+/// [`Cluster::remember_node_addition`].
+pub const NODE_ADDITION_HISTORY_CAP: usize = 64;
+
+/// The most presigned-URL grants one partner app keeps, so a caller asking for URL after
+/// URL cannot grow the store without end; a grant past the cap is forgotten, which a
+/// caller cannot tell from the expiry it was minted with. Beside the other store bounds,
+/// next to the [`PartnerApp`] it bounds.
+pub const GRANT_HISTORY_CAP: usize = 32;
+
+/// How long a presigned partner-app URL stays valid when the request names no
+/// `ExpiresInSeconds`.
+///
+/// The emulator's OWN choice, not a published AWS default: the model documents none. The
+/// widest value `ExpiresInSeconds` allows (`@range 5..300`), so a caller that names no
+/// value gets a link a human has time to follow. Beside [`GRANT_HISTORY_CAP`], with the
+/// other knobs of the [`PartnerApp`] record they govern.
+pub const DEFAULT_PRESIGNED_URL_EXPIRES_IN_SECONDS: i32 = 300;
+
+/// How long the session a presigned partner-app URL opens lasts when the request names
+/// no `SessionExpirationDurationInSeconds`.
+///
+/// The emulator's OWN choice, not a published AWS default: the narrowest value the model
+/// allows (`@range 1800..43200`), so an unnamed session is the shortest one rather than
+/// the longest.
+pub const DEFAULT_PRESIGNED_URL_SESSION_SECONDS: i32 = 1800;
 
 /// The lineage group every lineage entity this account creates belongs to.
 ///
@@ -381,6 +414,94 @@ pub const AUTO_MODEL_REGISTRATION_DISABLED: &str = "AutoModelRegistrationDisable
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+
+/// How long after the call that starts it the clock owes a transient -> ready
+/// transition for the resources in this slice: a scheduler resource's `Creating` ->
+/// `Created`, a cluster node's `Pending` -> `Running`, a volume attachment's
+/// `attaching` -> `attached`, and an export job's `InProgress` -> terminal.
+///
+/// Real SageMaker takes minutes; the span is compressed and never zero, so a caller
+/// acting straight after the call still observes the transient state. The due instant is
+/// stored and never slept on.
+///
+/// The span itself is stated ONCE for this service, by [`ENDPOINT_IN_SERVICE_AFTER`];
+/// this is that one value under the name the resources above are settled by, so the two
+/// cannot drift apart.
+pub const TRANSIENT_STATE_SETTLES_AFTER: Duration = ENDPOINT_IN_SERVICE_AFTER;
+
+/// `ClusterInstanceStatus`'s two members this emulator moves an added node through.
+pub const NODE_STATUS_PENDING: &str = "Pending";
+/// See [`NODE_STATUS_PENDING`].
+pub const NODE_STATUS_RUNNING: &str = "Running";
+
+/// `VolumeAttachmentStatus`'s two members this emulator moves an attachment through.
+pub const VOLUME_STATUS_ATTACHING: &str = "attaching";
+/// See [`VOLUME_STATUS_ATTACHING`].
+pub const VOLUME_STATUS_ATTACHED: &str = "attached";
+
+/// The device names this service hands successive volumes attached to one node.
+///
+/// AWS's EBS device-naming guidance recommends `/dev/sdf` through `/dev/sdp` for data
+/// volumes on a Linux instance; every entry also satisfies the modelled
+/// `VolumeDeviceName` pattern, whose `sd[b-z]` branch covers them.
+pub const VOLUME_DEVICE_NAMES: [&str; 11] = [
+    "/dev/sdf", "/dev/sdg", "/dev/sdh", "/dev/sdi", "/dev/sdj", "/dev/sdk", "/dev/sdl",
+    "/dev/sdm", "/dev/sdn", "/dev/sdo", "/dev/sdp",
+];
+
+/// What every ARN this service mints, and every ARN-shaped member it accepts, begins
+/// with — so a name-or-ARN member is told apart from a bare name once, here.
+pub const ARN_PREFIX: &str = "arn:";
+
+/// `GetScalingConfigurationRecommendation`'s documented default for
+/// `TargetCpuUtilizationPerCore`: "The percentage of how much utilization you want an
+/// instance to use before autoscaling. The default value is 50%."
+pub const DEFAULT_TARGET_CPU_UTILIZATION_PER_CORE: i32 = 50;
+
+/// The cooldowns the recommended dynamic scaling configuration carries, in seconds.
+///
+/// The emulator's OWN value rather than a claim about any published AWS default: the
+/// model documents none, and a recommendation has to carry some cooldown for a caller to
+/// apply. Equal for scale-in and scale-out, so neither direction is favoured.
+pub const RECOMMENDED_SCALING_COOLDOWN_SECONDS: i32 = 300;
+
+/// The target-tracking metric a SageMaker endpoint variant scales on, as Application
+/// Auto Scaling names its predefined metric for SageMaker.
+pub const PREDEFINED_SCALING_METRIC: &str = "SageMakerVariantInvocationsPerInstance";
+
+/// A fresh 12-character lowercase-hex resource id: the form SageMaker's
+/// `compute-quota/` and `cluster-scheduler-config/` ARNs carry (`^[a-z0-9]{12}$`), and
+/// the one [`mint_cluster_id`] gives a cluster.
+///
+/// The digits come from this module's ONE id scheme, [`mint_opaque_resource_id`], so
+/// every server-generated id in this crate is minted the same way and a new one needs no
+/// second scheme: take as many of its digits as the model's pattern admits.
+pub fn mint_short_id() -> String {
+    mint_opaque_resource_id().chars().take(12).collect()
+}
+
+/// A fresh EC2 instance id for a node that has reached `Running`: `i-` and 17 hex
+/// characters, the long form of the modelled `ClusterNodeId` pattern. Same scheme as
+/// [`mint_short_id`], cut to the length this pattern admits.
+pub fn mint_instance_id() -> String {
+    let digits: String = mint_opaque_resource_id().chars().take(17).collect();
+    format!("i-{digits}")
+}
+
+/// A fresh `NodeLogicalId`: the id `BatchAddClusterNodes` answers for a node it added,
+/// before the node has an instance id. The 32 hex digits [`mint_short_id`]'s scheme
+/// mints, which the modelled `ClusterNodeLogicalId` pattern
+/// (`^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]$`, len 1..128) accepts.
+pub fn mint_node_logical_id() -> String {
+    mint_opaque_resource_id()
+}
+
+/// A fresh opaque token for a presigned-URL grant, from the same scheme as every other
+/// id here. It is an identifier inside this emulator's own store, never a credential:
+/// nothing signs with it and nothing presents it back to the emulator.
+pub fn mint_grant_token() -> String {
+    mint_opaque_resource_id()
+}
 
 /// `TransformJobStatus`'s members this emulator moves a transform job through (the
 /// modelled enum also carries `Completed`, `Stopping` and `Stopped`, which this slice
@@ -791,6 +912,22 @@ impl InferenceComponent {
             _ => &[],
         }
     }
+}
+
+/// A trial created by `CreateTrial`, as `DescribeTrial` replays it.
+#[derive(Debug, Clone)]
+pub struct Trial {
+    pub name: String,
+    pub arn: String,
+    pub display_name: Option<String>,
+    pub experiment_name: String,
+    pub metadata_properties: Option<MetadataProperties>,
+    pub tags: Vec<Tag>,
+    /// Stored at creation rather than rebuilt per read, so every later read reports the
+    /// identity that actually created the trial.
+    pub created_by: UserContext,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
 }
 
 /// A processing job created by `CreateProcessingJob`, as `DescribeProcessingJob`
@@ -1221,8 +1358,8 @@ pub struct Artifact {
 }
 
 /// A model package group created by `CreateModelPackageGroup`, as
-/// `DescribeModelPackageGroup` replays it, and the container a VERSIONED model package
-/// is registered into.
+/// `DescribeModelPackageGroup` replays it, the container a VERSIONED model package is
+/// registered into, and the resource `PutModelPackageGroupPolicy` attaches a policy to.
 ///
 /// `created_by` is stored at creation rather than rebuilt per read, so every later read
 /// reports the identity that actually created the group.
@@ -1243,7 +1380,209 @@ pub struct ModelPackageGroup {
     pub created_by: UserContext,
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
+    /// The policy document the last `PutModelPackageGroupPolicy` stored, verbatim.
     pub resource_policy: Option<String>,
+}
+
+/// One presigned-URL grant `CreatePartnerAppPresignedUrl` minted: the opaque token the
+/// URL carries and when it stops being valid.
+///
+/// The token is NOT an AWS credential — it is never presented to this emulator and
+/// nothing signs with it — so it is a stored grant id rather than a credential-store
+/// record.
+#[derive(Debug, Clone)]
+pub struct PresignedUrlGrant {
+    pub token: String,
+    pub issued_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub session_expires_at: SystemTime,
+}
+
+/// What one remembered `BatchAddClusterNodes` `ClientToken` replays: the nodes that call
+/// added and the per-instance-group failures it reported, so the same token answers the
+/// same thing instead of adding the nodes twice.
+#[derive(Debug, Clone)]
+pub struct NodeAdditionRecord {
+    /// The `NodeLogicalId`s the call added, in the order it answered them.
+    pub added: Vec<String>,
+    pub failed: Vec<NodeAdditionFailure>,
+    /// When the call that this record replays ran, so the token store evicts by age.
+    pub issued_at: SystemTime,
+}
+
+/// One per-instance-group failure of a `BatchAddClusterNodes` call, as its `Failed` list
+/// reported it.
+#[derive(Debug, Clone)]
+pub struct NodeAdditionFailure {
+    pub instance_group_name: String,
+    pub error_code: String,
+    pub failed_count: i32,
+    pub availability_zones: Option<Vec<String>>,
+    pub instance_types: Option<Vec<String>>,
+    pub message: Option<String>,
+}
+
+impl Cluster {
+    /// The instance group of this cluster named `name`, as `CreateCluster` stored its
+    /// specification.
+    pub fn instance_group(
+        &self,
+        name: &str,
+    ) -> Option<&crate::ops::types::ClusterInstanceGroupSpecification> {
+        self.instance_groups
+            .iter()
+            .find(|group| group.instance_group_name == name)
+    }
+
+    /// [`Self::instance_group`], for a caller that raises the group's target count.
+    pub fn instance_group_mut(
+        &mut self,
+        name: &str,
+    ) -> Option<&mut crate::ops::types::ClusterInstanceGroupSpecification> {
+        self.instance_groups
+            .iter_mut()
+            .find(|group| group.instance_group_name == name)
+    }
+
+    /// The node of this cluster with instance id `instance_id`, once the node has one.
+    pub fn node_by_instance_id_mut(&mut self, instance_id: &str) -> Option<&mut ClusterNode> {
+        self.nodes
+            .values_mut()
+            .find(|node| node.instance_id.as_deref() == Some(instance_id))
+    }
+
+    /// Remember `record` under `token`, keeping the token store bounded.
+    ///
+    /// At most [`NODE_ADDITION_HISTORY_CAP`] tokens are held, so a caller retrying with
+    /// token after token cannot grow the store without end. The one dropped is the one
+    /// remembered LONGEST AGO (by its `issued_at`, not by how its token sorts), so the
+    /// token just recorded is never the one evicted. A token dropped that way is one the
+    /// cluster no longer remembers, so the next call carrying it adds nodes rather than
+    /// replaying — the same outcome as a token whose idempotency window has passed.
+    pub fn remember_node_addition(&mut self, token: String, record: NodeAdditionRecord) {
+        self.node_additions.insert(token, record);
+        while self.node_additions.len() > NODE_ADDITION_HISTORY_CAP {
+            let oldest = self
+                .node_additions
+                .iter()
+                .min_by_key(|(_, held)| held.issued_at)
+                .map(|(token, _)| token.clone());
+            match oldest {
+                Some(token) => self.node_additions.remove(&token),
+                // Unreachable while the map is over the cap, and breaking rather than
+                // looping forever is the safe answer if it ever is not.
+                None => break,
+            };
+        }
+    }
+}
+
+/// One node of a cluster, as `DescribeClusterNode` replays it.
+///
+/// `running_at` is the instant the clock owes the `Pending` -> `Running` transition,
+/// which is also when the node gets its EC2 instance id: a caller that describes a node
+/// straight after adding it still observes `Pending` with no instance id.
+#[derive(Debug, Clone)]
+pub struct ClusterNode {
+    pub logical_id: String,
+    pub instance_id: Option<String>,
+    pub instance_group_name: String,
+    /// The type the node runs, which is the one its instance group names. Absent for a
+    /// group whose specification names `InstanceRequirements` rather than an
+    /// `InstanceType`, which the model makes mutually exclusive.
+    pub instance_type: Option<String>,
+    pub status: String,
+    /// Where the node was placed: the zone the add request targeted, since a group's
+    /// zones follow from its VPC configuration, which this emulator does not resolve.
+    pub availability_zone: Option<String>,
+    pub threads_per_core: Option<i32>,
+    pub launch_time: SystemTime,
+    pub running_at: SystemTime,
+    /// The volumes attached to this node, keyed by `VolumeId`.
+    pub volume_attachments: BTreeMap<String, VolumeAttachment>,
+}
+
+impl ClusterNode {
+    /// Materialise the `Pending` -> `Running` transition the clock already owes, and with
+    /// it the node's instance id. Answers whether this call made the transition.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == NODE_STATUS_PENDING && now >= self.running_at {
+            self.status = NODE_STATUS_RUNNING.to_string();
+            self.instance_id = Some(mint_instance_id());
+            return true;
+        }
+        false
+    }
+
+    /// Materialise every `attaching` -> `attached` transition this node's volumes are
+    /// owed.
+    pub fn settle_attachments(&mut self, now: SystemTime) {
+        for attachment in self.volume_attachments.values_mut() {
+            attachment.settle_status(now);
+        }
+    }
+
+    /// The device name to hand the next volume attached to this node: the first entry of
+    /// [`VOLUME_DEVICE_NAMES`] no attachment of this node holds, or `None` once the node
+    /// has used them all.
+    pub fn free_device_name(&self) -> Option<&'static str> {
+        VOLUME_DEVICE_NAMES.into_iter().find(|candidate| {
+            !self
+                .volume_attachments
+                .values()
+                .any(|attachment| attachment.device_name == *candidate)
+        })
+    }
+}
+
+/// One EBS volume attached to a cluster node by `AttachClusterNodeVolume`.
+#[derive(Debug, Clone)]
+pub struct VolumeAttachment {
+    pub volume_id: String,
+    pub device_name: String,
+    pub status: String,
+    pub attach_time: SystemTime,
+    /// The instant the clock owes the `attaching` -> `attached` transition.
+    pub attached_at: SystemTime,
+}
+
+impl VolumeAttachment {
+    /// Materialise the `attaching` -> `attached` transition the clock already owes.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == VOLUME_STATUS_ATTACHING && now >= self.attached_at {
+            self.status = VOLUME_STATUS_ATTACHED.to_string();
+            return true;
+        }
+        false
+    }
+}
+
+/// An Inference Recommender job and the recommendations it benchmarked, which
+/// `GetScalingConfigurationRecommendation` computes a scaling configuration from.
+///
+/// `CreateInferenceRecommendationsJob` is still a scaffolded stub, and benchmarking an
+/// endpoint is work this emulator does not do, so nothing here synthesises a
+/// recommendation: `GetScalingConfigurationRecommendation` answers from the
+/// recommendations this store holds and refuses when it holds none for the request.
+#[derive(Debug, Clone)]
+pub struct InferenceRecommendationsJob {
+    pub name: String,
+    pub arn: String,
+    pub status: String,
+    pub recommendations: Vec<InferenceRecommendation>,
+    pub creation_time: SystemTime,
+}
+
+/// One benchmarked recommendation of an Inference Recommender job.
+#[derive(Debug, Clone)]
+pub struct InferenceRecommendation {
+    pub recommendation_id: String,
+    pub endpoint_name: String,
+    pub instance_type: String,
+    /// What one instance of `instance_type` sustained, in invocations per minute.
+    pub max_invocations_per_minute: i32,
+    /// The model latency measured at that load, in milliseconds.
+    pub model_latency_millis: i32,
 }
 
 /// Why SageMaker refuses `policy` as a resource policy for a model group, or `None` when
@@ -1513,6 +1852,11 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Trials, keyed by [`entity_key`] of their `TrialName`: the name "must be unique in
+    /// your Amazon Web Services account and is not case-sensitive"
+    /// (`CreateTrial$TrialName`), so two spellings differing only in case are ONE trial.
+    /// The record keeps the casing the create sent. Reached through [`Self::trial`].
+    pub trials: BTreeMap<String, Trial>,
     /// Keyed by `AlgorithmName`.
     pub algorithms: BTreeMap<String, Algorithm>,
     /// AutoML jobs V2, keyed by [`entity_key`] of their `AutoMLJobName`.
@@ -1545,6 +1889,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub apps: BTreeMap<AppKey, App>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
+    /// Keyed by `InferenceRecommendationsJobName`.
+    pub inference_recommendations_jobs: BTreeMap<String, InferenceRecommendationsJob>,
     /// Keyed by [`model_package_key`], so an unversioned package and the versions of a
     /// group share one store and one stable order.
     pub model_packages: BTreeMap<String, ModelPackage>,
@@ -2420,7 +2766,7 @@ pub fn mint_opaque_resource_id() -> String {
 /// `CreateModelCardExportJob`, the hub readers — so it belongs to a change that covers
 /// them together, with their refusal wording, rather than to any single operation.
 pub fn name_from_arn_or_name(value: &str) -> &str {
-    match value.strip_prefix("arn:") {
+    match value.strip_prefix(ARN_PREFIX) {
         Some(_) => value.split('/').next_back().unwrap_or(value),
         None => value,
     }
@@ -2945,6 +3291,17 @@ impl ModelCard {
     }
 }
 
+/// Whether `document` is a JSON object.
+///
+/// The one structural claim this service makes about a caller-supplied JSON document
+/// whose model bounds only its length — a model card's `Content`
+/// ([`is_model_card_content`]), a model package group's `ResourcePolicy` — so the
+/// boundary validator passes such a value and the service is what refuses it. Stated
+/// once here rather than once per operation.
+pub fn is_json_object(document: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(document).is_ok_and(|parsed| parsed.is_object())
+}
+
 /// Whether `content` can be a model card's `Content`.
 ///
 /// `Content`'s own documentation says it "must be in model card JSON schema and provided
@@ -2953,7 +3310,7 @@ impl ModelCard {
 /// value and the service refuses it. The schema's own required members are NOT checked
 /// here: this is the one structural claim the model's documentation makes.
 pub fn is_model_card_content(content: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(content).is_ok_and(|parsed| parsed.is_object())
+    is_json_object(content)
 }
 
 /// `ModelCardExportJobStatus`'s members this emulator moves an export job through (the
@@ -3493,6 +3850,12 @@ pub struct PartnerApp {
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub available_at: SystemTime,
+    /// Where the app itself is served; the presigned URL
+    /// `CreatePartnerAppPresignedUrl` answers is this plus the grant it minted.
+    pub base_url: String,
+    /// Every presigned-URL grant minted for this app that has not expired, oldest
+    /// first. See [`PresignedUrlGrant`].
+    pub grants: Vec<PresignedUrlGrant>,
 }
 
 impl PartnerApp {
@@ -3575,6 +3938,15 @@ pub struct Cluster {
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub in_service_at: SystemTime,
+    /// The cluster's nodes, keyed by `NodeLogicalId` — what `BatchAddClusterNodes` adds
+    /// to this record, `DescribeClusterNode` replays and `AttachClusterNodeVolume`
+    /// attaches storage inside. A cluster starts with none: provisioning the instances a
+    /// group asks for is work this emulator does not do, so the nodes it holds are the
+    /// ones a call added.
+    pub nodes: BTreeMap<String, ClusterNode>,
+    /// What a `BatchAddClusterNodes` `ClientToken` replays: the outcome of the first call
+    /// carrying that token. Keyed by the token.
+    pub node_additions: BTreeMap<String, NodeAdditionRecord>,
 }
 
 impl Cluster {
@@ -3618,15 +3990,35 @@ impl Cluster {
     }
 }
 
-/// Mint the id a `ClusterArn` carries: the first 12 of the 32 lowercase hex digits
-/// [`mint_opaque_resource_id`] produces, which is exactly the `[a-z0-9]{12}` the
+/// The instance types an instance group admits: the one its specification names, or the
+/// list its `InstanceRequirements` names.
+///
+/// The model makes the two mutually exclusive ("The `InstanceType` and
+/// `InstanceRequirements` properties are mutually exclusive" —
+/// `ClusterInstanceRequirements`' own doc), and a group may name neither, which is why
+/// this answers a list that can be empty: a group that names no type admits any.
+pub fn instance_group_types(
+    group: &crate::ops::types::ClusterInstanceGroupSpecification,
+) -> Vec<String> {
+    if let Some(instance_type) = &group.instance_type {
+        return vec![instance_type.clone()];
+    }
+    group
+        .instance_requirements
+        .as_ref()
+        .map(|requirements| requirements.instance_types.clone())
+        .unwrap_or_default()
+}
+
+/// Mint the id a `ClusterArn` carries: the 12 lowercase hex digits
+/// [`mint_short_id`] produces, which is exactly the `[a-z0-9]{12}` the
 /// modelled `ClusterArn` pattern admits.
 ///
 /// One minter for the service: the entropy, its bounds and the reasons it is not a
 /// secret are stated once, on [`mint_opaque_resource_id`]. `CreateCluster` still
 /// re-mints on a collision rather than assuming uniqueness.
 pub fn mint_cluster_id() -> String {
-    mint_opaque_resource_id().chars().take(12).collect()
+    mint_short_id()
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -4345,3 +4737,63 @@ impl ComAmazonawsSagemakerSagemakerState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The HyperPod scheduling, experiment-trial, model-card-export and partner-app
+// control-plane slice's own lookups and store bounds. They sit in their OWN inherent
+// `impl` block at the end of this module — the convention the slices above follow —
+// rather than in the first one, so a slice added beside them edits its own block
+// instead of the one every other slice also edits.
+// ---------------------------------------------------------------------------
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// The cluster a `ClusterNameOrArn` member names: by ARN when the value is one, by
+    /// name otherwise — the two forms the model accepts for the one resource.
+    pub fn cluster_by_name_or_arn(&self, value: &str) -> Option<&Cluster> {
+        if value.starts_with(ARN_PREFIX) {
+            return self.clusters.values().find(|cluster| cluster.arn == value);
+        }
+        self.clusters.get(value)
+    }
+
+    /// [`Self::cluster_by_name_or_arn`], for a caller that writes.
+    pub fn cluster_by_name_or_arn_mut(&mut self, value: &str) -> Option<&mut Cluster> {
+        if value.starts_with(ARN_PREFIX) {
+            return self
+                .clusters
+                .values_mut()
+                .find(|cluster| cluster.arn == value);
+        }
+        self.clusters.get_mut(value)
+    }
+
+    /// [`Self::cluster_by_arn`], for a caller that writes.
+    pub fn cluster_by_arn_mut(&mut self, value: &str) -> Option<&mut Cluster> {
+        self.clusters
+            .values_mut()
+            .find(|cluster| cluster.arn == value)
+    }
+
+    /// The partner app whose ARN is `value`.
+    pub fn partner_app_by_arn_mut(&mut self, value: &str) -> Option<&mut PartnerApp> {
+        self.partner_apps
+            .values_mut()
+            .find(|app| app.arn == value)
+    }
+
+    /// Whether another trial fits, i.e. the store is below [`TRIAL_QUOTA`].
+    pub fn trials_below_quota(&self) -> bool {
+        self.trials.len() < TRIAL_QUOTA
+    }
+
+    /// The trial `name` identifies, whatever case it is written in — `TrialName` is
+    /// unique per account and not case-sensitive, so the lookup folds case the way
+    /// [`Self::experiment`] does for an experiment.
+    pub fn trial(&self, name: &str) -> Option<&Trial> {
+        self.trials.get(&entity_key(name))
+    }
+
+    /// Whether another compute quota fits, i.e. the store is below [`COMPUTE_QUOTA_QUOTA`].
+    pub fn compute_quotas_below_quota(&self) -> bool {
+        self.compute_quotas.len() < COMPUTE_QUOTA_QUOTA
+    }
+}
