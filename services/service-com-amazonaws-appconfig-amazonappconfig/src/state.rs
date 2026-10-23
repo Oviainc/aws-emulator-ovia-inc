@@ -1823,8 +1823,8 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
     }
 
     /// Give back the accounting for a hosted configuration version that is no longer
-    /// stored. Nothing calls this yet — `DeleteHostedConfigurationVersion` is still a
-    /// stub, and this is the hook it needs so deleting a version frees its budget.
+    /// stored. `DeleteHostedConfigurationVersion` calls this with the length of the
+    /// content it removed, so deleting a version frees its budget.
     pub fn release_hosted_configuration_bytes(&mut self, bytes: usize) {
         self.hosted_configuration_bytes = self.hosted_configuration_bytes.saturating_sub(bytes);
     }

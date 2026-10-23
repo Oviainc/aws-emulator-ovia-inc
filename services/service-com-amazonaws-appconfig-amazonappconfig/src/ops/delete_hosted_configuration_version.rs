@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHostedConfigurationVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHostedConfigurationVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHostedConfigurationVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +118,19 @@ impl From<DeleteHostedConfigurationVersionErrorModeled> for DeleteHostedConfigur
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource that could not be
+/// resolved — the same shape, and the same `state` message helpers, that
+/// `GetHostedConfigurationVersion` answers a miss on this resource with.
+fn not_found(message: String, resource_name: String) -> DeleteHostedConfigurationVersionError {
+    DeleteHostedConfigurationVersionErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+            resource_name: Some(resource_name),
+        },
+    )
+    .into()
+}
+
 /// The `DeleteHostedConfigurationVersion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,20 +165,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHostedConfigurationVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHostedConfigurationVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteHostedConfigurationVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A hosted configuration version is addressed through its two parents, so they
+        // are resolved outermost-first and whichever level is missing is the resource the
+        // 404 names — the same order `CreateHostedConfigurationVersion` and
+        // `GetHostedConfigurationVersion` resolve this path in.
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application_id),
+                input.application_id,
+            ));
+        };
+        let Some(profile) = application
+            .profiles
+            .get_mut(&input.configuration_profile_id)
+        else {
+            return Err(not_found(
+                crate::state::configuration_profile_not_found(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                ),
+                input.configuration_profile_id,
+            ));
+        };
+
+        // The delete IS the removal of the stored version: once this answers 204,
+        // `GetHostedConfigurationVersion` and a second delete both miss on this version
+        // number, because each reads the map this took it out of. A version number is
+        // never reused — `next_version_number` only ever increases — so the number this
+        // frees cannot later resolve to different content, and the profile's remaining
+        // versions are untouched.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHostedConfigurationVersion"))
+        // A profile whose `LocationUri` is not the hosted store holds its configuration
+        // elsewhere and therefore has no hosted version under any number, so it misses
+        // here exactly as an unwritten number does; that is the reader's answer for the
+        // same address.
+        let Some(removed) = profile.hosted_versions.remove(&input.version_number) else {
+            return Err(not_found(
+                crate::state::hosted_configuration_version_not_found(
+                    &input.application_id,
+                    &input.configuration_profile_id,
+                    input.version_number,
+                ),
+                input.version_number.to_string(),
+            ));
+        };
+
+        // The content is no longer held, so the budget `CreateHostedConfigurationVersion`
+        // reserved for it is given back: deleting a version makes room for another one,
+        // rather than leaving this service permanently charged for bytes it dropped.
+        store.release_hosted_configuration_bytes(removed.content.len());
+
+        Ok(DeleteHostedConfigurationVersionOutput)
     }
 }
