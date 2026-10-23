@@ -61,7 +61,7 @@ async fn get(ivs: &Ivs, arn: &str) -> Value {
 
 /// Every persisted configuration, walked page by page through the `nextToken` the
 /// list issues.
-async fn list_all(ivs: &Ivs) -> Vec<Value> {
+pub(crate) async fn list_all(ivs: &Ivs) -> Vec<Value> {
     let mut all = Vec::new();
     let mut token = Value::Null;
     loop {
