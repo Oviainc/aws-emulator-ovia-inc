@@ -38,12 +38,15 @@ const REGION: &str = "us-east-1";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator: a fresh engine behind a router that claims `swf` requests.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite under `tests/all/` drives the service through the
+/// same router rather than standing up a second harness of its own.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -53,7 +56,7 @@ impl Emulator {
 
     /// Call one operation and return `(status, body)`. The `Authorization` header's
     /// credential scope is what routes the request to this service.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/swf/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
@@ -86,7 +89,7 @@ impl Emulator {
     }
 
     /// Call one operation, requiring a 200, and return the body.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -96,7 +99,13 @@ impl Emulator {
     }
 
     /// Call one operation, requiring a 400 with `expected_code`.
-    async fn refused(&self, case: &str, operation: &str, body: &Value, expected_code: &str) {
+    pub(crate) async fn refused(
+        &self,
+        case: &str,
+        operation: &str,
+        body: &Value,
+        expected_code: &str,
+    ) {
         let (status, parsed) = self.call(operation, body).await;
         let code = error_code(&parsed);
         assert_eq!(
@@ -119,7 +128,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn string_at(body: &Value, pointer: &str) -> String {
+pub(crate) fn string_at(body: &Value, pointer: &str) -> String {
     body.pointer(pointer)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a string at {pointer} of {body:?}"))
@@ -137,7 +146,7 @@ fn register_domain_body(name: &str, retention: &str) -> Value {
 }
 
 /// Register a domain, a workflow type carrying `defaults`, and nothing else.
-async fn seeded(
+pub(crate) async fn seeded(
     emulator: &Emulator,
     case: &str,
     domain: &str,
@@ -157,7 +166,7 @@ async fn seeded(
 }
 
 /// Fold `extra`'s members into `body`.
-fn merge(body: &mut Value, extra: Value) {
+pub(crate) fn merge(body: &mut Value, extra: Value) {
     let (Some(target), Some(source)) = (body.as_object_mut(), extra.as_object()) else {
         panic!("merge expects two JSON objects, got {body:?} and {extra:?}");
     };
@@ -167,7 +176,7 @@ fn merge(body: &mut Value, extra: Value) {
 }
 
 /// Every default a workflow type can carry, so a start needs no overrides at all.
-fn full_defaults(task_list: &str, child_policy: &str) -> Value {
+pub(crate) fn full_defaults(task_list: &str, child_policy: &str) -> Value {
     json!({
         "defaultTaskList": { "name": task_list },
         "defaultTaskStartToCloseTimeout": "60",
