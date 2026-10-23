@@ -6,7 +6,9 @@
 //! chooses which of that sheet's two paired files is returned — the PNG sheet
 //! or the JSON index describing it — and at which `pixelRatio` (`@2x`). Both
 //! files are derived from one layout of the same record, so the index always
-//! describes the sheet it is paired with.
+//! describes the sheet it is paired with. Both are served as STORED objects of
+//! the asset bucket, so both report the media type that bucket stores them
+//! with — see `crate::service::wire` for the object headers that carries.
 //!
 //! ## Shape of an operation
 //!
@@ -171,9 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
         // The modeled `FileName` pattern admits only `sprites[@2x].png` and
-        // `sprites[@2x].json`, so the name decides both the media type and the
-        // pixel ratio.
-        let Some((content_type, pixel_ratio)) = assets::sprite_file(&input.file_name) else {
+        // `sprites[@2x].json`, so the name decides both which of the sheet's
+        // two paired files is served and at which pixel ratio.
+        let Some(file) = assets::sprite_file(&input.file_name) else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "FileName must be one of sprites.png, sprites@2x.png, sprites.json or \
                  sprites@2x.json, got `{}`",
@@ -181,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        let sheet = {
+        let (sheet, content_type) = {
             let catalog = state.lock();
             let Some(sheet) = catalog.sprites.get(&(style, scheme, variant)) else {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
@@ -192,20 +194,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             // Read the record and release the catalog: laying the sheet out,
-            // drawing it and encoding it read nothing from state.
-            sheet.clone()
+            // drawing it and encoding it read nothing from state. Both of a
+            // sheet's files are stored objects of the asset bucket, so the
+            // media type they are delivered with comes from that record rather
+            // than from what is inside the object.
+            (sheet.clone(), catalog.asset_delivery.content_type.clone())
         };
 
-        let layout = assets::layout_sprites(&sheet, pixel_ratio);
-        let body = if content_type == "image/png" {
-            assets::render_sprite_sheet(&layout)
-        } else {
-            assets::sprite_index_json(&layout)
+        let layout = assets::layout_sprites(&sheet, file.pixel_ratio);
+        let body = match file.kind {
+            assets::SpriteFileKind::Sheet => assets::render_sprite_sheet(&layout),
+            assets::SpriteFileKind::Index => assets::sprite_index_json(&layout),
         };
 
         Ok(GetSpritesOutput {
             e_tag: Some(assets::etag(&body)),
-            content_type: Some(content_type.to_string()),
+            content_type: Some(content_type),
             cache_control: Some(sheet.cache_control.clone()),
             blob: Some(body),
         })

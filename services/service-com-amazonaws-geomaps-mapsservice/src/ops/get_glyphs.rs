@@ -5,7 +5,10 @@
 //! record in [`crate::state`] (comma-separated stacks resolve to the first name
 //! the catalog has metrics for, the way a client's fallback list is meant to
 //! work); `FontUnicodeRange` names the 256-codepoint range, and the `.pbf`
-//! bytes are the SDF glyphs derived from that record over that range.
+//! bytes are the SDF glyphs derived from that record over that range. A range
+//! is served as a STORED object of the asset bucket, so it reports the media
+//! type that bucket stores it with — see `crate::service::wire` for the object
+//! headers that carries.
 //!
 //! ## Shape of an operation
 //!
@@ -153,26 +156,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (start, end) = parse_range(&input.font_unicode_range)?;
 
-        let font = {
+        let (font, content_type) = {
             let catalog = state.lock();
             // A font stack is a fallback list (`Amazon Ember Bold,Noto Sans
             // Bold`): the first name the catalog has metrics for is the one
             // measured with, and a stack it knows none of is measured with the
             // catalog's fallback metrics, because this operation models no
             // error to refuse it with.
-            input
+            let font = input
                 .font_stack
                 .split(',')
                 .map(str::trim)
                 .find_map(|name| catalog.fonts.get(name))
                 .unwrap_or(&catalog.fallback_font)
-                .clone()
+                .clone();
+            // A glyph range is a stored object of the asset bucket, so the
+            // media type it is delivered with comes from the asset-delivery
+            // record rather than from the protobuf inside the object.
+            (font, catalog.asset_delivery.content_type.clone())
         };
 
         let body = assets::glyph_range_bytes(&font, &input.font_stack, start, end);
         Ok(GetGlyphsOutput {
             e_tag: Some(assets::etag(&body)),
-            content_type: Some(font.content_type.clone()),
+            content_type: Some(content_type),
             cache_control: Some(font.cache_control.clone()),
             blob: Some(body),
         })

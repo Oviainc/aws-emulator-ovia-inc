@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -34,14 +34,19 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec the modeled sequence reads and answers in.
+//!   This service serves the model's own `restJson1`, with the object-store
+//!   delivery headers its stored assets carry; see [`wire`].
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod wire;
+
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -52,6 +57,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built once here because
+    /// [`Service::override_protocol`] hands back a borrow of it. See [`wire`]
+    /// for what it adds to the model's own `restJson1`.
+    wire: wire::AssetDeliveryRestJson<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +69,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            wire: wire::AssetDeliveryRestJson::new(engine),
         }
     }
 }
@@ -132,6 +142,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // word that routing failure in your own envelope instead.
         let _ = req;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The model's own `restJson1`, with the object-store delivery headers
+        // the two stored-asset operations carry. Every other operation is
+        // serialized by the framework's codec, untouched.
+        Some(&self.wire)
     }
 
     fn override_framework_error(
