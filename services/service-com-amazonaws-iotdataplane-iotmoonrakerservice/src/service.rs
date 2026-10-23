@@ -67,6 +67,12 @@ use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 /// The media type the data plane announces for a shadow state document.
 const JSON_DOCUMENT_MEDIA_TYPE: &str = "application/json";
 
+/// The error code this service refuses a bad request with, which is the error its model
+/// binds to every operation for one — see [`EmulatedService::override_refusal`]. Named
+/// here as the wire code because a boundary refusal is rendered before any operation's
+/// error enum is reached.
+const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+
 /// Every output shape of this service whose `@httpPayload` member targets the
 /// `JsonDocument` shape.
 ///
@@ -250,16 +256,35 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // This service's client-input error is `InvalidRequestException` — one of the
+        // three errors its model binds to EVERY operation
+        // (`smithy_query(query="digest")`: `common_errors` is InternalFailureException /
+        // InvalidRequestException / ThrottlingException). `ValidationException`, which
+        // the framework names by default on the JSON protocols, is not a shape this
+        // service models at all, so a client's modelled-error dispatch cannot match it
+        // and the refusal surfaces as an unknown failure. Every refusal the framework
+        // describes structurally therefore carries this service's code — whichever
+        // operation and whichever member it was, since the model binds the error to all
+        // of them — and the status stays the 400 the protocol renders a constraint
+        // refusal with.
+        //
+        // The MESSAGE stays the framework's envelope: it names the member and the
+        // constraint it broke, built from the request, which is what a caller has to fix
+        // the request from. Only the code is this service's choice.
+        //
+        // An unauthenticated caller is not a constraint refusal and keeps the
+        // framework's 403 wording: this service models `ForbiddenException` with that
+        // status for exactly that case.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_REQUEST_EXCEPTION.to_string(),
+                message: aws_smithy_schema_server::envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
