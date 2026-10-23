@@ -244,6 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token,
             request_fingerprint: fingerprint,
             sequence,
+            // The principal this request authenticated as, recorded now so every later
+            // read of the template attributes it to the identity that created it.
+            created_by: crate::state::caller_identity_arn(),
         };
         // `insert_job_template` is what writes the `(CreateJobTemplate, clientToken) ->
         // id` entry the replay lookup above reads, in this same lock, so a record can

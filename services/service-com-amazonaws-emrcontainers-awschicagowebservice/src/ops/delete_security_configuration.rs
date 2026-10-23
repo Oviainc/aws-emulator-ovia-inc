@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSecurityConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSecurityConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSecurityConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored security configuration one id names and answers with the id it
+//! deleted, so a later `DescribeSecurityConfiguration` for that id misses and is refused
+//! with the modelled `ResourceNotFoundException`. An id that names no stored
+//! configuration is refused with the modelled `ValidationException` (this operation
+//! models no not-found error), because the output reports the id that WAS deleted and
+//! there was none.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +135,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSecurityConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSecurityConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSecurityConfiguration"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSecurityConfigurationError::Modeled(
+                DeleteSecurityConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the security configuration store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle();
+
+        // This operation models no not-found error, so an id that names no stored
+        // configuration is refused as an invalid request rather than answered as a no-op:
+        // the output reports the id that WAS deleted, and there was none.
+        let Some(record) = state.remove_security_configuration(&input.id) else {
+            return Err(DeleteSecurityConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    // The not-found message form the recorded refusals of this service
+                    // show: `<Resource type> <id> doesn't exist.`, built from the
+                    // requested id.
+                    message: Some(format!(
+                        "Security Configuration {} doesn't exist.",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DeleteSecurityConfigurationOutput {
+            id: Some(record.id),
+        })
     }
 }

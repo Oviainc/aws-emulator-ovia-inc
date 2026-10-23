@@ -23,6 +23,9 @@
 //! 5. The store is bounded: at the emulator's retention cap the create is refused with
 //!    the modelled `ValidationException` rather than growing the store, and the refusal
 //!    leaves every stored record readable.
+//! 6. A delete removes the configuration from state: it answers the id it deleted, a
+//!    later describe of that id misses and is refused, and an id the store does not hold
+//!    is refused rather than reported as deleted.
 
 use std::collections::BTreeSet;
 
@@ -42,6 +45,12 @@ async fn create_configuration(emr: &Emr, body: Value) -> Answer {
 /// `GET /securityconfigurations/{id}` — `DescribeSecurityConfiguration`.
 async fn describe_configuration(emr: &Emr, id: &str) -> Answer {
     emr.send("GET", &format!("/securityconfigurations/{id}"), None)
+        .await
+}
+
+/// `DELETE /securityconfigurations/{id}` — `DeleteSecurityConfiguration`.
+async fn delete_configuration(emr: &Emr, id: &str) -> Answer {
+    emr.send("DELETE", &format!("/securityconfigurations/{id}"), None)
         .await
 }
 
@@ -237,17 +246,21 @@ async fn a_created_security_configuration_is_described_from_state() {
                 "case {label:?}: {member} did not round-trip through state, got {configuration}"
             );
         }
-        // `createdBy` names the identity that created the configuration. Nothing created
-        // this one but the emulator, so reporting a principal would be fabricating one.
-        assert!(
-            configuration.get("createdBy").is_none(),
-            "case {label:?}: createdBy must stay absent: {configuration}"
+        // `createdBy` names the identity that created the configuration: the caller
+        // principal this emulator authenticates every request as. Its own rule and its
+        // own table live in `crate::created_metadata_wire_form`.
+        assert_eq!(
+            configuration.get("createdBy").and_then(Value::as_str),
+            Some(state::caller_identity_arn().as_str()),
+            "case {label:?}: createdBy must name the caller principal: {configuration}"
         );
-        // `containerProvider` is not a member of the `SecurityConfiguration` shape, so a
-        // describe reports none even when the create carried one.
-        assert!(
-            configuration.get("containerProvider").is_none(),
-            "case {label:?}: containerProvider is not a SecurityConfiguration member: {configuration}"
+        // `containerProvider` is recorded behaviour rather than a modelled member, and
+        // the create-time value is echoed on read; `crate::created_metadata_wire_form`
+        // asserts that over the shapes a provider takes.
+        assert_eq!(
+            configuration.get("containerProvider").cloned(),
+            case.body.get("containerProvider").cloned(),
+            "case {label:?}: the create-time containerProvider must be echoed: {configuration}"
         );
 
         let created_at = instant_millis(&configuration, "/createdAt", label);
@@ -446,4 +459,136 @@ async fn security_configuration_creates_stop_at_the_retention_cap() {
             "case {case:?}: configuration {index} must still describe after the refused create"
         );
     }
+}
+
+/// RULE 6: `DeleteSecurityConfiguration` removes the configuration from state, so the
+/// delete is observable through the only thing that can observe it — the next read.
+///
+/// The rows differ along what the deleted configuration carried (which half of
+/// `securityConfigurationData`, whether it had a `containerProvider`, how many tags) and
+/// along the form of the id handed to a delete that must be refused: both `ResourceIdString`
+/// length bounds, an all-digit id, a plausible minted id, and the id of a configuration
+/// that was already deleted.
+#[tokio::test]
+async fn deleting_a_security_configuration_removes_it_from_state() {
+    let emr = Emr::new();
+    let cases = [
+        (
+            "only the required members",
+            json!({
+                "name": "del-minimal",
+                "clientToken": "sc-del-tok-minimal",
+                "securityConfigurationData": {},
+            }),
+        ),
+        (
+            "a container provider and tags",
+            json!({
+                "name": "del-provider",
+                "clientToken": "sc-del-tok-provider",
+                "containerProvider": {
+                    "id": "eks-del",
+                    "type": "EKS",
+                    "info": {"eksInfo": {"namespace": "emr-del"}},
+                },
+                "securityConfigurationData": {},
+                "tags": {"team": "data", "env": "test"},
+            }),
+        ),
+        (
+            "authentication configuration and no tags",
+            json!({
+                "name": "del-auth",
+                "clientToken": "sc-del-tok-auth",
+                "securityConfigurationData": {
+                    "authenticationConfiguration": {
+                        "iamConfiguration": {
+                            "systemRole": "arn:aws:iam::000000000000:role/EMRDelRole",
+                        },
+                    },
+                },
+            }),
+        ),
+    ];
+
+    // A configuration that is NOT deleted, so the delete is shown to remove one record
+    // rather than to empty the store.
+    let keeper = create_configuration(
+        &emr,
+        json!({
+            "name": "del-keeper",
+            "clientToken": "sc-del-tok-keeper",
+            "securityConfigurationData": {},
+        }),
+    )
+    .await;
+    let keeper = text(keeper.ok("the kept configuration"), "/id", "keeper");
+
+    let mut deleted = Vec::new();
+    for (label, body) in &cases {
+        let created = create_configuration(&emr, body.clone()).await;
+        let id = text(created.ok(label), "/id", label);
+        // It describes before the delete, so the refusal below is the delete's effect.
+        describe_configuration(&emr, &id).await.ok(label);
+
+        let answer = delete_configuration(&emr, &id).await;
+        assert_eq!(
+            text(answer.ok(label), "/id", label),
+            id,
+            "case {label:?}: DeleteSecurityConfiguration must answer the id it deleted"
+        );
+
+        describe_configuration(&emr, &id)
+            .await
+            .refused(label, 400, "ResourceNotFoundException");
+        deleted.push(id);
+    }
+
+    // The kept configuration is untouched by every delete above.
+    let kept = describe_configuration(&emr, &keeper).await;
+    assert_eq!(
+        text(
+            field(kept.ok("the kept configuration"), "/securityConfiguration", "keeper"),
+            "/id",
+            "keeper"
+        ),
+        keeper,
+        "a delete must remove only the configuration it names"
+    );
+
+    // An id the store does not hold is refused: this operation models no not-found error,
+    // so the modelled `ValidationException` is what refuses it — never a success naming an
+    // id nothing deleted.
+    let mut refusals: Vec<(String, String)> = vec![
+        ("a single-character id".to_string(), "a".to_string()),
+        (
+            "a plausible minted id".to_string(),
+            "doesnotexist1".to_string(),
+        ),
+        (
+            "an id at the 64-character bound".to_string(),
+            "z".repeat(64),
+        ),
+        ("an all-digit id".to_string(), "0123456789".to_string()),
+    ];
+    for id in &deleted {
+        refusals.push(("an already-deleted id".to_string(), id.clone()));
+    }
+    for (label, id) in &refusals {
+        delete_configuration(&emr, id)
+            .await
+            .refused(label, 400, "ValidationException");
+    }
+
+    // A `clientToken` whose configuration was deleted is free again: the create mints a
+    // new configuration rather than replaying the deleted one.
+    let reused = create_configuration(&emr, cases[0].1.clone()).await;
+    let reused = text(reused.ok("a token reused after the delete"), "/id", "reuse");
+    assert!(
+        !deleted.contains(&reused),
+        "a create after the delete must mint a new configuration, got the deleted {reused:?}"
+    );
+    describe_configuration(&emr, &reused)
+        .await
+        .ok("a token reused after the delete");
 }

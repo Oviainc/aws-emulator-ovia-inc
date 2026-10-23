@@ -21,7 +21,10 @@ pub struct CreateJobTemplateInput {
     pub kms_key_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emrcontainers#CreateJobTemplateResponse")]
+/// `createdAt` targets `Date` (`@timestampFormat("date-time")`), so this shape's schema
+/// comes from `emrc_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order
+/// and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.emrcontainers#CreateJobTemplateResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct CreateJobTemplateOutput {
     pub id: Option<String>,
@@ -29,4 +32,16 @@ pub struct CreateJobTemplateOutput {
     pub arn: Option<String>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
 }
+
+emrc_schema_and_codec!(
+    CreateJobTemplateOutput,
+    CREATE_JOB_TEMPLATE_OUTPUT_SCHEMA,
+    "com.amazonaws.emrcontainers#CreateJobTemplateResponse",
+    "com.amazonaws.emrcontainers",
+    "CreateJobTemplateResponse",
+    (M_ID, id, "id", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (M_ARN, arn, "arn", 2, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, opt, date_time),
+);
 

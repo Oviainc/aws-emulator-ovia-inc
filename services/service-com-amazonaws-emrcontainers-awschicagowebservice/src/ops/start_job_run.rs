@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !state.job_templates.contains_key(template_id) {
                 return Err(StartJobRunErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Job template {template_id} was not found")),
+                        message: Some(format!("Job Template {template_id} doesn't exist.")),
                     },
                 )
                 .into());
@@ -276,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_details: None,
             tags: input.tags.unwrap_or_default(),
             sequence,
+            // The principal this request authenticated as, recorded now so every later
+            // read of the run attributes it to the identity that submitted it.
+            created_by: crate::state::caller_identity_arn(),
             pending: Some(crate::state::PendingTransition::due(
                 crate::state::JOB_RUNNING,
             )),
