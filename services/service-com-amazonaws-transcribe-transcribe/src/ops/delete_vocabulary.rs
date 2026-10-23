@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVocabulary
-//! Deletes a stored custom vocabulary, refusing one that is still being processed
+//! Deletes a stored custom vocabulary, refusing one that is still being processed and
+//! answering the same empty success for a name this account holds no vocabulary under
 //! (see [`DeleteVocabulary::handle`]).
 //!
 //! ## Shape of an operation
@@ -184,46 +185,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // The clock-owed transition is materialised FIRST, so a vocabulary whose
         // processing was already due is deleted rather than refused for a state it had
-        // left.
-        let Some(record) = store.vocabulary_mut(&input.vocabulary_name, now) else {
-            // "This can occur when the entity you're trying to delete doesn't exist"
-            // (`BadRequestException`'s own documentation): a vocabulary this account
-            // does not hold is that error, not the modelled `NotFoundException`.
-            return Err(DeleteVocabularyErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::not_found_message(
-                        crate::state::KIND_VOCABULARY,
-                    )),
-                },
-            )
-            .into());
-        };
+        // left. The stored state is copied out of the lookup so the removal below does
+        // not hold the borrow the lookup took.
+        let stored_state = store
+            .vocabulary_mut(&input.vocabulary_name, now)
+            .map(|record| record.state.clone());
 
-        // "Your request didn't pass one or more validation tests. This can occur when
-        // the entity you're trying to delete doesn't exist or if it's in a non-terminal
-        // state (such as IN PROGRESS)" (`BadRequestException`'s own documentation): a
-        // resource the service is still processing is not deletable.
-        if record.state == crate::state::VOCABULARY_STATE_PENDING {
-            let name = record.name.clone();
-            return Err(DeleteVocabularyErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "The custom vocabulary {name} is in the {state} state and can't be \
-                         deleted. Wait until it is no longer being processed and try your \
-                         request again.",
-                        state = crate::state::VOCABULARY_STATE_PENDING,
-                    )),
-                },
-            )
-            .into());
+        match stored_state {
+            // "Your request didn't pass one or more validation tests. This can occur
+            // when the entity you're trying to delete doesn't exist or if it's in a
+            // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
+            // documentation): a resource the service is still processing is not
+            // deletable.
+            Some(vocabulary_state)
+                if vocabulary_state == crate::state::VOCABULARY_STATE_PENDING =>
+            {
+                return Err(DeleteVocabularyErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "The custom vocabulary {name} is in the {vocabulary_state} state \
+                             and can't be deleted. Wait until it is no longer being \
+                             processed and try your request again.",
+                            name = input.vocabulary_name,
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(_) => {
+                store.vocabularies.remove(&input.vocabulary_name);
+                ::tracing::info!(
+                    operation = "DeleteVocabulary",
+                    vocabulary = %input.vocabulary_name,
+                    "custom vocabulary deleted"
+                );
+            }
+            // A DELETE IS IDEMPOTENT: a name this account holds no vocabulary under
+            // leaves nothing to do, and the recorded wire response for such a request
+            // is this operation's ordinary empty success, not a failure — absence is
+            // the state the caller asked for. This is why the delete path does NOT take
+            // the service's absent-resource branch (`crate::state::not_found_message`
+            // over `BadRequestException`, which every READING operation here answers):
+            // a teardown that runs twice, or one that follows a create that never took,
+            // succeeds both times instead of leaking a failure.
+            None => {
+                ::tracing::info!(
+                    operation = "DeleteVocabulary",
+                    vocabulary = %input.vocabulary_name,
+                    "no custom vocabulary of that name; the delete is already satisfied"
+                );
+            }
         }
 
-        store.vocabularies.remove(&input.vocabulary_name);
-        ::tracing::info!(
-            operation = "DeleteVocabulary",
-            vocabulary = %input.vocabulary_name,
-            "custom vocabulary deleted"
-        );
         Ok(DeleteVocabularyOutput)
     }
 }

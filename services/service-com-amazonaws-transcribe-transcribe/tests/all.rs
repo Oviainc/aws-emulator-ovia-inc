@@ -23,3 +23,5 @@ mod state_roundtrip;
 mod transcription_jobs;
 #[path = "all/vocabularies.rs"]
 mod vocabularies;
+#[path = "all/vocabulary_delete_and_tag_sets.rs"]
+mod vocabulary_delete_and_tag_sets;
