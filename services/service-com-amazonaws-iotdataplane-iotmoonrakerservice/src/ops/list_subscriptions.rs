@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the topic filters the client's MQTT session subscribes to, in stable
+//! filter order, each with the QoS the subscription was taken at — read from the stored
+//! session (`crate::state::MqttSession`), so an offline client with a persistent session
+//! still lists its subscriptions.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A client id the broker holds no session for has no subscriptions to list, so it is a
+//! 404 `ResourceNotFoundException` — the same condition every operation of this family
+//! answers for a client that has never connected.
+//!
+//! `nextToken` is this service's own offset into that ordered list, the same token form
+//! `ListRetainedMessages` and `ListNamedShadowsForThing` continue a page with.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSubscriptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSubscriptionsErrorModeled::InternalFailureException(InternalFailureException::new(
+                "An unexpected error has occurred.",
+            ))
+        })?;
+
+        // `nextToken` is this service's own offset into the session's ordered topic
+        // filters, so a token that is not one is an invalid request rather than an empty
+        // page.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token.parse::<usize>().map_err(|_| {
+                ListSubscriptionsErrorModeled::InvalidRequestException(
+                    InvalidRequestException::new(format!("the nextToken '{token}' is not valid")),
+                )
+            })?,
+        };
+        // A request that names no `maxResults` gets the documented default page. A value
+        // outside the modelled range never reaches this handler — the framework refuses
+        // it against the model — so the clamp only pins the bound the model states.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::DEFAULT_SUBSCRIPTION_PAGE_SIZE, |max_results| {
+                max_results.clamp(1, crate::state::MAX_SUBSCRIPTION_PAGE_SIZE as i32) as usize
+            });
+
+        let mut guard = state.lock();
+        // Reporting only: listing a session's subscriptions neither takes nor adds one.
+        // The single write is the release of the sessions the clock has already retired.
+        let session = guard
+            .session(&input.client_id, crate::state::now_millis())
+            .ok_or_else(|| {
+                ListSubscriptionsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException::new(crate::state::CLIENT_NOT_FOUND),
+                )
+            })?;
+        let total = session.subscriptions.len();
+        let page: Vec<SubscriptionSummary> = session
+            .subscriptions
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|(topic_filter, qos)| SubscriptionSummary {
+                topic_filter: topic_filter.clone(),
+                qos: *qos,
+            })
+            .collect();
+        drop(guard);
+
+        // The token is the offset the NEXT page starts at, and is absent once this page
+        // reached the end of the list — which is what tells a paginating caller to stop.
+        let consumed = offset.saturating_add(page.len());
+        let next_token = (consumed < total).then(|| consumed.to_string());
+
+        Ok(ListSubscriptionsOutput {
+            subscriptions: Some(page),
+            next_token,
+        })
     }
 }

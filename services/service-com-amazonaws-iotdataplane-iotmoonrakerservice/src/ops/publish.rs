@@ -99,6 +99,10 @@
 //! * `InvalidRequestException` (HTTP 400) — The request is not valid.
 //! * `MethodNotAllowedException` (HTTP 405) — The specified combination of HTTP verb and URI
 //!   is not supported.
+//! * `RequestEntityTooLargeException` (HTTP 413) — widened in through `extra_errors` (see
+//!   below): the payload exceeds the maximum size allowed. The SERVICE models the shape
+//!   (`SendDirectMessage`, `UpdateThingShadow`); this operation's `errors` list omits it,
+//!   while the broker answers an over-size message payload with it.
 //! * `ThrottlingException` (HTTP 429) — The rate exceeds the limit.
 //! * `UnauthorizedException` (HTTP 401) — You are not authorized to perform this operation.
 
@@ -204,12 +208,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PublishOutput {
 // here — hence the `PublishError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotdataplane#Publish")]
+//
+// `RequestEntityTooLargeException` is widened in through `extra_errors`: this SERVICE
+// models the shape (`SendDirectMessage` and `UpdateThingShadow` both list it, with
+// `httpError` 413) and the broker answers an over-size message payload with it, but this
+// operation's own `errors` list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotdataplane#Publish",
+    extra_errors = ["RequestEntityTooLargeException"]
+)]
 #[derive(Debug)]
 pub enum PublishErrorModeled {
     InternalFailureException(InternalFailureException),
     InvalidRequestException(InvalidRequestException),
     MethodNotAllowedException(MethodNotAllowedException),
+    RequestEntityTooLargeException(RequestEntityTooLargeException),
     ThrottlingException(ThrottlingException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -283,33 +296,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a
-        // PUBLISH topic: a topic carrying one is a topic FILTER, which only a
-        // subscription may be — which is exactly what the service's rejection says.
-        if input.topic.contains('+') || input.topic.contains('#') {
+        // PUBLISH topic, and the broker bounds both how many levels a topic name
+        // carries and how long it is. Each condition has its own message naming its own
+        // limit — see `crate::state::topic_name_refusal`, which is the one place that
+        // rule lives.
+        if let Some(refusal) = crate::state::topic_name_refusal(&input.topic) {
             return Err(PublishErrorModeled::InvalidRequestException(
-                InvalidRequestException::new(crate::state::INVALID_TOPIC_FILTER),
-            )
-            .into());
-        }
-
-        // A topic name is a path of levels separated by `/`, and the broker bounds how
-        // many levels one carries.
-        if input.topic.split('/').count() > crate::state::MAX_TOPIC_PARTS {
-            return Err(PublishErrorModeled::InvalidRequestException(
-                InvalidRequestException::new(crate::state::too_many_topic_parts(
-                    crate::state::MAX_TOPIC_PARTS,
-                )),
+                InvalidRequestException::new(refusal),
             )
             .into());
         }
 
         let payload = input.payload.unwrap_or_default();
         if payload.len() > crate::state::MAX_PUBLISH_PAYLOAD_BYTES {
-            return Err(PublishErrorModeled::InvalidRequestException(
-                InvalidRequestException::new(format!(
-                    "the payload is {} bytes; the maximum message payload size is {} bytes",
+            // The payload is too large for the broker to take, which is a 413 and not a
+            // malformed request: the caller has to split or shrink the message.
+            return Err(PublishErrorModeled::RequestEntityTooLargeException(
+                RequestEntityTooLargeException::new(crate::state::payload_too_large(
                     payload.len(),
-                    crate::state::MAX_PUBLISH_PAYLOAD_BYTES
+                    crate::state::MAX_PUBLISH_PAYLOAD_BYTES,
                 )),
             )
             .into());

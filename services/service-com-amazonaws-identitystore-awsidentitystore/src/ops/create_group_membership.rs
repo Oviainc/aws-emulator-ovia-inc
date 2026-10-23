@@ -172,8 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Who is creating this membership: recorded as its `CreatedBy`, which a later
+        // `ListGroupMemberships` reports.
+        let created_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateGroupMembershipErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the identity store is unavailable".to_string()),
@@ -181,17 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // The store is looked up rather than vivified: this operation needs an existing
-        // group, so a store that holds nothing cannot satisfy it, and a failed create
-        // must not leave an identity store behind as a side effect.
-        let store_key = crate::state::identity_store_key(&input.identity_store_id);
+        // The identity store the request names must exist; one that does not is refused
+        // rather than vivified by a create that names it.
         let group_not_found = || {
             CreateGroupMembershipErrorModeled::ResourceNotFoundException(crate::state::not_found(
                 crate::state::ResourceKind::Group,
                 &input.group_id,
             ))
         };
-        let store = state.stores.get_mut(&store_key).ok_or_else(group_not_found)?;
+        let store = state
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(CreateGroupMembershipErrorModeled::ResourceNotFoundException)?;
 
         // Both ends of the membership must already exist in this identity store. The
         // modelled `MemberId` union declares exactly one variant, `UserId`, so the
@@ -256,6 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             member_user_id: member_key,
             created_at: now,
             updated_at: now,
+            created_by: Some(created_by),
+            updated_by: None,
         };
 
         let output = CreateGroupMembershipOutput {

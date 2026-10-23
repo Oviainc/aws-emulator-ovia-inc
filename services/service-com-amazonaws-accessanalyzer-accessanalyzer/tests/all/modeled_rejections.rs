@@ -89,8 +89,8 @@ async fn create_service_linked_analyzer_is_denied_to_a_customer_caller() {
                 .get("message")
                 .and_then(Value::as_str)
                 .is_some_and(|message| !message.is_empty()),
-            "case {case:?}: AccessDeniedException's required message must say who was \
-             refused, got {:?}",
+            "case {case:?}: AccessDeniedException's required message must say that the \
+             caller is not authorized, got {:?}",
             reply.body
         );
         assert!(

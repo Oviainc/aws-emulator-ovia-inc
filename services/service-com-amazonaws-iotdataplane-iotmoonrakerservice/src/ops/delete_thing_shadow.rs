@@ -5,6 +5,11 @@
 //! acknowledgement: the `version` the document had when it was deleted, and the
 //! `timestamp` of the deletion. Deleting a shadow that is not stored is a 404.
 //!
+//! The document goes; the shadow name's VERSION COUNTER does not. The delete consumes
+//! one version of its own, so the next update of the same shadow name resumes above the
+//! deleted document and a write conditioned on a pre-delete version still conflicts —
+//! see `crate::state::ShadowSlot`.
+//!
 //! The acknowledgement is the whole response body (the `@httpPayload` `JsonDocument`
 //! blob) and is announced `content-type: application/json` — see the media-type note
 //! in `crate::service`, which decides that for every operation that answers with one.
@@ -162,8 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
         let mut guard = state.lock();
-        let deleted = guard.shadows.remove(&key).ok_or_else(|| {
-            DeleteThingShadowErrorModeled::ResourceNotFoundException(
+        // Only a shadow name that STORES a document can be deleted; one whose document
+        // is already gone is not found, even though its slot still holds the counter.
+        if guard.stored_shadow(&key).is_none() {
+            return Err(DeleteThingShadowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException::new(crate::state::no_shadow_exists(
                     crate::state::addressed_shadow_name(
                         &input.thing_name,
@@ -171,16 +178,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )),
             )
-        })?;
+            .into());
+        }
+        let slot = guard.shadows.entry(key).or_default();
+        // The version the document had when it was deleted, which the acknowledgement
+        // reports…
+        let deleted_version = slot.version;
+        // …and the version the DELETE itself consumes. The counter outlives the
+        // document, so the next update of this shadow name resumes above the delete
+        // rather than starting again at 1, and a write conditioned on a pre-delete
+        // version still conflicts afterwards.
+        slot.consume_version();
+        slot.document = None;
         drop(guard);
 
         // The deletion acknowledgement names the version that was deleted and when the
-        // deletion was accepted. The document is gone, so a later update of the same
-        // shadow starts again at version 1.
+        // deletion was accepted.
         let mut acknowledgement = ::serde_json::Map::new();
         acknowledgement.insert(
             "version".to_string(),
-            ::serde_json::Value::from(deleted.version),
+            ::serde_json::Value::from(deleted_version),
         );
         acknowledgement.insert(
             "timestamp".to_string(),

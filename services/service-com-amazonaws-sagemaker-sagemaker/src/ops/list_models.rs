@@ -214,10 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let resumed_after = crate::state::decode_page_token(token)
                     .and_then(|name| matching.iter().position(|model| model.name == name))
                     .ok_or_else(|| {
-                        crate::scaffolded::Scaffolded::validation(
-                            "NextToken does not name a page boundary of this result set; \
-                             restart the listing without it.",
-                        )
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
                     })?;
                 resumed_after + 1
             }

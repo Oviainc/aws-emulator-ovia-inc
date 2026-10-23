@@ -20,9 +20,8 @@
 
 use serde_json::{json, Value};
 
-use super::identity_store_lifecycle::{
-    assert_resource_arn, emulator, ok, refused, string, OTHER_STORE, STORE,
-};
+use crate::harness::{emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::assert_resource_arn;
 
 /// The upper bound of the `@length` both group text attributes carry: `DisplayName`
 /// targets `GroupDisplayName` and `Description` targets `SensitiveStringType`, each
@@ -604,11 +603,10 @@ async fn an_operation_this_api_cannot_apply_is_refused_and_changes_nothing() {
 async fn a_display_name_stays_a_uniqueness_claim_within_one_identity_store() {
     let router = emulator();
     let case = "a name another group of this store holds";
-    // Two groups in one store, plus one in another store holding the same name.
+    // Two groups in one store: one holding the name, one to be renamed onto it.
     let held = "the held display name";
     let taken = create(&router, STORE, held, case).await;
     let group = create(&router, STORE, "the group being renamed", case).await;
-    let elsewhere = create(&router, OTHER_STORE, "a name held elsewhere", case).await;
 
     // A name another group of this store holds conflicts.
     refused(
@@ -645,28 +643,21 @@ async fn a_display_name_stays_a_uniqueness_claim_within_one_identity_store() {
         case,
     );
 
-    // A claim is scoped to one identity store, so a name held in another is free.
-    let case = "a name held in a different identity store";
+    // A claim is scoped to one identity store, and a name nothing in this store holds
+    // is free.
+    let case = "a name no group of this store holds";
     ok(
         &router,
         "UpdateGroup",
-        rename(STORE, &group.group_id, "a name held elsewhere"),
+        rename(STORE, &group.group_id, "a name held nowhere"),
         case,
     )
     .await;
-    // The rename was applied here …
+    // The rename was applied.
     let reported = describe(&router, STORE, &group.group_id, case).await;
     assert_attributes(
         &reported,
-        Some("a name held elsewhere"),
-        Some(CREATED_DESCRIPTION),
-        case,
-    );
-    // … and the group of the other store that holds the same name is untouched.
-    let reported = describe(&router, OTHER_STORE, &elsewhere.group_id, case).await;
-    assert_attributes(
-        &reported,
-        Some("a name held elsewhere"),
+        Some("a name held nowhere"),
         Some(CREATED_DESCRIPTION),
         case,
     );
@@ -728,18 +719,18 @@ async fn the_group_an_update_names_must_exist_in_the_store_it_names() {
 
     let missing: [(&str, &str, String); 3] = [
         (
-            "a group id no store holds",
+            "a group id the store does not hold",
             STORE,
             ABSENT_GROUP_ID.to_string(),
         ),
         (
-            "an identity store nothing was ever created in",
+            "an identity store that does not exist",
             ABSENT_STORE,
             group.group_id.clone(),
         ),
         (
-            "a group of another identity store",
-            OTHER_STORE,
+            "another identity store that does not exist",
+            MISSING_STORE,
             group.group_id.clone(),
         ),
     ];

@@ -13,22 +13,37 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ::aws_smithy_types::Document;
+
 use crate::ops::types::{
     Address, ConflictException, Email, ExternalId, GroupMembership, MemberId, Name, PhoneNumber,
     Photo, ResourceNotFoundException, Role, ServiceQuotaExceededException,
 };
 
-/// The number of identity stores this emulator will hold at once.
+/// The one identity store that EXISTS in this emulator: the store IAM Identity Center
+/// provisioned for the instance `sso-admin` seeds.
 ///
-/// `IdentityStoreId` is a free-form request member and a store springs into being the
-/// first time a mutating operation names one (see
-/// [`ComAmazonawsIdentitystoreAwsidentitystoreState::try_store_mut`]), so without a cap
-/// a caller could multiply the per-request allocation by naming a fresh store every
-/// time. AWS publishes no figure for how many identity stores an account reaches, so
-/// the number itself is CHOSEN: its purpose is that the store map cannot grow without
-/// bound, and that the bound is reached through the modelled
-/// `ServiceQuotaExceededException` rather than by exhausting memory.
-pub const MAX_IDENTITY_STORES: usize = 16;
+/// This API models no operation that creates an identity store — in AWS one comes with
+/// an IAM Identity Center instance — so the set of stores is fixed at the deployment
+/// the emulator presents, and an `IdentityStoreId` naming anything else names no store.
+///
+/// The VALUE is the identity store of the instance `sso-admin` seeds, which its
+/// `InstanceMetadata$IdentityStoreId` reports to a client
+/// (`service_com_amazonaws_ssoadmin_swbexternalservice::state::SEED_IDENTITY_STORE_ID`,
+/// whose doc points back here). The two services hold separate state, so the id that
+/// joins them has to stay equal: a client reads it out of `ListInstances` there and then
+/// addresses this service with it, and a drifted value would make every such call answer
+/// `ResourceNotFoundException`. The form is `d-` + 10 hexadecimal digits, which both that
+/// member (`^[a-zA-Z0-9-]*$`, 1..64) and this service's own `IdentityStoreId` pattern
+/// accept, and which keeps the store's ARN inside its modelled 62..93 length.
+pub const SEED_IDENTITY_STORE_ID: &str = "d-9067f3a1c2";
+
+/// The `UserStatus` of a user created through this API: the modelled enum is
+/// `ENABLED | DISABLED` (`smithy_query(query="shape",shape="UserStatus")`) and
+/// `CreateUser` models no `UserStatus` member, so a user this API creates is usable —
+/// `ENABLED` — from the moment it exists. An `UpdateUser` naming the `userStatus`
+/// attribute moves it from there.
+pub const USER_STATUS_ENABLED: &str = "ENABLED";
 
 /// The number of users one identity store will hold.
 ///
@@ -165,13 +180,30 @@ pub fn identity_store_arn(identity_store_id: &str) -> String {
     )
 }
 
-/// The store key an `IdentityStoreId` member names.
+/// The store key an `IdentityStoreId` member names, or `None` when the identifier can
+/// name no store this emulator holds.
 ///
 /// The modelled pattern admits both the bare id (`d-0123456789`) and the store's ARN
 /// (`arn:aws:identitystore::<account>:identitystore/d-0123456789`), and both name the
 /// same store, so the ARN form is reduced to the id it ends with.
-pub fn identity_store_key(identifier: &str) -> String {
-    bare_id(identifier)
+///
+/// An ARN also carries the OWNING ACCOUNT, and the modelled pattern admits any 12-digit
+/// one: an ARN naming another account names that account's identity store, which is not
+/// one this emulator holds however the id ends, so there is no key to look up and the
+/// caller gets the same refusal as for any other store that does not exist.
+pub fn identity_store_key(identifier: &str) -> Option<String> {
+    if identifier.starts_with("arn:") && !names_this_account(identifier) {
+        return None;
+    }
+    Some(bare_id(identifier))
+}
+
+/// Whether an ARN's account field (the fifth `:`-separated field) is the emulator's own
+/// account.
+fn names_this_account(arn: &str) -> bool {
+    arn.split(':')
+        .nth(4)
+        .is_some_and(|account| account == ::engine::emulator_account_id())
 }
 
 /// The resource key a `ResourceId` member (`UserId`, `GroupId`, `MembershipId`,
@@ -217,10 +249,11 @@ pub struct User {
     pub preferred_language: Option<String>,
     pub locale: Option<String>,
     pub timezone: Option<String>,
-    /// `UserStatus` is reported only once something sets it. `CreateUser` models no
-    /// `UserStatus` member, so a freshly created user has none and the response omits
-    /// it rather than inventing `ENABLED`.
-    pub user_status: Option<String>,
+    /// The user's `UserStatus`. Every stored user has one — a created user is
+    /// [`USER_STATUS_ENABLED`] — so a describe reports it rather than omitting a
+    /// modelled member a caller gates provisioning on; an `UpdateUser` naming the
+    /// `userStatus` attribute changes it.
+    pub user_status: String,
     pub photos: Vec<Photo>,
     pub website: Option<String>,
     pub birthdate: Option<String>,
@@ -231,10 +264,10 @@ pub struct User {
     pub extensions: HashMap<String, ::aws_smithy_types::Document>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// The identity that created / last updated the record. The emulator does not
-    /// resolve a caller to an identity-store principal, so these stay `None` rather
-    /// than carrying a fabricated or credential-derived value; the members are
-    /// optional in the model.
+    /// The principal that created this user and the one that last updated it, as
+    /// [`caller_principal`] derives them from the CALLER's own credentials. `updated_by`
+    /// is set by an update, so a record nobody has changed since it was created carries
+    /// none.
     pub created_by: Option<String>,
     pub updated_by: Option<String>,
 }
@@ -299,7 +332,7 @@ impl User {
             preferred_language: self.preferred_language.clone(),
             locale: self.locale.clone(),
             timezone: self.timezone.clone(),
-            user_status: self.user_status.clone(),
+            user_status: Some(self.user_status.clone()),
             photos: modeled_list(&self.photos),
             website: self.website.clone(),
             birthdate: self.birthdate.clone(),
@@ -348,6 +381,7 @@ pub struct Group {
     pub external_ids: Vec<ExternalId>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// The creating / last-updating principal, exactly as on [`User`].
     pub created_by: Option<String>,
     pub updated_by: Option<String>,
 }
@@ -356,6 +390,18 @@ impl Group {
     /// The stored revision as the modelled `ResourceRevision` (pattern `^[0-9]+$`).
     pub fn revision(&self) -> String {
         self.revision.to_string()
+    }
+
+    /// Record that this group was modified at `at`: the next revision, and the new
+    /// `UpdatedAt` — the same bump [`User::record_update`] makes, so both resources
+    /// move their revision through one implementation.
+    ///
+    /// `Group$Revision` is "the current revision of the group in the identity store.
+    /// This value changes each time the group is modified", so every successful update
+    /// moves it on.
+    pub fn record_update(&mut self, at: SystemTime) {
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = at;
     }
 
     /// This record as the modelled `Group` a list reports.
@@ -407,6 +453,10 @@ pub struct GroupMembershipRecord {
     pub member_user_id: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+    /// The creating / last-updating principal, exactly as on [`User`]. A membership has
+    /// no modelled update operation, so `updated_by` stays `None` until one exists.
+    pub created_by: Option<String>,
+    pub updated_by: Option<String>,
 }
 
 impl GroupMembershipRecord {
@@ -425,8 +475,8 @@ impl GroupMembershipRecord {
             member_id: Some(self.modeled_member_id()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
-            created_by: None,
-            updated_by: None,
+            created_by: self.created_by.clone(),
+            updated_by: self.updated_by.clone(),
         }
     }
 }
@@ -710,49 +760,77 @@ impl IdentityStoreData {
 }
 
 /// Per-service state for com-amazonaws-identitystore-awsidentitystore. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsIdentitystoreAwsidentitystoreState {
-    /// Every identity store, keyed by its `IdentityStoreId`.
+    /// Every identity store, keyed by its `IdentityStoreId`. Seeded with the one store
+    /// IAM Identity Center provisioned ([`SEED_IDENTITY_STORE_ID`]) and never added to:
+    /// no modelled operation of this API creates an identity store.
     pub stores: HashMap<String, IdentityStoreData>,
 }
 
+impl Default for ComAmazonawsIdentitystoreAwsidentitystoreState {
+    /// Seeds the one identity store that exists, so the very first call of a process
+    /// finds the store `sso-admin`'s `ListInstances` points a client at and no handler
+    /// has to write on a read to create one.
+    ///
+    /// The map is keyed by `IdentityStoreId`, so everything a store holds is already
+    /// scoped to it: were IAM Identity Center to provision a second identity store
+    /// here (a second seeded instance in `sso-admin`), it would be one more entry
+    /// inserted here and nothing else would change.
+    fn default() -> Self {
+        let mut stores = HashMap::new();
+        stores.insert(
+            SEED_IDENTITY_STORE_ID.to_string(),
+            IdentityStoreData::new(SEED_IDENTITY_STORE_ID.to_string()),
+        );
+        Self { stores }
+    }
+}
+
 impl ComAmazonawsIdentitystoreAwsidentitystoreState {
-    /// The store `identifier` names, created empty on first use; `None` when it does
-    /// not exist and [`MAX_IDENTITY_STORES`] are already held.
+    /// The store `identifier` names, or the modelled `ResourceNotFoundException` when it
+    /// names no existing identity store.
     ///
-    /// This API models no operation that creates an identity store — in AWS one comes
-    /// with an IAM Identity Center instance — so a client has no provisioning call to
-    /// make and a store springs into being the first time a mutating operation names
-    /// it. `IdentityStoreId` is caller-chosen, so that vivification is CAPPED: past
-    /// the cap a create is refused with the modelled quota error instead of allocating
-    /// store number N+1. Reporting operations use [`Self::store`] instead, so a read
-    /// never conjures one.
-    pub fn try_store_mut(&mut self, identifier: &str) -> Option<&mut IdentityStoreData> {
-        let key = identity_store_key(identifier);
-        if !self.stores.contains_key(&key) && self.stores.len() >= MAX_IDENTITY_STORES {
-            return None;
+    /// Every operation of this API takes an `IdentityStoreId`, and the id is
+    /// CALLER-CHOSEN: a well-formed one that names no store (a typo, a stale id, another
+    /// account's) must be refused rather than answered, and a store is never brought
+    /// into being by naming it. This is the one place that resolution happens, so a
+    /// write cannot gate differently from a read.
+    pub fn resolve_store(
+        &self,
+        identifier: &str,
+    ) -> Result<&IdentityStoreData, ResourceNotFoundException> {
+        self.store(identifier)
+            .ok_or_else(|| identity_store_not_found(identifier))
+    }
+
+    /// [`Self::resolve_store`] for a mutating operation.
+    ///
+    /// Every caller resolves the store the same way and every one of them reports a
+    /// store that does not exist: `@idempotent` covers the RESOURCE a delete names —
+    /// `DeleteGroup` answers its empty success for a group that is already gone,
+    /// because the post-condition it promises already holds — but not the identity
+    /// store the request is addressed to, which is a deployment the caller named and
+    /// that is not there. No caller vivifies a store.
+    pub fn resolve_store_mut(
+        &mut self,
+        identifier: &str,
+    ) -> Result<&mut IdentityStoreData, ResourceNotFoundException> {
+        match self.store_mut(identifier) {
+            Some(store) => Ok(store),
+            None => Err(identity_store_not_found(identifier)),
         }
-        Some(
-            self.stores
-                .entry(key.clone())
-                .or_insert_with(|| IdentityStoreData::new(key)),
-        )
     }
 
-    /// The store `identifier` names, or `None` when none was ever created.
+    /// The store `identifier` names, or `None` when no such store exists.
     pub fn store(&self, identifier: &str) -> Option<&IdentityStoreData> {
-        self.stores.get(&identity_store_key(identifier))
+        self.stores.get(&identity_store_key(identifier)?)
     }
 
-    /// The store `identifier` names, for writing, or `None` when none was ever
-    /// created.
-    ///
-    /// Unlike [`Self::try_store_mut`] this NEVER brings a store into being: an
-    /// operation that changes or removes an existing resource has nothing to change in
-    /// a store that holds none, so it answers `ResourceNotFoundException` instead of
-    /// vivifying an empty store the caller never had.
-    pub fn store_mut(&mut self, identifier: &str) -> Option<&mut IdentityStoreData> {
-        self.stores.get_mut(&identity_store_key(identifier))
+    /// [`Self::store`] for a mutating caller, so both resolution paths read the
+    /// identifier the same way.
+    fn store_mut(&mut self, identifier: &str) -> Option<&mut IdentityStoreData> {
+        self.stores.get_mut(&identity_store_key(identifier)?)
     }
 }
 
@@ -764,13 +842,17 @@ pub fn modeled_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
 }
 
+/// The fixed message [`identity_store_not_found`] carries, so a handler and a test
+/// name one text.
+pub const IDENTITY_STORE_NOT_FOUND_MESSAGE: &str = "Identity store not found";
+
 /// The `ResourceNotFoundException` for an identity store this emulator does not hold.
 ///
-/// A store springs into being on its first mutating call (see
-/// [`ComAmazonawsIdentitystoreAwsidentitystoreState::try_store_mut`]),
-/// so an identifier no create has ever named holds nothing at all — and a reporting
-/// operation says so with the modelled 404 rather than vivifying one. `IDENTITY_STORE`
-/// is the `ResourceType` value for this kind (`RESOURCE_TYPE_VALUES`).
+/// The set of identity stores is fixed at the deployment the emulator presents (see
+/// [`SEED_IDENTITY_STORE_ID`]), so an identifier that names none of them names no
+/// store at all — and every operation says so with the modelled 404 rather than
+/// bringing one into being. `IDENTITY_STORE` is the `ResourceType` value for this kind
+/// (`RESOURCE_TYPE_VALUES`).
 ///
 /// The MESSAGE is this class's constant, like every other not-found message this service
 /// states: it carries nothing of the request, so it neither varies per call nor
@@ -780,9 +862,9 @@ pub fn modeled_list<T: Clone>(items: &[T]) -> Option<Vec<T>> {
 pub fn identity_store_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         resource_type: Some("IDENTITY_STORE".to_string()),
-        resource_id: Some(identity_store_key(identifier)),
+        resource_id: identity_store_key(identifier),
         reason: None,
-        message: Some("Identity store not found".to_string()),
+        message: Some(IDENTITY_STORE_NOT_FOUND_MESSAGE.to_string()),
         request_id: None,
     }
 }
@@ -912,20 +994,6 @@ pub fn uniqueness_conflict(claim: UniquenessClaim) -> ConflictException {
     }
 }
 
-/// The `ConflictException` for a conditional request whose `Revision` precondition no
-/// longer holds: the caller's expected revision is not the one the store carries, so
-/// something else changed the resource first.
-///
-/// `reason` is the modelled `ConflictExceptionReason` value for exactly that case
-/// (`CONFLICT_EXCEPTION_REASON_VALUES`).
-pub fn concurrent_modification(message: String) -> ConflictException {
-    ConflictException {
-        message: Some(message),
-        request_id: None,
-        reason: Some("CONCURRENT_MODIFICATION".to_string()),
-    }
-}
-
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would
 /// pass one of this emulator's capacity bounds: `subject` says which bound and what is
 /// already held.
@@ -935,6 +1003,109 @@ pub fn quota_exceeded(subject: String) -> ServiceQuotaExceededException {
             "the request would exceed the maximum this emulator holds: {subject}"
         )),
         request_id: None,
+    }
+}
+
+/// The modelled `ConflictException` for an update whose `Revision` precondition does
+/// not hold.
+///
+/// `Revision` is documented as "the expected current revision … the update is applied
+/// only if it matches the current revision … If the value doesn't match, the operation
+/// fails with a `ConflictException`" (`UpdateUser$Revision`,
+/// `smithy_query(query="doc",shape="UpdateUserRequest",member="Revision")`), and
+/// `CONCURRENT_MODIFICATION` is the modelled `ConflictExceptionReason` for that case.
+pub fn revision_conflict(expected: &str, stored: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "the request expected revision {expected} but the resource is at revision {stored}"
+        )),
+        request_id: None,
+        reason: Some("CONCURRENT_MODIFICATION".to_string()),
+    }
+}
+
+/// The principal that made this call, as the `CreatedBy` / `UpdatedBy` of what it
+/// writes.
+///
+/// Derived from the CALLER's own identity — the access key id its SigV4 credential
+/// scope names — and never from the request body, so two different callers creating the
+/// same resource are recorded as different principals. The emulator resolves no
+/// identity-store principal for a caller, so the value is the caller's IAM identity,
+/// which is what an audit consumer reads here.
+///
+/// An unsigned request has no access key id to read, and the framework's
+/// [`::engine::extract_akid`] answers its own fallback for one rather than an empty
+/// string, so the principal is a whole ARN whoever the caller is.
+pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let akid = ::engine::extract_akid(&ctx.parts().headers);
+    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+}
+
+// ---------------------------------------------------------------------------
+// `AttributeOperation` support, shared by `UpdateUser` and `UpdateGroup`.
+//
+// Both operations take `Operations: [{AttributePath, AttributeValue}]` and apply them
+// to one stored resource, so the refusal AWS builds from a path and the `AttributeValue`
+// text reader live here once; which paths each resource ACCEPTS, and how it names its
+// own attributes, is that operation's own table.
+// ---------------------------------------------------------------------------
+
+/// The message AWS answers an `AttributePath` an update cannot change with: an
+/// identifier, a service-generated value, or an attribute the resource does not have.
+///
+/// Built from the requested path, which is the rule AWS states for it — so this is the
+/// ONE place the text lives, for both update operations.
+pub fn unsupported_attribute_path_message(path: &str) -> String {
+    format!("Updates for AttributePath: {path} is not supported")
+}
+
+/// Which JSON type a document carries, for a refusal that says what arrived.
+pub fn attribute_value_kind(value: &Document) -> &'static str {
+    match value {
+        Document::Object(_) => "an object",
+        Document::Array(_) => "an array",
+        Document::Number(_) => "a number",
+        Document::String(_) => "a string",
+        Document::Bool(_) => "a boolean",
+        Document::Null => "null",
+    }
+}
+
+/// The new value of a STRING attribute an `AttributeOperation` sets: `None` when the
+/// operation REMOVES it (an absent `AttributeValue` or an explicit JSON `null`),
+/// otherwise the text it carries.
+///
+/// `max_len` is the modelled length of the member being set, and the model gives every
+/// one of them a minimum of 1, so an empty string is refused rather than quietly meaning
+/// "remove" — an operation that removes carries no value at all.
+///
+/// This is the reader `UpdateUser`'s decoders read every string attribute through, so
+/// one modelled constraint has one refusal there. `UpdateGroup` reads its two string
+/// attributes through the FRAMEWORK's own constraint walk over their member schemas
+/// instead (`crate::ops::update_group::attribute_value`), so its clause, bound and
+/// violation cap are the framework's; it shares the removal rule and the
+/// unsupported-path message with this module, not the length check.
+pub fn attribute_text_value(
+    value: Option<&Document>,
+    path: &str,
+    max_len: usize,
+) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Document::Null) => Ok(None),
+        Some(Document::String(text)) => {
+            let length = text.chars().count();
+            if !(1..=max_len).contains(&length) {
+                return Err(format!(
+                    "the AttributeValue for {path} is {length} characters long, \
+                     outside the 1..{max_len} the model allows"
+                ));
+            }
+            Ok(Some(text.clone()))
+        }
+        Some(other) => Err(format!(
+            "the AttributeValue for {path} must be a string, got {}",
+            attribute_value_kind(other)
+        )),
     }
 }
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one stored job — its `Id`, `Arn`, `Type`, `State`, details,
+//! asset configuration, errors and timestamps — exactly as state holds it, and
+//! answers 404 for a well-formed `JobId` that names none. A reporting operation: it
+//! writes nothing. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetJobErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `JobId` is `@httpLabel` with pattern ^[a-zA-Z0-9]{30,40}$, so an id of the
+        // wrong shape was already refused as a 400 ValidationException before this
+        // handler ran; reaching here, the id is well-formed but may name nothing.
+        // This operation is `@readonly`, so it only reads the record out of state.
+        let stored = state.lock().jobs.get(&input.job_id).cloned();
+        let Some(stored) = stored else {
+            return Err(GetJobErrorModeled::ResourceNotFoundException(
+                crate::state::job_not_found(&input.job_id),
+            )
+            .into());
+        };
+
+        Ok(GetJobOutput {
+            arn: Some(stored.arn),
+            asset_configuration: stored.asset_configuration,
+            created_at: Some(stored.created_at),
+            details: Some(stored.details),
+            errors: (!stored.errors.is_empty()).then_some(stored.errors),
+            id: Some(stored.id),
+            state: Some(stored.state),
+            r#type: Some(stored.r#type),
+            updated_at: Some(stored.updated_at),
+        })
     }
 }
