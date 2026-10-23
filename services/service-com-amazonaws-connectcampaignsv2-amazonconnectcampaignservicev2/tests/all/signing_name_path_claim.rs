@@ -337,6 +337,26 @@ async fn a_peer_route_never_reaches_this_service_while_its_own_route_is_served()
         }
     });
 
+    // A campaign belongs to a Connect instance onboarded to Campaigns, so the
+    // instance is onboarded first and the span the clock owes its job waited out;
+    // onboarding stores no campaign, which the ListCampaigns assertions below rely on.
+    let (status, payload) = call(
+        &router,
+        "PUT",
+        "/v2/connect-instance/instance-1/onboarding",
+        Some(&serde_json::json!({"encryptionConfig": {"enabled": false}})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected the instance to be onboarded, got {status} {payload}"
+    );
+    tokio::time::sleep(
+        service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION
+            + std::time::Duration::from_millis(100),
+    )
+    .await;
+
     // The peer API version's create route, carrying the signing name the two versions
     // share. This service must not claim it, so nothing reaches its store.
     let (status, payload) = call(&router, "PUT", "/campaigns", Some(&create_body)).await;

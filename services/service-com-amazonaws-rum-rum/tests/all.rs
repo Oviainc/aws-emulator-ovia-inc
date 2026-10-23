@@ -27,6 +27,8 @@ mod metrics_destination_removal;
 mod metrics_destinations;
 #[path = "all/not_found_and_conflict_bodies.rs"]
 mod not_found_and_conflict_bodies;
+#[path = "all/platform_domain_authority.rs"]
+mod platform_domain_authority;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tagging.rs"]

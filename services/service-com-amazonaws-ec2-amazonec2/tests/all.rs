@@ -52,6 +52,10 @@ mod dry_run_and_unknown_ids;
 // The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
+// The ec2Query response envelope: the success flag and the media type every response
+// carries, whichever operation answered.
+#[path = "all/ec2_query_envelope.rs"]
+mod ec2_query_envelope;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]

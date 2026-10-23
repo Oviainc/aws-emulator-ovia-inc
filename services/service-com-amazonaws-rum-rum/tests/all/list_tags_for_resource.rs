@@ -293,7 +293,7 @@ async fn reading_the_tags_changes_nothing_a_later_caller_sees() {
     );
     assert_eq!(
         monitor["State"].as_str(),
-        Some("ACTIVE"),
+        Some(service_com_amazonaws_rum_rum::state::CREATED_STATE),
         "case \"after the reads\": a read must not move the resource's state, got {:?}",
         monitor["State"]
     );

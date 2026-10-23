@@ -14,13 +14,13 @@ use std::sync::Arc;
 
 /// The region every request below is signed for; the ARNs and DNS names the service
 /// mints belong to it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The API version every awsQuery request carries, from the model's service version.
 const VERSION: &str = "2015-12-01";
 
 /// The canonical account id every emulator ARN carries.
-fn account() -> &'static str {
+pub(crate) fn account() -> &'static str {
     emulator_server::emulator_account_id()
 }
 
@@ -39,20 +39,20 @@ fn router() -> MultiServiceRouter {
 }
 
 /// One answer from the emulator.
-struct Reply {
-    status: u16,
-    body: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Reply {
     /// The text of the first element named `tag`, or `None` when it is absent or
     /// empty.
-    fn text(&self, tag: &str) -> Option<String> {
+    pub(crate) fn text(&self, tag: &str) -> Option<String> {
         first_text(&self.body, tag)
     }
 
     /// The `<Code>` of an awsQuery error envelope.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.text("Code").unwrap_or_default()
     }
 }
@@ -65,7 +65,7 @@ impl Reply {
 /// `Cargo.lock` content six times, so the suite reads and writes the wire bytes with
 /// the crates the service already depends on. Escaping every non-alphanumeric byte is
 /// always a valid form encoding.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match byte {
@@ -77,7 +77,7 @@ fn encode(value: &str) -> String {
 }
 
 /// One form field.
-fn p(key: &str, value: &str) -> (String, String) {
+pub(crate) fn p(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -93,12 +93,12 @@ type HealthCheckCase = (&'static str, Form, HealthCheckExpectation);
 type RefusalCase = (&'static str, Form, u16, &'static str);
 
 /// `Action` plus `Version`, the two fields every awsQuery request carries.
-fn action(name: &str) -> Vec<(String, String)> {
+pub(crate) fn action(name: &str) -> Vec<(String, String)> {
     vec![p("Action", name), p("Version", VERSION)]
 }
 
 /// Send one awsQuery request: `pairs` are the form fields, `Action` included.
-async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply {
+pub(crate) async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply {
     let body = pairs
         .iter()
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
@@ -132,13 +132,13 @@ async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply 
 
 /// The text of the first element named `tag`, or `None` when it is absent or carries
 /// nothing (an empty list serializes as `<Tag></Tag>`).
-fn first_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn first_text(xml: &str, tag: &str) -> Option<String> {
     let (inner, _) = element_span(xml, tag, 0)?;
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// The XML inside each `<member>` of the first element named `container`.
-fn members(xml: &str, container: &str) -> Vec<String> {
+pub(crate) fn members(xml: &str, container: &str) -> Vec<String> {
     let Some((inner, _)) = element_span(xml, container, 0) else {
         return Vec::new();
     };

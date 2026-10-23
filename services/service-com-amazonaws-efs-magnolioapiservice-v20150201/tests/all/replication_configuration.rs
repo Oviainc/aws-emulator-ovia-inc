@@ -137,11 +137,18 @@ async fn replication_configuration_lifecycle_round_trips_through_state() {
         destination_file_system["Encrypted"], json!(true),
         "a destination file system is encrypted, got {destination_file_system:?}"
     );
-    assert_eq!(
-        destination_file_system["KmsKeyId"],
-        json!(format!("arn:aws:kms:us-east-1:{ACCOUNT}:alias/aws/elasticfilesystem")),
-        "a destination file system with no KmsKeyId uses the default EFS key, got \
-         {destination_file_system:?}"
+    // "If you don't specify a KMS key, then the default KMS key for Amazon EFS,
+    // /aws/elasticfilesystem, is used" — and the description carries the KEY that alias
+    // resolves to, not the alias (see `mutation_results.rs`), so this asserts the form
+    // rather than a literal: a key ARN in the destination's Region.
+    let reported_key = destination_file_system["KmsKeyId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        reported_key.starts_with(&format!("arn:aws:kms:us-east-1:{ACCOUNT}:key/")),
+        "a destination file system with no KmsKeyId uses the default EFS key, resolved to \
+         a key ARN, got {reported_key:?}"
     );
     assert_eq!(
         destination_file_system["FileSystemProtection"]["ReplicationOverwriteProtection"],
@@ -281,9 +288,10 @@ async fn each_destination_form_mints_the_file_system_it_asks_for() {
             "no destination member at all",
             json!({}),
             json!({ "Region": "us-east-1", "RoleArn": null }),
+            // The default EFS key is named by an ALIAS, which the description reports as
+            // the key it resolves to; the `key/` prefix below is asserted for every row.
             json!({
                 "AvailabilityZoneName": null,
-                "KmsKeyId": format!("arn:aws:kms:us-east-1:{ACCOUNT}:alias/aws/elasticfilesystem"),
                 "PerformanceMode": "generalPurpose",
                 "ThroughputMode": "bursting",
             }),
@@ -292,9 +300,7 @@ async fn each_destination_form_mints_the_file_system_it_asks_for() {
             "a destination Region other than the source's",
             json!({ "Region": "us-west-2" }),
             json!({ "Region": "us-west-2" }),
-            json!({
-                "KmsKeyId": format!("arn:aws:kms:us-west-2:{ACCOUNT}:alias/aws/elasticfilesystem"),
-            }),
+            json!({}),
         ),
         (
             "One Zone storage in the source's Region",
@@ -312,7 +318,7 @@ async fn each_destination_form_mints_the_file_system_it_asks_for() {
             "a KMS key alias",
             json!({ "KmsKeyId": "alias/efs-replica" }),
             json!({ "Region": "us-east-1" }),
-            json!({ "KmsKeyId": format!("arn:aws:kms:us-east-1:{ACCOUNT}:alias/efs-replica") }),
+            json!({}),
         ),
         (
             "a bare KMS key id",
@@ -393,6 +399,15 @@ async fn each_destination_form_mints_the_file_system_it_asks_for() {
                 reported["Region"].as_str().unwrap_or_default()
             )),
             "case {case:?}: the destination ARN carries its Region, got {stored:?}"
+        );
+        // "A destination file system is encrypted", and the description names the KEY it
+        // is encrypted under, in the destination's Region — whichever form the request
+        // asked for it by (an alias resolves to the key it points at).
+        let key = stored["KmsKeyId"].as_str().unwrap_or_default().to_string();
+        let key_region = reported["Region"].as_str().unwrap_or_default();
+        assert!(
+            key.starts_with(&format!("arn:aws:kms:{key_region}:")) && key.contains(":key/"),
+            "case {case:?}: expected a KMS key ARN in {key_region}, got {key:?}"
         );
 
         // And the configuration reads back exactly as it was answered.

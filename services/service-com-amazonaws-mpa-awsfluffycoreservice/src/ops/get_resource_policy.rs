@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one policy attached to a resource, resolved from [`crate::state`] by the
+//! `(ResourceArn, PolicyName, PolicyType)` triple the request names. An approval team's
+//! `Policies` references ARE its attached resource policies, so this read answers from
+//! the same records `GetApprovalTeam$Policies` reports, resolved through the policy
+//! catalog: the name, the type, the version in effect (`$DEFAULT` resolving to the
+//! policy's current default version) and the document all come from the catalog entry
+//! the attachment names, and an attachment the catalog does not hold names no policy
+//! and is reported by nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The order of the refusals is the order the request is decided in:
+//!
+//! * a `ResourceArn` that is not a well-formed ARN (the member carries no modelled
+//!   pattern, so the boundary validator passes one) names no resource a policy can be
+//!   attached to: `InvalidParameterException` (400);
+//! * an ARN outside the caller's own account is denied BEFORE the resource is resolved
+//!   ([`crate::state::authorize_resource_arn`]): `AccessDeniedException` (403);
+//! * a triple that names no recorded attachment — no resource under that ARN, or no
+//!   policy of that name and type attached to it: `ResourceNotFoundException` (404).
+//!
+//! `@readonly`: this handler writes nothing of its own. It calls
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first,
+//! which applies only what the CLOCK already owed at this instant (a pending deletion
+//! window that has run out, an invitation response that has come due) — changes a
+//! caller who never polled would have seen anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +173,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // `ResourceArn` is a plain `String` with `length(max: 1000)` and NO modelled
+        // pattern, so the boundary validator passes a value that is not an ARN at all.
+        // Such a value names no resource a policy can be attached to, so the request is
+        // refused for the parameter it is wrong in rather than resolved against state.
+        if !crate::state::is_well_formed_arn(&input.resource_arn) {
+            return Err(GetResourcePolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: format!(
+                        "ResourceArn '{}' is not a valid Amazon Resource Name.",
+                        input.resource_arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The account boundary is evaluated BEFORE the resource is resolved, as on
+        // every other operation of this service that identifies its resource by ARN: an
+        // ARN outside the caller's account is refused whatever is stored under it.
+        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
+            .map_err(GetResourcePolicyErrorModeled::AccessDeniedException)?;
+
+        // `PolicyType` targets the `PolicyType` enum, so the boundary validator has
+        // already refused every token that enum does not declare. A value that reaches
+        // here and still names no policy type is refused for that parameter.
+        let Some(policy_type) = crate::state::PolicyType::from_wire(&input.policy_type) else {
+            return Err(GetResourcePolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: format!(
+                        "PolicyType '{}' is not a policy type this service supports.",
+                        input.policy_type
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The one answer for every triple that names no recorded attachment: a resource
+        // this store does not record, and a recorded resource carrying no policy of
+        // this name and type, are the same 404 to a caller.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        // The message is BUILT FROM THE REQUEST — the triple that resolved to nothing —
+        // as this service's other not-found refusals are (`GetApprovalTeam` names the
+        // ARN it could not resolve). The requirement for this refusal is the 404 and
+        // the `ResourceNotFoundException` code; neither AWS nor this service's model
+        // states the text of the message itself, so a recorded one is an example.
+        let not_found = || {
+            GetResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "No {} policy named '{}' is attached to resource '{}'.",
+                    input.policy_type, input.policy_name, input.resource_arn
+                ),
+            })
+        };
+
+        // This operation models no server error (its errors are `AccessDenied`,
+        // `InvalidParameter`, `ResourceNotFound`, `Throttling` and `Validation`), and
+        // the store is unreachable only on an engine that holds no state at all —
+        // where nothing is recorded, so for a READ the truthful answer is the same 404.
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found().into());
+        };
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let Some(policy) =
+            state.resource_policy(&input.resource_arn, &input.policy_name, policy_type)
+        else {
+            return Err(not_found().into());
+        };
+
+        Ok(GetResourcePolicyOutput {
+            resource_arn: policy.resource_arn,
+            policy_name: policy.policy_name,
+            policy_type: policy.policy_type.as_wire().to_string(),
+            // The ARN of the version in EFFECT: the attachment's version id, or the
+            // policy's current default version when the attachment names `$DEFAULT`.
+            policy_version_arn: Some(policy.policy_version_arn),
+            policy_document: policy.document,
+        })
     }
 }

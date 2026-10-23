@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartInvestigation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartInvestigation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartInvestigation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an investigation of one entity on a behavior graph and stores it
+//! on that graph, where `GetInvestigation` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartInvestigation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartInvestigationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartInvestigation"))
+        let _ = ctx;
+        // `GraphArn`'s pattern and `EntityArn`'s `^arn:` are modelled constraints the
+        // centralized walk has already refused anything outside of. WHICH entity an ARN
+        // names is this operation's own rule: "Detective supports IAM user ARNs and IAM
+        // role ARNs", and the `EntityType` it reports is resolved from the ARN rather
+        // than asked for, so an ARN naming neither is refused here.
+        let entity_type = crate::state::entity_type_of(&input.entity_arn).ok_or_else(|| {
+            StartInvestigationErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "EntityArn must be the ARN of an IAM user or an IAM role".to_string(),
+                ),
+                ..Default::default()
+            })
+        })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartInvestigationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let scope_start_time_millis = input.scope_start_time.to_millis().unwrap_or(now);
+        let scope_end_time_millis = input.scope_end_time.to_millis().unwrap_or(now);
+
+        let mut store = state.lock();
+        if store.graph(&input.graph_arn).is_none() {
+            return Err(StartInvestigationErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(),
+            )
+            .into());
+        }
+        // The store is finite: a graph already holding this emulator's cap takes no
+        // more investigations, which is a refusal of the request rather than a server
+        // fault.
+        let investigation_id = store
+            .fresh_investigation_id(&input.graph_arn)
+            .ok_or_else(|| {
+                StartInvestigationErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "this behavior graph already holds the maximum of {} investigations",
+                        crate::state::MAX_INVESTIGATIONS_PER_GRAPH
+                    )),
+                    ..Default::default()
+                })
+            })?;
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            StartInvestigationErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(),
+            )
+        })?;
+
+        // The investigation starts in the non-terminal `RUNNING` status, so the move to
+        // a terminal one is owed by the clock alone: the due instant is recorded here
+        // and materialised by whichever call first reads the record after it passes.
+        graph.investigations.insert(
+            investigation_id.clone(),
+            crate::state::Investigation {
+                investigation_id: investigation_id.clone(),
+                graph_arn: graph.arn.clone(),
+                entity_arn: input.entity_arn.clone(),
+                entity_type: entity_type.to_string(),
+                created_time_millis: now,
+                scope_start_time_millis,
+                scope_end_time_millis,
+                status: crate::state::INVESTIGATION_STATUS_RUNNING.to_string(),
+                severity: crate::state::INVESTIGATION_SEVERITY_INFORMATIONAL.to_string(),
+                state: crate::state::INVESTIGATION_STATE_ACTIVE.to_string(),
+                completion_due_millis: Some(now + crate::state::INVESTIGATION_RUN_MILLIS),
+            },
+        );
+
+        Ok(StartInvestigationOutput {
+            investigation_id: Some(investigation_id),
+        })
     }
 }

@@ -14,6 +14,9 @@
 #[path = "all/batch_execute_statement.rs"]
 mod batch_execute_statement;
 
+#[path = "all/data_api_surface.rs"]
+mod data_api_surface;
+
 #[path = "all/emulator.rs"]
 mod emulator;
 

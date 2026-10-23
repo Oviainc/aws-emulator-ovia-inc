@@ -59,6 +59,10 @@ mod resource_policies;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_refusal_envelope.rs"]
+mod tag_refusal_envelope;
+#[path = "all/tagging_arn_spelling.rs"]
+mod tagging_arn_spelling;
 #[path = "all/target_prefix_dispatch.rs"]
 mod target_prefix_dispatch;
 #[path = "all/target_prefix_routing.rs"]

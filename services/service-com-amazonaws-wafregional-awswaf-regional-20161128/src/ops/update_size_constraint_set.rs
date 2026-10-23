@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSizeConstraintSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSizeConstraintSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSizeConstraintSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +173,39 @@ impl From<UpdateSizeConstraintSetErrorModeled> for UpdateSizeConstraintSetError 
     }
 }
 
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not recognise.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value (the model's `PARAMETER_EXCEPTION_FIELD_VALUES` /
+/// `PARAMETER_EXCEPTION_REASON_VALUES`), so a client branching on them sees what the
+/// real service sends. `field` is an `Option` because `ParameterExceptionField` declares
+/// a value for a size constraint's comparison operator
+/// (`SIZE_CONSTRAINT_COMPARISON_OPERATOR`) but none for its `FieldToMatch` or its text
+/// transformation: naming one of those would invent a wire value the model does not
+/// declare, so those refusals leave it unset, as the `XssMatchSet` twin does.
+fn invalid_parameter(
+    field: Option<&str>,
+    parameter: &str,
+    reason: &str,
+) -> UpdateSizeConstraintSetError {
+    UpdateSizeConstraintSetErrorModeled::WAFInvalidParameterException(
+        WAFInvalidParameterException {
+            field: field.map(str::to_string),
+            parameter: Some(parameter.to_string()),
+            reason: Some(reason.to_string()),
+        },
+    )
+    .into()
+}
+
+/// The modelled `WAFLimitsExceededException`: "The operation exceeds a resource limit."
+fn limits_exceeded() -> UpdateSizeConstraintSetError {
+    UpdateSizeConstraintSetErrorModeled::WAFLimitsExceededException(WAFLimitsExceededException {
+        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateSizeConstraintSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -218,18 +242,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSizeConstraintSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSizeConstraintSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // Everything that depends only on the REQUEST is checked here, before this
+        // service's state is reached, so one request neither holds the shared store
+        // while walking a list it chose the length of nor does work no bound covers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSizeConstraintSet"))
+        // The batch cap comes first: `SizeConstraintSetUpdates` is modelled `len 1..`,
+        // so nothing upstream bounds how many updates one request may carry.
+        if input.updates.len() > crate::state::MAX_SIZE_CONSTRAINT_SET_UPDATES_PER_REQUEST {
+            return Err(limits_exceeded());
+        }
+
+        for update in &input.updates {
+            let action = update.action.as_str();
+            let constraint = &update.size_constraint;
+            let field_type = constraint.field_to_match.r#type.as_str();
+
+            // `ChangeAction`, `MatchFieldType`, `TextTransformation` and
+            // `ComparisonOperator` are enum shapes and `Size` carries a modelled
+            // `@range`, so a value outside any of them is refused before this handler
+            // runs. These checks state the same rule on this side of the boundary, from
+            // the model's own value lists rather than a hand-written catalogue: a value
+            // the model does not declare is a parameter AWS WAF does not recognise ("You
+            // specified an invalid value"), never a guessed one.
+            if !CHANGE_ACTION_VALUES.contains(&action) {
+                return Err(invalid_parameter(
+                    Some("CHANGE_ACTION"),
+                    action,
+                    "INVALID_OPTION",
+                ));
+            }
+            if !MATCH_FIELD_TYPE_VALUES.contains(&field_type) {
+                return Err(invalid_parameter(None, field_type, "INVALID_OPTION"));
+            }
+            if !TEXT_TRANSFORMATION_VALUES.contains(&constraint.text_transformation.as_str()) {
+                return Err(invalid_parameter(
+                    None,
+                    &constraint.text_transformation,
+                    "INVALID_OPTION",
+                ));
+            }
+            if !COMPARISON_OPERATOR_VALUES.contains(&constraint.comparison_operator.as_str()) {
+                return Err(invalid_parameter(
+                    Some("SIZE_CONSTRAINT_COMPARISON_OPERATOR"),
+                    &constraint.comparison_operator,
+                    "INVALID_OPTION",
+                ));
+            }
+            // "Valid values for size are 0 - 21474836480 bytes (0 - 20 GB)", which is
+            // `Size`'s modelled `@range` too. `ParameterExceptionField` declares no
+            // value for this member, so the refusal names the value and why, and leaves
+            // `field` unset.
+            if !(0..=crate::state::MAX_SIZE_CONSTRAINT_SIZE).contains(&constraint.size) {
+                return Err(invalid_parameter(
+                    None,
+                    &constraint.size.to_string(),
+                    "ILLEGAL_ARGUMENT",
+                ));
+            }
+            // What is NOT modelled is the pairing of `Type` with `Data`: `Data` names
+            // the header or query-string parameter for `HEADER` and `SINGLE_QUERY_ARG`
+            // ("You tried to update a ByteMatchSet with a Field of HEADER but no value
+            // for Data"), and "if the value of Type is any other value, omit Data".
+            if crate::state::match_field_takes_data(field_type)
+                != constraint.field_to_match.data.is_some()
+            {
+                return Err(invalid_parameter(None, field_type, "ILLEGAL_COMBINATION"));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSizeConstraintSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // The size constraint set is the CONTAINER the constraints go into, and the
+        // model reserves `WAFNonexistentContainerException` for exactly this: "You tried
+        // to add an object to or delete an object from another object that doesn't
+        // exist."
+        let Some(stored) = state.size_constraint_sets.get(&input.size_constraint_set_id) else {
+            return Err(
+                UpdateSizeConstraintSetErrorModeled::WAFNonexistentContainerException(
+                    WAFNonexistentContainerException {
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request refused
+        // part-way through leaves the stored set (and the change token) exactly as they
+        // were.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let constraint = &update.size_constraint;
+            let changed = match update.action.as_str() {
+                crate::state::CHANGE_ACTION_INSERT => {
+                    // One set holds at most `MAX_SIZE_CONSTRAINTS` constraints, so the
+                    // constraint state a caller can accumulate over many requests is
+                    // bounded, not just the number of updates one request may carry.
+                    if working.size_constraints.len() >= crate::state::MAX_SIZE_CONSTRAINTS {
+                        return Err(limits_exceeded());
+                    }
+                    working.insert_constraint(constraint)
+                }
+                crate::state::CHANGE_ACTION_DELETE => working.remove_constraint(constraint),
+                // `ChangeAction` is {INSERT, DELETE} and a value outside it was refused
+                // above, so this arm is reachable only if the model grows a third
+                // action: an action this operation does not know is the unrecognised
+                // parameter the model names, never a guessed INSERT or DELETE.
+                other => {
+                    return Err(invalid_parameter(
+                        Some("CHANGE_ACTION"),
+                        other,
+                        "INVALID_OPTION",
+                    ))
+                }
+            };
+            // "The operation failed because there was nothing to do" covers both ways an
+            // update can leave the set as it was: deleting a constraint the set does not
+            // hold, and inserting one it already holds. "If you want to change a
+            // SizeConstraintSetUpdate object, you delete the existing object and add a
+            // new one."
+            if !changed {
+                return Err(
+                    UpdateSizeConstraintSetErrorModeled::WAFInvalidOperationException(
+                        WAFInvalidOperationException {
+                            message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token, which
+        // must be one `GetChangeToken` minted and no other mutating call has used, since
+        // "each create, update, or delete request must use a unique change token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateSizeConstraintSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let set_id = working.size_constraint_set_id.clone();
+        state.size_constraint_sets.insert(set_id, working);
+
+        Ok(UpdateSizeConstraintSetOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

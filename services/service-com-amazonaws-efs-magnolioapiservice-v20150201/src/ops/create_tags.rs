@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the submitted tags onto the file system persisted in
+//! [`crate::state`], merging by key, so the one stored tag set every tag read of this
+//! service reports (`DescribeTags`, `ListTagsForResource`, the `Tags` of a file-system
+//! description) carries them. This is the DEPRECATED write path ("Use TagResource.") and
+//! writes the same set `TagResource` does, so the two cannot diverge.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +167,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTags"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+
+        let mut state = state.lock();
+
+        // "The ID of the file system whose tags you want to modify (String). This
+        // operation modifies the tags only, not the file system": the member takes an id
+        // or a file-system ARN, and the store is keyed by the bare id. The deprecated
+        // endpoint addresses a file system only, where `TagResource` also takes an access
+        // point.
+        let file_system_id = efs::file_system_id_of(&input.file_system_id).to_string();
+        let resource = efs::TaggedResource::FileSystem(&file_system_id);
+        let Some(held) = state.tags_of(resource) else {
+            return Err(not_found(efs::file_system_not_found_message(
+                &file_system_id,
+            )));
+        };
+
+        // "An array of Tag objects to add. Each Tag object is a key-value pair." The
+        // modelled list carries no length bound and no key-uniqueness constraint, and the
+        // published quota bounds the set this write LEAVES, so both are checked through
+        // the one construction every tag write of this service refuses with.
+        if let Some(problem) = efs::tag_write_problem(held, &input.tags, &input.file_system_id) {
+            return Err(bad_request(problem));
+        }
+
+        // Past every refusal, so this is the first write the request makes. "Creates or
+        // overwrites tags associated with a file system … If a tag key specified in the
+        // request already exists on the file system, this operation overwrites its value
+        // with the value provided in the request" — which is what `apply` merges by key,
+        // re-deriving the `Name` the description reports from the `Name` tag ("If you add
+        // the Name tag to your file system, Amazon EFS returns it in the response to the
+        // DescribeFileSystems operation").
+        let Some(mut record) = state.tagged_record_mut(resource) else {
+            return Err(not_found(efs::file_system_not_found_message(
+                &file_system_id,
+            )));
+        };
+        record.apply(&input.tags);
+        Ok(CreateTagsOutput)
     }
+}
+
+/// A 404 `FileSystemNotFound`: "the specified `FileSystemId` value doesn't exist in the
+/// requester's Amazon Web Services account". The sentence is the one construction every
+/// "not found" refusal of this service is built from; see `crate::state::does_not_exist`.
+fn not_found(message: impl Into<String>) -> CreateTagsError {
+    CreateTagsErrorModeled::FileSystemNotFound(FileSystemNotFound {
+        error_code: "FileSystemNotFound".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> CreateTagsError {
+    CreateTagsErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> CreateTagsError {
+    CreateTagsErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

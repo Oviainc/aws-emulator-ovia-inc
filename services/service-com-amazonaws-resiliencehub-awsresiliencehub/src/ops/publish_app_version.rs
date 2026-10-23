@@ -209,6 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change to it cannot alter what was published.
         let published = crate::state::AppVersionContents {
             app_components: draft.app_components,
+            resources: draft.resources,
             version_name: input.version_name.clone(),
             identifier: Some(identifier),
             creation_time: Some(crate::state::now()),

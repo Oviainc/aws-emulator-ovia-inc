@@ -39,12 +39,14 @@ use std::time::{Duration, SystemTime};
 // this list, which every operation added to this service edits.
 use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
-    CachedMethods, CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
+    CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
+    CustomErrorResponse, CustomErrorResponses, CustomOriginConfig,
     DefaultCacheBehavior, Distribution, DistributionConfig, DistributionSummary,
     EntityAlreadyExists, EntityNotFound, ForwardedValues, FunctionAssociations, GeoRestriction,
     Invalidation, InvalidationBatch, InvalidationSummary, InvalidTagging, KGKeyPairIds, KeyPairIds,
     KeyValueStore,
-    LambdaFunctionAssociations, LoggingConfig, NoSuchDistribution, NoSuchInvalidation,
+    LambdaFunctionAssociations, LoggingConfig, NoSuchCloudFrontOriginAccessIdentity,
+    NoSuchDistribution, NoSuchInvalidation,
     NoSuchResource, NoSuchResponseHeadersPolicy, Origin, OriginSslProtocols, Paths,
     ResponseHeadersPolicy, ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig,
     Restrictions, Signer, Tag, Tags, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
@@ -197,6 +199,25 @@ pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
 /// plane's own ceiling on distinct stores, so a store this service accepts is one that
 /// service can also hold.
 pub const MAX_KEY_VALUE_STORES: usize = 1_000;
+
+/// The most origin access identities this emulator holds.
+///
+/// CloudFront's published quota is 100 origin access identities per account, and the
+/// operation models `TooManyCloudFrontOriginAccessIdentities` — "Processing your request
+/// would cause you to exceed the maximum number of origin access identities allowed" —
+/// for a create that would exceed it. An identity record is what a later read answers
+/// from, so it cannot be evicted: the create path is refused at this entry count rather
+/// than growing further.
+pub const MAX_ORIGIN_ACCESS_IDENTITIES: usize = 100;
+
+/// How many lowercase-hex characters an Amazon S3 canonical user id is written in.
+///
+/// `CloudFrontOriginAccessIdentity$S3CanonicalUserId` is "The Amazon S3 canonical user ID
+/// for the origin access identity, used when giving the origin access identity read
+/// permission to an object in Amazon S3", and S3 writes a canonical user id as 64
+/// lowercase hex characters — the form a bucket ACL grantee takes, which is what makes
+/// the shape part of the contract rather than cosmetic.
+pub const S3_CANONICAL_USER_ID_LEN: usize = 64;
 
 /// The most response headers policies this emulator holds.
 ///
@@ -871,6 +892,47 @@ impl StoredKeyValueStore {
     }
 }
 
+/// One CloudFront origin access identity, as this emulator persists it.
+///
+/// The record is the single source of truth for the identity's id, its S3 canonical user
+/// id, its version token and its configuration as submitted, so the create, a later
+/// `GetCloudFrontOriginAccessIdentity` and a later `GetCloudFrontOriginAccessIdentityConfig`
+/// all answer from it rather than from the request being served.
+///
+/// An identity carries NO status: CloudFront answers a create with the identity ready to
+/// be named in a bucket policy, so there is no transition the clock owes one and nothing
+/// here for [`ComAmazonawsCloudfrontCloudfront20200531State::settle`] to materialise.
+#[derive(Debug, Clone)]
+pub struct StoredOriginAccessIdentity {
+    /// `CloudFrontOriginAccessIdentity$Id` — "The ID for the origin access identity":
+    /// the token minted at creation, which is also the key this record is held under and
+    /// the path segment its `Location` names.
+    pub id: String,
+    /// `CloudFrontOriginAccessIdentity$S3CanonicalUserId` — the canonical user id a
+    /// bucket policy or ACL names to grant this identity read access, minted with the
+    /// identity and fixed for its whole life.
+    pub s3_canonical_user_id: String,
+    /// The version token the last mutation handed back, and the single source of truth
+    /// for every `If-Match` check against this identity.
+    pub etag: String,
+    /// The configuration as submitted. Both of its members are required on the wire, so
+    /// there is nothing for the service to resolve into it: a later read answers with
+    /// what was stored.
+    pub config: CloudFrontOriginAccessIdentityConfig,
+}
+
+impl StoredOriginAccessIdentity {
+    /// The `CloudFrontOriginAccessIdentity` projection every identity operation returns,
+    /// read from the one stored record.
+    pub fn to_identity(&self) -> CloudFrontOriginAccessIdentity {
+        CloudFrontOriginAccessIdentity {
+            id: self.id.clone(),
+            s3_canonical_user_id: self.s3_canonical_user_id.clone(),
+            cloud_front_origin_access_identity_config: Some(self.config.clone()),
+        }
+    }
+}
+
 /// One CloudFront response headers policy, as this emulator persists it.
 ///
 /// The record is the single source of truth for the policy's id, the configuration it
@@ -926,6 +988,10 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// and a repeated name an `EntityAlreadyExists`. A `BTreeMap` for the same reason as
     /// `distributions`: one stable total order for a listing to page through.
     pub key_value_stores: BTreeMap<String, StoredKeyValueStore>,
+    /// Every origin access identity this emulator holds, keyed by its id. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for a listing to
+    /// page through.
+    pub origin_access_identities: BTreeMap<String, StoredOriginAccessIdentity>,
     /// Every response headers policy this emulator holds, keyed by its minted id — the
     /// identifier every response headers policy operation addresses one by. A `BTreeMap`
     /// for the same reason as `distributions`: one stable total order for a listing to
@@ -947,6 +1013,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The key value store `name` names, or `None` when the store holds none.
     pub fn key_value_store(&self, name: &str) -> Option<&StoredKeyValueStore> {
         self.key_value_stores.get(name)
+    }
+
+    /// The origin access identity `id` names, or `None` when the store holds none.
+    pub fn origin_access_identity(&self, id: &str) -> Option<&StoredOriginAccessIdentity> {
+        self.origin_access_identities.get(id)
+    }
+
+    /// The origin access identity created under `caller_reference`, or `None` when no
+    /// identity was.
+    ///
+    /// A scan over the identities rather than a second index beside them: the stored
+    /// records are the single source of truth for which references are taken, so a scan
+    /// cannot drift out of step with them, and the collection is bounded by
+    /// [`MAX_ORIGIN_ACCESS_IDENTITIES`].
+    pub fn origin_access_identity_by_caller_reference(
+        &self,
+        caller_reference: &str,
+    ) -> Option<&StoredOriginAccessIdentity> {
+        self.origin_access_identities
+            .values()
+            .find(|identity| identity.config.caller_reference == caller_reference)
     }
 
     /// The distribution `id` names, or `None` when the store holds none.
@@ -1155,6 +1242,21 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
+    /// Allocate an origin access identity id no stored identity holds.
+    ///
+    /// `CloudFrontOriginAccessIdentity$Id` is "The ID for the origin access identity, for
+    /// example, `E74FTE3AJFJ256A`": the same shape a distribution id and a version token
+    /// take (`E` + [`ID_BODY_LEN`] uppercase alphanumerics), drawn from the same mint, so
+    /// no two identities are minted the same id.
+    pub fn allocate_origin_access_identity_id(&mut self) -> String {
+        loop {
+            let candidate = format!("E{}", self.mint(ID_BODY_LEN));
+            if !self.origin_access_identities.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
     /// Allocate a response headers policy id no stored policy holds.
     ///
     /// `ResponseHeadersPolicy$Id` is the identifier every response headers policy
@@ -1166,6 +1268,28 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = self.mint_uuid();
             if !self.response_headers_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate the Amazon S3 canonical user id of an origin access identity, in the
+    /// [`S3_CANONICAL_USER_ID_LEN`] lowercase hex characters S3 writes one in.
+    ///
+    /// Drawn from the same mint as every other generated value here (four draws, 256
+    /// bits, rendered as hex), and checked against the stored identities so no two
+    /// identities share the canonical user id a bucket policy names them by.
+    pub fn allocate_s3_canonical_user_id(&mut self) -> String {
+        loop {
+            let mut candidate = String::with_capacity(S3_CANONICAL_USER_ID_LEN);
+            while candidate.len() < S3_CANONICAL_USER_ID_LEN {
+                candidate.push_str(&format!("{:016x}", self.mint_u64()));
+            }
+            if !self
+                .origin_access_identities
+                .values()
+                .any(|identity| identity.s3_canonical_user_id == candidate)
+            {
                 break candidate;
             }
         }
@@ -1393,6 +1517,13 @@ pub fn key_value_store_path(name: &str) -> String {
     format!("/2020-05-31/key-value-store/{name}")
 }
 
+/// The path of one origin access identity under this service's API version — the route
+/// `GetCloudFrontOriginAccessIdentity` serves (`/origin-access-identity/cloudfront/{Id}`),
+/// which is therefore the resource the create's `Location` names.
+pub fn origin_access_identity_path(id: &str) -> String {
+    format!("/2020-05-31/origin-access-identity/cloudfront/{id}")
+}
+
 /// The path of a response headers policy resource under this service's API version. The
 /// resource is addressed by ID, as `GetResponseHeadersPolicy`'s `{Id}` label is.
 pub fn response_headers_policy_path(id: &str) -> String {
@@ -1510,6 +1641,22 @@ pub fn same_batch(left: &InvalidationBatch, right: &InvalidationBatch) -> bool {
 /// rendering that hid or truncated a member would make two configurations differing in it
 /// compare equal, and that test fails the moment it does.
 pub fn same_config(left: &DistributionConfig, right: &DistributionConfig) -> bool {
+    format!("{left:?}") == format!("{right:?}")
+}
+
+/// Whether two origin access identity configurations ask for the same thing, which is
+/// what decides whether a repeated `CallerReference` is the same create again or a second
+/// identity under a reference that is already taken.
+///
+/// The same comparison [`same_config`] makes, for the same reasons: every member a caller
+/// can submit takes part, and comparing the DESERIALIZED configurations is what makes it
+/// insensitive to the request document's whitespace and member order — "the content of the
+/// `CloudFrontOriginAccessIdentityConfig` is identical to the original request (ignoring
+/// white space)".
+pub fn same_origin_access_identity_config(
+    left: &CloudFrontOriginAccessIdentityConfig,
+    right: &CloudFrontOriginAccessIdentityConfig,
+) -> bool {
     format!("{left:?}") == format!("{right:?}")
 }
 
@@ -2295,6 +2442,57 @@ pub fn key_value_store_already_exists(name: &str) -> EntityAlreadyExists {
     EntityAlreadyExists {
         message: Some(format!(
             "A key value store with the name {name} already exists in this account"
+        )),
+    }
+}
+
+/// `NoSuchCloudFrontOriginAccessIdentity`'s message: the sentence the model states on the
+/// shape itself, "The specified origin access identity does not exist."
+pub const NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE: &str =
+    "The specified origin access identity does not exist.";
+
+/// The modelled `NoSuchCloudFrontOriginAccessIdentity` (HTTP 404) for an identity id the
+/// store does not hold.
+///
+/// The id is NOT in the message, for the same reason it is not in
+/// [`no_such_distribution`]'s: the sentence is fixed service text, and the caller already
+/// knows which identity it asked for.
+pub fn no_such_origin_access_identity() -> NoSuchCloudFrontOriginAccessIdentity {
+    NoSuchCloudFrontOriginAccessIdentity {
+        message: Some(NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence `CloudFrontOriginAccessIdentityAlreadyExists` carries, up to the identity
+/// the caller reference is already associated with, which is named at the end — the one
+/// piece of request-derived detail in it, and the one a caller cannot work out for
+/// itself. The same shape [`distribution_already_exists_message`] takes, for the same
+/// rule applied to the other resource.
+pub fn origin_access_identity_already_exists_message(existing_id: &str) -> String {
+    format!(
+        "The caller reference that you are using to create an origin access identity is \
+         associated with another identity. Already exists: {existing_id}"
+    )
+}
+
+/// The longest comment an origin access identity carries.
+///
+/// `CloudFrontOriginAccessIdentityConfig$Comment`: "A comment to describe the origin
+/// access identity. The comment cannot be longer than 128 characters." The member carries
+/// no `@length` in the model, so the bound is not refused before a handler runs and the
+/// create path checks it itself.
+pub const MAX_ORIGIN_ACCESS_IDENTITY_COMMENT: usize = 128;
+
+/// The modelled `InvalidArgument` for an origin access identity comment past
+/// [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`].
+///
+/// The message states the CONSTRAINT the request broke and the length it submitted, which
+/// is the rule the refusal is built from rather than text echoed out of the request.
+pub fn comment_too_long(length: usize) -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(format!(
+            "An argument is invalid: the comment cannot be longer than \
+             {MAX_ORIGIN_ACCESS_IDENTITY_COMMENT} characters but the request submits {length}"
         )),
     }
 }

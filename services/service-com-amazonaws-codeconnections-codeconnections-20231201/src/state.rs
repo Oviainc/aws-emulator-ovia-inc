@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, SyncBlockerSummary,
-    SyncConfiguration, Tag, VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, ResourceSyncAttempt, Revision, SyncBlocker,
+    SyncBlockerContext, SyncBlockerSummary, SyncConfiguration, Tag, VpcConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -294,6 +294,27 @@ impl StoredSyncBlocker {
     }
 }
 
+/// The sync state this service has recorded for one `(SyncType, ResourceName)` pair:
+/// what `GetResourceSyncStatus` reports.
+///
+/// Only the SERVICE records a sync attempt, when it drives a resource from the Git
+/// repository the pair is configured against — never a caller: this API has no
+/// report-a-sync operation. Driving a resource means fetching that remote
+/// repository's commits, which this emulator does not do (nothing here performs a Git
+/// sync), so nothing puts a row here and every lookup misses — exactly like
+/// [`ComAmazonawsCodeconnectionsCodeconnections20231201State::sync_blockers`]. That is
+/// why `GetResourceSyncStatus` reports no sync state rather than inventing a revision,
+/// a commit sha and an event list for work nothing ran.
+#[derive(Debug, Clone, Default)]
+pub struct StoredResourceSyncState {
+    /// The revision the resource is being driven TO, when a sync has set one.
+    pub desired_state: Option<Revision>,
+    /// The latest attempt, successful or not.
+    pub latest_sync: Option<ResourceSyncAttempt>,
+    /// The latest attempt that succeeded.
+    pub latest_successful_sync: Option<ResourceSyncAttempt>,
+}
+
 /// The key a sync configuration is stored under: the `(SyncType, ResourceName)` pair
 /// every sync-configuration operation addresses.
 ///
@@ -347,6 +368,11 @@ pub struct ComAmazonawsCodeconnectionsCodeconnections20231201State {
     /// here and every lookup misses — which is why `UpdateSyncBlocker` answers the
     /// modeled `SyncBlockerDoesNotExistException` rather than inventing a blocker.
     pub sync_blockers: BTreeMap<String, StoredSyncBlocker>,
+    /// The sync state recorded against each `(SyncType, ResourceName)` pair, keyed by
+    /// [`sync_configuration_key`] — the same pair `GetResourceSyncStatus` addresses.
+    ///
+    /// Only a sync the service performed writes here; see [`StoredResourceSyncState`].
+    pub resource_sync_states: BTreeMap<(String, String), StoredResourceSyncState>,
 }
 
 impl ComAmazonawsCodeconnectionsCodeconnections20231201State {

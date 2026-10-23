@@ -23,6 +23,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `InvokeEndpoint` is the data plane of an endpoint the SageMaker CONTROL PLANE owns:
+# the endpoint is resolved in that service's own store through the shared engine, which
+# needs the owning service's state TYPE.
+service-com-amazonaws-sagemaker-sagemaker = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

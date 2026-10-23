@@ -19,6 +19,11 @@
 //! resource-scoped one on the log group it is attached to
 //! ([`LogGroupRecord::resource_policy`]).
 //!
+//! The account's import tasks — the CloudTrail Lake imports `CreateImportTask` starts and
+//! `DescribeImportTasks` reports — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::import_tasks`], each one an
+//! [`ImportTaskRecord`] carrying the instant the clock owes it a terminal status.
+//!
 //! A log group's data protection policy lives on that group as well
 //! ([`LogGroupRecord::data_protection_policy`]), because `PutDataProtectionPolicy`
 //! "applies to only the specified log group": one group holds at most one, and deleting
@@ -194,6 +199,32 @@ pub const MAX_STREAM_EVENTS: usize = 20_000;
 /// The byte half of the per-stream storage ceiling. See [`MAX_STREAM_EVENTS`].
 pub const MAX_STREAM_BYTES: i64 = 8 * 1024 * 1024;
 
+/// An import task that is still running, from the model's `ImportStatus` enum
+/// (`IN_PROGRESS` | `CANCELLED` | `COMPLETED` | `FAILED`). This is the only
+/// non-terminal one: an import AWS accepts starts here and leaves it on its own.
+pub const IMPORT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// An import task a caller cancelled, from the model's `ImportStatus` enum.
+pub const IMPORT_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// An import task that finished importing, from the model's `ImportStatus` enum.
+pub const IMPORT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// An import task that stopped on an error, from the model's `ImportStatus` enum. A task
+/// in this status reports why in `Import$errorMessage` ("Error message related to any
+/// failed imports").
+pub const IMPORT_STATUS_FAILED: &str = "FAILED";
+
+/// How long after it is created an import task becomes `COMPLETED`.
+///
+/// AWS documents no duration for an import ("Starts an import from a data source to
+/// CloudWatch Log"), so this span is THE EMULATOR'S OWN CHOICE: the import runs
+/// asynchronously, so the task is handed back `IN_PROGRESS` and the clock owes it a
+/// terminal status later. The span is deliberately not zero — a caller that reads or
+/// cancels the task straight after creating it still observes `IN_PROGRESS`, and the
+/// state rules that go with it.
+pub const IMPORT_COMPLETION_DELAY_MS: i64 = 500;
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -219,6 +250,11 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// operations in the account"). `None` until one is associated, and `None` again
     /// after `DisassociateKmsKey`.
     pub query_results_kms_key_id: Option<String>,
+    /// Every import task of this account — the resource `CreateImportTask` starts and
+    /// `DescribeImportTasks` reports — keyed by `importId`. A `BTreeMap` so
+    /// `DescribeImportTasks` enumerates in import-id order without re-sorting, which is
+    /// also what makes its pagination cursor stable.
+    pub import_tasks: BTreeMap<String, ImportTaskRecord>,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -234,6 +270,20 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         let seq = self.next_policy_revision;
         self.next_policy_revision = self.next_policy_revision.saturating_add(1);
         seq
+    }
+
+    /// Materialise every import-task status change the clock has ALREADY made due, as of
+    /// `now_ms`.
+    ///
+    /// An import runs asynchronously, so its terminal status is owed by the clock rather
+    /// than by a call: the change was due at [`ImportTaskRecord::completion_due_ms`] even
+    /// if nobody asked. A reporting operation calls this before it reads, so what it
+    /// reports is what the clock already decided — never a status moved on because
+    /// something was polled.
+    pub fn materialize_due_import_transitions(&mut self, now_ms: i64) {
+        for task in self.import_tasks.values_mut() {
+            task.materialize_due_transitions(now_ms);
+        }
     }
 }
 
@@ -262,6 +312,126 @@ impl ResourcePolicyRecord {
             POLICY_SCOPE_RESOURCE
         } else {
             POLICY_SCOPE_ACCOUNT
+        }
+    }
+}
+
+/// One import task — "An import job to move data from CloudTrail Event Data Store to
+/// CloudWatch" — as it is stored. Every member of the model's `Import` shape is reported
+/// from this record, so `DescribeImportTasks` answers from state alone.
+#[derive(Debug, Clone)]
+pub struct ImportTaskRecord {
+    /// `Import$importId` — "The unique identifier of the import task."
+    pub import_id: String,
+    /// `Import$importSourceArn` — "The ARN of the CloudTrail Lake Event Data Store being
+    /// imported from."
+    pub import_source_arn: String,
+    /// `CreateImportTask$importRoleArn` — "The ARN of the IAM role that grants CloudWatch
+    /// Logs permission to import". No `Import` member reports it, but the task is the only
+    /// record of the role the import runs under, so it is stored with the task. Written by
+    /// `CreateImportTask` once that operation is implemented (it is still a scaffold stub),
+    /// which is also the only caller [`ImportTaskRecord::new`] is waiting for — neither is
+    /// dead code to prune.
+    pub import_role_arn: String,
+    /// `Import$importDestinationArn` — "The ARN of the managed CloudWatch Logs log group
+    /// where the events are being imported to."
+    pub import_destination_arn: String,
+    /// `Import$importStatus`, one of the [`IMPORT_STATUS_IN_PROGRESS`] family.
+    pub import_status: String,
+    /// `ImportFilter$startEventTime`, when the create named one.
+    pub start_event_time_ms: Option<i64>,
+    /// `ImportFilter$endEventTime`, when the create named one.
+    pub end_event_time_ms: Option<i64>,
+    /// `ImportStatistics$bytesImported` — "The total number of bytes that have been
+    /// imported to the managed log group."
+    pub bytes_imported: i64,
+    /// `Import$creationTime`, in epoch milliseconds.
+    pub creation_time_ms: i64,
+    /// `Import$lastUpdatedTime`, in epoch milliseconds.
+    pub last_updated_time_ms: i64,
+    /// The instant this task's asynchronous import is due to reach `COMPLETED`, stored
+    /// rather than waited for: a reporting operation materialises the transition once the
+    /// clock is past it ([`materialize_due_import_transitions`]). `None` once the task is
+    /// in a terminal status, which owes no further transition.
+    ///
+    /// [`materialize_due_import_transitions`]:
+    ///     ComAmazonawsCloudwatchlogsLogs20140328State::materialize_due_import_transitions
+    pub completion_due_ms: Option<i64>,
+    /// `Import$errorMessage` — "Error message related to any failed imports". Only a
+    /// FAILED task carries one.
+    pub error_message: Option<String>,
+}
+
+impl ImportTaskRecord {
+    /// A brand-new import task: running, nothing imported yet, and due to complete
+    /// [`IMPORT_COMPLETION_DELAY_MS`] after it was created. This is what
+    /// `CreateImportTask` stores once it is implemented.
+    pub fn new(
+        import_id: &str,
+        import_source_arn: &str,
+        import_role_arn: &str,
+        import_destination_arn: &str,
+        import_filter: Option<&crate::ops::types::ImportFilter>,
+        creation_time_ms: i64,
+    ) -> Self {
+        Self {
+            import_id: import_id.to_string(),
+            import_source_arn: import_source_arn.to_string(),
+            import_role_arn: import_role_arn.to_string(),
+            import_destination_arn: import_destination_arn.to_string(),
+            import_status: IMPORT_STATUS_IN_PROGRESS.to_string(),
+            start_event_time_ms: import_filter.and_then(|filter| filter.start_event_time),
+            end_event_time_ms: import_filter.and_then(|filter| filter.end_event_time),
+            bytes_imported: 0,
+            creation_time_ms,
+            last_updated_time_ms: creation_time_ms,
+            completion_due_ms: Some(creation_time_ms.saturating_add(IMPORT_COMPLETION_DELAY_MS)),
+            error_message: None,
+        }
+    }
+
+    /// Whether this task has reached a status it can never leave — anything but
+    /// [`IMPORT_STATUS_IN_PROGRESS`], the one status the model's `ImportStatus` enum
+    /// describes as still running. This is the condition `CancelImportTask` refuses on
+    /// ("Cancels an ACTIVE import task"), and the one that tells this record it owes no
+    /// further clock transition.
+    pub fn is_terminal(&self) -> bool {
+        self.import_status != IMPORT_STATUS_IN_PROGRESS
+    }
+
+    /// This task's `importFilter`, or `None` when the create bounded the event time at
+    /// neither end — `ImportFilter`'s two members are both optional, so a task created
+    /// without either carries no filter to report.
+    pub fn import_filter(&self) -> Option<crate::ops::types::ImportFilter> {
+        let filter = crate::ops::types::ImportFilter {
+            start_event_time: self.start_event_time_ms,
+            end_event_time: self.end_event_time_ms,
+        };
+        (filter.start_event_time.is_some() || filter.end_event_time.is_some()).then_some(filter)
+    }
+
+    /// This task's `importStatistics`: what the import has moved so far, counted in state
+    /// rather than reported as progress nothing made.
+    pub fn import_statistics(&self) -> crate::ops::types::ImportStatistics {
+        crate::ops::types::ImportStatistics {
+            bytes_imported: Some(self.bytes_imported),
+        }
+    }
+
+    /// Materialise the status change the clock owes this task: a running import whose
+    /// completion instant has passed is `COMPLETED`, updated AT that instant and not at
+    /// the time something happened to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        if self.is_terminal() {
+            return;
+        }
+        let Some(due) = self.completion_due_ms else {
+            return;
+        };
+        if due <= now_ms {
+            self.import_status = IMPORT_STATUS_COMPLETED.to_string();
+            self.last_updated_time_ms = due;
+            self.completion_due_ms = None;
         }
     }
 }

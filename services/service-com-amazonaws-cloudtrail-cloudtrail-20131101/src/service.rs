@@ -25,7 +25,10 @@
 //!   generated routing table. Return `Some(op)` to route one yourself. THIS service
 //!   does: its `X-Amz-Target` prefix is the fully qualified Coral service name
 //!   (`com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101`), so the operation is
-//!   the segment after the LAST dot of the target rather than after the first.
+//!   the segment after the LAST dot of the target rather than after the first. The
+//!   operation that segment names is served through [`InModelledEnvelope`] when its
+//!   input carries a tag list, so a tag outside its modelled length is refused in
+//!   this service's own error shape rather than in the framework's envelope.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. THIS service rewords three classes: a tag key or value outside its
@@ -33,6 +36,12 @@
 //!   value inside an event selector outside its modelled constraint, which the model
 //!   declares `InvalidEventSelectorsException` for; and a violated `@pattern`, whose
 //!   recorded clause carries no value. See the inline notes on that method.
+//!   That seam carries only a code and a message, not a SHAPE, so a refusal leaving
+//!   through it still carries its prose in the framework's pre-dispatch envelope, whose
+//!   key is a lowercase `message`; CloudTrail's error shapes carry `Message`. Every
+//!   operation whose input carries a tag list is therefore ALSO served through
+//!   [`InModelledEnvelope`] below, which states the tag refusal in the modelled
+//!   `InvalidTagParameterException` shape — see `override_operation`.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -47,10 +56,23 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service refuses a tag outside its modelled length with: the
+/// shape `com.amazonaws.cloudtrail#InvalidTagParameterException`, "thrown when the
+/// specified tag key or values are not valid"
+/// (`smithy_query(query="shape", shape="InvalidTagParameterException")`).
+const INVALID_TAG_PARAMETER_EXCEPTION: &str = "InvalidTagParameterException";
+
+/// The HTTP status that shape's `@httpError` declares.
+const INVALID_TAG_PARAMETER_EXCEPTION_STATUS: u16 = 400;
 
 /// The target rule in isolation, as THIS service's prefix forms exercise it: which
 /// operation an `X-Amz-Target` names, over the prefix forms a client can write.
@@ -162,8 +184,8 @@ fn tag_member(path: &str) -> Option<&'static str> {
     }
 }
 
-/// The refusal a tag outside its modelled `@length` is answered with, if `violations`
-/// carries one.
+/// How CloudTrail states a tag key or value that broke its modelled `@length`
+/// maximum, or `None` for a violation that is not a tag's length.
 ///
 /// CloudTrail does not answer a tag outside the modelled `TagKey` / `TagValue` length
 /// with the framework's generic `ValidationException`: a tag key or value outside its
@@ -173,15 +195,37 @@ fn tag_member(path: &str) -> Option<&'static str> {
 /// `InvalidTagParameterException` "Tag value length cannot be more than 256
 /// characters." — and the rule holds for every operation that takes a tag, not only the
 /// tagging pair.
+///
+/// This is the ONE wording of that refusal, read by both places it can leave from: the
+/// modelled envelope [`InModelledEnvelope`] serializes, and the framework's
+/// pre-dispatch envelope [`invalid_tag_parameter`] rewords for anything that wrapper
+/// could not read. The bound itself comes from the violation, so the sentence cannot
+/// drift from the model's `TagKey` / `TagValue` lengths.
+fn tag_length_refusal(violation: &Violation) -> Option<String> {
+    let ViolationKind::MaxLength(max) = violation.kind else {
+        return None;
+    };
+    let part = tag_member(&violation.path)?;
+    Some(format!(
+        "Tag {part} length cannot be more than {max} characters."
+    ))
+}
+
+/// The refusal a tag outside its modelled `@length` is answered with, if `violations`
+/// carries one — the [`Refusal`] seam's form of [`tag_length_refusal`].
+///
+/// The seam carries a code and a message, not the error SHAPE the envelope is rendered
+/// from, so a refusal leaving through here still carries its prose in the framework's
+/// lowercase `message` key. [`InModelledEnvelope`] is what answers in the modelled
+/// shape, and it covers every operation whose input carries a tag list; what is left
+/// for this reader is a request that wrapper could not read as an input at all, whose
+/// code a client branches on stays right rather than degrading to a shape this model
+/// does not declare.
 fn invalid_tag_parameter(violations: &[Violation]) -> Option<Refused> {
     violations.iter().find_map(|violation| {
-        let ViolationKind::MaxLength(max) = violation.kind else {
-            return None;
-        };
-        let part = tag_member(&violation.path)?;
         Some(Refused {
-            code: "InvalidTagParameterException".to_string(),
-            message: format!("Tag {part} length cannot be more than {max} characters."),
+            code: INVALID_TAG_PARAMETER_EXCEPTION.to_string(),
+            message: tag_length_refusal(violation)?,
         })
     })
 }
@@ -248,6 +292,28 @@ fn invalid_event_selectors(violations: &[Violation]) -> Option<Refused> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The operations whose input carries a tag list, each the operation the generated
+    /// table holds wrapped in [`InModelledEnvelope`] and built from the SAME shared
+    /// engine, so a wrapped operation reads and writes the one store. Keyed by the
+    /// operation shape name, which is the key the generated table uses.
+    in_modelled_envelope: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`InModelledEnvelope`] and keyed by its operation shape name — the name
+/// `service_common::rpc_target` reads out of an `X-Amz-Target` and the generated table
+/// is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(InModelledEnvelope::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -255,8 +321,25 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut in_modelled_envelope = OperationRoutingTable::new();
+        // Every operation whose input carries a tag list — the `TagsList` of the
+        // tagging pair and of the three creates that seed tags, and `CreateChannel`'s
+        // `Tags` (`smithy_query(query="digest")`). An operation that takes no tag
+        // cannot break a tag's length, so it is not wrapped and keeps the generated
+        // table's own entry.
+        wrap_operations!(
+            in_modelled_envelope,
+            engine,
+            add_tags::AddTags,
+            create_channel::CreateChannel,
+            create_dashboard::CreateDashboard,
+            create_event_data_store::CreateEventDataStore,
+            create_trail::CreateTrail,
+            remove_tags::RemoveTags,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            in_modelled_envelope,
         }
     }
 
@@ -267,6 +350,101 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     fn shape_id(&self) -> &str {
         self.entry.identity().shape_id()
     }
+}
+
+/// One modelled operation, served with the tag refusal that precedes its handler
+/// stated in the shape CloudTrail states it in.
+///
+/// A tag key or value outside the modelled `TagKey` / `TagValue` length is refused
+/// before any handler runs, by the framework's own constraint walk. The framework's
+/// pre-dispatch envelope gets the status right (400) but names the error type
+/// `ValidationException` — a shape this model does not declare — and writes the prose
+/// into a lowercase `message` key, while every error shape CloudTrail declares carries
+/// `Message`. [`Service::override_refusal`] can replace that code and that message,
+/// but not the SHAPE the envelope is rendered from, so the one way to answer in the
+/// modelled shape is to refuse ahead of that walk — which is what this does.
+///
+/// The violations are the very ones the framework's own walk collects, from the
+/// framework's own deserializer and constraint walk, so this cannot find a different
+/// set from the walk that follows it. Nothing else is re-implemented: a request this
+/// wrapper does not refuse is handed to the generated [`ErasedOperation::run`], which
+/// owns deserialize -> validate -> handle -> serialize, telemetry and every modelled
+/// error.
+struct InModelledEnvelope<O> {
+    operation: O,
+}
+
+impl<O> InModelledEnvelope<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for InModelledEnvelope<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
+            // is not `Sync`, and this future is. The protocol itself is.
+            let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            if let Some(refused) = refused_before_handling::<O>(protocol, req) {
+                return refused;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// This service's `InvalidTagParameterException` for `req`, when one of the tags it
+/// carries is outside its modelled length; `None` when every tag is within it, so the
+/// request reaches the handler.
+///
+/// `None` also when the request cannot be read at all — a body the codec rejects, or
+/// one missing a required member, carries no tag to hold to its length, and the
+/// framework's own walk words that refusal — and when the chosen error cannot be
+/// serialized, which leaves that walk to refuse the request rather than answering with
+/// no reason at all.
+///
+/// A request this does not refuse is deserialized and walked a SECOND time by the
+/// generated `ErasedOperation::run`. That is the cost of stating the refusal in the
+/// modelled shape today: the framework's refusal seam carries a [`Refused`] code and
+/// message, which cannot name the error SHAPE the envelope is rendered from. Should
+/// `Refused` ever carry a shape, this layer can be dropped for `override_refusal` and
+/// the second walk goes away with it.
+fn refused_before_handling<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<RtResponse> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
+    drop(deserializer);
+    let message = constraints::validate(&input, O::INPUT_SCHEMA)
+        .iter()
+        .find_map(tag_length_refusal)?;
+    protocol
+        .serialize_error(
+            &crate::ops::types::shared_types::InvalidTagParameterException {
+                message: Some(message),
+            },
+            &crate::ops::types::shared_types::SCHEMA_INVALID_TAG_PARAMETER_EXCEPTION,
+            INVALID_TAG_PARAMETER_EXCEPTION,
+            INVALID_TAG_PARAMETER_EXCEPTION_STATUS,
+        )
+        .ok()
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -317,8 +495,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // and is the same answer for a single-identifier prefix. A target naming another
         // service, or an operation this model does not bind, still falls through to the
         // framework's own routing (and its routing error).
+        //
+        // The operation that name resolves to is the generated table's own: for an
+        // operation whose input carries a tag list it is served through
+        // `InModelledEnvelope`, which refuses a tag outside its modelled length in
+        // this service's own error shape and hands every other request to the very
+        // same generated operation. Nothing is re-routed.
         let operation = service_common::rpc_target::requested_operation(req, self.shape_id())?;
-        self.entry.routing_table().get(operation)
+        self.in_modelled_envelope
+            .get(operation)
+            .or_else(|| self.entry.routing_table().get(operation))
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -329,7 +515,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // * a tag key or value outside its modelled length is
         //   `InvalidTagParameterException`, not a `ValidationException`
-        //   ([`invalid_tag_parameter`]);
+        //   ([`invalid_tag_parameter`]) — for a request `InModelledEnvelope` could not
+        //   read as an input, which is what reaches this seam now that the wrapper
+        //   answers that refusal in the modelled shape;
         // * a value inside `EventSelectors` / `AdvancedEventSelectors` outside its
         //   modelled constraint is `InvalidEventSelectorsException`, the error the
         //   model declares for exactly that case ([`invalid_event_selectors`]);

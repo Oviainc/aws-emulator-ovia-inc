@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the tag collection stored on the resource `resourceArn` names.
+//! A pure read: it never writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The ARN is read into the record it names by [`crate::state::parse_tagged_resource`],
+//! the one place this service reads a `resourceArn`, so a tag read and a tag write can
+//! never resolve the same ARN to two different records. A string that is not the ARN of
+//! a taggable resource of this service is a bad request (400); a well-formed one that no
+//! stored record answers to is a missing resource (404).
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTags"))
+        let _ = ctx;
+        // `limit` ("(Not currently supported) The maximum number of returned results per
+        // page") and `position` ("(Not currently supported) The current pagination
+        // position in the paged result set") are documented as carrying no behaviour on
+        // this operation, so the whole collection is reported and neither member cuts a
+        // page out of it.
+        // An ARN this service cannot read as one of its taggable resources is refused
+        // before the store is reached: there is nothing to look up by it.
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn).ok_or_else(|| {
+            GetTagsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_tagged_resource_arn(&input.resource_arn)),
+            })
+        })?;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        let tags = store.tags_of(&resource).map_err(|message| {
+            GetTagsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        })?;
+        // This operation's output IS "the collection of tags" of the resource, so the
+        // member is always reported — empty for a resource that carries no tag, which a
+        // client can then tell from a member that was not reported at all.
+        Ok(GetTagsOutput {
+            tags: Some(tags.clone().into_iter().collect()),
+        })
     }
 }

@@ -180,16 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so it is RESOLVED against the host store rather than judged by being
         // present: a host the store holds is associated with the new connection, and
         // only an ARN naming no host is refused — with the modelled
-        // `ResourceUnavailableException` (400, "Resource not found. Verify the ARN for
-        // the host resource and try again."), because a connection must never point at
-        // a resource that is not there. An absent member associates nothing.
+        // `ResourceNotFoundException` (404), because the host it names is ABSENT, and
+        // absence is what that code reports throughout this service (`GetHost`,
+        // `GetConnection`, `ListConnections`' `HostArnFilter`). The operation's other
+        // modeled refusal, `ResourceUnavailableException` (400), stays reserved for a
+        // host that exists but is not usable. A connection must never point at a
+        // resource that is not there; an absent member associates nothing.
         if let Some(host_arn) = input.host_arn.as_deref() {
             if !store.hosts.contains_key(host_arn) {
-                return Err(CreateConnectionErrorModeled::ResourceUnavailableException(
-                    ResourceUnavailableException {
-                        message: Some(format!(
-                            "Resource not found. Verify the ARN for the host resource and try again: {host_arn}"
-                        )),
+                return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No host exists with the ARN: {host_arn}")),
                     },
                 )
                 .into());

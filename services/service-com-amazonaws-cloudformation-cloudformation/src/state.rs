@@ -62,7 +62,10 @@
 //! evaluated over them (see [`template`]) — rides on that same clock: the call computes
 //! the deployment ([`StoredStack::deploy_template`]) and `settle` installs it with the
 //! terminal status, so a stack always reports the resources and outputs of the template
-//! that finished deploying.
+//! that finished deploying. An operation that could NOT create a resource it declares
+//! reaches a FAILED terminal status instead ([`StoredStack::fail_transition`]), on the same
+//! clock: a failed create resolves no outputs and reports no identifier for what was never
+//! created, and a failed update leaves the template in force alone.
 //!
 //! CREATING those resources in the services that own them is [`provisioning`], which the
 //! deploying operation drives with no lock held — and which leaves the stack
@@ -412,8 +415,11 @@ pub struct StoredParameter {
 /// One resource a stack's template declares, as this emulator records it.
 ///
 /// The physical resource id and the attributes are what CloudFormation's documented
-/// return values for that resource type give it (see [`template::provision`]); they are
-/// what `Ref` and `Fn::GetAtt` resolve to when the stack's outputs are evaluated.
+/// return values for that resource type give it (see [`template::provision`]), unless the
+/// resource was really CREATED in the service that owns it
+/// ([`provisioning`](crate::state::provisioning)) — then they are what that service
+/// answered and `materialised` records it. They are what `Ref` and `Fn::GetAtt` resolve to
+/// when the stack's outputs are evaluated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredResource {
     pub logical_id: String,
@@ -508,7 +514,6 @@ pub struct StoredOperation {
     pub operation_id: String,
     pub operation_type: String,
 }
-
 
 /// A stack tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,24 +737,13 @@ impl StoredStack {
     /// own them is [`provisioning::reconcile`](provisioning::reconcile), which the
     /// deploying operation calls with these records once the store is unlocked.
     pub fn deploy_template(&mut self) {
-        let Some(declared) = self
-            .template_body
-            .as_deref()
-            .and_then(template::parse)
-        else {
+        let Some((declared, parameters)) = self.template_scope() else {
             // No template at all (a stack a CREATE change set created and nothing has
             // executed yet), or one this service will not read: either way the stack is
             // left with no resources and no outputs rather than with invented ones.
             self.pending_deployment = Some(PendingDeployment::default());
             return;
         };
-        // "Default: A value of the appropriate type for the template to use if no value
-        // is specified when a stack is created" — the request's values win over the
-        // template's declared defaults.
-        let mut parameters = declared.parameter_defaults();
-        for parameter in &self.parameters {
-            parameters.insert(parameter.key.clone(), parameter.value.clone());
-        }
         let stack = template::StackScope {
             region: &self.region,
             stack_name: &self.stack_name,
@@ -795,9 +789,27 @@ impl StoredStack {
         // operation calls with these records.
         let already_created = self.current_resources();
         for resource in &mut resources {
-            if let Some(existing) = already_created.iter().find(|existing| {
-                existing.materialised && provisioning::is_same_resource(existing, resource)
-            }) {
+            // The record of the same resource this stack already created. Judged by
+            // identity first; for a type whose id the OWNING SERVICE assigns, a record
+            // under the same logical id and type IS that resource, because nothing here
+            // can recompute the id it was created with.
+            let existing = already_created
+                .iter()
+                .find(|existing| {
+                    existing.materialised && provisioning::is_same_resource(existing, resource)
+                })
+                .or_else(|| {
+                    template::identity_is_service_assigned(&resource.resource_type)
+                        .then(|| {
+                            already_created.iter().find(|existing| {
+                                existing.materialised
+                                    && existing.logical_id == resource.logical_id
+                                    && existing.resource_type == resource.resource_type
+                            })
+                        })
+                        .flatten()
+                });
+            if let Some(existing) = existing {
                 // Deliberately NOT `provisioning::carry_forward`: that one also carries
                 // the properties the resource was created with, and this record's
                 // properties are what `reconcile` compares against them to see whether
@@ -805,13 +817,107 @@ impl StoredStack {
                 // already exists. Only the fact that it exists, and what the owning
                 // service reported about it, carry forward here.
                 resource.materialised = true;
+                if template::identity_is_service_assigned(&resource.resource_type) {
+                    // The identifier in force is the one that service minted, so the
+                    // record keeps it: an output naming the resource reports the id a
+                    // client can call that service with, and `reconcile` sees the resource
+                    // the stack already has rather than one to create again.
+                    resource.physical_resource_id = existing.physical_resource_id.clone();
+                }
                 for (name, value) in &existing.attributes {
                     resource.attributes.insert(name.clone(), value.clone());
                 }
             }
         }
-        let outputs = template::evaluate_outputs(&declared, &resolved, &mut budget);
+        // The outputs are evaluated against the identities now in force, which is why this
+        // is after the carry-forward above: a resource whose id the owning service assigned
+        // carries the one it minted, and an output naming that resource must report THAT.
+        let outputs = self.evaluated_outputs(&declared, scope, &resources, &mut budget);
         self.pending_deployment = Some(PendingDeployment { resources, outputs });
+    }
+
+    /// The stack's declared outputs, evaluated against `resources`.
+    ///
+    /// An output's value is a function of the template, the parameters in force and the
+    /// resources' IDENTITIES, so it is evaluated wherever one of those is settled: by
+    /// [`Self::deploy_template`] when the template is deployed, and again by
+    /// [`Self::record_materialised_resources`] once the services that own the resources
+    /// have reported the identifiers they minted.
+    fn evaluated_outputs(
+        &self,
+        declared: &template::Template,
+        scope: template::Scope<'_>,
+        resources: &[StoredResource],
+        budget: &mut template::Budget,
+    ) -> Vec<StoredOutput> {
+        let identities: BTreeMap<String, StoredResource> = resources
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect();
+        template::evaluate_outputs(
+            declared,
+            &template::Scope {
+                resources: &identities,
+                ..scope
+            },
+            budget,
+        )
+    }
+
+    /// The template this stack carries and the parameter values in force on it.
+    ///
+    /// "Default: A value of the appropriate type for the template to use if no value is
+    /// specified when a stack is created" — the request's values win over the template's
+    /// declared defaults, which is what this merge is.
+    ///
+    /// `None` for a stack with no template, or one this service cannot read: there is
+    /// nothing to evaluate then.
+    fn template_scope(&self) -> Option<(template::Template, BTreeMap<String, String>)> {
+        let declared = self.template_body.as_deref().and_then(template::parse)?;
+        let mut parameters = declared.parameter_defaults();
+        for parameter in &self.parameters {
+            parameters.insert(parameter.key.clone(), parameter.value.clone());
+        }
+        Some((declared, parameters))
+    }
+
+    /// Re-evaluate the stack's outputs over the resource records now in force.
+    ///
+    /// Called where the identities those records carry have CHANGED since the template was
+    /// deployed — which is what provisioning does for a type whose physical id the owning
+    /// service assigns ([`template::identity_is_service_assigned`]): the output of such a
+    /// resource must report the identifier that service minted, since that is the one a
+    /// client calls it with. Nothing else about the evaluation differs, so the stack's
+    /// outputs stay a function of its template, its parameters and its resources.
+    fn reevaluate_outputs(&mut self) {
+        let Some((declared, parameters)) = self.template_scope() else {
+            return;
+        };
+        let resources = self.current_resources();
+        let parameter_types = declared.parameter_types();
+        let no_resources = BTreeMap::new();
+        let mut budget = template::Budget::new();
+        let outputs = self.evaluated_outputs(
+            &declared,
+            template::Scope {
+                stack: template::StackScope {
+                    region: &self.region,
+                    stack_name: &self.stack_name,
+                    stack_id: &self.stack_id,
+                },
+                parameters: &parameters,
+                parameter_types: &parameter_types,
+                resources: &no_resources,
+                mappings: &declared.mappings,
+                conditions: &declared.conditions,
+            },
+            &resources,
+            &mut budget,
+        );
+        match &mut self.pending_deployment {
+            Some(deployment) => deployment.outputs = outputs,
+            None => self.outputs = outputs,
+        }
     }
 
     /// Whether this stack is still part of the live set — the set addressable by stack
@@ -971,8 +1077,8 @@ impl StoredStack {
     }
 
     /// Replace the resources of [`Self::current_resources`] with what the services that
-    /// own them answered — the attributes they reported, and whether each one was really
-    /// created there.
+    /// own them answered — the identifier each one minted, the attributes they reported,
+    /// and whether each resource was really created there.
     ///
     /// For an operation still in flight that is the pending deployment, which
     /// [`Self::settle`] installs when the operation completes. For one that has already
@@ -980,9 +1086,16 @@ impl StoredStack {
     /// records are rewritten in place, each keeping the resource STATUS and timestamp its
     /// deployment gave it: nothing about a resource's status changed because its
     /// provisioning record did.
+    ///
+    /// The stack's outputs are evaluated again over the recorded set
+    /// ([`Self::reevaluate_outputs`]): for a type whose physical id the owning service
+    /// ASSIGNS, the identity in these records is the one it minted rather than the one the
+    /// naming rules computed, and an output naming that resource reports what a client can
+    /// call that service with.
     pub fn record_materialised_resources(&mut self, resources: Vec<StoredResource>) {
         if let Some(deployment) = &mut self.pending_deployment {
             deployment.resources = resources;
+            self.reevaluate_outputs();
             return;
         }
         for resource in resources {
@@ -1001,6 +1114,7 @@ impl StoredStack {
                 )),
             }
         }
+        self.reevaluate_outputs();
     }
 
     /// Record that the operation in flight could not be carried out: the stack takes the
@@ -1497,6 +1611,12 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// the id wins, and this emulator derives a generated physical id from the stack id, so
     /// two stacks collide only where their templates NAME the same resource.
     pub fn stack_of_physical_resource(&self, physical_resource_id: &str) -> Option<&StoredStack> {
+        if physical_resource_id.is_empty() {
+            // A resource that was never created carries no physical id, so nothing is
+            // addressable by one: the empty string must not resolve to the first stack
+            // holding such a resource.
+            return None;
+        }
         self.stacks.iter().find(|stack| {
             stack
                 .resources
@@ -1542,6 +1662,16 @@ impl ComAmazonawsCloudformationCloudformationState {
                     .position(|stack| stack.stack_name == name_or_id && stack.is_live())
             })
     }
+}
+
+/// A resource's `PhysicalResourceId`, which a resource that was never CREATED does not
+/// have.
+///
+/// A resource whose create the service that owns it refused carries no identifier at all,
+/// and `StackResource$PhysicalResourceId` is optional, so it is reported ABSENT — an id
+/// nothing minted is what a client must never be handed.
+pub fn physical_resource_id(resource: &StoredResource) -> Option<String> {
+    (!resource.physical_resource_id.is_empty()).then(|| resource.physical_resource_id.clone())
 }
 
 /// Stored outputs as the modelled `Outputs` member.

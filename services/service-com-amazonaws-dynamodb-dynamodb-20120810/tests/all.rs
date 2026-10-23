@@ -23,6 +23,8 @@ mod index_capacity_and_item_collections;
 mod key_schema_element_refusals;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
+#[path = "all/region_from_the_request_endpoint.rs"]
+mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]
 mod regions_indexes_and_capacity;
 

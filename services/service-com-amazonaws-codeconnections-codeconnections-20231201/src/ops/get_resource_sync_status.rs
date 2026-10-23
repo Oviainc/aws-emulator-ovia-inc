@@ -57,8 +57,15 @@
 //!   the sync status with the Git repository.
 //! * `LatestSuccessfulSync` (ResourceSyncAttempt) — The latest successful sync for the sync
 //!   status with the Git repository.
-//! * `LatestSync` (ResourceSyncAttempt) **required** — The latest sync for the sync status
+//! * `LatestSync` (ResourceSyncAttempt) — The latest sync for the sync status
 //!   with the Git repository, whether successful or not.
+//!
+//! AWS's published model marks `LatestSync` `@required`; the service does not honour
+//! that for a `(ResourceName, SyncType)` pair it has recorded no sync state for — it
+//! answers HTTP 200 with none of these members present. Since this crate's codegen
+//! always writes a `@required` member, the trait is off this one output member in
+//! `smithy-model/` so the recorded response can be rendered; see
+//! `types::GetResourceSyncStatusOutput`.
 //!
 //! ## Errors
 //!
@@ -161,53 +168,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let store = state.lock();
-        // The RESOURCE is resolved first. A resource with no sync configuration of this
-        // type is not tracked against any repository, so the request names a sync target
-        // that does not exist: that makes THIS REQUEST invalid rather than naming a
-        // status that is merely missing, and it is refused with the modeled
-        // `InvalidInputException` (400) — the code this API uses throughout for an
-        // unresolvable sync reference (`GetRepositorySyncStatus` for a repository link
-        // id it does not hold, `UpdateSyncConfiguration` and `CreateSyncConfiguration`
-        // for a resource or link that is not there), as against the
-        // `ResourceNotFoundException` `GetSyncConfiguration` answers when the
-        // CONFIGURATION ITSELF is the resource being read. The message is built from the
-        // request, naming the pair that resolved to nothing.
+        // The report is the sync state this service has RECORDED for the pair, and
+        // nothing else. A pair it holds no sync state for is reported as exactly that:
+        // a success carrying none of the sync-state members, not a refusal. Whether the
+        // resource also has a sync CONFIGURATION is a different question, answered by
+        // `GetSyncConfiguration` (which does report `ResourceNotFoundException` for a
+        // configuration it does not hold): a caller polling for sync status before, or
+        // without, configuring the resource must be able to tell "never synced" from
+        // "bad request", so neither case is refused with `InvalidInputException` here.
         let key = crate::state::sync_configuration_key(&input.sync_type, &input.resource_name);
-        let configured = store.sync_configurations.contains_key(&key);
-        drop(store);
-        if !configured {
-            return Err(GetResourceSyncStatusErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Sync Configuration for Resource {} was not found",
-                        input.resource_name
-                    )),
-                },
-            )
-            .into());
+        let recorded = {
+            let store = state.lock();
+            store.resource_sync_states.get(&key).cloned()
         }
+        .unwrap_or_default();
 
-        // The output's `LatestSync` is a REQUIRED `ResourceSyncAttempt`: the record of a
-        // sync the SERVICE performed, carrying the revision it started from, the
-        // revision it drove the resource to, and the events it produced. Driving a
-        // resource from a tracked repository means fetching that remote repository's
-        // commits, which this emulator does not do — nothing here ever performs a Git
-        // sync, so no attempt is recorded for any resource and there is no revision or
-        // commit sha to report. Rather than synthesise a status, a revision and an event
-        // list for work nothing ran, the report is refused with the modeled
-        // `ResourceNotFoundException` (404): there is no sync attempt to return. This is
-        // the same answer `GetRepositorySyncStatus` gives for a link that IS there.
-        Err(
-            GetResourceSyncStatusErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "No {} sync attempt was found for resource {}",
-                        input.sync_type, input.resource_name
-                    )),
-                },
-            )
-            .into(),
-        )
+        // Only a sync the SERVICE performed records a state; nothing in this emulator
+        // fetches a remote repository's commits, so no revision, commit sha or event
+        // list is ever recorded, and none is synthesised here for work nothing ran. The
+        // members are rendered from the stored row — absent when nothing is stored.
+        Ok(GetResourceSyncStatusOutput {
+            desired_state: recorded.desired_state,
+            latest_sync: recorded.latest_sync,
+            latest_successful_sync: recorded.latest_successful_sync,
+        })
     }
 }

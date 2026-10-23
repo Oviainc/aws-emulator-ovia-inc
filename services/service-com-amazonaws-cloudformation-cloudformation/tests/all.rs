@@ -49,6 +49,8 @@ mod stack_outputs;
 mod stack_reported_members;
 #[path = "all/stack_resource_detail.rs"]
 mod stack_resource_detail;
+#[path = "all/stack_resource_providers.rs"]
+mod stack_resource_providers;
 #[path = "all/stack_resource_provisioning.rs"]
 mod stack_resource_provisioning;
 #[path = "all/stack_resources.rs"]

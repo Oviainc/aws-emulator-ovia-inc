@@ -78,6 +78,11 @@ use crate::ops::types::{
 /// single [`ComAmazonawsSagemakerSagemakerState::cluster_policies`] field.
 pub mod cluster_policy;
 
+/// The reader half of the HyperPod cluster slice: the one lookup that resolves the
+/// `ClusterNameOrArn` every cluster operation takes, and the `*Details` / `*Output`
+/// projections a reader builds from the [`Cluster`] record this module stores.
+pub mod cluster;
+
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
 /// also SageMaker's sigv4 signing name).
 pub const ARN_SERVICE: &str = "sagemaker";
@@ -2399,7 +2404,9 @@ pub fn record_state_change(
 }
 
 /// `arn:aws:sagemaker:<region>:<account>:<kind>/<name>` — the one ARN form this
-/// service mints, for the resource kinds it owns.
+/// service mints, for the resource kinds it owns. `name` is the segment the modelled
+/// ARN shape requires: the resource's name for most kinds, and the minted
+/// `[a-z0-9]{12}` id for a cluster (see [`mint_cluster_id`]).
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
 }

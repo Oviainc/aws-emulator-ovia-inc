@@ -25,6 +25,8 @@ mod error_envelope;
 mod invalidation_list;
 #[path = "all/key_value_store_lifecycle.rs"]
 mod key_value_store_lifecycle;
+#[path = "all/origin_access_identity_lifecycle.rs"]
+mod origin_access_identity_lifecycle;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
 #[path = "all/state_roundtrip.rs"]

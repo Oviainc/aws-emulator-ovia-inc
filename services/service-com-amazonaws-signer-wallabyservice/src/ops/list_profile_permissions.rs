@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfilePermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfilePermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfilePermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the cross-account permission statements of a signing profile, the
+//! policy's current revision and the size of the document they form. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +108,31 @@ impl From<ListProfilePermissionsErrorModeled> for ListProfilePermissionsError {
     }
 }
 
+/// The modelled 404 for a profile name this account holds no profile for.
+///
+/// `code` carries the condition a client branches on — the profile named by the
+/// request does not exist — which is the only machine-readable discriminator a
+/// 404 body has.
+fn profile_not_found(profile_name: &str) -> ListProfilePermissionsError {
+    ListProfilePermissionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("profile with name {profile_name} does not exists")),
+        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a `nextToken` that is not one this service handed out.
+///
+/// `code` names the condition a paginating client resets on, as the service's
+/// other paginated list words it.
+fn invalid_next_token(token: &str) -> ListProfilePermissionsError {
+    ListProfilePermissionsErrorModeled::ValidationException(ValidationException {
+        message: Some(format!("Invalid next token provided: {token}")),
+        code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
+    })
+    .into()
+}
+
 /// The `ListProfilePermissions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +169,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfilePermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfilePermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfilePermissions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListProfilePermissionsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the signer profile store is unavailable".to_string()),
+                        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        let Some(profile) = store.profiles.get(&input.profile_name) else {
+            return Err(profile_not_found(&input.profile_name));
+        };
+
+        // A profile nobody has granted anything on holds no policy: no revision to
+        // report, no statements, and `policySizeBytes` at the modelled default of
+        // 0 — there is no document to measure. A page of it can only be the first
+        // one, so a token against it is a token this service never handed out.
+        let Some(policy) = store.profile_permissions.get(&input.profile_name) else {
+            if let Some(token) = input.next_token.as_deref() {
+                return Err(invalid_next_token(token));
+            }
+            return Ok(ListProfilePermissionsOutput {
+                revision_id: None,
+                policy_size_bytes: 0,
+                // Present even when empty: a reader has to be able to tell "no
+                // permissions" from "permissions not reported".
+                permissions: Some(Vec::new()),
+                next_token: None,
+            });
+        };
+
+        // `nextToken` is the statement id the next page starts at, so the only
+        // tokens this service hands out are statement ids of this policy; anything
+        // else is refused with the modelled 400 rather than silently answering an
+        // arbitrary suffix of the order.
+        if let Some(token) = input.next_token.as_deref() {
+            if !policy.statements.contains_key(token) {
+                return Err(invalid_next_token(token));
+            }
+        }
+
+        // The operation models no `maxResults`, so the page size is the service's:
+        // at most `PERMISSION_PAGE_LIMIT` statements per answer, with the id the
+        // next page resumes at handed back when the policy holds more — so one
+        // read costs a bounded amount however many statements have accumulated.
+        let mut permissions = Vec::with_capacity(crate::state::permissions::PERMISSION_PAGE_LIMIT);
+        let mut next_token = None;
+        for (statement_id, statement) in policy
+            .statements
+            .range(input.next_token.clone().unwrap_or_default()..)
+        {
+            if permissions.len() == crate::state::permissions::PERMISSION_PAGE_LIMIT {
+                next_token = Some(statement_id.clone());
+                break;
+            }
+            permissions.push(statement.to_permission());
+        }
+
+        Ok(ListProfilePermissionsOutput {
+            revision_id: Some(policy.revision_id.clone()),
+            // The size of the WHOLE policy, which is what the member reports, not
+            // the size of this page.
+            policy_size_bytes: policy.policy_size_bytes(profile),
+            permissions: Some(permissions),
+            next_token,
+        })
     }
 }

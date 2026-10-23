@@ -8,17 +8,21 @@
 //! [`CampaignState`], and `DeleteCampaign` removes it. No handler keeps a copy of
 //! its own, so every response describes what the store holds.
 //!
-//! The instance-onboarding store does the same for a Connect instance's onboarding
-//! job: `StartInstanceOnboardingJob` writes a record here with the encryption
-//! config it was given, and `GetInstanceOnboardingJobStatus` reports the status
-//! that record is at.
+//! The instance-onboarding store beside it is the single source of truth for which
+//! Connect instances are onboarded to Campaigns: `StartInstanceOnboardingJob` writes a
+//! record here with the encryption config it was given,
+//! `GetInstanceOnboardingJobStatus` reports the status that record is at,
+//! `GetConnectInstanceConfig` projects the config it holds, and `CreateCampaign`
+//! consults it before minting a campaign — an instance with no finished onboarding job
+//! is not a campaign target.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::SystemTime;
 
 use crate::ops::types::{
     Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimitsConfig,
-    CommunicationTimeConfig, EncryptionConfig, EntryLimitsConfig, InstanceOnboardingJobStatus,
-    Schedule, Source,
+    CommunicationTimeConfig, EncryptionConfig, EntryLimitsConfig, InstanceConfig,
+    InstanceOnboardingJobStatus, Schedule, Source,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -43,6 +47,61 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// emulator's canonical placeholder account rather than a literal.
 pub fn campaign_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("campaign/{id}"))
+}
+
+/// The resource-type segment of the only ARN family this service's tag operations
+/// recognise: a campaign, the one taggable resource its model mints an ARN for
+/// (`CampaignArn`, built by [`campaign_arn`]).
+pub const CAMPAIGN_RESOURCE_TYPE: &str = "campaign";
+
+/// The wire error code ConnectCampaignsV2 answers a tag operation with when the ARN is
+/// well formed but names no resource this account holds, at HTTP 404.
+///
+/// The recorded responses carry this code, which is NOT the name of the model's
+/// corresponding shape (`ResourceNotFoundException`); a client branches on the code it
+/// is sent, so the emulator sends this one through
+/// [`crate::scaffolded::Scaffolded::wire_coded`].
+pub const TAG_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The wire error code ConnectCampaignsV2 answers a tag operation with when the ARN's
+/// resource path is not one of its own resources, at HTTP 400 — refused before any
+/// existence check. Recorded in the same way as [`TAG_NOT_FOUND_CODE`], and not the
+/// name of the model's corresponding shape (`ValidationException`).
+pub const TAG_BAD_REQUEST_CODE: &str = "BadRequestException";
+
+/// The most tags one resource holds.
+///
+/// Source: `TagKeyList`, the shape `UntagResource$tagKeys` takes, whose `@length` is
+/// 0..50 — a resource whose every tag can be removed in one call holds at most 50.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The campaign id an `/v2/tags/{arn}` ARN names, or `None` when `arn` does not name
+/// a connect-campaigns campaign at all.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`; the resource
+/// portion may itself contain `:`, so only the first five fields are split off. The
+/// ARN names a campaign when its service field is this service's ARN namespace and its
+/// resource portion is `campaign/<id>` with a non-empty id. Anything else — another
+/// service's ARN, an unknown resource type, a bare resource with no id — is a resource
+/// path this service cannot resolve, which its tag operations refuse as a bad request
+/// BEFORE asking whether any resource exists.
+pub fn campaign_id_from_arn(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let ("arn", Some(_partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+        fields.next()?,
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    if service != ARN_NAMESPACE {
+        return None;
+    }
+    let (resource_type, id) = resource.split_once('/')?;
+    (resource_type == CAMPAIGN_RESOURCE_TYPE && !id.is_empty()).then_some(id)
 }
 
 /// Encode a `ListCampaigns` cursor: the creation sequence number of the last
@@ -159,6 +218,39 @@ pub struct StoredCampaign {
     /// When this campaign was created. Part of the record, not of any response:
     /// no modelled member in this slice carries it.
     pub created_at: std::time::SystemTime,
+    /// The outbound requests this campaign has taken, keyed by the `clientToken`
+    /// each was submitted under — the idempotency token `PutOutboundRequestBatch`
+    /// ("This API is idempotent", per the model's own documentation) resolves a
+    /// repeated submission through, so the same token is answered with the dial
+    /// request id it was first given rather than a second one.
+    pub outbound_requests: BTreeMap<String, StoredOutboundRequest>,
+}
+
+/// An outbound request a campaign has taken, as stored.
+#[derive(Debug, Clone)]
+pub struct StoredOutboundRequest {
+    /// The `DialRequestId` this request was given. Minted from the campaign's own
+    /// counter, never from anything in the request, and within `DialRequestId`'s
+    /// pattern `^[-_.a-zA-Z0-9]+$` and its 1..256 length bound.
+    pub id: String,
+    /// The `ChannelSubtype` the request was submitted for.
+    pub channel_subtype: String,
+    /// The `expirationTime` the caller sent, as epoch seconds.
+    pub expires_at_epoch_seconds: i64,
+}
+
+/// What a campaign's store did with one outbound request of a batch, as
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::take_outbound_request`]
+/// reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundRequestOutcome {
+    /// The request is in the campaign's buffer under this `DialRequestId` — either
+    /// freshly minted, or the id an earlier submission under the same `clientToken`
+    /// was given, in which case this repeat stored nothing new.
+    Taken(String),
+    /// The campaign's buffer already holds [`MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`]
+    /// requests, so nothing was stored.
+    BufferFull,
 }
 
 impl StoredCampaign {
@@ -338,6 +430,20 @@ impl StoredInstanceOnboarding {
             failure_code: None,
         }
     }
+
+    /// This record as the modelled `InstanceConfig` shape `GetConnectInstanceConfig`
+    /// returns: the instance, the encryption config this record persisted, and the
+    /// account's Campaigns service-linked role (see [`service_linked_role_arn`]).
+    ///
+    /// A config exists once the instance's onboarding job has finished, so the caller
+    /// checks [`Self::status_at`] before projecting one.
+    pub fn to_config(&self) -> InstanceConfig {
+        InstanceConfig {
+            connect_instance_id: self.connect_instance_id.clone(),
+            service_linked_role_arn: service_linked_role_arn(),
+            encryption_config: self.encryption_config.clone(),
+        }
+    }
 }
 
 /// The most campaigns this emulator's store holds, after which `CreateCampaign`
@@ -353,6 +459,16 @@ impl StoredInstanceOnboarding {
 /// workload and enforced through the error AWS answers a quota breach with.
 pub const MAX_CAMPAIGNS: usize = 1_000;
 
+/// The most outbound requests one campaign's store holds, after which a further
+/// request in a batch is reported as a per-request failure carrying the modelled
+/// `FailureCode` `BufferLimitExceeded` — the code the model declares for a campaign
+/// that cannot take another request right now.
+///
+/// A campaign's buffer grows one record per accepted request and never shrinks, so
+/// without a ceiling a caller could submit batches until the process runs out of
+/// memory. The figure is the emulator's own, set far above any plausible workload.
+pub const MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN: usize = 10_000;
+
 /// The most Connect instances this emulator's store holds onboarding records for,
 /// after which `StartInstanceOnboardingJob` refuses to take another with the
 /// modelled `ConflictException` (HTTP 409) — of the errors that operation declares,
@@ -364,6 +480,20 @@ pub const MAX_CAMPAIGNS: usize = 1_000;
 /// of memory. AWS publishes no such limit, so this is the emulator's own, set far
 /// above any plausible workload.
 pub const MAX_ONBOARDED_INSTANCES: usize = 1_000;
+
+/// The service-linked role every onboarded instance's config names.
+///
+/// `InstanceConfig$serviceLinkedRoleArn` is required, and AWS fills it with the
+/// Campaigns service-linked role of the caller's own account — one role per account,
+/// not per instance — so it is built from the emulator's canonical account rather than
+/// from anything in the request. IAM is global, hence the empty region segment.
+pub fn service_linked_role_arn() -> String {
+    ::emulator_server::emulator_arn(
+        "iam",
+        "",
+        "role/aws-service-role/connect-campaigns.amazonaws.com/AWSServiceRoleForAmazonConnectCampaigns",
+    )
+}
 
 /// Why the store refused to take a campaign, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::insert_new_campaign`]
@@ -386,11 +516,18 @@ pub enum InsertRejected {
 /// map, so `ListCampaigns` paginates deterministically and its `nextToken` can
 /// name the sequence number the last page ended at. Growth is bounded:
 /// [`MAX_CAMPAIGNS`] records, enforced by [`Self::insert_new_campaign`].
+///
+/// `instance_onboarding` is the second store: one onboarding record per Connect
+/// instance, keyed by its instance id, bounded at [`MAX_ONBOARDED_INSTANCES`] by
+/// [`Self::start_instance_onboarding`]. It is the one place "is this instance a
+/// campaign target?" is answered, so `CreateCampaign`'s gate and
+/// `GetConnectInstanceConfig` / `GetInstanceOnboardingJobStatus` cannot disagree.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     campaigns: HashMap<String, StoredCampaign>,
     order: Vec<(u64, String)>,
     next_sequence: u64,
+    next_dial_sequence: u64,
     /// One onboarding record per Connect instance, keyed by instance id. Bounded by
     /// [`MAX_ONBOARDED_INSTANCES`], enforced by [`Self::start_instance_onboarding`].
     instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
@@ -453,6 +590,100 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         let removed = self.campaigns.remove(id)?;
         self.order.retain(|(_, stored)| stored != id);
         Some(removed)
+    }
+
+    /// The campaign whose ARN is `arn`, or `None` when no stored campaign carries
+    /// it.
+    ///
+    /// The whole ARN is compared, not just the id it ends with: an ARN names a
+    /// partition, a region and an account as well as a resource, so one naming a
+    /// different region or account names a different resource and resolves to
+    /// nothing here.
+    pub fn campaign_by_arn(&self, arn: &str) -> Option<&StoredCampaign> {
+        let id = campaign_id_from_arn(arn)?;
+        self.campaigns.get(id).filter(|stored| stored.arn == arn)
+    }
+
+    /// The campaign whose ARN is `arn`, for a handler that writes to it. Resolved
+    /// exactly as [`Self::campaign_by_arn`] resolves it.
+    pub fn campaign_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredCampaign> {
+        let id = campaign_id_from_arn(arn)?.to_string();
+        self.campaigns
+            .get_mut(&id)
+            .filter(|stored| stored.arn == arn)
+    }
+
+    /// The id the next outbound request this store takes will carry: a store-wide
+    /// sequence number, so no two dial requests of any campaign share an id.
+    ///
+    /// Minted from the store's own counter, never from anything in the request. The
+    /// text is within `DialRequestId`'s pattern `^[-_.a-zA-Z0-9]+$` and its 1..256
+    /// length bound.
+    fn next_dial_request_id(&mut self) -> String {
+        let sequence = self.next_dial_sequence;
+        self.next_dial_sequence = self.next_dial_sequence.saturating_add(1);
+        format!("dial-{sequence:012}")
+    }
+
+    /// Take the outbound request submitted under `client_token` into the buffer of
+    /// the campaign stored under `campaign_id`, and report what became of it (see
+    /// [`OutboundRequestOutcome`]). `None` when no campaign is stored under that id.
+    ///
+    /// A `client_token` the campaign has already taken stores nothing and reports
+    /// the id it was given then, which is what makes a repeated batch idempotent.
+    pub fn take_outbound_request(
+        &mut self,
+        campaign_id: &str,
+        client_token: &str,
+        channel_subtype: &str,
+        expires_at_epoch_seconds: i64,
+    ) -> Option<OutboundRequestOutcome> {
+        {
+            let campaign = self.campaigns.get(campaign_id)?;
+            if let Some(taken) = campaign.outbound_requests.get(client_token) {
+                return Some(OutboundRequestOutcome::Taken(taken.id.clone()));
+            }
+            if campaign.outbound_requests.len() >= MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN {
+                return Some(OutboundRequestOutcome::BufferFull);
+            }
+        }
+        // Only now, past both refusals, is an id minted — so a refused request
+        // consumes no id and leaves no gap in the sequence.
+        let id = self.next_dial_request_id();
+        let campaign = self.campaigns.get_mut(campaign_id)?;
+        campaign.outbound_requests.insert(
+            client_token.to_string(),
+            StoredOutboundRequest {
+                id: id.clone(),
+                channel_subtype: channel_subtype.to_string(),
+                expires_at_epoch_seconds,
+            },
+        );
+        Some(OutboundRequestOutcome::Taken(id))
+    }
+
+    /// The onboarding record of `connect_instance_id` when that instance is onboarded
+    /// to Campaigns at `now` — a record exists AND its job has reached `SUCCEEDED` —
+    /// and `None` otherwise. An instance whose job is still `IN_PROGRESS` is not a
+    /// campaign target yet.
+    ///
+    /// The one place "is this instance onboarded?" is decided, so `CreateCampaign`'s
+    /// gate ([`Self::is_onboarded`]) and `GetConnectInstanceConfig`'s projection
+    /// cannot disagree. A pure read of the stored due instant (see
+    /// [`StoredInstanceOnboarding::status_at`]), so neither writes anything.
+    pub fn onboarded_instance(
+        &self,
+        connect_instance_id: &str,
+        now: SystemTime,
+    ) -> Option<&StoredInstanceOnboarding> {
+        self.instance_onboarding(connect_instance_id)
+            .filter(|record| record.status_at(now) == ONBOARDING_STATUS_SUCCEEDED)
+    }
+
+    /// Whether `connect_instance_id` is onboarded to Campaigns at `now`, as
+    /// [`Self::onboarded_instance`] decides it.
+    pub fn is_onboarded(&self, connect_instance_id: &str, now: SystemTime) -> bool {
+        self.onboarded_instance(connect_instance_id, now).is_some()
     }
 
     /// Every stored campaign, in creation order, each with its creation sequence

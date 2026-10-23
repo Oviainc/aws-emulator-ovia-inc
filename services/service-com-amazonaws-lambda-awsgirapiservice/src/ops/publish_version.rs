@@ -462,7 +462,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Versions are numbered from 1 upwards and a number is never reused, so the next
         // one follows the highest ever published rather than the count held.
-        let Some(version_number) = record.latest_version.checked_add(1) else {
+        let mut config = record.config.clone();
+        config.description = description;
+        let Some(version_number) = record.publish_next_version(config, now) else {
             return Err(PublishVersionErrorModeled::ServiceException(ServiceException {
                 r#type: None,
                 message: Some(
@@ -471,17 +473,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let mut config = record.config.clone();
-        config.description = description;
-        record.versions.insert(
-            version_number,
-            crate::state::FunctionVersionRecord {
-                version: version_number,
-                config,
-                created: crate::state::iso8601(now),
-            },
-        );
-        record.latest_version = version_number;
 
         // Answered by reading the snapshot back out of the record, so GetFunction on the
         // new version reports exactly what this call persisted.

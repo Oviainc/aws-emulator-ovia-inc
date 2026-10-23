@@ -7,6 +7,20 @@
 //! `GetApprovalTeam` / `ListApprovalTeams` / `UpdateApprovalTeam` /
 //! `StartActiveApprovalTeamDeletion` all compute their answers from it.
 //!
+//! # Policies attached to a resource
+//!
+//! A team's `Policies` references are also the POLICIES ATTACHED to that team as a
+//! resource, so the resource-policy reads (`GetResourcePolicy`) answer from the same
+//! records rather than from a second copy, and resolve each reference through the
+//! catalog below so that every member they report is the policy record's own:
+//! [`ComAmazonawsMpaAwsfluffycoreserviceState::attached_resource_policy`] turns one
+//! attached `QualifiedPolicyArn` into the [`ResourcePolicy`] those reads report
+//! ([`parse_policy_version_arn`] reading the ARN back, `$DEFAULT` resolving to the
+//! policy's current default version), and
+//! [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_policies`] /
+//! [`ComAmazonawsMpaAwsfluffycoreserviceState::resource_policy`] resolve them for a
+//! resource ARN.
+//!
 //! # The clock, and who materialises it
 //!
 //! Two changes are owed by the passage of time alone, so they are recorded as DUE
@@ -346,6 +360,15 @@ impl ApprovalTeam {
     }
 }
 
+/// Longest category or name segment a policy ARN may carry, from the
+/// `[a-zA-Z0-9_\.-]{1,1023}` segments `UnqualifiedPolicyArn`'s modelled pattern declares.
+const MAX_POLICY_ARN_SEGMENT: usize = 1023;
+
+/// The version segment that stands for "whichever version is this policy's default" —
+/// the alternative `QualifiedPolicyArn`'s pattern allows beside a decimal version id
+/// (`^arn:.{1,63}:mpa:::aws:policy/[a-zA-Z0-9_\.-]{1,1023}/[a-zA-Z0-9_\.-]{1,1023}/(?:[\d]+|\$DEFAULT)$`).
+pub const DEFAULT_POLICY_VERSION: &str = "$DEFAULT";
+
 /// Type of a policy, in the tokens `PolicyType` declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyType {
@@ -360,6 +383,16 @@ impl PolicyType {
         match self {
             Self::AwsManaged => "AWS_MANAGED",
             Self::AwsRam => "AWS_RAM",
+        }
+    }
+    /// The policy type `token` names, or `None` when `PolicyType` declares no such
+    /// value.
+    #[must_use]
+    pub fn from_wire(token: &str) -> Option<Self> {
+        match token {
+            "AWS_MANAGED" => Some(Self::AwsManaged),
+            "AWS_RAM" => Some(Self::AwsRam),
+            _ => None,
         }
     }
 }
@@ -380,6 +413,155 @@ impl PolicyStatus {
             Self::Deprecated => "DEPRECATED",
         }
     }
+}
+
+/// The version of a policy a `QualifiedPolicyArn` names: an explicit
+/// `PolicyVersionId`, or the policy's default version — the `$DEFAULT` alternative the
+/// pattern allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyVersionSelector {
+    Default,
+    Id(i32),
+}
+
+/// The policy and version a `QualifiedPolicyArn` names, split into the unqualified ARN
+/// the catalog is keyed by ([`policy_arn`]) and the version it selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVersionRef {
+    pub policy_arn: String,
+    pub version: PolicyVersionSelector,
+}
+
+/// Whether `segment` fits the `[a-zA-Z0-9_\.-]{1,1023}` category/name segment
+/// `UnqualifiedPolicyArn`'s pattern declares.
+fn is_policy_arn_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_POLICY_ARN_SEGMENT
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+}
+
+/// Whether `arn` is an unqualified policy ARN in the form `UnqualifiedPolicyArn`'s
+/// pattern fixes — the form [`policy_arn`] mints and the catalog is keyed by:
+/// `arn:<partition>:mpa:::aws:policy/<Category>/<Name>`.
+#[must_use]
+pub fn is_policy_arn(arn: &str) -> bool {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>`, the resource being
+    // `aws:policy/<Category>/<Name>` — which carries a colon of its own, so the ARN
+    // splits into SIX fields and no more.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next() != Some("arn") {
+        return false;
+    }
+    // `.{1,63}` in the pattern's partition position.
+    if !fields
+        .next()
+        .is_some_and(|partition| !partition.is_empty() && partition.len() <= 63)
+    {
+        return false;
+    }
+    if fields.next() != Some(SERVICE_ACTION_PREFIX) {
+        return false;
+    }
+    // A policy is an AWS-owned, global resource: `:::` in the pattern, so its region
+    // and account fields are both empty.
+    if fields.next() != Some("") || fields.next() != Some("") {
+        return false;
+    }
+    let Some(path) = fields.next().and_then(|r| r.strip_prefix("aws:policy/")) else {
+        return false;
+    };
+    let mut segments = path.split('/');
+    let (Some(category), Some(name), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return false;
+    };
+    is_policy_arn_segment(category) && is_policy_arn_segment(name)
+}
+
+/// The policy and version `arn` names, or `None` when it is not a policy-version ARN in
+/// the grammar `QualifiedPolicyArn`'s pattern fixes (an unqualified policy ARN followed
+/// by `/<PolicyVersionId>` or `/$DEFAULT`).
+///
+/// The inverse of [`policy_version_arn`], so what this service mints it also reads back.
+#[must_use]
+pub fn parse_policy_version_arn(arn: &str) -> Option<PolicyVersionRef> {
+    let (policy_arn, version) = arn.rsplit_once('/')?;
+    if !is_policy_arn(policy_arn) {
+        return None;
+    }
+    let version = if version == DEFAULT_POLICY_VERSION {
+        PolicyVersionSelector::Default
+    } else {
+        // `[\d]+` in the pattern, and `PolicyVersionId` is `range(min: 1)`, so a signed
+        // or out-of-range value names no version.
+        if !version.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let version_id: i32 = version.parse().ok()?;
+        if version_id < FIRST_POLICY_VERSION {
+            return None;
+        }
+        PolicyVersionSelector::Id(version_id)
+    };
+    Some(PolicyVersionRef {
+        policy_arn: policy_arn.to_string(),
+        version,
+    })
+}
+
+/// A policy attached to a resource this store records, as the resource-policy reads
+/// report it. Every member is read off the catalog entry the attachment resolves to, so
+/// a reported resource policy can never disagree with the policy the catalog holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePolicy {
+    /// ARN of the resource the policy is attached to.
+    pub resource_arn: String,
+    /// `UnqualifiedPolicyArn` of the policy itself.
+    pub policy_arn: String,
+    /// ARN of the version in effect — the version the attachment RESOLVES to, so an
+    /// attachment of `$DEFAULT` reports the policy's default version by id.
+    pub policy_version_arn: String,
+    /// Id of that version.
+    pub policy_version_id: i32,
+    pub policy_name: String,
+    pub policy_type: PolicyType,
+    /// Document of the version in effect.
+    pub document: String,
+}
+
+/// The document this service reports for version `version_id` of `policy`.
+///
+/// Its identity is read from the catalog: the statement id is built from the policy's
+/// name and the version id, so every version of every policy has a document of its own
+/// and the same version always reports the same one.
+///
+/// The document's CONTENTS are this emulator's and are NOT a claim about the text AWS
+/// serves: AWS does not publish its MPA managed policy documents in this service's
+/// model, and `PolicyDocument` carries no modelled structure beyond
+/// `@length(max: 400000)`. What is reported is a syntactically valid document in the IAM
+/// policy grammar that `PolicyVersion$Status`' own documentation points at, over this
+/// service's own action namespace.
+#[must_use]
+pub fn policy_version_document(policy: &CatalogPolicy, version_id: i32) -> String {
+    // An IAM `Sid` is alphanumeric, so the policy's name contributes only its
+    // alphanumeric characters rather than the `_`, `.` and `-` its own pattern allows.
+    let name: String = policy
+        .name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    let document = ::serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": format!("{name}v{version_id}"),
+            "Effect": "Allow",
+            "Action": format!("{SERVICE_ACTION_PREFIX}:*"),
+            "Resource": "*",
+        }],
+    });
+    document.to_string()
 }
 
 /// One version of a catalog policy: everything `ListPolicyVersions` reports for it that
@@ -685,6 +867,73 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         teams
     }
 
+    /// Every policy attached to the resource `resource_arn` names, in attachment
+    /// order, or `None` when this store records NO resource under that ARN — which is
+    /// what tells a missing resource from a resource with no policy of the name asked
+    /// for.
+    ///
+    /// An approval team is the only resource this store records, and a team's attached
+    /// policies are the `Policies` references it carries, so the resource-policy reads
+    /// and `GetApprovalTeam$Policies` report one and the same attachment list. Each
+    /// reference is resolved through the CATALOG, so every member reported comes from
+    /// the policy record itself; a reference the catalog does not hold names no policy
+    /// and is reported by nothing.
+    #[must_use]
+    pub fn resource_policies(&self, resource_arn: &str) -> Option<Vec<ResourcePolicy>> {
+        let team = self.team(resource_arn)?;
+        Some(
+            team.policies
+                .iter()
+                .filter_map(|attached| self.attached_resource_policy(resource_arn, attached))
+                .collect(),
+        )
+    }
+
+    /// The policy of this name and type attached to the resource `resource_arn` names,
+    /// or `None` when no resource is recorded under that ARN or none of its attached
+    /// policies carries that name and type.
+    #[must_use]
+    pub fn resource_policy(
+        &self,
+        resource_arn: &str,
+        policy_name: &str,
+        policy_type: PolicyType,
+    ) -> Option<ResourcePolicy> {
+        self.resource_policies(resource_arn)?
+            .into_iter()
+            .find(|policy| policy.policy_name == policy_name && policy.policy_type == policy_type)
+    }
+
+    /// The resource policy an attachment of `attached_arn` to `resource_arn` reports,
+    /// or `None` when the attachment names no policy version the catalog holds.
+    ///
+    /// `PolicyReference$PolicyArn` is a `QualifiedPolicyArn`, so an attachment names a
+    /// policy and one of its versions: the version id when it names one, and the
+    /// policy's current default version when it names `$DEFAULT`.
+    #[must_use]
+    pub fn attached_resource_policy(
+        &self,
+        resource_arn: &str,
+        attached_arn: &str,
+    ) -> Option<ResourcePolicy> {
+        let reference = parse_policy_version_arn(attached_arn)?;
+        let policy = self.policy(&reference.policy_arn)?;
+        let version_id = match reference.version {
+            PolicyVersionSelector::Default => policy.default_version,
+            PolicyVersionSelector::Id(version_id) => version_id,
+        };
+        policy.version(version_id)?;
+        Some(ResourcePolicy {
+            resource_arn: resource_arn.to_string(),
+            policy_arn: policy.arn.clone(),
+            policy_version_arn: policy.version_arn(version_id),
+            policy_version_id: version_id,
+            policy_name: policy.name.clone(),
+            policy_type: policy.policy_type,
+            document: policy_version_document(policy, version_id),
+        })
+    }
+
     /// The catalog policy with this ARN.
     #[must_use]
     pub fn policy(&self, arn: &str) -> Option<&CatalogPolicy> {
@@ -774,6 +1023,24 @@ pub fn caller_identity_arn() -> String {
 #[must_use]
 pub fn arn_account_id(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
+}
+
+/// Whether `arn` is a well-formed Amazon Resource Name:
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` — six colon-separated
+/// fields with a non-empty partition, service and resource.
+///
+/// Region and account are empty on a global resource's ARN (an AWS-managed MPA policy,
+/// `arn:aws:mpa:::aws:policy/...`, for one), so neither is required.
+#[must_use]
+pub fn is_well_formed_arn(arn: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    let prefix = fields.next() == Some("arn");
+    let partition = fields.next().is_some_and(|field| !field.is_empty());
+    let service = fields.next().is_some_and(|field| !field.is_empty());
+    let region = fields.next().is_some();
+    let account = fields.next().is_some();
+    let resource = fields.next().is_some_and(|field| !field.is_empty());
+    prefix && partition && service && region && account && resource
 }
 
 /// Whether `arn` names a resource in the caller's own account.
