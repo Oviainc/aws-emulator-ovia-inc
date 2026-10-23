@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the locations this store can host game servers in: the custom locations
+//! `CreateLocation` persisted, and the Amazon Web Services Regions the store knows —
+//! narrowed by `Filters` to either kind, and paged.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLocations"))
+        let invalid = |message: String| -> Self::Error {
+            ListLocationsErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `Filters` is modelled `LocationFilterList` of `LocationFilter` (`AWS`,
+        // `CUSTOM`) with length 1..2, so the boundary walk has already refused an unknown
+        // filter and an oversized list; naming one kind twice narrows to that kind, which
+        // is what the set below expresses. An absent `Filters` narrows nothing: the list
+        // holds both kinds.
+        let filters: ::std::collections::HashSet<&str> = input
+            .filters
+            .as_deref()
+            .map(|filters| filters.iter().map(String::as_str).collect())
+            .unwrap_or_else(|| LOCATION_FILTER_VALUES.iter().copied().collect());
+
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLocationsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the GameLift emulator state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        let mut locations: Vec<LocationModel> = Vec::new();
+        if filters.contains(AWS_LOCATION_FILTER) {
+            locations.extend(
+                state
+                    .aws_locations(&region)
+                    .iter()
+                    .map(|location| crate::state::aws_location_model(location)),
+            );
+        }
+        if filters.contains(CUSTOM_LOCATION_FILTER) {
+            locations.extend(
+                state
+                    .custom_locations_in_order()
+                    .into_iter()
+                    .map(crate::state::CustomLocationRecord::to_modelled),
+            );
+        }
+
+        let Some((page, next_token)) = crate::state::paginate(
+            crate::state::PageKind::Locations,
+            &locations,
+            input.limit,
+            input.next_token.as_deref(),
+        ) else {
+            return Err(invalid(
+                "NextToken is not a pagination token this service issued.".to_string(),
+            ));
+        };
+        Ok(ListLocationsOutput {
+            locations: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The `LocationFilter` value that selects the Amazon Web Services locations: that
+/// member's own doc — "use this parameter to narrow down results to only Amazon Web
+/// Services-managed locations (Amazon EC2 or container) or only your custom locations".
+/// Both values come from the modelled enum (`smithy_query shape=LocationFilter`), which
+/// `LOCATION_FILTER_VALUES` carries.
+const AWS_LOCATION_FILTER: &str = "AWS";
+/// See [`AWS_LOCATION_FILTER`].
+const CUSTOM_LOCATION_FILTER: &str = "CUSTOM";
