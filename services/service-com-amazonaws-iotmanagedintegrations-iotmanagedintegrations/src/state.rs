@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, ResourceNotFoundException,
-    WiFiSimpleSetupConfiguration,
+    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, PushConfig,
+    ResourceNotFoundException, WiFiSimpleSetupConfiguration,
 };
 
 /// The region an ARN carries when the request names none (the emulator's default
@@ -83,6 +83,30 @@ pub struct ManagedThing {
     pub activated_at: Option<SystemTime>,
     /// Monotonic insertion sequence. `ListManagedThings` pages by it, so a page token
     /// keeps resuming at the right place even when records are deleted in between.
+    pub sequence: u64,
+}
+
+/// One stored over-the-air (OTA) task configuration: the authoritative record every
+/// OTA-task-configuration operation reads and writes. `CreateOtaTaskConfiguration`
+/// inserts it and `GetOtaTaskConfiguration` projects it onto its output shape.
+#[derive(Debug, Clone)]
+pub struct OtaTaskConfiguration {
+    /// The generated `OtaTaskConfigurationId` this record is keyed by.
+    pub id: String,
+    /// The region the creating request was signed for. An OTA task configuration is a
+    /// regional resource: only that region's endpoint resolves it.
+    pub region: String,
+    /// `OtaTaskConfigurationName` — `@sensitive`, and absent when the create named none
+    /// (the model marks no member of the create request `@required`).
+    pub name: Option<String>,
+    /// `OtaDescription`.
+    pub description: Option<String>,
+    /// `PushConfig`, stored exactly as the create supplied it so a read reports the
+    /// configuration the caller submitted.
+    pub push_config: Option<PushConfig>,
+    pub created_at: SystemTime,
+    /// Monotonic insertion sequence, taken from [`Self::take_sequence`], so the records
+    /// have a deterministic order independent of the hash map.
     pub sequence: u64,
 }
 
@@ -212,12 +236,17 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Insertion order of managed-thing ids, so `ListManagedThings` pages
     /// deterministically. An id is appended on create and removed on delete.
     pub managed_thing_order: Vec<String>,
-    /// `ClientToken` (`@idempotencyToken`) -> what the first call created, so a
-    /// replayed `CreateManagedThing` returns the original record instead of a duplicate.
+    /// The authoritative OTA-task-configuration store, keyed by the generated
+    /// `OtaTaskConfigurationId`.
+    pub ota_task_configurations: HashMap<String, OtaTaskConfiguration>,
+    /// A resource kind plus a `ClientToken` (`@idempotencyToken`) -> what the first call
+    /// created, so a replayed create returns the original record instead of a duplicate.
+    /// The key carries the resource kind because a `ClientToken` is scoped to the
+    /// operation that minted it: the same token on two different creates is two tokens.
     /// Bounded by [`IDEMPOTENCY_TTL`] and [`MAX_IDEMPOTENCY_TOKENS`].
-    pub idempotency_tokens: HashMap<String, IdempotencyRecord>,
-    /// Source of [`ManagedThing::sequence`] values and of the per-record suffix that
-    /// makes a generated id unique.
+    pub idempotency_tokens: HashMap<IdempotencyKey, IdempotencyRecord>,
+    /// Source of [`ManagedThing::sequence`] / [`OtaTaskConfiguration::sequence`] values
+    /// and of the per-record suffix that makes a generated id unique.
     pub next_sequence: u64,
     /// This account's default encryption configuration, keyed by region: the setting is
     /// per account AND per region (`GetDefaultEncryptionConfiguration` reports it "for the
@@ -238,6 +267,11 @@ pub const MANAGED_THING_PAGE_LIMIT: usize = 100;
 /// is a bound CHOSEN for the emulator, not a published AWS quota.
 pub const MAX_MANAGED_THINGS: usize = 10_000;
 
+/// The most OTA task configurations one store holds, for the same reason and on the same
+/// terms as [`MAX_MANAGED_THINGS`]: a bound CHOSEN for the emulator, not a published AWS
+/// quota.
+pub const MAX_OTA_TASK_CONFIGURATIONS: usize = 10_000;
+
 /// How long a `ClientToken` keeps replaying its original answer. A CHOSEN bound (AWS
 /// does not publish this window), so the idempotency map cannot keep a record for a
 /// caller-supplied token for the life of the process.
@@ -247,12 +281,32 @@ pub const IDEMPOTENCY_TTL: ::std::time::Duration = ::std::time::Duration::from_s
 /// oldest, so the map is bounded even when every token is still inside its TTL.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 10_000;
 
-/// What a `ClientToken` replays into: the managed thing the first call created, and
-/// when the token was minted (so [`IDEMPOTENCY_TTL`] can retire it).
+/// What a `ClientToken` replays into: the resource the first call created, and when the
+/// token was minted (so [`IDEMPOTENCY_TTL`] can retire it). Which KIND of resource that
+/// id names is the [`IdempotencyKey`] the record is stored under.
 #[derive(Debug, Clone)]
 pub struct IdempotencyRecord {
-    pub managed_thing_id: String,
+    pub resource_id: String,
     pub minted_at: SystemTime,
+}
+
+/// What an idempotency record is stored under: the kind of resource the create makes —
+/// the resource type the service reports it as, e.g. [`MANAGED_THING_RESOURCE_TYPE`] —
+/// and the `ClientToken` the caller sent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey {
+    pub resource_type: String,
+    pub token: String,
+}
+
+impl IdempotencyKey {
+    /// The key `token` occupies for `resource_type`.
+    pub fn new(resource_type: &str, token: &str) -> Self {
+        Self {
+            resource_type: resource_type.to_string(),
+            token: token.to_string(),
+        }
+    }
 }
 
 impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
@@ -262,6 +316,18 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.managed_things
             .get(id)
             .filter(|thing| thing.region == region)
+    }
+
+    /// The OTA task configuration `region`'s endpoint holds under `id`, if any. A record
+    /// created in another region is not visible here, as for every regional resource.
+    pub fn ota_task_configuration_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&OtaTaskConfiguration> {
+        self.ota_task_configurations
+            .get(id)
+            .filter(|configuration| configuration.region == region)
     }
 
     /// [`Self::managed_thing_in`], mutably.
@@ -323,6 +389,44 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
                 // A record minted "after" now (a clock that went backwards) is not old.
                 Err(_) => true,
             });
+    }
+
+    /// The id of the `resource_type` resource the first call carrying `token` created, if
+    /// that token is still in the map. Call
+    /// [`Self::retire_expired_idempotency_tokens`] first: a token past its TTL does not
+    /// replay.
+    pub fn replayed_resource_id(&self, resource_type: &str, token: &str) -> Option<String> {
+        self.idempotency_tokens
+            .get(&IdempotencyKey::new(resource_type, token))
+            .map(|record| record.resource_id.clone())
+    }
+
+    /// Record that `token` created the `resource_type` resource `resource_id` at
+    /// `minted_at`, so a retry of the same create replays it. Keeps the map under
+    /// [`MAX_IDEMPOTENCY_TOKENS`].
+    pub fn record_idempotency_token(
+        &mut self,
+        resource_type: &str,
+        token: &str,
+        resource_id: &str,
+        minted_at: SystemTime,
+    ) {
+        self.make_room_for_idempotency_token();
+        self.idempotency_tokens.insert(
+            IdempotencyKey::new(resource_type, token),
+            IdempotencyRecord {
+                resource_id: resource_id.to_string(),
+                minted_at,
+            },
+        );
+    }
+
+    /// Forget every token that replays into the `resource_type` resource `resource_id`:
+    /// a `ClientToken` whose resource is gone must not replay into a deleted id.
+    pub fn forget_idempotency_tokens_for(&mut self, resource_type: &str, resource_id: &str) {
+        self.idempotency_tokens.retain(|key, record| {
+            key.resource_type != resource_type || record.resource_id != resource_id
+        });
     }
 
     /// Evict the oldest idempotency records while the map is at
@@ -680,6 +784,15 @@ pub const MANAGED_THING_RESOURCE_TYPE: &str = "ManagedThing";
 /// ([`resource_not_found_message`]).
 pub const MANAGED_THING_RESOURCE_NAME: &str = "Managed Thing";
 
+/// The `ResourceType` this service reports an OTA task configuration under — the Smithy
+/// resource name, as [`MANAGED_THING_RESOURCE_TYPE`] is for a managed thing. It is also
+/// the resource kind an [`IdempotencyKey`] of a `CreateOtaTaskConfiguration` carries.
+pub const OTA_TASK_CONFIGURATION_RESOURCE_TYPE: &str = "OtaTaskConfiguration";
+
+/// The OTA-task-configuration resource as a READ's reason names it: the resource's name
+/// in words, the way [`MANAGED_THING_RESOURCE_NAME`] is for a managed thing.
+pub const OTA_TASK_CONFIGURATION_RESOURCE_NAME: &str = "Ota Task Configuration";
+
 /// How a MUTATION of this service states that the resource its `Identifier` named does
 /// not exist: the resource's type, the identifier the request carried, and that it was
 /// not found.
@@ -737,6 +850,20 @@ fn managed_thing_not_found(identifier: &str) -> ResourceNotFoundException {
         message: None,
         resource_id: Some(identifier.to_string()),
         resource_type: Some(MANAGED_THING_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for an OTA task configuration
+/// the store does not hold under the identifier a request named: the read path's reason
+/// ([`resource_not_found_message`]) plus the `ResourceId` and `ResourceType` members the
+/// shape declares, reported exactly as a managed thing's read 404 reports them.
+pub fn ota_task_configuration_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            OTA_TASK_CONFIGURATION_RESOURCE_NAME,
+        )),
+        resource_id: Some(identifier.to_string()),
+        resource_type: Some(OTA_TASK_CONFIGURATION_RESOURCE_TYPE.to_string()),
     }
 }
 

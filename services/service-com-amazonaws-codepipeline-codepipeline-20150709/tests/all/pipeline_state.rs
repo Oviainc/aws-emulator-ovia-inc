@@ -279,9 +279,9 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
                 );
             }
 
-            // Nothing runs a stage, an action or a rule, so no execution is reported
-            // for any of them — and a revision only `PutActionRevision` records is
-            // not reported either.
+            // No execution has been started for these pipelines, so no stage and no
+            // action has an execution to report — and a revision only
+            // `PutActionRevision` records is not reported either.
             for absent in ["latestExecution", "inboundExecution", "inboundExecutions"] {
                 assert!(
                     reported.get(absent).is_none(),

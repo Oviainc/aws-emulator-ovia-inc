@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegexPatternSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegexPatternSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegexPatternSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies each `RegexPatternSetUpdate` to the stored `RegexPatternSet` named by
+//! `RegexPatternSetId` — `INSERT` adds the update's `RegexPatternString` to the set's
+//! pattern-string collection, `DELETE` removes it — so every later `GetRegexPatternSet`
+//! of that id reports the patterns this call wrote. A mutation, as the operation's own
+//! documentation states ("Inserts or deletes RegexPatternString objects in a
+//! RegexPatternSet").
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +153,15 @@ impl From<UpdateRegexPatternSetErrorModeled> for UpdateRegexPatternSetError {
     }
 }
 
+/// The modelled `WAFLimitsExceededException`, the answer to a request that asks for more
+/// updates than one request may carry and to an insert past a set's own pattern bound.
+fn limits_exceeded() -> UpdateRegexPatternSetError {
+    UpdateRegexPatternSetErrorModeled::WAFLimitsExceededException(WAFLimitsExceededException {
+        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateRegexPatternSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,18 +198,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegexPatternSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegexPatternSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegexPatternSet"))
+        let _ = ctx;
+        // The number of updates one request carries is the caller's choice, so it is
+        // bounded BEFORE the shared store's lock is taken: no request can make the
+        // service do an amount of work it picked, nor hold the lock for it.
+        if input.updates.len() > crate::state::MAX_REGEX_PATTERN_SET_UPDATES_PER_REQUEST {
+            return Err(limits_exceeded());
+        }
+
+        // `ChangeAction` is an enum shape and `RegexPatternString`'s length bounds are
+        // modelled, so both are refused before this handler runs; a pattern string that
+        // satisfies them is stored as given. Whether the string is a regular expression
+        // AWS would compile is what the operation's `WAFInvalidRegexPatternException`
+        // answers, and deciding it means compiling caller text — a caller-driven cost,
+        // and a dependency, this change does not take on. That gap is tracked by its own
+        // report, `issues/things-that-do-not-work/20261024T000000Z-waf-regional-\
+        // updateregexpatternset-accepts-a-pattern-string-that-is-not-a-regex.md`, which
+        // states what a fix needs; it is not guessed at here.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRegexPatternSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // The RegexPatternSet is the CONTAINER the updates go into, and the model
+        // reserves `WAFNonexistentContainerException` for exactly this: "You tried to add
+        // an object to or delete an object from another object that doesn't exist."
+        let Some(stored) = state.regex_pattern_sets.get(&input.regex_pattern_set_id) else {
+            return Err(
+                UpdateRegexPatternSetErrorModeled::WAFNonexistentContainerException(
+                    WAFNonexistentContainerException {
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request that is refused
+        // part-way through leaves the stored RegexPatternSet (and the change token)
+        // exactly as they were. Each step under the lock is a string compare and a push
+        // or a remove over at most `MAX_REGEX_PATTERN_STRINGS` patterns.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let pattern = update.regex_pattern_string.as_str();
+            let changed = if update.action == crate::state::CHANGE_ACTION_INSERT {
+                // One RegexPatternSet holds at most `MAX_REGEX_PATTERN_STRINGS` patterns
+                // — the bound its own modelled shape carries — so the pattern state a
+                // caller can accumulate over many requests is bounded, not just the
+                // number of updates one request may carry.
+                if working.patterns.len() >= crate::state::MAX_REGEX_PATTERN_STRINGS {
+                    return Err(limits_exceeded());
+                }
+                working.insert_pattern(pattern)
+            } else {
+                working.remove_pattern(pattern)
+            };
+            // "The operation failed because there was nothing to do" covers both ways an
+            // update can leave the set as it was: deleting a pattern the set does not
+            // hold, and inserting one it already holds.
+            if !changed {
+                return Err(
+                    UpdateRegexPatternSetErrorModeled::WAFInvalidOperationException(
+                        WAFInvalidOperationException {
+                            message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token.
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateRegexPatternSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let regex_pattern_set_id = working.regex_pattern_set_id.clone();
+        state
+            .regex_pattern_sets
+            .insert(regex_pattern_set_id, working);
+
+        Ok(UpdateRegexPatternSetOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

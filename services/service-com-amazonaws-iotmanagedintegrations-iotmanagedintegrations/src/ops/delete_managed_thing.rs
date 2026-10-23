@@ -200,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.managed_thing_order.retain(|id| id != &input.identifier);
         // A `ClientToken` whose managed thing is gone must not replay into the deleted
         // id, so the idempotency record goes with the resource.
-        store
-            .idempotency_tokens
-            .retain(|_, record| record.managed_thing_id != input.identifier);
+        store.forget_idempotency_tokens_for(
+            crate::state::MANAGED_THING_RESOURCE_TYPE,
+            &input.identifier,
+        );
 
         Ok(DeleteManagedThingOutput)
     }
