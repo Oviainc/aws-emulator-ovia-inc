@@ -48,9 +48,21 @@ pub(crate) fn router() -> MultiServiceRouter {
     router
 }
 
-/// Call one operation and return its HTTP status and parsed body.
+/// Call one operation in the Region this suite's requests are scoped to, and return its
+/// HTTP status and parsed body.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    call_in_region(router, "us-east-1", operation, body).await
+}
+
+/// Call one operation with the request scoped to `region` — what a caller reaching that
+/// Region's endpoint sends — and return its HTTP status and parsed body.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
@@ -62,9 +74,11 @@ pub(crate) async fn call(
         // The router keys on the signing name in the SigV4 credential scope.
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDTEST/20260101/us-east-1/arc-region-switch/aws4_request, \
-             SignedHeaders=host, Signature=00",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDTEST/20260101/{region}/arc-region-switch/aws4_request, \
+                 SignedHeaders=host, Signature=00"
+            ),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),
