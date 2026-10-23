@@ -181,9 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let queue = state::queue_name_from_url(&input.queue_url)
             .and_then(|name| store.queues.get_mut(name))
             .ok_or_else(|| {
-                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(
-                    &input.queue_url,
-                ))
+                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
         // Retention lapses and visibility timeouts were owed by the clock whether or
         // not anybody asked, so applying them here is what makes the message counters

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags `TagKeys` names from the queue's one tag map — the inverse of
+//! `TagQueue`, which upserts into it, and read back by `ListQueueTags`.
+//!
+//! A key the queue does not carry is already in the state the request asks for, so it is
+//! removed idempotently rather than refused: nothing in the model declares an error for an
+//! unknown key, and "Tags are case-sensitive", so a key differing only in case names a
+//! different tag and leaves this one alone.
+//!
+//! A tag is not one of the attributes `GetQueueAttributes` reports, so — exactly as in
+//! `TagQueue` — the queue's `LastModifiedTimestamp` is left where it was.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +169,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagQueue"))
+        use crate::state;
+
+        let _ = ctx;
+        // "The list of tags to be removed from the specified queue": a list that names no
+        // tag removes nothing, a request this operation models no error for — so it rides
+        // the 400 `ValidationException` channel, exactly as an empty `Tags` map does in
+        // `TagQueue`.
+        if input.tag_keys.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "TagKeys must name at least one tag to remove",
+            ));
+        }
+
+        let store = state::service_state(&*self.engine).ok_or_else(|| {
+            UntagQueueErrorModeled::UnsupportedOperation(state::store_unavailable())
+        })?;
+        let mut store = store.lock();
+
+        let name = state::queue_name_from_url(&input.queue_url)
+            .filter(|name| store.queues.contains_key(*name))
+            .map(str::to_string)
+            .ok_or_else(|| {
+                UntagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+            })?;
+
+        let queue = store
+            .queues
+            .get_mut(&name)
+            .expect("the queue was resolved out of this same store");
+        // Each named key is removed; one the queue does not carry leaves the map as it is,
+        // so a repeated request is the same request. Keys are matched verbatim, since
+        // "Tags are case-sensitive".
+        for key in &input.tag_keys {
+            queue.tags.remove(key);
+        }
+        // `last_modified_at` is NOT touched, for the same reason `TagQueue` leaves it
+        // alone: a tag is not an attribute `GetQueueAttributes` reports.
+
+        Ok(UntagQueueOutput)
     }
 }

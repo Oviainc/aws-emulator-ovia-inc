@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! One entry per resource type this emulator really creates: which service owns the type,
-//! and the create and delete calls that make its resources exist and stop existing.
+//! and the create, update and delete calls that make its resources exist, change and stop
+//! existing.
 //!
 //! This is the half of provisioning that is PER RESOURCE TYPE. The half that is not —
 //! reconciling what a deployment declares against what the stack already has, deleting
@@ -14,6 +15,15 @@
 //! [`super::provisioning`](crate::state::provisioning) documents: nothing is created in
 //! any service, and the resource still carries the physical id and attributes
 //! CloudFormation's documented naming rules give it.
+//!
+//! A deployment that re-declares a resource with a DIFFERENT configuration is applied
+//! through the owning service's own update API ([`Provisioner::update`]), which is per
+//! type for the same reason the create is: `AWS::SQS::Queue`'s configuration is its
+//! attributes and its tags, so the change is a `SetQueueAttributes` plus a
+//! `TagQueue`/`UntagQueue` ([`update_queue`]). A type with no arm there has nothing asked
+//! of its service and the deployment reports the change as not applied, exactly as a type
+//! with no create arm is left declared-only — never a stack that completed while the
+//! caller's change went nowhere.
 //!
 //! How a create call is BUILT depends on what the type's properties are:
 //!
@@ -90,6 +100,12 @@ const IAM_ROLE: &str = "AWS::IAM::Role";
 /// `AWS::CodePipeline::Pipeline`: "Ref returns the pipeline name".
 const CODEPIPELINE_PIPELINE: &str = "AWS::CodePipeline::Pipeline";
 
+/// The code a refusal carries where the change a deployment asks for is one this emulator
+/// has not written the owning API call for. It is the same code the scaffold's own 501
+/// answers under (`smithy.framework#NotImplemented`), and not a code any AWS service
+/// answers, so it is never mistaken for one of theirs.
+const NOT_IMPLEMENTED: &str = "NotImplemented";
+
 /// The services whose resources this emulator creates. One variant per resource type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Provisioner {
@@ -149,6 +165,36 @@ impl Provisioner {
                 create_experiment_template(ctx, region, resource).await
             }
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
+        }
+    }
+
+    /// Apply a CHANGED configuration to a resource that already exists, through the owning
+    /// service's own update API, and report what that service decided about it (the same
+    /// [`Created`] an initial create answers with: the attributes it reported now).
+    ///
+    /// `resource` is the record of the resource as it stands — the identity its service
+    /// knows it by, and the properties it was last deployed with — and `declared` is the
+    /// property document this deployment declares for it. The difference between the two is
+    /// what the call carries, so a property neither side changed is not re-sent.
+    ///
+    /// `Ok(None)` is a type this emulator has no update path for YET: nothing is asked of
+    /// the owning service, and [`super::provisioning::reconcile`] reports the change as not
+    /// applied rather than as a success that dropped it. `Err` is that service's own
+    /// refusal of the change — including a change its API cannot make to an existing
+    /// resource, which is the refusal a client would get.
+    pub(super) async fn update(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+        declared: &Value,
+    ) -> Result<Option<Created>, Refusal> {
+        match self {
+            Self::SqsQueue => update_queue(ctx, region, resource, declared).await.map(Some),
+            // Every other type's in-place update is its own entry here, exactly as its
+            // create and delete are: until one is written, nothing is asked of the owning
+            // service and the deployment says so.
+            _ => Ok(None),
         }
     }
 
@@ -1377,6 +1423,107 @@ async fn create_queue(
     Ok(Created::attributes(attributes))
 }
 
+/// Apply a changed `AWS::SQS::Queue` declaration to the queue that already exists.
+///
+/// A queue's configuration is its ATTRIBUTES and its TAGS, and Amazon SQS has an API for
+/// changing each of them on an existing queue, so that is what this calls: one
+/// `SetQueueAttributes` carrying the attributes this deployment states differently (added
+/// or given another value), one `TagQueue` carrying the tags it adds or re-values, and one
+/// `UntagQueue` naming the tag keys it no longer declares. A property neither revision
+/// changed is not sent at all, and nothing is called where nothing changed.
+///
+/// The queue keeps its name, so it keeps the url its `Ref` resolves to and everything it
+/// holds: the change is applied to the queue the stack created rather than replacing it.
+/// The create reported the `QueueUrl` attribute and the queue still answers to it, so this
+/// reports no attribute of its own.
+///
+/// Two changes Amazon SQS will not make to an existing queue are REFUSED rather than
+/// quietly dropped, each with the refusal a client calling that API would get, so the stack
+/// never reports a queue configured differently from its declaration:
+///
+/// * an attribute `SetQueueAttributes` does not take — `FifoQueue` is "an attribute [you
+///   can] provide only during queue creation", so SQS answers `InvalidAttributeName`;
+/// * a property this deployment no longer declares, which AWS resets to that attribute's
+///   documented default. `SetQueueAttributes` has no way to ask for a default and the
+///   defaults are Amazon SQS's own (restating them here would be a second copy of its
+///   documentation), so the removal is answered with `NotImplemented` naming the property.
+async fn update_queue(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let url = resource.physical_resource_id.clone();
+    let before = queue_attributes(&resource.properties);
+    let after = queue_attributes(declared);
+
+    // A property the new declaration drops: nothing is called at all, so the queue is left
+    // exactly as it is and the deployment reports why.
+    if let Some(dropped) = before.keys().find(|name| !after.contains_key(*name)) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not reset the {dropped} property of an existing \
+                 {SQS_QUEUE} that an update no longer declares to Amazon SQS's documented \
+                 default; the resource was left as it is."
+            ),
+        });
+    }
+
+    let changed: Map<String, Value> = after
+        .into_iter()
+        .filter(|(name, value)| before.get(name) != Some(value))
+        .collect();
+    if !changed.is_empty() {
+        call_json_rpc(
+            ctx,
+            SQS_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{SQS_TARGET_PREFIX}.SetQueueAttributes"),
+            &serde_json::json!({ "QueueUrl": url, "Attributes": Value::Object(changed) }),
+        )
+        .await?;
+    }
+
+    let before_tags = queue_tags(&resource.properties);
+    let after_tags = queue_tags(declared);
+    let added: Map<String, Value> = after_tags
+        .iter()
+        .filter(|(key, value)| before_tags.get(*key) != Some(value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !added.is_empty() {
+        call_json_rpc(
+            ctx,
+            SQS_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{SQS_TARGET_PREFIX}.TagQueue"),
+            &serde_json::json!({ "QueueUrl": url, "Tags": Value::Object(added) }),
+        )
+        .await?;
+    }
+    let removed: Vec<Value> = before_tags
+        .keys()
+        .filter(|key| !after_tags.contains_key(*key))
+        .map(|key| Value::String(key.clone()))
+        .collect();
+    if !removed.is_empty() {
+        call_json_rpc(
+            ctx,
+            SQS_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{SQS_TARGET_PREFIX}.UntagQueue"),
+            &serde_json::json!({ "QueueUrl": url, "TagKeys": Value::Array(removed) }),
+        )
+        .await?;
+    }
+
+    Ok(Created::default())
+}
+
 /// Delete the queue a stack created. A queue SQS no longer has (`QueueDoesNotExist`) is
 /// already in the state the delete asks for.
 ///
@@ -1962,7 +2109,7 @@ async fn create_experiment_template(
         // configured differently from the declaration. Refused rather than silently
         // dropped; mapping it is its own fix.
         return Err(Refusal {
-            code: "NotImplemented".to_string(),
+            code: NOT_IMPLEMENTED.to_string(),
             message: format!(
                 "this emulator does not implement the {FIS_REPORT_CONFIGURATION} property of \
                  {}",

@@ -270,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store_bytes = state.retained_message_bytes();
         let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
             return Err(SendMessageErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(&input.queue_url),
+                sqs::queue_does_not_exist(),
             )
             .into());
         };

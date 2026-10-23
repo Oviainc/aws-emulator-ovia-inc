@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the SQS queue-tag slice: `TagQueue` and `ListQueueTags`,
-//! driven over the wire through the shared harness in `support`.
+//! End-to-end tests for the SQS queue-tag slice: `TagQueue`, `UntagQueue` and
+//! `ListQueueTags`, driven over the wire through the shared harness in `support`.
 //!
-//! The rule under test: a queue carries ONE tag map, and `TagQueue` UPSERTS into it —
+//! The rule under test: a queue carries ONE tag map, `TagQueue` UPSERTS into it and
+//! `UntagQueue` removes exactly the keys it names —
 //! "A new tag with a key identical to that of an existing tag overwrites the existing
 //! tag", every key the call does not name keeps the value it had, "Tags are
 //! case-sensitive" and "Amazon SQS interprets tags as character strings" with no
@@ -567,6 +568,180 @@ async fn create_queue_enforces_the_same_tag_restrictions() {
             );
         }
     }
+}
+
+/// One row of the untag table: the tags the queue starts from, a SEQUENCE of `UntagQueue`
+/// calls, and the tag map every later `ListQueueTags` must report.
+struct UntagRow {
+    case: &'static str,
+    existing: &'static [(&'static str, &'static str)],
+    removals: &'static [&'static [&'static str]],
+    remaining: &'static [(&'static str, &'static str)],
+}
+
+/// `UntagQueue` removes exactly the keys it names from the queue's one tag map, and
+/// nothing else: a key the queue does not carry leaves the map as it is (so a repeated
+/// request is the same request), and "Tags are case-sensitive", so a key differing only in
+/// case names a different tag.
+///
+/// The rows span what the rule generalises over: how many keys one call names (one,
+/// several, every one the queue has), whether each names a tag the queue carries, and
+/// whether the keys repeat a call already made.
+#[tokio::test]
+async fn untag_queue_removes_exactly_the_keys_it_names() {
+    let router = emulator();
+    let rows: &[UntagRow] = &[
+        UntagRow {
+            case: "one key of several",
+            existing: &[("Environment", "production"), ("Team", "payments")],
+            removals: &[&["Environment"]],
+            remaining: &[("Team", "payments")],
+        },
+        UntagRow {
+            case: "several keys in one call",
+            existing: &[("A", "1"), ("B", "2"), ("C", "3"), ("D", "4")],
+            removals: &[&["A", "C"]],
+            remaining: &[("B", "2"), ("D", "4")],
+        },
+        UntagRow {
+            case: "every key the queue carries",
+            existing: &[("Only", "tag")],
+            removals: &[&["Only"]],
+            remaining: &[],
+        },
+        UntagRow {
+            case: "a key the queue does not carry leaves the map alone",
+            existing: &[("Environment", "production")],
+            removals: &[&["Absent"]],
+            remaining: &[("Environment", "production")],
+        },
+        UntagRow {
+            case: "the same keys removed twice is the same request",
+            existing: &[("Environment", "production"), ("Team", "payments")],
+            removals: &[&["Team"], &["Team"], &["Team"]],
+            remaining: &[("Environment", "production")],
+        },
+        UntagRow {
+            case: "keys are case-sensitive, so only the key named goes",
+            existing: &[("Environment", "upper"), ("environment", "lower")],
+            removals: &[&["environment"]],
+            remaining: &[("Environment", "upper")],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let url = create_ok(&router, &format!("untag-{index}"), &json!({})).await;
+        let _ = ok(
+            &router,
+            "TagQueue",
+            json!({"QueueUrl": url, "Tags": as_value(&expected(row.existing))}),
+        )
+        .await;
+        assert_eq!(
+            list_tags(&router, &url).await,
+            expected(row.existing),
+            "case {case}: the queue did not start from the tags the row names"
+        );
+
+        for keys in row.removals {
+            let (status, parsed) = call(
+                &router,
+                "UntagQueue",
+                &json!({"QueueUrl": url, "TagKeys": keys}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: UntagQueue {keys:?} expected HTTP 200, got {status} with {parsed}"
+            );
+        }
+
+        assert_eq!(
+            list_tags(&router, &url).await,
+            expected(row.remaining),
+            "case {case}: UntagQueue left the wrong tag map"
+        );
+        // A queue left with no tag reports no `Tags` member at all, exactly as one that
+        // was never tagged does.
+        assert_eq!(
+            reports_a_tags_member(&router, &url).await,
+            !row.remaining.is_empty(),
+            "case {case}: whether a Tags member is reported must follow the tag map"
+        );
+    }
+}
+
+/// Removing tags changes that queue only, and is not an attribute change: another queue's
+/// tags and this queue's reported attribute map are untouched.
+#[tokio::test]
+async fn untag_queue_changes_only_the_queue_it_names() {
+    let router = emulator();
+    let untagged = create_ok(&router, "untag-target", &json!({"VisibilityTimeout": "45"})).await;
+    let other = create_ok(&router, "untag-other", &json!({})).await;
+    for url in [&untagged, &other] {
+        let _ = ok(
+            &router,
+            "TagQueue",
+            json!({"QueueUrl": url, "Tags": {"Environment": "production", "Team": "payments"}}),
+        )
+        .await;
+    }
+    let attributes_before = all_attributes(&router, &untagged).await;
+
+    let _ = ok(
+        &router,
+        "UntagQueue",
+        json!({"QueueUrl": untagged, "TagKeys": ["Environment"]}),
+    )
+    .await;
+
+    assert_eq!(
+        list_tags(&router, &untagged).await,
+        expected(&[("Team", "payments")]),
+        "case the untagged queue: expected only the key named to go"
+    );
+    assert_eq!(
+        list_tags(&router, &other).await,
+        expected(&[("Environment", "production"), ("Team", "payments")]),
+        "case the other queue: untagging one queue must not untag another"
+    );
+    assert_eq!(
+        all_attributes(&router, &untagged).await,
+        attributes_before,
+        "case the untagged queue's attributes: untagging must not change the reported attribute map"
+    );
+}
+
+/// A `TagKeys` list that names no tag removes nothing: refused as a 400
+/// `ValidationException`, exactly as an empty `Tags` map is, and the queue keeps its tags.
+#[tokio::test]
+async fn untag_queue_refuses_a_tag_keys_list_that_names_no_tag() {
+    let router = emulator();
+    let url = create_ok(&router, "empty-tag-keys", &json!({})).await;
+    let _ = ok(
+        &router,
+        "TagQueue",
+        json!({"QueueUrl": url, "Tags": {"Owner": "platform"}}),
+    )
+    .await;
+
+    let (status, parsed) = call(
+        &router,
+        "UntagQueue",
+        &json!({"QueueUrl": url, "TagKeys": []}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "ValidationException"),
+        "case an empty TagKeys list: expected a 400 ValidationException, got {status} with {parsed}"
+    );
+    assert_eq!(
+        list_tags(&router, &url).await,
+        expected(&[("Owner", "platform")]),
+        "case an empty TagKeys list: the refusal must leave the queue's tags alone"
+    );
 }
 
 /// A `Tags` map that names no tag adds nothing: refused as a 400 `ValidationException`,

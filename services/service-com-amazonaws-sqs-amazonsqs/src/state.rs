@@ -737,15 +737,24 @@ pub fn queue_name_from_url(queue_url: &str) -> Option<&str> {
     Some(name)
 }
 
-/// The modelled refusal for a `QueueUrl` no queue answers to.
+/// The message every `QueueDoesNotExist` refusal carries, whatever the request named.
 ///
-/// The payload's wording follows the shape's own documentation: "Ensure that the
-/// `QueueUrl` is correct and that the queue has not been deleted."
-pub fn queue_does_not_exist(queue_url: &str) -> QueueDoesNotExist {
+/// Amazon SQS answers this error with ONE fixed string — "The specified queue does not
+/// exist." — for every operation and every queue: the error CODE
+/// (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
+/// `awsQueryError`) is what identifies the condition, and the message is a constant a
+/// client can match on. It deliberately does not name the queue, so a caller probing for
+/// a queue it may not address is never handed the name it probed back.
+pub const QUEUE_DOES_NOT_EXIST_MESSAGE: &str = "The specified queue does not exist.";
+
+/// The modelled refusal for a `QueueUrl` or `QueueName` no queue of this account answers
+/// to, carrying [`QUEUE_DOES_NOT_EXIST_MESSAGE`] verbatim.
+///
+/// Takes no argument on purpose: nothing of the request may reach this payload, so no
+/// caller can word a message of its own that echoes a url, a name or an owner.
+pub fn queue_does_not_exist() -> QueueDoesNotExist {
     QueueDoesNotExist {
-        message: Some(format!(
-            "The queue referred to by {queue_url} does not exist. Ensure that the QueueUrl is correct and that the queue has not been deleted."
-        )),
+        message: Some(QUEUE_DOES_NOT_EXIST_MESSAGE.to_string()),
     }
 }
 

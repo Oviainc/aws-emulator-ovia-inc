@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call on that url cannot find it.
         if state.remove_queue_by_url(&input.queue_url).is_none() {
             return Err(DeleteQueueErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(&input.queue_url),
+                sqs::queue_does_not_exist(),
             )
             .into());
         }

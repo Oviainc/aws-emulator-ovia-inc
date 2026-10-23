@@ -46,8 +46,9 @@
 //! signed transport each of those calls rides on ([`call_json_rpc`] for a service whose
 //! model declares awsJson, [`call_query`] for one that declares awsQuery — the wire is the
 //! called service's, not this one's). The part that is
-//! per type — which service owns it, and the create and delete calls that make its
-//! resources exist — is [`super::provisioner`], reached only through
+//! per type — which service owns it, and the create, update and delete calls that make its
+//! resources exist, change and stop existing — is [`super::provisioner`], reached only
+//! through
 //! [`provisioner_for`](super::provisioner::provisioner_for), so adding a resource type
 //! never touches the algorithm here.
 //!
@@ -235,6 +236,14 @@ pub struct Materialised {
 /// resources created before it are still reported (with their `materialised` flag set), so
 /// the stack's deletion can clean them up, and the ones after it are reported as the
 /// declaration left them.
+///
+/// A resource the stack already has and this deployment re-declares with DIFFERENT
+/// properties is UPDATED IN PLACE, through the owning service's own update API
+/// ([`super::provisioner::Provisioner::update`]): the resource keeps its identity, so
+/// nothing is created and nothing is deleted, and the stack records the declared
+/// configuration because that is the one now in force. Only a type with no update path
+/// there, and a change the owning service refuses, leave the deployment with a failure —
+/// never a success that dropped the caller's change.
 pub async fn reconcile(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -251,22 +260,57 @@ pub async fn reconcile(
             // The owning service already created exactly this resource and the deployment
             // did not change its identity, so nothing is created again; what that service
             // reported about it, and the configuration it really has, are carried forward.
-            let changed = resource.properties != existing.properties;
+            let declared_properties = resource.properties.clone();
+            let changed = declared_properties != existing.properties;
             carry_forward(existing, &mut resource);
             if changed {
                 // ...but this deployment asks for a DIFFERENT configuration of a resource
-                // that already exists, and changing one in place is not something this
-                // emulator does: the owning service's update API is not called here, so
-                // nothing would have changed there. Reported as a failure of the
-                // deployment rather than a success that dropped the caller's change.
-                outcome.failure = Some(format!(
-                    "The following resource(s) failed to update: [{}]. NotImplemented: this \
-                     emulator does not change the properties of an existing {} in place; the \
-                     resource was left as it is.",
-                    resource.logical_id, resource.resource_type
-                ));
-                outcome.resources.push(resource);
-                break;
+                // that already exists. CloudFormation applies such a change THROUGH the
+                // owning service's own update API, and the stack completes: the resource
+                // keeps its identity, so nothing is created and nothing is deleted. The
+                // call that applies it is the type's own entry
+                // ([`super::provisioner::Provisioner::update`]); a type with no update
+                // path there has nothing asked of its service, and the change is reported
+                // as NOT applied rather than as a success that dropped the caller's
+                // change.
+                let applied = match provisioner_for(&resource.resource_type) {
+                    Some(provisioner) => {
+                        provisioner
+                            .update(ctx, region, &resource, &declared_properties)
+                            .await
+                    }
+                    None => Ok(None),
+                };
+                match applied {
+                    // The owning service applied it, so the configuration in force is the
+                    // DECLARED one — which is what the stack records, and what a later
+                    // deployment and drift detection compare against.
+                    Ok(Some(updated)) => {
+                        resource.attributes.extend(updated.attributes);
+                        resource.properties = declared_properties;
+                    }
+                    Ok(None) => {
+                        outcome.failure = Some(format!(
+                            "The following resource(s) failed to update: [{}]. NotImplemented: \
+                             this emulator does not change the properties of an existing {} in \
+                             place; the resource was left as it is.",
+                            resource.logical_id, resource.resource_type
+                        ));
+                        outcome.resources.push(resource);
+                        break;
+                    }
+                    Err(refusal) => {
+                        // The owning service refused the change: nothing changed there, so
+                        // the deployment reports that refusal rather than a configuration
+                        // nothing applied.
+                        outcome.failure = Some(format!(
+                            "The following resource(s) failed to update: [{}]. {refusal}",
+                            resource.logical_id
+                        ));
+                        outcome.resources.push(resource);
+                        break;
+                    }
+                }
             }
             outcome.resources.push(resource);
             continue;
@@ -384,6 +428,11 @@ fn adopt_minted_identity(resource: &mut StoredResource, assigned: Option<String>
 /// Record what an owning service already created: the resource exists there with the
 /// identity and the configuration it was created with, so the new record carries both
 /// rather than the deployment's own idea of them.
+///
+/// For a resource whose configuration this deployment CHANGES, [`reconcile`] replaces the
+/// properties again with the declared ones once the owning service has applied them — so
+/// the record still states the configuration the resource really has, never one that was
+/// only asked for.
 fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
     resource.materialised = true;
     for (name, value) in &existing.attributes {

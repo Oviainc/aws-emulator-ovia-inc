@@ -1130,8 +1130,11 @@ async fn an_update_creates_the_streams_it_declares_and_deletes_the_ones_it_drops
 }
 
 /// An update that asks for a DIFFERENT configuration of a resource that already exists is
-/// not reported as applied: this emulator does not change a resource in place, so the
-/// stack fails, names the resource, and the resource keeps the configuration it has.
+/// never reported as applied when nothing applied it: a type whose in-place update path
+/// this emulator has not written (a Firehose delivery stream here — the owning service's
+/// update API is not called for it) leaves the stack failed, naming the resource, and the
+/// resource keeps the configuration it has. A type that HAS one is applied in place and
+/// completes, which `cloudformation_provisions_sqs_queues.rs` holds to.
 #[tokio::test]
 async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_stack() {
     let router = build_router();
