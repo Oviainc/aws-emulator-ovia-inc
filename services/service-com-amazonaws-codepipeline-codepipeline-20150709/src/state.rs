@@ -6,10 +6,11 @@
 //! The pipeline definition lifecycle (`CreatePipeline` / `GetPipeline` /
 //! `ListPipelines` / `DeletePipeline`), the custom action types
 //! `CreateCustomActionType` mints and `ListActionTypes` reports, the execution
-//! records `StartPipelineExecution` mints and the stage-transition states
-//! `DisableStageTransition` / `EnableStageTransition` change all live in the one
-//! store reached through [`service_state`], so every handler computes its answer
-//! from persisted state rather than from the request it is answering.
+//! records `StartPipelineExecution` mints, the stage-transition states
+//! `DisableStageTransition` / `EnableStageTransition` change and the webhooks
+//! `PutWebhook` defines all live in the one store reached through [`service_state`],
+//! so every handler computes its answer from persisted state rather than from the
+//! request it is answering.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -17,9 +18,10 @@ use std::time::SystemTime;
 use crate::ops::types::{
     ActionConfigurationProperty, ActionState, ActionType, ActionTypeId, ActionTypeSettings,
     ArtifactDetails, Condition, ConditionState, CurrentRevision, ExecutionDetails,
-    ExecutionTrigger, PipelineDeclaration, PipelineExecution, PipelineExecutionSummary,
-    PipelineMetadata, PipelineSummary, ResolvedPipelineVariable, RuleState, SourceRevision,
-    StageConditionState, StageState, Tag, ThirdPartyJob, TransitionState,
+    ExecutionTrigger, ListWebhookItem, PipelineDeclaration, PipelineExecution,
+    PipelineExecutionSummary, PipelineMetadata, PipelineSummary, ResolvedPipelineVariable,
+    RuleState, SourceRevision, StageConditionState, StageState, Tag, ThirdPartyJob,
+    TransitionState, WebhookDefinition,
 };
 
 /// The region an ARN carries when the request names none.
@@ -171,6 +173,44 @@ pub const MAX_ACTION_TYPES_PER_ACCOUNT: usize = 1000;
 /// `MAX_PIPELINES_PER_ACCOUNT * MAX_EXECUTION_HISTORY_PER_PIPELINE`.
 pub const MAX_EXECUTION_HISTORY_PER_PIPELINE: usize = 1000;
 
+/// The most webhooks this emulator holds for the account before `PutWebhook`
+/// refuses another one.
+///
+/// A bound is required for the same reason the pipeline one is: `webhooks` grows by
+/// one on every accepted create and is released only by `DeleteWebhook`. The refusal
+/// it answers with is the error the model declares for exactly this condition —
+/// `LimitExceededException`. AWS publishes its own webhook quota per account and
+/// adjusts it, so this figure is this emulator's bound rather than a documented
+/// constant.
+pub const MAX_WEBHOOKS_PER_ACCOUNT: usize = 1000;
+
+/// The tag-key prefix AWS reserves for its own tags: "you cannot edit or delete a
+/// tag with the `aws:` prefix", so a caller-supplied key carrying it — in any
+/// letter case, since the reserved namespace is not case-sensitive — is refused with
+/// `InvalidTagsException`.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// What a stored `SecretToken` renders as in a response.
+///
+/// `PutWebhook` and `ListWebhooks` both document "If a secret token was provided, it
+/// will be redacted in the response", so the stored token never leaves the emulator;
+/// the placeholder satisfies `WebhookAuthConfigurationSecretToken`'s modelled
+/// 1..100 length.
+pub const REDACTED_SECRET_TOKEN: &str = "****";
+
+/// The `WebhookAuthenticationType` value whose configuration carries a GitHub HMAC
+/// secret, from the model's enum (`WEBHOOK_AUTHENTICATION_TYPE_VALUES` ->
+/// `GITHUB_HMAC`, `IP`, `UNAUTHENTICATED`).
+pub const AUTHENTICATION_GITHUB_HMAC: &str = "GITHUB_HMAC";
+
+/// The `WebhookAuthenticationType` value whose configuration carries an allowed IP
+/// range.
+pub const AUTHENTICATION_IP: &str = "IP";
+
+/// The `WebhookAuthenticationType` value that "accepts all webhook trigger requests
+/// regardless of origin", so its configuration carries neither property.
+pub const AUTHENTICATION_UNAUTHENTICATED: &str = "UNAUTHENTICATED";
+
 /// The `ActionOwner` a custom action type carries, from the model's enum
 /// (`smithy_query query="shape" shape="ActionOwner"` -> `AWS`, `ThirdParty`,
 /// `Custom`). `ActionTypeId$owner` documents the three values and
@@ -203,6 +243,8 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// so repeating an idempotency token returns the same execution. An entry lives
     /// exactly as long as the execution it names.
     pub idempotency: BTreeMap<(String, String), String>,
+    /// Stored webhooks, keyed by `WebhookDefinition$name`.
+    pub webhooks: BTreeMap<String, Webhook>,
     /// The action types this ACCOUNT registered — the custom ones
     /// `CreateCustomActionType` mints — keyed by their `ActionTypeId`. The action
     /// types the service itself provides are not account state and live in
@@ -366,6 +408,29 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
             .retain(|(pipeline_name, _), _| pipeline_name != name);
     }
 
+    /// A webhook trigger URL in `region` that no stored webhook already uses.
+    ///
+    /// Like [`Self::new_execution_id`]: the 122 random bits make a collision against
+    /// the at most [`MAX_WEBHOOKS_PER_ACCOUNT`] stored URLs unreachable in practice,
+    /// and the store is checked anyway. The check is best-effort and the loop is
+    /// bounded, so a request can never spin: after eight collisions the last
+    /// candidate is returned rather than failing a request over odds of roughly
+    /// 2^-122 per draw.
+    pub fn new_webhook_url(&self, region: &str) -> String {
+        let mut candidate = webhook_url(region, &random_uuid_v4());
+        for _ in 0..8 {
+            if !self
+                .webhooks
+                .values()
+                .any(|webhook| webhook.url == candidate)
+            {
+                break;
+            }
+            candidate = webhook_url(region, &random_uuid_v4());
+        }
+        candidate
+    }
+
     /// The third-party job `job_id`, for a worker that proved it holds the job's
     /// `clientToken`.
     ///
@@ -457,6 +522,216 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         }
         catalog
     }
+}
+
+/// The URL a webhook is triggered on, in the shape CodePipeline generates
+/// (`https://<region>.webhooks.aws/trigger?t=<opaque token>&v=1`).
+///
+/// `PutWebhook` documents that it "returns a unique webhook URL generated by
+/// CodePipeline" to be "supplied to third party source hosting providers", and
+/// `ListWebhookItem$url` is `@required`, so every stored webhook carries one. The
+/// token is the only part that identifies the webhook and it is minted per webhook
+/// by [`ComAmazonawsCodepipelineCodepipeline20150709State::new_webhook_url`], never
+/// derived from the request. This emulator serves no webhook TRIGGER plane, so the
+/// URL is an opaque identifier that nothing here dereferences.
+fn webhook_url(region: &str, token: &str) -> String {
+    format!("https://{region}.webhooks.aws/trigger?t={token}&v=1")
+}
+
+/// One stored webhook: the definition exactly as the caller sent it, plus the
+/// service-owned members `PutWebhook` and `ListWebhooks` report.
+#[derive(Debug, Clone)]
+pub struct Webhook {
+    /// The definition as stored, secret token included — [`Webhook::to_item`] is
+    /// what redacts it on the way out.
+    pub definition: WebhookDefinition,
+    /// The trigger URL minted when the webhook was created, stable for its life.
+    pub url: String,
+    /// This webhook's ARN.
+    pub arn: String,
+    /// The tags applied to the webhook.
+    pub tags: Vec<Tag>,
+    /// When a trigger request last started the target pipeline, or `None` while the
+    /// webhook has never fired.
+    ///
+    /// `ListWebhookItem` reports no created/updated instants, so none are kept: a
+    /// webhook's only service-owned instant is this one.
+    pub last_triggered: Option<SystemTime>,
+}
+
+impl Webhook {
+    /// Store `definition` as a brand-new webhook triggered on `url`.
+    pub fn create(
+        definition: WebhookDefinition,
+        url: String,
+        arn: String,
+        tags: Vec<Tag>,
+    ) -> Self {
+        Self {
+            definition,
+            url,
+            arn,
+            tags,
+            // Nothing has triggered a freshly defined webhook, and this emulator
+            // serves no trigger plane, so the member is absent rather than carrying
+            // an invented instant.
+            last_triggered: None,
+        }
+    }
+
+    /// This webhook as `PutWebhook` and `ListWebhooks` report it, with the secret
+    /// token redacted as both operations document.
+    pub fn to_item(&self) -> ListWebhookItem {
+        let mut definition = self.definition.clone();
+        if definition
+            .authentication_configuration
+            .secret_token
+            .is_some()
+        {
+            definition.authentication_configuration.secret_token =
+                Some(REDACTED_SECRET_TOKEN.to_string());
+        }
+        ListWebhookItem {
+            definition,
+            url: self.url.clone(),
+            // `errorCode`/`errorMessage` report the failure of the LAST webhook
+            // trigger, and this emulator serves no trigger plane, so neither is
+            // invented here.
+            error_message: None,
+            error_code: None,
+            last_triggered: self.last_triggered.map(to_date_time),
+            arn: Some(self.arn.clone()),
+            tags: optional_list(self.tags.clone()),
+        }
+    }
+}
+
+/// A defect in a `WebhookDefinition` that the model's own constraints cannot express,
+/// so it has to be refused by the handler.
+///
+/// Each variant names the modelled error shape that states it, so every caller
+/// refuses one defect in exactly one way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookProblem {
+    /// Refused as `InvalidWebhookFilterPatternException`: one event filter rule is
+    /// not in the format the member documents.
+    FilterPattern(String),
+    /// Refused as `InvalidWebhookAuthenticationParametersException`: the
+    /// authentication configuration does not match the authentication type.
+    Authentication(String),
+}
+
+impl WebhookProblem {
+    /// Why the definition was refused. Built from the request, so the caller can fix
+    /// the definition from this text alone.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::FilterPattern(message) | Self::Authentication(message) => message,
+        }
+    }
+}
+
+/// Refuse a `WebhookDefinition` whose filters or authentication parameters cannot
+/// describe a webhook.
+///
+/// Two documented rules, neither expressible as a Smithy constraint:
+///
+/// * `WebhookFilterRule$jsonPath` is "a JsonPath expression that is applied to the
+///   body/payload of the webhook", so a value that is not a JsonPath expression at
+///   all can never select anything.
+/// * `WebhookAuthConfiguration` documents which property each authentication type
+///   uses: "For `GITHUB_HMAC`, only the `SecretToken` property must be set", "For
+///   `IP`, only the `AllowedIPRange` property must be set. This property must be set
+///   to a valid CIDR range", and `UNAUTHENTICATED` "accepts all webhook trigger
+///   requests regardless of origin", so it uses neither.
+pub fn validate_webhook_definition(
+    definition: &WebhookDefinition,
+) -> Result<(), WebhookProblem> {
+    // What reaches the expression parser is bounded by the model, and the boundary
+    // validator enforces both bounds BEFORE this runs: `WebhookFilters` is
+    // `@length(min: 0, max: 5)` and `JsonPath` is `@length(min: 1, max: 150)`
+    // (`smithy_query query="shape" shape="WebhookFilters,JsonPath"`), so at most five
+    // strings of at most 150 characters each are parsed per request — no part of the
+    // request body's size reaches the parser.
+    for (index, filter) in definition.filters.iter().enumerate() {
+        if ::serde_json_path::JsonPath::parse(&filter.json_path).is_err() {
+            return Err(WebhookProblem::FilterPattern(format!(
+                "filters[{index}].jsonPath {:?} is not a JsonPath expression",
+                filter.json_path
+            )));
+        }
+    }
+
+    let configuration = &definition.authentication_configuration;
+    let secret_token = configuration
+        .secret_token
+        .as_deref()
+        .filter(|token| !token.is_empty());
+    let allowed_ip_range = configuration
+        .allowed_ip_range
+        .as_deref()
+        .filter(|range| !range.is_empty());
+    let authentication = definition.authentication.as_str();
+    let (wants_secret_token, wants_allowed_ip_range) = match authentication {
+        AUTHENTICATION_GITHUB_HMAC => (true, false),
+        AUTHENTICATION_IP => (false, true),
+        AUTHENTICATION_UNAUTHENTICATED => (false, false),
+        // `WebhookAuthenticationType` is a modelled enum, so the boundary validator
+        // refuses any other value before this runs; a value that reaches here is one
+        // no authentication configuration can be checked against.
+        other => {
+            return Err(WebhookProblem::Authentication(format!(
+                "authentication {other:?} is not a supported authentication type"
+            )))
+        }
+    };
+
+    for (member, supplied, wanted) in [
+        ("SecretToken", secret_token.is_some(), wants_secret_token),
+        (
+            "AllowedIPRange",
+            allowed_ip_range.is_some(),
+            wants_allowed_ip_range,
+        ),
+    ] {
+        if supplied != wanted {
+            let requirement = if wanted { "requires" } else { "does not use" };
+            return Err(WebhookProblem::Authentication(format!(
+                "authentication {authentication} {requirement} authenticationConfiguration.{member}"
+            )));
+        }
+    }
+
+    if let Some(range) = allowed_ip_range.filter(|range| !is_cidr_range(range)) {
+        return Err(WebhookProblem::Authentication(format!(
+            "authenticationConfiguration.AllowedIPRange {range:?} is not a valid CIDR range"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `range` is a CIDR range — an IP address and a prefix length the address
+/// family allows (32 bits for IPv4, 128 for IPv6) — as
+/// `WebhookAuthConfiguration$AllowedIPRange` requires ("This property must be set to
+/// a valid CIDR range").
+///
+/// The address is parsed by `std::net::IpAddr`, so no hand-written address grammar
+/// decides what an address is.
+fn is_cidr_range(range: &str) -> bool {
+    let Some((address, prefix_length)) = range.split_once('/') else {
+        return false;
+    };
+    let Ok(address) = address.parse::<::std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix_length) = prefix_length.parse::<u8>() else {
+        return false;
+    };
+    let bits = match address {
+        ::std::net::IpAddr::V4(_) => 32,
+        ::std::net::IpAddr::V6(_) => 128,
+    };
+    prefix_length <= bits
 }
 
 /// Why a job worker's call naming a third-party job cannot be served, as
@@ -1144,7 +1419,9 @@ impl TagProblem {
 ///
 /// * at most [`MAX_TAGS_PER_RESOURCE`] tags on one resource;
 /// * one key at most once — a map from key to value cannot hold a key twice, so a
-///   list naming one key twice does not describe a tag set.
+///   list naming one key twice does not describe a tag set;
+/// * no key in AWS's reserved [`RESERVED_TAG_KEY_PREFIX`] namespace, which a caller
+///   may not set, matched in any letter case.
 pub fn validate_tags(tags: &[Tag]) -> Result<(), TagProblem> {
     if tags.len() > MAX_TAGS_PER_RESOURCE {
         return Err(TagProblem::TooMany(format!(
@@ -1154,6 +1431,19 @@ pub fn validate_tags(tags: &[Tag]) -> Result<(), TagProblem> {
     }
     let mut seen = BTreeSet::new();
     for tag in tags {
+        // `str::get` answers `None` rather than panicking when the key's first four
+        // bytes are not a character boundary, so a key that cannot carry the prefix
+        // is simply not one.
+        if tag
+            .key
+            .get(..RESERVED_TAG_KEY_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+        {
+            return Err(TagProblem::Invalid(format!(
+                "tags names the key {} in the reserved {RESERVED_TAG_KEY_PREFIX} namespace",
+                tag.key
+            )));
+        }
         if !seen.insert(tag.key.as_str()) {
             return Err(TagProblem::Invalid(format!(
                 "tags names the key {} more than once",
@@ -1564,6 +1854,9 @@ pub const CURSOR_PIPELINE: &str = "pipeline";
 /// The cursor kind a `ListPipelineExecutions` token carries.
 pub const CURSOR_EXECUTION: &str = "execution";
 
+/// The cursor kind a `ListWebhooks` token carries.
+pub const CURSOR_WEBHOOK: &str = "webhook";
+
 /// The cursor kind a `ListActionTypes` token carries.
 pub const CURSOR_ACTION_TYPE: &str = "actionType";
 
@@ -1572,20 +1865,20 @@ pub const CURSOR_ACTION_TYPE: &str = "actionType";
 /// Base64 of `<kind>:<key>` (the encoding AWS's own opaque tokens use, from
 /// `aws_smithy_types::base64`): opaque to the caller, round-trips exactly, and stays
 /// inside `NextToken`'s modelled 1..2048 length for every key this service pages
-/// over (a pipeline name is at most 100 characters, an execution id 36, and an
-/// action type's four `ActionTypeId` members at most 8 + 10 + 35 + 9). The kind
-/// prefix is what lets [`decode_page_token`] reject a token this listing never
-/// issued; neither a `PipelineName` nor a `PipelineExecutionId` can contain `:`,
-/// so the prefix is unambiguous.
+/// over (a pipeline or webhook name is at most 100 characters, an execution id 36,
+/// and an action type's four `ActionTypeId` members at most 8 + 10 + 35 + 9). The
+/// kind prefix is what lets [`decode_page_token`] reject a token this listing never
+/// issued; none of `PipelineName`, `WebhookName` or `PipelineExecutionId` can contain
+/// `:`, so the prefix is unambiguous.
 ///
 /// Every listing applies ONE rule to a cursor: the page resumes at the first item
 /// still in the listing's order at or after the key, and the token is refused with
 /// `InvalidNextTokenException` only when it is not a cursor that listing issued or
 /// no such position exists. They differ only in what their order makes possible:
-/// `ListPipelines` and `ListActionTypes` are ordered BY the key, so an item deleted
-/// between pages still has a position (the next key) and paging continues;
-/// `ListPipelineExecutions` is ordered by when each execution started, so an id that
-/// is no longer retained has no position at all and its cursor is refused.
+/// `ListPipelines`, `ListWebhooks` and `ListActionTypes` are ordered BY the key, so
+/// an item deleted between pages still has a position (the next key) and paging
+/// continues; `ListPipelineExecutions` is ordered by when each execution started, so
+/// an id that is no longer retained has no position at all and its cursor is refused.
 pub fn encode_page_token(kind: &str, key: &str) -> String {
     ::aws_smithy_types::base64::encode(format!("{kind}:{key}"))
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWebhooks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWebhooks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWebhooks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the webhooks `PutWebhook` stored, one page at a time in webhook-name
+//! order, each with the URL and ARN that definition minted and its secret token
+//! redacted. Reporting only: nothing about a stored webhook changes because it was
+//! listed.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +108,11 @@ impl From<ListWebhooksErrorModeled> for ListWebhooksError {
     }
 }
 
+/// The largest page `ListWebhooks` serves, and the page size a request that names no
+/// `MaxResults` gets: the maximum the model allows for that member (`MaxResults`,
+/// `@range(min: 1, max: 100)`).
+const MAX_WEBHOOKS_PER_PAGE: usize = 100;
+
 /// The `ListWebhooks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +149,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWebhooks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWebhooksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWebhooks"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let state = state.lock();
+
+        // Where this page starts: the first stored name at or after the one the
+        // caller's cursor names (see `state::encode_page_token` for the rule every
+        // listing shares), else the first stored webhook.
+        let start = match input.next_token.as_deref() {
+            None => ::std::ops::Bound::Unbounded,
+            Some(token) => {
+                let key = crate::state::decode_page_token(crate::state::CURSOR_WEBHOOK, token)
+                    .ok_or_else(|| {
+                        ListWebhooksError::from(
+                            ListWebhooksErrorModeled::InvalidNextTokenException(
+                                InvalidNextTokenException {
+                                    message: Some(
+                                        "NextToken was not issued by ListWebhooks".to_string(),
+                                    ),
+                                },
+                            ),
+                        )
+                    })?;
+                ::std::ops::Bound::Included(key)
+            }
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator is what refuses an out-of-range request before this handler
+        // runs; the clamp keeps the page bound local to the growth site, so the
+        // vector below cannot exceed it whatever reaches here.
+        let limit = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_WEBHOOKS_PER_PAGE)
+            .clamp(1, MAX_WEBHOOKS_PER_PAGE);
+
+        let mut webhooks = Vec::new();
+        let mut next_token = None;
+        for (name, webhook) in state.webhooks.range((start, ::std::ops::Bound::Unbounded)) {
+            if webhooks.len() == limit {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::CURSOR_WEBHOOK,
+                    name,
+                ));
+                break;
+            }
+            webhooks.push(webhook.to_item());
+        }
+
+        Ok(ListWebhooksOutput {
+            webhooks: Some(webhooks),
+            next_token,
+        })
     }
 }

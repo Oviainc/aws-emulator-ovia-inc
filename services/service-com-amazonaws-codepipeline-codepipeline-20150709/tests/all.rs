@@ -31,3 +31,5 @@ mod third_party_job_results;
 mod third_party_jobs;
 #[path = "all/update_pipeline.rs"]
 mod update_pipeline;
+#[path = "all/webhooks.rs"]
+mod webhooks;

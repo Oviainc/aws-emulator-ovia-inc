@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Parses a webhook filter's `jsonPath` so `PutWebhook` refuses one that is not a
+# JsonPath expression, rather than this crate hand-writing the grammar.
+serde_json_path = "0.7"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
