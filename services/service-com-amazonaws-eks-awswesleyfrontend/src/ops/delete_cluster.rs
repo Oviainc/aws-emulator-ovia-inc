@@ -199,6 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name in the same Region must not inherit the deleted cluster's
         // associations.
         guard.remove_pod_identity_associations_for_cluster(&key.0, &key.1);
+        // And so is a managed node group, for the same reason.
+        guard.remove_nodegroups_for_cluster(&key.0, &key.1);
         record.status = STATUS_DELETING.to_string();
         // The cluster is gone, so the `CREATING` -> `ACTIVE` move the clock owed it is
         // no longer owed to anybody.

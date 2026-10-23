@@ -2645,6 +2645,9 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// AS2 profiles by `ProfileId` (`"p-" + 17 hex`). `BTreeMap` so `ListProfiles`
     /// pages in a stable, resumable order, like [`Self::servers`].
     pub profiles: BTreeMap<String, Profile>,
+    /// Imported certificates by `CertificateId` (`"cert-" + 17 hex`). `BTreeMap` so
+    /// `ListCertificates` pages in a stable, resumable order, like [`Self::profiles`].
+    pub certificates: BTreeMap<String, Certificate>,
     /// Workflows by `WorkflowId` (`"w-" + 17 hex`). `BTreeMap` so `ListWorkflows` pages
     /// in a stable, resumable order.
     pub workflows: BTreeMap<String, Workflow>,
@@ -3069,6 +3072,103 @@ impl ComAmazonawsTransferTransferserviceState {
     /// [`MAX_ACCESSES_PER_SERVER`].
     pub fn server_has_access_capacity(&self, server_id: &str) -> bool {
         self.accesses_of(server_id).count() < MAX_ACCESSES_PER_SERVER
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The imported-certificate plane
+// ---------------------------------------------------------------------------
+//
+// A certificate is an ACCOUNT-level resource (its id is the only identifier any
+// certificate operation takes), so the records live in one map keyed by
+// `CertificateId`, like [`ComAmazonawsTransferTransferserviceState::profiles`] — the
+// AS2 profiles whose `CertificateIds` name them.
+//
+// `Status` is DERIVED at read time ([`Certificate::status`]) rather than stored,
+// because it is a function of the CLOCK and the certificate's validity window: a
+// certificate whose `InactiveDate` has passed must not still read as `ACTIVE`, and no
+// caller has to be made to touch the record for the clock's own effect to show.
+
+/// `CertificateStatusType`'s `ACTIVE`: the clock is inside the certificate's validity
+/// window. (`smithy_query(query="shape",shape="CertificateStatusType")` reports the
+/// whole value set `[ACTIVE, PENDING_ROTATION, INACTIVE]`.)
+pub const CERTIFICATE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `CertificateStatusType`'s `PENDING_ROTATION`: the certificate is not active yet —
+/// its modelled doc is "PENDING_ROTATION means that this certificate will replace the
+/// current certificate when it expires".
+pub const CERTIFICATE_STATUS_PENDING_ROTATION: &str = "PENDING_ROTATION";
+
+/// `CertificateStatusType`'s `INACTIVE`: the certificate's validity window has closed.
+pub const CERTIFICATE_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// `CertificateType`'s `CERTIFICATE` — the type of a certificate imported WITHOUT a
+/// private key. (`smithy_query(query="shape",shape="CertificateType")` reports
+/// `[CERTIFICATE, CERTIFICATE_WITH_PRIVATE_KEY]`.)
+pub const CERTIFICATE_TYPE_CERTIFICATE: &str = "CERTIFICATE";
+
+/// `CertificateType`'s `CERTIFICATE_WITH_PRIVATE_KEY` — "If a private key has been
+/// specified for the certificate, its type is `CERTIFICATE_WITH_PRIVATE_KEY`".
+pub const CERTIFICATE_TYPE_WITH_PRIVATE_KEY: &str = "CERTIFICATE_WITH_PRIVATE_KEY";
+
+/// `arn:aws:transfer:<region>:<account>:certificate/<CertificateId>`.
+///
+/// The same shape the model's `aws.api#arn` templates give every other account-level
+/// resource of this service (`profile/{ProfileId}`, `connector/{ConnectorId}`), with
+/// the resource name the API uses for this one.
+pub fn certificate_arn(region: &str, certificate_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("certificate/{certificate_id}"))
+}
+
+/// One imported certificate, keyed by `CertificateId`.
+///
+/// Holds what a certificate READER reports about the record: the minted id, its ARN,
+/// how the certificate is used, its type, the validity window its status follows and
+/// the caller's description. The certificate material itself, its serial and its
+/// `NotBefore`/`NotAfter` dates belong to `DescribeCertificate`'s projection and
+/// arrive with the import that can parse them (`ImportCertificate` is still a scaffold
+/// with its own issue), so nothing is invented for them here.
+#[derive(Debug, Clone)]
+pub struct Certificate {
+    /// The minted `cert-` + 17 hex-digit identifier (`^cert-([0-9a-f]{17})$`).
+    pub certificate_id: String,
+    /// `arn:aws:transfer:<region>:<account>:certificate/<CertificateId>`.
+    pub arn: String,
+    /// `CertificateUsageType`: `SIGNING`, `ENCRYPTION` or `TLS`.
+    pub usage: String,
+    /// `CertificateType`: [`CERTIFICATE_TYPE_CERTIFICATE`] or
+    /// [`CERTIFICATE_TYPE_WITH_PRIVATE_KEY`].
+    pub certificate_type: String,
+    /// `ActiveDate`: when the certificate becomes active, resolved at import time from
+    /// the caller's value or the certificate's own `NotBeforeDate`. `None` leaves the
+    /// window open at the start, so the certificate is active from the first read.
+    pub active_date: Option<SystemTime>,
+    /// `InactiveDate`: when the certificate becomes inactive, resolved the same way
+    /// from `NotAfterDate`. `None` leaves the window open at the end.
+    pub inactive_date: Option<SystemTime>,
+    /// The caller's `Description`, absent when the import named none.
+    pub description: Option<String>,
+}
+
+impl Certificate {
+    /// `Status` at instant `now`: DERIVED from the validity window, never stored.
+    ///
+    /// `Status`' modelled doc is "If you set values for these parameters
+    /// [`ActiveDate`/`InactiveDate`], those values are used to determine whether the
+    /// certificate has a status of ACTIVE or INACTIVE", and `PENDING_ROTATION` "means
+    /// that this certificate will replace the current certificate when it expires" —
+    /// so the certificate is `ACTIVE` exactly while the clock is inside the half-open
+    /// window `[ActiveDate, InactiveDate)`, `PENDING_ROTATION` before it opens (the
+    /// certificate is imported but not in use yet) and `INACTIVE` once it has closed.
+    /// An absent bound leaves that end of the window open.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.active_date.is_some_and(|active_from| now < active_from) {
+            CERTIFICATE_STATUS_PENDING_ROTATION
+        } else if self.inactive_date.is_some_and(|inactive_from| now >= inactive_from) {
+            CERTIFICATE_STATUS_INACTIVE
+        } else {
+            CERTIFICATE_STATUS_ACTIVE
+        }
     }
 }
 

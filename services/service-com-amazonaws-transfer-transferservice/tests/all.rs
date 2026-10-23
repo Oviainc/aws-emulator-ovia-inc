@@ -15,6 +15,8 @@
 mod access_lifecycle;
 #[path = "all/as2_profile_listing.rs"]
 mod as2_profile_listing;
+#[path = "all/certificate_listing.rs"]
+mod certificate_listing;
 #[path = "all/connector_configuration.rs"]
 mod connector_configuration;
 #[path = "all/connector_listing.rs"]

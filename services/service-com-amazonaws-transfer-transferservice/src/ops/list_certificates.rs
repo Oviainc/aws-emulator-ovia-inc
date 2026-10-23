@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored imported certificates in `BTreeMap` (`CertificateId`) order, with
+//! the same page bound and opaque-token contract as `ListProfiles`/`ListConnectors`.
+//! Every member it reports comes out of the stored record, except `Status`, which the
+//! record DERIVES from the clock and its own validity window
+//! ([`crate::state::Certificate::status`]). Reports stored state and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificates"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListCertificatesErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        // A token this service did not hand out resumes nothing, so it is refused
+        // rather than silently restarting the listing.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListCertificatesErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "The NextToken is not valid".to_string(),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // ONE instant for the whole page, so two certificates sharing a validity
+        // window cannot report statuses read off two different clock values.
+        let now = ::std::time::SystemTime::now();
+
+        let guard = state.lock();
+
+        // ONE walk of the certificate map: the records to render come straight out of
+        // it, so no row is looked up a second time.
+        let stored: Vec<&st::Certificate> = guard.certificates.values().collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|certificate| certificate.certificate_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let certificates = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedCertificate {
+                arn: Some(stored.arn.clone()),
+                certificate_id: Some(stored.certificate_id.clone()),
+                usage: Some(stored.usage.clone()),
+                // Derived from the stored window and the one instant above, so a
+                // certificate whose window has closed cannot read as active.
+                status: Some(stored.status(now).to_string()),
+                active_date: stored.active_date.map(::aws_smithy_types::DateTime::from),
+                inactive_date: stored
+                    .inactive_date
+                    .map(::aws_smithy_types::DateTime::from),
+                r#type: Some(stored.certificate_type.clone()),
+                description: stored.description.clone(),
+            })
+            .collect();
+
+        Ok(ListCertificatesOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            certificates,
+        })
     }
 }
