@@ -263,6 +263,17 @@ pub(crate) fn generated_host_key() -> (String, String) {
     (material, fingerprint)
 }
 
+/// An OpenSSH ED25519 PUBLIC key, in the `key-type key-body comment` form
+/// `ssh-keygen` writes, generated here by the OpenSSH key-format crate — so a suite
+/// that needs a real trusted host key does not paste one in.
+pub(crate) fn generated_public_key() -> String {
+    let keypair = ssh_key::private::Ed25519Keypair::random(&mut ssh_key::rand_core::OsRng);
+    ssh_key::PrivateKey::from(keypair)
+        .public_key()
+        .to_openssh()
+        .expect("the generated key encodes as an OpenSSH public key")
+}
+
 /// The SSH algorithm name of private key MATERIAL, read back out of the material by
 /// the OpenSSH key-format crate — one of the values `DescribedHostKey.Type` documents
 /// (`ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`).

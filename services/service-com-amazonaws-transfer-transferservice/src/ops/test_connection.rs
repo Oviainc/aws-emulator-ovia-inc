@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the `ConnectorId` against stored state and reports the verdict that
+//! connector's stored configuration earns:
+//!
+//! * a `ConnectorId` the store does not hold is not found;
+//! * a connector that configures no SFTP connection (an AS2 one) has no connection for
+//!   this call to test, so it is refused with the modelled `InvalidRequestException`;
+//! * otherwise the verdict travels in the modelled `Status`/`StatusMessage` pair, at
+//!   this operation's own documented failure state `ERROR`, with the message naming the
+//!   first defect the stored SFTP configuration carries — no secret to authenticate
+//!   with, no trusted host key, or a trusted host key that is not a key — or, when it
+//!   carries none, saying that the connection itself was never verified.
+//!
+//! `Status` `OK` and `SftpConnectionDetails.HostKey` are properties of a session with
+//! the partner's SFTP server that really happened ("successful test"; a host key
+//! "returned during the initial connection attempt"). This emulator opens no outbound
+//! connection, so no session can run here: both would report a connection nothing made,
+//! and this handler reports neither. See [`crate::state::TEST_CONNECTION_STATUS_ERROR`]
+//! and [`crate::state::sftp_connection_status_message`], where the verdict and every
+//! text it carries are built.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +170,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestConnection"))
+        use crate::state as st;
+
+        // A pure read: this operation reports a verdict on the stored connector and
+        // writes nothing, so a test leaves the next caller exactly what it found. It
+        // reads no request metadata either; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            TestConnectionErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // The connector is the resource the request is addressed at, so it is resolved
+        // FIRST: a `ConnectorId` the store does not hold is not found — never a service
+        // fault, and never a failed test.
+        let Some(connector) = guard.connectors.get(&input.connector_id) else {
+            return Err(st::not_found(
+                TestConnectionErrorModeled::ResourceNotFoundException(st::unknown_connector(
+                    &input.connector_id,
+                )),
+            ));
+        };
+
+        // What this operation tests is an SFTP connection; a connector that configures
+        // none has nothing for it to test.
+        let Some(sftp_config) = connector.sftp_config.as_ref() else {
+            return Err(TestConnectionErrorModeled::InvalidRequestException(
+                st::connector_configures_no_sftp_connection(),
+            )
+            .into());
+        };
+
+        Ok(TestConnectionOutput {
+            // "Returns the identifier of the connector object that you are testing" —
+            // the connector this verdict is about, read back out of the store.
+            connector_id: Some(connector.connector_id.clone()),
+            status: Some(st::TEST_CONNECTION_STATUS_ERROR.to_string()),
+            status_message: Some(st::sftp_connection_status_message(sftp_config).to_string()),
+            // The remote server's host key is observed ON the connection attempt. None
+            // was made, so none was observed, and an invented key would name a server
+            // nothing talked to.
+            sftp_connection_details: None,
+        })
     }
 }

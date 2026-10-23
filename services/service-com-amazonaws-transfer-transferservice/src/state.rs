@@ -24,6 +24,11 @@
 //! stored ARN and reads or rewrites that resource's own `tags` — which is why a tag
 //! written through `TagResource` is at once what the resource's own reader reports.
 //!
+//! The verdict `TestConnection` reports on a stored SFTP connector is built here as
+//! well ([`TEST_CONNECTION_STATUS_ERROR`], [`sftp_connection_status_message`]): it is
+//! decided from that connector's stored configuration alone, so the rule for what
+//! counts as a usable configuration lives beside the configuration itself.
+//!
 //! `UserCount` and `SshPublicKeyCount` are DERIVED at read time ([`
 //! ComAmazonawsTransferTransferserviceState::user_count`],
 //! [`User::ssh_public_key_count`]) rather than stored, so they cannot go stale when a
@@ -1641,6 +1646,135 @@ pub fn resolve_sftp_connector_config(requested: SftpConnectorConfig) -> SftpConn
             DEFAULT_MAX_CONCURRENT_CONNECTIONS
         },
         ..requested
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Testing an SFTP connector's connection
+// -----------------------------------------------------------------------------
+//
+// `TestConnection`'s whole answer is a verdict on ONE connector: `Status` is "OK for
+// successful test, or ERROR if the test fails", `StatusMessage` is "Connection
+// succeeded ... Or, ... a descriptive error message if the test fails", and
+// `SftpConnectionDetails.HostKey` is "the SSH public key of the remote SFTP server ...
+// returned during the initial connection attempt". The three texts below each state
+// one defect the STORED configuration carries, decided from that configuration alone;
+// the fourth states that the connection itself was never verified. Each is a FIXED
+// text per condition carrying no request data, for the reason this module's docs give.
+
+/// `TestConnection`'s `Status` for a test that succeeded.
+///
+/// `Status` is modelled as a plain string, so the two values the operation documents
+/// ("Returns OK for successful test, or ERROR if the test fails") live here as
+/// constants. NOTHING in this emulator reports this one — see
+/// [`TEST_CONNECTION_STATUS_ERROR`].
+pub const TEST_CONNECTION_STATUS_OK: &str = "OK";
+
+/// `TestConnection`'s `Status` for a test that did not succeed, and the status every
+/// test in this emulator reports.
+///
+/// `OK` is documented as a "successful test" and `SftpConnectionDetails.HostKey` as a
+/// key "returned during the initial connection attempt": both are properties of a
+/// session with the partner's SFTP server that really happened. This emulator opens no
+/// outbound connection, so no attempt can run and nothing here can report that one
+/// succeeded — the test ends in the operation's own documented failure state, with
+/// [`sftp_connection_status_message`] saying why, and reports no observed host key.
+pub const TEST_CONNECTION_STATUS_ERROR: &str = "ERROR";
+
+/// `StatusMessage` for an SFTP configuration that names no secret to authenticate
+/// with. `UserSecretId` is "the identifier for the secret ... that contains the SFTP
+/// user's private key, password, or both", so without it the connector has no
+/// credentials to offer; the second sentence is the model's own troubleshooting text
+/// for that condition.
+const SFTP_NO_USER_SECRET: &str = "The connector configuration names no UserSecretId, \
+     so the SFTP user's credentials cannot be read. Verify that the secret exists and \
+     is formatted correctly.";
+
+/// `StatusMessage` for an SFTP configuration that trusts no host key.
+///
+/// `TrustedHostKeys` is "the public portion of the host key, or keys, that are used to
+/// identify the external server to which you are connecting", and is "optional for
+/// `CreateConnector` [because] you can use `TestConnection` to retrieve the server host
+/// key during the initial connection attempt" — an attempt this emulator cannot make,
+/// so a connector that trusts none has nothing to identify the remote server by.
+const SFTP_NO_TRUSTED_HOST_KEY: &str = "The connector configuration carries no \
+     TrustedHostKeys, so the remote server cannot be identified. Verify that the \
+     trusted host key in the connector configuration matches the ssh-keyscan output.";
+
+/// `StatusMessage` for an SFTP configuration whose trusted host key is not a key.
+///
+/// `TrustedHostKeys`' documented form is "`key-type key-body`", the "`<key type>` and
+/// `<body base64>`" elements of an SSH public key; a value [`ssh_key`] cannot read as
+/// one is not a host key at all, so it can never match what the remote server presents
+/// — whatever that server turns out to be.
+const SFTP_UNREADABLE_TRUSTED_HOST_KEY: &str = "A TrustedHostKeys entry in the \
+     connector configuration is not an SSH public key in 'key-type key-body' form, so \
+     it can never match the remote server's host key. Verify that the trusted host key \
+     in the connector configuration matches the ssh-keyscan output.";
+
+/// `StatusMessage` for an SFTP configuration that carries no defect this emulator can
+/// decide from stored state: the test got as far as the connection itself, which is
+/// what this emulator does not make.
+const SFTP_CONNECTION_NOT_VERIFIED: &str = "The stored connector configuration is \
+     complete, but the connection to the remote SFTP server could not be verified: \
+     this emulator opens no outbound connection, so no SFTP session was established \
+     and no remote host key was observed.";
+
+/// Whether `material` is an SSH PUBLIC key this service can read.
+///
+/// Asks [`ssh_key`] — the crate that implements the OpenSSH key formats — rather than
+/// matching on the text, so what counts as a key is the format itself: the
+/// `key-type key-body [comment]` form `ssh-keygen` writes, and not, say, the
+/// `host key-type key-body` line `ssh-keyscan` prints, whose host-name element the
+/// model documents as one a caller must NOT paste into `TrustedHostKeys`.
+///
+/// Crate-private: the rule a handler needs is the whole verdict
+/// ([`sftp_connection_status_message`]), not this one predicate.
+pub(crate) fn is_readable_ssh_public_key(material: &str) -> bool {
+    ::ssh_key::PublicKey::from_openssh(material).is_ok()
+}
+
+/// The `StatusMessage` a test of the SFTP configuration `config` reports: the FIRST
+/// defect it carries that makes an SFTP session impossible, or
+/// [`SFTP_CONNECTION_NOT_VERIFIED`] when it carries none.
+///
+/// Every branch is decided from the stored configuration alone — no request data
+/// reaches the text, and nothing here claims an outcome for a session nothing opened.
+pub fn sftp_connection_status_message(config: &SftpConnectorConfig) -> &'static str {
+    let names_secret = config
+        .user_secret_id
+        .as_deref()
+        .is_some_and(|secret| !secret.trim().is_empty());
+    if !names_secret {
+        return SFTP_NO_USER_SECRET;
+    }
+
+    let trusted_host_keys = config.trusted_host_keys.as_deref().unwrap_or_default();
+    if trusted_host_keys.is_empty() {
+        return SFTP_NO_TRUSTED_HOST_KEY;
+    }
+    if trusted_host_keys
+        .iter()
+        .any(|key| !is_readable_ssh_public_key(key))
+    {
+        return SFTP_UNREADABLE_TRUSTED_HOST_KEY;
+    }
+
+    SFTP_CONNECTION_NOT_VERIFIED
+}
+
+/// `TestConnection`'s refusal for a connector that configures no SFTP connection.
+///
+/// The operation "tests whether your SFTP connector is set up successfully", and its
+/// whole output — the `Status`, the `StatusMessage`, the remote server's host key — is
+/// about an SFTP session. An AS2 connector configures none (`CreateConnector` takes
+/// "exactly one configuration object: either for AS2 (`As2Config`) or SFTP
+/// (`SftpConfig`)"), so there is no connection for this call to test: a malformed
+/// request, on the same reading [`not_configured_for_external_auth`] gives
+/// `TestIdentityProvider` on a server that delegates authentication to nothing.
+pub fn connector_configures_no_sftp_connection() -> InvalidRequestException {
+    InvalidRequestException {
+        message: required_when("SftpConfig", "a connector's connection is tested"),
     }
 }
 

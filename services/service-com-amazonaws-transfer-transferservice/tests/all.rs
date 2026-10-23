@@ -19,6 +19,8 @@ mod as2_profile_listing;
 mod certificate_listing;
 #[path = "all/connector_configuration.rs"]
 mod connector_configuration;
+#[path = "all/connector_connection_test.rs"]
+mod connector_connection_test;
 #[path = "all/connector_listing.rs"]
 mod connector_listing;
 #[path = "all/connector_updates.rs"]
