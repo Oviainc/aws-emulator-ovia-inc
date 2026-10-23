@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterNotificationHub
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterNotificationHub`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterNotificationHub::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one `NotificationHub` per Region: inserts it in `REGISTERING`, which
+//! the clock moves to `ACTIVE` a short span later. Bounded by the documented
+//! maximum of one hub per Region and three hubs per account.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterNotificationHub` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterNotificationHubErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterNotificationHub"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterNotificationHubErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Apply what the clock already owed before deciding anything: a hub whose
+        // deregister has fallen due is gone, so it neither blocks this region nor
+        // counts against the account's cap.
+        let now = ::std::time::SystemTime::now();
+        store.settle_due_hubs(now);
+
+        // `notificationHubRegion` already satisfies the modelled `Region` length
+        // and pattern: the boundary validator refused the request otherwise.
+        let region = input.notification_hub_region;
+
+        if let Some(existing) = store.hubs.get(&region) {
+            // "Cannot register a Notification Hub in the same region as one in
+            // this status", from `NotificationHubStatus`'s own documentation for
+            // `DEREGISTERING`: the region is still occupied by a hub on its way
+            // out, which is the inconsistent state `ConflictException` names.
+            if existing.status == crate::state::NOTIFICATION_HUB_STATUS_DEREGISTERING {
+                return Err(RegisterNotificationHubErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "the NotificationHub in region {region} is being deregistered"
+                        ),
+                        resource_id: region,
+                    },
+                )
+                .into());
+            }
+            // There is "a maximum of one NotificationHub per Region" and the
+            // operation is `@idempotent`, so registering a region that already
+            // holds a hub reports that hub instead of minting a second one or
+            // restarting its registration.
+            return Ok(RegisterNotificationHubOutput {
+                notification_hub_region: existing.region.clone(),
+                status_summary: existing.status_summary(),
+                creation_time: existing.creation_time,
+                last_activation_time: existing.last_activation_time,
+            });
+        }
+
+        // The account is capped at `MAX_NOTIFICATION_HUBS` hubs; past it a
+        // register is refused with the error the model declares for a quota.
+        if !store.has_hub_capacity() {
+            return Err(
+                RegisterNotificationHubErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this account already holds the maximum of {} NotificationHubs",
+                            crate::state::MAX_NOTIFICATION_HUBS
+                        ),
+                        resource_type: "NotificationHub".to_string(),
+                        resource_id: Some(region),
+                        service_code: Some("notifications".to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Read the response out of the stored record rather than echoing the
+        // values just built, so this response can only report what a later
+        // listing does.
+        let stored = store.register_hub(&region, now);
+        Ok(RegisterNotificationHubOutput {
+            notification_hub_region: stored.region.clone(),
+            status_summary: stored.status_summary(),
+            creation_time: stored.creation_time,
+            last_activation_time: stored.last_activation_time,
+        })
     }
 }

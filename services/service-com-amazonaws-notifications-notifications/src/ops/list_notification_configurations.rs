@@ -133,34 +133,10 @@ impl From<ListNotificationConfigurationsErrorModeled> for ListNotificationConfig
 /// refuses anything outside it before this handler runs.
 const DEFAULT_MAX_RESULTS: usize = 20;
 
-/// Encode the resume point of a page as a `nextToken`.
-///
-/// The token is this process's [`crate::state::page_token_tag`] followed by the
-/// creation sequence of the last configuration on the page; the next page is
-/// everything older than that cursor. Rendered through the `hex` codec so the
-/// token is an opaque fixed-width string of word characters, within the modelled
-/// `NextToken` length (1..4096) and pattern (`^[\w+-/=]+$`). The tag is what
-/// makes a forged-but-well-formed cursor distinguishable from one this emulator
-/// issued.
-fn encode_page_token(cursor: u64) -> String {
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&crate::state::page_token_tag().to_be_bytes());
-    bytes[8..].copy_from_slice(&cursor.to_be_bytes());
-    hex::encode(bytes)
-}
-
-/// Recover the cursor from a `nextToken` this operation issued. `None` for a
-/// token it did not issue — wrong length, not hex, or carrying another tag —
-/// which the handler refuses as a validation failure rather than silently
-/// restarting the listing at the newest record.
-fn decode_page_token(token: &str) -> Option<u64> {
-    let bytes: [u8; 16] = hex::decode(token).ok()?.try_into().ok()?;
-    let tag = u64::from_be_bytes(bytes[..8].try_into().ok()?);
-    if tag != crate::state::page_token_tag() {
-        return None;
-    }
-    Some(u64::from_be_bytes(bytes[8..].try_into().ok()?))
-}
+// The page token codec every paginated listing in this service shares: the
+// cursor here is the creation sequence of the last configuration on the page,
+// and the next page is everything older than it.
+use crate::state::{decode_page_token, encode_page_token};
 
 /// The `ListNotificationConfigurations` operation.
 ///
@@ -211,6 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                // A token this process never issued is refused, rather than
+                // silently restarting the listing at the newest record.
                 ListNotificationConfigurationsErrorModeled::ValidationException(
                     ValidationException {
                         message: "nextToken is not a token this service issued".to_string(),
