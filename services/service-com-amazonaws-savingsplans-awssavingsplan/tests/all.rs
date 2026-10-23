@@ -15,6 +15,8 @@
 mod offering_catalog;
 #[path = "all/queued_plan_wire_rules.rs"]
 mod queued_plan_wire_rules;
+#[path = "all/queued_purchase_deletion.rs"]
+mod queued_purchase_deletion;
 #[path = "all/savings_plans_lifecycle.rs"]
 mod savings_plans_lifecycle;
 #[path = "all/state_roundtrip.rs"]
