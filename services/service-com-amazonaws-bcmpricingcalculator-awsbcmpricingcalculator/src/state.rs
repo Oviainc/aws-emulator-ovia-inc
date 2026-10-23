@@ -111,6 +111,95 @@ pub const MAX_USAGE_PER_WORKLOAD_ESTIMATE: usize = 2000;
 /// values `USD`), so it is the currency every cost this service reports is in.
 pub const COST_CURRENCY: &str = "USD";
 
+/// What the `resourceType` member of a modelled error names a bill scenario as: the
+/// resource's own Smithy shape name (`com.amazonaws.bcmpricingcalculator#BillScenario`),
+/// the name the bill-scenario handlers already answer with.
+pub const BILL_SCENARIO_RESOURCE_TYPE: &str = "BillScenario";
+
+/// The resource-type segment a bill scenario's ARN carries, as `CreateBillScenario`
+/// mints it: `arn:aws:bcm-pricing-calculator:<region>:<account>:bill-scenario/<id>`.
+pub const BILL_SCENARIO_ARN_TYPE: &str = "bill-scenario";
+
+/// The resource-type segment a workload estimate's ARN carries, as
+/// `CreateWorkloadEstimate` mints it:
+/// `arn:aws:bcm-pricing-calculator:<region>:<account>:workload-estimate/<id>`.
+pub const WORKLOAD_ESTIMATE_ARN_TYPE: &str = "workload-estimate";
+
+/// Every resource kind an ARN of this service names, as `(ARN segment, Smithy shape
+/// name)`: the segment is what an `Arn` carries on the wire, the shape name is what a
+/// modelled error's `resourceType` reports.
+///
+/// `bill-estimate` is listed although `CreateBillEstimate` is still a scaffold stub, so
+/// an ARN naming a bill estimate is reported as the kind it names rather than as an
+/// unrecognised string — the store holds none, so such an ARN resolves to nothing
+/// exactly as an ARN naming a deleted resource does.
+const ARN_RESOURCE_TYPES: [(&str, &str); 3] = [
+    (BILL_SCENARIO_ARN_TYPE, BILL_SCENARIO_RESOURCE_TYPE),
+    (WORKLOAD_ESTIMATE_ARN_TYPE, WORKLOAD_ESTIMATE_RESOURCE_TYPE),
+    ("bill-estimate", "BillEstimate"),
+];
+
+/// The greatest number of tags ONE resource carries at once, INFERRED from the model's
+/// maximum for the `Tags` map every tagging operation reads and writes (smithy_query:
+/// `shape="Tags"`, `length 0..200`).
+///
+/// It is an inference from that payload bound, not a service quota AWS states: neither
+/// the model nor the API reference publishes a per-resource tag quota for this service
+/// (AWS's general tagging guidance is lower, 50 tags per resource). The payload bound is
+/// nevertheless a true ceiling on what a resource can carry here, because
+/// `ListTagsForResource` reports a resource's tags as a single `Tags` map, so a resource
+/// holding more could not be read back. A cap is required rather than optional:
+/// `TagResource` models `ServiceQuotaExceededException` (HTTP 402), which is unreachable
+/// without one, and without it a caller could grow one resource's tag map without bound.
+pub const MAX_RESOURCE_TAGS: usize = 200;
+
+/// The tag-key prefix AWS reserves for its own tags.
+///
+/// AWS's tagging rules state that the `aws:` prefix is reserved for AWS use and that a
+/// caller can neither create nor modify a tag key carrying it, so `TagResource` refuses
+/// such a key instead of storing it. The comparison is case-insensitive, because the
+/// prefix is reserved however it is cased.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is a tag key AWS reserves for itself (see
+/// [`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// `str::get` rather than a byte-range slice (`key[..4]`), which PANICS when the request's
+/// key carries a multi-byte character straddling that byte index — the modelled key
+/// pattern `^[\w\s:+=@/-]+$` is matched with a Unicode-aware `\w`, so such a key passes
+/// validation and reaches this helper. `get` answers `None` for a key shorter than the
+/// prefix or one whose boundary falls mid-character, which is exactly "not reserved".
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The resource-type segment `arn` names (`bill-scenario`, `workload-estimate`, …), or
+/// `None` when the string does not have the ARN form this service's `Arn` shape pins.
+///
+/// The segment is the sixth `:`-field up to its `/`, from the form every ARN this service
+/// mints carries: `arn:<partition>:bcm-pricing-calculator:<region>:<account>:<type>/<id>`.
+pub fn arn_resource_type(arn: &str) -> Option<&str> {
+    arn.split(':').nth(5)?.split('/').next()
+}
+
+/// What a modelled error's `resourceType` names the resource `arn` addresses as: the
+/// resource kind's own Smithy shape name when the ARN names one of this service's kinds
+/// ([`ARN_RESOURCE_TYPES`]), and otherwise the segment as the ARN wrote it, since that
+/// segment is all that names the thing the caller asked for.
+pub fn arn_resource_label(arn: &str) -> String {
+    let Some(segment) = arn_resource_type(arn) else {
+        // Unreachable through the wire: `Arn`'s pattern pins the ARN form before a
+        // handler runs. Reported as the whole string rather than invented, so a
+        // hand-built value reaching here is visible instead of silently relabelled.
+        return arn.to_string();
+    };
+    ARN_RESOURCE_TYPES
+        .iter()
+        .find(|(arn_type, _)| *arn_type == segment)
+        .map_or_else(|| segment.to_string(), |(_, shape)| (*shape).to_string())
+}
+
 /// One stored usage modification of a bill scenario.
 #[derive(Debug, Clone)]
 pub struct UsageModification {
@@ -236,9 +325,9 @@ pub struct WorkloadEstimate {
     /// built through `engine::emulator_arn` so the account segment is the canonical
     /// one.
     ///
-    /// Stored, not yet reported: the operations that address an estimate by ARN
-    /// (`TagResource`, `UntagResource`, `ListTagsForResource`) are still 501 and own
-    /// their own issues, so this is what they will resolve against.
+    /// This is what the operations that address an estimate by ARN (`TagResource`,
+    /// `UntagResource`, `ListTagsForResource`) resolve against, through
+    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::resource_tags`].
     pub arn: String,
     pub name: String,
     /// A `WorkloadEstimateStatus` value (`UPDATING` | `VALID` | `INVALID` |
@@ -322,9 +411,9 @@ pub struct BillScenario {
     /// `arn:aws:bcm-pricing-calculator:<region>:<account>:bill-scenario/<id>`, built
     /// through `engine::emulator_arn` so the account segment is the canonical one.
     ///
-    /// Stored, not yet reported: the operations that address a scenario by ARN
-    /// (`TagResource`, `UntagResource`, `ListTagsForResource`) are still 501 and own
-    /// their own issue, so this is what they will resolve against.
+    /// This is what the operations that address a scenario by ARN (`TagResource`,
+    /// `UntagResource`, `ListTagsForResource`) resolve against, through
+    /// [`ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::resource_tags`].
     pub arn: String,
     pub name: String,
     /// A `BillScenarioStatus` value (`READY` | `LOCKED` | `STALE` | `FAILED`).
@@ -480,6 +569,37 @@ impl ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState {
     /// The workload estimate with this id, mutably.
     pub fn workload_estimate_mut(&mut self, id: &str) -> Option<&mut WorkloadEstimate> {
         self.workload_estimates.iter_mut().find(|e| e.id == id)
+    }
+
+    /// The tags of the resource `arn` addresses, or `None` when this store holds no
+    /// resource with that ARN.
+    ///
+    /// The ARN is matched against the one the resource was minted with, so an ARN is
+    /// resolved to the resource whose ARN it IS — every segment of it, partition, region
+    /// and account included. A well-formed ARN naming a resource this store does not hold
+    /// (one that was deleted, one that expired, or one of a kind this service cannot yet
+    /// create) resolves to nothing, which every tagging operation answers with the
+    /// modelled `ResourceNotFoundException`.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(scenario) = self.bill_scenarios.iter().find(|s| s.arn == arn) {
+            return Some(&scenario.tags);
+        }
+        self.workload_estimates
+            .iter()
+            .find(|e| e.arn == arn)
+            .map(|estimate| &estimate.tags)
+    }
+
+    /// The tags of the resource `arn` addresses, to be changed in place. `None` for an
+    /// ARN this store holds no resource for; see [`Self::resource_tags`].
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(scenario) = self.bill_scenarios.iter_mut().find(|s| s.arn == arn) {
+            return Some(&mut scenario.tags);
+        }
+        self.workload_estimates
+            .iter_mut()
+            .find(|e| e.arn == arn)
+            .map(|estimate| &mut estimate.tags)
     }
 
     /// Drop the workload estimate with this id. `true` when one was removed.

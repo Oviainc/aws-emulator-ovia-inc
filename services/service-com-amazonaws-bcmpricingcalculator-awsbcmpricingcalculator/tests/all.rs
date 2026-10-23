@@ -15,6 +15,8 @@
 mod bill_scenario_lifecycle;
 #[path = "all/preferences.rs"]
 mod preferences;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_refusal_framing.rs"]
