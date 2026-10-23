@@ -391,7 +391,8 @@ pub const PROCUREMENT_PORTAL_ENV_VALUES: &[&str] = &["PROD", "TEST"];
 
 
 /// The values `ProcurementPortalName` accepts on the wire.
-pub const PROCUREMENT_PORTAL_NAME_VALUES: &[&str] = &["COUPA", "SAP_BUSINESS_NETWORK"];
+pub const PROCUREMENT_PORTAL_NAME_VALUES: &[&str] =
+    &["COUPA", "JAGGAER", "SAP_BUSINESS_NETWORK", "ZIP"];
 
 
 /// The values `ProcurementPortalPreferenceStatus` accepts on the wire.

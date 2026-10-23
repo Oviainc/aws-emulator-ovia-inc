@@ -2,9 +2,11 @@
 
 //! @op DeleteInvoiceUnit
 //!
-//! Removes the invoice unit from state, with the tags that were attached to it, and
-//! returns the ARN it removed. A later `GetInvoiceUnit` on that ARN is a
-//! `ResourceNotFoundException` and `ListInvoiceUnits` no longer reports it.
+//! RETIRES the invoice unit: it stops being a resource — a later `GetInvoiceUnit` on
+//! that ARN is a `ResourceNotFoundException`, `ListInvoiceUnits` no longer reports it
+//! and the tags that were attached to it are gone — while the instant it was deleted at
+//! is kept, so a point-in-time (`AsOf`) read between the unit's creation and its
+//! deletion still answers with it. Returns the ARN it retired.
 //!
 //! ## Shape of an operation
 //!
@@ -157,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let client_token = input.client_token.as_deref();
 
         // `@idempotent`: a replay of the delete (the same `ClientToken` against the same
-        // invoice unit) answers with the ARN the first call removed rather than reporting
+        // invoice unit) answers with the ARN the first call retired rather than reporting
         // it missing. The same token against a DIFFERENT unit deletes that unit.
         if let Some(arn) =
             store.replayed_result(Self::NAME, &input.invoice_unit_arn, client_token)
@@ -167,16 +169,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        if store
-            .invoice_units
-            .remove(&input.invoice_unit_arn)
-            .is_none()
-        {
+        // A delete RETIRES the unit: it stops being a resource (every live read now
+        // reports it missing, and the `Name` it held is free again) while the instant it
+        // was deleted at stays in state, because the model documents `AsOf` as showing
+        // "legacy invoice units that are currently deleted if the AsOf time is set to
+        // before it was deleted" — a point-in-time read between the unit's creation and
+        // this instant must still answer with it. Erasing the entry would lose that
+        // history and make "existed then, deleted later" indistinguishable from "never
+        // existed".
+        let deleted_at = crate::state::now();
+        if !store.retire_invoice_unit(&input.invoice_unit_arn, deleted_at) {
             return Err(DeleteInvoiceUnitErrorModeled::ResourceNotFoundException(
                 crate::state::no_such_resource(&input.invoice_unit_arn),
             )
             .into());
         }
+        // The tags went with the resource: a retired unit is not a tagged resource, and
+        // the tag plane answers for the live surface only.
         store.resource_tags.remove(&input.invoice_unit_arn);
 
         store.record_result(

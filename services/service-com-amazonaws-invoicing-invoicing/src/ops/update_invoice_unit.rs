@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(arn) =
             store.replayed_result(Self::NAME, &input.invoice_unit_arn, client_token)
         {
-            if store.invoice_units.contains_key(&arn) {
+            if store.live_invoice_unit(&arn).is_some() {
                 return Ok(UpdateInvoiceUnitOutput {
                     invoice_unit_arn: Some(arn),
                 });
@@ -181,9 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         {
+            // An update acts on the resource as it is NOW: a unit a delete has retired
+            // is history kept for point-in-time reads, not something an update can
+            // change, so it is reported missing like any other ARN that names nothing.
             let unit = store
-                .invoice_units
-                .get_mut(&input.invoice_unit_arn)
+                .live_invoice_unit_mut(&input.invoice_unit_arn)
                 .ok_or_else(|| {
                     UpdateInvoiceUnitErrorModeled::ResourceNotFoundException(
                         crate::state::no_such_resource(&input.invoice_unit_arn),

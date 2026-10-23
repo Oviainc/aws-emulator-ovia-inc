@@ -151,10 +151,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Tags belong to a resource, so there has to be one: the only resource this
-        // service's ARNs name is an invoice unit.
-        if !store.invoice_units.contains_key(&input.resource_arn) {
+        // service's ARNs name is an invoice unit, and one a delete has retired is no
+        // longer a resource.
+        if store.live_invoice_unit(&input.resource_arn).is_none() {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::no_such_resource(&input.resource_arn),
+            )
+            .into());
+        }
+
+        // What the write would leave the resource holding, decided BEFORE anything is
+        // written: a key already set is REPLACED rather than added, so re-tagging an
+        // existing key is never a quota step. The quota is on the RESOURCE
+        // (`MAX_RESOURCE_TAGS`), not on this call's array, so a caller tagging in
+        // batches reaches it; the whole write is refused or applied, because a partially
+        // tagged resource would leave the caller unable to tell which tags took, and the
+        // identical call succeeds once an `UntagResource` has freed the headroom.
+        let held = store
+            .resource_tags
+            .get(&input.resource_arn)
+            .map(std::collections::BTreeMap::len)
+            .unwrap_or_default();
+        let already_set = |key: &String| {
+            store
+                .resource_tags
+                .get(&input.resource_arn)
+                .is_some_and(|tags| tags.contains_key(key))
+        };
+        let added = input
+            .resource_tags
+            .iter()
+            .filter(|tag| !already_set(&tag.key))
+            .count();
+        if held + added > crate::state::MAX_RESOURCE_TAGS {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string(),
+                },
             )
             .into());
         }
@@ -163,30 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resource_tags
             .entry(input.resource_arn.clone())
             .or_default();
-        // What the write would leave the resource holding: a key already set is
-        // REPLACED rather than added, so re-tagging an existing key is never a quota
-        // step. The whole write is refused or applied; a partially tagged resource
-        // would leave the caller unable to tell which tags took.
-        let added = input
-            .resource_tags
-            .iter()
-            .filter(|tag| !tags.contains_key(&tag.key))
-            .count();
-        if tags.len() + added > crate::state::MAX_RESOURCE_TAGS {
-            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "A resource holds at most {} tags; {} already carries {} and the \
-                         request adds {}",
-                        crate::state::MAX_RESOURCE_TAGS,
-                        input.resource_arn,
-                        tags.len(),
-                        added
-                    ),
-                },
-            )
-            .into());
-        }
         for tag in input.resource_tags {
             tags.insert(tag.key, tag.value);
         }

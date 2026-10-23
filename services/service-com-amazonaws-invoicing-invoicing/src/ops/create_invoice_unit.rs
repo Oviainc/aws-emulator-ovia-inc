@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minting a second invoice unit. A record whose unit has since been deleted is
         // not a replay: there is nothing left to answer with, so the request creates.
         if let Some(arn) = store.replayed_result(Self::NAME, &input.name, client_token) {
-            if store.invoice_units.contains_key(&arn) {
+            if store.live_invoice_unit(&arn).is_some() {
                 return Ok(CreateInvoiceUnitOutput {
                     invoice_unit_arn: Some(arn),
                 });
@@ -178,8 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model's `ValidationExceptionReason` declares `maxInvoiceUnitsExceeded`, so
         // the real service refuses a create past its maximum; this emulator's maximum is
-        // `MAX_INVOICE_UNITS`.
-        if store.invoice_units.len() >= crate::state::MAX_INVOICE_UNITS {
+        // `MAX_INVOICE_UNITS`. Only the units that EXIST count: a deleted one is history
+        // kept for point-in-time reads, not an invoice unit this account holds.
+        if store.live_invoice_unit_count() >= crate::state::MAX_INVOICE_UNITS {
             return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
                 message: Some(format!(
                     "This account already holds the maximum of {} invoice units",
@@ -191,15 +192,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A resource holds at most `MAX_RESOURCE_TAGS` tags however the tags got there,
+        // so a create carrying more than that many distinct keys is refused before it
+        // mints anything. This operation models no `ServiceQuotaExceededException`
+        // (`smithy_query(query="operation", operation="CreateInvoiceUnit")` lists
+        // `ValidationException` as its only input refusal), so the quota is stated in
+        // the error it does model.
+        let tags = input
+            .resource_tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if tags.len() > crate::state::MAX_RESOURCE_TAGS {
+            return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string()),
+                reason: Some("invalidInput".to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // `Name` is documented as "a unique name that is distinctive within your Amazon
         // Web Services [account]", and the model's `ValidationExceptionReason` enum
-        // carries `duplicateInvoiceUnit` for the collision.
-        if store.invoice_units.values().any(|unit| unit.name == input.name) {
+        // carries `duplicateInvoiceUnit` for the collision. Uniqueness is over the units
+        // that EXIST: the model documents `Name` as changeable only by deleting the unit
+        // and recreating it, so a deleted unit's name is free again.
+        //
+        // The message states the service's own template over the requested `Name`, which
+        // is where the name a caller or operator reads out of the refusal comes from.
+        if store.live_invoice_units().any(|unit| unit.name == input.name) {
             return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "An invoice unit named {} already exists in this account",
-                    input.name
-                )),
+                message: Some(format!("Invoice Unit already exists with name: {}", input.name)),
                 reason: Some("duplicateInvoiceUnit".to_string()),
                 ..Default::default()
             })
@@ -221,14 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_modified: created_at,
             },
             superseded: Vec::new(),
+            deleted_at: None,
         };
         store.invoice_units.insert(arn.clone(), unit);
 
-        if let Some(tags) = input.resource_tags {
-            let tags = tags
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect::<std::collections::BTreeMap<_, _>>();
+        if !tags.is_empty() {
             store.resource_tags.insert(arn.clone(), tags);
         }
 
