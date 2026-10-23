@@ -5,9 +5,11 @@
 //! (`crate::state`), one page at a time. This is the ONLY file to touch for this
 //! operation.
 //!
-//! The instance set is seeded once, when the state store is first touched, so this read
-//! never writes: the same instance, with the same ARN and `CreatedDate`, is reported to
-//! every later caller.
+//! The account's instance is seeded once, when the state store is first touched, and
+//! `CreateInstance` mints one for an account that holds none. This read writes nothing of
+//! its own: the only change it applies is a transition the CLOCK already owes — an
+//! instance whose activation instant has passed is `ACTIVE` whether or not anybody listed
+//! (`crate::state::ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`).
 //!
 //! ## Shape of an operation
 //!
@@ -173,9 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Keyed by `InstanceArn`, which is also the map's order, so the next page
-        // resumes from the key this one ends on.
+        // resumes from the key this one ends on. A READ, except for what the CLOCK
+        // already owes: an instance whose activation instant has passed is ACTIVE
+        // whether or not anybody listed.
         let ordered: Vec<(String, InstanceMetadata)> = {
-            let store = state.lock();
+            let mut store = state.lock();
+            store.materialize_due(::std::time::SystemTime::now());
             store
                 .instances
                 .values()

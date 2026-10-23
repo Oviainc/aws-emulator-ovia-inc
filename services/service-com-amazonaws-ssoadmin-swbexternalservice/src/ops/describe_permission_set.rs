@@ -159,6 +159,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
+        // sets are a feature of an organization instance, so on an account instance no
+        // permission set can ever exist and the refusal does not depend on whether this
+        // one does. An ARN this account holds no instance for is NOT this refusal — it
+        // falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
+            return Err(DescribePermissionSetErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                    ),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
         if store.instance(&input.instance_arn).is_none() {
             return Err(DescribePermissionSetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

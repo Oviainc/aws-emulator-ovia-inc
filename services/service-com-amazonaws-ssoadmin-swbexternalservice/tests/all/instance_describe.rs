@@ -203,9 +203,9 @@ async fn describe_instance_reports_the_stored_instance_and_denies_every_other_ar
         );
         assert_eq!(
             body["PermissionSetsEnabled"],
-            Value::Bool(true),
-            "case {:?}: permission sets are served on this instance, so it must report \
-             them enabled, got {:?}",
+            Value::Bool(false),
+            "case {:?}: the account's instance is an ACCOUNT instance, which serves no \
+             permission sets, so it must report them disabled, got {:?}",
             case.label,
             body["PermissionSetsEnabled"]
         );
