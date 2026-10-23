@@ -157,6 +157,37 @@ pub(crate) fn member(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
+/// One awsQuery call to IAM over the same router, answered with the HTTP status and the XML
+/// body.
+///
+/// The ONE IAM caller of this crate's suites: the role records a stack reads (a `RoleARN`'s
+/// trust policy) and the roles a stack CREATES are both written and read through IAM's own
+/// wire, so a change to the calling convention is made here once.
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2010-05-08");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "iam.amazonaws.com")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed IAM request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    (status, body)
+}
+
 /// Undo the XML text escaping the serializer applies, so a round-tripped value can be
 /// compared with what was sent.
 pub(crate) fn xml_unescape(text: &str) -> String {

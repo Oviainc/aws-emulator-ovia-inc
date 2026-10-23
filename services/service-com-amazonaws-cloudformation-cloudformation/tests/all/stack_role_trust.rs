@@ -40,7 +40,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{status, SERVICE
 use service_com_amazonaws_cloudformation_cloudformation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::stack_lifecycle::{call, form_encode, member, wait_for_the_transition, xml_text};
+use crate::stack_lifecycle::{call, iam, member, wait_for_the_transition, xml_text};
 
 /// The template the stacks here are created from: one `AWS::CloudFormation::WaitConditionHandle`.
 ///
@@ -70,28 +70,6 @@ fn emulator() -> MultiServiceRouter {
     );
     router.register_service(EmulatedService::new(engine));
     router
-}
-
-/// One awsQuery call to IAM, answered with the HTTP status and the XML body.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
-    let mut body = format!("Action={action}&Version=2010-05-08");
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(&form_encode(name));
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", "iam.amazonaws.com")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8_lossy(response.body()).to_string();
-    (status, body)
 }
 
 /// Create a role carrying `document` as its trust policy, answered with the ARN IAM

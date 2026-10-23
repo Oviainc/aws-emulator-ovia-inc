@@ -33,6 +33,8 @@ mod ecs_elbv2_stack_outputs;
 mod error_envelope;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
+#[path = "all/generated_physical_names.rs"]
+mod generated_physical_names;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/provisioned_resources.rs"]

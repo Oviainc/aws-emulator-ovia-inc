@@ -1742,10 +1742,7 @@ fn physical_name(
         Some(name) => name,
         // A GENERATED name is held to the naming rules of the service that owns the type,
         // because a name that service would refuse could not be provisioned at all.
-        None => naming_rules(
-            &declared.resource_type,
-            generated_name(&declared.logical_id, naming.stack),
-        ),
+        None => generated_name(&declared.resource_type, &declared.logical_id, naming.stack),
     }
 }
 
@@ -1780,82 +1777,244 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
         .find(|property| properties.get(property).is_some())
 }
 
-/// A GENERATED name held to the naming rules of the service that owns the resource type.
+/// The naming rules of the service that OWNS a resource type: the longest name it accepts
+/// for one, and the characters such a name may carry.
 ///
-/// A generated `<stack name>-<logical id>-<unique id>` is built from a logical id and a
-/// stack name, and those admit characters the owning service's own names do not: an
-/// Amazon S3 bucket name "can consist only of lowercase letters, numbers, dots (.), and
-/// hyphens (-)", "must begin and end with a letter or number" and must be "between 3
-/// (min) and 63 (max) characters long" (Amazon S3 bucket naming rules), which is why
-/// CloudFormation's own generated bucket names are lowercase
-/// (`mystack-mybucket-kdwwxmddtr2g`). A name outside those rules is not one the owning
-/// service would accept, so the resource could not be provisioned under it at all.
+/// A generated `<stack name>-<logical id>-<unique id>` is built from a stack name and a
+/// logical id, and those are LONGER — and admit more characters — than several owning
+/// services' own names are: an IAM role's name is at most 64 characters while a stack name
+/// may be 128 on its own, and an Amazon S3 bucket name "can consist only of lowercase
+/// letters, numbers, dots (.), and hyphens (-)" and "must begin and end with a letter or
+/// number" (Amazon S3 bucket naming rules). A name outside the owning service's rules is
+/// not one that service would accept, so the resource could not be created under it at all
+/// and the stack that declared it would roll back — which is why CloudFormation FITS the
+/// name it generates to those rules, and why its generated bucket names come out lowercase
+/// and within 63 characters (`mystack-mybucket-kdwwxmddtr2g`).
 ///
-/// The 3-character MINIMUM needs nothing here: the unique segment alone is
-/// [`GENERATED_NAME_DIGEST_CHARS`] characters, so every name [`generated_name`] produces
-/// is longer than that, and the truncation below keeps that segment.
-fn naming_rules(resource_type: &str, name: String) -> String {
+/// `None` for a type whose owning service publishes no bound a generated name could break;
+/// such a name is used as it is built.
+#[derive(Debug, Clone, Copy)]
+struct NameRules {
+    /// The longest name the owning service accepts.
+    max_characters: usize,
+    /// The characters such a name may carry.
+    characters: Characters,
+}
+
+/// Which characters a name of a resource type may carry — the one thing the naming rules
+/// below differ in beyond their length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Characters {
+    /// Every character a generated name is built from: a CloudFormation stack name is
+    /// `[a-zA-Z][-a-zA-Z0-9]*` and a logical id is alphanumeric, and these owning services'
+    /// name patterns admit all of those (IAM's `roleNameType` is `[\w+=,.@-]+`, Amazon Data
+    /// Firehose's `DeliveryStreamName` is `[a-zA-Z0-9_.-]+`, CodePipeline's `PipelineName`
+    /// is `[A-Za-z0-9.@\-_]+`), so only the LENGTH has to be fitted — and the shortening
+    /// itself leaves no hyphen beside the one that joins the segments (see
+    /// [`shortened_to`]), which is what an Elastic Load Balancing name requires.
+    AsGenerated,
+    /// Lowercase alphanumerics and the hyphen, beginning and ending with an alphanumeric:
+    /// an Amazon S3 bucket name (the naming rules above), an Amazon ECR repository name
+    /// (`RepositoryName`'s pattern, `^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*…$` in Amazon ECR's
+    /// and Amazon ECR Public's own models, which admits no upper case and requires an
+    /// alphanumeric at each end and between separators) and an Amazon RDS identifier
+    /// (lowercase, no trailing hyphen, no two consecutive hyphens).
+    LowercaseAlphanumeric,
+}
+
+/// The naming rules the service that owns `resource_type` holds a name to.
+///
+/// Each bound is the owning service's OWN contract for the member a resource of the type is
+/// created under — the `@length` in that service's Smithy model where it carries one, and
+/// the limit that service's API reference publishes where the model does not. A type absent
+/// from this catalogue has no bound a generated name could break (its name is assigned by
+/// the service, or its owning API publishes none), so its generated name is left as built.
+fn naming_rules(resource_type: &str) -> Option<NameRules> {
+    let rules = |max_characters: usize, characters: Characters| {
+        Some(NameRules {
+            max_characters,
+            characters,
+        })
+    };
     match resource_type {
-        S3_BUCKET => {
-            // Lowercase, and every character outside the set a bucket name may carry
-            // replaced by a hyphen — which is one of them — rather than dropped, so two
-            // names that differ only in such a character cannot become one.
-            let within_the_set: String = name
-                .to_lowercase()
-                .chars()
-                .map(|character| {
-                    if character.is_ascii_lowercase()
-                        || character.is_ascii_digit()
-                        || character == '.'
-                        || character == '-'
-                    {
-                        character
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            let characters = within_the_set.chars().count();
-            // Past the maximum the TAIL is kept: it carries the unique segment, so two
-            // resources of one stack still cannot collide. A bucket name has to begin and
-            // end with a letter or a number, and the tail always ends in one, so what the
-            // truncation leaves in FRONT of the first one goes.
-            let kept: String = if characters > MAX_BUCKET_NAME_LEN {
-                within_the_set
-                    .chars()
-                    .skip(characters - MAX_BUCKET_NAME_LEN)
-                    .collect()
-            } else {
-                within_the_set
-            };
-            kept.trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
-                .to_string()
+        // "Bucket names must be between 3 (min) and 63 (max) characters long", lowercase
+        // (Amazon S3 bucket naming rules).
+        S3_BUCKET => rules(63, Characters::LowercaseAlphanumeric),
+        // IAM `CreateRole.RoleName`: `@length(min: 1, max: 64)` (`roleNameType`, IAM's own
+        // Smithy model). A longer name is the 400 `ValidationError` IAM answers, which the
+        // stack that declared the role then rolls back on.
+        "AWS::IAM::Role" => rules(64, Characters::AsGenerated),
+        // IAM `CreateUser.UserName`: `userNameType`, `@length(min: 1, max: 64)`.
+        "AWS::IAM::User" => rules(64, Characters::AsGenerated),
+        // IAM `CreateGroup.GroupName`: `groupNameType`, `@length(min: 1, max: 128)`.
+        "AWS::IAM::Group" => rules(128, Characters::AsGenerated),
+        // IAM `CreateInstanceProfile.InstanceProfileName`: `instanceProfileNameType`,
+        // `@length(min: 1, max: 128)`.
+        "AWS::IAM::InstanceProfile" => rules(128, Characters::AsGenerated),
+        // IAM `CreatePolicy.PolicyName`: `policyNameType`, `@length(min: 1, max: 128)`.
+        "AWS::IAM::ManagedPolicy" => rules(128, Characters::AsGenerated),
+        // Amazon Data Firehose `CreateDeliveryStream.DeliveryStreamName`:
+        // `@length(min: 1, max: 64)` (Firehose's own Smithy model).
+        FIREHOSE_DELIVERY_STREAM => rules(64, Characters::AsGenerated),
+        // Amazon ECR `CreateRepository.repositoryName`: `RepositoryName`,
+        // `@length(min: 2, max: 256)`, lowercase (Amazon ECR's own Smithy model).
+        ECR_REPOSITORY => rules(256, Characters::LowercaseAlphanumeric),
+        // Amazon ECR Public `CreateRepository.repositoryName`: `RepositoryName`,
+        // `@length(min: 2, max: 205)`, lowercase (Amazon ECR Public's own Smithy model).
+        ECR_PUBLIC_REPOSITORY => rules(205, Characters::LowercaseAlphanumeric),
+        // CodePipeline `PipelineDeclaration.name`: `PipelineName`,
+        // `@length(min: 1, max: 100)` (CodePipeline's own Smithy model).
+        "AWS::CodePipeline::Pipeline" => rules(100, Characters::AsGenerated),
+        // Amazon DynamoDB `CreateTable.TableName`: `TableName`,
+        // `@length(min: 3, max: 255)` (DynamoDB's own Smithy model).
+        "AWS::DynamoDB::Table" => rules(255, Characters::AsGenerated),
+        // Amazon CloudWatch Logs `CreateLogGroup.logGroupName`: `LogGroupName`,
+        // `@length(min: 1, max: 512)` (CloudWatch Logs's own Smithy model).
+        "AWS::Logs::LogGroup" => rules(512, Characters::AsGenerated),
+        // Amazon CloudWatch `PutMetricAlarm.AlarmName`: `AlarmName`,
+        // `@length(min: 1, max: 255)` (CloudWatch's own Smithy model).
+        "AWS::CloudWatch::Alarm" => rules(255, Characters::AsGenerated),
+        // AWS Secrets Manager `CreateSecret.Name`: `NameType`,
+        // `@length(min: 1, max: 512)` (Secrets Manager's own Smithy model).
+        "AWS::SecretsManager::Secret" => rules(512, Characters::AsGenerated),
+        // AWS Lambda `CreateFunction.FunctionName`: the modelled 140 characters covers the
+        // full ARN — "If you specify only the function name, it is limited to 64 characters
+        // in length" (`FunctionName`, AWS Lambda API reference).
+        "AWS::Lambda::Function" => rules(64, Characters::AsGenerated),
+        // Amazon SQS `CreateQueue.QueueName`: "A queue name can have up to 80 characters"
+        // (Amazon SQS API reference) — SQS's model carries no `@length` for it.
+        SQS_QUEUE => rules(80, Characters::AsGenerated),
+        // Amazon SNS `CreateTopic.Name`: topic names "must be between 1 and 256 characters
+        // long" (Amazon SNS API reference) — SNS's model carries no `@length` for it.
+        SNS_TOPIC => rules(256, Characters::AsGenerated),
+        // Amazon ECS `CreateCluster.clusterName`: "Up to 255 letters (uppercase and
+        // lowercase), numbers, underscores, and hyphens are allowed" (Amazon ECS API
+        // reference) — ECS's model carries no `@length` for it.
+        ECS_CLUSTER => rules(255, Characters::AsGenerated),
+        // Elastic Load Balancing `CreateLoadBalancer.Name` and
+        // `CreateTargetGroup.Name`: each "can have a maximum of 32 characters" (Elastic
+        // Load Balancing API reference) — the ELBv2 model carries no `@length` for either.
+        ELB_LOAD_BALANCER | ELB_TARGET_GROUP => rules(32, Characters::AsGenerated),
+        // Amazon RDS `DBInstanceIdentifier` / `DBClusterIdentifier`: each "must contain
+        // from 1 to 63 letters, numbers, or hyphens", "can't end with a hyphen or contain
+        // two consecutive hyphens", and is "stored as all lowercase" (Amazon RDS API
+        // reference) — RDS's model carries no `@length` for either.
+        "AWS::RDS::DBInstance" | "AWS::RDS::DBCluster" => {
+            rules(63, Characters::LowercaseAlphanumeric)
         }
-        _ => name,
+        // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
+        // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
+        "AWS::EC2::SecurityGroup" => rules(255, Characters::AsGenerated),
+        _ => None,
     }
 }
 
-/// The longest name an Amazon S3 bucket may carry: "Bucket names must be between 3 (min)
-/// and 63 (max) characters long" (Amazon S3 bucket naming rules).
-const MAX_BUCKET_NAME_LEN: usize = 63;
-
 /// The physical name CloudFormation generates for a resource the template does not name:
-/// `<stack name>-<logical id>-<unique id>`.
+/// `<stack name>-<logical id>-<unique id>`, fitted to the naming rules of the service that
+/// owns the type ([`naming_rules`]).
 ///
 /// The unique segment is derived from the stack id and the logical id rather than drawn
 /// fresh, so it is stable across reads and across a later update of the same stack — the
-/// physical id of a resource that was not replaced does not change.
-fn generated_name(logical_id: &str, scope: StackScope<'_>) -> String {
-    format!(
-        "{}-{logical_id}-{}",
-        scope.stack_name,
-        derived_digits(
-            scope.stack_id,
-            logical_id,
-            GENERATED_NAME_DIGEST_CHARS,
-            Alphabet::Upper
-        )
-    )
+/// physical id of a resource that was not replaced does not change. It is also what keeps
+/// two resources of one stack (and two stacks of one name) apart, so it is never what the
+/// fitting gives up: the stack name and the logical id are what lose characters, and they
+/// lose them from the FULL logical id and stack name the unique segment was derived from,
+/// so two resources whose shortened segments coincide still carry different names.
+///
+/// A type's minimum name length needs nothing here: the unique segment alone is
+/// [`GENERATED_NAME_DIGEST_CHARS`] characters, longer than any of the minimums in
+/// [`naming_rules`] (3 for a bucket or a table, 2 for a repository), and it is kept whole.
+fn generated_name(resource_type: &str, logical_id: &str, scope: StackScope<'_>) -> String {
+    let unique = derived_digits(
+        scope.stack_id,
+        logical_id,
+        GENERATED_NAME_DIGEST_CHARS,
+        Alphabet::Upper,
+    );
+    let Some(rules) = naming_rules(resource_type) else {
+        return format!("{}-{logical_id}-{unique}", scope.stack_name);
+    };
+    // The room the stack name and the logical id have BETWEEN them: the limit, less the
+    // unique segment and the two hyphens that join the three segments.
+    let room = rules
+        .max_characters
+        .saturating_sub(unique.chars().count() + GENERATED_NAME_SEPARATORS);
+    let name = if room < 2 {
+        // No owning service publishes a limit with no room for both segments; the unique
+        // segment is what keeps the name unique, so it is what a limit that small leaves.
+        unique.chars().take(rules.max_characters).collect()
+    } else {
+        let (stack_name, shortened) = shortened_to(scope.stack_name, logical_id, room);
+        format!("{stack_name}-{shortened}-{unique}")
+    };
+    within(name, rules.characters)
+}
+
+/// The two hyphens that join the three segments of a [`generated_name`].
+const GENERATED_NAME_SEPARATORS: usize = 2;
+
+/// `stack_name` and `logical_id` shortened to `room` characters between them, each keeping
+/// as much of itself as that allows.
+///
+/// Characters come off whichever of the two is LONGER, so a long stack name does not eat
+/// the room the logical id needs to stay recognisable and neither segment is spent while
+/// the other still has more to give. `room` is at least 2, so each keeps at least its first
+/// character.
+///
+/// A segment the shortening CUT gives up a trailing hyphen too: a stack name may carry one
+/// (`[a-zA-Z][-a-zA-Z0-9]*`), and a cut landing just after it would otherwise put two
+/// hyphens together in the name — which several owning services' names may not carry (an
+/// Elastic Load Balancing name and an Amazon RDS identifier among them). A segment the
+/// shortening did not touch is left exactly as it is, so a name that needed no fitting is
+/// the name CloudFormation builds.
+fn shortened_to(stack_name: &str, logical_id: &str, room: usize) -> (String, String) {
+    let mut stack: Vec<char> = stack_name.chars().collect();
+    let mut logical: Vec<char> = logical_id.chars().collect();
+    let (full_stack, full_logical) = (stack.len(), logical.len());
+    while stack.len() + logical.len() > room {
+        if stack.len() >= logical.len() {
+            stack.pop();
+        } else {
+            logical.pop();
+        }
+    }
+    let cut = |mut segment: Vec<char>, was: usize| -> String {
+        if segment.len() < was {
+            while segment.len() > 1 && segment.ends_with(&['-']) {
+                segment.pop();
+            }
+        }
+        segment.into_iter().collect()
+    };
+    (cut(stack, full_stack), cut(logical, full_logical))
+}
+
+/// `name` reduced to the characters `characters` admits.
+///
+/// Length is settled before this runs ([`generated_name`] fits the segments to the limit),
+/// and nothing here lengthens a name: a character outside the set becomes one inside it,
+/// and the edges are only trimmed.
+fn within(name: String, characters: Characters) -> String {
+    match characters {
+        Characters::AsGenerated => name,
+        Characters::LowercaseAlphanumeric => {
+            // Lower case, with every character outside the set replaced by a hyphen —
+            // which is in it — rather than dropped, so two names that differ only in such
+            // a character cannot become one. A RUN of them becomes ONE hyphen, because a
+            // repository name's pattern separates its alphanumeric groups by a single
+            // separator, and the edges are trimmed to the alphanumeric both a bucket name
+            // and a repository name have to begin and end with.
+            let mut within_the_set = String::with_capacity(name.len());
+            for character in name.chars().map(|character| character.to_ascii_lowercase()) {
+                if character.is_ascii_lowercase() || character.is_ascii_digit() {
+                    within_the_set.push(character);
+                } else if !within_the_set.ends_with('-') {
+                    within_the_set.push('-');
+                }
+            }
+            within_the_set.trim_matches('-').to_string()
+        }
+    }
 }
 
 /// Which alphabet a derived identifier's digits are drawn from — the ONE thing the
@@ -2292,29 +2451,21 @@ fn return_values(
         ECR_REPOSITORY => {
             // "A repository name must start with a letter and can only contain lowercase
             // letters, numbers, hyphens, underscores, and forward slashes"
-            // (`RepositoryName`'s pattern is lower case only), so the name CloudFormation
-            // GENERATES for a repository the template does not name is lower-cased; a name
-            // the template declared is reported exactly as it wrote it.
-            let repository = match properties.get("RepositoryName") {
-                Some(_) => name.to_string(),
-                None => name.to_lowercase(),
-            };
+            // (`RepositoryName`'s pattern is lower case only), which is the character set
+            // [`naming_rules`] already holds a GENERATED name to; a name the template
+            // declared is reported exactly as it wrote it.
             attributes.insert(
                 "Arn".to_string(),
-                ::emulator_server::emulator_arn(
-                    "ecr",
-                    region,
-                    &format!("repository/{repository}"),
-                ),
+                ::emulator_server::emulator_arn("ecr", region, &format!("repository/{name}")),
             );
             attributes.insert(
                 "RepositoryUri".to_string(),
                 format!(
-                    "{}.dkr.ecr.{region}.{URL_SUFFIX}/{repository}",
+                    "{}.dkr.ecr.{region}.{URL_SUFFIX}/{name}",
                     ::emulator_server::emulator_account_id()
                 ),
             );
-            (repository, attributes)
+            (name.to_string(), attributes)
         }
         // "Ref returns the cluster name"; Fn::GetAtt: Arn. This is the type
         // `super::provisioning` creates in Amazon ECS itself, so the cluster a stack's
