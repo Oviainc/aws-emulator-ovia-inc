@@ -30,20 +30,20 @@ use service_com_amazonaws_sagemaker_sagemaker::state;
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Long enough to pass `state::MODEL_PACKAGE_COMPLETED_AFTER` (300 ms).
-const PAST_COMPLETED_DUE: Duration = Duration::from_millis(600);
+pub(crate) const PAST_COMPLETED_DUE: Duration = Duration::from_millis(600);
 
 /// A container the boundary validator accepts for an `InferenceSpecification`.
-fn container(image: &str) -> Value {
+pub(crate) fn container(image: &str) -> Value {
     json!({"Image": image, "ModelDataUrl": "s3://models/artifact.tar.gz"})
 }
 
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not SigV4; the request below carries a
@@ -57,7 +57,7 @@ impl Emulator {
 
     /// Create the model package group a versioned registration joins, through the API
     /// that owns it, and return its ARN.
-    async fn create_group(&self, region: &str, name: &str) -> String {
+    pub(crate) async fn create_group(&self, region: &str, name: &str) -> String {
         let (status, created) = self
             .call_in(
                 region,
@@ -121,12 +121,12 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, target: &str, body: &Value) -> (u16, Value) {
         self.call_in(state::DEFAULT_REGION, target, body).await
     }
 
     /// Call `target` and require a 200, returning the parsed output.
-    async fn ok(&self, case: &str, target: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, target: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(target, body).await;
         assert_eq!(
             status, 200,
@@ -136,13 +136,13 @@ impl Emulator {
     }
 
     /// Register a model package and return its ARN.
-    async fn create(&self, case: &str, body: &Value) -> String {
+    pub(crate) async fn create(&self, case: &str, body: &Value) -> String {
         let output = self.ok(case, "CreateModelPackage", body).await;
         str_field(&output, "ModelPackageArn")
     }
 
     /// Describe `identifier` (a name, a `name/version` pair or an ARN).
-    async fn describe(&self, case: &str, identifier: &str) -> Value {
+    pub(crate) async fn describe(&self, case: &str, identifier: &str) -> Value {
         self.ok(
             case,
             "DescribeModelPackage",
@@ -153,7 +153,7 @@ impl Emulator {
 }
 
 /// The `__type` an error body carries, with any `namespace#` prefix stripped.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -171,7 +171,7 @@ fn message(body: &Value) -> String {
         .to_string()
 }
 
-fn str_field(body: &Value, member: &str) -> String {
+pub(crate) fn str_field(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a string {member} in {body}"))
@@ -180,7 +180,7 @@ fn str_field(body: &Value, member: &str) -> String {
 
 /// The ARN form every model package carries:
 /// `arn:aws:sagemaker:<region>:<account>:model-package/<name>[/<version>]`.
-fn expected_arn(region: &str, resource: &str) -> String {
+pub(crate) fn expected_arn(region: &str, resource: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:model-package/{resource}")
 }
 
