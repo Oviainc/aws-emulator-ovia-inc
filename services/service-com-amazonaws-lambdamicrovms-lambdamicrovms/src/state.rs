@@ -8,12 +8,14 @@
 //!
 //! ## The clock-owed transitions
 //!
-//! Two of the service's documented lifecycles are asynchronous:
+//! Several of the service's lifecycles are asynchronous:
 //!
 //! * `CreateMicrovmImage` — "The build is asynchronous — the image transitions
-//!   from CREATING to CREATED on success"; and
+//!   from CREATING to CREATED on success";
 //! * `RunMicrovm` — "The MicroVM starts in PENDING state and transitions to
-//!   RUNNING once provisioning completes."
+//!   RUNNING once provisioning completes."; and
+//! * `DeleteMicrovmImage` — the image is reported `DELETING` and the removal that
+//!   makes every later read miss is owed by the clock.
 //!
 //! Each record therefore stores the INSTANT its next transition becomes due and
 //! [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::materialize_due`] applies
@@ -46,6 +48,23 @@ pub const MICROVM_PROVISION_SPAN: Duration = Duration::from_millis(500);
 /// How long after `TerminateMicrovm` the `TERMINATING` -> `TERMINATED`
 /// transition becomes due. Chosen for the same reason as [`IMAGE_BUILD_SPAN`].
 pub const MICROVM_TERMINATE_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteMicrovmImage` the image's removal becomes due.
+///
+/// The deletion is asynchronous — the call reports the image `DELETING` and a client
+/// polls `GetMicrovmImage` until it answers 404 — but AWS publishes no duration for
+/// it, so this span is chosen for the same reason as [`IMAGE_BUILD_SPAN`]: a caller
+/// acting straight after the delete still observes `DELETING`, and a poll gets
+/// through it quickly.
+pub const IMAGE_DELETE_SPAN: Duration = Duration::from_millis(500);
+
+/// The AWS-managed network connector a MicroVM image gets when the request names no
+/// `egressNetworkConnectors`: outbound internet access.
+///
+/// This service names its managed connectors (`CreateMicrovmShellAuthToken` documents
+/// "the SHELL_INGRESS network connector"); which one is the egress default is recorded
+/// AWS behaviour rather than modelled.
+pub const DEFAULT_EGRESS_NETWORK_CONNECTOR: &str = "INTERNET_EGRESS";
 
 /// The `maximumDurationInSeconds` a MicroVM gets when the caller names none.
 ///
@@ -116,6 +135,73 @@ pub const EXPIRY_REASON: &str = "Platform.MaximumDurationExceeded";
 pub const IMAGE_STATE_CREATING: &str = "CREATING";
 /// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`).
 pub const IMAGE_STATE_CREATED: &str = "CREATED";
+/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
+/// carries while `DeleteMicrovmImage`'s asynchronous deletion is in flight.
+pub const IMAGE_STATE_DELETING: &str = "DELETING";
+/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state
+/// `DeleteMicrovmImage` reports for an image this account no longer holds.
+pub const IMAGE_STATE_DELETED: &str = "DELETED";
+
+/// The version the FIRST build of a MicroVM image is minted as.
+///
+/// Versions are named in this service's `major.minor` form, and a client feeds the
+/// string straight back into the version-addressed calls
+/// (`GetMicrovmImageVersion`, `RunMicrovm$imageVersion`,
+/// `DeleteMicrovmImageVersion`), so the form matters as much as the ordering.
+pub const FIRST_IMAGE_VERSION: &str = "1.0";
+
+/// The `message` of the 404 a MicroVM-image lookup answers, built from the
+/// `imageIdentifier` the request carried.
+pub fn image_not_found_message(identifier: &str) -> String {
+    format!("MicroVMImage not found for MicroVMImageID: {identifier}")
+}
+
+/// The `message` of the 404 a MicroVM lookup answers, built from the
+/// `microvmIdentifier` the request carried.
+pub fn microvm_not_found_message(identifier: &str) -> String {
+    format!("MicroVM not found: {identifier}")
+}
+
+/// The `message` of the 404 `RunMicrovm` answers when it can resolve no ACTIVE
+/// version for the image the request names — a different condition from a missing
+/// image, and the one whose remediation is to publish or wait for a version.
+pub fn no_active_version_message(image: &str) -> String {
+    format!("No active version found for MicroVM image {image}")
+}
+
+/// The version the NEXT build of an image is minted as, given the versions it
+/// already holds.
+///
+/// Versions are `major.minor` (see [`FIRST_IMAGE_VERSION`]): the first build is
+/// `1.0` and every later build of the same image takes the next minor of the
+/// highest `major.minor` already minted. A stored version that is not in that form
+/// (nothing this service mints is) is ignored rather than crashing the mint.
+pub fn next_image_version<'a>(existing: impl IntoIterator<Item = &'a str>) -> String {
+    let highest = existing
+        .into_iter()
+        .filter_map(parse_image_version)
+        .max_by_key(|(major, minor)| (*major, *minor));
+    match highest {
+        Some((major, minor)) => format!("{major}.{}", minor + 1),
+        None => FIRST_IMAGE_VERSION.to_string(),
+    }
+}
+
+/// `version` as its `(major, minor)` pair, or `None` when it is not in that form.
+fn parse_image_version(version: &str) -> Option<(u64, u64)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Whether a MicroVM in `state` can still be connected to, which is what an
+/// authentication token is for (`CreateMicrovmAuthToken`: "an authentication token
+/// for accessing a running MicroVM").
+///
+/// A MicroVM on its way out, or already gone, never accepts another connection, so a
+/// token for it would grant access to nothing.
+pub fn is_connectable_microvm_state(state: &str) -> bool {
+    state != MICROVM_STATE_TERMINATING && state != MICROVM_STATE_TERMINATED
+}
 
 /// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`).
 pub const VERSION_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
@@ -177,6 +263,9 @@ pub struct MicrovmImage {
     pub latest_failed_image_version: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub versions: BTreeMap<String, MicrovmImageVersion>,
+    /// When this image's asynchronous deletion removes it; `None` while no delete is
+    /// in flight.
+    pub delete_due_at: Option<Instant>,
 }
 
 /// A running (or terminated) MicroVM, keyed in
@@ -271,12 +360,18 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 .map(|(k, _)| k.clone())
                 .collect();
             for version in due {
+                // The build completing CHANGES the version and the image, so both
+                // carry a new `updatedAt` — "the timestamp when the MicroVM image
+                // was last updated" is what a client orders change by.
+                let updated_at = now_datetime();
                 let Some(record) = image.versions.get_mut(&version) else {
                     continue;
                 };
                 record.build_due_at = None;
                 record.state = VERSION_STATE_SUCCESSFUL.to_string();
                 record.status = VERSION_STATUS_ACTIVE.to_string();
+                record.updated_at = Some(updated_at);
+                image.updated_at = Some(updated_at);
                 // A newly successful build becomes the image's active version,
                 // and the previous one steps down: `MicrovmImageVersionStatus`
                 // marks exactly one version ACTIVE.
@@ -290,6 +385,20 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                 if image.state == IMAGE_STATE_CREATING {
                     image.state = IMAGE_STATE_CREATED.to_string();
                 }
+            }
+        }
+
+        // `DeleteMicrovmImage` is asynchronous: an image whose removal the clock has
+        // made due goes, with every version it holds, and both indexes go with it.
+        let removed: Vec<String> = self
+            .images
+            .values()
+            .filter(|image| image.delete_due_at.is_some_and(|at| at <= now))
+            .map(|image| image.name.clone())
+            .collect();
+        for name in removed {
+            if let Some(image) = self.images.remove(&name) {
+                self.arn_index.remove(&image.image_arn);
             }
         }
 
@@ -428,6 +537,26 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
         self.microvms.get(&id)
     }
 
+    /// The image `identifier` names, for mutation.
+    pub fn image_mut(&mut self, identifier: &str) -> Option<&mut MicrovmImage> {
+        let name = self.resolve_image_name(identifier)?;
+        self.images.get_mut(&name)
+    }
+
+    /// The version of the base image `base_image_arn` names, for a request that named
+    /// none.
+    ///
+    /// `baseImageVersion` is "the specific version of the base MicroVM image to use",
+    /// so the service resolves one rather than recording none: the base image's own
+    /// active version when this account holds it, and otherwise — an AWS-managed base
+    /// image, whose catalogue this emulator does not hold — that image's initial
+    /// version, [`FIRST_IMAGE_VERSION`].
+    pub fn resolve_base_image_version(&self, base_image_arn: &str) -> String {
+        self.image(base_image_arn)
+            .and_then(|image| image.latest_active_image_version.clone())
+            .unwrap_or_else(|| FIRST_IMAGE_VERSION.to_string())
+    }
+
     /// The MicroVM `identifier` names, for mutation.
     pub fn microvm_mut(&mut self, identifier: &str) -> Option<&mut Microvm> {
         let id = self.resolve_microvm_id(identifier)?;
@@ -470,6 +599,17 @@ pub fn microvm_image_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("lambda", region, &format!("microvm-image:{name}"))
 }
 
+/// The ARN of an AWS-MANAGED network connector named `name`, in `region`.
+///
+/// The connector is an AWS-owned resource, so its ARN carries `aws` in the account
+/// field rather than this account's id — which is why it is not built through
+/// `engine::emulator_arn` (that mints an ARN owned by the emulator's account).
+/// The form is recorded AWS behaviour:
+/// `arn:aws:lambda:<region>:aws:network-connector:aws-network-connector:<NAME>`.
+pub fn managed_network_connector_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:lambda:{region}:aws:network-connector:aws-network-connector:{name}")
+}
+
 /// The ARN of the MicroVM `microvm_id` in `region`.
 ///
 /// `MicrovmIdentifier` is documented as "The ARN or ID of the MicroVm", so each
@@ -483,6 +623,28 @@ pub fn microvm_arn(region: &str, microvm_id: &str) -> String {
 /// documented as "The HTTPS endpoint URL for communicating with the MicroVM".
 pub fn microvm_endpoint(region: &str, microvm_id: &str) -> String {
     format!("https://{microvm_id}.microvm.lambda.{region}.amazonaws.com")
+}
+
+/// A fresh authentication token for connecting a client to one MicroVM's endpoint,
+/// for `CreateMicrovmAuthToken`.
+///
+/// The token authenticates to the MICROVM endpoint, not to this emulator, so it must
+/// never be accepted as a SigV4 credential — but it is still a secret handed to a
+/// caller, and nothing in a service may construct a secret itself. It is therefore
+/// minted by the one component that generates secrets, the emulator's credential
+/// store, and then removed from that store again: the caller gets the secret, the
+/// emulator keeps no credential it would accept, and nothing accumulates per call.
+///
+/// `None` when the store minted no token secret, which leaves the operation to refuse
+/// rather than report a token it made up.
+pub fn mint_microvm_auth_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    token
 }
 
 /// A sorted copy of a wire map, so a stored record has one deterministic order.

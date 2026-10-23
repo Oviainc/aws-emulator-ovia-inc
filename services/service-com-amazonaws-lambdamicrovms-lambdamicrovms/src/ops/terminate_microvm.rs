@@ -160,14 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(now);
 
         let Some(vm) = store.microvm_mut(&input.microvm_identifier) else {
+            // The not-found envelope this service puts on the wire: a
+            // request-derived `message`, with `resourceType` and `resourceId` unset.
             return Err(TerminateMicrovmErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no MicroVM matches the identifier {}",
-                        input.microvm_identifier
-                    ),
-                    resource_type: Some("Microvm".to_string()),
-                    resource_id: Some(input.microvm_identifier.clone()),
+                    message: crate::state::microvm_not_found_message(&input.microvm_identifier),
+                    resource_type: None,
+                    resource_id: None,
                 },
             )
             .into());

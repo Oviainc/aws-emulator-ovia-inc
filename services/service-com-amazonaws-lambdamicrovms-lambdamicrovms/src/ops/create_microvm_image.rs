@@ -274,27 +274,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let image_arn = crate::state::microvm_image_arn(&region, &input.name);
-        let image_version = "1".to_string();
+        // A new image holds no version yet, so this mints the FIRST one, in the
+        // `major.minor` form every version-addressed call takes back.
+        let image_version = crate::state::next_image_version([]);
         let tags = crate::state::sorted_map(input.tags);
+
+        // A member the request OMITS whose value the service supplies is resolved
+        // here and stored, so every projection of this image reports the same value
+        // rather than nothing:
+        //
+        // * `baseImageVersion` is "the specific version of the base MicroVM image to
+        //   use", resolved from the base image this request names; and
+        // * `egressNetworkConnectors` are "the list of egress network connectors
+        //   available to the MicroVM at runtime", which is the AWS-managed egress
+        //   connector when the caller asks for none.
+        let base_image_version = Some(input.base_image_version.unwrap_or_else(|| {
+            store.resolve_base_image_version(&input.base_image_arn)
+        }));
+        let egress_network_connectors = match input.egress_network_connectors {
+            Some(connectors) if !connectors.is_empty() => connectors,
+            _ => vec![crate::state::managed_network_connector_arn(
+                &region,
+                crate::state::DEFAULT_EGRESS_NETWORK_CONNECTOR,
+            )],
+        };
 
         let version = MicrovmImageVersion {
             image_version: image_version.clone(),
             state: crate::state::VERSION_STATE_IN_PROGRESS.to_string(),
             status: crate::state::VERSION_STATUS_INACTIVE.to_string(),
             base_image_arn: input.base_image_arn,
-            base_image_version: input.base_image_version,
+            base_image_version,
             build_role_arn: input.build_role_arn,
             description: input.description,
             code_artifact: input.code_artifact,
             logging: input.logging,
-            egress_network_connectors: input.egress_network_connectors.unwrap_or_default(),
+            egress_network_connectors,
             cpu_configurations: input.cpu_configurations.unwrap_or_default(),
             resources: input.resources.unwrap_or_default(),
             additional_os_capabilities: input.additional_os_capabilities.unwrap_or_default(),
             hooks: input.hooks,
             environment_variables: crate::state::sorted_map(input.environment_variables),
             created_at,
-            updated_at: None,
+            // "The timestamp when the MicroVM image was last updated": the create IS
+            // the record's first update, so the stamp is set here rather than left
+            // absent until something else changes it.
+            updated_at: Some(created_at),
             tags: tags.clone(),
             // The build is asynchronous: the version completes, and with it the
             // image's CREATING -> CREATED move, once the clock makes it due.
@@ -312,11 +337,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: input.name.clone(),
                 state: crate::state::IMAGE_STATE_CREATING.to_string(),
                 created_at,
-                updated_at: None,
+                updated_at: Some(created_at),
                 latest_active_image_version: None,
                 latest_failed_image_version: None,
                 tags,
                 versions,
+                delete_due_at: None,
             },
         );
         if let Some(token) = input.client_token {

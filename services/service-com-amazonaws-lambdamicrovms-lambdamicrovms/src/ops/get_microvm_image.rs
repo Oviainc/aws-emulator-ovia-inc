@@ -171,14 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due(::std::time::Instant::now());
 
         let Some(image) = store.image(&input.image_identifier) else {
+            // `ResourceNotFoundException` models `message` as the only required
+            // member; `resourceType` and `resourceId` are optional and this service
+            // leaves them unset, so the message — built from the identifier the
+            // request carried — is the whole envelope.
             return Err(GetMicrovmImageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no MicroVM image matches the identifier {}",
-                        input.image_identifier
-                    ),
-                    resource_type: Some("MicrovmImage".to_string()),
-                    resource_id: Some(input.image_identifier.clone()),
+                    message: crate::state::image_not_found_message(&input.image_identifier),
+                    resource_type: None,
+                    resource_id: None,
                 },
             )
             .into());

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMicrovmImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMicrovmImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMicrovmImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the [`crate::state::MicrovmImage`] the `imageIdentifier` names: the call
+//! records it `DELETING` and the removal the clock then owes takes the record and
+//! every version it holds, so a later read misses. Idempotent: an image this account
+//! no longer holds is reported deleted rather than refused.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMicrovmImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMicrovmImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteMicrovmImageErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MicroVM image store is unavailable".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+        store.materialize_due(now);
+
+        // The delete is DURABLE and ASYNCHRONOUS: the call records the image
+        // `DELETING` and the removal the clock then owes takes the record, both of its
+        // index entries and every version it held — so `GetMicrovmImage` and every
+        // other lookup miss once it is due, and the name is free for a later create.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMicrovmImage"))
+        // "This operation is idempotent; deleting an image that has already been
+        // deleted succeeds without error" — so a repeat leaves the deletion already in
+        // flight exactly as it is, and an identifier this account no longer holds is
+        // answered with the state it has: DELETED.
+        let state_after_deletion = match store.image_mut(&input.image_identifier) {
+            Some(image) => {
+                if image.delete_due_at.is_none() {
+                    image.state = crate::state::IMAGE_STATE_DELETING.to_string();
+                    image.updated_at = Some(crate::state::now_datetime());
+                    image.delete_due_at = Some(now + crate::state::IMAGE_DELETE_SPAN);
+                }
+                image.state.clone()
+            }
+            None => crate::state::IMAGE_STATE_DELETED.to_string(),
+        };
+
+        Ok(DeleteMicrovmImageOutput {
+            // "The identifier of the deleted MicroVM image": the one the request
+            // addressed, in the form it addressed it.
+            image_identifier: input.image_identifier,
+            state: state_after_deletion,
+        })
     }
 }

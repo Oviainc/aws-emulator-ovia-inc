@@ -171,13 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(identifier) => match store.image(identifier) {
                 Some(image) => Some(image.image_arn.clone()),
                 None => {
+                    // Same not-found envelope as every other image lookup: a
+                    // request-derived message, no `resourceType`/`resourceId`.
                     return Err(ListMicrovmsErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: format!(
-                                "no MicroVM image matches the identifier {identifier}"
-                            ),
-                            resource_type: Some("MicrovmImage".to_string()),
-                            resource_id: Some(identifier.to_string()),
+                            message: crate::state::image_not_found_message(identifier),
+                            resource_type: None,
+                            resource_id: None,
                         },
                     )
                     .into());

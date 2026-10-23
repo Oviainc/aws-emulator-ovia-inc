@@ -219,8 +219,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(output_of(vm));
         }
 
-        let Some(image_name) = store.resolve_image_name(&input.image_identifier) else {
-            return Err(image_not_found(&input.image_identifier));
+        // A MicroVM runs a BUILT image version. With no `imageVersion` named, the
+        // precondition is the resolution of the image's ACTIVE version — and that
+        // resolution fails identically whether the account holds no such image or the
+        // image holds no active version yet, so both answer the one 404 that names the
+        // active-version miss ("image absent" and "no active version" are reported as
+        // the same failed resolution, which is what the client must act on: publish or
+        // wait for a version).
+        let (image_arn, image_version) = match input.image_version.as_deref() {
+            None => {
+                let resolved = store.image(&input.image_identifier).and_then(|image| {
+                    let arn = image.image_arn.clone();
+                    image
+                        .latest_active_image_version
+                        .clone()
+                        .map(|version| (arn, version))
+                });
+                match resolved {
+                    Some(resolved) => resolved,
+                    None => {
+                        // The image by its stored ARN when this account holds it,
+                        // otherwise by the identifier the request carried — there is
+                        // no ARN to name for an image that does not exist.
+                        let named = store
+                            .image(&input.image_identifier)
+                            .map(|image| image.image_arn.clone())
+                            .unwrap_or_else(|| input.image_identifier.clone());
+                        return Err(no_active_version(&named));
+                    }
+                }
+            }
+            Some(requested) => {
+                let Some(image) = store.image(&input.image_identifier) else {
+                    return Err(version_not_found(&input.image_identifier, requested));
+                };
+                let image_arn = image.image_arn.clone();
+                match image.versions.get(requested) {
+                    Some(version) if version.status == crate::state::VERSION_STATUS_ACTIVE => {
+                        (image_arn, requested.to_string())
+                    }
+                    Some(version) => {
+                        let message = format!(
+                            "version {requested} of MicroVM image {} is not active (build state {})",
+                            image.name, version.state
+                        );
+                        return Err(conflict(message, &image_arn));
+                    }
+                    None => {
+                        return Err(version_not_found(&image_arn, requested));
+                    }
+                }
+            }
         };
 
         // The account's concurrent-MicroVM quota: the modelled 402 rather than an
@@ -240,43 +289,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let Some(image) = store.images.get(&image_name) else {
-            return Err(unavailable());
-        };
-        let image_arn = image.image_arn.clone();
-        // A MicroVM runs a BUILT image version: either the one the caller named or
-        // the image's current active one.
-        let image_version = match input.image_version.as_deref() {
-            Some(requested) => match image.versions.get(requested) {
-                Some(version) if version.status == crate::state::VERSION_STATUS_ACTIVE => {
-                    requested.to_string()
-                }
-                Some(version) => {
-                    return Err(conflict(
-                        format!(
-                            "version {requested} of MicroVM image {} is not active (build state {})",
-                            image.name, version.state
-                        ),
-                        &image_arn,
-                    ));
-                }
-                None => {
-                    return Err(version_not_found(&image_arn, requested));
-                }
-            },
-            None => match image.latest_active_image_version.clone() {
-                Some(active) => active,
-                None => {
-                    return Err(conflict(
-                        format!(
-                            "MicroVM image {} has no active version yet (image state {})",
-                            image.name, image.state
-                        ),
-                        &image_arn,
-                    ));
-                }
-            },
-        };
 
         // `maximumDurationInSeconds` is modelled `@range(min: 1, max: 28800)`: the
         // boundary validator refuses anything outside it before this handler runs, and
@@ -357,22 +369,25 @@ fn unavailable() -> RunMicrovmError {
     .into()
 }
 
-/// 404: no image matches the `imageIdentifier`.
-fn image_not_found(identifier: &str) -> RunMicrovmError {
+/// 404: no ACTIVE version could be resolved for the image the request named —
+/// because the account holds no such image, or because it holds no active version
+/// yet. `resourceType`/`resourceId` stay unset, as on every not-found this service
+/// answers.
+fn no_active_version(image: &str) -> RunMicrovmError {
     RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("no MicroVM image matches the identifier {identifier}"),
-        resource_type: Some("MicrovmImage".to_string()),
-        resource_id: Some(identifier.to_string()),
+        message: crate::state::no_active_version_message(image),
+        resource_type: None,
+        resource_id: None,
     })
     .into()
 }
 
-/// 404: the image exists but carries no such `imageVersion`.
-fn version_not_found(image_arn: &str, image_version: &str) -> RunMicrovmError {
+/// 404: the request named an `imageVersion` the image does not carry.
+fn version_not_found(image: &str, image_version: &str) -> RunMicrovmError {
     RunMicrovmErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("MicroVM image {image_arn} has no version {image_version}"),
-        resource_type: Some("MicrovmImageVersion".to_string()),
-        resource_id: Some(format!("{image_arn}:{image_version}")),
+        message: format!("MicroVM image {image} has no version {image_version}"),
+        resource_type: None,
+        resource_id: None,
     })
     .into()
 }

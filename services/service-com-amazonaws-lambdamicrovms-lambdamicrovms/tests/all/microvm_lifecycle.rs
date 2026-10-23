@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request is signed for; each minted ARN and endpoint must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical emulator account id (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
@@ -22,7 +22,7 @@ const ACCOUNT: &str = "000000000000";
 /// by the time this has passed the transition is due even on a loaded machine. The
 /// margin is deliberately several times the span: these suites assert that a transition
 /// HAS become due, so only an over-long wait is safe.
-const PAST_THE_SPAN: Duration = Duration::from_millis(2_500);
+pub(crate) const PAST_THE_SPAN: Duration = Duration::from_millis(2_500);
 
 /// Comfortably longer than the 1-second `maximumDurationInSeconds` the expiry suite asks
 /// for, for the same reason as [`PAST_THE_SPAN`].
@@ -58,7 +58,7 @@ const ECHOED_IMAGE_MEMBERS: &[&str] = &[
 ];
 
 /// A fresh emulator holding only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -70,7 +70,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// One request against the emulator; the SigV4 credential scope is what routes it to
 /// this service's `lambda` signing name and names the region its ARNs carry.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -104,7 +104,7 @@ async fn call(
 }
 
 /// A `CreateMicrovmImage` body: the four required members, plus whatever `extra` adds.
-fn image_body(name: &str, extra: Value) -> Value {
+pub(crate) fn image_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "name": name,
         "baseImageArn": BASE_IMAGE_ARN,
@@ -121,7 +121,7 @@ fn image_body(name: &str, extra: Value) -> Value {
 }
 
 /// The ARN `CreateMicrovmImage` must mint for `name`.
-fn expected_image_arn(name: &str) -> String {
+pub(crate) fn expected_image_arn(name: &str) -> String {
     format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image:{name}")
 }
 
@@ -132,7 +132,7 @@ fn expected_microvm_arn(microvm_id: &str) -> String {
 }
 
 /// Create an image and wait out its asynchronous build, so it has an active version.
-async fn built_image(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn built_image(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(
         router,
         "POST",
@@ -149,7 +149,7 @@ async fn built_image(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// Run a MicroVM from `image_identifier` and return the whole response body.
-async fn run_microvm(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn run_microvm(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", "/2025-09-09/microvms", Some(body)).await
 }
 
@@ -223,7 +223,7 @@ async fn created_images_are_persisted_and_read_back_by_name_or_arn() {
         );
         assert_eq!(
             created["imageVersion"].as_str(),
-            Some("1"),
+            Some("1.0"),
             "case {case:?}: expected the first image version, got {:?}",
             created["imageVersion"]
         );
@@ -285,7 +285,7 @@ async fn created_images_are_persisted_and_read_back_by_name_or_arn() {
         );
         assert_eq!(
             by_name.1["latestActiveImageVersion"].as_str(),
-            Some("1"),
+            Some("1.0"),
             "case {case:?}: the completed build becomes the active version, got {:?}",
             by_name.1["latestActiveImageVersion"]
         );
@@ -353,7 +353,7 @@ async fn an_image_build_is_asynchronous_and_observable_in_both_states() {
     );
     assert_eq!(
         done["latestActiveImageVersion"].as_str(),
-        Some("1"),
+        Some("1.0"),
         "the completed build becomes the active version, got {:?}",
         done["latestActiveImageVersion"]
     );
@@ -460,7 +460,7 @@ async fn running_a_microvm_persists_it_and_get_returns_the_stored_record() {
         ),
         (
             "explicit image version",
-            json!({"imageIdentifier": "runnable", "imageVersion": "1"}),
+            json!({"imageIdentifier": "runnable", "imageVersion": "1.0"}),
             28_800,
         ),
         (
@@ -513,7 +513,7 @@ async fn running_a_microvm_persists_it_and_get_returns_the_stored_record() {
         );
         assert_eq!(
             run["imageVersion"].as_str(),
-            Some("1"),
+            Some("1.0"),
             "case {case:?}: expected the image's active version, got {:?}",
             run["imageVersion"]
         );
@@ -869,7 +869,7 @@ async fn list_microvms_filters_and_pages_over_the_store() {
         ),
         (
             "filter by image and version",
-            "?imageIdentifier=image-one&imageVersion=1".to_string(),
+            "?imageIdentifier=image-one&imageVersion=1.0".to_string(),
             on_first.clone(),
         ),
         (
@@ -1059,10 +1059,13 @@ async fn unknown_identifiers_answer_resource_not_found() {
     }
 }
 
-/// RULE: a MicroVM runs a BUILT image version, so an image whose build has not finished
-/// is a conflict with the resource's current state (409), not a 404 and not a success.
+/// RULE: a MicroVM runs a BUILT image version. With no `imageVersion` named, the
+/// precondition is the resolution of the image's ACTIVE version, so an image whose build
+/// has not finished has none and the refusal is the 404 that says so; naming a version
+/// that EXISTS but is not active is instead a conflict with that version's current state
+/// (409). Once the build is due, both succeed.
 #[tokio::test]
-async fn running_from_an_unbuilt_image_conflicts() {
+async fn running_from_an_unbuilt_image_is_refused_until_a_version_is_active() {
     let router = emulator();
     let (status, created) = call(
         &router,
@@ -1075,8 +1078,34 @@ async fn running_from_an_unbuilt_image_conflicts() {
 
     let (status, response) = run_microvm(&router, json!({"imageIdentifier": "still-building"})).await;
     assert_eq!(
+        status, 404,
+        "a CREATING image has no active version to resolve, got {status} {response}"
+    );
+    assert_eq!(
+        response["__type"].as_str(),
+        Some("ResourceNotFoundException"),
+        "expected ResourceNotFoundException, got {response}"
+    );
+    assert_eq!(
+        response["message"].as_str(),
+        Some(
+            format!(
+                "No active version found for MicroVM image {}",
+                expected_image_arn("still-building")
+            )
+            .as_str()
+        ),
+        "the 404 must name the active-version miss, got {response}"
+    );
+
+    let (status, response) = run_microvm(
+        &router,
+        json!({"imageIdentifier": "still-building", "imageVersion": "1.0"}),
+    )
+    .await;
+    assert_eq!(
         status, 409,
-        "running from a CREATING image must conflict, got {status} {response}"
+        "a version that exists but is not active conflicts, got {status} {response}"
     );
     assert_eq!(
         response["__type"].as_str(),
@@ -1084,13 +1113,21 @@ async fn running_from_an_unbuilt_image_conflicts() {
         "expected ConflictException, got {response}"
     );
 
-    // Once the build is due, the same request succeeds.
+    // Once the build is due, the same requests succeed.
     tokio::time::sleep(PAST_THE_SPAN).await;
-    let (status, response) = run_microvm(&router, json!({"imageIdentifier": "still-building"})).await;
-    assert_eq!(
-        status, 200,
-        "the same request succeeds once the build completed, got {status} {response}"
-    );
+    for (case, body) in [
+        ("the active version", json!({"imageIdentifier": "still-building"})),
+        (
+            "that version named explicitly",
+            json!({"imageIdentifier": "still-building", "imageVersion": "1.0"}),
+        ),
+    ] {
+        let (status, response) = run_microvm(&router, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: succeeds once the build completed, got {status} {response}"
+        );
+    }
 }
 
 /// RULE: the store is BOUNDED — the account's image and concurrent-MicroVM quotas are
@@ -1247,7 +1284,7 @@ async fn identifiers_resolve_by_id_or_by_the_stored_arn_only() {
 /// character, so none of them needs escaping and what a test sends is what the server
 /// reads back. The assertion keeps that true: a value that WOULD need escaping fails
 /// loudly here instead of being sent raw.
-fn as_uri_value(value: &str) -> &str {
+pub(crate) fn as_uri_value(value: &str) -> &str {
     assert!(
         value
             .chars()
