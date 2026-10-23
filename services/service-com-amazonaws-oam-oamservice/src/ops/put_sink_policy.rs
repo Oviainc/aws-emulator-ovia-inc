@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutSinkPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutSinkPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation answers from this service's persisted sink records;
+//! this is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutSinkPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `PutSinkPolicy` creates or replaces the resource policy attached to one stored
+//! sink: the document is validated, then stored on the sink's own record, so what
+//! this answers is exactly what a later `GetSinkPolicy` reads back and a refused put
+//! leaves the stored policy untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutSinkPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutSinkPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `SinkIdentifier`'s presence and its `ResourceIdentifier` pattern, and
+        // `Policy`'s presence, are modelled constraints, so the centralized walk has
+        // already refused anything outside them before this body runs. What is left to
+        // this handler is the service's own rule about the document itself.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutSinkPolicy"))
+        // The document is judged BEFORE anything is stored, so a refused put leaves
+        // the sink's policy exactly as it was — the rule itself lives on
+        // `crate::state::sink_policy_rejection`.
+        if let Some(why) = crate::state::sink_policy_rejection(&input.policy) {
+            return Err(PutSinkPolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutSinkPolicyErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the sink store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The policy hangs off a STORED sink: an identifier naming none — never
+        // created, or since deleted — is the modelled 404, never a sink synthesized
+        // from the identifier itself.
+        let id = store
+            .resolve_sink_id(&region, &input.sink_identifier)
+            .ok_or_else(|| {
+                PutSinkPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    ..Default::default()
+                })
+            })?;
+        let sink = store.sinks.get_mut(&id).ok_or_else(|| {
+            PutSinkPolicyErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the sink could not be read for update".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // "If you are updating an existing policy, the entire existing policy is
+        // replaced by what you specify here" (the `Policy` member's own
+        // documentation), so the stored document is REPLACED rather than merged. It is
+        // stored exactly as the caller sent it, which is what makes the reported
+        // `Policy` "the policy that you specified".
+        sink.policy = Some(input.policy);
+
+        // Reported from the STORED record rather than from the request, so what this
+        // put answers is exactly what a later `GetSinkPolicy` reads back.
+        Ok(PutSinkPolicyOutput {
+            sink_arn: Some(sink.arn.clone()),
+            sink_id: Some(sink.id.clone()),
+            policy: sink.policy.clone(),
+        })
     }
 }

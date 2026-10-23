@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSinkPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSinkPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation answers from this service's persisted sink records;
+//! this is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSinkPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `GetSinkPolicy` reports the resource policy `PutSinkPolicy` attached to one stored
+//! sink. It is `@readonly`: it reads the stored record and writes nothing. A sink that
+//! carries no policy has none to report, so the read is the modelled 404 rather than a
+//! success with an absent `Policy`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSinkPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSinkPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSinkPolicy"))
+        // `SinkIdentifier`'s presence and its `ResourceIdentifier` pattern are
+        // modelled constraints, already refused by the centralized walk before this
+        // body runs. This operation is `@readonly`: it reports the stored policy and
+        // writes nothing.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSinkPolicyErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the sink store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        let not_found = || {
+            GetSinkPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                ..Default::default()
+            })
+        };
+
+        // Resolved against what is STORED: an identifier naming no sink, and a stored
+        // sink that no `PutSinkPolicy` has attached a policy to, are the same refusal —
+        // "the request references a resource that does not exist" — because the policy
+        // is the resource being asked for and it does not exist until it is put.
+        let sink = store
+            .sink(&region, &input.sink_identifier)
+            .ok_or_else(not_found)?;
+        let policy = sink.policy.clone().ok_or_else(not_found)?;
+
+        Ok(GetSinkPolicyOutput {
+            sink_arn: Some(sink.arn.clone()),
+            sink_id: Some(sink.id.clone()),
+            policy: Some(policy),
+        })
     }
 }
