@@ -838,9 +838,9 @@ async fn a_client_token_maps_to_one_execution_and_a_plan_runs_one_at_a_time() {
 }
 
 /// An execution is created in a transient state and the clock — not the read — moves it
-/// on, so a caller acting straight after the start still sees the transient state. The
-/// outcome the clock owes it is the service's modelled FAILURE state, because this
-/// emulator runs no workflow execution block; and failing RELEASES the plan.
+/// on, so a caller acting straight after the start still sees the transient state. An
+/// execution whose next step is a block this emulator does not run reaches the service's
+/// modelled FAILURE state, with the reason recorded; and failing RELEASES the plan.
 #[tokio::test]
 async fn an_execution_starts_pending_and_the_clock_settles_it_into_the_failure_state() {
     let router = router();
@@ -892,6 +892,28 @@ async fn an_execution_starts_pending_and_the_clock_settles_it_into_the_failure_s
         later["startTime"], immediately["startTime"],
         "case \"after the outcome came due\": startTime expected {}, got {}",
         immediately["startTime"], later["startTime"]
+    );
+    // The step it stopped at is the one that was not performed; the one behind it was
+    // never reached.
+    let stopped: Vec<(&str, &str)> = later["stepStates"]
+        .as_array()
+        .map(|steps| {
+            steps
+                .iter()
+                .map(|step| {
+                    (
+                        step["name"].as_str().unwrap_or_default(),
+                        step["status"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        stopped,
+        vec![("scale-up", "failed"), ("shift-traffic", "notStarted")],
+        "case \"after the outcome came due\": expected the first step failed and the rest \
+         unreached, got {stopped:?}"
     );
 
     // The reason is told, not left to guess: the executionFailed event carries it.
@@ -1280,8 +1302,8 @@ async fn list_plan_execution_events_reports_the_timeline_the_execution_recorded(
         );
     }
 
-    // `name` selects one step's events; the execution's own lifecycle events carry none,
-    // so a step filter answers an empty timeline here.
+    // `name` selects one step's events; the execution's own lifecycle events carry no step
+    // name, so a step filter answers an empty timeline here.
     let (status, filtered) = call(
         &router,
         "ListPlanExecutionEvents",
@@ -1297,6 +1319,23 @@ async fn list_plan_execution_events_reports_the_timeline_the_execution_recorded(
         json!([]),
         "case \"filtered by step name\": expected no step events, got {}",
         filtered["items"]
+    );
+
+    let (status, unreached) = call(
+        &router,
+        "ListPlanExecutionEvents",
+        &json!({"planArn": plan_arn, "executionId": execution_id, "name": "shift-traffic"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"filtered by an unreached step\": expected 200, got {status} with {unreached}"
+    );
+    assert_eq!(
+        unreached["items"],
+        json!([]),
+        "case \"filtered by an unreached step\": expected no events, got {}",
+        unreached["items"]
     );
 
     let (status, body) = call(
