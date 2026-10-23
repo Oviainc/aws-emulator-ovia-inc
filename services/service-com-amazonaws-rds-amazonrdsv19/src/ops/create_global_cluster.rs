@@ -192,7 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A global cluster is ACCOUNT-scoped and its ARN carries no region, so the region
         // the request was signed for does not scope what it creates. It is still read, so
         // a malformed credential scope is refused here as it is everywhere else in this
-        // service.
+        // service — and it is the region a source DB cluster this request names is
+        // resolved in, since a DB cluster IS regional.
         let region =
             crate::state::request_region(ctx).map_err(CreateGlobalClusterError::validation)?;
         // "This parameter is stored as a lowercase string", so the identifier is folded

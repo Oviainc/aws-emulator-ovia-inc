@@ -1084,6 +1084,10 @@ fn hyphenated(segment: &str) -> String {
 /// is also what that type's `Ref` returns); where none is declared, "CloudFormation
 /// generates a unique physical ID and uses that ID for the resource name", in the form
 /// `<stack name>-<logical id>-<unique id>`.
+///
+/// A type whose owning API spells its name member with the resource's FULL noun rather
+/// than the type's last segment is read through [`declared_name_property`] first, so the
+/// name such a template asked for is still the name the resource carries.
 fn physical_name(
     declared: &DeclaredResource,
     naming: &Scope<'_>,
@@ -1094,17 +1098,24 @@ fn physical_name(
         .rsplit("::")
         .next()
         .unwrap_or_default();
-    let candidates = [
-        format!("{segment}Name"),
-        "Name".to_string(),
-        format!("{segment}Identifier"),
-    ];
-    let declared_name = candidates.iter().find_map(|property| {
-        declared
-            .properties
-            .get(property)
-            .and_then(|value| text(value, naming, 0, budget))
-    });
+    // The type's OWN name property, where it is neither convention, comes first; then the
+    // two conventions, then the Amazon RDS `Identifier` spelling. The chain is consumed
+    // as it is built — the first property the template declares wins — so no candidate
+    // past it is even formatted.
+    let declared_name = declared_name_property(&declared.resource_type)
+        .map(ToString::to_string)
+        .into_iter()
+        .chain([
+            format!("{segment}Name"),
+            "Name".to_string(),
+            format!("{segment}Identifier"),
+        ])
+        .find_map(|property| {
+            declared
+                .properties
+                .get(&property)
+                .and_then(|value| text(value, naming, 0, budget))
+        });
     declared_name.unwrap_or_else(|| generated_name(&declared.logical_id, naming.stack))
 }
 
@@ -1242,6 +1253,29 @@ fn database_port(
     )
 }
 
+/// The property a resource type takes its NAME from when that property is neither the
+/// type's last segment plus `Name` nor plain `Name`, which is what [`physical_name`]
+/// reads by convention.
+///
+/// A CloudFormation resource type's name property is the name member of the API resource
+/// it wraps, and a few APIs spell that member with the resource's full noun: the Bedrock
+/// AgentCore control plane's `CreateAgentRuntime` takes `agentRuntimeName`, so
+/// `AWS::BedrockAgentCore::Runtime` takes `AgentRuntimeName` — the type's last segment is
+/// `Runtime`, so neither `RuntimeName` nor `Name` finds it.
+///
+/// This is the OTHER HALF of the per-type catalogue [`return_values`] below keys: a type
+/// whose name property is unconventional has to be registered here AND there. The two are
+/// separate functions only because the name is needed BEFORE the return values are
+/// computed from it ([`provision`] calls [`physical_name`] first), so they cannot share one
+/// `match`; keep them adjacent, and when a second entry appears here, fold both into one
+/// per-type descriptor returned by a single lookup.
+fn declared_name_property(resource_type: &str) -> Option<&'static str> {
+    match resource_type {
+        "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
+        _ => None,
+    }
+}
+
 /// The LABEL an AgentCore identifier derived from `name` carries: `name` reduced to the
 /// characters that identifier's documented pattern admits, cut to
 /// [`AGENTCORE_LABEL_CHARS`], and made to start with a letter.
@@ -1316,6 +1350,8 @@ fn gateway_label_char(c: char) -> bool {
 /// resource type this emulator provisions, and nothing for a name it knows nothing about.
 /// Keep it in step with the `match` in [`return_values`] — one entry per arm.
 pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
+    "AWS::BedrockAgentCore::Browser",
+    "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",
     "AWS::BedrockAgentCore::Memory",
     "AWS::BedrockAgentCore::Runtime",
@@ -1560,12 +1596,13 @@ fn return_values(
             attributes.insert("GroupId".to_string(), group_id.clone());
             (group_id, attributes)
         }
-        // The four Amazon Bedrock AgentCore types. Source for each one's identifiers: the
+        // The Amazon Bedrock AgentCore types. Source for each one's identifiers: the
         // AgentCore control-plane model, whose `arnReference` traits name these very
         // resource types — `MemoryArn` references `AWS::BedrockAgentCore::Memory`,
         // `GatewayArn` `AWS::BedrockAgentCore::Gateway`, `AgentRuntimeArn`
-        // `AWS::BedrockAgentCore::Runtime` and `WorkloadIdentityArnType`
-        // `AWS::BedrockAgentCore::WorkloadIdentity` — and whose create responses publish
+        // `AWS::BedrockAgentCore::Runtime`, `WorkloadIdentityArnType`
+        // `AWS::BedrockAgentCore::WorkloadIdentity`, and `CodeInterpreterArn` /
+        // `BrowserArn` the two sandbox types — and whose create responses publish
         // the members a CloudFormation resource of that type returns. `Ref` returns the
         // resource's own identifier (the type's primary identifier) and `Fn::GetAtt` reads
         // the identifier and the ARN, each in the form the model's pattern fixes; the
@@ -1611,6 +1648,47 @@ fn return_values(
                 "AgentRuntimeVersion".to_string(),
                 FIRST_AGENTCORE_RUNTIME_VERSION.to_string(),
             );
+            (id, attributes)
+        }
+        // The two SANDBOX types, the same shape one resource along. `CodeInterpreterId`
+        // and `BrowserId` are `^[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10}$` — the agent
+        // runtime's label alphabet exactly, hence `runtime_label_char` — and their ARN
+        // patterns admit `code-interpreter(-custom)?` / `browser(-custom)?`: the bare
+        // segment is the service's built-in `aws.codeinterpreter.v1` /
+        // `aws.browser.v1` sandbox, so a sandbox a template declares is a
+        // customer-created one and carries the `-custom` segment.
+        //
+        // "Ref returns the code interpreter id"; Fn::GetAtt: CodeInterpreterId,
+        // CodeInterpreterArn.
+        "AWS::BedrockAgentCore::CodeInterpreter" => {
+            let id = generated_service_id(
+                &agentcore_label(name, runtime_label_char, false, 'c'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("code-interpreter-custom/{id}"),
+            );
+            attributes.insert("CodeInterpreterId".to_string(), id.clone());
+            attributes.insert("CodeInterpreterArn".to_string(), arn);
+            (id, attributes)
+        }
+        // "Ref returns the browser id"; Fn::GetAtt: BrowserId, BrowserArn.
+        "AWS::BedrockAgentCore::Browser" => {
+            let id = generated_service_id(
+                &agentcore_label(name, runtime_label_char, false, 'b'),
+                name,
+                AGENTCORE_ID_SUFFIX_CHARS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                AGENTCORE_ARN_SERVICE,
+                region,
+                &format!("browser-custom/{id}"),
+            );
+            attributes.insert("BrowserId".to_string(), id.clone());
+            attributes.insert("BrowserArn".to_string(), arn);
             (id, attributes)
         }
         // "Ref returns the gateway id"; Fn::GetAtt: GatewayId, GatewayArn. A gateway

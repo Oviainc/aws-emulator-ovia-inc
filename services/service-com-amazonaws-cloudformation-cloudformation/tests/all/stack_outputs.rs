@@ -154,7 +154,10 @@ fn is_transfer_arn(value: &str, kind: &str, id_form: fn(&str) -> bool) -> bool {
 /// ten-character suffix: every one of the AgentCore control-plane model's identifier
 /// patterns ends in `-[a-zA-Z0-9]{10}` (`MemoryId`, `AgentRuntimeId`) or
 /// `-[0-9a-z]{10}` (`GatewayId`).
-fn agentcore_id_parts(value: &str) -> Option<(&str, &str)> {
+///
+/// `pub(crate)` so the AgentCore suite in this target reads the identifier form from
+/// here rather than keeping a second copy of the rule.
+pub(crate) fn agentcore_id_parts(value: &str) -> Option<(&str, &str)> {
     let (label, suffix) = value.rsplit_once('-')?;
     (suffix.len() == 10
         && suffix.chars().all(|c| c.is_ascii_alphanumeric())
@@ -177,8 +180,10 @@ fn is_agentcore_memory_id(value: &str) -> bool {
 
 /// Whether `value` is an `AgentRuntimeId`:
 /// `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$` — a label with NO `-` in it, and at
-/// most 47 characters of it inside `AgentRuntimeArn`.
-fn is_agentcore_runtime_id(value: &str) -> bool {
+/// most 47 characters of it inside `AgentRuntimeArn`. `CodeInterpreterId` and `BrowserId`
+/// are that same form (`^[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10}$`), so the AgentCore
+/// suite checks its sandbox identifiers against this one rule — hence `pub(crate)`.
+pub(crate) fn is_agentcore_runtime_id(value: &str) -> bool {
     agentcore_id_parts(value).is_some_and(|(label, _)| {
         label.len() <= 48
             && label.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -204,8 +209,9 @@ fn is_agentcore_gateway_id(value: &str) -> bool {
 
 /// Whether `value` is the ARN of an AgentCore resource of type `kind` whose id satisfies
 /// `id_form` — `arn:aws:bedrock-agentcore:<region>:<account>:<kind>/<id>`, the form every
-/// `arnReference` in the AgentCore control-plane model publishes.
-fn is_agentcore_arn(value: &str, kind: &str, id_form: fn(&str) -> bool) -> bool {
+/// `arnReference` in the AgentCore control-plane model publishes. `pub(crate)` for the
+/// same reason as [`agentcore_id_parts`].
+pub(crate) fn is_agentcore_arn(value: &str, kind: &str, id_form: fn(&str) -> bool) -> bool {
     value
         .strip_prefix(&format!(
             "arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:{kind}/"

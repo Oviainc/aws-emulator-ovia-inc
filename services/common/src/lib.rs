@@ -116,6 +116,15 @@
 //! through the service's OWN protocol (`routing_key`), so the claim and the later
 //! operation lookup cannot disagree.
 //!
+//! When the two models' path spaces overlap at MANY segments, neither the first segment
+//! nor one deeper segment separates them: AgentCore's data plane and control plane share
+//! nine first path segments and differ, per operation, at a different depth of each. For
+//! that case [`addresses_modeled_route`] asks the framework's own route matcher
+//! (`ServerProtocol::routing_key`) whether a service's model binds a route for the
+//! request's METHOD + URI — the granularity a REST protocol actually routes at — so each
+//! peer claims exactly its own modelled routes and no literal segment catalogue is
+//! written anywhere.
+//!
 //! # Services still carrying their own copy
 //!
 //! The path half of the rule predates this crate and is inlined in the `can_handle` of
@@ -455,34 +464,23 @@ pub fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str])
 ///
 /// `Service::can_handle` is handed the request's parts, while a protocol reads a whole
 /// runtime-API request, so the three things a routing key is read from — the method, the
-/// URI and the headers — are re-presented to it on an EMPTY body. No protocol that keys
-/// on the body is affected: `awsQuery` and `ec2Query` route on the `Action` form field,
-/// publish no `smithy.api#http` bindings at all, and are therefore separated by the
-/// service their request NAMES rather than by a route (see [`claims_request`]).
+/// URI and the headers — are re-presented to it on an EMPTY body, through
+/// [`runtime_request_from`], the ONE copy in this crate of the router's own private
+/// rebuild: every claim phrasing here goes through it, so the crate presents one request
+/// to one `routing_key`. No protocol that keys on the body is affected: `awsQuery` and
+/// `ec2Query` route on the `Action` form field, publish no `smithy.api#http` bindings at
+/// all, and are therefore separated by the service their request NAMES rather than by a
+/// route (see [`claims_request`]).
 ///
 /// `false` when the request cannot be rebuilt (a URI or method the runtime API rejects),
 /// when the protocol resolves no routing key, and when the key it resolves names no
-/// operation this service wires.
-///
-/// The rebuild is [`runtime_request_from`], the ONE copy in this crate of the router's
-/// own `runtime_api_request_from_parts`
-/// (`vendor/smithy-server-runtime/src/multi_service_router.rs`), which is private to that
-/// agent-immutable crate: the URI, the method and every header value, `append`ed so a
-/// repeated header keeps all of its values. The two must stay in step — the ONE
-/// difference is deliberate, the empty body, since no routing key this is used for reads
-/// one. Every claim phrasing in this crate goes through that one rebuild, so the crate
-/// presents one request to one `routing_key`.
+/// operation this service wires — the boolean form of [`modeled_operation`], which it
+/// delegates to so that "does my model bind this route" is asked in exactly one place.
 pub fn addresses_modeled_route(
     parts: &http::request::Parts,
     definition: &dyn ErasedServiceDefinition,
 ) -> bool {
-    let Some(request) = runtime_request_from(parts) else {
-        return false;
-    };
-    match definition.protocol().routing_key(&request) {
-        Ok(key) => definition.routing_table().get(key).is_some(),
-        Err(_) => false,
-    }
+    modeled_operation(parts, definition).is_some()
 }
 
 /// [`claims_modeled_path`] over the LITERAL segments only: the two protocol
