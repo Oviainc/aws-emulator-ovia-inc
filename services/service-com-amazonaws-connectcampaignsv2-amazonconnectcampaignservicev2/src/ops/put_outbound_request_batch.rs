@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutOutboundRequestBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutOutboundRequestBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes a batch of outbound requests into a campaign's buffer. The campaign is
+//! resolved first — an id the store does not hold is the modelled
+//! `ResourceNotFoundException` (HTTP 404) — then its lifecycle state: a campaign takes
+//! outbound requests only while it is `Running`, and any other state is the modelled
+//! `InvalidCampaignStateException` (HTTP 409) carrying that state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutOutboundRequestBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each request of the batch is then reported on its own, as the response's two lists
+//! say: a request for a channel subtype the campaign is not configured for fails with
+//! `InvalidInput`, one past the campaign's buffer ceiling
+//! (`crate::state::MAX_OUTBOUND_REQUESTS_PER_CAMPAIGN`) with `BufferLimitExceeded`, and
+//! anything else is taken under a minted `DialRequestId`. The call is idempotent, as
+//! the model's documentation says ("This API is idempotent"): a `clientToken` the
+//! campaign has already taken is answered with the id it was given then, and stores
+//! nothing further.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +145,21 @@ impl<Eng> PutOutboundRequestBatch<Eng> {
     }
 }
 
+/// The `ChannelSubtype` value a request's `channelSubtypeParameters` asks to dial on.
+///
+/// The union's four members are the four channels, and the values are the model's own
+/// `ChannelSubtype` catalog (`CHANNEL_SUBTYPE_VALUES` in [`crate::ops::types`]) — the
+/// same catalog `StoredCampaign::channel_subtypes` reports a campaign's configuration
+/// in, so the two can be compared directly.
+fn requested_channel_subtype(parameters: &ChannelSubtypeParameters) -> &'static str {
+    match parameters {
+        ChannelSubtypeParameters::Telephony(_) => "TELEPHONY",
+        ChannelSubtypeParameters::Sms(_) => "SMS",
+        ChannelSubtypeParameters::Email(_) => "EMAIL",
+        ChannelSubtypeParameters::whatsApp(_) => "WHATSAPP",
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for PutOutboundRequestBatch<Eng>
 {
@@ -155,20 +175,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutOutboundRequestBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutOutboundRequestBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutOutboundRequestBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutOutboundRequestBatchErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(campaign) = store.campaign(&input.id) else {
+            return Err(
+                PutOutboundRequestBatchErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Campaign: {} doesn't exist", input.id),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A campaign dials only while it is running: an Initialized, Paused,
+        // Stopped, Completed or Failed campaign is not placing calls, so it takes no
+        // outbound requests and the refusal names the state it is in.
+        if campaign.state != crate::state::CampaignState::Running {
+            return Err(
+                PutOutboundRequestBatchErrorModeled::InvalidCampaignStateException(
+                    InvalidCampaignStateException {
+                        state: campaign.state.as_wire().to_string(),
+                        message: format!(
+                            "Campaign {} is {} and takes outbound requests only while Running",
+                            input.id,
+                            campaign.state.as_wire()
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        // Owned, so the per-request walk below can write through the same guard.
+        let configured = campaign.channel_subtypes();
+
+        let mut successful_requests = Vec::new();
+        let mut failed_requests = Vec::new();
+        for request in &input.outbound_requests {
+            let channel_subtype = requested_channel_subtype(&request.channel_subtype_parameters);
+            // A campaign dials only the channels its `channelSubtypeConfig`
+            // configures; a request for any other channel is one this campaign
+            // cannot serve. `InvalidInput` and `BufferLimitExceeded` below are both
+            // from the model's own `FailureCode` catalog (`FAILURE_CODE_VALUES` in
+            // `crate::ops::types`).
+            if !configured.iter().any(|subtype| subtype == channel_subtype) {
+                failed_requests.push(FailedRequest {
+                    client_token: Some(request.client_token.clone()),
+                    id: None,
+                    failure_code: Some("InvalidInput".to_string()),
+                });
+                continue;
+            }
+            let outcome = store.take_outbound_request(
+                &input.id,
+                &request.client_token,
+                channel_subtype,
+                request.expiration_time.secs(),
+            );
+            match outcome {
+                Some(crate::state::OutboundRequestOutcome::Taken(id)) => {
+                    successful_requests.push(SuccessfulRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: Some(id),
+                    });
+                }
+                Some(crate::state::OutboundRequestOutcome::BufferFull) => {
+                    failed_requests.push(FailedRequest {
+                        client_token: Some(request.client_token.clone()),
+                        id: None,
+                        failure_code: Some("BufferLimitExceeded".to_string()),
+                    });
+                }
+                // The campaign was resolved above under the guard this walk still
+                // holds, so it cannot have gone; answered rather than panicked on.
+                None => {
+                    return Err(
+                        PutOutboundRequestBatchErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: format!(
+                                    "campaign {} went missing while its batch was being taken",
+                                    input.id
+                                ),
+                                x_amz_error_type: None,
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            }
+        }
+
+        // Both lists are always present, including when one is empty: a client reads
+        // the outcome of every request it sent out of them.
+        Ok(PutOutboundRequestBatchOutput {
+            successful_requests: Some(successful_requests),
+            failed_requests: Some(failed_requests),
+        })
     }
 }
