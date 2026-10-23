@@ -181,9 +181,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })?
             .ok_or_else(|| {
-                GetTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
-                    message: Some(crate::state::unknown_trail_message(&input.name)),
-                })
+                // The model says 404 for this error; CloudTrail answers 400. See
+                // `crate::state::TRAIL_NOT_FOUND_STATUS`. This operation's recorded
+                // refusal carries the identifier as the request sent it, where the
+                // operations that drive one Region's trail name that trail's ARN
+                // (`crate::state::trail_not_found_arn_message`).
+                crate::scaffolded::Scaffolded::modeled_with_status(
+                    GetTrailErrorModeled::TrailNotFoundException(TrailNotFoundException {
+                        message: Some(crate::state::unknown_trail_message(&input.name)),
+                    }),
+                    crate::state::TRAIL_NOT_FOUND_STATUS,
+                )
             })?;
 
         Ok(GetTrailOutput {

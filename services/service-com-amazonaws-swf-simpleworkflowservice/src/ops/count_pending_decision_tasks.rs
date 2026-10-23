@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CountPendingDecisionTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CountPendingDecisionTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CountPendingDecisionTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with how many decision tasks are WAITING in the named domain's task list:
+//! one per `DecisionTaskScheduled` event of an OPEN run of that domain that named this
+//! list and that nothing has since taken out of it. A reporting operation — it reads
+//! state and writes nothing — and a list no decision task was ever scheduled in
+//! answers 0, as the operation's own doc states.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +152,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CountPendingDecisionTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CountPendingDecisionTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CountPendingDecisionTasksErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A task list name obeys SWF's naming rule, which the model cannot express, so
+        // the boundary validator passes it and it is refused here as a bad request.
+        crate::state::validate_name("taskList.name", &input.task_list.name)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let guard = state.lock();
+        // A task list lives inside a domain, so an unregistered domain name addresses
+        // no task list at all: that is the modelled `UnknownResourceFault` ("Returned
+        // when the named resource cannot be found with in the scope of this operation
+        // (region or domain)"), the same answer `ListOpenWorkflowExecutions` and the
+        // execution readers give it. The documented zero ("If you specify a task list
+        // that no decision task was ever scheduled in then 0 is returned") is about the
+        // LIST within a known domain, not about the domain.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CountPendingDecisionTasks"))
+        // A deprecated domain is still a known one: deprecation stops new registrations
+        // and starts, while the runs already in it keep their tasks.
+        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
+            CountPendingDecisionTasksErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(format!("Unknown domain: {}", input.domain)),
+            })
+        })?;
+
+        let pending = domain.pending_decision_tasks_on(&input.task_list.name);
+
+        // `truncated` reports a count clipped to the most this API answers with. Every
+        // waiting decision task belongs to one of the domain's open runs, so the cap on
+        // stored runs bounds this count too and it is not clipped in practice.
+        let truncated = pending > crate::state::MAX_REPORTED_EXECUTION_COUNT;
+        let reported = pending.min(crate::state::MAX_REPORTED_EXECUTION_COUNT);
+        Ok(CountPendingDecisionTasksOutput {
+            count: i32::try_from(reported).unwrap_or(i32::MAX),
+            truncated,
+        })
     }
 }
+
