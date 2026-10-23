@@ -39,6 +39,19 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken here, both of them about how a REFUSED request is
+//! answered, and both implemented in [`refusal`]:
+//!
+//! * `override_refusal` states a constraint refusal the way IAM Identity Center states it
+//!   — one `Value of input '<member>' failed to satisfy constraint: <requirement>` clause
+//!   per violation, joined by `"; "`;
+//! * `override_operation` serves every routable request through
+//!   [`refusal::DetailMemberOperation`], which reports the detail text of whatever was
+//!   answered in the `Message` member every error shape of this model declares. Routing,
+//!   status, the error code and the text itself all stay with the framework.
+
+pub mod refusal;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +65,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper `override_operation` hands back. Stateless, and held here rather than
+    /// built per request because that method answers with a reference to it.
+    detail_member: refusal::DetailMemberOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +77,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            detail_member: refusal::DetailMemberOperation,
         }
     }
 }
@@ -87,26 +104,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // wrapper, which delegates to that same operation and then reports the detail text
+        // of whatever it answered in this service's `Message` member (see [`refusal`]). A
+        // request the table cannot serve is left to the framework.
+        refusal::routes(&self.entry, req).then_some(&self.detail_member as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service reword
+        // it. IAM Identity Center words one clause per refused member and names BOTH the
+        // member and the requirement it broke, for every constraint class and every
+        // operation, because that wording is a property of the service's validator rather
+        // than of one member; the code stays the modelled `ValidationException` (400),
+        // which is what the framework would have answered. A refusal this service does not
+        // word — an unauthenticated caller — keeps the framework's own code and wording.
+        refusal::refused(refusal)
     }
 
     fn override_routing_error(
