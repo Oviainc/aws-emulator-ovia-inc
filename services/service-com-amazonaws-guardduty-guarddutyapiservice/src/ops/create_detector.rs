@@ -253,6 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at_millis: now,
             findings: std::collections::BTreeMap::new(),
             filters: std::collections::BTreeMap::new(),
+            publishing_destinations: std::collections::BTreeMap::new(),
             threat_intel_sets: std::collections::BTreeMap::new(),
             investigations: std::collections::BTreeMap::new(),
             trusted_entity_sets: std::collections::BTreeMap::new(),
