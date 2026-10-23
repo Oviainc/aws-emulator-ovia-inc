@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRuleGroup"))
+        // A delete reads no request metadata: the rule group is identified by the
+        // members below and nothing about it is minted here.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteRuleGroupErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the rule group store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        let key = state
+            .resolve_rule_group_request(
+                input.rule_group_name.as_deref(),
+                input.r#type.as_deref(),
+                input.rule_group_arn.as_deref(),
+            )
+            .map_err(delete_rule_group_error)?;
+
+        // `InvalidOperationException` is "the operation failed because it's not
+        // valid. For example, you might have tried to delete a rule group or
+        // firewall policy that's in use", so a rule group a firewall policy still
+        // references is refused — the same guard `DeleteFirewallPolicy` applies to a
+        // policy a firewall still uses, reading the record's own association count.
+        let associations = state
+            .rule_groups
+            .get(&key)
+            .map_or(0, |record| record.number_of_associations);
+        if associations > 0 {
+            return Err(DeleteRuleGroupErrorModeled::InvalidOperationException(
+                InvalidOperationException {
+                    message: Some(format!(
+                        "Rule group {key} is in use by {associations} firewall policy/policies \
+                         and cannot be deleted."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(mut record) = state.rule_groups.remove(&key) else {
+            return Err(DeleteRuleGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Rule group {key} does not exist.")),
+                },
+            )
+            .into());
+        };
+        // Both halves of the rule group's identity go: with the ARN index entry
+        // removed, a later `DescribeRuleGroup` for either the name or the ARN takes
+        // its not-found path.
+        state.rule_group_arn_index.remove(&record.rule_group_arn);
+
+        // The record is gone from state; the response reports the terminal status of
+        // the rule group this call just removed, as `DeleteFirewall` and
+        // `DeleteFirewallPolicy` do for theirs.
+        record.status = crate::state::RESOURCE_DELETING.to_string();
+        record.last_modified_time = ::std::time::SystemTime::now();
+
+        Ok(DeleteRuleGroupOutput {
+            rule_group_response: record.to_response(),
+        })
     }
 }
+
+crate::state::impl_resolve_error!(
+    delete_lookup_error -> DeleteRuleGroupError, DeleteRuleGroupErrorModeled,
+    resource = "rule group", plural = "rule groups",
+    name_member = "RuleGroupName", arn_member = "RuleGroupArn"
+);
+
+crate::state::impl_rule_group_lookup_error!(
+    delete_rule_group_error -> DeleteRuleGroupError, DeleteRuleGroupErrorModeled,
+    resolve = delete_lookup_error
+);

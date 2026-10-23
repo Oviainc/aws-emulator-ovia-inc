@@ -731,6 +731,24 @@ pub enum ResolveError {
     NotFound,
 }
 
+/// Why a `RuleGroupName`/`Type`/`RuleGroupArn` triple did not name a stored rule
+/// group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleGroupLookupError {
+    /// A name was given without a `Type` and without an ARN, so the request
+    /// names at most half of a rule group's identity.
+    TypeRequired,
+    /// The triple was well formed but did not resolve.
+    Resolve(ResolveError),
+}
+
+/// What a request that gives a rule group's name but neither its `Type` nor its
+/// ARN is refused with: `DescribeRuleGroup$Type` (and the same member on every
+/// other rule-group operation) is "required for requests that do not include the
+/// RuleGroupARN".
+pub const TYPE_REQUIRED_MESSAGE: &str =
+    "Type is required for requests that do not include the RuleGroupArn.";
+
 /// The status of one firewall endpoint, as persisted.
 #[derive(Debug, Clone)]
 pub struct SyncStateRecord {
@@ -918,10 +936,10 @@ impl FirewallPolicyRecord {
             encryption_configuration: self.encryption_configuration.clone(),
             last_modified_time: Some(as_date_time(self.last_modified_time)),
             // The Consumed*Capacity members count capacity units drawn by the
-            // rule groups the policy references. A policy's references are not
-            // resolved against the rule-group store yet, so there is nothing to
-            // total and the members are left absent rather than filled with a
-            // guess.
+            // rule groups the policy references. `CreateFirewallPolicy` resolves
+            // those references (so an unresolvable one is refused), but the
+            // record does not total their capacity, so the members are left
+            // absent rather than filled with a guess.
             ..FirewallPolicyResponse::default()
         }
     }
@@ -1043,21 +1061,118 @@ impl ComAmazonawsNetworkfirewallNetworkfirewall20201112State {
         })
     }
 
-    /// The [`rule_groups`](Self::rule_groups) key the given name and/or ARN
-    /// identifies.
+    /// The [`rule_groups`](Self::rule_groups) key a request's `RuleGroupName`,
+    /// `Type` and `RuleGroupArn` identify.
     ///
-    /// A name is only half of a rule group's identity, so the caller passes the
-    /// resource path [`rule_group_resource_path`] builds from the name and the
-    /// request's `Type` — a request that gives a name without a type is refused
-    /// before this, as `DescribeRuleGroup$Type` documents.
-    pub fn resolve_rule_group(
+    /// A rule group's name is unique only within its type, so the store is keyed
+    /// by the resource path [`rule_group_resource_path`] builds from both and
+    /// `Type` "is required for requests that do not include the RuleGroupARN"
+    /// (`DescribeRuleGroup$Type`). With an ARN in hand the name adds nothing the
+    /// ARN does not already carry, so a typeless name is resolved through the ARN
+    /// and then checked against the record rather than ignored.
+    ///
+    /// Every rule-group operation that takes this triple resolves it here, so one
+    /// identification rule serves the read, the update and the delete alike.
+    pub fn resolve_rule_group_request(
         &self,
-        resource_path: Option<&str>,
+        name: Option<&str>,
+        group_type: Option<&str>,
         arn: Option<&str>,
-    ) -> Result<String, ResolveError> {
-        resolve(&self.rule_group_arn_index, resource_path, arn, |key| {
-            self.rule_groups.contains_key(key)
-        })
+    ) -> Result<String, RuleGroupLookupError> {
+        let resource_path = match (name, group_type) {
+            (Some(name), Some(group_type)) => Some(rule_group_resource_path(group_type, name)),
+            (Some(_), None) if arn.is_none() => {
+                return Err(RuleGroupLookupError::TypeRequired);
+            }
+            (_, _) => None,
+        };
+        let key = resolve(
+            &self.rule_group_arn_index,
+            resource_path.as_deref(),
+            arn,
+            |key| self.rule_groups.contains_key(key),
+        )
+        .map_err(RuleGroupLookupError::Resolve)?;
+        if resource_path.is_none()
+            && name.is_some_and(|name| {
+                self.rule_groups
+                    .get(&key)
+                    .is_some_and(|record| record.rule_group_name != name)
+            })
+        {
+            return Err(RuleGroupLookupError::Resolve(ResolveError::Mismatch));
+        }
+        Ok(key)
+    }
+
+    /// Why a `FirewallPolicy` document's rule-group references cannot be served,
+    /// as a message naming the first offending reference, or `None` when every
+    /// one of them resolves.
+    ///
+    /// Two documented rules, both of them `InvalidRequestException`'s ("Your
+    /// request references an ARN that is malformed, or corresponds to a resource
+    /// that isn't valid in the context of the request"):
+    ///
+    /// * a reference names a rule group that EXISTS — the reference is that rule
+    ///   group's ARN (`StatelessRuleGroupReference$ResourceArn` is "the Amazon
+    ///   Resource Name (ARN) of the stateless rule group"), so an ARN no stored
+    ///   rule group carries names no resource at all; and
+    /// * it names one of the KIND its list is for: `StatelessRuleGroupReferences`
+    ///   are "references to the stateless rule groups that are used in the
+    ///   policy" and a `StatefulRuleGroupReference$ResourceArn` is "the ARN of
+    ///   the stateful rule group", so a stateless reference naming a stateful
+    ///   rule group (or the reverse) is a resource that is not valid in the
+    ///   context of the request.
+    ///
+    /// This reads the store, so a caller runs it in the same critical section it
+    /// inserts the policy in: a reference cannot be resolved and then go stale
+    /// before the record lands.
+    pub fn policy_reference_breach(&self, policy: &FirewallPolicy) -> Option<String> {
+        let stateless = policy
+            .stateless_rule_group_references
+            .iter()
+            .flatten()
+            .map(|reference| {
+                (
+                    "StatelessRuleGroupReferences",
+                    &reference.resource_arn,
+                    false,
+                )
+            });
+        let stateful = policy
+            .stateful_rule_group_references
+            .iter()
+            .flatten()
+            .map(|reference| ("StatefulRuleGroupReferences", &reference.resource_arn, true));
+
+        for (member, arn, wants_stateful) in stateless.chain(stateful) {
+            let Some(record) = self
+                .rule_group_arn_index
+                .get(arn)
+                .and_then(|key| self.rule_groups.get(key))
+            else {
+                return Some(format!(
+                    "FirewallPolicy.{member} references a rule group that does not exist, \
+                     parameter: [{arn}]"
+                ));
+            };
+            // Every type other than STATELESS is a stateful rule group, which is
+            // the same split the store's keys are built on.
+            let is_stateful = record.rule_group_type != RULE_GROUP_STATELESS;
+            if is_stateful != wants_stateful {
+                return Some(format!(
+                    "FirewallPolicy.{member} must reference a {} rule group, but [{arn}] is a \
+                     {} rule group.",
+                    if wants_stateful {
+                        "stateful"
+                    } else {
+                        RULE_GROUP_STATELESS
+                    },
+                    record.rule_group_type
+                ));
+            }
+        }
+        None
     }
 }
 
@@ -1149,6 +1264,39 @@ macro_rules! impl_resolve_error {
 }
 
 pub(crate) use impl_resolve_error;
+
+/// Generate one rule-group operation's [`RuleGroupLookupError`] ->
+/// modelled-error mapping, on top of the [`ResolveError`] mapper
+/// [`impl_resolve_error`] generated for the same operation.
+///
+/// Every operation that identifies a rule group by `RuleGroupName`/`Type`/
+/// `RuleGroupArn` shares both refusals — a name without a type or an ARN is a bad
+/// request, everything else is the ordinary name/ARN resolution — and each still
+/// owns a different error enum, so this is the same per-operation expansion.
+///
+/// Internal to this crate: `pub(crate) use` below keeps it off the crate's
+/// public surface while still letting `src/ops/*` reach it by path.
+macro_rules! impl_rule_group_lookup_error {
+    ($mapper:ident -> $error:ty, $modeled:ident, resolve = $resolve_mapper:ident) => {
+        /// Map a rule-group lookup failure onto this operation's modelled errors.
+        fn $mapper(error: $crate::state::RuleGroupLookupError) -> $error {
+            match error {
+                $crate::state::RuleGroupLookupError::TypeRequired => {
+                    <$error>::from($modeled::InvalidRequestException(
+                        $crate::ops::types::InvalidRequestException {
+                            message: ::std::option::Option::Some(
+                                $crate::state::TYPE_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    ))
+                }
+                $crate::state::RuleGroupLookupError::Resolve(error) => $resolve_mapper(error),
+            }
+        }
+    };
+}
+
+pub(crate) use impl_rule_group_lookup_error;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
