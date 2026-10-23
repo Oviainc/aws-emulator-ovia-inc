@@ -21,6 +21,8 @@ mod emulator;
 mod event_data_store_reads;
 #[path = "all/event_selectors.rs"]
 mod event_selectors;
+#[path = "all/import_reads.rs"]
+mod import_reads;
 #[path = "all/import_stop.rs"]
 mod import_stop;
 #[path = "all/insights_metric_data.rs"]

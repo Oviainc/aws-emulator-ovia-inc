@@ -527,7 +527,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .clone()
                         .unwrap_or_else(|| st::default_parameter_group(&cluster_version)),
                 ),
-                parameter_apply_status: Some("in-sync".to_string()),
+                parameter_apply_status: Some(st::PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
                 cluster_parameter_status_list: None,
             }]),
             cluster_subnet_group_name: input.cluster_subnet_group_name.clone(),

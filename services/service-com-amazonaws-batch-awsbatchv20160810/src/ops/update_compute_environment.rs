@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComputeEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComputeEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies an update to the compute environment [`crate::state`] holds, resolved by name
+//! OR ARN, and reports the environment's name and ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComputeEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It is a MUTATION: every member the request carries is written to the stored
+//! environment, and a member it leaves out is left exactly as it was (an update patches,
+//! it does not replace). `computeResources` is merged member-wise into the stored
+//! `ComputeResource` for the same reason.
+//!
+//! The update is applied asynchronously by AWS Batch, which reports the environment in
+//! the `UPDATING` status while it is: so this call moves it to `UPDATING` and the move
+//! back to `VALID` is owed by the clock ([`crate::state::JOB_PHASE_MILLIS`]), exactly
+//! like the `CREATING` -> `VALID` move a create owes.
+//!
+//! Each refusal below is the modelled `ClientException` (HTTP 400) and comes from a rule
+//! the model documents on the member:
+//!
+//! * `computeResources` is "details of the compute resources MANAGED by the compute
+//!   environment", so it is accepted only for a `MANAGED` environment;
+//! * `unmanagedvCpus` — "Don't specify this parameter for a managed compute environment";
+//! * `eksConfiguration` — "Only specify this parameter if the compute environment's
+//!   `containerOrchestrationType` is EKS", and `accessEntry` is "the only Amazon EKS
+//!   configuration that you can change after the compute environment is created";
+//! * `computeResources$desiredvCpus` — "the value must be between the `minvCpus` and
+//!   `maxvCpus` values", checked against the values the merge leaves in place.
+//!
+//! An empty `subnets`/`securityGroupIds` list follows what those members document: for
+//! Fargate compute resources it "is handled as if this parameter wasn't specified and no
+//! change is made", and for Amazon EC2 compute resources it removes them.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +151,200 @@ pub enum UpdateComputeEnvironmentErrorModeled {
     ServerException(ServerException),
 }
 
+/// The `CRType` values whose compute resources run on Fargate.
+///
+/// The `subnets` and `securityGroupIds` docs single them out: an empty list is "handled
+/// as if this parameter wasn't specified and no change is made" for Fargate compute
+/// resources, and removes the values for Amazon EC2 ones. Source: the model's
+/// `com.amazonaws.batch#CRType` enum (`EC2 | SPOT | FARGATE | FARGATE_SPOT |
+/// ECS_MANAGED_INSTANCES`), of which these two are the Fargate pair.
+const FARGATE_COMPUTE_TYPES: &[&str] = &["FARGATE", "FARGATE_SPOT"];
+
+/// `minvCpus` of a compute resource that names none: the member is optional, and an
+/// environment without one maintains no instances.
+const DEFAULT_MIN_VCPUS: i32 = 0;
+
+/// The modelled `ClientException` (HTTP 400) for a request this operation understood but
+/// cannot accept, worded the way every refusal of this service is
+/// ([`crate::state::client_exception`]).
+fn refuse(detail: impl AsRef<str>) -> UpdateComputeEnvironmentError {
+    UpdateComputeEnvironmentErrorModeled::ClientException(crate::state::client_exception(detail))
+        .into()
+}
+
+/// Whether a compute resource of this `CRType` runs on Fargate ([`FARGATE_COMPUTE_TYPES`]).
+fn is_fargate(compute_type: &str) -> bool {
+    FARGATE_COMPUTE_TYPES.contains(&compute_type)
+}
+
+/// What a list member (`subnets`, `securityGroupIds`) holds after the update: the stored
+/// list when the request carries none, and — per those members' docs — also when the
+/// request carries an EMPTY list for a Fargate compute resource ("handled as if this
+/// parameter wasn't specified and no change is made"). For every other compute type an
+/// empty list is a removal, so it is stored as given.
+fn updated_list(
+    current: Option<Vec<String>>,
+    update: Option<Vec<String>>,
+    fargate: bool,
+) -> Option<Vec<String>> {
+    match update {
+        None => current,
+        Some(values) if values.is_empty() && fargate => current,
+        Some(values) => Some(values),
+    }
+}
+
+/// Merge `update` into the environment's stored compute resources, member-wise: a member
+/// the request carries replaces the stored one and a member it leaves out is left exactly
+/// as it was, which is what makes this an update rather than a replacement.
+///
+/// `Err(detail)` for a `managedInstancesProvider` update on a compute resource that has
+/// none: its `infrastructureRoleArn` and `instanceLaunchTemplate` are required members, so
+/// a partial update cannot produce one, and nothing in the model lets an environment grow
+/// a provider it was not created with.
+fn merge_compute_resources(
+    resource: &mut ComputeResource,
+    update: ComputeResourceUpdate,
+) -> Result<(), String> {
+    if let Some(compute_type) = update.r#type {
+        resource.r#type = compute_type;
+    }
+    // Decided from the type the update LEAVES in place, so a request that changes the
+    // type and the subnets in one call is read against its own type.
+    let fargate = is_fargate(&resource.r#type);
+    resource.subnets = updated_list(resource.subnets.take(), update.subnets, fargate);
+    resource.security_group_ids = updated_list(
+        resource.security_group_ids.take(),
+        update.security_group_ids,
+        fargate,
+    );
+    if let Some(value) = update.minv_cpus {
+        resource.minv_cpus = Some(value);
+    }
+    if let Some(value) = update.maxv_cpus {
+        resource.maxv_cpus = value;
+    }
+    if let Some(value) = update.desiredv_cpus {
+        resource.desiredv_cpus = Some(value);
+    }
+    if let Some(value) = update.allocation_strategy {
+        resource.allocation_strategy = Some(value);
+    }
+    if let Some(value) = update.instance_types {
+        resource.instance_types = Some(value);
+    }
+    if let Some(value) = update.ec2_key_pair {
+        resource.ec2_key_pair = Some(value);
+    }
+    if let Some(value) = update.instance_role {
+        resource.instance_role = Some(value);
+    }
+    if let Some(value) = update.tags {
+        resource.tags = Some(value);
+    }
+    if let Some(value) = update.placement_group {
+        resource.placement_group = Some(value);
+    }
+    if let Some(value) = update.bid_percentage {
+        resource.bid_percentage = Some(value);
+    }
+    if let Some(value) = update.launch_template {
+        resource.launch_template = Some(value);
+    }
+    if let Some(value) = update.ec2_configuration {
+        resource.ec2_configuration = Some(value);
+    }
+    if let Some(value) = update.image_id {
+        resource.image_id = Some(value);
+    }
+    if let Some(value) = update.scaling_policy {
+        resource.scaling_policy = Some(value);
+    }
+    if let Some(value) = update.capacity_tags {
+        resource.capacity_tags = Some(value);
+    }
+    if let Some(provider_update) = update.managed_instances_provider {
+        let Some(provider) = resource.managed_instances_provider.as_mut() else {
+            return Err(
+                "managedInstancesProvider can only be updated on a compute environment created with one"
+                    .to_string(),
+            );
+        };
+        merge_managed_instances_provider(provider, provider_update);
+    }
+    // `updateToLatestImageVersion` asks Batch to replace the AMI the environment's
+    // instances run. It is not part of the environment's reported compute resources
+    // (`ComputeResource` models no such member) and no instance runs here, so there is
+    // nothing to store for it.
+    Ok(())
+}
+
+/// Merge an `UpdateManagedInstancesProviderConfiguration` into the stored provider,
+/// member-wise, including its `instanceLaunchTemplate`.
+fn merge_managed_instances_provider(
+    provider: &mut ManagedInstancesProvider,
+    update: UpdateManagedInstancesProviderConfiguration,
+) {
+    if let Some(value) = update.propagate_tags {
+        provider.propagate_tags = Some(value);
+    }
+    if let Some(value) = update.infrastructure_role_arn {
+        provider.infrastructure_role_arn = value;
+    }
+    if let Some(value) = update.infrastructure_optimization {
+        provider.infrastructure_optimization = Some(value);
+    }
+    if let Some(template) = update.instance_launch_template {
+        let current = &mut provider.instance_launch_template;
+        if let Some(value) = template.ec2_instance_profile_arn {
+            current.ec2_instance_profile_arn = value;
+        }
+        if let Some(value) = template.network_configuration {
+            current.network_configuration = value;
+        }
+        if let Some(value) = template.instance_requirements {
+            current.instance_requirements = Some(value);
+        }
+        if let Some(value) = template.storage_configuration {
+            current.storage_configuration = Some(value);
+        }
+        if let Some(value) = template.monitoring {
+            current.monitoring = Some(value);
+        }
+        if let Some(value) = template.capacity_reservations {
+            current.capacity_reservations = Some(value);
+        }
+        if let Some(value) = template.instance_metadata_tags_propagation {
+            current.instance_metadata_tags_propagation = Some(value);
+        }
+        if let Some(value) = template.local_storage_configuration {
+            current.local_storage_configuration = Some(value);
+        }
+    }
+}
+
+/// The vCPU bounds a merged compute resource must satisfy, from the `desiredvCpus` doc:
+/// "the value must be between the `minvCpus` and `maxvCpus` values". Checked against the
+/// values the merge leaves in place, so a request that moves only one of the three is
+/// still read against the other two.
+fn validate_vcpus(resource: &ComputeResource) -> Result<(), String> {
+    let minimum = resource.minv_cpus.unwrap_or(DEFAULT_MIN_VCPUS);
+    let maximum = resource.maxv_cpus;
+    if minimum > maximum {
+        return Err(format!(
+            "minvCpus ({minimum}) must not exceed maxvCpus ({maximum})"
+        ));
+    }
+    if let Some(desired) = resource.desiredv_cpus {
+        if desired < minimum || desired > maximum {
+            return Err(format!(
+                "desiredvCpus ({desired}) must be between minvCpus ({minimum}) and maxvCpus ({maximum})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::update_compute_environment::UpdateComputeEnvironmentError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
@@ -181,18 +396,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComputeEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateComputeEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComputeEnvironment"))
+        use crate::state as batch;
+
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(UpdateComputeEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // "The name or full Amazon Resource Name (ARN) of the compute environment to
+        // update" — resolved both ways, like every "name or ARN" member of this service.
+        let stored_name = state.compute_environment_name(&input.compute_environment);
+        let Some(environment) = stored_name
+            .as_deref()
+            .and_then(|name| state.compute_environments.get_mut(name))
+        else {
+            return Err(refuse(format!(
+                "Compute environment {} does not exist",
+                input.compute_environment
+            )));
+        };
+
+        let managed = environment.ce_type == batch::CE_TYPE_MANAGED;
+        // `computeResources` is "details of the compute resources MANAGED by the compute
+        // environment", so only a MANAGED environment has any to update.
+        if input.compute_resources.is_some() && !managed {
+            return Err(refuse(format!(
+                "computeResources can only be updated for a MANAGED compute environment, and {} is {}",
+                environment.name, environment.ce_type
+            )));
+        }
+        // `unmanagedvCpus`: "Don't specify this parameter for a managed compute
+        // environment."
+        if input.unmanagedv_cpus.is_some() && managed {
+            return Err(refuse(format!(
+                "unmanagedvCpus must not be specified for a MANAGED compute environment, and {} is {}",
+                environment.name, environment.ce_type
+            )));
+        }
+        // `eksConfiguration`: "Only specify this parameter if the compute environment's
+        // containerOrchestrationType is EKS" — which here is exactly an environment
+        // created with an `eksConfiguration` (see `DescribeComputeEnvironments`).
+        if input.eks_configuration.is_some() && environment.eks_configuration.is_none() {
+            return Err(refuse(format!(
+                "eksConfiguration can only be updated when the compute environment's containerOrchestrationType is {}, and {} is {}",
+                batch::ORCHESTRATION_TYPE_EKS,
+                environment.name,
+                batch::ORCHESTRATION_TYPE_ECS,
+            )));
+        }
+
+        // The compute resources the update leaves behind, computed before anything is
+        // written so a refusal changes nothing a later caller sees.
+        let mut compute_resources = environment.compute_resources.clone();
+        if let Some(update) = input.compute_resources {
+            let Some(resource) = compute_resources.as_mut() else {
+                return Err(refuse(format!(
+                    "compute environment {} has no computeResources to update",
+                    environment.name
+                )));
+            };
+            merge_compute_resources(resource, update).map_err(refuse)?;
+            validate_vcpus(resource).map_err(refuse)?;
+        }
+
+        if let Some(requested_state) = input.state {
+            environment.state = requested_state;
+        }
+        if let Some(vcpus) = input.unmanagedv_cpus {
+            environment.unmanagedv_cpus = Some(vcpus);
+        }
+        if let Some(service_role) = input.service_role {
+            environment.service_role = Some(service_role);
+        }
+        if let Some(context) = input.context {
+            environment.context = Some(context);
+        }
+        if let Some(ecs_settings) = input.ecs_settings {
+            environment.ecs_settings = Some(ecs_settings);
+        }
+        // "Currently, the accessEntry setting is the only Amazon EKS configuration that
+        // you can change after the compute environment is created", so the cluster and
+        // namespace the environment was created with stay as they are.
+        if let Some(eks_update) = input.eks_configuration {
+            if let (Some(configuration), Some(access_entry)) =
+                (environment.eks_configuration.as_mut(), eks_update.access_entry)
+            {
+                configuration.access_entry = Some(access_entry);
+            }
+        }
+        if let Some(update_policy) = input.update_policy {
+            environment.update_policy = Some(update_policy);
+        }
+        environment.compute_resources = compute_resources;
+
+        // AWS Batch applies the update asynchronously and reports the environment in
+        // `UPDATING` while it does, so the move back to `VALID` is owed by the CLOCK —
+        // materialised by `materialize_due`, never by a read.
+        environment.status = batch::STATUS_UPDATING.to_string();
+        environment.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+
+        Ok(UpdateComputeEnvironmentOutput {
+            compute_environment_name: Some(environment.name.clone()),
+            compute_environment_arn: Some(environment.arn.clone()),
+        })
     }
 }

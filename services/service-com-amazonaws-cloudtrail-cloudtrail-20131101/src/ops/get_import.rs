@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one CloudTrail Lake import, addressed by its import id. It is a pure
+//! read: every member of the answer comes from the stored import record, and
+//! nothing in the registry changes.
 //!
 //! ## Shape of an operation
 //!
@@ -163,17 +157,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImport"))
+        // request metadata.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetImportErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "GetImport needs the CloudTrail import registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let store = state.lock();
+
+        // An import belongs to the Region it was created in, so an id naming no import
+        // THIS Region holds was not found — the same answer as an id naming no import
+        // at all. The modelled `UUID` pattern and length are already enforced by the
+        // boundary validator, so an id reaching here is well formed.
+        let Some(record) = store.import(&input.import_id, &region) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetImportErrorModeled::ImportNotFoundException(ImportNotFoundException {
+                    message: Some(crate::state::import_not_found_message(&input.import_id)),
+                }),
+                crate::state::IMPORT_NOT_FOUND_HTTP_STATUS,
+            ));
+        };
+
+        Ok(report(record))
+    }
+}
+
+/// Project a stored import onto this operation's response.
+///
+/// A member is reported only when the record carries it, so a value the import does
+/// not hold stays absent on the wire rather than becoming an empty list or an
+/// invented number — `ImportStatistics` stays absent while CloudTrail has recorded
+/// no counts for the import, and the event-time bounds only appear when the import
+/// was started with them.
+fn report(record: &crate::state::ImportRecord) -> GetImportOutput {
+    GetImportOutput {
+        import_id: Some(record.import_id.clone()),
+        destinations: Some(record.destinations.clone()),
+        import_source: record.import_source.clone(),
+        start_event_time: record
+            .start_event_time
+            .map(::aws_smithy_types::DateTime::from),
+        end_event_time: record
+            .end_event_time
+            .map(::aws_smithy_types::DateTime::from),
+        import_status: Some(record.status.clone()),
+        created_timestamp: Some(::aws_smithy_types::DateTime::from(record.created_timestamp)),
+        updated_timestamp: Some(::aws_smithy_types::DateTime::from(record.updated_timestamp)),
+        import_statistics: record.statistics.clone(),
     }
 }

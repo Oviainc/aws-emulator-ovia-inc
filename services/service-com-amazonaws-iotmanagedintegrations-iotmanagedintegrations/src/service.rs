@@ -79,6 +79,21 @@
 //! service's constrained input members ARE `@sensitive` (`Owner`,
 //! `AuthenticationMaterial`, `SerialNumber`, `Brand`, `Model`, `Classification`, `Tags`,
 //! `CaCertificate`, …), and an error body must not publish a value the model marks so.
+//!
+//! The ORDER an enum's value set is listed in is NOT this service's to choose: a Smithy
+//! enum's value set is a set, so the model fixes no order and AWS documents none, and the
+//! two recorded refusals enumerate their sets in an order that is neither the model's nor
+//! any other order a rule produces: `AuthMaterialType`, which the model declares as
+//! `[CUSTOM_PROTOCOL_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE, ZWAVE_QR_BAR_CODE,
+//! ZIGBEE_QR_BAR_CODE, DISCOVERED_DEVICE, PRE_ONBOARDED_CLOUD]`, comes back as
+//! `[PRE_ONBOARDED_CLOUD, ZIGBEE_QR_BAR_CODE, ZWAVE_QR_BAR_CODE, WIFI_SETUP_QR_BAR_CODE,
+//! DISCOVERED_DEVICE, CUSTOM_PROTOCOL_QR_BAR_CODE]` — not the declaration order, not its
+//! reverse (which would list `DISCOVERED_DEVICE` second), and not sorted. Reproducing it
+//! would mean storing one permutation per enum, taken from one recording. The set, the
+//! member path, the requirement, the code and the status
+//! are what a caller can act on, and all of those are the framework's; the listing order
+//! stays the framework's too rather than being fitted to one recording.
+//!
 //! Everything else about the clause — which constraint classes exist and how each one
 //! words its requirement — stays the framework's, so a constraint class added there
 //! cannot arrive with a sentence of this service's own.

@@ -45,6 +45,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+// How this service words a request that breaks a constraint — the one place its
+// validation dialect lives, reached both from `override_refusal` below and from the
+// handlers that enforce a constraint the model cannot express.
+pub(crate) mod validation;
+
 /// This service's own Smithy shape id, whose LOCAL name (`SageMaker`) is what an
 /// awsJson1_1 request names its target service by
 /// (`X-Amz-Target: SageMaker.<Operation>`).
@@ -124,15 +129,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. SageMaker states two of those facts differently from
+        // the framework — a `@pattern` without its whole-value anchors, and an enum
+        // value set in the service's own declared order — so a constraint failure is
+        // reworded through `validation`, which restates the code (`ValidationException`)
+        // together with the message: a chosen `Refused` replaces both.
+        //
+        // Every other refusal class keeps the framework's wording: an unauthenticated
+        // caller is answered by the framework's own 403.
+        match refusal {
+            Refusal::Invalid(violations) => validation::refusal(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

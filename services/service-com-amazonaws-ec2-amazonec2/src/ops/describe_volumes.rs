@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            decode_page_token, encode_page_token, invalid_pagination_token, require_known_volume,
+            decode_page_token, encode_page_token, invalid_pagination_token_for, require_known_volume,
             require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
             MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
             MAX_RESOURCE_IDS,
@@ -245,7 +245,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request.
         let start_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
         };
 
         let state = require_service_state(&*self.engine)?;

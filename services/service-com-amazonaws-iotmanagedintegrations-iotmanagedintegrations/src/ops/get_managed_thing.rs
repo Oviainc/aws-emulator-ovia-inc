@@ -214,11 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let thing = store
             .managed_thing_in(&region, &input.identifier)
             .ok_or_else(|| {
-                GetManagedThingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("Managed thing {} was not found", input.identifier)),
-                    resource_id: Some(input.identifier.clone()),
-                    resource_type: Some("ManagedThing".to_string()),
-                })
+                // A read reports WHICH KIND of resource was not found; the identifier
+                // the request carried is reported on `ResourceId`.
+                GetManagedThingErrorModeled::ResourceNotFoundException(
+                    crate::state::managed_thing_not_found_on_read(&input.identifier),
+                )
             })?;
 
         Ok(GetManagedThingOutput {

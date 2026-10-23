@@ -259,9 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model doc), so a job naming no stored model is refused with the modelled
         // not-found error and nothing is persisted.
         if !store.models.contains_key(&input.model_name) {
-            let model_arn = crate::state::resource_arn(&region, "model", &input.model_name);
             return Err(CreateTransformJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find model \"{model_arn}\".")),
+                message: Some(crate::state::could_not_find(
+                    crate::state::MODEL_KIND_LABEL,
+                    &input.model_name,
+                )),
             })
             .into());
         }

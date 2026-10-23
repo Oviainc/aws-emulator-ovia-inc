@@ -659,6 +659,67 @@ pub const MULTI_REGION_ACCESS_POINT_QUOTA: usize = 1_000;
 /// one that invents a token.
 pub const ASYNC_REQUESTS_RETAINED: usize = 1_000;
 
+/// One stored S3 Access Grants instance: everything
+/// `CreateAccessGrantsInstance` recorded and `GetAccessGrantsInstance` reports.
+#[derive(Debug, Clone)]
+pub struct AccessGrantsInstanceRecord {
+    /// The account that owns the instance — the first half of the key, kept on
+    /// the record so a record passed on its own still names its owner.
+    pub account_id: String,
+    /// The Region the instance lives in, which is the Region the create call
+    /// was signed for: `CreateAccessGrantsInstance` documents one instance per
+    /// Region per account, so the Region is half this resource's identity and
+    /// the ARN it reports is in that Region.
+    pub region: String,
+    /// The instance id. `AccessGrantsInstanceId` documents it as `default` for
+    /// every instance (see [`ACCESS_GRANTS_INSTANCE_ID`]), so it is on the
+    /// record as the value both the ARN and the reads are built from rather
+    /// than re-derived per handler.
+    pub id: String,
+    pub arn: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    /// The IAM Identity Center instance the create call associated, if any —
+    /// `None` for an instance created without one, which is what the reads
+    /// report as an absent `IdentityCenterInstanceArn`.
+    pub identity_center_instance_arn: Option<String>,
+    /// The Identity Center application S3 Access Grants creates for the
+    /// instance when one is associated (see
+    /// [`identity_center_application_arn`]); `None` exactly when
+    /// `identity_center_instance_arn` is.
+    pub identity_center_application_arn: Option<String>,
+    /// The tags `CreateAccessGrantsInstance` was given. Recorded here because
+    /// they are part of the resource; the operations that report them
+    /// (`ListTagsForResource`, `TagResource`, `UntagResource`) are still stubs
+    /// with their own gap issues, and will read this field rather than a second
+    /// copy.
+    pub tags: Vec<Tag>,
+}
+
+/// How a stored S3 Access Grants instance is keyed: the owning account id and
+/// the Region, which is the pair an instance is unique within — one instance
+/// per Region per account, as `CreateAccessGrantsInstance` documents.
+pub type AccessGrantsInstanceKey = (String, String);
+
+/// The id every S3 Access Grants instance carries.
+///
+/// `AccessGrantsInstanceId` documents it: "The ID of the S3 Access Grants
+/// instance. The ID is `default`. You can have one S3 Access Grants instance
+/// per Region per account." — so it is a constant and not a minted id.
+pub const ACCESS_GRANTS_INSTANCE_ID: &str = "default";
+
+/// How many S3 Access Grants instances the store holds before
+/// `CreateAccessGrantsInstance` refuses to record one for a FURTHER
+/// (account, Region) pair.
+///
+/// This is the emulator's OWN bound on its store, not a claim about a limit AWS
+/// publishes: AWS allows one instance per Region per account, which bounds how
+/// many instances ONE account can have in one Region, but `AccountId` is
+/// constrained only to `^\d{12}$` and the Region comes from the request's
+/// credential scope, so the number of KEYS is caller-chosen. Without this bound
+/// a caller could grow this process's state without end by varying either half
+/// of the key.
+pub const ACCESS_GRANTS_INSTANCE_QUOTA: usize = 1_000;
+
 /// Per-service state for com-amazonaws-s3control-awss3controlservicev20180820. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
@@ -751,6 +812,25 @@ pub struct ComAmazonawsS3controlAwss3controlservicev20180820State {
     /// BOUNDED by retention rather than by a caller's delete: see
     /// [`ASYNC_REQUESTS_RETAINED`] and [`Self::record_async_request`].
     pub async_requests: BTreeMap<AsyncRequestKey, AsyncRequestRecord>,
+
+    /// S3 Access Grants instances by (account id, Region) — what
+    /// `CreateAccessGrantsInstance` records and `GetAccessGrantsInstance`
+    /// reports.
+    ///
+    /// A `BTreeMap` for the same reason as `access_points`:
+    /// `ListAccessGrantsInstances` is `@paginated`, and a page token can only
+    /// resume a scan whose order does not change between calls.
+    ///
+    /// An (account, Region) pair is a KEY here only once an instance has been
+    /// created for it: an ABSENT entry is what `GetAccessGrantsInstance`
+    /// refuses as a missing instance, and `CreateAccessGrantsInstance` refuses
+    /// a PRESENT one rather than replacing it, because an account has at most
+    /// one instance per Region.
+    ///
+    /// BOUNDED: `CreateAccessGrantsInstance` refuses a NEW instance past
+    /// [`ACCESS_GRANTS_INSTANCE_QUOTA`] records, and every member of a record
+    /// is length-bounded by the model.
+    pub access_grants_instances: BTreeMap<AccessGrantsInstanceKey, AccessGrantsInstanceRecord>,
 }
 
 impl ComAmazonawsS3controlAwss3controlservicev20180820State {
@@ -884,6 +964,69 @@ pub fn storage_lens_configuration_arn(region: &str, config_id: &str) -> String {
 /// canonical emulator account.
 pub fn storage_lens_group_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("storage-lens-group/{name}"))
+}
+
+/// The ARN of an S3 Access Grants instance: the `access-grants/<instance-id>`
+/// resource in this service's ARN namespace (`s3`, per the model's
+/// `awsService.arnNamespace`), in the Region the instance lives in — the form
+/// `AccessGrantsInstanceArn`'s pattern
+/// (`^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:access\-grants\/[a-zA-Z0-9\-]+$`)
+/// admits.
+///
+/// The account segment comes from [`::emulator_server::emulator_arn`], the
+/// single source of truth for the canonical emulator account.
+pub fn access_grants_instance_arn(region: &str, instance_id: &str) -> String {
+    ::emulator_server::emulator_arn("s3", region, &format!("access-grants/{instance_id}"))
+}
+
+/// How many characters of the Identity Center application segment an
+/// application ARN this emulator mints carries after `apl-`.
+const IDENTITY_CENTER_APPLICATION_SUFFIX_LEN: usize = 16;
+
+/// The ARN of the IAM Identity Center application S3 Access Grants creates for
+/// an instance that is associated with an Identity Center instance.
+///
+/// `CreateAccessGrantsInstance` documents that S3 Access Grants creates this
+/// application itself ("S3 Access Grants creates this Identity Center
+/// application for the specific S3 Access Grants instance"), so the ARN is
+/// assigned by the service and never taken from the request. It follows
+/// `IdentityCenterApplicationArn`'s pattern
+/// (`^arn:[^:]+:sso::\d{12}:application/.*$`): an `sso` ARN carries no Region,
+/// and its resource is `application/<identity-center-instance-id>/apl-<suffix>`.
+///
+/// Both segments are DERIVED from the instance's identity — the Identity Center
+/// instance it is a subresource of, and the account and Region of the S3 Access
+/// Grants instance it was created for — rather than drawn at random, so the ARN
+/// is one value per instance: stable across every later read, and different for
+/// a different instance.
+pub fn identity_center_application_arn(
+    identity_center_instance_arn: &str,
+    account_id: &str,
+    region: &str,
+) -> String {
+    use sha2::Digest;
+
+    let digest = sha2::Sha256::digest(
+        format!("{identity_center_instance_arn}/{account_id}/{region}").as_bytes(),
+    );
+    let suffix: String = hex::encode(digest)
+        .chars()
+        .take(IDENTITY_CENTER_APPLICATION_SUFFIX_LEN)
+        .collect();
+    // The Identity Center instance id is the tail of the instance ARN, whose
+    // resource the pattern `^arn:[^:]+:sso::(\d{12}){0,1}:instance/.*$` spells
+    // `instance/<id>`. An ARN whose tail is empty leaves the application a
+    // subresource of the digest alone, which still names one instance.
+    let instance_id = identity_center_instance_arn
+        .rsplit("instance/")
+        .next()
+        .unwrap_or_default();
+    let resource = if instance_id.is_empty() {
+        format!("application/apl-{suffix}")
+    } else {
+        format!("application/{instance_id}/apl-{suffix}")
+    };
+    ::emulator_server::emulator_arn("sso", "", &resource)
 }
 
 /// The suffix length AWS access point aliases carry between the name and the
@@ -1350,6 +1493,70 @@ pub fn no_such_async_request<E>(request_token_arn: &str) -> crate::scaffolded::S
         "NotFoundException",
         404,
         format!("The specified request token names no asynchronous request: {request_token_arn}"),
+    )
+}
+
+// The refusals the S3 Access Grants instance lifecycle shares.
+//
+// S3 Control's model declares no errors for these operations either, so each is
+// built through `Scaffolded::service_failure`, which carries the wire `<Code>`
+// and the HTTP status a client branches on.
+// ---------------------------------------------------------------------------
+
+/// `AccessGrantsInstanceNotExistsError` (HTTP 404): the account the request
+/// names has no S3 Access Grants instance in the Region the request was signed
+/// for, because none was created there (or it was deleted).
+///
+/// An instance is a Region-scoped resource of which an account has at most one,
+/// so the refusal names the pair that was looked up rather than an id: every
+/// instance carries the same id, [`ACCESS_GRANTS_INSTANCE_ID`].
+pub fn no_such_access_grants_instance<E>(
+    account_id: &str,
+    region: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsInstanceNotExistsError",
+        404,
+        format!(
+            "Access Grants Instance does not exist: account {account_id} has no S3 Access \
+             Grants instance in {region}."
+        ),
+    )
+}
+
+/// `AccessGrantsInstanceAlreadyExistsError` (HTTP 409): the account already has
+/// an S3 Access Grants instance in this Region, and
+/// `CreateAccessGrantsInstance` documents one instance per Region per account —
+/// so creating it again would be a second resource under one identity, not a
+/// replacement.
+pub fn access_grants_instance_already_exists<E>(
+    account_id: &str,
+    region: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsInstanceAlreadyExistsError",
+        409,
+        format!(
+            "Access Grants Instance already exists: account {account_id} already has an S3 \
+             Access Grants instance in {region}."
+        ),
+    )
+}
+
+/// `AccessDenied` (HTTP 403): the store already holds
+/// [`ACCESS_GRANTS_INSTANCE_QUOTA`] instances, so recording one for a further
+/// (account, Region) pair would grow this process's state without end. As with
+/// [`public_access_block_store_full`], `AccessDenied` is the refusal a caller
+/// gets when the service will not let the resource be created, and the message
+/// says which bound was reached.
+pub fn access_grants_instance_store_full<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessDenied",
+        403,
+        format!(
+            "This emulator holds the maximum of {ACCESS_GRANTS_INSTANCE_QUOTA} S3 Access \
+             Grants instances."
+        ),
     )
 }
 

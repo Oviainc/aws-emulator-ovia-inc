@@ -5,6 +5,11 @@
 //! `DELETE_COMPLETE` with a `DeletionTime` once the clock makes it due, which takes the
 //! stack out of the live set. A stack with termination protection enabled is refused.
 //!
+//! Deleting a stack also DELETES THE RESOURCES it created, newest first, through the
+//! services that own them ([`crate::state::provisioning`]); a resource one of those
+//! services refuses to delete leaves the stack in `DELETE_FAILED` with that refusal as
+//! the reason, rather than reporting a deletion that did not happen.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,76 +180,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack to delete, and nothing
             // was written.
             return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStack"));
         };
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // calls that delete the stack's resources run after it, and each of those reaches
+        // another service's own handler, which takes that service's lock.
+        let (stack_id, region, resources) = {
+            let mut store = state.lock();
+            store.settle(now);
 
-        // Deleting a stack that is not in the live set is a no-op that succeeds: the
-        // request asks for a state the store is already in.
-        let Some(previous) = store.resolve(&input.stack_name) else {
-            return Ok(DeleteStackOutput);
+            // Deleting a stack that is not in the live set is a no-op that succeeds: the
+            // request asks for a state the store is already in.
+            let Some(previous) = store.resolve(&input.stack_name) else {
+                return Ok(DeleteStackOutput);
+            };
+            if !previous.is_live() {
+                return Ok(DeleteStackOutput);
+            }
+            // "If a user attempts to delete a stack with termination protection enabled,
+            // the operation fails and the stack remains unchanged."
+            if previous.enable_termination_protection {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Stack [{}] cannot be deleted while TerminationProtection is enabled",
+                    input.stack_name
+                )));
+            }
+            // "For stacks in the DELETE_FAILED state, a list of resource logical IDs that
+            // are associated with the resources you want to retain." A stack in any other
+            // state is refused, as CloudFormation refuses it; retaining a resource of a
+            // stack whose deletion DID fail is not implemented, so that case is answered
+            // 501 rather than with a deletion that quietly deleted what the caller asked
+            // to keep.
+            if input
+                .retain_resources
+                .as_deref()
+                .is_some_and(|retain| !retain.is_empty())
+            {
+                if previous.status != status::DELETE_FAILED {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                        "RetainResources can only be specified for a stack in the \
+                         DELETE_FAILED state; stack [{}] is in {} state",
+                        input.stack_name, previous.status
+                    )));
+                }
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "DeleteStack with RetainResources",
+                ));
+            }
+            // A deletion already in flight: the request asks for what is already
+            // happening, so it does not start a second one.
+            if previous.status == status::DELETE_IN_PROGRESS {
+                return Ok(DeleteStackOutput);
+            }
+
+            let operation_id = crate::state::new_operation_id();
+            let stack = store
+                .resolve_mut(&input.stack_name)
+                .expect("the stack resolved immediately above");
+            stack.deletion_mode = input.deletion_mode.clone();
+            if let Some(config) = input.deployment_config.as_ref() {
+                stack.deployment_config = crate::state::stored_deployment_config(Some(config));
+            }
+            if let Some(role_arn) = &input.role_arn {
+                stack.role_arn = Some(role_arn.clone());
+            }
+            if let Some(token) = &input.client_request_token {
+                stack.client_request_token = Some(token.clone());
+            }
+            // "Once the call completes successfully, stack deletion starts":
+            // DELETE_IN_PROGRESS now, DELETE_COMPLETE (with its DeletionTime) once the
+            // clock makes it due.
+            stack.begin_transition(
+                now,
+                status::DELETE_IN_PROGRESS,
+                status::DELETE_COMPLETE,
+                Some(operation_id),
+                input.client_request_token.clone(),
+            );
+            (
+                stack.stack_id.clone(),
+                // The stack's OWN Region, not the one this request was signed for: the
+                // resources were created in the Region the stack lives in, so that is
+                // where they have to be deleted.
+                stack.region.clone(),
+                stack.current_resources().to_vec(),
+            )
         };
-        if !previous.is_live() {
-            return Ok(DeleteStackOutput);
-        }
-        // "If a user attempts to delete a stack with termination protection enabled, the
-        // operation fails and the stack remains unchanged."
-        if previous.enable_termination_protection {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Stack [{}] cannot be deleted while TerminationProtection is enabled",
-                input.stack_name
-            )));
-        }
-        // "For stacks in the DELETE_FAILED state, a list of resource logical IDs that are
-        // associated with the resources you want to retain." This emulator creates no
-        // stack resources, so no stack of its own can be DELETE_FAILED and a retain list
-        // has nothing it could apply to.
-        if input
-            .retain_resources
-            .as_deref()
-            .is_some_and(|retain| !retain.is_empty())
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "RetainResources can only be specified for a stack in the DELETE_FAILED \
-                 state; stack [{}] is in {} state",
-                input.stack_name, previous.status
-            )));
-        }
-        // A deletion already in flight: the request asks for what is already happening,
-        // so it does not start a second one.
-        if previous.status == status::DELETE_IN_PROGRESS {
-            return Ok(DeleteStackOutput);
-        }
 
-        let operation_id = crate::state::new_operation_id();
-        let stack = store
-            .resolve_mut(&input.stack_name)
-            .expect("the stack resolved immediately above");
-        stack.deletion_mode = input.deletion_mode.clone();
-        if let Some(config) = input.deployment_config.as_ref() {
-            stack.deployment_config = crate::state::stored_deployment_config(Some(config));
+        // "Deletes a specified stack. Once the call completes successfully, stack deletion
+        // starts" — deleting a stack deletes the resources it created, in the services
+        // that own them.
+        let deleted = crate::state::provisioning::delete(ctx, &region, &resources).await;
+
+        let mut store = state.lock();
+        if let Some(stack) = store.resolve_mut(&stack_id) {
+            // What is left: a resource whose deletion the owning service carried out no
+            // longer carries `materialised`, so a retried delete does not ask for it
+            // again.
+            stack.record_materialised_resources(deleted.resources);
+            if let Some(failure) = deleted.failure {
+                // A resource the owning service refused to delete: the stack stays, in
+                // DELETE_FAILED with that service's own refusal as the reason, rather
+                // than reporting a deletion that did not happen.
+                stack.fail_transition(
+                    ::std::time::SystemTime::now(),
+                    status::DELETE_FAILED,
+                    failure,
+                );
+            }
         }
-        if let Some(role_arn) = &input.role_arn {
-            stack.role_arn = Some(role_arn.clone());
-        }
-        if let Some(token) = &input.client_request_token {
-            stack.client_request_token = Some(token.clone());
-        }
-        // "Once the call completes successfully, stack deletion starts": DELETE_IN_PROGRESS
-        // now, DELETE_COMPLETE (with its DeletionTime) once the clock makes it due.
-        stack.begin_transition(
-            now,
-            status::DELETE_IN_PROGRESS,
-            status::DELETE_COMPLETE,
-            Some(operation_id),
-            input.client_request_token.clone(),
-        );
 
         Ok(DeleteStackOutput)
     }
