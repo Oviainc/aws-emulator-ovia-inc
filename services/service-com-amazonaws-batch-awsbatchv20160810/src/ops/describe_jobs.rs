@@ -6,7 +6,9 @@
 //! status and `statusReason`, `createdAt`/`stoppedAt` in epoch milliseconds, its
 //! parameters, tags and the effective container the definition and the submit overrides
 //! added up to. An id nothing stored is omitted silently, as AWS Batch does, rather than
-//! failing the whole call.
+//! failing the whole call. A request naming more ids than the member's documented
+//! maximum ("A list of up to 100 job IDs") is refused with the modelled `ClientException`
+//! before anything is read ([`crate::state::describe_jobs_bound_message`]).
 //!
 //! It is a REPORTING operation: it materialises only the job transitions the clock
 //! already owed (see [`crate::state`]), so repeated describes report a status that only
@@ -162,6 +164,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DescribeJobsErrorModeled::ServerException(batch::unreachable_state()).into(),
             );
         };
+        // `jobs` is "A list of up to 100 job IDs" (the member's own doc); the model types
+        // it as a plain `StringList`, so the bound is applied here. The detail is the one
+        // AWS is recorded to state, inside its frontend envelope.
+        if input.jobs.len() > batch::limits::MAX_DESCRIBE_JOBS {
+            return Err(DescribeJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::describe_jobs_bound_message()),
+            )
+            .into());
+        }
         let now = batch::now_millis();
         let mut state = state.lock();
         state.materialize_due(now);

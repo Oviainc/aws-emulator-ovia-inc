@@ -5,9 +5,13 @@
 //!
 //! `jobQueue` resolves by name or ARN and `jobDefinition` by name, `name:revision` or
 //! ARN, both against persisted state: an unknown queue, a queue whose `JQState` is
-//! `DISABLED` ("new jobs can't be added to the queue"), an unknown definition or an
-//! unknown `dependsOn` job id is a `ClientException`, never a 200 carrying an id nothing
-//! stored. The job id is a fresh UUID, and the record keeps the queue ARN, the resolved
+//! `DISABLED` ("new jobs can't be added to the queue"), a definition reference that names
+//! no ACTIVE revision or an unknown `dependsOn` job id is a `ClientException`, never a 200
+//! carrying an id nothing stored. The `jobDefinition` is resolved FIRST, so a submit that
+//! names neither a stored definition nor a stored queue is refused on the DEFINITION, and
+//! a reference naming nothing and one naming a revision that is not `ACTIVE` are the same
+//! refusal ("does not exist or is not in ACTIVE status."). The job id is a fresh UUID, and
+//! the record keeps the queue ARN, the resolved
 //! revision's ARN, `createdAt` in epoch milliseconds, the parameters (the definition's
 //! defaults with the request's applied over them), the effective container
 //! (`containerProperties` with `containerOverrides` applied) and the submit request's own
@@ -266,6 +270,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // AWS resolves the JOB DEFINITION before the job queue: a submit naming neither is
+        // refused on the definition. The two ways a reference fails to name a runnable
+        // revision — nothing stored for it, and a stored revision that is not ACTIVE —
+        // are ONE refusal, worded from the reference the request gave.
+        let definition = state
+            .job_definition(&input.job_definition)
+            .filter(|definition| definition.status.as_deref() == Some(batch::STATUS_ACTIVE))
+            .cloned();
+        let Some(definition) = definition else {
+            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "JobDefinition name {} does not exist or is not in ACTIVE status.",
+                    input.job_definition
+                ),
+            ))
+            .into());
+        };
+        if definition.container_properties.is_none() && definition.node_properties.is_none() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SubmitJob against an ecsProperties or eksProperties job definition",
+            ));
+        }
+
         let Some(queue) = state.job_queue(&input.job_queue) else {
             return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
                 format!("Job queue {} does not exist", input.job_queue),
@@ -281,28 +308,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 format!("Job queue {queue_arn} is DISABLED and can't accept new jobs"),
             ))
             .into());
-        }
-
-        let Some(definition) = state.job_definition(&input.job_definition) else {
-            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                format!("Job definition {} does not exist", input.job_definition),
-            ))
-            .into());
-        };
-        let definition = definition.clone();
-        if definition.status.as_deref() != Some(batch::STATUS_ACTIVE) {
-            return Err(SubmitJobErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "Job definition {} is not ACTIVE",
-                    definition.job_definition_arn
-                ),
-            ))
-            .into());
-        }
-        if definition.container_properties.is_none() && definition.node_properties.is_none() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "SubmitJob against an ecsProperties or eksProperties job definition",
-            ));
         }
 
         // AWS documents the bound on `SubmitJob$dependsOn`: "A job can depend upon a

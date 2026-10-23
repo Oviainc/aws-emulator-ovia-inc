@@ -159,10 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(analyzer) = state.analyzer_by_arn(&input.resource_arn) else {
             crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NotFound);
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::resource_arn_not_found(&input.resource_arn),
-            )
-            .into());
+            // The tagging path's own 404 code (`NotFoundException`), shared with
+            // `TagResource` and `UntagResource`; see
+            // [`crate::state::tag_target_not_found`].
+            return Err(crate::state::tag_target_not_found());
         };
 
         // A resource that carries no tags answers with an empty map rather than an

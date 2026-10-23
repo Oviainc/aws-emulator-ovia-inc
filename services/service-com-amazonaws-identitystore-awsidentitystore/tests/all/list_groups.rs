@@ -18,16 +18,17 @@ use std::collections::BTreeSet;
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The HTTP harness, shared with the lifecycle suite rather than restated here.
-use crate::identity_store_lifecycle::{
-    assert_resource_arn, assert_uuid, call, emulator, ok, refused, string,
-};
+/// The HTTP harness, shared with this crate's other suites rather than restated here.
+use crate::harness::{call, emulator, ok, refused, string, MISSING_STORE, STORE};
+use crate::identity_store_lifecycle::{assert_resource_arn, assert_uuid};
 
-/// Identity-store identifiers this suite lists in. Every form the modelled
-/// `IdentityStoreId` pattern admits is one row's worth of input: the `d-` form, the
-/// UUID form, and the store ARN (`smithy_query(query="operation",operation="ListGroups")`).
-const STORE: &str = "d-1234567890";
+/// A well-formed `IdentityStoreId` in the UUID form the modelled pattern also admits,
+/// naming no identity store: a second FORM of "no such store", not a second store.
 const UUID_STORE: &str = "a1b2c3d4-5678-90ab-cdef-111122223333";
+
+/// The prefix of an identity store's ARN, the third identifier form the modelled
+/// `IdentityStoreId` pattern admits
+/// (`smithy_query(query="operation",operation="ListGroups")`).
 const STORE_ARN_PREFIX: &str = "arn:aws:identitystore::";
 
 /// The bounds of the modelled `MaxResults` range on `ListGroups` (range 1..100,
@@ -350,22 +351,19 @@ async fn groups_paginate_in_one_stable_order() {
 }
 
 #[tokio::test]
-async fn one_stores_groups_never_appear_in_another_stores_listing() {
+async fn a_listing_covers_exactly_the_store_the_request_names() {
     let router = emulator();
-    // Rows are the identifier forms the modelled `IdentityStoreId` admits, each a
-    // distinct store, plus the ARN form of the first one — which names the SAME store.
+    // The listing is the store's own groups, whichever FORM of its identifier named it:
+    // the modelled `IdentityStoreId` admits the bare id and the store's ARN.
     let case = "per-store scope";
     let here = create_groups(&router, STORE, 3, "here").await;
-    let there = create_groups(&router, UUID_STORE, 2, "there").await;
 
-    for (store, expected) in [(STORE, &here), (UUID_STORE, &there)] {
-        let listed = group_ids(&walk_groups(&router, store, None, case).await);
-        assert_eq!(
-            listed.iter().collect::<BTreeSet<_>>(),
-            expected.iter().collect::<BTreeSet<_>>(),
-            "case {case:?}: expected store {store} to list only its own groups, got {listed:?}"
-        );
-    }
+    let listed = group_ids(&walk_groups(&router, STORE, None, case).await);
+    assert_eq!(
+        listed.iter().collect::<BTreeSet<_>>(),
+        here.iter().collect::<BTreeSet<_>>(),
+        "case {case:?}: expected store {STORE} to list its own groups, got {listed:?}"
+    );
 
     // The ARN form of an identity store names that store, so it lists the same groups.
     let by_arn = group_ids(
@@ -386,6 +384,18 @@ async fn one_stores_groups_never_appear_in_another_stores_listing() {
         "case {case:?}: expected the store ARN to list the same groups as its id, \
          got {by_arn:?} vs {by_id:?}"
     );
+
+    // And a store that does not exist lists nothing at all — it is refused, so one
+    // store's groups can never appear in another's listing.
+    refused(
+        &router,
+        "ListGroups",
+        list_request(MISSING_STORE, None, None),
+        404,
+        "ResourceNotFoundException",
+        case,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -497,7 +507,6 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
     let router = emulator();
     let case = "cursor handling";
     create_groups(&router, STORE, 3, case).await;
-    let other = create_groups(&router, UUID_STORE, 3, case).await;
 
     let first = ok(
         &router,
@@ -514,13 +523,14 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         "case {case:?}: expected an opaque NextToken, got the group id {token:?}"
     );
 
-    // Rows: a token this service never minted, one naming a group of ANOTHER store's
-    // listing, and one that is a well-formed id no group carries.
+    // Rows: a token this service never minted, and ones that are well-formed ids no
+    // group of this store carries, in either letter case.
+    let stranger = "0123abcd-4567-89ab-cdef-0123456789ab";
     for bad in [
         "not-a-cursor".to_string(),
         hex::encode(b"00000000-0000-4000-8000-000000000000"),
-        hex::encode(other[0].as_bytes()),
-        hex::encode(other[0].to_ascii_uppercase().as_bytes()),
+        hex::encode(stranger.as_bytes()),
+        hex::encode(stranger.to_ascii_uppercase().as_bytes()),
     ] {
         refused(
             &router,
@@ -579,15 +589,16 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 }
 
 #[tokio::test]
-async fn an_identity_store_nothing_was_created_in_is_reported_as_not_found() {
+async fn an_identity_store_that_does_not_exist_is_reported_as_not_found() {
     let router = emulator();
-    // Rows are the identifier forms of a store this emulator holds nothing for.
+    // Rows are the identifier FORMS of a store this emulator does not hold: the `d-`
+    // form, the UUID form and the store ARN.
     let case = "unknown identity store";
     let arn = format!(
         "{STORE_ARN_PREFIX}{}:identitystore/d-00ff00ff00",
         engine::emulator_account_id()
     );
-    for store in [STORE, UUID_STORE, arn.as_str()] {
+    for store in [MISSING_STORE, UUID_STORE, arn.as_str()] {
         let body = refused(
             &router,
             "ListGroups",
@@ -604,8 +615,8 @@ async fn an_identity_store_nothing_was_created_in_is_reported_as_not_found() {
         );
     }
 
-    // The refusal did not bring a store into being: a create is still the only thing
-    // that does, and the listing that follows it reports exactly that one group.
+    // The refusals brought no store into being, and the store that DOES exist still
+    // lists exactly what was created in it.
     let group = create_group(
         &router,
         &json!({ "IdentityStoreId": STORE, "DisplayName": "first" }),
@@ -618,7 +629,7 @@ async fn an_identity_store_nothing_was_created_in_is_reported_as_not_found() {
         vec![group],
         "case {case:?}: expected the created group to be the whole listing, got {listed:?}"
     );
-    // ...and the store that was never written to is still unknown.
+    // ...and the stores that do not exist are still unknown.
     let (status, code, _) = call(&router, "ListGroups", list_request(UUID_STORE, None, None)).await;
     assert_eq!(
         (status, code.contains("ResourceNotFoundException")),

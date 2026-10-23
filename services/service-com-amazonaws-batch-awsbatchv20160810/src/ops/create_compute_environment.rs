@@ -243,10 +243,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if input.r#type == batch::CE_TYPE_MANAGED && input.compute_resources.is_none() {
+            // The one Batch refusal recorded INSIDE the frontend envelope for this
+            // operation, detail verbatim: `computeResources` is "required for a managed
+            // compute environment" (the member's own doc), and the envelope names the id
+            // of the call being refused ([`batch::client_exception_enveloped`]).
             return Err(CreateComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(
-                    "computeResources is required for a MANAGED compute environment",
+                batch::client_exception_enveloped(
+                    "computeResources must be provided for a MANAGED compute environment",
                 ),
+            )
+            .into());
+        }
+        // The other half of the same rule: `computeResources` describes the resources
+        // Batch MANAGES, and Fargate capacity only exists where Batch manages it, so an
+        // UNMANAGED environment cannot be created over Fargate compute resources
+        // ([`batch::UNMANAGED_FARGATE_NOT_CREATABLE`]).
+        if input.r#type != batch::CE_TYPE_MANAGED
+            && input
+                .compute_resources
+                .as_ref()
+                .is_some_and(|resources| batch::is_fargate_compute_type(&resources.r#type))
+        {
+            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::UNMANAGED_FARGATE_NOT_CREATABLE),
             )
             .into());
         }

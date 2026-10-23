@@ -241,22 +241,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is a question about the store, answered below with a page (possibly empty) and
         // never with a refusal.
         let named = selectors.iter().filter(|selector| selector.is_some()).count();
+        // These are the request-validation refusals Batch's frontend raises, which it
+        // answers inside its envelope naming the id of the call being refused
+        // (`batch::client_exception_enveloped`).
         if named == 0 {
-            return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
-                "Job queue name is required.",
-            ))
+            return Err(ListJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped("Job queue name is required."),
+            )
             .into());
         }
         if input.array_job_id.is_some() && input.multi_node_job_id.is_some() {
-            return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
-                "Array job id and multinode job id cannot both be set.",
-            ))
+            return Err(ListJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped(
+                    "Array job id and multinode job id cannot both be set.",
+                ),
+            )
             .into());
         }
         if named > 1 {
-            return Err(ListJobsErrorModeled::ClientException(batch::client_exception(
-                "Only one of job queue, array job id and multinode job id can be set.",
-            ))
+            return Err(ListJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped(
+                    "Only one of job queue, array job id and multinode job id can be set.",
+                ),
+            )
             .into());
         }
 

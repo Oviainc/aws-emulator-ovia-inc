@@ -43,6 +43,12 @@
 //!   with oldest-first eviction.
 //! * `classifier_idempotency_tokens` — an entry is dropped together with the
 //!   classifier it points at, so this index cannot outgrow `document_classifiers`.
+//! * `endpoints` — [`MAX_ENDPOINT_RECORDS`], enforced by the ONE insertion path,
+//!   [`ComAmazonawsComprehendComprehend20171127State::insert_endpoint`], with
+//!   oldest-first eviction. The bound also caps the lock-held `settle` sweep
+//!   `ListEndpoints` performs.
+//! * `endpoint_idempotency_tokens` — an entry is dropped together with the endpoint
+//!   it points at, so this index cannot outgrow `endpoints`.
 //!
 //! Every analysis-job `List*DetectionJobs` bounds the RESPONSE the same way, with
 //! [`DEFAULT_JOB_PAGE_SIZE`] and the modelled [`MAX_JOB_PAGE_SIZE`] ceiling, and
@@ -65,6 +71,17 @@
 //! [`DocumentClassifier::document_classifier_properties`] projects it into the
 //! modelled `DocumentClassifierProperties` shape that `ListDocumentClassifiers` and
 //! `DescribeDocumentClassifier` report.
+//!
+//! ## Endpoints
+//!
+//! [`Endpoint`] is one model-specific inference endpoint — what `CreateEndpoint`
+//! persists, keyed by the `EndpointArn` it mints — and
+//! [`Endpoint::endpoint_properties`] projects it into the modelled
+//! `EndpointProperties` shape `DescribeEndpoint` and `ListEndpoints` report.
+//! [`Endpoint::settle`] is the ONE place its clock-owed `EndpointStatus` change is
+//! materialised, exactly as [`AnalysisJob::settle`] is for a job, and
+//! [`EndpointProvisioning`] holds the outcome of the provisioning the create
+//! actually performed, exactly as [`JobOutcome`] does for a job's run.
 //!
 //! ## Tags
 //!
@@ -97,9 +114,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ClassifierMetadata, DocumentClassifierInputDataConfig, DocumentClassifierOutputDataConfig,
-    DocumentClassifierProperties, DominantLanguageDetectionJobProperties, InputDataConfig,
-    KeyPhrasesDetectionJobProperties, OutputDataConfig, PiiEntitiesDetectionJobProperties,
-    PiiOutputDataConfig, RedactionConfig, SentimentDetectionJobProperties, Tag, VpcConfig,
+    DocumentClassifierProperties, DominantLanguageDetectionJobProperties, EndpointProperties,
+    InputDataConfig, KeyPhrasesDetectionJobProperties, OutputDataConfig,
+    PiiEntitiesDetectionJobProperties, PiiOutputDataConfig, RedactionConfig,
+    SentimentDetectionJobProperties, Tag, VpcConfig,
 };
 
 /// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
@@ -992,6 +1010,17 @@ impl DocumentClassifier {
         )
     }
 
+    /// Whether a model trained from this classifier can serve inference: the two
+    /// `ModelStatus` values that mean a model was fitted.
+    ///
+    /// `DescribeDocumentClassifier` documents `TRAINED` as "the classifier is trained
+    /// and ready to use" and `TRAINED_WITH_WARNING` as trained on data the service
+    /// had reservations about; every other status names a model that has not been
+    /// fitted, so there is nothing to deploy behind an endpoint.
+    pub fn is_trained(&self) -> bool {
+        matches!(self.status.as_str(), "TRAINED" | "TRAINED_WITH_WARNING")
+    }
+
     /// Why a started training fails: the labelled documents it was pointed at were
     /// never read, so no model was ever fitted.
     fn untrained_model_message(&self) -> String {
@@ -1109,6 +1138,209 @@ pub fn document_classifier_arn(region: &str, name: &str, version_name: Option<&s
     ::emulator_server::emulator_arn("comprehend", region, &resource)
 }
 
+/// How long a freshly created endpoint stays `CREATING` before the clock owes it the
+/// status [`Endpoint::provisioning`] holds.
+///
+/// The emulator's own span, not a documented AWS duration: provisioning real
+/// inference capacity takes minutes, which no test can wait for. It is deliberately
+/// non-zero, so a caller that describes an endpoint straight back still observes
+/// `CREATING` — the state `EndpointProperties$Status` documents callers have to wait
+/// out before making inference requests.
+pub const ENDPOINT_CREATING_SPAN: Duration = Duration::from_millis(300);
+
+/// The most endpoint records this emulator retains.
+///
+/// The EMULATOR's bound, for the same reason as [`MAX_ANALYSIS_JOB_RECORDS`]: the
+/// oldest record is evicted once the store passes it, so no sequence of requests can
+/// grow this store without limit. AWS's own per-account endpoint quota is adjustable
+/// and is not emulated as a refusal here, so creating an endpoint is never refused
+/// for this bound; only the record set is trimmed. The bound also caps the page
+/// `ListEndpoints` can ever walk.
+pub const MAX_ENDPOINT_RECORDS: usize = 1000;
+
+/// The outcome of the provisioning a `CreateEndpoint` call performed: the status the
+/// clock reveals once the endpoint's creating span is over, and the `Message` that
+/// says why.
+///
+/// Held separately from [`Endpoint::status`] for the same reason [`JobOutcome`] is
+/// held separately from a job's status: a status is only reported for work that ran,
+/// so until the provisioning reports, the endpoint is still `CREATING`.
+#[derive(Debug, Clone)]
+pub struct EndpointProvisioning {
+    /// One of `super::ops::types::ENDPOINT_STATUS_VALUES`, and the status the
+    /// creation settles into: `IN_SERVICE` or `FAILED`.
+    pub status: String,
+    /// What the provisioning has to say — the failure's reason, or nothing for an
+    /// endpoint that came into service.
+    pub message: Option<String>,
+}
+
+impl EndpointProvisioning {
+    /// The outcome of provisioning that put a trained model behind the endpoint, so
+    /// the endpoint can serve inference from it.
+    pub fn in_service() -> Self {
+        Self {
+            status: "IN_SERVICE".to_string(),
+            message: None,
+        }
+    }
+
+    /// The outcome of provisioning that could not be carried out, naming `reason`.
+    /// `FAILED` is the modelled status whose `Message` member documents exactly this:
+    /// "Specifies a reason for failure in cases of `Failed` status."
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            status: "FAILED".to_string(),
+            message: Some(reason.into()),
+        }
+    }
+}
+
+/// One persisted model-specific inference endpoint.
+///
+/// Every member is a value `CreateEndpoint` was called with, or a value this service
+/// minted for it — never anything a later `Describe`/`List` request supplied. The
+/// record is keyed by its `EndpointArn`, which is what every other endpoint operation
+/// names it by, and [`Self::endpoint_properties`] is the ONE place it is projected
+/// into the modelled shape the reporting operations return.
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    /// Creation order within the service, the stable key `ListEndpoints` pages on.
+    pub seq: u64,
+    /// The endpoint's ARN, as [`endpoint_arn`] renders it.
+    pub endpoint_arn: String,
+    /// `EndpointName`, the descriptive suffix of the ARN. Not a member of
+    /// `EndpointProperties`: the ARN carries it.
+    pub endpoint_name: String,
+    /// One of `super::ops::types::ENDPOINT_STATUS_VALUES`.
+    pub status: String,
+    pub message: Option<String>,
+    /// The ARN of the model this endpoint was created for.
+    pub model_arn: Option<String>,
+    pub desired_inference_units: i32,
+    /// The inference units actually serving requests: `None` until the endpoint is
+    /// in service, because nothing is serving before that — the modelled
+    /// `InferenceUnitsInteger` has `@range min 1`, so an idle endpoint has no
+    /// count to report rather than a zero.
+    pub current_inference_units: Option<i32>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// When the clock owes `CREATING` -> the status [`Self::provisioning`] holds.
+    pub ready_due_at: SystemTime,
+    /// The outcome of the provisioning the create performed, revealed by
+    /// [`Self::settle`] once the clock owes the transition.
+    pub provisioning: EndpointProvisioning,
+    pub data_access_role_arn: Option<String>,
+    pub flywheel_arn: Option<String>,
+    pub tags: Vec<Tag>,
+    /// The `ClientRequestToken` the endpoint was created under, if any. Held so the
+    /// idempotency-index entry can be dropped with the record it points at.
+    pub client_request_token: Option<String>,
+}
+
+impl Endpoint {
+    /// An endpoint record as it stands the instant it was created: `CREATING`, with
+    /// nothing serving inference yet, the instant the clock owes it its settled
+    /// status, and the outcome of the provisioning the create performed.
+    pub fn creating(
+        seq: u64,
+        endpoint_arn: String,
+        endpoint_name: String,
+        desired_inference_units: i32,
+        created_at: SystemTime,
+        provisioning: EndpointProvisioning,
+    ) -> Self {
+        Self {
+            seq,
+            endpoint_arn,
+            endpoint_name,
+            status: "CREATING".to_string(),
+            message: None,
+            model_arn: None,
+            desired_inference_units,
+            current_inference_units: None,
+            creation_time: created_at,
+            last_modified_time: created_at,
+            ready_due_at: created_at + ENDPOINT_CREATING_SPAN,
+            provisioning,
+            data_access_role_arn: None,
+            flywheel_arn: None,
+            tags: Vec::new(),
+            client_request_token: None,
+        }
+    }
+
+    /// Materialise the status change the clock already owed at `now`.
+    ///
+    /// Called by the reporting operations as well as the mutating ones: the
+    /// transition was due at `now` whether or not anybody called, so applying it on
+    /// read reports the status the endpoint already had rather than advancing it.
+    ///
+    /// What the transition reveals is [`Self::provisioning`] — the outcome of the
+    /// provisioning the create actually performed — never an assumed `IN_SERVICE`:
+    /// an endpoint is in service only when there is a trained model behind it to
+    /// serve inference from.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == "CREATING" && now >= self.ready_due_at {
+            self.status = self.provisioning.status.clone();
+            self.message = self.provisioning.message.clone();
+            self.last_modified_time = self.ready_due_at;
+            if self.status == "IN_SERVICE" {
+                self.current_inference_units = Some(self.desired_inference_units);
+            }
+        }
+    }
+
+    /// Project this record into the modelled `EndpointProperties` shape.
+    ///
+    /// `DesiredModelArn` and `DesiredDataAccessRoleArn` are the members an
+    /// `UpdateEndpoint` in flight reports — "ARN of the new model to use for updating
+    /// an existing endpoint" — so an endpoint with no update in flight reports
+    /// neither.
+    pub fn endpoint_properties(&self) -> EndpointProperties {
+        EndpointProperties {
+            endpoint_arn: Some(self.endpoint_arn.clone()),
+            status: Some(self.status.clone()),
+            message: self.message.clone(),
+            model_arn: self.model_arn.clone(),
+            desired_model_arn: None,
+            desired_inference_units: Some(self.desired_inference_units),
+            current_inference_units: self.current_inference_units,
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+            data_access_role_arn: self.data_access_role_arn.clone(),
+            desired_data_access_role_arn: None,
+            flywheel_arn: self.flywheel_arn.clone(),
+        }
+    }
+}
+
+/// The ARN an endpoint carries, stated once here.
+///
+/// The form the modelled `ComprehendEndpointArn` pattern requires:
+/// `arn:aws:comprehend:<region>:<account>:<resource-type>/<name>`, where
+/// `resource_type` is what [`endpoint_resource_type`] derives from the attached
+/// model's own ARN.
+pub fn endpoint_arn(region: &str, resource_type: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn("comprehend", region, &format!("{resource_type}/{name}"))
+}
+
+/// The endpoint resource type an endpoint attached to the model `model_arn` carries,
+/// or `None` when that ARN names no Comprehend custom model.
+///
+/// The modelled `ComprehendEndpointArn` pattern admits exactly two resource types,
+/// `document-classifier-endpoint` and `entity-recognizer-endpoint`, and
+/// `ComprehendModelArn` admits the two matching model types: an endpoint's own
+/// resource type is the attached model's, suffixed `-endpoint`.
+pub fn endpoint_resource_type(model_arn: &str) -> Option<&'static str> {
+    let resource = model_arn.split(':').nth(5)?;
+    match resource.split('/').next()? {
+        "document-classifier" => Some("document-classifier-endpoint"),
+        "entity-recognizer" => Some("entity-recognizer-endpoint"),
+        _ => None,
+    }
+}
+
 /// How many job records a `List*DetectionJobs` page carries when the request sets
 /// no `MaxResults`.
 ///
@@ -1197,11 +1429,34 @@ impl JobFilterParts<'_> {
     }
 }
 
+/// Render the opaque page cursor that resumes a `List*` page after the record with
+/// creation (or submission) sequence number `seq`.
+///
+/// The ONE cursor codec this service's paging operations share, so no two of them
+/// can disagree about the form of a `NextToken`. What the number MEANS stays the
+/// issuing operation's own — a token is opaque to everything but the operation that
+/// minted it, and each caller checks the sequence against the records it pages — but
+/// the rendering is stated once: the sequence number is not a member of any modelled
+/// shape, so it is carried as hex rather than exposed.
+pub fn encode_page_cursor(seq: u64) -> String {
+    hex::encode(seq.to_be_bytes())
+}
+
+/// Read back a cursor produced by [`encode_page_cursor`]; `None` when the string is
+/// not of that form. Each caller additionally checks that the sequence number it
+/// carries is one this service has minted, so a well-formed string naming no page it
+/// ever issued is refused too.
+pub fn decode_page_cursor(token: &str) -> Option<u64> {
+    let bytes = hex::decode(token).ok()?;
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
 /// Render the page cursor that resumes after the job with submission sequence `seq`,
 /// in whichever direction the page was served. Opaque to the caller: the sequence
 /// number is not a member of any modelled shape.
 pub fn encode_job_page_token(seq: u64) -> String {
-    hex::encode(seq.to_be_bytes())
+    encode_page_cursor(seq)
 }
 
 /// Read back a cursor produced by [`encode_job_page_token`]; `None` when the string
@@ -1211,9 +1466,7 @@ pub fn encode_job_page_token(seq: u64) -> String {
 /// that the sequence number it carries is one this service has minted, so a
 /// well-formed string naming no page it ever issued is refused too.
 pub fn decode_job_page_token(token: &str) -> Option<u64> {
-    let bytes = hex::decode(token).ok()?;
-    let bytes: [u8; 8] = bytes.try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
+    decode_page_cursor(token)
 }
 
 /// Per-service state for com-amazonaws-comprehend-comprehend-20171127. A handler reaches it through [`service_state`].
@@ -1243,6 +1496,20 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
     /// Monotonic creation counter, the source of a classifier's `seq` — the stable
     /// order `ListDocumentClassifiers` pages on.
     pub document_classifier_seq: u64,
+    /// Every persisted inference endpoint, keyed by its `EndpointArn`. Bounded by
+    /// [`MAX_ENDPOINT_RECORDS`]: insert through [`Self::insert_endpoint`], never
+    /// directly.
+    pub endpoints: BTreeMap<String, Endpoint>,
+    /// The first endpoint ARN minted for a `ClientRequestToken`, so a retried
+    /// `CreateEndpoint` resolves to the endpoint it already created rather than
+    /// colliding with it — which is what `ClientRequestToken`'s own documentation
+    /// states: "If this token matches a previous endpoint creation request, Amazon
+    /// Comprehend will not return a `ResourceInUseException`." An entry is dropped
+    /// with the endpoint it points at.
+    pub endpoint_idempotency_tokens: HashMap<String, String>,
+    /// Monotonic creation counter, the source of an endpoint's `seq` — the stable
+    /// order `ListEndpoints` pages on.
+    pub endpoint_seq: u64,
 }
 
 impl ComAmazonawsComprehendComprehend20171127State {
@@ -1512,6 +1779,75 @@ impl ComAmazonawsComprehendComprehend20171127State {
             let Some(oldest) = oldest else { break };
             let evicted = self.document_classifiers.remove(&oldest);
             self.forget_classifier_token(&oldest, evicted);
+        }
+    }
+
+    /// Materialise every endpoint status change the clock already owed at `now`.
+    ///
+    /// The ONE place an endpoint's clock-owed change is applied to the STORE, so
+    /// every reporting and mutating operation calls it first. The sweep is bounded by
+    /// [`MAX_ENDPOINT_RECORDS`].
+    pub fn settle_endpoints(&mut self, now: SystemTime) {
+        for endpoint in self.endpoints.values_mut() {
+            endpoint.settle(now);
+        }
+    }
+
+    /// Mint the next endpoint creation sequence number.
+    ///
+    /// An endpoint's identity is its ARN (the name the caller chose), so nothing is
+    /// hashed here: the counter exists only to give the records a stable creation
+    /// order for paging.
+    pub fn mint_endpoint_seq(&mut self) -> u64 {
+        self.endpoint_seq += 1;
+        self.endpoint_seq
+    }
+
+    /// Drop the idempotency-index entry of an endpoint record that has just left the
+    /// store — but only while it still points at that record, because a later
+    /// creation may have taken the same token over.
+    ///
+    /// The ONE place that invariant is written, for every way an endpoint record
+    /// leaves: an eviction at the bound, and a creation that displaces an earlier
+    /// record under the same ARN.
+    fn forget_endpoint_token(&mut self, arn: &str, record: Option<Endpoint>) {
+        if let Some(token) = record.and_then(|endpoint| endpoint.client_request_token) {
+            if self
+                .endpoint_idempotency_tokens
+                .get(&token)
+                .is_some_and(|indexed| indexed == arn)
+            {
+                self.endpoint_idempotency_tokens.remove(&token);
+            }
+        }
+    }
+
+    /// Persist an endpoint record, index it under its `ClientRequestToken`, and evict
+    /// the oldest once the store passes [`MAX_ENDPOINT_RECORDS`].
+    ///
+    /// The ONE insertion path for [`Self::endpoints`], so the bound cannot be
+    /// bypassed by a handler. It reclaims a displaced or evicted record's index entry
+    /// exactly as [`Self::insert_document_classifier`] does, so the index cannot
+    /// outgrow the records it points at.
+    pub fn insert_endpoint(&mut self, endpoint: Endpoint) {
+        let arn = endpoint.endpoint_arn.clone();
+        let token = endpoint.client_request_token.clone();
+        let displaced = self.endpoints.insert(arn.clone(), endpoint);
+        self.forget_endpoint_token(&arn, displaced);
+        if let Some(token) = token {
+            self.endpoint_idempotency_tokens.insert(token, arn);
+        }
+        while self.endpoints.len() > MAX_ENDPOINT_RECORDS {
+            let oldest = self
+                .endpoints
+                .iter()
+                .min_by(|(left_arn, left), (right_arn, right)| {
+                    (left.seq, left_arn.as_str()).cmp(&(right.seq, right_arn.as_str()))
+                })
+                .map(|(arn, _)| arn.clone());
+            let Some(oldest) = oldest else { break };
+            let evicted = self.endpoints.remove(&oldest);
+            self.forget_endpoint_token(&oldest, evicted);
         }
     }
 }

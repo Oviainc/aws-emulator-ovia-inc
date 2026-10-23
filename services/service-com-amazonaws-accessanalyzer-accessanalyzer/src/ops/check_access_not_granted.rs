@@ -220,6 +220,18 @@ const MAX_ACTIONS_PER_ACCESS: usize = 100;
 /// See [`MAX_ACTIONS_PER_ACCESS`].
 const MAX_RESOURCES_PER_ACCESS: usize = 100;
 
+/// The `message` of the `ValidationException` that refuses an `access` object naming
+/// neither an action nor a resource.
+///
+/// AWS's own constant for this refusal, as the recorded responses carry it. The
+/// at-least-one-of rule it states is the one the `access` member documents ("If only
+/// actions are specified … If only resources are specified …"), and the service states
+/// it about the access OBJECT rather than about a position in the list, so the text
+/// carries no index and nothing else from the request: the same string answers every
+/// request that trips it, in any account or Region.
+const ACCESS_WITHOUT_ACTIONS_OR_RESOURCES_MESSAGE: &str =
+    "The access object must have at least one action or one resource.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -390,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
                 return Err(refuse_field(
                     "access",
-                    format!("access[{position}] must specify actions, resources, or both"),
+                    ACCESS_WITHOUT_ACTIONS_OR_RESOURCES_MESSAGE.to_string(),
                 ));
             };
             probed = Some(match probed {

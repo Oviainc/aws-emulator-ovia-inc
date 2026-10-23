@@ -214,8 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Who is creating this user: recorded on the record as its `CreatedBy`, which a
+        // later `DescribeUser` reports.
+        let created_by = crate::state::caller_principal(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateUserErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the identity store is unavailable".to_string()),
@@ -223,20 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // A create may bring an identity store into being (this API models no
-        // operation that creates one), but only while fewer than
-        // `MAX_IDENTITY_STORES` are held: `IdentityStoreId` is caller-chosen, so the
-        // vivification is capped rather than unbounded.
+        // The identity store must EXIST: `IdentityStoreId` is caller-chosen, and a
+        // well-formed id that names no store is refused with the modelled
+        // `ResourceNotFoundException` rather than answered — nothing is created, and no
+        // store springs into being because a request named one.
         let store = state
-            .try_store_mut(&input.identity_store_id)
-            .ok_or_else(|| {
-                CreateUserErrorModeled::ServiceQuotaExceededException(crate::state::quota_exceeded(
-                    format!(
-                        "{} identity stores",
-                        crate::state::MAX_IDENTITY_STORES
-                    ),
-                ))
-            })?;
+            .resolve_store_mut(&input.identity_store_id)
+            .map_err(CreateUserErrorModeled::ResourceNotFoundException)?;
 
         // The store holds a bounded number of users. The operation models
         // `ServiceQuotaExceededException` for "the request would cause the number of
@@ -289,7 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             preferred_language: input.preferred_language,
             locale: input.locale,
             timezone: input.timezone,
-            user_status: None,
+            // A user this API creates is usable from the moment it exists: `CreateUser`
+            // models no `UserStatus` member, and the enum's other value (`DISABLED`) is
+            // reached through an `UpdateUser` naming the `userStatus` attribute.
+            user_status: crate::state::USER_STATUS_ENABLED.to_string(),
             photos: input.photos.unwrap_or_default(),
             website: input.website,
             birthdate: input.birthdate,
@@ -298,7 +297,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             extensions: input.extensions.unwrap_or_default(),
             created_at: now,
             updated_at: now,
-            created_by: None,
+            created_by: Some(created_by),
+            // Nothing has updated this user yet, so it carries no `UpdatedBy`.
             updated_by: None,
         };
 

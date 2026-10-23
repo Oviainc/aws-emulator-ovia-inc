@@ -1050,7 +1050,8 @@ async fn deleting_a_shadow_removes_it_from_every_reader() {
             );
         }
 
-        // Recreating starts a new document at version 1.
+        // Recreating resumes the shadow name's version counter: the two updates took it
+        // to 2, the delete consumed 3, so the recreated document is version 4.
         let recreated = harness
             .update(
                 "deleteThing",
@@ -1061,8 +1062,8 @@ async fn deleting_a_shadow_removes_it_from_every_reader() {
             .await;
         assert_eq!(
             recreated.json().get("version").and_then(Value::as_i64),
-            Some(1),
-            "case {case:?}: expected a recreated shadow at version 1, got {}",
+            Some(4),
+            "case {case:?}: expected the recreated shadow to resume above the delete, got {}",
             String::from_utf8_lossy(&recreated.body)
         );
     }
@@ -1225,7 +1226,8 @@ async fn the_shadow_store_holds_at_most_its_maximum_number_of_documents() {
         String::from_utf8_lossy(&answer.body)
     );
 
-    // Deleting one frees a slot.
+    // Deleting a document does NOT free a slot: a shadow name's version counter outlives
+    // its document, so the slot stays and a new name is still refused…
     let deleted = harness.delete_shadow("capThing", Some("s0")).await;
     assert_eq!(
         deleted.status, 200,
@@ -1233,13 +1235,29 @@ async fn the_shadow_store_holds_at_most_its_maximum_number_of_documents() {
         deleted.status
     );
     let answer = harness
-        .update("otherCapThing", Some("overflow"), payload)
+        .update("otherCapThing", Some("overflow"), payload.clone())
         .await;
     assert_eq!(
         answer.status,
-        200,
-        "expected a freed slot to admit a new shadow, got {} with body {}",
+        400,
+        "expected the cap to still refuse a new shadow name after a delete, got {} with body {}",
         answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    // …while the deleted name, whose slot is still held, is recreatable and resumes its
+    // counter: two updates took it to 2 and the delete consumed 3.
+    let answer = harness.update("capThing", Some("s0"), payload).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "expected a recreate of a slot the store already holds, got {} with body {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        answer.json().get("version").and_then(Value::as_i64),
+        Some(4),
+        "expected the recreated shadow to resume above the delete, got {}",
         String::from_utf8_lossy(&answer.body)
     );
 }
@@ -1551,11 +1569,16 @@ async fn a_publish_outside_the_modelled_and_mqtt_rules_is_refused() {
         );
     }
 
-    // The documented message-payload quota is 128 KB: at the bound it is accepted,
-    // past it refused.
-    for (case, size, expected_status) in [
-        ("at the 128 KB quota", 128 * 1024, 200_u16),
-        ("one byte past the quota", 128 * 1024 + 1, 400),
+    // The documented message-payload quota is 128 KB: at the bound it is accepted, past
+    // it refused — and refused as an entity too large (413), not as a malformed request.
+    for (case, size, expected_status, expected_code) in [
+        ("at the 128 KB quota", 128 * 1024, 200_u16, ""),
+        (
+            "one byte past the quota",
+            128 * 1024 + 1,
+            413,
+            "RequestEntityTooLargeException",
+        ),
     ] {
         let answer = harness
             .publish("sized-topic", 0, true, None, vec![7u8; size])
@@ -1567,6 +1590,14 @@ async fn a_publish_outside_the_modelled_and_mqtt_rules_is_refused() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
+        if !expected_code.is_empty() {
+            assert_eq!(
+                answer.error_code(),
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
     }
     // The refused publish did not replace the accepted one.
     let stored = harness.get_retained_message("sized-topic").await.json();
