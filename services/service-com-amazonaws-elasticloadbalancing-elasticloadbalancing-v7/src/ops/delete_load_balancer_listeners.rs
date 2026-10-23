@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLoadBalancerListeners
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLoadBalancerListeners`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: removes the listeners on the requested load balancer ports from the
+//! named load balancer's stored record. A port the record does not configure is already
+//! in the state the caller asked for, so the call succeeds and changes nothing. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLoadBalancerListeners::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -131,18 +126,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLoadBalancerListeners` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLoadBalancerListenersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLoadBalancerListeners"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // `LoadBalancerPorts` is caller-sized, so it is walked ONCE into a set: the ports
+        // are deduplicated and the removal below is one pass over the stored listeners,
+        // costing O(listeners x log ports) rather than one scan per requested port.
+        let ports: ::std::collections::BTreeSet<i32> = input.load_balancer_ports.iter().copied().collect();
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for; a name no record holds there is the operation's one
+        // modelled failure.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                DeleteLoadBalancerListenersErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Deleting a port the record does not configure is a success that changes
+        // nothing: the operation's contract is that no listener is left on the named
+        // ports, and it models no not-found error for a listener. So a repeat of the same
+        // delete answers exactly as the first one did.
+        record
+            .listeners
+            .retain(|listener| !ports.contains(&listener.load_balancer_port));
+
+        // The model declares no output members: the answer is the empty
+        // `DeleteLoadBalancerListenersResult` plus the envelope's `ResponseMetadata`.
+        Ok(DeleteLoadBalancerListenersOutput::default())
     }
 }

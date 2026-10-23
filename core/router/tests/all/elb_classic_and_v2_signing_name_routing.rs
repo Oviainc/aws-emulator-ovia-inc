@@ -1,0 +1,560 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Classic Elastic Load Balancing and Elastic Load Balancing v2 are TWO emulated
+//! services behind ONE endpoint.
+//!
+//! Both models declare `endpointPrefix` / `arnNamespace` / `aws.auth#sigv4` name
+//! `elasticloadbalancing` (`smithy_query(query="service_info")` on either), differing only
+//! in `sdkId` and in the API version they declare (`2012-06-01` and `2015-12-01`), and
+//! every AWS SDK for either API signs that one name. With the generated signing-name claim
+//! on both, the router found TWO claimants for every Elastic Load Balancing request and
+//! answered `500 AmbiguousService` — a code that exists in no AWS model, in a JSON body an
+//! awsQuery client cannot parse — so neither API was reachable at all.
+//!
+//! The rules this suite pins:
+//!
+//! * a signing name shared by several emulated services resolves to EXACTLY ONE of them —
+//!   here the Classic model, whose own identity IS that name;
+//! * that front door serves its OWN API version: a request whose awsQuery envelope names
+//!   another version is refused `400 InvalidAction` (the action/version pair it cannot
+//!   resolve) rather than answered out of the wrong model's shapes — which matters because
+//!   TEN action names are declared by both models with different inputs and outputs;
+//! * the ELBv2 model stays reachable under the routing key that names IT
+//!   (`elasticloadbalancingv2`), by credential scope or by host label;
+//! * whatever the answer is, it is the serving model's own awsQuery XML and never a
+//!   router-level refusal.
+//!
+//! The rows run IN ORDER against one router over one engine, so a later row reads what an
+//! earlier one wrote: each API creates a load balancer and reads it back, which the
+//! ambiguity refusal made impossible — the request never reached a handler at all.
+//!
+//! This suite needs the WHOLE router: the ambiguity exists only when both services are
+//! mounted, so a single-service test cannot see it. Assembling the router costs stack
+//! (see `boot_serve.rs`), so it is built — and the requests driven — on an explicitly
+//! sized thread.
+
+use std::sync::Arc;
+
+use aws_emulator_router::{build_router, InMemoryEngine};
+
+/// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
+const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// The API version the Classic model declares.
+const CLASSIC_VERSION: &str = "2012-06-01";
+
+/// The API version the ELBv2 model declares.
+const V2_VERSION: &str = "2015-12-01";
+
+/// The region every signed request below is signed for.
+const REGION: &str = "us-east-1";
+
+/// How a request names the service it is for.
+#[derive(Debug, Clone, Copy)]
+enum Addressed {
+    /// A SigV4 credential scope naming this routing key — the signal the router reads
+    /// first, and what every AWS SDK sends.
+    Signed(&'static str),
+    /// A host-style endpoint and no credentials at all: the last routing signal, which an
+    /// anonymous request still carries.
+    Host(&'static str),
+}
+
+/// One call: how it is addressed, the awsQuery `Action` and `Version` it names, and what
+/// the ONE model that owns that pair must answer.
+struct Call {
+    case: &'static str,
+    addressed: Addressed,
+    action: &'static str,
+    /// The `Version` the envelope carries, or `None` to send no `Version` field at all.
+    version: Option<&'static str>,
+    /// The form parameters beyond `Action` and `Version`. Values are plain ASCII, so the
+    /// body needs no escaping.
+    params: &'static [(&'static str, &'static str)],
+    expected_status: u16,
+    /// The awsQuery `<Code>` the answer must carry, when the row pins one.
+    expected_code: Option<&'static str>,
+    /// Elements the answer must carry, for a row that pins WHAT was reported rather than
+    /// only the status.
+    expected_body_contains: &'static [&'static str],
+}
+
+#[test]
+fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
+    std::thread::Builder::new()
+        .name("elb-routing".to_string())
+        .stack_size(BOOT_STACK_SIZE)
+        .spawn(|| {
+            let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+            let mut router = build_router(engine);
+            router.set_request_authentication(false);
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime");
+
+            // The rows differ along all three axes that decide what answers: how the
+            // request is addressed (the shared signing name, the ELBv2 model's own key, a
+            // host-style endpoint instead of a credential scope), the `Version` it names
+            // (this model's, the other model's, none, and one neither declares), and the
+            // action — one only the Classic model declares, one only the ELBv2 model
+            // declares, and `CreateLoadBalancer`/`DescribeLoadBalancers`, which BOTH
+            // declare with different inputs and outputs.
+            let calls: [Call; 17] = [
+                Call {
+                    // The request the issue reports as `500 AmbiguousService`: a Classic
+                    // DescribeLoadBalancers on the shared signing name.
+                    case: "classic DescribeLoadBalancers with nothing created",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeLoadBalancers",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<DescribeLoadBalancersResponse",
+                        "<DescribeLoadBalancersResult>",
+                        "<LoadBalancerDescriptions",
+                    ],
+                },
+                Call {
+                    case: "classic CreateLoadBalancer",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "CreateLoadBalancer",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[
+                        ("LoadBalancerName", "router-classic-elb"),
+                        ("AvailabilityZones.member.1", "us-east-1a"),
+                        ("Listeners.member.1.Protocol", "HTTP"),
+                        ("Listeners.member.1.LoadBalancerPort", "80"),
+                        ("Listeners.member.1.InstancePort", "8080"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<DNSName>router-classic-elb-"],
+                },
+                Call {
+                    // …and the read back, which reports the record the create persisted.
+                    case: "classic DescribeLoadBalancers reads the created load balancer back",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeLoadBalancers",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[("LoadBalancerNames.member.1", "router-classic-elb")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<LoadBalancerName>router-classic-elb</LoadBalancerName>",
+                        "<LoadBalancerPort>80</LoadBalancerPort>",
+                    ],
+                },
+                Call {
+                    case: "classic ConfigureHealthCheck",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "ConfigureHealthCheck",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[
+                        ("LoadBalancerName", "router-classic-elb"),
+                        ("HealthCheck.Target", "HTTP:8080/health"),
+                        ("HealthCheck.Interval", "10"),
+                        ("HealthCheck.Timeout", "5"),
+                        ("HealthCheck.UnhealthyThreshold", "2"),
+                        ("HealthCheck.HealthyThreshold", "3"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<Target>HTTP:8080/health</Target>"],
+                },
+                Call {
+                    case: "classic DescribeLoadBalancerAttributes reports the defaults",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeLoadBalancerAttributes",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[("LoadBalancerName", "router-classic-elb")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<IdleTimeout>60</IdleTimeout>",
+                        "elb.http.desyncmitigationmode",
+                    ],
+                },
+                Call {
+                    case: "classic DeleteLoadBalancer",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DeleteLoadBalancer",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[("LoadBalancerName", "router-classic-elb")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<DeleteLoadBalancerResponse"],
+                },
+                Call {
+                    // The documented idempotent repeat: the model declares no error for
+                    // this operation, so deleting a name nothing holds succeeds too.
+                    case: "classic DeleteLoadBalancer repeated",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DeleteLoadBalancer",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[("LoadBalancerName", "router-classic-elb")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<DeleteLoadBalancerResponse"],
+                },
+                Call {
+                    // The ELBv2 model, addressed by the routing key that names IT: the
+                    // SAME action name as the Classic create above, with its own input
+                    // members and its own `<LoadBalancers>` output.
+                    case: "elbv2 CreateLoadBalancer addressed by the ELBv2 key",
+                    addressed: Addressed::Signed("elasticloadbalancingv2"),
+                    action: "CreateLoadBalancer",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-v2-elb"),
+                        ("Subnets.member.1", "subnet-12345678"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<CreateLoadBalancerResponse",
+                        "<LoadBalancers>",
+                        "<LoadBalancerName>router-v2-elb</LoadBalancerName>",
+                    ],
+                },
+                Call {
+                    case: "elbv2 CreateTargetGroup addressed by the ELBv2 key",
+                    addressed: Addressed::Signed("elasticloadbalancingv2"),
+                    action: "CreateTargetGroup",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-v2-tg"),
+                        ("Protocol", "HTTP"),
+                        ("Port", "80"),
+                        ("VpcId", "vpc-12345678"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<TargetGroupName>router-v2-tg</TargetGroupName>"],
+                },
+                Call {
+                    // The target group the previous row created, read back: the ELBv2
+                    // model is not just reachable, it is serving its own state.
+                    case: "elbv2 DescribeTargetGroups reads the created target group back",
+                    addressed: Addressed::Signed("elasticloadbalancingv2"),
+                    action: "DescribeTargetGroups",
+                    version: Some(V2_VERSION),
+                    params: &[("Names.member.1", "router-v2-tg")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<TargetGroupName>router-v2-tg</TargetGroupName>",
+                        "<VpcId>vpc-12345678</VpcId>",
+                    ],
+                },
+                Call {
+                    // The ELBv2 load balancer created above: the same action name as the
+                    // Classic describe, answered from the OTHER model's shapes.
+                    case: "elbv2 DescribeLoadBalancers addressed by the ELBv2 key",
+                    addressed: Addressed::Signed("elasticloadbalancingv2"),
+                    action: "DescribeLoadBalancers",
+                    version: Some(V2_VERSION),
+                    params: &[("Names.member.1", "router-v2-elb")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<LoadBalancerName>router-v2-elb</LoadBalancerName>",
+                        "<LoadBalancerArn>",
+                    ],
+                },
+                Call {
+                    // An anonymous request addressed at the ELBv2 host: the routing key
+                    // comes from the host label instead of a credential scope, and reaches
+                    // that model too.
+                    case: "elbv2 DescribeTargetGroups addressed by host",
+                    addressed: Addressed::Host("elasticloadbalancingv2.us-east-1.amazonaws.com"),
+                    action: "DescribeTargetGroups",
+                    version: Some(V2_VERSION),
+                    params: &[("Names.member.1", "router-v2-tg")],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<TargetGroupName>router-v2-tg</TargetGroupName>"],
+                },
+                Call {
+                    // An anonymous request addressed at the Elastic Load Balancing
+                    // endpoint host: the routing key comes from the host label instead of
+                    // a credential scope, and must still resolve to the one owner.
+                    case: "classic DescribeLoadBalancers addressed by host",
+                    addressed: Addressed::Host("elasticloadbalancing.us-east-1.amazonaws.com"),
+                    action: "DescribeLoadBalancers",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<DescribeLoadBalancersResponse"],
+                },
+                Call {
+                    // The ELBv2 API version on the SHARED name: this front door serves the
+                    // 2012-06-01 API, and `CreateLoadBalancer` is one of the ten action
+                    // names both models declare — so the pair is refused rather than
+                    // answered out of the wrong model's shapes.
+                    case: "the ELBv2 API version on the shared signing name",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "CreateLoadBalancer",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-wrong-version"),
+                        ("Subnets.member.1", "subnet-12345678"),
+                    ],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    expected_body_contains: &["<ErrorResponse", V2_VERSION],
+                },
+                Call {
+                    // No `Version` at all, naming an action only the ELBv2 model declares:
+                    // the owner of the key has no such operation, so its own routing
+                    // refusal answers — in its awsQuery envelope, not the router's JSON.
+                    case: "an ELBv2-only action on the shared name with no Version field",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetGroups",
+                    version: None,
+                    params: &[("Names.member.1", "router-v2-tg")],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    expected_body_contains: &["<ErrorResponse"],
+                },
+                Call {
+                    // A Classic action asked for at the ELBv2 version: refused on the
+                    // version, naming the pair, rather than served as if it had named
+                    // this model's.
+                    case: "a Classic-only action at the ELBv2 version",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "ConfigureHealthCheck",
+                    version: Some(V2_VERSION),
+                    params: &[("LoadBalancerName", "router-classic-elb")],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    expected_body_contains: &["<ErrorResponse", "ConfigureHealthCheck"],
+                },
+                Call {
+                    // A version no Elastic Load Balancing model declares: refused the same
+                    // way, naming the pair it could not resolve.
+                    case: "an API version neither model declares",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeLoadBalancers",
+                    version: Some("2099-01-01"),
+                    params: &[],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    expected_body_contains: &["<ErrorResponse", "2099-01-01"],
+                },
+            ];
+
+            for call in calls {
+                let mut body = format!("Action={}", call.action);
+                if let Some(version) = call.version {
+                    body.push_str(&format!("&Version={version}"));
+                }
+                for (name, value) in call.params {
+                    body.push_str(&format!("&{name}={value}"));
+                }
+                let mut builder = http::Request::builder()
+                    .method("POST")
+                    .uri("http://localhost/")
+                    .header("content-type", "application/x-www-form-urlencoded");
+                builder = match call.addressed {
+                    Addressed::Signed(signing_name) => builder
+                        .header("host", "localhost")
+                        .header("authorization", authorization(signing_name)),
+                    Addressed::Host(host) => builder.header("host", host),
+                };
+                let request = builder
+                    .body(bytes::Bytes::from(body))
+                    .expect("a well-formed request");
+                let response = runtime.block_on(router.dispatch(request));
+                let status = response.status().as_u16();
+                let rendered = String::from_utf8_lossy(response.body()).to_string();
+                let case = call.case;
+
+                // Neither routing failure may happen: `AmbiguousService` (500, several
+                // claimants) nor `UnknownService` (404, none).
+                assert!(
+                    !rendered.contains("AmbiguousService") && !rendered.contains("UnknownService"),
+                    "case {case:?}: the request must reach exactly one service, got \
+                     {status} with {rendered}"
+                );
+                // Whatever the answer is, it is an awsQuery envelope — XML, which a
+                // query-protocol client can parse — and never the router's JSON `__type`
+                // document.
+                assert!(
+                    rendered.trim_start().starts_with('<') && !rendered.contains("__type"),
+                    "case {case:?}: an awsQuery client must get XML, got {status} with \
+                     {rendered}"
+                );
+                assert_eq!(
+                    status, call.expected_status,
+                    "case {case:?}: the owning model must answer HTTP {}, got {status} \
+                     with {rendered}",
+                    call.expected_status
+                );
+                if let Some(expected) = call.expected_code {
+                    let code = rendered
+                        .split_once("<Code>")
+                        .and_then(|(_, rest)| rest.split_once("</Code>"))
+                        .map(|(code, _)| code.to_string());
+                    assert_eq!(
+                        code.as_deref(),
+                        Some(expected),
+                        "case {case:?}: expected the error code {expected}, got {status} \
+                         with {rendered}"
+                    );
+                }
+                for expected in call.expected_body_contains {
+                    assert!(
+                        rendered.contains(expected),
+                        "case {case:?}: expected {expected:?} in the owning model's \
+                         answer, got {status} with {rendered}"
+                    );
+                }
+            }
+        })
+        .expect("spawn the routing thread")
+        .join()
+        .expect("Classic Elastic Load Balancing and ELBv2 must route apart");
+}
+
+/// The SigV4 `Authorization` header of a request signed for `signing_name`, as every AWS
+/// SDK sends it. The signature is never checked: the claim predicate reads only the
+/// credential scope.
+fn authorization(signing_name: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
+         SignedHeaders=host, Signature=not-verified"
+    )
+}
+
+/// How a row of the claim table below names the service it is for.
+#[derive(Debug, Clone, Copy)]
+enum Claiming {
+    /// A SigV4 `Authorization` scope naming this routing key.
+    Signed(&'static str),
+    /// A presigned URL's `X-Amz-Credential` query parameter naming `elasticloadbalancing`.
+    Presigned,
+    /// No credentials at all, so the `Host` label resolves the key.
+    Anonymous,
+}
+
+/// The claim table, one layer BELOW the dispatch table above: it asks each service's
+/// [`smithy_server_runtime::Service::can_handle`] directly, so a row pins both that the
+/// right service claims a request and that NO other does — the condition the router turns
+/// into `500 AmbiguousService` when it fails.
+///
+/// Every awsQuery request is `POST /`: neither model binds a `smithy.api#http` trait, so
+/// the path carries no discriminator and the route key decides alone. The rows span the
+/// three signals that resolve it, both keys, and a `Host` that agrees with, disagrees with
+/// or says nothing about the target.
+#[test]
+fn exactly_one_service_claims_each_request_for_the_elasticloadbalancing_key() {
+    use smithy_server_runtime::Service;
+
+    let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+    let classic =
+        service_com_amazonaws_elasticloadbalancing_elasticloadbalancing_v7::EmulatedService::new(
+            Arc::clone(&engine),
+        );
+    let v2 =
+        service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(
+            engine,
+        );
+
+    /// A presigned credential scope naming the shared signing name, with its `/`
+    /// separators encoded.
+    const PRESIGNED: &str =
+        "X-Amz-Credential=AKIDEXAMPLE%2F20260101%2Fus-east-1%2Felasticloadbalancing%2Faws4_request";
+
+    // (case, how the request is addressed, its Host, the services that must claim it, by
+    // routing key)
+    let rows: [(&str, Claiming, &str, &[&str]); 8] = [
+        (
+            "a signed request on the Elastic Load Balancing host",
+            Claiming::Signed("elasticloadbalancing"),
+            "elasticloadbalancing.us-east-1.amazonaws.com",
+            &["elasticloadbalancing"],
+        ),
+        (
+            "a signed request on a bare emulator endpoint",
+            Claiming::Signed("elasticloadbalancing"),
+            "localhost:9297",
+            &["elasticloadbalancing"],
+        ),
+        (
+            "a presigned request in the query string",
+            Claiming::Presigned,
+            "elasticloadbalancing.eu-west-2.amazonaws.com",
+            &["elasticloadbalancing"],
+        ),
+        (
+            "an anonymous request addressed to the Elastic Load Balancing host",
+            Claiming::Anonymous,
+            "elasticloadbalancing.us-east-1.amazonaws.com",
+            &["elasticloadbalancing"],
+        ),
+        (
+            "a request signed for the ELBv2 model's own key",
+            Claiming::Signed("elasticloadbalancingv2"),
+            "elasticloadbalancing.us-east-1.amazonaws.com",
+            &["elasticloadbalancingv2"],
+        ),
+        (
+            "an anonymous request addressed to the ELBv2 host",
+            Claiming::Anonymous,
+            "elasticloadbalancingv2.us-east-1.amazonaws.com",
+            &["elasticloadbalancingv2"],
+        ),
+        (
+            // The scope decides, not the host: a request signed for the shared name on
+            // the ELBv2 host is the Classic front door's.
+            "a signed request on the ELBv2 host: the scope decides",
+            Claiming::Signed("elasticloadbalancing"),
+            "elasticloadbalancingv2.us-east-1.amazonaws.com",
+            &["elasticloadbalancing"],
+        ),
+        (
+            // Claimed by neither, which is the router's `404 UnknownService` and NOT an
+            // ambiguity.
+            "an anonymous request addressed to an unrelated host",
+            Claiming::Anonymous,
+            "sqs.us-east-1.amazonaws.com",
+            &[],
+        ),
+    ];
+
+    for (case, claiming, host, expected) in rows {
+        let uri = match claiming {
+            Claiming::Presigned => format!("/?{PRESIGNED}"),
+            _ => "/".to_string(),
+        };
+        let mut builder = http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", host);
+        if let Claiming::Signed(signing_name) = claiming {
+            builder = builder.header("authorization", authorization(signing_name));
+        }
+        let parts = builder
+            .body(bytes::Bytes::new())
+            .expect("a well-formed request")
+            .into_parts()
+            .0;
+        let claimants: Vec<&str> = [
+            ("elasticloadbalancing", classic.can_handle(&parts)),
+            ("elasticloadbalancingv2", v2.can_handle(&parts)),
+        ]
+        .into_iter()
+        .filter_map(|(key, claimed)| claimed.then_some(key))
+        .collect();
+        assert_eq!(
+            claimants,
+            expected.to_vec(),
+            "case {case:?} (POST / to host {host}, {claiming:?}): expected it to be \
+             claimed by exactly {expected:?}, got {claimants:?}"
+        );
+    }
+}

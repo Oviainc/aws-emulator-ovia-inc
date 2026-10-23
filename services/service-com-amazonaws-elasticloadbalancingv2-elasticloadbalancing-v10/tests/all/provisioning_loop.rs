@@ -104,14 +104,22 @@ async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply 
         .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
         .collect::<Vec<_>>()
         .join("&");
+    // Signed for this model's OWN routing key, which is what addresses it directly: the
+    // `elasticloadbalancing` signing name both Elastic Load Balancing models declare is
+    // claimed by the Classic front door (see `src/service.rs`'s `ROUTE_KEY`), which
+    // serves this model's operations for a `Version=2015-12-01` envelope. This suite
+    // mounts this service ALONE, so it addresses it by its own key; that the shared name
+    // reaches these same operations is pinned in
+    // `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs`, which needs
+    // both services mounted.
     let request = http::Request::builder()
         .method("POST")
-        .uri("https://elasticloadbalancing.us-west-2.amazonaws.com/")
+        .uri("https://elasticloadbalancingv2.us-west-2.amazonaws.com/")
         .header("content-type", "application/x-www-form-urlencoded")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/elasticloadbalancing/aws4_request, SignedHeaders=host, Signature=0000"
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/elasticloadbalancingv2/aws4_request, SignedHeaders=host, Signature=0000"
             ),
         )
         .body(bytes::Bytes::from(body))

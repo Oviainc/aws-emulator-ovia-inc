@@ -147,6 +147,92 @@ pub struct ListenerEntry {
     pub policy_names: Vec<String>,
 }
 
+impl ListenerEntry {
+    /// Whether `other` asks for the SAME listener this one already configures.
+    ///
+    /// The comparison is the one `DuplicateListenerException` is stated over — "A
+    /// listener already exists for the specified load balancer name and port, but with a
+    /// different instance port, protocol, or SSL certificate" — so a request that repeats
+    /// a configured listener exactly is a no-op rather than a conflict, and one that
+    /// differs in any of those is the conflict that error names. `policy_names` is not
+    /// part of it: a listener's policies are set by other operations, not by the create.
+    pub fn configures_the_same(&self, other: &Self) -> bool {
+        self.protocol == other.protocol
+            && self.load_balancer_port == other.load_balancer_port
+            && self.instance_protocol == other.instance_protocol
+            && self.instance_port == other.instance_port
+            && self.ssl_certificate_id == other.ssl_certificate_id
+    }
+}
+
+/// Why a requested listener cannot be stored. Each variant is one rule the model states;
+/// the OPERATION maps it onto the modelled error it declares for that rule, because the
+/// two operations that create listeners declare different error sets.
+#[derive(Debug, Clone)]
+pub enum ListenerRejection {
+    /// A `Protocol`/`InstanceProtocol` outside [`LISTENER_PROTOCOLS`].
+    UnsupportedProtocol { protocol: String },
+    /// A back-end protocol from the other transport family than the front-end one.
+    IncompatibleProtocols {
+        protocol: String,
+        instance_protocol: String,
+    },
+}
+
+/// Project one requested listener onto the record this service stores, applying the two
+/// rules the model states over a listener's protocols.
+///
+/// `instance_protocol` of `None` takes the documented default ("The protocol to use for
+/// routing traffic to instances" defaults to the front-end protocol), and both protocols
+/// are stored upper-cased, the spelling the model's own documentation and
+/// `DescribeLoadBalancers` use.
+pub fn listener_entry(
+    protocol: &str,
+    load_balancer_port: i32,
+    instance_protocol: Option<&str>,
+    instance_port: i32,
+    ssl_certificate_id: Option<&str>,
+) -> Result<ListenerEntry, ListenerRejection> {
+    let protocol = protocol.to_ascii_uppercase();
+    let instance_protocol =
+        instance_protocol.map_or_else(|| protocol.clone(), str::to_ascii_uppercase);
+
+    for candidate in [&protocol, &instance_protocol] {
+        if !LISTENER_PROTOCOLS.contains(&candidate.as_str()) {
+            return Err(ListenerRejection::UnsupportedProtocol {
+                protocol: candidate.clone(),
+            });
+        }
+    }
+    // From `Listener$InstanceProtocol`: "If the front-end protocol is TCP or SSL, the
+    // back-end protocol must be TCP or SSL. If the front-end protocol is HTTP or HTTPS,
+    // the back-end protocol must be HTTP or HTTPS."
+    if transport_family(&protocol) != transport_family(&instance_protocol) {
+        return Err(ListenerRejection::IncompatibleProtocols {
+            protocol,
+            instance_protocol,
+        });
+    }
+
+    Ok(ListenerEntry {
+        protocol,
+        load_balancer_port,
+        instance_protocol,
+        instance_port,
+        ssl_certificate_id: ssl_certificate_id.map(str::to_string),
+        policy_names: Vec::new(),
+    })
+}
+
+/// `HTTP`/`HTTPS` and `TCP`/`SSL` are the two families the model's compatibility rule is
+/// stated over; a secure protocol belongs to the same family as its plain peer.
+fn transport_family(protocol: &str) -> &'static str {
+    match protocol {
+        "HTTP" | "HTTPS" => "http",
+        _ => "tcp",
+    }
+}
+
 /// A load balancer's health-check configuration.
 ///
 /// Seeded at create with the Classic Load Balancer defaults so
@@ -175,6 +261,114 @@ impl HealthCheckConfig {
     }
 }
 
+/// The idle connection timeout, in seconds, of a load balancer nobody has modified.
+///
+/// From `LoadBalancerAttributes$ConnectionSettings`' own documentation: "By default,
+/// Elastic Load Balancing maintains a 60-second idle connection timeout for both
+/// front-end and back-end connections of your load balancer."
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: i32 = 60;
+
+/// The `ConnectionSettings$IdleTimeout` bounds, which the model declares as
+/// `@range(min: 1, max: 3600)`.
+pub const IDLE_TIMEOUT_SECONDS: (i32, i32) = (1, 3600);
+
+/// Whether connection draining is enabled on a load balancer nobody has modified, from
+/// `ConnectionDraining$Enabled`'s modelled `@default(false)`.
+pub const DEFAULT_CONNECTION_DRAINING_ENABLED: bool = false;
+
+/// The connection-draining timeout, in seconds, of a load balancer nobody has modified.
+///
+/// "The default timeout is 300 seconds" — the "Configure Connection Draining for Your
+/// Classic Load Balancer" page of the Classic Load Balancers Guide, which
+/// `ConnectionDraining`'s documentation links to. The value is AWS's, not one this
+/// emulator chose. Whether draining is ON by default is a separate question, answered by
+/// [`DEFAULT_CONNECTION_DRAINING_ENABLED`] from the model's own `@default(false)`.
+pub const DEFAULT_CONNECTION_DRAINING_TIMEOUT_SECONDS: i32 = 300;
+
+/// The `ConnectionDraining$Timeout` bounds. The model declares no range for the member,
+/// so these are the bounds the same guide publishes ("a value between 1 and 3,600
+/// seconds").
+pub const CONNECTION_DRAINING_TIMEOUT_SECONDS: (i32, i32) = (1, 3600);
+
+/// The access-log publishing interval, in minutes, of a load balancer nobody has
+/// modified. From `AccessLog$EmitInterval`: "Default: 60 minutes".
+pub const DEFAULT_ACCESS_LOG_EMIT_INTERVAL_MINUTES: i32 = 60;
+
+/// The only two intervals `AccessLog$EmitInterval` accepts: "You can specify an interval
+/// of either 5 minutes or 60 minutes."
+pub const ACCESS_LOG_EMIT_INTERVALS_MINUTES: &[i32] = &[5, 60];
+
+/// The one additional attribute this service documents, from
+/// `AdditionalAttribute$Key`: "`elb.http.desyncmitigationmode` - Determines how the load
+/// balancer handles requests that might pose a security risk to your application."
+pub const DESYNC_MITIGATION_MODE_KEY: &str = "elb.http.desyncmitigationmode";
+
+/// Its accepted values, from the same sentence: "The possible values are `monitor`,
+/// `defensive`, and `strictest`."
+pub const DESYNC_MITIGATION_MODES: &[&str] = &["monitor", "defensive", "strictest"];
+
+/// Its value on a load balancer nobody has modified: "The default is `defensive`."
+pub const DEFAULT_DESYNC_MITIGATION_MODE: &str = "defensive";
+
+/// A load balancer's `AccessLog` attribute.
+#[derive(Debug, Clone)]
+pub struct AccessLogConfig {
+    pub enabled: bool,
+    pub emit_interval_minutes: i32,
+    pub s3_bucket_name: Option<String>,
+    pub s3_bucket_prefix: Option<String>,
+}
+
+/// A load balancer's `ConnectionDraining` attribute.
+#[derive(Debug, Clone)]
+pub struct ConnectionDrainingConfig {
+    pub enabled: bool,
+    pub timeout_seconds: i32,
+}
+
+/// The attributes of one load balancer: every member
+/// `DescribeLoadBalancerAttributes` reports and `ModifyLoadBalancerAttributes` writes.
+///
+/// Seeded at create with the service defaults, so a freshly created load balancer
+/// reports the same attribute set AWS reports for one — rather than an empty document —
+/// and a modification of one attribute leaves the others at whatever they held.
+#[derive(Debug, Clone)]
+pub struct AttributeConfig {
+    pub cross_zone_load_balancing_enabled: bool,
+    pub access_log: AccessLogConfig,
+    pub connection_draining: ConnectionDrainingConfig,
+    pub idle_timeout_seconds: i32,
+    /// The `AdditionalAttributes` entries, keyed so one key holds one value and the list
+    /// is reported in a stable order. Bounded by the member's modelled `@length(max: 10)`.
+    pub additional: BTreeMap<String, String>,
+}
+
+impl Default for AttributeConfig {
+    /// The attributes of a load balancer nobody has modified.
+    fn default() -> Self {
+        Self {
+            // `CrossZoneLoadBalancing$Enabled` is modelled `@default(false)`.
+            cross_zone_load_balancing_enabled: false,
+            access_log: AccessLogConfig {
+                // `AccessLog$Enabled` is modelled `@default(false)`.
+                enabled: false,
+                emit_interval_minutes: DEFAULT_ACCESS_LOG_EMIT_INTERVAL_MINUTES,
+                s3_bucket_name: None,
+                s3_bucket_prefix: None,
+            },
+            connection_draining: ConnectionDrainingConfig {
+                enabled: DEFAULT_CONNECTION_DRAINING_ENABLED,
+                timeout_seconds: DEFAULT_CONNECTION_DRAINING_TIMEOUT_SECONDS,
+            },
+            idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
+            additional: BTreeMap::from([(
+                DESYNC_MITIGATION_MODE_KEY.to_string(),
+                DEFAULT_DESYNC_MITIGATION_MODE.to_string(),
+            )]),
+        }
+    }
+}
+
 /// One Classic load balancer, as persisted by `CreateLoadBalancer` and read back by
 /// every other operation.
 #[derive(Debug, Clone)]
@@ -195,6 +389,9 @@ pub struct LoadBalancer {
     /// [`MAX_INSTANCES_PER_LOAD_BALANCER`].
     pub instances: InstanceSet,
     pub health_check: HealthCheckConfig,
+    /// The modifiable attributes `DescribeLoadBalancerAttributes` reports and
+    /// `ModifyLoadBalancerAttributes` writes, seeded with the service defaults.
+    pub attributes: AttributeConfig,
     pub tags: BTreeMap<String, String>,
 }
 

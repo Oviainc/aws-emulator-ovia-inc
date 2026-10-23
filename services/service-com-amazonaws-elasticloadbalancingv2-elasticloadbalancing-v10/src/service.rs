@@ -45,6 +45,33 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The routing key that names THIS service, as opposed to the endpoint prefix and SigV4
+/// signing name it SHARES with the Classic Elastic Load Balancing model.
+///
+/// Elastic Load Balancing publishes ONE endpoint for two APIs: this model
+/// (`sdkId: Elastic Load Balancing v2`, version `2015-12-01`) and the Classic model
+/// (`sdkId: Elastic Load Balancing`, version `2012-06-01`,
+/// `services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7`) both
+/// declare `endpointPrefix` / `arnNamespace` / `aws.auth#sigv4` name
+/// `elasticloadbalancing` (`smithy_query(query="service_info")` on either model). With
+/// the generated signing-name claim on both, every Elastic Load Balancing request was
+/// claimed twice and the router answered it `500 AmbiguousService` — a code no AWS model
+/// carries, in a JSON body an awsQuery client cannot parse — leaving BOTH APIs
+/// unreachable.
+///
+/// The shared name resolves to the ONE service whose own identity is that name: the
+/// Classic model. That is not a lost operation for this one: an awsQuery envelope names
+/// the API version it is for, so the Classic front door serves a `Version=2015-12-01`
+/// request from THIS model, over the one shared engine (see that crate's
+/// `src/service/api_version.rs`) — which is how AWS resolves the two APIs on their shared
+/// endpoint too. So an AWS SDK ELBv2 client, which signs `elasticloadbalancing`, reaches
+/// these operations exactly as it does against AWS.
+///
+/// This key is what addresses this model DIRECTLY, without the shared front door: the
+/// prefix derived from its own `sdkId`, as a credential scope or a host label. The
+/// routing table is `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs`.
+const ROUTE_KEY: &str = "elasticloadbalancingv2";
+
 /// The `com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,11 +101,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // The model does not express this service's identity: its signing name is
+        // `elasticloadbalancing`, the endpoint prefix it shares with the Classic Elastic
+        // Load Balancing model, so matching on the signing name alone claims that
+        // model's traffic too and the router refuses both with `500 AmbiguousService`.
+        // Claim only a request whose routing key names THIS service (see [`ROUTE_KEY`]);
+        // the shared `elasticloadbalancing` name belongs to the Classic front door, which
+        // serves this model's operations for an envelope naming this model's API version.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) => key == ROUTE_KEY,
             None => false,
         }
     }

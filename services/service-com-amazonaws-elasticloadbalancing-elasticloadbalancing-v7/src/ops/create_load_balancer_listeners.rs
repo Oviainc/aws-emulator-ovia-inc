@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoadBalancerListeners
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoadBalancerListeners`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: adds the requested listeners to the named load balancer's stored record
+//! — a port it does not configure yet is created, a port it already configures the same
+//! way is left alone, and one it configures differently is the modelled conflict. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoadBalancerListeners::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoadBalancerListeners` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoadBalancerListenersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancerListeners"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // Bound the caller-driven work before any of it runs: one load balancer holds at
+        // most this many listeners, so a longer list cannot be satisfied anyway.
+        if input.listeners.len() > crate::state::MAX_LISTENERS_PER_LOAD_BALANCER {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Listeners must carry at most {} listeners; got {}",
+                crate::state::MAX_LISTENERS_PER_LOAD_BALANCER,
+                input.listeners.len()
+            )));
+        }
+
+        // Project every requested listener FIRST, so a request that breaks one of the
+        // model's listener rules is refused before anything is stored.
+        let mut claimed_ports: ::std::collections::BTreeSet<i32> =
+            ::std::collections::BTreeSet::new();
+        let mut requested: Vec<crate::state::ListenerEntry> =
+            Vec::with_capacity(input.listeners.len());
+        for listener in &input.listeners {
+            let entry = crate::state::listener_entry(
+                &listener.protocol,
+                listener.load_balancer_port,
+                listener.instance_protocol.as_deref(),
+                listener.instance_port,
+                listener.ssl_certificate_id.as_deref(),
+            )
+            .map_err(rejected)?;
+            // A listener is keyed by its load balancer port, so one request cannot name
+            // one port twice: the set answers that in O(log n) per listener.
+            if !claimed_ports.insert(listener.load_balancer_port) {
+                return Err(
+                    CreateLoadBalancerListenersErrorModeled::InvalidConfigurationRequestException(
+                        InvalidConfigurationRequestException {
+                            message: Some(format!(
+                                "LoadBalancerPort {} is claimed by more than one listener",
+                                listener.load_balancer_port
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            requested.push(entry);
+        }
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                CreateLoadBalancerListenersErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Decide the whole request against the stored set before changing any of it, so
+        // a conflict on the second listener does not leave the first one added: "If a
+        // listener with the specified port does not already exist, it is created;
+        // otherwise, the properties of the new listener must match the properties of the
+        // existing listener."
+        let mut additions: Vec<crate::state::ListenerEntry> = Vec::new();
+        for entry in requested {
+            match record
+                .listeners
+                .iter()
+                .find(|held| held.load_balancer_port == entry.load_balancer_port)
+            {
+                Some(held) if held.configures_the_same(&entry) => {}
+                Some(held) => {
+                    return Err(
+                        CreateLoadBalancerListenersErrorModeled::DuplicateListenerException(
+                            DuplicateListenerException {
+                                message: Some(format!(
+                                    "A listener already exists for {} on LoadBalancerPort {}, \
+                                     but with Protocol {}, InstanceProtocol {} and \
+                                     InstancePort {}",
+                                    input.load_balancer_name,
+                                    held.load_balancer_port,
+                                    held.protocol,
+                                    held.instance_protocol,
+                                    held.instance_port,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                None => additions.push(entry),
+            }
+        }
+        if record.listeners.len() + additions.len()
+            > crate::state::MAX_LISTENERS_PER_LOAD_BALANCER
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "a load balancer holds at most {} listeners; {} already configured and {} \
+                 more were requested",
+                crate::state::MAX_LISTENERS_PER_LOAD_BALANCER,
+                record.listeners.len(),
+                additions.len()
+            )));
+        }
+        record.listeners.extend(additions);
+
+        // The model declares no output members: the answer is the empty
+        // `CreateLoadBalancerListenersResult` plus the envelope's `ResponseMetadata`.
+        Ok(CreateLoadBalancerListenersOutput::default())
+    }
+}
+
+/// This operation's wording for a listener the model's own rules rule out, in the errors
+/// it declares: `UnsupportedProtocolException` (400) for the protocol set and
+/// `InvalidConfigurationRequestException` (409) for the front-end/back-end pairing.
+fn rejected(rejection: crate::state::ListenerRejection) -> CreateLoadBalancerListenersError {
+    match rejection {
+        crate::state::ListenerRejection::UnsupportedProtocol { protocol } => {
+            CreateLoadBalancerListenersErrorModeled::UnsupportedProtocolException(
+                UnsupportedProtocolException {
+                    message: Some(format!(
+                        "Protocol must be one of {:?}; got '{protocol}'",
+                        crate::state::LISTENER_PROTOCOLS
+                    )),
+                },
+            )
+            .into()
+        }
+        crate::state::ListenerRejection::IncompatibleProtocols {
+            protocol,
+            instance_protocol,
+        } => CreateLoadBalancerListenersErrorModeled::InvalidConfigurationRequestException(
+            InvalidConfigurationRequestException {
+                message: Some(format!(
+                    "InstanceProtocol '{instance_protocol}' is not compatible with \
+                     Protocol '{protocol}'"
+                )),
+            },
+        )
+        .into(),
     }
 }

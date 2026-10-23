@@ -39,7 +39,16 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One of those seams is taken here, for ONE reason: this service's signing name is the
+//! endpoint prefix it SHARES with the ELBv2 model, so neither the claim nor the operation
+//! lookup can come from the model alone. [`api_version`] carries that whole rule — which
+//! API version the request's awsQuery envelope names, and what this front door does with
+//! an envelope naming another one.
 
+pub mod api_version;
+
+use api_version::UnsupportedApiVersionOperation;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -52,6 +61,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The refusal served for an envelope naming an API version this model does not
+    /// declare. Held in a field, built once, because `override_operation` hands back a
+    /// reference borrowed from `&self`.
+    unsupported_api_version: UnsupportedApiVersionOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +74,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            unsupported_api_version: UnsupportedApiVersionOperation,
         }
     }
 }
@@ -74,9 +88,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // Claim a request whose resolved route key is this service's signing name,
+        // `elasticloadbalancing`.
+        //
+        // That key is SHARED: the ELBv2 model
+        // (`services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10`)
+        // publishes the same `endpointPrefix`, `arnNamespace` and `aws.auth#sigv4` name,
+        // and every AWS SDK for either API signs it — nothing in a request's headers or
+        // URI tells the two apart, so the key must resolve to exactly ONE service. THIS
+        // service owns it: its own identity IS that name (`sdkId: Elastic Load
+        // Balancing`, `docId: elasticloadbalancing-2012-06-01`), while the other model's
+        // is `Elastic Load Balancing v2`, which claims its own `elasticloadbalancingv2`
+        // key. An envelope naming THAT model's API version is refused here rather than
+        // answered out of this model's 2012-06-01 shapes (see [`api_version`]).
+        //
+        // Before this, both services claimed the key and the router answered every
+        // Elastic Load Balancing request `500 AmbiguousService` — a code no AWS model
+        // carries, in a JSON body an awsQuery client cannot parse. The claim table is
+        // `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs`.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
@@ -87,11 +116,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // The ONE routing decision the model's key cannot make: an awsQuery envelope
+        // names the API version it is for alongside the action, and the framework's
+        // routing key reads the action alone — which matters here because TEN action
+        // names are declared by this model AND by the ELBv2 model with different inputs
+        // and outputs. A request naming a version this model does not declare is refused
+        // rather than served as if it had named this one; the rule, and what it means for
+        // the ELBv2 model, is in [`api_version`].
+        if !api_version::serves_requested_version(req) {
+            return Some(&self.unsupported_api_version);
+        }
+        // Every other request resolves through the generated routing table, and an
+        // `Action` naming no modelled operation is the framework's own `400
+        // InvalidAction` in this service's envelope.
         None
     }
 

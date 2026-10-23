@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureHealthCheck
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfigureHealthCheck`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfigureHealthCheck::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the requested health check onto the named load balancer's stored
+//! record and answers the configuration that record now holds. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +131,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfigureHealthCheck` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfigureHealthCheckErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfigureHealthCheck"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models only a not-found error, and a 501 would claim "not
+            // implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+        let requested = &input.health_check;
+
+        // Each member's own range is modelled (`Interval` 5..300, `Timeout` 2..60, both
+        // thresholds 2..10), so the boundary validator has already refused a value
+        // outside one. The RELATION between two of them is documented rather than
+        // modelled — `HealthCheck$Timeout`: "This value must be less than the Interval
+        // value" — so it is refused here, naming both values the caller sent.
+        if requested.timeout >= requested.interval {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "HealthCheck.Timeout ({}) must be less than HealthCheck.Interval ({})",
+                requested.timeout, requested.interval
+            )));
+        }
+        if let Err(why) = target_rejection(&requested.target) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        let accepted = crate::state::HealthCheckConfig {
+            target: requested.target.clone(),
+            interval: requested.interval,
+            timeout: requested.timeout,
+            unhealthy_threshold: requested.unhealthy_threshold,
+            healthy_threshold: requested.healthy_threshold,
+        };
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for; a name no record holds there is the operation's one
+        // modelled failure.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                ConfigureHealthCheckErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        record.health_check = accepted;
+        // Answered from the STORED record, so what the caller reads back is what a later
+        // `DescribeLoadBalancers` reports for the same load balancer.
+        let stored = record.health_check.clone();
+
+        Ok(ConfigureHealthCheckOutput {
+            health_check: Some(HealthCheck {
+                target: stored.target,
+                interval: stored.interval,
+                timeout: stored.timeout,
+                unhealthy_threshold: stored.unhealthy_threshold,
+                healthy_threshold: stored.healthy_threshold,
+            }),
+        })
+    }
+}
+
+/// The protocols a health-check target may name, from `HealthCheck$Target`: "The protocol
+/// is either TCP, HTTP, HTTPS, or SSL."
+const TARGET_PROTOCOLS: &[&str] = &["TCP", "SSL", "HTTP", "HTTPS"];
+
+/// The ports a health-check target may name, from the same paragraph: "The range of valid
+/// ports is one (1) through 65535."
+const TARGET_PORTS: (i32, i32) = (1, 65535);
+
+/// The longest HTTP/HTTPS target: "The total length of the HTTP ping target must be 1024
+/// 16-bit Unicode characters or less."
+const MAX_HTTP_TARGET_CHARS: usize = 1024;
+
+/// Why `target` is not a health-check target, or `Ok(())` when it is one.
+///
+/// `HealthCheckTarget` is a plain string in the model, so its grammar is documented
+/// rather than modelled and nothing has refused a malformed one before this handler runs:
+/// "TCP is the default, specified as a TCP: port pair, for example \"TCP:5000\"… SSL is
+/// also specified as SSL: port pair… For HTTP/HTTPS, you must include a ping path in the
+/// string… for example \"HTTP:80/weather/us/wa/seattle\"". The message names the member
+/// and the rule it broke, which is what a caller fixes the request from.
+fn target_rejection(target: &str) -> Result<(), String> {
+    let Some((protocol, rest)) = target.split_once(':') else {
+        return Err(format!(
+            "HealthCheck.Target must be '<protocol>:<port>' for TCP and SSL or \
+             '<protocol>:<port>/<path>' for HTTP and HTTPS, with the protocol one of \
+             {TARGET_PROTOCOLS:?}; got '{target}'"
+        ));
+    };
+    let protocol = protocol.to_ascii_uppercase();
+    if !TARGET_PROTOCOLS.contains(&protocol.as_str()) {
+        return Err(format!(
+            "HealthCheck.Target protocol must be one of {TARGET_PROTOCOLS:?}; got \
+             '{protocol}'"
+        ));
+    }
+
+    // An HTTP or HTTPS target carries a ping path after the port; a TCP or SSL target is
+    // the port alone, so a '/' in it is not a path but a malformed port.
+    let is_http = matches!(protocol.as_str(), "HTTP" | "HTTPS");
+    let (port, path) = match rest.split_once('/') {
+        Some((port, path)) => (port, Some(path)),
+        None => (rest, None),
+    };
+    match (is_http, path) {
+        (true, None) => {
+            return Err(format!(
+                "HealthCheck.Target must include a ping path for {protocol}, as in \
+                 '{protocol}:80/index.html'; got '{target}'"
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(format!(
+                "HealthCheck.Target must be '{protocol}:<port>' with no ping path; got \
+                 '{target}'"
+            ))
+        }
+        _ => {}
+    }
+    if is_http && target.chars().count() > MAX_HTTP_TARGET_CHARS {
+        return Err(format!(
+            "HealthCheck.Target must be at most {MAX_HTTP_TARGET_CHARS} characters; got {}",
+            target.chars().count()
+        ));
+    }
+
+    let (low, high) = TARGET_PORTS;
+    match port.parse::<i32>() {
+        Ok(port) if (low..=high).contains(&port) => Ok(()),
+        _ => Err(format!(
+            "HealthCheck.Target port must be a number from {low} through {high}; got \
+             '{port}'"
+        )),
     }
 }

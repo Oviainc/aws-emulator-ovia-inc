@@ -35,6 +35,12 @@ mod cloudfront_key_value_store_handshake;
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
+// Declared HERE, in the sorted list, rather than appended at the end of this file like
+// the most recent suites: the tail is where every landing in the same window appends, so
+// it is the contended region now, while this span of the sorted list is untouched by
+// those appends.
+#[path = "all/elb_classic_and_v2_signing_name_routing.rs"]
+mod elb_classic_and_v2_signing_name_routing;
 #[path = "all/events_signing_name_routing.rs"]
 mod events_signing_name_routing;
 #[path = "all/events_store_ownership.rs"]

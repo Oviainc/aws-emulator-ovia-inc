@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyLoadBalancerAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyLoadBalancerAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyLoadBalancerAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the attributes the request supplies onto the named load balancer's
+//! stored record, leaving every attribute it does not name as it was, and echoes back the
+//! ones it supplied as the record now holds them. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyLoadBalancerAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyLoadBalancerAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyLoadBalancerAttributes"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+        let requested = &input.load_balancer_attributes;
+
+        // Everything the request asks for is checked BEFORE anything is written, so a
+        // request that breaks one rule leaves every attribute as it found them.
+        if let Some(access_log) = &requested.access_log {
+            check_access_log(access_log)?;
+        }
+        if let Some(draining) = &requested.connection_draining {
+            check_connection_draining(draining)?;
+        }
+        let additional = checked_additional(requested.additional_attributes.as_deref())?;
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                ModifyLoadBalancerAttributesErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let held = &mut record.attributes;
+
+        // A PARTIAL update: each attribute the request carries replaces the stored one,
+        // and an attribute it does not carry keeps the value it already had — which is
+        // what makes a one-attribute modification followed by a describe report the other
+        // four unchanged.
+        if let Some(cross_zone) = &requested.cross_zone_load_balancing {
+            held.cross_zone_load_balancing_enabled = cross_zone.enabled;
+        }
+        if let Some(access_log) = &requested.access_log {
+            held.access_log = crate::state::AccessLogConfig {
+                enabled: access_log.enabled,
+                // An absent `EmitInterval` takes the documented default rather than
+                // whatever the previous configuration used: the member's own
+                // documentation states "Default: 60 minutes".
+                emit_interval_minutes: access_log
+                    .emit_interval
+                    .unwrap_or(crate::state::DEFAULT_ACCESS_LOG_EMIT_INTERVAL_MINUTES),
+                s3_bucket_name: access_log.s3_bucket_name.clone(),
+                s3_bucket_prefix: access_log.s3_bucket_prefix.clone(),
+            };
+        }
+        if let Some(draining) = &requested.connection_draining {
+            held.connection_draining = crate::state::ConnectionDrainingConfig {
+                enabled: draining.enabled,
+                timeout_seconds: draining
+                    .timeout
+                    .unwrap_or(crate::state::DEFAULT_CONNECTION_DRAINING_TIMEOUT_SECONDS),
+            };
+        }
+        if let Some(settings) = &requested.connection_settings {
+            held.idle_timeout_seconds = settings.idle_timeout;
+        }
+        for (key, value) in additional {
+            held.additional.insert(key, value);
+        }
+
+        // AWS echoes the attributes the request supplied, not the whole set, so the
+        // answer carries exactly the members the request named — read back from the
+        // record that now holds them, never from the request.
+        let stored = held.clone();
+        Ok(ModifyLoadBalancerAttributesOutput {
+            load_balancer_name: Some(input.load_balancer_name.clone()),
+            load_balancer_attributes: Some(LoadBalancerAttributes {
+                cross_zone_load_balancing: requested.cross_zone_load_balancing.as_ref().map(|_| {
+                    CrossZoneLoadBalancing {
+                        enabled: stored.cross_zone_load_balancing_enabled,
+                    }
+                }),
+                access_log: requested.access_log.as_ref().map(|_| AccessLog {
+                    enabled: stored.access_log.enabled,
+                    s3_bucket_name: stored.access_log.s3_bucket_name.clone(),
+                    emit_interval: Some(stored.access_log.emit_interval_minutes),
+                    s3_bucket_prefix: stored.access_log.s3_bucket_prefix.clone(),
+                }),
+                connection_draining: requested.connection_draining.as_ref().map(|_| {
+                    ConnectionDraining {
+                        enabled: stored.connection_draining.enabled,
+                        timeout: Some(stored.connection_draining.timeout_seconds),
+                    }
+                }),
+                connection_settings: requested.connection_settings.as_ref().map(|_| {
+                    ConnectionSettings {
+                        idle_timeout: stored.idle_timeout_seconds,
+                    }
+                }),
+                additional_attributes: requested.additional_attributes.as_ref().map(|supplied| {
+                    supplied
+                        .iter()
+                        .filter_map(|attribute| {
+                            let key = attribute.key.clone()?;
+                            let value = stored.additional.get(&key)?.clone();
+                            Some(AdditionalAttribute {
+                                key: Some(key),
+                                value: Some(value),
+                            })
+                        })
+                        .collect()
+                }),
+            }),
+        })
     }
+}
+
+/// Refuse an `AccessLog` the service cannot apply.
+///
+/// Two rules, both from the member documentation: access logs are delivered "to the
+/// Amazon S3 bucket that you specify", so enabling them without naming one cannot be
+/// satisfied; and `AccessLog$EmitInterval` states "You can specify an interval of either
+/// 5 minutes or 60 minutes". Neither is modelled as a constraint, so nothing has refused
+/// them before this handler runs.
+fn check_access_log(access_log: &AccessLog) -> Result<(), ModifyLoadBalancerAttributesError> {
+    if access_log.enabled
+        && access_log
+            .s3_bucket_name
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(invalid_configuration(
+            "AccessLog.S3BucketName is required to enable access logs",
+        ));
+    }
+    match access_log.emit_interval {
+        None => Ok(()),
+        Some(interval)
+            if crate::state::ACCESS_LOG_EMIT_INTERVALS_MINUTES.contains(&interval) =>
+        {
+            Ok(())
+        }
+        Some(interval) => Err(invalid_configuration(format!(
+            "AccessLog.EmitInterval must be one of {:?} minutes; got {interval}",
+            crate::state::ACCESS_LOG_EMIT_INTERVALS_MINUTES
+        ))),
+    }
+}
+
+/// Refuse a `ConnectionDraining` timeout outside the published bounds.
+///
+/// The model declares no range for `ConnectionDraining$Timeout`, so the bound is the one
+/// the Classic Load Balancers Guide publishes (see
+/// [`crate::state::CONNECTION_DRAINING_TIMEOUT_SECONDS`]) and this handler is what
+/// applies it.
+fn check_connection_draining(
+    draining: &ConnectionDraining,
+) -> Result<(), ModifyLoadBalancerAttributesError> {
+    let (low, high) = crate::state::CONNECTION_DRAINING_TIMEOUT_SECONDS;
+    match draining.timeout {
+        Some(timeout) if !(low..=high).contains(&timeout) => Err(invalid_configuration(format!(
+            "ConnectionDraining.Timeout must be a number from {low} through {high} \
+             seconds; got {timeout}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The additional attributes to write, or the modelled failure for a key this service
+/// does not publish.
+///
+/// `AdditionalAttribute$Key` documents exactly one supported attribute
+/// ([`crate::state::DESYNC_MITIGATION_MODE_KEY`]) with exactly three values, so any other
+/// key is the attribute `LoadBalancerAttributeNotFoundException` is about ("The specified
+/// load balancer attribute does not exist") and any other value is a configuration this
+/// service cannot apply.
+fn checked_additional(
+    supplied: Option<&[AdditionalAttribute]>,
+) -> Result<Vec<(String, String)>, ModifyLoadBalancerAttributesError> {
+    let mut updates = Vec::new();
+    for attribute in supplied.unwrap_or_default() {
+        let key = attribute.key.as_deref().unwrap_or_default();
+        if key != crate::state::DESYNC_MITIGATION_MODE_KEY {
+            return Err(
+                ModifyLoadBalancerAttributesErrorModeled::LoadBalancerAttributeNotFoundException(
+                    LoadBalancerAttributeNotFoundException {
+                        message: Some(format!(
+                            "There is no load balancer attribute named '{key}'; the \
+                             supported additional attribute is '{}'",
+                            crate::state::DESYNC_MITIGATION_MODE_KEY
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let value = attribute.value.as_deref().unwrap_or_default();
+        if !crate::state::DESYNC_MITIGATION_MODES.contains(&value) {
+            return Err(invalid_configuration(format!(
+                "{key} must be one of {:?}; got '{value}'",
+                crate::state::DESYNC_MITIGATION_MODES
+            )));
+        }
+        updates.push((key.to_string(), value.to_string()));
+    }
+    Ok(updates)
+}
+
+/// `InvalidConfigurationRequestException` (HTTP 409) — "The requested configuration change
+/// is not valid" — which is what this operation declares for an attribute value it cannot
+/// apply.
+fn invalid_configuration(message: impl Into<String>) -> ModifyLoadBalancerAttributesError {
+    ModifyLoadBalancerAttributesErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
 }

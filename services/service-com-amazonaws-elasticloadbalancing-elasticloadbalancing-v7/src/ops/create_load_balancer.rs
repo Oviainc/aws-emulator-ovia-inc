@@ -329,6 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_id: None,
             instances: crate::state::InstanceSet::default(),
             health_check,
+            // The service defaults, so `DescribeLoadBalancerAttributes` reports the same
+            // attribute set AWS reports for a load balancer nobody has modified.
+            attributes: crate::state::AttributeConfig::default(),
             tags,
         };
         // The region's map is created only now, on the success path, and only while the
@@ -365,42 +368,17 @@ fn build_listeners(
     let mut claimed_ports: ::std::collections::BTreeSet<i32> = ::std::collections::BTreeSet::new();
     let mut entries: Vec<crate::state::ListenerEntry> = Vec::with_capacity(requested.len());
     for listener in requested {
-        let protocol = listener.protocol.to_ascii_uppercase();
-        // `InstanceProtocol` defaults to the front-end protocol.
-        let instance_protocol = listener
-            .instance_protocol
-            .as_deref()
-            .map_or_else(|| protocol.clone(), str::to_ascii_uppercase);
-
-        for candidate in [&protocol, &instance_protocol] {
-            if !crate::state::LISTENER_PROTOCOLS.contains(&candidate.as_str()) {
-                return Err(CreateLoadBalancerErrorModeled::UnsupportedProtocolException(
-                    UnsupportedProtocolException {
-                        message: Some(format!(
-                            "Protocol must be one of {:?}; got '{candidate}'",
-                            crate::state::LISTENER_PROTOCOLS
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
-
-        // From `Listener$InstanceProtocol`: a TCP/SSL front end requires a TCP/SSL back
-        // end, and an HTTP/HTTPS front end requires an HTTP/HTTPS back end.
-        if transport_family(&protocol) != transport_family(&instance_protocol) {
-            return Err(
-                CreateLoadBalancerErrorModeled::InvalidConfigurationRequestException(
-                    InvalidConfigurationRequestException {
-                        message: Some(format!(
-                            "InstanceProtocol '{instance_protocol}' is not compatible with \
-                             Protocol '{protocol}'"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        // The protocol rules are the SAME ones `CreateLoadBalancerListeners` applies to a
+        // listener added later, so they live once in `crate::state::listener_entry` and
+        // each operation words the rejection in the error ITS model declares.
+        let entry = crate::state::listener_entry(
+            &listener.protocol,
+            listener.load_balancer_port,
+            listener.instance_protocol.as_deref(),
+            listener.instance_port,
+            listener.ssl_certificate_id.as_deref(),
+        )
+        .map_err(rejected)?;
 
         // A listener is keyed by its load balancer port, so one port cannot be claimed
         // twice in one configuration. The claimed ports are held in a set, so the check
@@ -419,24 +397,39 @@ fn build_listeners(
             );
         }
 
-        entries.push(crate::state::ListenerEntry {
-            protocol,
-            load_balancer_port: listener.load_balancer_port,
-            instance_protocol,
-            instance_port: listener.instance_port,
-            ssl_certificate_id: listener.ssl_certificate_id.clone(),
-            policy_names: Vec::new(),
-        });
+        entries.push(entry);
     }
     Ok(entries)
 }
 
-/// `HTTP`/`HTTPS` and `TCP`/`SSL` are the two families the model's compatibility rule
-/// is stated over; a secure protocol belongs to the same family as its plain peer.
-fn transport_family(protocol: &str) -> &'static str {
-    match protocol {
-        "HTTP" | "HTTPS" => "http",
-        _ => "tcp",
+/// This operation's wording for a listener the model's own rules rule out: the protocol
+/// set is `UnsupportedProtocolException` (400) and the front-end/back-end pairing is
+/// `InvalidConfigurationRequestException` (409), both of which this operation declares.
+fn rejected(rejection: crate::state::ListenerRejection) -> CreateLoadBalancerError {
+    match rejection {
+        crate::state::ListenerRejection::UnsupportedProtocol { protocol } => {
+            CreateLoadBalancerErrorModeled::UnsupportedProtocolException(
+                UnsupportedProtocolException {
+                    message: Some(format!(
+                        "Protocol must be one of {:?}; got '{protocol}'",
+                        crate::state::LISTENER_PROTOCOLS
+                    )),
+                },
+            )
+            .into()
+        }
+        crate::state::ListenerRejection::IncompatibleProtocols {
+            protocol,
+            instance_protocol,
+        } => CreateLoadBalancerErrorModeled::InvalidConfigurationRequestException(
+            InvalidConfigurationRequestException {
+                message: Some(format!(
+                    "InstanceProtocol '{instance_protocol}' is not compatible with \
+                     Protocol '{protocol}'"
+                )),
+            },
+        )
+        .into(),
     }
 }
 
