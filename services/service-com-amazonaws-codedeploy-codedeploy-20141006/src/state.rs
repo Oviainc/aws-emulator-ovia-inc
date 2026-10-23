@@ -199,6 +199,20 @@ pub const RESOURCE_ARN_MISSING: &str = "Resource ARN is missing";
 /// `RevisionRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
 pub const REVISION_MISSING: &str = "Revision is missing";
 
+/// `InvalidEC2TagCombinationException` (HTTP 400): a deployment group selects
+/// Amazon EC2 instances by EITHER the flat `ec2TagFilters` list or the grouped
+/// `ec2TagSet`, so a request naming both forms is refused with this sentence,
+/// which names the two members and interpolates nothing from the request. Both
+/// `CreateDeploymentGroup` and `UpdateDeploymentGroup` raise the shape, so it is
+/// worded once, here.
+pub const EC2_TAG_COMBINATION: &str =
+    "Only one of ec2TagFilters and ec2TagSet can be used in a single call";
+
+/// `InvalidOnPremisesTagCombinationException` (HTTP 400): the on-premises
+/// selector's pair of the same rule. See [`EC2_TAG_COMBINATION`].
+pub const ON_PREMISES_TAG_COMBINATION: &str =
+    "Only one of onPremisesInstanceTagFilters and onPremisesTagSet can be used in a single call";
+
 /// The `DeploymentCreator` value for a deployment a client asked for, as opposed
 /// to one an auto-scaling event or a rollback created
 /// (`smithy_query(query="shape",shape="DeploymentCreator")`).

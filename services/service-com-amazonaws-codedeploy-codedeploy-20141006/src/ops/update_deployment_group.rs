@@ -306,15 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A deployment group targets instances by EITHER a filter list or a tag
         // set; naming both in one call is what the two combination errors are
-        // for.
+        // for. The sentences live in `crate::state` so `CreateDeploymentGroup`
+        // words the same refusal identically.
         if input.ec2_tag_filters.is_some() && input.ec2_tag_set.is_some() {
             return Err(
                 UpdateDeploymentGroupErrorModeled::InvalidEC2TagCombinationException(
                     InvalidEC2TagCombinationException {
-                        message: Some(
-                            "Only one of ec2TagFilters and ec2TagSet can be used in a single call"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::EC2_TAG_COMBINATION.to_string()),
                     },
                 )
                 .into(),
@@ -324,11 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateDeploymentGroupErrorModeled::InvalidOnPremisesTagCombinationException(
                     InvalidOnPremisesTagCombinationException {
-                        message: Some(
-                            "Only one of onPremisesInstanceTagFilters and onPremisesTagSet can be \
-                             used in a single call"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::ON_PREMISES_TAG_COMBINATION.to_string()),
                     },
                 )
                 .into(),

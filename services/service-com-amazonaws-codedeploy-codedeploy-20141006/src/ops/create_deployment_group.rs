@@ -352,6 +352,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A tag FILTER list and a tag SET are two forms of the same selector —
+        // the set is the grouped form of the filters — so naming both in one
+        // call is what the two combination errors are for. The sentences live in
+        // `crate::state` so this refusal is worded exactly as
+        // `UpdateDeploymentGroup` words it, and it is judged from the request
+        // alone, before the store is touched.
+        if input.ec2_tag_filters.is_some() && input.ec2_tag_set.is_some() {
+            return Err(
+                CreateDeploymentGroupErrorModeled::InvalidEC2TagCombinationException(
+                    InvalidEC2TagCombinationException {
+                        message: Some(crate::state::EC2_TAG_COMBINATION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.on_premises_instance_tag_filters.is_some() && input.on_premises_tag_set.is_some() {
+            return Err(
+                CreateDeploymentGroupErrorModeled::InvalidOnPremisesTagCombinationException(
+                    InvalidOnPremisesTagCombinationException {
+                        message: Some(crate::state::ON_PREMISES_TAG_COMBINATION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let application_name = input.application_name;
         let deployment_group_name = input.deployment_group_name;
         let requested_config = input.deployment_config_name;

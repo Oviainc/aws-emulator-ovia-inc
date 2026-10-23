@@ -1562,3 +1562,107 @@ async fn the_deployment_history_is_bounded() {
         listed.len()
     );
 }
+
+/// RULE: a deployment group's instance selector is given EITHER as a flat tag
+/// FILTER list OR as the grouped tag SET of the same tags, never as both at
+/// once, so a request carrying both forms of one selector is refused with that
+/// selector's `Invalid…TagCombinationException` and stores nothing — while
+/// either form alone, and the two different selectors together, are accepted.
+#[tokio::test]
+async fn a_deployment_group_takes_one_form_of_each_tag_selector() {
+    let emulator = Emulator::new();
+    emulator
+        .ok("CreateApplication", json!({"applicationName": "tag-forms"}))
+        .await;
+
+    // Both selector members and both of their forms, from
+    // `smithy_query(query="shape",shape="EC2TagSet,EC2TagFilter,OnPremisesTagSet,TagFilter")`.
+    let ec2_filters = json!([{"Key": "Name", "Value": "web", "Type": "KEY_AND_VALUE"}]);
+    let ec2_set = json!({"ec2TagSetList": [[{"Key": "Name", "Value": "web", "Type": "KEY_AND_VALUE"}]]});
+    let premises_filters = json!([{"Key": "Stage", "Value": "prod", "Type": "KEY_AND_VALUE"}]);
+    let premises_set =
+        json!({"onPremisesTagSetList": [[{"Key": "Stage", "Value": "prod", "Type": "KEY_AND_VALUE"}]]});
+
+    // Rows differ along which selector is doubled up, and include the empty
+    // filter list — an explicitly specified list is still specified.
+    let cases: &[(&str, Value, Option<&str>)] = &[
+        (
+            "ec2 filters alone",
+            json!({"ec2TagFilters": ec2_filters}),
+            None,
+        ),
+        ("ec2 tag set alone", json!({"ec2TagSet": ec2_set}), None),
+        (
+            "on-premises filters alone",
+            json!({"onPremisesInstanceTagFilters": premises_filters}),
+            None,
+        ),
+        (
+            "on-premises tag set alone",
+            json!({"onPremisesTagSet": premises_set}),
+            None,
+        ),
+        (
+            "one form of each different selector",
+            json!({"ec2TagFilters": ec2_filters, "onPremisesTagSet": premises_set}),
+            None,
+        ),
+        (
+            "both forms of the ec2 selector",
+            json!({"ec2TagFilters": ec2_filters, "ec2TagSet": ec2_set}),
+            Some("InvalidEC2TagCombinationException"),
+        ),
+        (
+            "both forms of the ec2 selector, the filter list empty",
+            json!({"ec2TagFilters": [], "ec2TagSet": ec2_set}),
+            Some("InvalidEC2TagCombinationException"),
+        ),
+        (
+            "both forms of the on-premises selector",
+            json!({
+                "onPremisesInstanceTagFilters": premises_filters,
+                "onPremisesTagSet": premises_set
+            }),
+            Some("InvalidOnPremisesTagCombinationException"),
+        ),
+    ];
+
+    for (index, (case, selector, expected)) in cases.iter().enumerate() {
+        let group = format!("tag-forms-{index}");
+        let mut request = json!({
+            "applicationName": "tag-forms",
+            "deploymentGroupName": group,
+            "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+        });
+        for (member, value) in selector.as_object().expect("the selector is an object") {
+            request[member] = value.clone();
+        }
+        let (status, body) = emulator.call("CreateDeploymentGroup", request).await;
+        match expected {
+            None => assert_eq!(
+                status, 200,
+                "case {case}: expected the group created, got {status} {body:?}"
+            ),
+            Some(code) => {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, *code),
+                    "case {case}: expected 400 {code}, got {status} {body:?}"
+                );
+                // A refusal stores nothing: the group is not readable back.
+                let (read_status, read_body) = emulator
+                    .call(
+                        "GetDeploymentGroup",
+                        json!({"applicationName": "tag-forms", "deploymentGroupName": group}),
+                    )
+                    .await;
+                assert_eq!(
+                    (read_status, error_code(&read_body).as_str()),
+                    (400, "DeploymentGroupDoesNotExistException"),
+                    "case {case}: a refused create must store nothing, got {read_status} \
+                     {read_body:?}"
+                );
+            }
+        }
+    }
+}
