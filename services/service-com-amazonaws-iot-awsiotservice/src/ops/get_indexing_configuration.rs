@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIndexingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIndexingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIndexingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's fleet-indexing configuration out of this service's state:
+//! the two sections `UpdateIndexingConfiguration` writes, or — for an account that
+//! has never updated them — the disabled configuration every mode's documented `OFF`
+//! value makes up ([`crate::state::IndexingConfiguration::disabled`]).
+//!
+//! It is a pure READ: nothing in the store changes, so two calls with no update
+//! between them report the same configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIndexingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIndexingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIndexingConfiguration"))
+        // `GetIndexingConfigurationRequest` is an empty structure and the
+        // configuration is account-wide, so neither the request nor its metadata
+        // selects what is reported.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetIndexingConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: the record is cloned out from under the lock and the store is
+        // left exactly as it was, so a later caller sees what this one saw.
+        let configuration = state.lock().indexing_configuration.clone();
+
+        Ok(GetIndexingConfigurationOutput {
+            thing_indexing_configuration: Some(configuration.thing),
+            thing_group_indexing_configuration: Some(configuration.thing_group),
+        })
     }
 }

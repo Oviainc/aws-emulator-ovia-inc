@@ -29,5 +29,7 @@ mod route_request_parameter;
 mod route_response_lifecycle;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/stage_lifecycle.rs"]
+mod stage_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

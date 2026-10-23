@@ -387,6 +387,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // `PreferredMaintenanceWindow` is the same documented range here as on a
+        // cache cluster, refused through the one helper
+        // (`crate::state::maintenance_window_refusal`) before anything is
+        // stored.
+        if let Some(message) = input
+            .preferred_maintenance_window
+            .as_deref()
+            .and_then(crate::state::maintenance_window_refusal)
+        {
+            return Err(invalid_value(message));
+        }
+
         // A Global datastore the group would join has to exist, and none can:
         // every global-replication-group operation is a scaffolded 501 that owns
         // its own issue, so there is nothing to join.
@@ -401,22 +413,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Cache security groups are the pre-VPC, EC2-Classic mechanism whose
-        // `CreateCacheSecurityGroup` is a scaffolded 501, so none exists.
-        if let Some(name) = input
+        // Cache security groups are the pre-VPC, EC2-Classic mechanism, and the
+        // whole surface is closed for this account — see
+        // `crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED`. A request that
+        // names one is refused with that account-wide closure rather than a
+        // per-name not-found: no such group can exist for any name, so there is
+        // nothing a caller could create and retry with.
+        if !input
             .cache_security_group_names
             .as_deref()
             .unwrap_or_default()
-            .first()
+            .is_empty()
         {
-            return Err(
-                CreateReplicationGroupErrorModeled::CacheSecurityGroupNotFoundFault(
-                    CacheSecurityGroupNotFoundFault {
-                        message: Some(format!("Cache security group {name} not found.")),
-                    },
-                )
-                .into(),
-            );
+            return Err(invalid_value(
+                crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED.to_string(),
+            ));
         }
 
         // Same for user groups: `CreateUserGroup` is a scaffolded 501.
@@ -823,7 +834,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(cluster) = store.cache_clusters.get(&key) else {
                     return Err(CreateReplicationGroupErrorModeled::CacheClusterNotFoundFault(
                         CacheClusterNotFoundFault {
-                            message: Some(format!("Cache cluster {id} not found.")),
+                            message: Some(crate::state::cache_cluster_not_found_message(id)),
                         },
                     )
                     .into());

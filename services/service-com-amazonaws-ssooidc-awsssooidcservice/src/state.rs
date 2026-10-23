@@ -39,6 +39,47 @@ pub const SUPPORTED_GRANT_TYPES: &[&str] = &[
     GRANT_TYPE_REFRESH_TOKEN,
 ];
 
+/// The OAuth 2.0 JWT-bearer grant, as `CreateTokenWithIAMRequest$grantType`
+/// names it: "JWT Bearer - urn:ietf:params:oauth:grant-type:jwt-bearer".
+pub const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// The OAuth 2.0 token-exchange grant (RFC 8693), as
+/// `CreateTokenWithIAMRequest$grantType` names it: "Token Exchange -
+/// urn:ietf:params:oauth:grant-type:token-exchange".
+pub const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
+/// Every grant type `CreateTokenWithIAM` serves, from
+/// `CreateTokenWithIAMRequest$grantType`: "Supports the following OAuth grant
+/// types: Authorization Code, Refresh Token, JWT Bearer, and Token Exchange. ...
+/// * Authorization Code - authorization_code * Refresh Token - refresh_token *
+/// JWT Bearer - urn:ietf:params:oauth:grant-type:jwt-bearer * Token Exchange -
+/// urn:ietf:params:oauth:grant-type:token-exchange". The device-code grant is
+/// NOT among them: that one is `CreateToken`'s
+/// (`smithy_query(query="doc",shape="com.amazonaws.ssooidc#CreateTokenWithIAMRequest",member="grantType")`).
+pub const IAM_SUPPORTED_GRANT_TYPES: &[&str] = &[
+    GRANT_TYPE_AUTHORIZATION_CODE,
+    GRANT_TYPE_REFRESH_TOKEN,
+    GRANT_TYPE_JWT_BEARER,
+    GRANT_TYPE_TOKEN_EXCHANGE,
+];
+
+/// The `TokenTypeURI` of an access token: "Access Token -
+/// urn:ietf:params:oauth:token-type:access_token"
+/// (`CreateTokenWithIAMRequest$requestedTokenType`).
+pub const TOKEN_TYPE_URI_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// The `TokenTypeURI` of a refresh token: "Refresh Token -
+/// urn:ietf:params:oauth:token-type:refresh_token"
+/// (`CreateTokenWithIAMRequest$requestedTokenType`).
+pub const TOKEN_TYPE_URI_REFRESH_TOKEN: &str = "urn:ietf:params:oauth:token-type:refresh_token";
+
+/// Every token type `CreateTokenWithIAM` can be asked to issue, from
+/// `CreateTokenWithIAMRequest$requestedTokenType`: "The following values are
+/// supported: * Access Token - urn:ietf:params:oauth:token-type:access_token *
+/// Refresh Token - urn:ietf:params:oauth:token-type:refresh_token".
+pub const ISSUABLE_TOKEN_TYPE_URIS: &[&str] =
+    &[TOKEN_TYPE_URI_ACCESS_TOKEN, TOKEN_TYPE_URI_REFRESH_TOKEN];
+
 /// `tokenType` of every token this service issues: the access token "can be used
 /// to ... access application APIs using `bearer` authentication" (`CreateToken`
 /// documentation).
@@ -241,6 +282,11 @@ pub struct IssuedToken {
     pub client_id: String,
     pub scopes: Vec<String>,
     pub token_type: String,
+    /// The region of the endpoint that issued this token: a token "was issued by
+    /// and is only usable by calling IAM Identity Center endpoints" in one region
+    /// (`InvalidRequestRegionException` documentation), so the region is part of
+    /// the record rather than re-derived from whoever presents it.
+    pub region: String,
     pub issued_at: SystemTime,
     pub expires_in: i32,
 }
@@ -252,6 +298,7 @@ impl std::fmt::Debug for IssuedToken {
             .field("client_id", &self.client_id)
             .field("scopes", &self.scopes)
             .field("token_type", &self.token_type)
+            .field("region", &self.region)
             .field("issued_at", &self.issued_at)
             .field("expires_in", &self.expires_in)
             .finish_non_exhaustive()
@@ -278,6 +325,9 @@ pub struct RefreshGrant {
     pub refresh_token: String,
     pub client_id: String,
     pub scopes: Vec<String>,
+    /// The region of the endpoint that issued this refresh token; see
+    /// [`IssuedToken::region`].
+    pub region: String,
     pub issued_at: SystemTime,
     pub expires_in: i32,
     /// The access token this refresh token was issued with, dropped when the
@@ -303,6 +353,7 @@ impl std::fmt::Debug for RefreshGrant {
         f.debug_struct("RefreshGrant")
             .field("client_id", &self.client_id)
             .field("scopes", &self.scopes)
+            .field("region", &self.region)
             .field("issued_at", &self.issued_at)
             .field("expires_in", &self.expires_in)
             .finish_non_exhaustive()
@@ -480,11 +531,13 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
             .insert(authorization.device_code.clone(), authorization);
     }
 
-    /// Mints and persists an access token for `client_id`, with a refresh token
-    /// when the client may use the refresh-token grant.
+    /// Mints and persists an access token for `client_id`, issued by the endpoint
+    /// in `region`, with a refresh token when the client may use the
+    /// refresh-token grant.
     pub fn issue_token(
         &mut self,
         client_id: &str,
+        region: &str,
         scopes: Vec<String>,
         with_refresh_token: bool,
         now: SystemTime,
@@ -498,6 +551,7 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
             client_id: client_id.to_string(),
             scopes,
             token_type: TOKEN_TYPE_BEARER.to_string(),
+            region: region.to_string(),
             issued_at: now,
             expires_in: ACCESS_TOKEN_EXPIRES_IN,
         };
@@ -508,6 +562,7 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
                     refresh_token,
                     client_id: client_id.to_string(),
                     scopes: token.scopes.clone(),
+                    region: region.to_string(),
                     issued_at: now,
                     expires_in: REFRESH_TOKEN_EXPIRES_IN,
                     bound_access_token: access_token.clone(),
@@ -528,6 +583,7 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
         &mut self,
         refresh_token: &str,
         client_id: &str,
+        region: &str,
         requested_scopes: Option<Vec<String>>,
         now: SystemTime,
     ) -> Result<IssuedToken, RefreshFailure> {
@@ -563,7 +619,7 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
         };
         self.refresh_tokens.remove(refresh_token);
         self.access_tokens.remove(&grant.bound_access_token);
-        Ok(self.issue_token(client_id, scopes, true, now))
+        Ok(self.issue_token(client_id, region, scopes, true, now))
     }
 }
 

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransitGatewayPolicyTableAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransitGatewayPolicyTableAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransitGatewayPolicyTableAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the attachments associated with the transit gateway policy table the request
+//! names, out of [`crate::state`]: every association of that table by default, or the
+//! subset its `Filters` select, one `MaxResults`-sized page at a time. A REPORTING
+//! operation — the only thing it writes is the `associating` -> `associated` move the clock
+//! already owed each association ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]),
+//! which was due at its instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +139,257 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransitGatewayPolicyTableAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransitGatewayPolicyTableAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransitGatewayPolicyTableAssociations"))
+        // `ctx` carries request metadata only; this operation reads none of it — the policy
+        // table is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first: an id that is not a transit gateway policy table id
+        // at all is refused as malformed, so "not an id of this kind" never reads as "no
+        // such policy table" and is never answered by the DryRun arm below either.
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_POLICY_TABLE_ID_PREFIX,
+            &input.transit_gateway_policy_table_id,
+            state::INVALID_TRANSIT_GATEWAY_POLICY_TABLE_ID_MALFORMED,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`GetTransitGatewayPolicyTableAssociationsRequest$DryRun`). Every caller of this
+        // emulator is permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The token for the next page of results" (`...Request$NextToken`) — anything else
+        // is refused rather than read as an id, and it is refused before any other member
+        // is looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(state::decode_page_token(token).ok_or_else(state::invalid_pagination_token)?)
+            }
+        };
+
+        // Matching cost is filters x values x value length x stored associations, so each
+        // request-controlled factor is capped here, BEFORE any work proportional to it is
+        // done, and their PRODUCT is charged to one [`state::MatchBudget`] below — the
+        // bound the per-factor caps cannot give. The model bounds none of them.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum of {}",
+                state::MAX_FILTERS
+            )));
+        }
+
+        // A filter name that is not one of the association's own attributes is refused
+        // whether or not any association would have matched it, so an unsupported filter
+        // can never read as "no results". Each value is compiled into its pattern ONCE here
+        // rather than re-compiled per comparison.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<state::CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !ASSOCIATION_FILTERS.contains(&name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of {}",
+                    values.len(),
+                    state::MAX_FILTER_VALUES
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of {}",
+                    oversize.len(),
+                    state::MAX_FILTER_VALUE_BYTES
+                )));
+            }
+            selectors.push(state::CompiledFilter::new(
+                name.to_string(),
+                values.to_vec(),
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The clock before the read: an association whose `associated` move has fallen due
+        // is reported in the state it is ACTUALLY in, and that move was owed at its instant
+        // whether or not this call ever came.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway policy table"
+        // (`...Request$TransitGatewayPolicyTableId`) is required, so an id naming no policy
+        // table of the account is refused rather than read as "no associations".
+        let table = store.require_transit_gateway_policy_table(&input.transit_gateway_policy_table_id)?;
+
+        // Every filter must hold ("If you specify multiple filters, the filters are joined
+        // with an AND" — `Filter`), and every comparison, with the candidate itself, is
+        // charged to ONE budget, so the PRODUCT of stored associations, filters, values and
+        // value length is bounded however the caller combines them — which is also what
+        // bounds how long this holds the state lock.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&TransitGatewayPolicyTableAssociation> = Vec::new();
+        for association in table.associations.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if matches_every_filter(&association.view, &selectors, &mut budget) {
+                selected.push(&association.view);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {} comparisons to evaluate; \
+                     narrow them or page with MaxResults",
+                    state::MAX_FILTER_MATCH_STEPS
+                ),
+            ));
+        }
+
+        // Page in attachment-id order, which the cursor below names a position in: the
+        // associations of a table are keyed by `TransitGatewayAttachmentId` in an ordered
+        // map, so its iteration order already satisfies this sort, and doing it here
+        // establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| {
+            left.transit_gateway_attachment_id
+                .cmp(&right.transit_gateway_attachment_id)
+        });
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|association| {
+                association
+                    .transit_gateway_attachment_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`...Request$MaxResults`). A request that names none gets the largest page the
+        // model publishes, so the `NextToken` path behaves the same whether or not a page
+        // size was asked for. The model's `range 5..1000` has already refused anything
+        // outside it, so the only value that cannot convert is one the boundary validator
+        // would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // A token only when an association follows this page, naming the attachment id the
+        // next page starts at — opaquely, so a caller cannot assemble one.
+        let next_token = page
+            .get(limit)
+            .and_then(|association| association.transit_gateway_attachment_id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(GetTransitGatewayPolicyTableAssociationsOutput {
+            associations: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|association| (*association).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`TransitGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The filter names this operation accepts.
+///
+/// The model documents no catalog for this one — `...Request$Filters` says only "The filters
+/// associated with the transit gateway policy table" — so the catalog is the ATTRIBUTES an
+/// association has, each spelled the way EC2 spells a filter for a member (lowercase,
+/// hyphen-separated). Its source is the member list of the reported shape:
+///
+/// ```text
+/// smithy_query(query="shape",shape="TransitGatewayPolicyTableAssociation",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// which is `TransitGatewayPolicyTableId`, `TransitGatewayAttachmentId`, `ResourceId`,
+/// `ResourceType` and `State`. Every entry must be answered by [`filter_values`].
+const ASSOCIATION_FILTERS: [&str; 5] = [
+    "resource-id",
+    "resource-type",
+    "state",
+    "transit-gateway-attachment-id",
+    "transit-gateway-policy-table-id",
+];
+
+/// The values the EC2 filter `name` compares against this association.
+///
+/// A filter naming an attribute this association carries no value for compares against NO
+/// values, so it selects nothing — the same answer AWS gives for any attribute a resource
+/// holds no value for.
+fn filter_values<'a>(
+    association: &'a TransitGatewayPolicyTableAssociation,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "resource-id" => text(association.resource_id.as_deref()),
+        "resource-type" => text(association.resource_type.as_deref()),
+        "state" => text(association.state.as_deref()),
+        "transit-gateway-attachment-id" => text(association.transit_gateway_attachment_id.as_deref()),
+        "transit-gateway-policy-table-id" => {
+            text(association.transit_gateway_policy_table_id.as_deref())
+        }
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `association` satisfy every filter?
+///
+/// The AND/OR evaluation EC2 defines for every `Filters` member, through the crate's one
+/// implementation of it ([`crate::state::matches_every_filter`]): "If you specify multiple
+/// filters, the filters are joined with an AND" (`Filter`), and within one filter "if you
+/// specify multiple values for a filter, the values are joined with an OR"
+/// (`Filter$Values`) — each value matched case-sensitively, with EC2's own `*`/`?`
+/// wildcards, by the pattern the value was compiled into. So a filter carrying no value at
+/// all matches nothing, there being no value for the attribute to match.
+///
+/// Every comparison, and the candidate itself, is charged to `budget`, so one request's
+/// filtering cannot cost more than the ceiling however it combines filters, values and
+/// value length.
+fn matches_every_filter(
+    association: &TransitGatewayPolicyTableAssociation,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    crate::state::matches_every_filter(selectors, budget, &|name| {
+        filter_values(association, name)
+    })
 }

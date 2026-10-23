@@ -277,17 +277,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored as a lowercase string".
         let cache_cluster_id = input.cache_cluster_id.to_ascii_lowercase();
 
-        // A cache security group cannot exist here (its creator is a scaffolded
-        // 501), so a request naming one is refused rather than recorded.
-        if let Some(name) = input
+        // Cache security groups are the EC2-Classic mechanism, and the whole
+        // surface is closed for this account — see
+        // `crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED`. A request that
+        // names one is refused with that account-wide closure rather than a
+        // per-name not-found: no such group can exist for any name, so a caller
+        // told "that group does not exist" would retry a path that can never
+        // work.
+        if !input
             .cache_security_group_names
             .as_deref()
             .unwrap_or_default()
-            .first()
+            .is_empty()
         {
-            return Err(ModifyCacheClusterErrorModeled::CacheSecurityGroupNotFoundFault(
-                CacheSecurityGroupNotFoundFault {
-                    message: Some(format!("Cache security group {name} not found.")),
+            return Err(ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED.to_string()),
                 },
             )
             .into());
@@ -318,28 +323,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
             return Err(ModifyCacheClusterErrorModeled::CacheClusterNotFoundFault(
                 CacheClusterNotFoundFault {
-                    message: Some(format!(
-                        "Cache cluster {} not found.",
-                        input.cache_cluster_id
+                    message: Some(crate::state::cache_cluster_not_found_message(
+                        &input.cache_cluster_id,
                     )),
                 },
             )
             .into());
         };
 
-        // A cluster can only be modified while it is settled: one still
-        // `creating`, or already `modifying` from an earlier immediate change,
-        // is refused with the modelled state fault.
-        if cluster.status != crate::state::STATUS_AVAILABLE {
-            return Err(ModifyCacheClusterErrorModeled::InvalidCacheClusterStateFault(
-                InvalidCacheClusterStateFault {
-                    message: Some(format!(
-                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
-                        cluster.status
-                    )),
-                },
-            )
-            .into());
+        // Every check that reads nothing but this request runs BEFORE the state
+        // gate below, so a malformed value is reported as the bad parameter it
+        // is whatever status the cluster happens to be in — a client that is
+        // told "wrong state" retries forever instead of fixing its input.
+        //
+        // `PreferredMaintenanceWindow` is a documented range; see
+        // `crate::state::maintenance_window_refusal`. It is checked here rather
+        // than where it is applied, so a refused request stores nothing and the
+        // cluster keeps the window it was running.
+        if let Some(message) = input
+            .preferred_maintenance_window
+            .as_deref()
+            .and_then(crate::state::maintenance_window_refusal)
+        {
+            return Err(
+                ModifyCacheClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
         }
 
         // `Engine` and `NumCacheNodes` interact: the legal node count depends on
@@ -360,6 +373,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             None => cluster.engine.clone(),
         };
+
+        // A cluster has to be provisioned before it can be reconfigured, so one
+        // still `creating`, going away, or busy with work of its own (a reboot,
+        // a snapshot) is refused with the modelled state fault. A cluster
+        // already `modifying` is NOT: `ApplyImmediately` documents that "if you
+        // perform a ModifyCacheCluster before a pending modification is
+        // applied, the pending modification is replaced by the newer
+        // modification", so a second change arriving while the first is still
+        // being worked through is the documented way to supersede it — which is
+        // also the shape of every converge loop that reapplies its desired
+        // configuration.
+        if cluster.status != crate::state::STATUS_AVAILABLE
+            && cluster.status != crate::state::STATUS_MODIFYING
+        {
+            return Err(ModifyCacheClusterErrorModeled::InvalidCacheClusterStateFault(
+                InvalidCacheClusterStateFault {
+                    message: Some(format!(
+                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
+                        cluster.status
+                    )),
+                },
+            )
+            .into());
+        }
         let ids_to_remove = input.cache_node_ids_to_remove.unwrap_or_default();
         let new_zones = input.new_availability_zones.unwrap_or_default();
 

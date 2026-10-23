@@ -229,6 +229,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The note this call carries is copied onto every finding it processes, so
+        // the documented bound on `Note$Text` is checked once, before any of them is
+        // written.
+        if let Some(message) = input
+            .note
+            .as_ref()
+            .and_then(crate::state::note_update_violation)
+        {
+            return Err(BatchUpdateFindingsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    code: Some("InvalidInputException".to_string()),
+                },
+            )
+            .into());
+        }
+
         // One instant for the whole call: `Note.UpdatedAt` records when this update
         // was made, so every note it writes carries the same timestamp, and so does
         // every finding-history event the call appends.

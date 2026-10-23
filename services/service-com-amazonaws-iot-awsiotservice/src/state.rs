@@ -34,6 +34,12 @@
 //! hands back, so `GetTopicRule` after `CreateTopicRule` returns the created rule
 //! member-for-member.
 //!
+//! It also holds the account's FLEET INDEXING configuration — one record, not a map,
+//! because `GetIndexingConfiguration` / `UpdateIndexingConfiguration` name no
+//! resource: there is one indexing configuration per account. An account that has
+//! never updated it still has one (fleet indexing disabled), which is why the field
+//! has a default and the reader never has to create what it reports.
+//!
 //! Finally it holds the account's COMMANDS, keyed by `commandId` ("A unique
 //! identifier for the command", and the `@httpLabel` of `/commands/{commandId}`),
 //! whose EXISTENCE the IoT Jobs data plane also needs — `StartCommandExecution`
@@ -50,7 +56,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Action, CommandParameter, CommandPayload, CommandPreprocessor, GetCommandOutput, JobExecution,
-    JobExecutionStatusDetails, TopicRule, TopicRulePayload,
+    JobExecutionStatusDetails, ThingGroupIndexingConfiguration, ThingIndexingConfiguration,
+    TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -365,6 +372,14 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// this command exist?". Both are bounded by
     /// [`iot_commands::MAX_REGISTERED_COMMANDS`].
     pub commands: BTreeMap<String, RegisteredCommand>,
+    /// The account's FLEET INDEXING configuration — one record, read by
+    /// `GetIndexingConfiguration` and replaced by `UpdateIndexingConfiguration`.
+    ///
+    /// It is a plain field and not an `Option`, because an account that has never
+    /// updated it still HAS a configuration: fleet indexing disabled
+    /// ([`IndexingConfiguration::disabled`]). That is what makes the read a pure
+    /// read — it never has to create the record it reports.
+    pub indexing_configuration: IndexingConfiguration,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -988,6 +1003,121 @@ impl RegisteredCommand {
             deprecated: Some(self.deprecated),
             pending_deletion: Some(self.pending_deletion),
         }
+    }
+}
+
+/// The wire token every fleet-indexing mode uses for "this kind of indexing is
+/// disabled".
+///
+/// `ThingIndexingMode`, `ThingConnectivityIndexingMode`,
+/// `DeviceDefenderIndexingMode`, `NamedShadowIndexingMode` and
+/// `ThingGroupIndexingMode` each declare it and each document it as "OFF - ...
+/// indexing is disabled"
+/// (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="thingIndexingMode")`).
+pub const INDEXING_MODE_OFF: &str = "OFF";
+
+/// How many custom fields one indexing configuration may carry, per section.
+///
+/// `Fields` carries no modelled length and the list is one a CALLER supplies, so
+/// this is the emulator's own ceiling on it — the same reason [`MAX_TOPIC_RULES`]
+/// exists — and `UpdateIndexingConfiguration` past it refuses with a modelled error
+/// rather than recording a configuration of unbounded size.
+pub const MAX_CUSTOM_FIELDS: usize = 100;
+
+/// The account's fleet-indexing configuration, as this service persists it.
+///
+/// One record for the account, holding the two configuration sections the model
+/// declares — `GetIndexingConfiguration` reports both, `UpdateIndexingConfiguration`
+/// writes the ones its request supplies — so the reader hands back exactly what the
+/// last writer stored and the two cannot drift.
+///
+/// Like the rest of this store it is NOT partitioned by region (see
+/// [`ComAmazonawsIotAwsiotserviceState`]): one account, one configuration.
+#[derive(Debug, Clone)]
+pub struct IndexingConfiguration {
+    /// `ThingIndexingConfiguration` — "Thing indexing configuration".
+    pub thing: ThingIndexingConfiguration,
+    /// `ThingGroupIndexingConfiguration` — "Thing group indexing configuration".
+    pub thing_group: ThingGroupIndexingConfiguration,
+}
+
+impl IndexingConfiguration {
+    /// The configuration of an account that has never updated it: every kind of
+    /// indexing at its documented [`INDEXING_MODE_OFF`] value, no custom fields and
+    /// no filter.
+    ///
+    /// `thingIndexingMode` and `thingGroupIndexingMode` are `@required` members of
+    /// their sections, so the disabled configuration states them explicitly rather
+    /// than leaving either section's mode unset.
+    pub fn disabled() -> Self {
+        Self {
+            thing: ThingIndexingConfiguration {
+                thing_indexing_mode: INDEXING_MODE_OFF.to_string(),
+                thing_connectivity_indexing_mode: Some(INDEXING_MODE_OFF.to_string()),
+                device_defender_indexing_mode: Some(INDEXING_MODE_OFF.to_string()),
+                named_shadow_indexing_mode: Some(INDEXING_MODE_OFF.to_string()),
+                managed_fields: None,
+                custom_fields: None,
+                filter: None,
+            },
+            thing_group: ThingGroupIndexingConfiguration {
+                thing_group_indexing_mode: INDEXING_MODE_OFF.to_string(),
+                managed_fields: None,
+                custom_fields: None,
+            },
+        }
+    }
+
+    /// Record `supplied` as the account's THING indexing configuration.
+    ///
+    /// A supplied section replaces the stored one in full — the request carries the
+    /// whole `ThingIndexingConfiguration`, not a patch of it — so an optional mode
+    /// the request leaves out is recorded at [`INDEXING_MODE_OFF`] rather than
+    /// keeping the value some earlier call set. `managedFields` is dropped: "You
+    /// can't modify managed fields by updating fleet indexing configuration"
+    /// (`smithy_query(query="doc",shape="ThingIndexingConfiguration",member="managedFields")`),
+    /// so the caller's list is not what the service indexes.
+    pub fn set_thing(&mut self, supplied: ThingIndexingConfiguration) {
+        self.thing = ThingIndexingConfiguration {
+            thing_indexing_mode: supplied.thing_indexing_mode,
+            thing_connectivity_indexing_mode: Some(
+                supplied
+                    .thing_connectivity_indexing_mode
+                    .unwrap_or_else(|| INDEXING_MODE_OFF.to_string()),
+            ),
+            device_defender_indexing_mode: Some(
+                supplied
+                    .device_defender_indexing_mode
+                    .unwrap_or_else(|| INDEXING_MODE_OFF.to_string()),
+            ),
+            named_shadow_indexing_mode: Some(
+                supplied
+                    .named_shadow_indexing_mode
+                    .unwrap_or_else(|| INDEXING_MODE_OFF.to_string()),
+            ),
+            managed_fields: None,
+            custom_fields: supplied.custom_fields,
+            filter: supplied.filter,
+        };
+    }
+
+    /// Record `supplied` as the account's THING GROUP indexing configuration, under
+    /// the same replacement and `managedFields` rules as
+    /// [`IndexingConfiguration::set_thing`].
+    pub fn set_thing_group(&mut self, supplied: ThingGroupIndexingConfiguration) {
+        self.thing_group = ThingGroupIndexingConfiguration {
+            thing_group_indexing_mode: supplied.thing_group_indexing_mode,
+            managed_fields: None,
+            custom_fields: supplied.custom_fields,
+        };
+    }
+}
+
+/// A store with no recorded update reports the disabled configuration, so that is
+/// this record's default.
+impl Default for IndexingConfiguration {
+    fn default() -> Self {
+        Self::disabled()
     }
 }
 

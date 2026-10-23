@@ -15,6 +15,8 @@
 mod command_registry;
 #[path = "all/describe_endpoint.rs"]
 mod describe_endpoint;
+#[path = "all/indexing_configuration.rs"]
+mod indexing_configuration;
 #[path = "all/job_execution_read.rs"]
 mod job_execution_read;
 #[path = "all/job_targeting.rs"]

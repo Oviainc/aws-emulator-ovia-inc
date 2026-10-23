@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTokenWithIAM
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTokenWithIAM`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTokenWithIAM::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues a token to an IAM-authenticated caller from persisted state: the caller is
+//! authenticated by its SigV4 identity rather than a `clientSecret` (the request models
+//! none), so this operation resolves the grant it is handed — a persisted `refreshToken`,
+//! or a persisted access token presented as the subject of a token exchange — against the
+//! store, and mints and persists the token it returns.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +158,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as st;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -206,6 +204,117 @@ impl From<CreateTokenWithIAMErrorModeled> for CreateTokenWithIAMError {
     }
 }
 
+/// `InternalServerException` (500): this service's store is not reachable.
+fn state_unavailable() -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::InternalServerException(InternalServerException {
+        error: Some("server_error".to_string()),
+        error_description: Some("the service state for AWS SSO OIDC is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// `InvalidRequestException` (400): a member this grant needs is missing, or
+/// carries a value the grant does not define.
+fn invalid_request(description: impl Into<String>) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::InvalidRequestException(InvalidRequestException {
+        error: Some("invalid_request".to_string()),
+        reason: None,
+        error_description: Some(description.into()),
+    })
+    .into()
+}
+
+/// `InvalidGrantException` (400): the grant presented resolves to nothing this
+/// service issued or configured, or to something already spent.
+fn invalid_grant(description: impl Into<String>) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::InvalidGrantException(InvalidGrantException {
+        error: Some("invalid_grant".to_string()),
+        error_description: Some(description.into()),
+    })
+    .into()
+}
+
+/// `UnsupportedGrantTypeException` (400): the grant type is not one this
+/// operation serves.
+fn unsupported_grant_type(grant_type: &str) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::UnsupportedGrantTypeException(UnsupportedGrantTypeException {
+        error: Some("unsupported_grant_type".to_string()),
+        error_description: Some(format!(
+            "grantType '{grant_type}' is not supported; supported grant types are {}",
+            st::IAM_SUPPORTED_GRANT_TYPES.join(", ")
+        )),
+    })
+    .into()
+}
+
+/// `UnauthorizedClientException` (400): the grant is one this operation serves,
+/// but not one configured for the client named by `clientId`.
+fn unauthorized_client(grant_type: &str) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::UnauthorizedClientException(UnauthorizedClientException {
+        error: Some("unauthorized_client".to_string()),
+        error_description: Some(format!(
+            "the client has no OAuth grant configured for the {grant_type} grant"
+        )),
+    })
+    .into()
+}
+
+/// `InvalidScopeException` (400): the request asked for a scope broader than the
+/// grant being spent carries.
+fn invalid_scope(description: impl Into<String>) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::InvalidScopeException(InvalidScopeException {
+        error: Some("invalid_scope".to_string()),
+        error_description: Some(description.into()),
+    })
+    .into()
+}
+
+/// `ExpiredTokenException` (400): the token presented was issued by this service
+/// but its lifetime has run out.
+fn expired_token(description: impl Into<String>) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::ExpiredTokenException(ExpiredTokenException {
+        error: Some("expired_token".to_string()),
+        error_description: Some(description.into()),
+    })
+    .into()
+}
+
+/// `InvalidRequestRegionException` (400): the token presented was issued by
+/// another region's endpoint, and "is only usable by calling IAM Identity Center
+/// endpoints in another region". The response names that region and its endpoint,
+/// which is where the caller may retry.
+fn invalid_request_region(issuing_region: &str) -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::InvalidRequestRegionException(InvalidRequestRegionException {
+        error: Some("invalid_request".to_string()),
+        error_description: Some(format!(
+            "the token presented was issued in {issuing_region} and is only usable against that region's endpoint"
+        )),
+        endpoint: Some(st::oidc_endpoint(issuing_region)),
+        region: Some(issuing_region.to_string()),
+    })
+    .into()
+}
+
+/// `SlowDownException` (400): the store is already holding its maximum number of
+/// tokens, so this request is "more than the service can handle".
+fn slow_down() -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::SlowDownException(SlowDownException {
+        error: Some("slow_down".to_string()),
+        error_description: Some(format!(
+            "the service is holding its maximum of {} access tokens; retry later",
+            st::MAX_ACCESS_TOKENS
+        )),
+    })
+    .into()
+}
+
+/// What a grant resolved to: the minted token, and the `TokenTypeURI` naming what
+/// was issued (`issuedTokenType`).
+struct Issued {
+    token: st::IssuedToken,
+    issued_token_type: String,
+}
+
 /// The `CreateTokenWithIAM` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -242,18 +351,259 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTokenWithIAM` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTokenWithIAMErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTokenWithIAM"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let now = SystemTime::now();
+        // "This API is used with Signature Version 4": the caller is an IAM
+        // entity, authenticated by the emulator's own signature verification, and
+        // the request models no `clientSecret` — so this operation authenticates
+        // no client credential of its own. The region the request is addressed to
+        // is what binds the tokens it issues and the tokens it accepts.
+        let region = st::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The grant type is settled first: a grant this operation does not serve
+        // is refused whatever else the request carries. The device-code grant is
+        // `CreateToken`'s and is deliberately NOT in this list.
+        if !st::IAM_SUPPORTED_GRANT_TYPES.contains(&input.grant_type.as_str()) {
+            return Err(unsupported_grant_type(&input.grant_type));
+        }
+
+        // `clientId` "is an application ARN that has OAuth grants configured", so
+        // a token is only ever issued for a client this service knows: one it does
+        // not know has no OAuth grant configured at all, which is an invalid
+        // grant and not a bad credential — the request carries no credential to
+        // reject. The registrations `RegisterClient` mints are this service's only
+        // client registry.
+        let Some(client) = store.clients.get(&input.client_id).cloned() else {
+            return Err(invalid_grant(
+                "the clientId does not name a client with OAuth grants configured in this service",
+            ));
+        };
+        // `grantTypes` on the registration "is used to restrict the token granting
+        // flows available to the client", so a client restricted to other grants
+        // is not authorized for this one.
+        if !client.allows_grant(&input.grant_type) {
+            return Err(unauthorized_client(&input.grant_type));
+        }
+
+        // "Through downscoping, you can use the scopes parameter to request tokens
+        // with reduced permissions compared to the original client application's
+        // permissions or, if applicable, the refresh token's scopes": a requested
+        // scope only ever narrows what the client and the grant being spent
+        // already carry, and a request naming none keeps that grant's own scopes.
+        let requested_scopes = input.scope.clone().unwrap_or_default();
+        if let Some(outside) = requested_scopes
+            .iter()
+            .find(|scope| !client.allows_scope(scope))
+        {
+            return Err(invalid_scope(format!(
+                "scope '{outside}' is not among the scopes configured for the client"
+            )));
+        }
+
+        let issued = match input.grant_type.as_str() {
+            st::GRANT_TYPE_REFRESH_TOKEN => {
+                let Some(refresh_token) = input
+                    .refresh_token
+                    .as_deref()
+                    .filter(|token| !token.is_empty())
+                else {
+                    return Err(invalid_request(format!(
+                        "refreshToken is required for the {} grant",
+                        st::GRANT_TYPE_REFRESH_TOKEN
+                    )));
+                };
+                // A token is usable only against the endpoint of the region that
+                // issued it, so one issued elsewhere is refused with the region
+                // and endpoint the caller may retry against.
+                let issued_elsewhere = store
+                    .refresh_tokens
+                    .get(refresh_token)
+                    .map(|grant| grant.region.clone())
+                    .filter(|issuing_region| issuing_region != &region);
+                if let Some(issuing_region) = issued_elsewhere {
+                    return Err(invalid_request_region(&issuing_region));
+                }
+
+                let narrowed = (!requested_scopes.is_empty()).then(|| requested_scopes.clone());
+                match store.rotate_refresh_token(
+                    refresh_token,
+                    &input.client_id,
+                    &region,
+                    narrowed,
+                    now,
+                ) {
+                    // The refresh-token grant hands the requester an access token.
+                    Ok(token) => Issued {
+                        token,
+                        issued_token_type: st::TOKEN_TYPE_URI_ACCESS_TOKEN.to_string(),
+                    },
+                    Err(st::RefreshFailure::InvalidGrant) => {
+                        return Err(invalid_grant(
+                            "the refreshToken is unknown, has already been rotated, or was not issued to the client named by clientId",
+                        ));
+                    }
+                    Err(st::RefreshFailure::Expired) => {
+                        return Err(expired_token(format!(
+                            "the refreshToken expired {} seconds after it was issued",
+                            st::REFRESH_TOKEN_EXPIRES_IN
+                        )));
+                    }
+                    Err(st::RefreshFailure::ScopeTooBroad) => {
+                        return Err(invalid_scope(
+                            "the requested scope is broader than the scope the refreshToken was granted",
+                        ));
+                    }
+                }
+            }
+            st::GRANT_TYPE_TOKEN_EXCHANGE => {
+                let Some(subject_token) = input
+                    .subject_token
+                    .as_deref()
+                    .filter(|token| !token.is_empty())
+                else {
+                    return Err(invalid_request(format!(
+                        "subjectToken is required for the {} grant",
+                        st::GRANT_TYPE_TOKEN_EXCHANGE
+                    )));
+                };
+                // `subjectTokenType`: "The following value is supported: * Access
+                // Token - urn:ietf:params:oauth:token-type:access_token".
+                if let Some(unsupported) = input
+                    .subject_token_type
+                    .as_deref()
+                    .filter(|kind| *kind != st::TOKEN_TYPE_URI_ACCESS_TOKEN)
+                {
+                    return Err(invalid_request(format!(
+                        "subjectTokenType '{unsupported}' is not supported; the subject of an exchange is a {}",
+                        st::TOKEN_TYPE_URI_ACCESS_TOKEN
+                    )));
+                }
+                // `requestedTokenType` is "the type of token that the requester
+                // can receive"; a request naming none receives an access token.
+                let requested_token_type = input
+                    .requested_token_type
+                    .clone()
+                    .unwrap_or_else(|| st::TOKEN_TYPE_URI_ACCESS_TOKEN.to_string());
+                if !st::ISSUABLE_TOKEN_TYPE_URIS.contains(&requested_token_type.as_str()) {
+                    return Err(invalid_request(format!(
+                        "requestedTokenType '{requested_token_type}' is not supported; supported token types are {}",
+                        st::ISSUABLE_TOKEN_TYPE_URIS.join(", ")
+                    )));
+                }
+
+                // "The value of the subject token must be an access token issued
+                // by IAM Identity Center to a different client or application", so
+                // the exchange resolves the persisted access token it names.
+                let Some(subject) = store.access_tokens.get(subject_token).cloned() else {
+                    return Err(invalid_grant(
+                        "the subjectToken does not name an access token this service issued",
+                    ));
+                };
+                if subject.is_expired(now) {
+                    return Err(expired_token(format!(
+                        "the subjectToken expired {} seconds after it was issued",
+                        subject.expires_in
+                    )));
+                }
+                if subject.region != region {
+                    return Err(invalid_request_region(&subject.region));
+                }
+                if subject.client_id == input.client_id {
+                    return Err(invalid_grant(
+                        "the subjectToken was issued to the client named by clientId; an exchange takes a token issued to a different client",
+                    ));
+                }
+                // Downscoping only: the exchanged token carries no scope the
+                // subject token was not granted. A subject token carrying no scope
+                // restricts nothing, as a registration naming no scope does.
+                let widened = requested_scopes
+                    .iter()
+                    .find(|scope| !subject.scopes.contains(scope))
+                    .filter(|_| !subject.scopes.is_empty());
+                if let Some(outside) = widened {
+                    return Err(invalid_scope(format!(
+                        "scope '{outside}' is broader than the scope the subjectToken was granted"
+                    )));
+                }
+                let scopes = if requested_scopes.is_empty() {
+                    subject.scopes.clone()
+                } else {
+                    requested_scopes.clone()
+                };
+
+                // This grant adds a token to the store, so reclaim what the clock
+                // has already expired and then refuse rather than grow the store
+                // past its bound. The subject token was resolved above, so a
+                // caller presenting an expired one still learns that.
+                store.purge_expired_tokens(now);
+                if !store.has_room_for_token() {
+                    return Err(slow_down());
+                }
+                // A refresh token is minted beside the access token only when the
+                // requester asked to receive one ("Refresh Token -
+                // urn:ietf:params:oauth:token-type:refresh_token").
+                let with_refresh_token = requested_token_type == st::TOKEN_TYPE_URI_REFRESH_TOKEN;
+                let token =
+                    store.issue_token(&input.client_id, &region, scopes, with_refresh_token, now);
+                Issued {
+                    token,
+                    issued_token_type: requested_token_type,
+                }
+            }
+            st::GRANT_TYPE_AUTHORIZATION_CODE => {
+                if input.code.as_deref().is_none_or(str::is_empty) {
+                    return Err(invalid_request(format!(
+                        "code is required for the {} grant",
+                        st::GRANT_TYPE_AUTHORIZATION_CODE
+                    )));
+                }
+                // The code "is obtained through a redirect from IAM Identity Center
+                // to a redirect URI": the authorization endpoint that mints it is
+                // not an operation of this API, so no code presented here was ever
+                // issued by this service.
+                return Err(invalid_grant(
+                    "the authorization code does not name an authorization of this service",
+                ));
+            }
+            st::GRANT_TYPE_JWT_BEARER => {
+                if input.assertion.as_deref().is_none_or(str::is_empty) {
+                    return Err(invalid_request(format!(
+                        "assertion is required for the {} grant",
+                        st::GRANT_TYPE_JWT_BEARER
+                    )));
+                }
+                // The assertion is "the JSON Web Token (JWT) issued by a trusted
+                // token issuer. To authorize a trusted token issuer, configure the
+                // JWT Bearer GrantOptions for the application" — which is done
+                // outside this API, so this service trusts no issuer and no
+                // assertion presented here resolves to a grant.
+                return Err(invalid_grant(
+                    "the assertion was not issued by a trusted token issuer of this service",
+                ));
+            }
+            other => return Err(unsupported_grant_type(other)),
+        };
+
+        Ok(CreateTokenWithIAMOutput {
+            access_token: Some(issued.token.access_token),
+            token_type: Some(issued.token.token_type),
+            expires_in: issued.token.expires_in,
+            refresh_token: issued.token.refresh_token,
+            // `idToken` "identifies the user associated with the issued access
+            // token", and `awsAdditionalDetails.identityContext` is a context
+            // assertion "signed and encrypted by STS" about that same user. The
+            // grants this service resolves are issued to clients and nothing in it
+            // authenticates an Identity Center user, so there is no identity to
+            // describe: both are left absent rather than filled with a value
+            // nothing computed.
+            id_token: issued.token.id_token,
+            issued_token_type: Some(issued.issued_token_type),
+            // "The list of scopes for which authorization is granted" — absent
+            // when the grant carried none.
+            scope: (!issued.token.scopes.is_empty()).then_some(issued.token.scopes),
+            aws_additional_details: None,
+        })
     }
 }

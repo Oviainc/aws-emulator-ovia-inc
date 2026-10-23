@@ -270,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateTokenError::from(CreateTokenErrorModeled::InternalServerException(
@@ -284,6 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = SystemTime::now();
+        // A token this endpoint mints is only usable against this endpoint's own
+        // region, so the region it was issued by is recorded on the token.
+        let region = st::request_region(ctx.parts());
         let mut store = state.lock();
         // Reclaim the tokens whose lifetime has run out. The store's capacity is
         // checked further down, where a new token is actually minted: a refresh
@@ -420,7 +423,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .into());
                 }
-                let token = store.issue_token(&input.client_id, scopes, with_refresh_token, now);
+                let token =
+                    store.issue_token(&input.client_id, &region, scopes, with_refresh_token, now);
                 // An authorization grant is spent by the exchange that succeeded,
                 // so the same device code cannot be redeemed twice. The record was
                 // resolved above under this same lock, so the `None` arm is
@@ -447,7 +451,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )));
                 };
                 let narrowed = (!requested_scopes.is_empty()).then_some(requested_scopes);
-                match store.rotate_refresh_token(refresh_token, &input.client_id, narrowed, now) {
+                match store.rotate_refresh_token(
+                    refresh_token,
+                    &input.client_id,
+                    &region,
+                    narrowed,
+                    now,
+                ) {
                     Ok(token) => token,
                     Err(st::RefreshFailure::InvalidGrant) => {
                         return Err(invalid_grant(

@@ -27,6 +27,8 @@ mod list_configuration_profiles;
 mod list_deployment_strategies;
 #[path = "all/list_environments.rs"]
 mod list_environments;
+#[path = "all/list_extensions.rs"]
+mod list_extensions;
 #[path = "all/resource_deletes.rs"]
 mod resource_deletes;
 #[path = "all/resource_tags.rs"]

@@ -69,7 +69,10 @@ pub(crate) async fn resource_with_a_method(
 /// The integration's own method is the input's `integrationHttpMethod`, whose `jsonName`
 /// is `httpMethod` (`smithy_query(query="operation",operation="PutIntegration")`), so
 /// that is the member name a request body carries — the method's verb is the path label.
-async fn put_integration(
+///
+/// Shared with the sibling `integration_response` suite, which puts integration responses
+/// on the integrations it stands up, so both suites create an integration the same way.
+pub(crate) async fn put_integration(
     gateway: &Gateway,
     api: &str,
     resource: &str,
@@ -85,8 +88,15 @@ async fn put_integration(
         .await
 }
 
-/// `GetIntegration` for `verb` on `resource` of `api`.
-async fn get_integration(gateway: &Gateway, api: &str, resource: &str, verb: &str) -> Answer {
+/// `GetIntegration` for `verb` on `resource` of `api`. Shared with the sibling
+/// `integration_response` suite, which reads the stored responses back through the
+/// integration that owns them.
+pub(crate) async fn get_integration(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+) -> Answer {
     gateway
         .call(
             "GET",

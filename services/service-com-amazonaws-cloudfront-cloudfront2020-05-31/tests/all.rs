@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/distribution_config_defaults.rs"]
 mod distribution_config_defaults;
+#[path = "all/distribution_copy.rs"]
+mod distribution_copy;
 #[path = "all/distribution_delete_gate.rs"]
 mod distribution_delete_gate;
 #[path = "all/distribution_lifecycle.rs"]

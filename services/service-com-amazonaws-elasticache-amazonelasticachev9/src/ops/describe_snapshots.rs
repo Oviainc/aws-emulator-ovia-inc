@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !known {
                     return Err(DescribeSnapshotsErrorModeled::CacheClusterNotFoundFault(
                         CacheClusterNotFoundFault {
-                            message: Some(format!("Cache cluster {id} not found.")),
+                            message: Some(crate::state::cache_cluster_not_found_message(id)),
                         },
                     )
                     .into());

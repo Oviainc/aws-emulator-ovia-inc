@@ -174,23 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::btree_map::Entry::Occupied(entry) => entry,
             ::std::collections::btree_map::Entry::Vacant(_) => {
                 return Err(DeleteSessionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Session with identifier {} was not found.",
-                            input.session_identifier
-                        )),
-                    },
+                    crate::state::session_not_found(&input.session_identifier),
                 )
                 .into());
             }
         };
         if entry.get().status == crate::state::SessionStatus::Active {
-            return Err(DeleteSessionErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Session {} has status ACTIVE and cannot be deleted. End the session first.",
-                    entry.get().session_id
-                )),
-            })
+            return Err(DeleteSessionErrorModeled::ConflictException(
+                crate::state::active_session_not_deletable(),
+            )
             .into());
         }
 

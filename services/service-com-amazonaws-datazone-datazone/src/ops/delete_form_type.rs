@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFormType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFormType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFormType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored metadata form type — every revision of it — from its domain in
+//! [`crate::state`], so the next `GetFormType` answers `ResourceNotFoundException` and a
+//! second `DeleteFormType` on the same identifier does too.
+//!
+//! The documented prerequisites (`smithy_query(query="doc",shape="DeleteFormType")`) are
+//! what this handler enforces: "The form type must exist in the domain" and "The form
+//! type must not be in use by any asset types or assets" / "Any dependencies (such as
+//! linked asset types) must be removed first". A form type some stored asset type or
+//! asset still binds a metadata form to is refused with the `ConflictException` the
+//! operation models, naming the form type and the stored object that prevented the
+//! delete ([`crate::state::deletion_prevented_message`]), and the refusal stores
+//! nothing: the form type is still readable afterwards. Which stored objects count as a
+//! dependency is decided by [`crate::state::Domain::form_type_blocker`], which resolves
+//! every stored reference with [`crate::state::form_type_reference_name`] — the same
+//! rule `CreateAssetType` stores a form entry's type name by.
+//!
+//! The operation's output carries no status member, so there is no in-progress state to
+//! report and nothing for the clock to settle: the removal is complete when the call
+//! returns 204.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +160,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFormType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFormTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFormType"))
+        let _ = ctx;
+        use crate::state::{
+            deletion_prevented_message, graph_object, now_ms, ResourceKind, DOMAIN_STATUS_DELETING,
+            GRAPH_TAG_FORM_TYPE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteFormTypeErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // A domain already being deleted is gone as far as its contents go — the same
+        // liveness rule `GetFormType` reads a form type through.
+        let domain = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .filter(|domain| domain.status != DOMAIN_STATUS_DELETING)
+            .ok_or_else(|| {
+                DeleteFormTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: ResourceKind::Domain.not_found_message(),
+                })
+            })?;
+
+        // "The form type must exist in the domain": a form type is stored under the
+        // `FormTypeName` that IS the `formTypeIdentifier` addressing it, so the
+        // identifier is looked up exactly as `GetFormType` looks it up — an identifier
+        // that reads a form type is the identifier that deletes it, and no other.
+        if !domain.form_types.contains_key(&input.form_type_identifier) {
+            return Err(DeleteFormTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: ResourceKind::FormType.not_found_message(),
+                },
+            )
+            .into());
+        }
+        // "The form type must not be in use by any asset types or assets." Checked
+        // BEFORE the removal, so a refused delete leaves the store exactly as it was,
+        // and the refusal names the stored object that prevented it.
+        if let Some(blocker) = domain.form_type_blocker(&input.form_type_identifier) {
+            let object = graph_object(
+                GRAPH_TAG_FORM_TYPE,
+                &domain.id,
+                &input.form_type_identifier,
+            );
+            let blocker = graph_object(blocker.tag, &domain.id, &blocker.identifier);
+            return Err(DeleteFormTypeErrorModeled::ConflictException(ConflictException {
+                message: deletion_prevented_message(&object, &blocker),
+            })
+            .into());
+        }
+
+        // Nothing addresses one revision of a form type — `DeleteFormType` takes no
+        // `revision` member (smithy_query operation="DeleteFormType") — so the whole
+        // record goes, revisions and all.
+        domain.form_types.remove(&input.form_type_identifier);
+        Ok(DeleteFormTypeOutput {})
     }
 }
