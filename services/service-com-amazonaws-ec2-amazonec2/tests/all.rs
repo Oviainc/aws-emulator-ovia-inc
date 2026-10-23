@@ -98,6 +98,8 @@ mod network_performance_data;
 mod placement_groups;
 #[path = "all/regions.rs"]
 mod regions;
+#[path = "all/route_servers.rs"]
+mod route_servers;
 #[path = "all/secondary_networks.rs"]
 mod secondary_networks;
 #[path = "all/secondary_subnets.rs"]
