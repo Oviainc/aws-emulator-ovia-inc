@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetApplicationRevisions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetApplicationRevisions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers one `RevisionInfo` per revision the request names, read from the
+//! application's revision registry — the same record `GetApplicationRevision`
+//! answers for one revision at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetApplicationRevisions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +82,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many revisions one batch may carry, as the model documents for the member
+/// (`smithy_query(query="doc",shape="BatchGetApplicationRevisionsInput",member="revisions")`:
+/// "The maximum number of `RevisionLocation` objects you can specify is 25").
+///
+/// `RevisionLocationList` itself carries no modelled length, so the bound is this
+/// handler's to enforce, and `BatchLimitExceededException` is the refusal the
+/// model declares for it.
+const MAX_BATCH_REVISIONS: usize = 25;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +164,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetApplicationRevisions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetApplicationRevisionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetApplicationRevisions"))
+        let _ = ctx;
+        // `applicationName` is @required and carries the modelled length and
+        // pattern, so the boundary already refused an absent, empty or malformed
+        // name (`service.rs` words those as this service's
+        // `ApplicationNameRequiredException` / `InvalidApplicationNameException`).
+        let name = input.application_name;
+        let requested = input.revisions;
+
+        // The batch precondition comes FIRST: a batch past the documented maximum
+        // is refused whatever it carries, and nothing about the store is read for
+        // it.
+        if requested.len() > MAX_BATCH_REVISIONS {
+            return Err(
+                BatchGetApplicationRevisionsErrorModeled::BatchLimitExceededException(
+                    BatchLimitExceededException {
+                        message: Some(format!(
+                            "The maximum number of RevisionLocation objects you can specify for \
+                             revisions is {MAX_BATCH_REVISIONS}, but {} were specified",
+                            requested.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A batch has to name at least one revision: an empty list identifies
+        // nothing to look up, which is the same refusal as an absent `revisions`.
+        if requested.is_empty() {
+            return Err(
+                BatchGetApplicationRevisionsErrorModeled::RevisionRequiredException(
+                    RevisionRequiredException {
+                        message: Some(crate::state::REVISION_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Every revision in the batch has to identify an artifact. A
+        // `RevisionLocation` that names no location at all identifies nothing, so
+        // it is the same `InvalidRevisionException` the single-revision
+        // operations answer for one — and the whole batch is refused, since the
+        // answer carries no per-revision error channel to report it in.
+        let keys = requested
+            .iter()
+            .map(crate::state::revision_key)
+            .collect::<Option<Vec<String>>>()
+            .ok_or_else(|| {
+                BatchGetApplicationRevisionsError::from(
+                    BatchGetApplicationRevisionsErrorModeled::InvalidRevisionException(
+                        InvalidRevisionException {
+                            message: Some(
+                                "The revision was specified in an invalid format: it names no S3, \
+                                 GitHub, string or AppSpec content location"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                )
+            })?;
+
+        let found = crate::state::with_state(&*self.engine, |state| {
+            let Some(application) = state.applications.get(&name) else {
+                return Err(
+                    BatchGetApplicationRevisionsErrorModeled::ApplicationDoesNotExistException(
+                        ApplicationDoesNotExistException {
+                            message: Some(crate::state::application_not_found(&name)),
+                        },
+                    ),
+                );
+            };
+            // ONE walk of the deployment index for the whole batch, shared by
+            // every entry's projection, so a batch of 25 revisions costs what a
+            // single read does.
+            let targets = crate::state::target_revision_keys(state, application);
+            // One entry per REQUESTED revision, in the order the request named
+            // them, so a caller can line the answer up with its input — a
+            // repeated revision is answered at each position it appears at. A
+            // revision the registry does not hold is reported with its location
+            // and an empty `GenericRevisionInfo`: this operation models no
+            // "revision does not exist" error, so an unregistered revision does
+            // not refuse the batch.
+            Ok(requested
+                .iter()
+                .zip(&keys)
+                .map(|(asked, key)| RevisionInfo {
+                    // The revision as the application holds it when it holds one
+                    // — `GetApplicationRevision` answers the registered record,
+                    // not the request's spelling of it — and the caller's own
+                    // location for one that is not registered.
+                    revision_location: Some(
+                        application
+                            .revisions
+                            .get(key)
+                            .map_or_else(|| asked.clone(), |stored| stored.revision.clone()),
+                    ),
+                    generic_revision_info: Some(crate::state::generic_revision_info(
+                        application, &targets, key,
+                    )),
+                })
+                .collect::<Vec<_>>())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let revisions = found?;
+        Ok(BatchGetApplicationRevisionsOutput {
+            application_name: Some(name),
+            // `errorMessage` reports "errors that might have occurred during the
+            // API call": this batch either answers every revision it was asked
+            // about or is refused outright with the modelled error for why, so
+            // there is never a partial failure left to describe here.
+            error_message: None,
+            revisions: Some(revisions),
+        })
     }
 }
