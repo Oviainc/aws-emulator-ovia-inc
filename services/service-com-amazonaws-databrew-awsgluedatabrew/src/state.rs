@@ -17,7 +17,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference};
+use crate::ops::types::{
+    Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference, RecipeStep,
+};
 
 /// The message DataBrew answers a `ResourceNotFoundException` with.
 ///
@@ -55,6 +57,30 @@ pub const MAX_JOBS: usize = 1_000;
 
 /// The most schedules this emulator retains, for the reason [`MAX_DATASETS`] gives.
 pub const MAX_SCHEDULES: usize = 1_000;
+
+/// The most recipes this emulator retains, for the reason [`MAX_DATASETS`] gives.
+pub const MAX_RECIPES: usize = 1_000;
+
+/// The version identifier a recipe carries the moment `CreateRecipe` mints it.
+///
+/// A recipe version is `X.Y`, major and minor (model: `Recipe$RecipeVersion` —
+/// "Numeric version (X.Y) ... Both X and Y are required, and \"0.0\" isn't a valid
+/// version"), and publishing takes the next MAJOR number, so the version a recipe is
+/// created at is the first minor of major 0: its working version, which no publish has
+/// frozen yet.
+pub const INITIAL_RECIPE_VERSION: &str = "0.1";
+
+/// The alias naming "the most recent valid version being developed" (model:
+/// `Recipe$RecipeVersion`).
+pub const LATEST_WORKING: &str = "LATEST_WORKING";
+
+/// The alias naming "the most recent published version" (model:
+/// `Recipe$RecipeVersion`).
+pub const LATEST_PUBLISHED: &str = "LATEST_PUBLISHED";
+
+/// The most digits one half of a numeric recipe version may carry: "The maximum
+/// length of each is 6 digits" (model: `Recipe$RecipeVersion`).
+const RECIPE_VERSION_MAX_DIGITS: usize = 6;
 
 /// The most runs this emulator retains for one job. `StartJobRun` inserts a record
 /// on every call and a run has no name of its own to collide on, so retention is
@@ -175,6 +201,49 @@ pub struct ScheduleRecord {
     pub audit: Audit,
 }
 
+/// One version of a stored recipe: the definition that version holds, plus who
+/// created, last modified and published it.
+///
+/// A recipe is versioned (model: `Recipe$RecipeVersion`), so the definition members —
+/// the steps and the description — belong to the VERSION rather than to the recipe:
+/// publishing freezes a version while development carries on from the working one, so
+/// two versions of one recipe answer with two different definitions.
+#[derive(Debug, Clone)]
+pub struct RecipeVersionRecord {
+    pub version: String,
+    pub description: Option<String>,
+    pub steps: Vec<RecipeStep>,
+    /// Set only on a version a publish froze; `None` on a working version, whose
+    /// modelled `PublishedBy`/`PublishedDate` report a publish that has not happened
+    /// (`PublishRecipe`, still its own stub issue, is what sets them).
+    pub published_by: Option<String>,
+    pub published_date: Option<SystemTime>,
+    pub audit: Audit,
+}
+
+/// A stored DataBrew recipe: the versions it holds, plus the members that belong to
+/// the recipe as a whole (its name, ARN, tags and the project it is attached to).
+///
+/// Every recipe has a working version from the moment it is created, and publishing
+/// adds frozen versions beside it, so the two are held apart rather than in one map:
+/// `LATEST_WORKING` and `LATEST_PUBLISHED` name exactly these.
+#[derive(Debug, Clone)]
+pub struct RecipeRecord {
+    pub name: String,
+    /// The project this recipe is attached to, which is a project's doing rather than
+    /// a recipe's: `None` until a project names the recipe (`CreateProject`, still its
+    /// own stub issue, is what sets it).
+    pub project_name: Option<String>,
+    pub tags: BTreeMap<String, String>,
+    pub resource_arn: String,
+    /// The `LATEST_WORKING` version — the one development continues on. Every recipe
+    /// has one.
+    pub working: RecipeVersionRecord,
+    /// The published versions, oldest first, so the last of them is
+    /// `LATEST_PUBLISHED`. Empty until a publish freezes a version.
+    pub published: Vec<RecipeVersionRecord>,
+}
+
 /// A stored run of a job: what `StartJobRun` minted plus the job's shape copied at
 /// start time, so the run still reports what it ran with after the job changes.
 #[derive(Debug, Clone)]
@@ -204,6 +273,8 @@ pub struct ComAmazonawsDatabrewAwsgluedatabrewState {
     pub jobs: BTreeMap<String, JobRecord>,
     /// Schedules by `Name`.
     pub schedules: BTreeMap<String, ScheduleRecord>,
+    /// Recipes by `Name`, each holding its own versions.
+    pub recipes: BTreeMap<String, RecipeRecord>,
     /// Job runs by `(JobName, RunId)`, so one job's runs are a contiguous range.
     pub job_runs: BTreeMap<(String, String), JobRunRecord>,
     /// Monotonic source of the `RunId` values stored in `job_runs`.
@@ -352,6 +423,59 @@ impl DatasetRecord {
             path_options: self.path_options.clone(),
             tags: wire_tags(&self.tags),
             resource_arn: Some(self.resource_arn.clone()),
+        }
+    }
+}
+
+impl RecipeRecord {
+    /// The recipe `principal` created at `at`: one working version holding the
+    /// definition the request carried, and no published version, since a create
+    /// publishes nothing.
+    pub fn created(
+        name: String,
+        resource_arn: String,
+        tags: BTreeMap<String, String>,
+        description: Option<String>,
+        steps: Vec<RecipeStep>,
+        at: SystemTime,
+        principal: String,
+    ) -> Self {
+        Self {
+            name,
+            project_name: None,
+            tags,
+            resource_arn,
+            working: RecipeVersionRecord {
+                version: INITIAL_RECIPE_VERSION.to_string(),
+                description,
+                steps,
+                published_by: None,
+                published_date: None,
+                audit: Audit::created(at, principal),
+            },
+            published: Vec::new(),
+        }
+    }
+
+    /// The version a request's `RecipeVersion` names, or `None` when this recipe holds
+    /// no such version.
+    ///
+    /// The identifier is either a numeric `X.Y` version or one of the two aliases the
+    /// model documents, and omitting it asks for "the latest published version"
+    /// (model: `DescribeRecipeRequest$RecipeVersion`). A recipe nobody has published
+    /// holds exactly one version — its working one — so that is what the omitted
+    /// identifier resolves to; asking for `LATEST_PUBLISHED` by name resolves nothing
+    /// until a publish has frozen a version.
+    pub fn resolve_version(&self, requested: Option<&str>) -> Option<&RecipeVersionRecord> {
+        match requested {
+            None => self.published.last().or(Some(&self.working)),
+            Some(LATEST_PUBLISHED) => self.published.last(),
+            Some(LATEST_WORKING) => Some(&self.working),
+            Some(version) if version == self.working.version => Some(&self.working),
+            Some(version) => self
+                .published
+                .iter()
+                .find(|held| held.version == version),
         }
     }
 }
@@ -513,6 +637,43 @@ pub fn validate_resource_name(member: &str, value: &str) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// Refuse a `RecipeVersion` that is not an identifier DataBrew documents.
+///
+/// The documented forms are a numeric `X.Y` version — major and minor, both required,
+/// each at most 6 digits, neither negative, and not `0.0` — or the `LATEST_WORKING`
+/// and `LATEST_PUBLISHED` aliases (model: `Recipe$RecipeVersion`). The modelled length
+/// bounds (1..16) are already enforced before a handler runs.
+///
+/// `Err` carries the message of the `ValidationException` to answer with.
+pub fn validate_recipe_version(member: &str, value: &str) -> Result<(), String> {
+    if value == LATEST_WORKING || value == LATEST_PUBLISHED {
+        return Ok(());
+    }
+    let malformed = || {
+        Err(format!(
+            "{member} must be a numeric version X.Y, with X and Y of at most \
+             {RECIPE_VERSION_MAX_DIGITS} digits and not 0.0, or {LATEST_WORKING} or \
+             {LATEST_PUBLISHED}"
+        ))
+    };
+    let Some((major, minor)) = value.split_once('.') else {
+        return malformed();
+    };
+    for half in [major, minor] {
+        if half.is_empty()
+            || half.len() > RECIPE_VERSION_MAX_DIGITS
+            || !half.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return malformed();
+        }
+    }
+    // "0.0" isn't a valid version, whichever way it is written.
+    if major.bytes().chain(minor.bytes()).all(|byte| byte == b'0') {
+        return malformed();
+    }
+    Ok(())
 }
 
 /// One field of a DataBrew cron expression: the values and wildcards it accepts.

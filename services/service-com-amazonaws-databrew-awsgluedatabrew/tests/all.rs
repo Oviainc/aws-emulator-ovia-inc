@@ -17,6 +17,8 @@ mod databrew_core_loop;
 mod databrew_harness;
 #[path = "all/dataset_update_lifecycle.rs"]
 mod dataset_update_lifecycle;
+#[path = "all/recipe_lifecycle.rs"]
+mod recipe_lifecycle;
 #[path = "all/schedule_lifecycle.rs"]
 mod schedule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
