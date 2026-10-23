@@ -20,18 +20,18 @@ use service_com_amazonaws_oam_oamservice::state::MAX_LINKS_PER_SOURCE_ACCOUNT;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The access key id most cases sign with. A link belongs to the source account the
 /// request speaks for, and that is read from this credential, so a case that needs a
 /// second source account signs with a second key id.
-const AKID: &str = "AKIDOAMTEST1";
+pub(crate) const AKID: &str = "AKIDOAMTEST1";
 
 /// Every value the modelled `ResourceType` enum declares, in the model's own order.
 ///
 /// From `smithy_query(query="shape",shape="ResourceType")` — the same catalog the
 /// handler checks against.
-const RESOURCE_TYPES: &[&str] = &[
+pub(crate) const RESOURCE_TYPES: &[&str] = &[
     "AWS::CloudWatch::Metric",
     "AWS::Logs::LogGroup",
     "AWS::XRay::Trace",
@@ -42,8 +42,13 @@ const RESOURCE_TYPES: &[&str] = &[
 ];
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// One emulator mounted on `engine`, so a suite that reads or seeds the store
+/// directly holds the very engine the handlers answer from.
+pub(crate) fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -74,7 +79,7 @@ fn request(uri: &str, body: &Value, akid: &str, region: &str) -> http::Request<b
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     uri: &str,
     body: &Value,
@@ -105,12 +110,17 @@ async fn call_as(
 }
 
 /// One call signed by [`AKID`] in `region`.
-async fn call(router: &MultiServiceRouter, uri: &str, body: &Value, region: &str) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    uri: &str,
+    body: &Value,
+    region: &str,
+) -> (u16, Value) {
     call_as(router, uri, body, AKID, region).await
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -122,7 +132,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// A member of a response body, as a string.
-fn field(case: &str, body: &Value, member: &str) -> String {
+pub(crate) fn field(case: &str, body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected a {member} member, got {body:?}"))
@@ -154,7 +164,11 @@ fn assert_arn(case: &str, arn: &str, resource: &str, region: &str) -> String {
 }
 
 /// Create a sink that must succeed, and answer its ARN.
-async fn create_sink_ok(router: &MultiServiceRouter, name: &str, region: &str) -> String {
+pub(crate) async fn create_sink_ok(
+    router: &MultiServiceRouter,
+    name: &str,
+    region: &str,
+) -> String {
     let (status, created) = call(router, "/CreateSink", &json!({ "Name": name }), region).await;
     assert_eq!(
         status, 200,
