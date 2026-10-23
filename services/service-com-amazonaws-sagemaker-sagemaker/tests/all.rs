@@ -53,6 +53,8 @@ mod model_package_group_lifecycle;
 mod model_package_registry;
 #[path = "all/notebook_instance_lifecycle.rs"]
 mod notebook_instance_lifecycle;
+#[path = "all/notebook_instance_stop.rs"]
+mod notebook_instance_stop;
 #[path = "all/notebook_lifecycle_config.rs"]
 mod notebook_lifecycle_config;
 #[path = "all/partner_apps.rs"]

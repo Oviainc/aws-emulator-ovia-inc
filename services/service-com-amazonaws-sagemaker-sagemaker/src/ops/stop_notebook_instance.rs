@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopNotebookInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopNotebookInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopNotebookInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: terminates the ML compute instance of the notebook instance
+//! `crate::state` holds under `NotebookInstanceName`. The status moves to `Stopping`
+//! now and the clock owes `Stopped` at `crate::state::NOTEBOOK_INSTANCE_STOPPED_AFTER`,
+//! which whichever reporting call first runs at or after that instant materialises
+//! (`crate::state::NotebookInstance::settle_status`). Every stored member is left as it
+//! stands — SageMaker AI preserves the ML storage volume — so a later read replays the
+//! same configuration. A name the store does not hold, and an instance in a status with
+//! no ML compute instance to terminate, are refused with a 400 `ValidationException`:
+//! this operation models no errors at all. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +153,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopNotebookInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopNotebookInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopNotebookInstance"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(notebook) = store
+            .notebook_instances
+            .get_mut(&input.notebook_instance_name)
+        else {
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
+                &input.notebook_instance_name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "RecordNotFound. Notebook Instance Arn: {arn}"
+            )));
+        };
+
+        // Whatever the clock already owed is materialised FIRST, so the status this
+        // transition is decided against is the one any reader would have reported at this
+        // instant — an instance whose provisioning came due counts as `InService` here
+        // even if nobody described it in between. That transition is a state change in
+        // its own right, so it leaves the same record a reporting call would leave.
+        let now = ::std::time::SystemTime::now();
+        let arn = notebook.arn.clone();
+        let settled = notebook.settle_status(now);
+
+        // There is nothing to terminate from any other status, so the stop is refused
+        // below and the stored status stands.
+        let stoppable = notebook.is_stoppable();
+        let status = (!stoppable).then(|| notebook.status.clone());
+        if stoppable {
+            notebook.begin_stop(now);
+        }
+        // Every decision is taken under the one guard; it is released before anything is
+        // recorded, so no record is emitted while the store is locked.
+        drop(store);
+
+        if let Some(status) = status {
+            if settled {
+                crate::state::record_state_change(Self::NAME, &arn, ctx);
+            }
+            // The operation models no error, so a refusal is a 400 `ValidationException`.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Status ({status}) not in ({}). Unable to transition to ({}) for Notebook \
+                 Instance ({arn}).",
+                crate::state::NOTEBOOK_INSTANCE_STOPPABLE_STATUSES.join(", "),
+                crate::state::NOTEBOOK_INSTANCE_STATUS_STOPPING,
+            )));
+        }
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(StopNotebookInstanceOutput)
     }
 }

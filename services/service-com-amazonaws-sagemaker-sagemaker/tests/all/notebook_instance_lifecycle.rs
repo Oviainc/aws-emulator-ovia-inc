@@ -24,15 +24,15 @@ use serde_json::{json, Value};
 use super::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
 /// Long enough to pass `state::NOTEBOOK_INSTANCE_IN_SERVICE_AFTER` (300 ms).
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
+pub(crate) const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
 
 /// A valid `InstanceType` for a notebook instance (from the modelled `InstanceType`
 /// enum, `smithy_query shape=InstanceType`).
-const SMALL_INSTANCE: &str = "ml.t3.medium";
+pub(crate) const SMALL_INSTANCE: &str = "ml.t3.medium";
 
 /// A role ARN satisfying `RoleArn`'s modelled pattern
 /// `^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
-const ROLE: &str = "arn:aws:iam::000000000000:role/SageMakerNotebookRole";
+pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/SageMakerNotebookRole";
 
 /// Create a notebook instance named `name` and wait out the span the clock owes its
 /// `Pending` -> `InService` transition, so the reader reports a provisioned instance.
@@ -45,7 +45,7 @@ async fn create_in_service(emulator: &Emulator, name: &str, extra: &Value) -> Va
 }
 
 /// `DescribeNotebookInstance` for `name`, requiring a 200.
-async fn describe(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn describe(emulator: &Emulator, name: &str) -> Value {
     emulator
         .ok(
             "DescribeNotebookInstance",
@@ -56,7 +56,7 @@ async fn describe(emulator: &Emulator, name: &str) -> Value {
 
 /// A `CreateNotebookInstance` body: the three required members plus whatever `extra`
 /// carries.
-fn create_body(name: &str, extra: &Value) -> Value {
+pub(crate) fn create_body(name: &str, extra: &Value) -> Value {
     let mut body = json!({
         "NotebookInstanceName": name,
         "InstanceType": SMALL_INSTANCE,

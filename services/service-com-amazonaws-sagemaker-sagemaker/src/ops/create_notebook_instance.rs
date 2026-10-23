@@ -335,6 +335,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 in_service_at: now + crate::state::NOTEBOOK_INSTANCE_IN_SERVICE_AFTER,
+                // Nothing is stopping yet, so the clock owes no `Stopped` transition.
+                stopped_at: None,
+                // Still provisioning: the instance has no Jupyter endpoint or network
+                // interface to report until the clock's `InService` transition is due.
+                provisioned: false,
             },
         );
         drop(store);

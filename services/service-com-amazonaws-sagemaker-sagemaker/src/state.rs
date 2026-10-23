@@ -2115,8 +2115,9 @@ pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
 // ---------------------------------------------------------------------------
 // Notebook instances
 //
-// Everything `CreateNotebookInstance` and `DescribeNotebookInstance` need, kept in one
-// block: the record the store holds, the spans and defaults those two operations apply,
+// Everything `CreateNotebookInstance`, `StopNotebookInstance` and
+// `DescribeNotebookInstance` need, kept in one
+// block: the record the store holds, the spans and defaults those operations apply,
 // and the two values the create derives (the Jupyter host and the network-interface id).
 // ---------------------------------------------------------------------------
 
@@ -2131,10 +2132,35 @@ pub const NOTEBOOK_INSTANCE_IN_SERVICE_AFTER: Duration = Duration::from_millis(3
 pub const NOTEBOOK_INSTANCE_QUOTA: usize = 1_000;
 
 /// The `NotebookInstanceStatus` member a fresh instance carries. The modelled enum also
-/// carries the stop, update, delete and maintenance states, which this slice does not
+/// carries the update, delete and maintenance states, which this slice does not
 /// reach; `InService` is spelled the same as an endpoint's, so [`STATUS_IN_SERVICE`]
 /// stands for both.
 pub const NOTEBOOK_INSTANCE_STATUS_PENDING: &str = "Pending";
+
+/// The `NotebookInstanceStatus` an instance carries while `StopNotebookInstance` is
+/// terminating its ML compute instance, from the modelled `NotebookInstanceStatus` enum
+/// (`smithy_query shape=NotebookInstanceStatus`).
+pub const NOTEBOOK_INSTANCE_STATUS_STOPPING: &str = "Stopping";
+
+/// The `NotebookInstanceStatus` an instance carries once its ML compute instance is
+/// terminated, from the modelled `NotebookInstanceStatus` enum.
+pub const NOTEBOOK_INSTANCE_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `StopNotebookInstance` the clock owes the `Stopping` -> `Stopped`
+/// transition. Same contract as [`NOTEBOOK_INSTANCE_IN_SERVICE_AFTER`]: a caller that
+/// describes the instance straight after stopping it still observes `Stopping`, one that
+/// waits (as `aws sagemaker wait notebook-instance-stopped` does) observes `Stopped`.
+/// Real SageMaker takes minutes to detach the ML storage volume and terminate the
+/// compute instance; the span is this emulator's own compressed choice, never zero, and
+/// the due instant is stored rather than slept on.
+pub const NOTEBOOK_INSTANCE_STOPPED_AFTER: Duration = Duration::from_millis(300);
+
+/// The statuses a `StopNotebookInstance` transitions an instance OUT of: the ones where
+/// an ML compute instance exists to terminate, because it is serving (`InService`) or
+/// coming up (`Pending`). From every other `NotebookInstanceStatus` there is nothing to
+/// stop, so the call is refused rather than moving the status.
+pub const NOTEBOOK_INSTANCE_STOPPABLE_STATUSES: [&str; 2] =
+    [NOTEBOOK_INSTANCE_STATUS_PENDING, STATUS_IN_SERVICE];
 
 /// The IMDS version a notebook instance reports when the create named none:
 /// `MinimumInstanceMetadataServiceVersion`'s doc says that "when passed as part of
@@ -2207,7 +2233,7 @@ pub struct NotebookInstance {
     pub arn: String,
     pub status: String,
     /// Why the instance failed, for the `Failed` status. No implemented operation moves
-    /// an instance there yet (the stop, start and update operations are still stubs), so
+    /// an instance there yet (the start and update operations are still stubs), so
     /// it is stored `None` and reported absent.
     pub failure_reason: Option<String>,
     /// The Jupyter host the instance serves on, minted at create from the name and the
@@ -2235,32 +2261,77 @@ pub struct NotebookInstance {
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub in_service_at: SystemTime,
+    /// The instant the clock owes the `Stopping` -> `Stopped` transition, set by
+    /// `StopNotebookInstance` and cleared once the transition is materialised. `None`
+    /// while no stop is in flight.
+    pub stopped_at: Option<SystemTime>,
+    /// Whether the instance ever finished provisioning, i.e. the `Pending` ->
+    /// `InService` transition was materialised. Kept beside the status rather than
+    /// derived from it, because a stop that lands while the instance is still `Pending`
+    /// leaves it `Stopping` and then `Stopped` without it ever having come up — and an
+    /// instance that never came up has no Jupyter endpoint and no network interface to
+    /// report (see [`NotebookInstance::is_provisioned`]).
+    pub provisioned: bool,
 }
 
 impl NotebookInstance {
-    /// Materialise the `Pending` -> `InService` transition the clock already owes, the
-    /// way [`Endpoint::settle_status`] does for an endpoint: it was due at
-    /// `in_service_at` whether or not anybody called, and `LastModifiedTime` moves to
-    /// the instant it was due rather than to "now", so the value is stable across later
-    /// reads.
+    /// Materialise whichever status transition the clock already owes, the way
+    /// [`Endpoint::settle_status`] does for an endpoint: `Pending` -> `InService` after a
+    /// create, `Stopping` -> `Stopped` after a stop. Each was due at its stored instant
+    /// whether or not anybody called, and `LastModifiedTime` moves to the instant it was
+    /// due rather than to "now", so the value is stable across later reads.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
         if self.status == NOTEBOOK_INSTANCE_STATUS_PENDING && now >= self.in_service_at {
             self.status = STATUS_IN_SERVICE.to_string();
             self.last_modified_time = self.in_service_at;
+            self.provisioned = true;
+            return true;
+        }
+        // The stop's own due instant, kept beside the create's so a stop that arrives
+        // while the instance is still `Pending` does not later snap back to `InService`.
+        let stop_due = match self.stopped_at {
+            Some(due) if self.status == NOTEBOOK_INSTANCE_STATUS_STOPPING && now >= due => {
+                Some(due)
+            }
+            _ => None,
+        };
+        if let Some(due) = stop_due {
+            self.status = NOTEBOOK_INSTANCE_STATUS_STOPPED.to_string();
+            self.last_modified_time = due;
+            self.stopped_at = None;
             return true;
         }
         false
     }
 
-    /// Whether the instance has finished provisioning, i.e. it is past `Pending`.
+    /// Whether `StopNotebookInstance` has an ML compute instance to terminate, i.e. the
+    /// status is one of [`NOTEBOOK_INSTANCE_STOPPABLE_STATUSES`].
+    pub fn is_stoppable(&self) -> bool {
+        NOTEBOOK_INSTANCE_STOPPABLE_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Start terminating the ML compute instance: the status moves to `Stopping` now and
+    /// the clock owes `Stopped` at [`NOTEBOOK_INSTANCE_STOPPED_AFTER`] from `now`, which
+    /// [`NotebookInstance::settle_status`] materialises once it comes due.
     ///
-    /// A `Pending` instance has no Jupyter endpoint and no network interface to report
-    /// yet, so `DescribeNotebookInstance` omits `Url` and `NetworkInterfaceId` until it
-    /// is provisioned.
+    /// Every stored member is left as it stands — SageMaker preserves the ML storage
+    /// volume across a stop — so a later start replays the same configuration.
+    pub fn begin_stop(&mut self, now: SystemTime) {
+        self.status = NOTEBOOK_INSTANCE_STATUS_STOPPING.to_string();
+        self.last_modified_time = now;
+        self.stopped_at = Some(now + NOTEBOOK_INSTANCE_STOPPED_AFTER);
+    }
+
+    /// Whether the instance has finished provisioning, i.e. the `Pending` ->
+    /// `InService` transition the create owed has been materialised.
+    ///
+    /// An instance that has not come up has no Jupyter endpoint and no network interface
+    /// to report, so `DescribeNotebookInstance` omits `Url` and `NetworkInterfaceId`
+    /// until it is provisioned — including for one stopped before it ever came up.
     pub fn is_provisioned(&self) -> bool {
-        self.status != NOTEBOOK_INSTANCE_STATUS_PENDING
+        self.provisioned
     }
 }
 
