@@ -15,5 +15,7 @@
 mod error_message_rendering;
 #[path = "all/graph_lifecycle.rs"]
 mod graph_lifecycle;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

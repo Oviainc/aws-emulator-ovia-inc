@@ -218,12 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = request_region(ctx);
         let now = ::std::time::Instant::now();
 
-        // Nothing caller-sized reaches the store unchecked. The model's own `@length`
-        // traits on `TagMap`/`TagKey`/`TagValue` refuse these at the boundary too; the
-        // check is repeated at the growth site so the bound on what one record stores
-        // lives beside the insert that stores it.
+        // Nothing caller-sized reaches the store unchecked — the bound on what one
+        // record's tags may hold is stated once, in `crate::state`, and is reached by
+        // every operation that accepts a `tags` map.
         if let Some(tags) = input.tags.as_ref() {
-            if let Err(message) = bound_tags(tags) {
+            if let Err(message) = crate::state::bound_tags(tags) {
                 return Err(CreateGraphErrorModeled::ValidationException(ValidationException {
                     message,
                     reason: Some("CONSTRAINT_VIOLATION".to_string()),
@@ -326,37 +325,6 @@ fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
         .map_or_else(|| "us-east-1".to_string(), |scope| scope.region)
 }
 
-/// Refuse a `tags` map that would put more into one stored record than it may hold
-/// (`crate::state::MAX_TAGS` entries of at most `MAX_TAG_KEY_CHARS` /
-/// `MAX_TAG_VALUE_CHARS` characters). `Err` carries the message, naming the member and
-/// the bound it broke, for the caller to fix the request from.
-fn bound_tags(tags: &::std::collections::HashMap<String, String>) -> Result<(), String> {
-    if tags.len() > crate::state::MAX_TAGS {
-        return Err(format!(
-            "tags may carry at most {} entries, got {}",
-            crate::state::MAX_TAGS,
-            tags.len()
-        ));
-    }
-    for (key, value) in tags {
-        let key_chars = key.chars().count();
-        if key_chars > crate::state::MAX_TAG_KEY_CHARS {
-            return Err(format!(
-                "a tag key may be at most {} characters, got {key_chars}",
-                crate::state::MAX_TAG_KEY_CHARS
-            ));
-        }
-        let value_chars = value.chars().count();
-        if value_chars > crate::state::MAX_TAG_VALUE_CHARS {
-            return Err(format!(
-                "the value of tag '{key}' may be at most {} characters, got {value_chars}",
-                crate::state::MAX_TAG_VALUE_CHARS
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Whether `name` satisfies the modelled `GraphName` pattern
 /// `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`, read literally: no `g-` prefix, a lowercase
 /// letter first, then lowercase letters, digits and single interior hyphens, and no
@@ -389,62 +357,7 @@ fn graph_name_is_well_formed(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bound_tags, graph_name_is_well_formed};
-
-    /// The bound on what one stored record may hold, at the limit and one past it for
-    /// the entry count, the key length and the value length.
-    #[test]
-    fn tag_bounds_accept_the_limit_and_refuse_one_past_it() {
-        let map = |pairs: Vec<(String, String)>| -> ::std::collections::HashMap<String, String> {
-            pairs.into_iter().collect()
-        };
-        let many = |count: usize| {
-            map((0..count)
-                .map(|index| (format!("key{index}"), "v".to_string()))
-                .collect())
-        };
-
-        // (case, tags, accepted)
-        let cases: Vec<(&str, ::std::collections::HashMap<String, String>, bool)> = vec![
-            ("no tags", map(Vec::new()), true),
-            ("at the entry limit", many(crate::state::MAX_TAGS), true),
-            ("one entry past the limit", many(crate::state::MAX_TAGS + 1), false),
-            (
-                "a key at the length limit",
-                map(vec![("k".repeat(crate::state::MAX_TAG_KEY_CHARS), "v".to_string())]),
-                true,
-            ),
-            (
-                "a key one character past the limit",
-                map(vec![("k".repeat(crate::state::MAX_TAG_KEY_CHARS + 1), "v".to_string())]),
-                false,
-            ),
-            (
-                "a value at the length limit",
-                map(vec![(
-                    "k".to_string(),
-                    "v".repeat(crate::state::MAX_TAG_VALUE_CHARS),
-                )]),
-                true,
-            ),
-            (
-                "a value one character past the limit",
-                map(vec![(
-                    "k".to_string(),
-                    "v".repeat(crate::state::MAX_TAG_VALUE_CHARS + 1),
-                )]),
-                false,
-            ),
-        ];
-        for (case, tags, accepted) in cases {
-            let actual = bound_tags(&tags);
-            assert_eq!(
-                actual.is_ok(),
-                accepted,
-                "case {case:?}: expected accepted={accepted}, got {actual:?}"
-            );
-        }
-    }
+    use super::graph_name_is_well_formed;
 
     /// The name rule, with a row for each clause of the modelled pattern
     /// `^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`
