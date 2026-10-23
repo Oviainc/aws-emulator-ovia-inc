@@ -45,9 +45,10 @@ use crate::ops::types::{
     DeploymentController, EphemeralStorage, Failure, KeyValuePair, LoadBalancer,
     NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping,
     ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
-    ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration, Tag,
-    Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride, ThresholdConfiguration,
-    VersionInfo, Volume, VpcLatticeConfiguration, CLUSTER_SETTING_NAME_VALUES,
+    ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration,
+    Setting, Tag, Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride,
+    ThresholdConfiguration, VersionInfo, Volume, VpcLatticeConfiguration,
+    CLUSTER_SETTING_NAME_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -71,13 +72,197 @@ pub const DEFAULT_CLUSTER_NAME: &str = "default";
 /// and CloudWatch Container Insights is OFF until one of those turns it on, so the
 /// account default a cluster inherits here is `disabled`.
 ///
-/// TODO: `PutAccountSetting`/`PutAccountSettingDefault` are scaffold stubs (501), so
-/// there is no account-settings store to read the inherited value from yet. When those
-/// writes land — they are part of the related open issue on unpersisted ECS cluster
-/// mutations — [`ClusterRecord::effective_settings`] must read the account default from
-/// that store and fall back to this constant, or a cluster will keep reporting
-/// `disabled` after an account default turned Container Insights on.
+/// It is the SERVICE default for the `containerInsights` account setting (see
+/// [`ACCOUNT_SETTINGS`]): a cluster that set nothing reports the account setting in
+/// effect, which falls back to this value until `PutAccountSetting` or
+/// `PutAccountSettingDefault` stores one — see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`].
 pub const CLUSTER_SETTING_DEFAULT_VALUE: &str = "disabled";
+
+/// One Amazon ECS ACCOUNT SETTING: the name `SettingName` defines, the value in effect
+/// until somebody stores one, who manages it (`Setting$type`), and the values a write
+/// of it accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountSettingSpec {
+    /// The setting name, one of `SettingName`
+    /// (`smithy_query(query="shape", shape="SettingName")`).
+    pub name: &'static str,
+    /// The value this setting has for an account that has never written it.
+    pub default_value: &'static str,
+    /// `Setting$type`: "Indicates whether Amazon Web Services manages the account
+    /// setting, or if the user manages it" — one of `SettingType`.
+    pub setting_type: &'static str,
+    /// The values `PutAccountSetting`/`PutAccountSettingDefault` accept for this name,
+    /// from the `value` member's doc.
+    pub accepted_values: &'static [&'static str],
+}
+
+/// `Setting$type` for a setting the customer writes.
+pub const SETTING_TYPE_USER: &str = "user";
+
+/// `Setting$type` for a setting Amazon Web Services manages: "`aws_managed` account
+/// settings are read-only, as Amazon Web Services manages such on the customer's
+/// behalf. Currently, the `guardDutyActivate` account setting is the only one Amazon
+/// Web Services manages."
+pub const SETTING_TYPE_AWS_MANAGED: &str = "aws_managed";
+
+/// The values a toggle account setting accepts. `PutAccountSetting$value`: "Accepted
+/// values are `enabled`, `disabled`, `enhanced`, `on`, and `off`" — `enhanced` belongs
+/// to `containerInsights` alone, which has its own entry below.
+const SETTING_TOGGLE_VALUES: &[&str] = &["enabled", "disabled", "on", "off"];
+
+/// The value an opt-in feature setting has until a write turns it on. Every such
+/// setting's own doc in `PutAccountSetting$name` describes what changes "when
+/// modified"/"if turned on", so the account starts out with the feature off.
+const SETTING_OFF: &str = "disabled";
+
+/// The value the ARN-and-resource-id-format settings report. Their shared doc in
+/// `PutAccountSetting$name`: "You must turn on this setting to use Amazon ECS features
+/// such as resource tagging" — and this emulator DOES tag every resource it creates and
+/// emits the long ARN format for all of them, so the setting that behaviour requires is
+/// on.
+const SETTING_ON: &str = "enabled";
+
+/// Every account setting this service has, keyed by the `SettingName` enum
+/// (`smithy_query(query="shape", shape="SettingName")`). `ListAccountSettings` reports
+/// one effective entry per row, and a write is checked against the row's
+/// `accepted_values`.
+///
+/// A default_value is the value AWS documents for an account that never wrote the
+/// setting; the citation is on each row.
+pub const ACCOUNT_SETTINGS: &[AccountSettingSpec] = &[
+    // "When modified, the Amazon Resource Name (ARN) and resource ID format of the
+    // resource type ... is affected. ... You must turn on this setting to use Amazon ECS
+    // features such as resource tagging."
+    AccountSettingSpec {
+        name: "serviceLongArnFormat",
+        default_value: SETTING_ON,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    AccountSettingSpec {
+        name: "taskLongArnFormat",
+        default_value: SETTING_ON,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    AccountSettingSpec {
+        name: "containerInstanceLongArnFormat",
+        default_value: SETTING_ON,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    // "If `awsvpcTrunking` is turned on, any new container instances that support the
+    // feature are launched have the increased ENI limits available to them" — an opt-in,
+    // and this emulator applies no increased ENI limit to a registered instance.
+    AccountSettingSpec {
+        name: "awsvpcTrunking",
+        default_value: SETTING_OFF,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    // "To use Container Insights with enhanced observability, set the
+    // `containerInsights` account setting to `enhanced`. To use Container Insights, set
+    // the `containerInsights` account setting to `enabled`" — so the three values
+    // `ClusterSetting$value` documents, off by default
+    // ([`CLUSTER_SETTING_DEFAULT_VALUE`]).
+    AccountSettingSpec {
+        name: "containerInsights",
+        default_value: CLUSTER_SETTING_DEFAULT_VALUE,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: &CLUSTER_SETTING_VALUES,
+    },
+    // Fargate FIPS-140 compliance is an opt-in an account turns on; this emulator serves
+    // no FIPS endpoint.
+    AccountSettingSpec {
+        name: "fargateFIPSMode",
+        default_value: SETTING_OFF,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    // "Amazon ECS is introducing tagging authorization for resource creation. ...
+    // Therefore, you must grant explicit permissions to use the `ecs:TagResource`
+    // action" — an opt-in, and this emulator runs no extra tag authorization.
+    AccountSettingSpec {
+        name: "tagResourceAuthorization",
+        default_value: SETTING_OFF,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    // `PutAccountSetting$value`: "When you specify `fargateTaskRetirementWaitPeriod` for
+    // the `name`, the following are the valid values: `0` ... `7` ... `14`". The wait
+    // Amazon Web Services applies until an account changes it is 7 calendar days
+    // ("Amazon Web Services Fargate task maintenance", the doc this member links).
+    AccountSettingSpec {
+        name: "fargateTaskRetirementWaitPeriod",
+        default_value: "7",
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: &["0", "7", "14"],
+    },
+    // "The `guardDutyActivate` parameter is read-only in Amazon ECS and indicates
+    // whether Amazon ECS Runtime Monitoring is enabled or disabled by your security
+    // administrator ... Amazon GuardDuty controls this account setting on your behalf" —
+    // so it is `aws_managed`, and nothing in this emulator turns Runtime Monitoring on.
+    AccountSettingSpec {
+        name: "guardDutyActivate",
+        default_value: SETTING_OFF,
+        setting_type: SETTING_TYPE_AWS_MANAGED,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+    // "The `defaultLogDriverMode` setting supports two values: `blocking` and
+    // `non-blocking`. ... On June 25, 2025, Amazon ECS changed the default log driver
+    // mode from `blocking` to `non-blocking`".
+    AccountSettingSpec {
+        name: "defaultLogDriverMode",
+        default_value: "non-blocking",
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: &["blocking", "non-blocking"],
+    },
+    // "Use `fargateEventWindows` to use EC2 Event Windows associated with Fargate tasks
+    // to configure time windows for task retirement" — an opt-in, and this emulator
+    // models no event window.
+    AccountSettingSpec {
+        name: "fargateEventWindows",
+        default_value: SETTING_OFF,
+        setting_type: SETTING_TYPE_USER,
+        accepted_values: SETTING_TOGGLE_VALUES,
+    },
+];
+
+/// The row [`ACCOUNT_SETTINGS`] holds for `name`, or `None` when the name is not an
+/// account setting. A `name` member that reached a handler targets the closed
+/// `SettingName` enum, so `None` means this catalog is missing a row the model defines —
+/// which the crate's tests pin.
+pub fn account_setting_spec(name: &str) -> Option<&'static AccountSettingSpec> {
+    ACCOUNT_SETTINGS
+        .iter()
+        .find(|setting| setting.name == name)
+}
+
+/// The largest `maxResults` `ListAccountSettings` accepts, and the page size it uses
+/// when the request gives none. That member's doc: "This value can be between 1 and 10.
+/// If this parameter isn't used, then ListAccountSettings returns up to 10 results and a
+/// nextToken value if applicable."
+pub const ACCOUNT_SETTINGS_PAGE_SIZE: usize = 10;
+
+/// How many DISTINCT principals this emulator holds explicit account settings for.
+/// EMULATOR-CHOSEN, for the same reason as [`MAX_CLUSTERS`]: `PutAccountSetting` takes
+/// the principal from the request, so without a cap a caller could grow the in-memory
+/// store without limit.
+pub const MAX_ACCOUNT_SETTING_PRINCIPALS: usize = 64;
+
+/// The longest `principalArn` an account-setting write may name. EMULATOR-CHOSEN, so one
+/// accepted write cannot carry an arbitrarily long key into the store: IAM bounds a
+/// principal's name at 64 characters and its path at 512, so no ARN Amazon Web Services
+/// itself mints comes close.
+pub const MAX_PRINCIPAL_ARN_LENGTH: usize = 1024;
+
+/// What [`ComAmazonawsEcsAmazonec2containerservicev20141113State::put_account_setting`]
+/// answers when storing a setting for a principal this emulator does not hold one for
+/// yet would push it past [`MAX_ACCOUNT_SETTING_PRINCIPALS`]: nothing was written, so
+/// the caller refuses the whole request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountSettingCapacityExceeded;
 
 /// How long a task takes to cross one lifecycle boundary (`PENDING` -> `RUNNING`,
 /// `DEACTIVATING` -> `STOPPED`). EMULATOR-CHOSEN — AWS publishes no duration for it —
@@ -561,26 +746,15 @@ impl ClusterRecord {
 }
 
 impl ClusterRecord {
-    /// The cluster's EFFECTIVE settings: one entry for every setting name the model
-    /// defines (`ClusterSettingName`), carrying the value stored for this cluster when
-    /// one was set and the inherited account default ([`CLUSTER_SETTING_DEFAULT_VALUE`])
-    /// otherwise. `Cluster$settings` is "the settings for the cluster. This parameter
-    /// indicates whether CloudWatch Container Insights is on or off for a cluster", so a
-    /// cluster that set nothing still has an answer to that question and reports it.
-    pub fn effective_settings(&self) -> Vec<ClusterSetting> {
-        CLUSTER_SETTING_NAME_VALUES
+    /// The value stored for one setting NAME on this cluster, or `None` when the cluster
+    /// never set it — in which case the cluster inherits the account setting of that
+    /// name (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_effective_settings`]).
+    pub fn setting_value(&self, name: &str) -> Option<String> {
+        self.settings
             .iter()
-            .map(|name| ClusterSetting {
-                name: Some((*name).to_string()),
-                value: Some(
-                    self.settings
-                        .iter()
-                        .find(|setting| setting.name.as_deref() == Some(*name))
-                        .and_then(|setting| setting.value.clone())
-                        .unwrap_or_else(|| CLUSTER_SETTING_DEFAULT_VALUE.to_string()),
-                ),
-            })
-            .collect()
+            .find(|setting| setting.name.as_deref() == Some(name))
+            .and_then(|setting| setting.value.clone())
     }
 }
 
@@ -1269,6 +1443,16 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// cluster ("Service names must be unique within a cluster, but you can have
     /// similarly named services in multiple clusters"), which is exactly this key.
     pub services: HashMap<(String, String), ServiceRecord>,
+    /// `(principalArn, settingName)` -> the account setting value stored for that ONE
+    /// principal by `PutAccountSetting`. An entry here shadows the account-wide default
+    /// for that principal alone (`ListAccountSettings$effectiveSettings`: "the account
+    /// settings for the root user or the default setting for the `principalArn`").
+    pub principal_account_settings: HashMap<(String, String), String>,
+    /// `settingName` -> the ACCOUNT-WIDE value, as `PutAccountSettingDefault`
+    /// ("Modifies an account setting for all users on an account for whom no individual
+    /// account setting has been specified") or a `PutAccountSetting` on the root user
+    /// stored it. A name with no entry takes its [`ACCOUNT_SETTINGS`] default.
+    pub account_setting_defaults: HashMap<String, String>,
     /// Monotonic source of task ids, so every task ARN is distinct.
     next_task_seq: u64,
     /// Monotonic source of container ids, so every container ARN is distinct.
@@ -2067,6 +2251,129 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .collect()
     }
 
+    /// The value stored for `name` for ONE principal, or `None` when that principal has
+    /// no setting of that name.
+    ///
+    /// The ROOT user's own settings ARE the account-wide defaults — `PutAccountSetting`
+    /// `principalArn`: "If you specify the root user, it modifies the account setting
+    /// for all users ... unless an individual account setting was specified" — so a
+    /// lookup for the root principal reads the defaults map.
+    pub fn explicit_account_setting(&self, principal_arn: &str, name: &str) -> Option<String> {
+        if principal_arn == root_principal_arn() {
+            return self.account_setting_defaults.get(name).cloned();
+        }
+        self.principal_account_settings
+            .get(&(principal_arn.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    /// The ACCOUNT-WIDE value of `name`: what a write of the default (or of the root
+    /// user's setting) stored, falling back to the [`ACCOUNT_SETTINGS`] default for a
+    /// name the account has never written.
+    pub fn default_account_setting(&self, name: &str) -> String {
+        self.account_setting_defaults
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| {
+                account_setting_spec(name)
+                    // Unreachable for a `name` off the closed `SettingName` enum; a name
+                    // outside the catalog is reported off rather than invented.
+                    .map_or(SETTING_OFF, |setting| setting.default_value)
+                    .to_string()
+            })
+    }
+
+    /// The EFFECTIVE account setting of `name` for `principal_arn`, and the principal it
+    /// comes from: the principal's own value when it has one, otherwise the account-wide
+    /// default, which belongs to the root user.
+    ///
+    /// `ListAccountSettings$effectiveSettings`: "If `true`, the account settings for the
+    /// root user or the default setting for the `principalArn` are returned."
+    pub fn effective_account_setting(&self, principal_arn: &str, name: &str) -> ResolvedSetting {
+        match self.explicit_account_setting(principal_arn, name) {
+            Some(value) => ResolvedSetting {
+                value,
+                principal_arn: principal_arn.to_string(),
+            },
+            None => ResolvedSetting {
+                value: self.default_account_setting(name),
+                principal_arn: root_principal_arn(),
+            },
+        }
+    }
+
+    /// Store the account setting `name` for ONE principal, as `PutAccountSetting` does,
+    /// and answer the setting it reports.
+    ///
+    /// A write against the ROOT user is a write of the account-wide default, because the
+    /// root user's settings are those defaults (see [`Self::explicit_account_setting`]).
+    ///
+    /// REFUSED with [`AccountSettingCapacityExceeded`], storing nothing, when the
+    /// principal is one this emulator holds no setting for yet and
+    /// [`MAX_ACCOUNT_SETTING_PRINCIPALS`] are already stored: the principal comes from
+    /// the request, so the number of them a caller can leave behind is bounded here the
+    /// way every other caller-driven map in this store is.
+    pub fn put_account_setting(
+        &mut self,
+        principal_arn: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<Setting, AccountSettingCapacityExceeded> {
+        if principal_arn == root_principal_arn() {
+            return Ok(self.put_account_setting_default(name, value));
+        }
+        let principals: HashSet<&str> = self
+            .principal_account_settings
+            .keys()
+            .map(|(principal, _)| principal.as_str())
+            .collect();
+        if !principals.contains(principal_arn)
+            && principals.len() >= MAX_ACCOUNT_SETTING_PRINCIPALS
+        {
+            return Err(AccountSettingCapacityExceeded);
+        }
+        self.principal_account_settings.insert(
+            (principal_arn.to_string(), name.to_string()),
+            value.to_string(),
+        );
+        Ok(setting_view(name, value, principal_arn))
+    }
+
+    /// Store the ACCOUNT-WIDE default of `name`, as `PutAccountSettingDefault` does, and
+    /// answer the setting it reports: one that belongs to the root user, since the
+    /// default applies "for all users on an account for whom no individual account
+    /// setting has been specified".
+    pub fn put_account_setting_default(&mut self, name: &str, value: &str) -> Setting {
+        self.account_setting_defaults
+            .insert(name.to_string(), value.to_string());
+        setting_view(name, value, &root_principal_arn())
+    }
+
+    /// The cluster's EFFECTIVE settings: one entry for every setting name the model
+    /// defines (`ClusterSettingName`), carrying the value stored for this cluster when
+    /// one was set and the account setting of that name otherwise.
+    ///
+    /// `ClusterSetting$value`: "If a cluster value is specified, it will override the
+    /// `containerInsights` value set with PutAccountSetting or PutAccountSettingDefault"
+    /// — so what a cluster that set nothing reports is exactly the account setting in
+    /// effect for the caller this emulator authenticates every request as
+    /// ([`caller_identity_arn`]), which falls back to the account-wide default and then
+    /// to the setting's own default. `Cluster$settings` "indicates whether CloudWatch
+    /// Container Insights is on or off for a cluster", so a cluster that set nothing
+    /// still has an answer to that question and reports it.
+    pub fn cluster_effective_settings(&self, cluster: &ClusterRecord) -> Vec<ClusterSetting> {
+        let principal_arn = caller_identity_arn();
+        CLUSTER_SETTING_NAME_VALUES
+            .iter()
+            .map(|name| ClusterSetting {
+                name: Some((*name).to_string()),
+                value: Some(cluster.setting_value(name).unwrap_or_else(|| {
+                    self.effective_account_setting(&principal_arn, name).value
+                })),
+            })
+            .collect()
+    }
+
     /// The `Cluster` a cluster-returning operation reports.
     ///
     /// The counters are COMPUTED from the task, container-instance and service maps, so
@@ -2110,7 +2417,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // rather than absent and a client cannot mistake "not asked for" for "none
             // stored".
             settings: Some(if fields.settings {
-                cluster.effective_settings()
+                self.cluster_effective_settings(cluster)
             } else {
                 Vec::new()
             }),
@@ -2150,7 +2457,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// What the cluster is CONFIGURED to be is always materialised: `settings` (the
     /// effective value of every setting name the model defines, see
-    /// [`ClusterRecord::effective_settings`] — `Cluster$settings` "indicates whether
+    /// [`Self::cluster_effective_settings`] — `Cluster$settings` "indicates whether
     /// CloudWatch Container Insights is on or off for a cluster", which is true of a
     /// cluster whoever reads it) and `configuration` ("the execute command and managed
     /// storage configuration for the cluster"), so a client can read back the cluster it
@@ -2428,6 +2735,83 @@ pub fn cluster_arn(region: &str, name: &str) -> String {
 /// access key id is not one.
 pub fn caller_identity_arn() -> String {
     ::engine::emulator_arn("iam", "", "user/emulator")
+}
+
+/// The ARN of the account's ROOT user — the principal whose account settings are the
+/// account-wide defaults (`PutAccountSettingDefault`: "Modifies an account setting for
+/// all users on an account for whom no individual account setting has been specified").
+pub fn root_principal_arn() -> String {
+    ::engine::emulator_arn("iam", "", "root")
+}
+
+/// An account setting value together with the principal it came from.
+#[derive(Debug, Clone)]
+pub struct ResolvedSetting {
+    pub value: String,
+    pub principal_arn: String,
+}
+
+/// The `Setting` a response reports for one name, value and principal.
+///
+/// `Setting$type` comes from the catalog rather than the request: it "indicates whether
+/// Amazon Web Services manages the account setting, or if the user manages it", which is
+/// a property of the NAME ([`ACCOUNT_SETTINGS`]).
+pub fn setting_view(name: &str, value: &str, principal_arn: &str) -> Setting {
+    Setting {
+        name: Some(name.to_string()),
+        value: Some(value.to_string()),
+        principal_arn: Some(principal_arn.to_string()),
+        r#type: Some(
+            account_setting_spec(name)
+                .map_or(SETTING_TYPE_USER, |setting| setting.setting_type)
+                .to_string(),
+        ),
+    }
+}
+
+/// Check the `value` a write of the account setting `name` carries against the values
+/// that name accepts ([`ACCOUNT_SETTINGS`]), answering the message an
+/// `InvalidParameterException` carries when it is outside them.
+///
+/// Shared by `PutAccountSetting` and `PutAccountSettingDefault`, so the same value is
+/// accepted or refused whichever of them a client calls.
+pub fn validate_account_setting_value(name: &str, value: &str) -> Result<(), String> {
+    let Some(spec) = account_setting_spec(name) else {
+        // Unreachable from the wire: `name` targets the closed `SettingName` enum, which
+        // the request walk has already checked.
+        return Err(format!("name must be an Amazon ECS account setting; got {name:?}"));
+    };
+    if !spec.accepted_values.contains(&value) {
+        return Err(format!(
+            "value for {name} must be one of {}; got {value:?}",
+            spec.accepted_values.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `principal_arn` is a principal an account setting may be written for, and a
+/// key this store may hold.
+///
+/// `PutAccountSetting$principalArn`: "The ARN of the principal, which can be a user,
+/// role, or the root user" — an IAM ARN, which is the six colon-separated fields
+/// `arn:<partition>:iam::<account>:<resource>` ([`::engine::emulator_arn`] builds every
+/// one this emulator emits the same way, with the empty region a global service carries).
+/// A value that is not one names no principal a setting could belong to, and is refused
+/// before it can become a key — as is one longer than [`MAX_PRINCIPAL_ARN_LENGTH`].
+pub fn is_principal_arn(principal_arn: &str) -> bool {
+    if principal_arn.len() > MAX_PRINCIPAL_ARN_LENGTH {
+        return false;
+    }
+    // The resource is the LAST field, so it keeps any colon of its own.
+    let fields: Vec<&str> = principal_arn.splitn(6, ':').collect();
+    fields.len() == 6
+        && fields[0] == "arn"
+        && !fields[1].is_empty()
+        && fields[2] == "iam"
+        && fields[3].is_empty()
+        && !fields[4].is_empty()
+        && !fields[5].is_empty()
 }
 
 /// The ARN of a task-definition revision:
