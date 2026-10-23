@@ -148,6 +148,69 @@ fn is_transfer_arn(value: &str, kind: &str, id_form: fn(&str) -> bool) -> bool {
         .is_some_and(id_form)
 }
 
+/// An Amazon Bedrock AgentCore identifier splits at its LAST `-` into a label and a
+/// ten-character suffix: every one of the AgentCore control-plane model's identifier
+/// patterns ends in `-[a-zA-Z0-9]{10}` (`MemoryId`, `AgentRuntimeId`) or
+/// `-[0-9a-z]{10}` (`GatewayId`).
+fn agentcore_id_parts(value: &str) -> Option<(&str, &str)> {
+    let (label, suffix) = value.rsplit_once('-')?;
+    (suffix.len() == 10
+        && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+        && !label.is_empty())
+    .then_some((label, suffix))
+}
+
+/// Whether `value` is a `MemoryId`: `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`,
+/// `length 12..`.
+fn is_agentcore_memory_id(value: &str) -> bool {
+    agentcore_id_parts(value).is_some_and(|(label, _)| {
+        value.len() >= 12
+            && label.len() <= 100
+            && label.starts_with(|c: char| c.is_ascii_alphabetic())
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+/// Whether `value` is an `AgentRuntimeId`:
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,99}-[a-zA-Z0-9]{10}$` — a label with NO `-` in it, and at
+/// most 47 characters of it inside `AgentRuntimeArn`.
+fn is_agentcore_runtime_id(value: &str) -> bool {
+    agentcore_id_parts(value).is_some_and(|(label, _)| {
+        label.len() <= 48
+            && label.starts_with(|c: char| c.is_ascii_alphabetic())
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Whether `value` is a `GatewayId`: `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$` — lower case
+/// only, with no doubled or trailing `-` in the label, and at most 48 characters of it
+/// inside `GatewayArn`.
+fn is_agentcore_gateway_id(value: &str) -> bool {
+    agentcore_id_parts(value).is_some_and(|(label, suffix)| {
+        label.len() <= 48
+            && suffix.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && !label.contains("--")
+            && label
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-')
+    })
+}
+
+/// Whether `value` is the ARN of an AgentCore resource of type `kind` whose id satisfies
+/// `id_form` — `arn:aws:bedrock-agentcore:<region>:<account>:<kind>/<id>`, the form every
+/// `arnReference` in the AgentCore control-plane model publishes.
+fn is_agentcore_arn(value: &str, kind: &str, id_form: fn(&str) -> bool) -> bool {
+    value
+        .strip_prefix(&format!(
+            "arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:{kind}/"
+        ))
+        .is_some_and(id_form)
+}
+
 /// One row of the outputs table: a template, the parameters the create supplies, and
 /// what each declared output must report.
 struct OutputCase {
@@ -457,6 +520,139 @@ fn output_cases() -> Vec<OutputCase> {
                         check: |value| {
                             is_transfer_arn(value, "workflow", is_transfer_workflow_id)
                         },
+                    },
+                ),
+            ],
+        },
+        OutputCase {
+            // The AgentCore deployment case: a memory and a workload identity, whose
+            // identifiers the OWNING SERVICE assigns, so the rule is the documented form.
+            case: "an agentcore memory and workload identity: the ids their service assigns",
+            stack_name: "agentcore-memory",
+            template: concat!(
+                "Resources:\n",
+                "  Memory:\n",
+                "    Type: AWS::BedrockAgentCore::Memory\n",
+                "    Properties:\n",
+                "      EventExpiryDuration: 30\n",
+                "  Identity:\n",
+                "    Type: AWS::BedrockAgentCore::WorkloadIdentity\n",
+                "    Properties:\n",
+                "      Name: probe-workload\n",
+                "Outputs:\n",
+                "  MemoryId:\n",
+                "    Value: !GetAtt Memory.MemoryId\n",
+                "  MemoryArn:\n",
+                "    Value:\n",
+                "      Fn::GetAtt: [Memory, MemoryArn]\n",
+                "  MemoryRef:\n",
+                "    Value: !Ref Memory\n",
+                "  IdentityName:\n",
+                "    Value: !GetAtt Identity.Name\n",
+                "  IdentityArn:\n",
+                "    Value: !GetAtt Identity.WorkloadIdentityArn\n",
+            )
+            .to_string(),
+            parameters: vec![],
+            expected: vec![
+                (
+                    "MemoryId",
+                    Expected::Form {
+                        described: "a MemoryId of the form <label>- + 10 characters",
+                        check: is_agentcore_memory_id,
+                    },
+                ),
+                (
+                    "MemoryArn",
+                    Expected::Form {
+                        described: "an agentcore memory ARN",
+                        check: |value| is_agentcore_arn(value, "memory", is_agentcore_memory_id),
+                    },
+                ),
+                (
+                    // The type's primary identifier is its memory id, so that is what
+                    // `Ref` answers.
+                    "MemoryRef",
+                    Expected::Form {
+                        described: "a MemoryId",
+                        check: is_agentcore_memory_id,
+                    },
+                ),
+                (
+                    // A workload identity is NAMED, not id'd: the template's own name is
+                    // the identifier, so this row is a literal rather than a form.
+                    "IdentityName",
+                    Expected::Value("probe-workload".to_string()),
+                ),
+                (
+                    "IdentityArn",
+                    Expected::Value(format!(
+                        "arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:\
+                         workload-identity-directory/default/workload-identity/probe-workload"
+                    )),
+                ),
+            ],
+        },
+        OutputCase {
+            // The same rule two types along, where each identifier's documented ALPHABET
+            // differs: a runtime label carries no `-` and a gateway's is lower case only.
+            case: "an agentcore runtime and gateway: each id in its own documented form",
+            stack_name: "AgentCoreRuntime",
+            template: r#"{"Resources":{
+                   "Runtime":{"Type":"AWS::BedrockAgentCore::Runtime",
+                     "Properties":{"AgentRuntimeName":"probe_runtime",
+                       "RoleArn":"arn:aws:iam::000000000000:role/AgentRole"}},
+                   "Gateway":{"Type":"AWS::BedrockAgentCore::Gateway",
+                     "Properties":{"Name":"Probe-Gateway","RoleArn":"arn:aws:iam::000000000000:role/GatewayRole"}}},
+                 "Outputs":{
+                   "RuntimeId":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeId"]}},
+                   "RuntimeArn":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeArn"]}},
+                   "RuntimeVersion":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeVersion"]}},
+                   "GatewayId":{"Value":{"Fn::GetAtt":["Gateway","GatewayId"]}},
+                   "GatewayArn":{"Value":{"Fn::GetAtt":["Gateway","GatewayArn"]}},
+                   "GatewayRef":{"Value":{"Ref":"Gateway"}}}}"#
+                .to_string(),
+            parameters: vec![],
+            expected: vec![
+                (
+                    "RuntimeId",
+                    Expected::Form {
+                        described: "an AgentRuntimeId whose label carries no '-'",
+                        check: is_agentcore_runtime_id,
+                    },
+                ),
+                (
+                    "RuntimeArn",
+                    Expected::Form {
+                        described: "an agentcore runtime ARN",
+                        check: |value| is_agentcore_arn(value, "runtime", is_agentcore_runtime_id),
+                    },
+                ),
+                (
+                    // "The version of the AgentCore Runtime" — a freshly declared runtime
+                    // has its first.
+                    "RuntimeVersion",
+                    Expected::Value("1".to_string()),
+                ),
+                (
+                    "GatewayId",
+                    Expected::Form {
+                        described: "a lower-case GatewayId",
+                        check: is_agentcore_gateway_id,
+                    },
+                ),
+                (
+                    "GatewayArn",
+                    Expected::Form {
+                        described: "an agentcore gateway ARN",
+                        check: |value| is_agentcore_arn(value, "gateway", is_agentcore_gateway_id),
+                    },
+                ),
+                (
+                    "GatewayRef",
+                    Expected::Form {
+                        described: "a GatewayId",
+                        check: is_agentcore_gateway_id,
                     },
                 ),
             ],

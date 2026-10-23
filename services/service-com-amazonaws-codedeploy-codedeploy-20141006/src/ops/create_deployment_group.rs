@@ -509,8 +509,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 trigger_configurations: input.trigger_configurations.unwrap_or_default(),
                 alarm_configuration: input.alarm_configuration,
                 auto_rollback_configuration,
-                outdated_instances_strategy: input.outdated_instances_strategy,
-                deployment_style: input.deployment_style,
+                // Both members carry a server-side default when the request
+                // leaves them unset, so the stored group — and every read of it
+                // — carries the strategy and the style the group actually runs
+                // by.
+                outdated_instances_strategy: crate::state::effective_outdated_instances_strategy(
+                    input.outdated_instances_strategy,
+                ),
+                deployment_style: crate::state::effective_deployment_style(input.deployment_style),
                 blue_green_deployment_configuration: input.blue_green_deployment_configuration,
                 load_balancer_info: input.load_balancer_info,
                 ec2_tag_set: input.ec2_tag_set,
