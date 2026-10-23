@@ -6,12 +6,19 @@
 //! are persisted here, under the single shared engine, so a create is observable by every
 //! later Get/List/Delete. Each collection keeps BOTH a `HashMap` keyed by the resource's
 //! generated id (the lookup every Get/Delete does) and a `Vec` of ids in insertion
-//! order (the stable enumeration the `@paginated` List operations page through).
+//! order (the stable enumeration the `@paginated` List operations page through). The runs
+//! `StartTransformerJob` performed live here too ([`TransformerJob`]), which is what
+//! `GetTransformerJob` reports.
 //!
 //! It also owns the wording of the `ResourceNotFoundException` each resource type is
-//! reported absent with, so every handler that resolves an id states it the same way.
+//! reported absent with, so every handler that resolves an id states it the same way; the
+//! ONE way this service reaches an Amazon S3 object ([`read_edi_object`],
+//! [`write_object`]); and the ONE authorization decision its operations take
+//! ([`authorize`]), against the IAM identity policies of the principal that signed the
+//! request.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Whether a document is the file format a request declared it to be — the check the
 /// test-harness operations (`TestConversion`, `TestMapping`) share.
@@ -22,8 +29,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub mod documents;
 
 use crate::ops::types::{
-    CapabilityConfiguration, CapabilityOptions, EdiType, InputConversion, Mapping,
-    OutputConversion, S3Location, SampleDocuments, Tag,
+    AccessDeniedException, CapabilityConfiguration, CapabilityOptions, EdiType, InputConversion,
+    Mapping, OutputConversion, S3Location, SampleDocuments, Tag,
 };
 
 /// The region an emulated ARN carries when the request's SigV4 scope does not name one
@@ -69,8 +76,9 @@ pub const TRANSFORMER_STATUS_INACTIVE: &str = "inactive";
 
 /// The other value of the modelled `TransformerStatus` enum (`active` | `inactive`,
 /// `smithy_query(query="shape",shape="TransformerStatus")`): the state a transformer has
-/// to be in to be used by a capability, and the state its configuration rests immutable
-/// in (see `UpdateTransformer`).
+/// to be in to be used — by a capability, and by a transformer job
+/// (`StartTransformerJob`) — and the state its configuration rests immutable in (see
+/// `UpdateTransformer`).
 pub const TRANSFORMER_STATUS_ACTIVE: &str = "active";
 
 /// How many hex digits follow the resource-type prefix in a generated id.
@@ -95,6 +103,28 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// bounds the per-request work the List operations do under the state lock (their filter
 /// and token-resume scans walk at most this many ids).
 pub const MAX_RECORDS_PER_STORE: usize = 1_000;
+
+/// How long the create an `@idempotencyToken` started reports as still IN FLIGHT.
+///
+/// AWS answers a duplicate of an in-flight request with `ConflictException` and replays
+/// the original resource only once that request has completed (recorded for
+/// `CreateTransformer` by trace `b2bi.create-transformer-idempotent-token-concurrent-dedup`:
+/// of N concurrent creates sharing one token exactly one resource is minted and the losing
+/// racers are refused with `ConflictException`). A create is served here in microseconds,
+/// so "while the first request runs" would be a window no concurrent client could ever
+/// observe: the create a token started therefore reports in flight for this span, the same
+/// non-zero span this emulator gives every transition a call starts, and a caller acting
+/// straight after the call sees that transient state.
+pub const IDEMPOTENT_CREATE_IN_FLIGHT: Duration = Duration::from_millis(250);
+
+/// How long after `StartTransformerJob` a transformer job reports `running`.
+///
+/// The job's work is done by the call that started it, but AWS answers that call with a
+/// job in the non-terminal `running` status and reveals the outcome to a later
+/// `GetTransformerJob`; this is the span this emulator holds `running` for, so a caller
+/// polling straight after the start observes the status AWS returns. It is never zero and
+/// nothing sleeps for it: the due instant is stored on the job and compared when read.
+pub const TRANSFORMER_JOB_RUNNING_FOR: Duration = Duration::from_millis(250);
 
 /// The most `@idempotencyToken` replays remembered at once.
 ///
@@ -131,6 +161,9 @@ pub struct Profile {
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: Option<::aws_smithy_types::DateTime>,
     pub tags: Vec<Tag>,
+    /// Digest of the create request that minted this profile — see
+    /// [`request_digest`] and [`Transformer::request_digest`].
+    pub request_digest: String,
 }
 
 /// A capability: the EDI processing a partnership references by id.
@@ -147,6 +180,9 @@ pub struct Capability {
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: Option<::aws_smithy_types::DateTime>,
     pub tags: Vec<Tag>,
+    /// Digest of the create request that minted this capability — see
+    /// [`request_digest`] and [`Transformer::request_digest`].
+    pub request_digest: String,
 }
 
 /// A transformer: the EDI <-> JSON/XML translation a capability references by id.
@@ -179,6 +215,104 @@ pub struct Transformer {
     pub request_digest: String,
 }
 
+/// The `TransformerJobStatus` a job reports while the clock still owes its outcome:
+/// `running`, one of the three values the model declares (`failed | running | succeeded`).
+pub const TRANSFORMER_JOB_RUNNING: &str = "running";
+
+/// The `TransformerJobStatus` of a run that produced its output file.
+pub const TRANSFORMER_JOB_SUCCEEDED: &str = "succeeded";
+
+/// The `TransformerJobStatus` of a run that could not: `GetTransformerJob$message`
+/// carries the reason, which is what that member documents ("Returns an optional error
+/// message, which gets populated when the job is not run successfully").
+pub const TRANSFORMER_JOB_FAILED: &str = "failed";
+
+/// The most transformer jobs this emulator remembers at once, oldest evicted first.
+///
+/// A job is reachable without a stored resource of its own, so without a ceiling every
+/// `StartTransformerJob` would add a resident record for good. AWS keeps a job for 30 days
+/// (`StartTransformerJob`: "The system stores transformer jobs for 30 days"), a span this
+/// emulator's process lifetime never reaches, so the bound is a count rather than an age.
+pub const MAX_TRANSFORMER_JOBS: usize = 1_000;
+
+/// What one `StartTransformerJob` run did, as `GetTransformerJob` reports it.
+///
+/// The run itself is performed by the call that starts it — the input object is read, the
+/// transformation evaluated and the output file written there — and its OUTCOME is what is
+/// persisted here, beside the instant the job stops reporting `running`
+/// ([`TRANSFORMER_JOB_RUNNING_FOR`]). Nothing about the record changes after that instant:
+/// the reader only chooses which of the two states the stored job is in.
+#[derive(Debug, Clone)]
+pub struct TransformerJob {
+    pub transformer_job_id: String,
+    /// The transformer this job ran, so a `GetTransformerJob` naming a different
+    /// `transformerId` does not resolve it.
+    pub transformer_id: String,
+    /// A digest of what the `StartTransformerJob` request that started this run asked for,
+    /// so a repeat of its `@idempotencyToken` can tell the SAME request (a retry, answered
+    /// with this job) from a different one (a token already used, refused with
+    /// `ConflictException`) — the same test `CreateTransformer` applies to its own token.
+    pub request_digest: String,
+    /// The terminal status the run reached: [`TRANSFORMER_JOB_SUCCEEDED`] or
+    /// [`TRANSFORMER_JOB_FAILED`].
+    pub terminal_status: String,
+    /// The output files the run wrote, reported once the job is no longer `running`.
+    pub output_files: Vec<S3Location>,
+    /// Why the run failed, for a run that did.
+    pub message: Option<String>,
+    /// When the job stops reporting `running` and reports its terminal status.
+    pub settles_at: Instant,
+}
+
+impl TransformerJob {
+    /// The status a read at `now` reports: `running` until the outcome is due, then the
+    /// terminal status the run reached.
+    pub fn status_at(&self, now: Instant) -> &str {
+        if now < self.settles_at {
+            TRANSFORMER_JOB_RUNNING
+        } else {
+            &self.terminal_status
+        }
+    }
+
+    /// The output files a read at `now` reports: none while the job is still `running`,
+    /// because a caller may not follow a path the job has not yet reported.
+    pub fn output_files_at(&self, now: Instant) -> Option<Vec<S3Location>> {
+        if now < self.settles_at || self.output_files.is_empty() {
+            return None;
+        }
+        Some(self.output_files.clone())
+    }
+
+    /// The `message` a read at `now` reports: only a settled, failed run has one.
+    pub fn message_at(&self, now: Instant) -> Option<String> {
+        if now < self.settles_at {
+            return None;
+        }
+        self.message.clone()
+    }
+}
+
+/// What a remembered `@idempotencyToken` minted, and when that create settled.
+#[derive(Debug, Clone)]
+pub struct IdempotentCreate {
+    /// The id of the resource the first call carrying this token created.
+    pub resource_id: String,
+    /// When the create stops reporting as in flight — see
+    /// [`IDEMPOTENT_CREATE_IN_FLIGHT`].
+    pub settles_at: Instant,
+}
+
+/// What a create carrying an already-remembered `@idempotencyToken` answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenReplay {
+    /// The create this token started has not settled: a duplicate is the racer that lost
+    /// it, which AWS refuses with `ConflictException`.
+    InFlight,
+    /// The create settled, so a duplicate answers with the resource it minted.
+    Completed(String),
+}
+
 /// A partnership: one trading partner, under a profile, bound to a set of capabilities.
 #[derive(Debug, Clone)]
 pub struct Partnership {
@@ -194,6 +328,9 @@ pub struct Partnership {
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: Option<::aws_smithy_types::DateTime>,
     pub tags: Vec<Tag>,
+    /// Digest of the create request that minted this partnership — see
+    /// [`request_digest`] and [`Transformer::request_digest`].
+    pub request_digest: String,
 }
 
 /// Per-service state for com-amazonaws-b2bi-b2bi. A handler reaches it through [`service_state`].
@@ -221,9 +358,17 @@ pub struct ComAmazonawsB2biB2biState {
     pub transformers: HashMap<String, Transformer>,
     /// `transformers` in creation order, for `ListTransformers` paging.
     pub transformer_order: Vec<String>,
-    /// `@idempotencyToken` replay: [`idempotency_key`] -> the id of the resource the
-    /// first call with that token created. Bounded by [`MAX_IDEMPOTENCY_ENTRIES`].
-    pub idempotency: HashMap<String, String>,
+    /// The transformer runs `StartTransformerJob` performed, keyed by
+    /// `transformerJobId`: the set `GetTransformerJob` resolves against. Bounded by
+    /// [`MAX_TRANSFORMER_JOBS`]. See [`TransformerJob`].
+    pub transformer_jobs: HashMap<String, TransformerJob>,
+    /// `transformer_jobs` in start order, so the oldest job is the one evicted once the
+    /// store is full.
+    pub transformer_job_order: VecDeque<String>,
+    /// `@idempotencyToken` replay: [`idempotency_key`] -> what the first call with that
+    /// token created, and when that create settled. Bounded by
+    /// [`MAX_IDEMPOTENCY_ENTRIES`].
+    pub idempotency: HashMap<String, IdempotentCreate>,
     /// The order [`idempotency`](Self::idempotency)'s keys were recorded in, so the
     /// oldest is the one evicted once the map is full.
     pub idempotency_order: VecDeque<String>,
@@ -256,13 +401,47 @@ impl ComAmazonawsB2biB2biState {
     /// Remember that `key` minted `id`, evicting the oldest remembered token once
     /// [`MAX_IDEMPOTENCY_ENTRIES`] are held — so a caller cannot grow this map without
     /// limit by sending a fresh `clientToken` on every request.
+    ///
+    /// The record reports the create as in flight for [`IDEMPOTENT_CREATE_IN_FLIGHT`]
+    /// from here, which is what [`replay`](Self::replay) reads.
     pub fn record_idempotency(&mut self, key: String, id: &str) {
-        if self.idempotency.insert(key.clone(), id.to_string()).is_none() {
+        let record = IdempotentCreate {
+            resource_id: id.to_string(),
+            settles_at: Instant::now() + IDEMPOTENT_CREATE_IN_FLIGHT,
+        };
+        if self.idempotency.insert(key.clone(), record).is_none() {
             self.idempotency_order.push_back(key);
         }
         while self.idempotency_order.len() > MAX_IDEMPOTENCY_ENTRIES {
             if let Some(oldest) = self.idempotency_order.pop_front() {
                 self.idempotency.remove(&oldest);
+            }
+        }
+    }
+
+    /// What a create carrying the token `key` answers at `now`: nothing when the token is
+    /// not remembered, [`TokenReplay::InFlight`] while the create it started is still in
+    /// flight, and the id it minted once that create has settled.
+    pub fn replay(&self, key: &str, now: Instant) -> Option<TokenReplay> {
+        self.idempotency.get(key).map(|record| {
+            if now < record.settles_at {
+                TokenReplay::InFlight
+            } else {
+                TokenReplay::Completed(record.resource_id.clone())
+            }
+        })
+    }
+
+    /// Remember `job` as a run of its transformer, evicting the oldest remembered job
+    /// once [`MAX_TRANSFORMER_JOBS`] are held.
+    pub fn record_transformer_job(&mut self, job: TransformerJob) {
+        let job_id = job.transformer_job_id.clone();
+        if self.transformer_jobs.insert(job_id.clone(), job).is_none() {
+            self.transformer_job_order.push_back(job_id);
+        }
+        while self.transformer_job_order.len() > MAX_TRANSFORMER_JOBS {
+            if let Some(oldest) = self.transformer_job_order.pop_front() {
+                self.transformer_jobs.remove(&oldest);
             }
         }
     }
@@ -344,11 +523,50 @@ impl ComAmazonawsB2biB2biState {
     /// deleted: a replay of that token mints a fresh resource anyway, so keeping the
     /// entry would hold memory for a resource that no longer exists.
     pub fn forget_idempotency_for(&mut self, id: &str) {
-        self.idempotency.retain(|_, minted| minted != id);
+        self.idempotency.retain(|_, record| record.resource_id != id);
         let remembered = &self.idempotency;
         self.idempotency_order
             .retain(|key| remembered.contains_key(key));
     }
+}
+
+/// The `ConflictException` message for a create whose `clientToken` names a create that
+/// has not settled yet: the caller is the racer that lost the in-flight race, and the
+/// request it duplicated is the one that mints the resource.
+pub fn create_in_flight(resource_type: &str, client_token: &str) -> String {
+    format!(
+        "Another request to create a {resource_type} with clientToken {client_token} is in \
+         progress; retry once it has completed to receive its result"
+    )
+}
+
+/// The digest of what a create request asked for, as the `@idempotencyToken` replay check
+/// compares it: `rendered` is the request's own members, rendered by the handler that owns
+/// them (destructured there, so a member the model adds cannot be silently left out).
+///
+/// Hashed rather than kept verbatim because one request can carry hundreds of kilobytes (a
+/// `mappingTemplate` is `len 0..350000`), so a record holds a fixed number of bytes
+/// whatever the request did. A `Debug` rendering is enough precisely because a digest is
+/// never compared with one from anywhere else: it is only ever compared with a digest THIS
+/// process computed, over records in this process's own memory, so it has to distinguish
+/// two requests rather than be stable across builds.
+pub fn request_digest(rendered: &str) -> String {
+    use ::sha2::Digest;
+
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(rendered.as_bytes());
+    ::hex::encode(digest.finalize())
+}
+
+/// The `ConflictException` message for a SETTLED `clientToken` used again for a DIFFERENT
+/// request.
+///
+/// An `@idempotencyToken` makes a retry safe, so one token names ONE request: a second
+/// request under a token this store already minted a resource for can neither be served as
+/// a replay (the parameters differ) nor mint a second resource, which is what
+/// `ConflictException` (HTTP 409) is modelled for.
+pub fn token_already_used(resource_type: &str, id: &str) -> String {
+    format!("this clientToken already created {resource_type} {id} with different parameters")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -388,6 +606,17 @@ pub fn partnership_not_found(partnership_id: &str) -> String {
 /// above; each template is the one recorded for that resource type.
 pub fn transformer_not_found(transformer_id: &str) -> String {
     format!("Transformer with transformerId {transformer_id} not found")
+}
+
+/// The `ResourceNotFoundException` message for a `transformerJobId` this service holds no
+/// run for under that `transformerId` — including a job AWS has already dropped, which it
+/// does 30 days after the run ("if 30 days have elapsed since your transformer job was
+/// started, the system deletes it … you receive a 404 response", `GetTransformerJob`).
+pub fn transformer_job_not_found(transformer_job_id: &str, transformer_id: &str) -> String {
+    format!(
+        "Transformer job with transformerJobId {transformer_job_id} not found for \
+         transformerId {transformer_id}"
+    )
 }
 
 /// The CloudWatch Logs log group a logging-ENABLED profile reports as `logGroupName`,
@@ -432,6 +661,15 @@ pub fn is_arn(candidate: &str) -> bool {
 /// The current wall-clock instant, as the modelled `CreatedDate`/`ModifiedDate` timestamp.
 pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
+}
+
+/// The ARN a request's own identifier names, for authorization.
+///
+/// Built from the REQUEST rather than from the store, because a request is authorized
+/// before its identifier is resolved: a caller with no permission on a resource learns
+/// that it is not authorized, not whether that resource exists.
+pub fn resource_arn(region: &str, kind: &str, id: &str) -> String {
+    ::engine::emulator_arn(SERVICE_CODE, region, &format!("{kind}/{id}"))
 }
 
 /// The tag-key prefix AWS reserves for its own tags across every service: a caller may
@@ -535,6 +773,36 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// the clock) so ids are not guessable, and `taken` is consulted by the caller to
 /// guarantee the id is not already in use.
 pub fn new_resource_id(prefix: &str) -> String {
+    format!("{prefix}-{}", random_hex(ID_HEX_DIGITS))
+}
+
+/// How many characters a `transformerJobId` carries: the modelled `TransformerJobId` is
+/// `len 25..25`, `pattern ^[a-zA-Z0-9_-]+$`, so a job id is exactly 25 characters and hex
+/// digits satisfy the pattern.
+const TRANSFORMER_JOB_ID_DIGITS: usize = 25;
+
+/// A fresh, system-generated `transformerJobId`.
+///
+/// Unpredictable for the same reason a resource id is, and exactly
+/// [`TRANSFORMER_JOB_ID_DIGITS`] characters long, which is what the model requires of
+/// this id.
+pub fn new_transformer_job_id() -> String {
+    random_hex(TRANSFORMER_JOB_ID_DIGITS)
+}
+
+/// `count` unpredictable lowercase hex digits: a per-process-seeded hasher over a
+/// process-wide sequence number and the clock, so two ids minted in one clock tick still
+/// differ and neither is guessable.
+///
+/// Two 64-bit digests are what it has to draw from, so [`MAX_RANDOM_HEX_DIGITS`] is the
+/// most it can answer with. A caller asking for more is a programming error — it would get
+/// a shorter id than the length its model requires — so it is asserted rather than
+/// silently truncated.
+fn random_hex(count: usize) -> String {
+    assert!(
+        count <= MAX_RANDOM_HEX_DIGITS,
+        "random_hex can answer with at most {MAX_RANDOM_HEX_DIGITS} digits, asked for {count}"
+    );
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -559,8 +827,12 @@ pub fn new_resource_id(prefix: &str) -> String {
     low.write_u64(sequence.wrapping_mul(MIX));
 
     let digits = format!("{:016x}{:016x}", high.finish(), low.finish());
-    format!("{prefix}-{}", &digits[..ID_HEX_DIGITS])
+    digits[..count].to_string()
 }
+
+/// The most digits [`random_hex`] can answer with: the two 64-bit digests it draws from,
+/// as hex.
+const MAX_RANDOM_HEX_DIGITS: usize = 32;
 
 /// Why a `nextToken` was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,4 +876,422 @@ pub fn paginate(
     let page = ids[start..end].to_vec();
     let next = ids.get(end).map(|id| encode_page_token(id));
     Ok((page, next))
+}
+
+// ---------------------------------------------------------------------------
+// Amazon S3: where every EDI document this service reads and writes lives.
+// ---------------------------------------------------------------------------
+
+/// The most bytes this service reads out of ONE Amazon S3 object.
+///
+/// AWS's own bound for the EDI file the test operations take: "The input file has a file
+/// size limit of 250 KB" (`TestParsing` / `TestConversion` documentation). It also bounds
+/// the buffer one request can make this emulator hold.
+pub const MAX_EDI_OBJECT_BYTES: usize = 250 * 1024;
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated service:
+/// it routes in process, so no network client is configured here and this crate names no
+/// other service's crate. `region` is the request's own signing region, so an object is
+/// read and written where the caller's own S3 requests go.
+pub fn s3_client(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a virtual-host
+        // bucket name is not a host this emulator resolves, so every request addresses
+        // its bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly. (Same configuration as `CreateProfile`'s CloudWatch Logs client.)
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Why an `S3Location` could not be read, split the way the modelled errors are: a
+/// location that is not a location at all, or an object this service will not read, is the
+/// caller's mistake (400), an object that is not there is the 404 every one of these
+/// operations models, and a call that failed is a fault of this service (500).
+#[derive(Debug, Clone)]
+pub enum ObjectError {
+    /// The location names no bucket or no key, so it addresses no object.
+    Incomplete(String),
+    /// Nothing is stored under that bucket and key.
+    NotFound(String),
+    /// The object is there, and is not one this service reads: past the EDI file size
+    /// limit, or not text at all.
+    Rejected(String),
+    /// S3 was asked and the call itself failed.
+    Unreadable(String),
+}
+
+impl ObjectError {
+    /// What a refusal built from this failure says.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Incomplete(message)
+            | Self::NotFound(message)
+            | Self::Rejected(message)
+            | Self::Unreadable(message) => message,
+        }
+    }
+}
+
+/// The bucket and key an `S3Location` addresses, or why it addresses nothing.
+pub fn object_path(location: &S3Location, member: &str) -> Result<(String, String), ObjectError> {
+    let bucket = location.bucket_name.as_deref().unwrap_or_default();
+    let key = location.key.as_deref().unwrap_or_default();
+    if bucket.is_empty() || key.is_empty() {
+        return Err(ObjectError::Incomplete(format!(
+            "{member} must name both an Amazon S3 bucketName and a key"
+        )));
+    }
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+/// Read the object `location` names, as text, through the emulator's own S3 service.
+///
+/// Refuses an object past [`MAX_EDI_OBJECT_BYTES`] and one whose bytes are not UTF-8
+/// text: an EDI interchange is text, so bytes that are not text hold no interchange.
+pub async fn read_edi_object(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    location: &S3Location,
+    member: &str,
+) -> Result<String, ObjectError> {
+    let (bucket, key) = object_path(location, member)?;
+    let object = s3_client(ctx, region)
+        .get_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|error| {
+            use ::aws_sdk_s3::error::ProvideErrorMetadata;
+            let detail = ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
+            match error.code() {
+                Some("NoSuchKey" | "NoSuchBucket" | "NotFound") => ObjectError::NotFound(format!(
+                    "no object is stored at s3://{bucket}/{key}"
+                )),
+                _ => ObjectError::Unreadable(format!(
+                    "the object at s3://{bucket}/{key} could not be read: {detail}"
+                )),
+            }
+        })?;
+    // The clamp is applied to the size S3 REPORTS, before a byte of the object is
+    // buffered, so an oversized object costs no allocation at all; the check after the
+    // body is read is the backstop for an object whose reported size was wrong.
+    if object
+        .content_length()
+        .is_some_and(|length| length > MAX_EDI_OBJECT_BYTES as i64)
+    {
+        return Err(ObjectError::Rejected(format!(
+            "the object at s3://{bucket}/{key} is {} bytes, more than the \
+             {MAX_EDI_OBJECT_BYTES}-byte limit on an EDI file",
+            object.content_length().unwrap_or_default()
+        )));
+    }
+    let body = object.body.collect().await.map_err(|error| {
+        ObjectError::Unreadable(format!(
+            "the object at s3://{bucket}/{key} could not be read: {error}"
+        ))
+    })?;
+    let bytes = body.into_bytes();
+    if bytes.len() > MAX_EDI_OBJECT_BYTES {
+        return Err(ObjectError::Rejected(format!(
+            "the object at s3://{bucket}/{key} is {} bytes, more than the \
+             {MAX_EDI_OBJECT_BYTES}-byte limit on an EDI file",
+            bytes.len()
+        )));
+    }
+    String::from_utf8(bytes.to_vec()).map_err(|_| {
+        ObjectError::Rejected(format!(
+            "the object at s3://{bucket}/{key} is not UTF-8 text, so it holds no EDI \
+             interchange"
+        ))
+    })
+}
+
+/// Write `body` to `bucket`/`key` through the emulator's own S3 service, answering the
+/// reason it could not be written.
+pub async fn write_object(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    content_type: &str,
+    body: String,
+) -> Result<(), String> {
+    s3_client(ctx, region)
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .content_type(content_type)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(
+            body.into_bytes(),
+        ))
+        .send()
+        .await
+        .map(drop)
+        .map_err(|error| {
+            format!(
+                "the output file s3://{bucket}/{key} could not be written: {}",
+                ::aws_smithy_types::error::display::DisplayErrorContext(&error)
+            )
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Authorization: the IAM identity policies of the principal that signed the request.
+// ---------------------------------------------------------------------------
+
+/// The service prefix every one of this service's IAM actions carries
+/// (`b2bi:CreateProfile`): its `arnNamespace` / `sigv4Name`
+/// (`smithy_query(query="service_info")` -> `arnNamespace: b2bi`), which is the same
+/// string as [`SERVICE_CODE`].
+pub const IAM_ACTION_PREFIX: &str = SERVICE_CODE;
+
+/// The resource an operation that addresses no existing resource is authorized against:
+/// a create has no ARN yet, and a list addresses the whole collection, so the request is
+/// matched against the policy wildcard rather than against an ARN nothing holds.
+pub const ANY_RESOURCE: &str = "*";
+
+/// The STS session store in the SAME shared engine, which is where the identity an access
+/// key id speaks for lives.
+///
+/// This is the STS service's OWN accessor, called rather than copied, so b2bi resolves the
+/// caller from the very store `sts:AssumeRole` writes and `sts:GetCallerIdentity` reads.
+/// `None` means the engine carries no such store — a router that mounts b2bi without STS,
+/// where no session can have been minted at all.
+pub fn sts_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::ComAmazonawsStsAwssecuritytokenservicev20110615State>>
+{
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::service_state(engine)
+}
+
+/// The IAM store in the SAME shared engine, which is where the account's roles and their
+/// identity policies live. The IAM service's OWN accessor, for the same reason
+/// [`sts_state`] is.
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State>>
+{
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// Authorize this request against the IAM identity policies of the principal the signing
+/// credentials name, as the service prefix [`IAM_ACTION_PREFIX`] and `operation` name the
+/// action and `resource` names what it acts on ([`ANY_RESOURCE`] where no ARN exists yet).
+///
+/// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation of
+/// IAM policy documents against a request, so b2bi and every other service handed the same
+/// document answer alike: an explicit `Deny` wins, otherwise an `Allow` about the request
+/// grants it, and with neither the request is refused by IAM's default deny. What this
+/// function owns is the two things only this service can collect — WHO the request speaks
+/// for (the STS session the access key id names) and WHICH documents are in force on it
+/// (the role's inline policies and the default versions of its attached managed policies,
+/// read out of the IAM store, so adding a `Deny` to a role takes effect on the next
+/// request and removing it lifts it again).
+///
+/// Four callers are served rather than evaluated, because there is no identity policy that
+/// bounds them:
+///
+/// * a request whose access key id names no STS session — the ambient identity, the
+///   long-term key this emulator publishes at start, which is the account's own
+///   administrator (`sts_state::ambient_identity`), the position account root credentials
+///   are in;
+/// * a session that is not an assumed role (an `sts:GetSessionToken` or
+///   `sts:GetFederationToken` session, or an IAM user's own long-term key): what bounds
+///   such a caller is the user's own identity policies or the inline session policy the
+///   mint supplied, and THIS SERVICE DOES NOT EVALUATE EITHER — a `Deny` on an IAM user's
+///   inline policy therefore has no effect here. Stated rather than hidden: the recorded
+///   boundary this issue answers is an assumed-role session's, and widening the decision
+///   to a user principal belongs with the shared collection step
+///   `services/service-com-amazonaws-rum-rum/src/state/authorization.rs` already performs
+///   for both principal forms;
+/// * a router that mounts b2bi without the STS or IAM service, where no session and no role
+///   can exist at all;
+/// * a role carrying an AWS-MANAGED policy, whose document the account does not hold
+///   (`iam_store::AWS_MANAGED_POLICY_ACCOUNT`): this emulator cannot read what that policy
+///   grants, and refusing on evidence it does not have would deny access AWS permits. An
+///   explicit `Deny` in a document it CAN read still refuses, and an attachment naming a
+///   CUSTOMER-managed policy the account does not hold grants nothing, because the account
+///   is the authority on its own policies. (The same reading
+///   `services/service-com-amazonaws-rum-rum/src/state/authorization.rs` gives it.)
+pub fn authorize<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+) -> Result<(), AccessDeniedException> {
+    let Some(sts) = sts_state(engine) else {
+        return Ok(());
+    };
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let identity = {
+        let mut sessions = sts.lock();
+        ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::resolve_caller(
+            &mut sessions,
+            &access_key_id,
+            SystemTime::now(),
+            ctx.credential_store(),
+        )
+    };
+    // An expired session is refused by the layer that verifies the signature, not here.
+    let Ok(identity) = identity else {
+        return Ok(());
+    };
+    let Some(role_name) = assumed_role_name(&identity.arn) else {
+        return Ok(());
+    };
+    let Some(iam) = iam_state(engine) else {
+        return Ok(());
+    };
+    let policies = role_identity_policies(&iam.lock(), role_name);
+
+    let action = format!("{IAM_ACTION_PREFIX}:{operation}");
+    // Identity-based documents name no principal, so the principal spellings a
+    // resource-based policy would be matched against are not part of this decision.
+    let request = ::service_common::iam_authorization::Request::new(&action, resource, &[]);
+    let decided =
+        ::service_common::iam_authorization::identity_decision(&policies.documents, &request);
+    match decided {
+        ::service_common::iam_authorization::Decision::Allowed => Ok(()),
+        // An explicit `Deny` in a document this emulator CAN read refuses the request
+        // whatever else the role carries, which is why it is answered before the
+        // unreadable attachment below.
+        ::service_common::iam_authorization::Decision::Denied => Err(access_denied(
+            &identity.arn,
+            &action,
+            resource,
+            "with an explicit deny in an identity-based policy",
+        )),
+        // Nothing the store holds grants the action — but a grant it cannot READ may: see
+        // this function's docs.
+        ::service_common::iam_authorization::Decision::NotStated
+            if policies.unreadable_attachment =>
+        {
+            Ok(())
+        }
+        ::service_common::iam_authorization::Decision::NotStated => Err(access_denied(
+            &identity.arn,
+            &action,
+            resource,
+            &format!("because no identity-based policy allows the {action} action"),
+        )),
+    }
+}
+
+/// The modelled `AccessDeniedException` for a refused request, worded the way IAM words an
+/// authorization failure: the principal, the action, the resource it was asked for (left
+/// out where the request addresses no ARN) and which of IAM's two rules refused it.
+fn access_denied(
+    principal: &str,
+    action: &str,
+    resource: &str,
+    reason: &str,
+) -> AccessDeniedException {
+    let on_resource = if resource == ANY_RESOURCE {
+        String::new()
+    } else {
+        format!(" on resource: {resource}")
+    };
+    AccessDeniedException {
+        message: format!("User: {principal} is not authorized to perform: {action}{on_resource} {reason}"),
+    }
+}
+
+/// The role name an assumed-role session's ARN names
+/// (`arn:aws:sts::<account>:assumed-role/<RoleName>/<SessionName>`), or `None` for every
+/// other principal form.
+pub fn assumed_role_name(identity_arn: &str) -> Option<&str> {
+    let resource = identity_arn.splitn(6, ':').nth(5)?;
+    let path = resource.strip_prefix("assumed-role/")?;
+    let role_name = path.split('/').next()?;
+    (!role_name.is_empty()).then_some(role_name)
+}
+
+/// The identity policies in force on one role.
+#[derive(Debug, Default)]
+pub struct RolePolicies {
+    /// Every document the IAM store holds for the role: its inline policies and the
+    /// DEFAULT version of each managed policy attached to it — the two kinds of identity
+    /// policy IAM evaluates for a role.
+    pub documents: Vec<String>,
+    /// Set when the role carries an AWS-MANAGED policy, whose document the account does
+    /// not hold, so what it grants cannot be read here. See [`authorize`].
+    pub unreadable_attachment: bool,
+}
+
+/// The identity policies attached to the role `role_name`.
+///
+/// An unknown role holds no policy, which IAM's default deny refuses.
+fn role_identity_policies(
+    iam: &::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State,
+    role_name: &str,
+) -> RolePolicies {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+
+    let role_key = iam_store::name_key(role_name);
+    let mut policies = RolePolicies {
+        documents: iam
+            .role_inline_policies
+            .get(&role_key)
+            .into_iter()
+            .flat_map(|held| held.values())
+            .map(|policy| policy.policy_document.clone())
+            .collect(),
+        unreadable_attachment: false,
+    };
+    for arn in iam
+        .role_attached_policies
+        .get(&role_key)
+        .into_iter()
+        .flatten()
+    {
+        let document = iam.policy_by_arn(arn).and_then(|managed| {
+            managed
+                .policy
+                .default_version_id
+                .as_deref()
+                .and_then(|version_id| managed.versions.get(version_id))
+                .or_else(|| {
+                    managed
+                        .versions
+                        .values()
+                        .find(|version| version.is_default_version)
+                })
+                .and_then(|version| version.document.clone())
+        });
+        match document {
+            Some(document) => policies.documents.push(document),
+            // Only an AWS-MANAGED policy is a grant this emulator cannot read; an
+            // attachment naming a customer-managed policy the account does not hold grants
+            // nothing, because the account is the authority on its own policies.
+            None if iam_store::parse_policy_arn(arn).is_some_and(|policy| {
+                policy.account == iam_store::AWS_MANAGED_POLICY_ACCOUNT
+            }) =>
+            {
+                policies.unreadable_attachment = true;
+            }
+            None => {}
+        }
+    }
+    policies
 }

@@ -159,6 +159,46 @@ impl From<CreateCapabilityErrorModeled> for CreateCapabilityError {
 /// `quotaCode` and `serviceCode` name the limit that was actually reached — this
 /// emulator's own storage bound and this service's own code — rather than an AWS quota
 /// code, which only AWS can assign.
+/// The modelled refusal for a repeat of a `clientToken` that asks for something else — the
+/// wording every create of this service refuses it with
+/// ([`crate::state::token_already_used`]).
+fn token_already_used(minted: &str) -> CreateCapabilityError {
+    CreateCapabilityErrorModeled::ConflictException(ConflictException {
+        message: crate::state::token_already_used("capability", minted),
+    })
+    .into()
+}
+
+/// A digest of everything this create request asks for, as the `@idempotencyToken` replay
+/// check compares it ([`crate::state::request_digest`]). The tag list is sorted, so two
+/// requests differing only in tag ORDER are the same request; `clientToken` is excluded,
+/// being the key rather than part of the payload.
+fn request_digest(input: &CreateCapabilityInput) -> String {
+    // Destructured, not field-accessed, so the member set is EXHAUSTIVE at compile time: a
+    // member added by a model update breaks this line instead of being silently left out
+    // of the digest (which would answer a genuinely different request as a replay).
+    let CreateCapabilityInput {
+        name,
+        r#type,
+        configuration,
+        instructions_documents,
+        client_token: _,
+        tags,
+    } = input;
+
+    let mut tags: Vec<(&str, &str)> = tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+
+    crate::state::request_digest(&format!(
+        "{:?}",
+        (name, r#type, configuration, instructions_documents, &tags)
+    ))
+}
+
 fn store_full() -> CreateCapabilityError {
     CreateCapabilityErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
         message: format!(
@@ -236,6 +276,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(CreateCapabilityErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCapabilityErrorModeled::InternalServerException(
                 InternalServerException {
@@ -248,18 +293,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
-        // same token answers with the resource the first call created, not a second one.
+        // same token answers with the resource the first call created, not a second one —
+        // and, while that first create is still in flight, is the racer AWS refuses with
+        // `ConflictException` (see [`crate::state::IDEMPOTENT_CREATE_IN_FLIGHT`]). A repeat
+        // under a token that already created a DIFFERENT capability is the other conflict,
+        // which [`request_digest`] is what tells apart.
+        let digest = request_digest(&input);
         let idempotency_key = input
             .client_token
             .as_deref()
             .map(|token| crate::state::idempotency_key("capability", token));
         if let Some(key) = idempotency_key.as_deref() {
-            if let Some(existing) = state
-                .idempotency
-                .get(key)
-                .and_then(|id| state.capabilities.get(id))
-            {
-                return Ok(stored_capability_response(existing));
+            match state.replay(key, ::std::time::Instant::now()) {
+                Some(crate::state::TokenReplay::InFlight) => {
+                    return Err(CreateCapabilityErrorModeled::ConflictException(
+                        ConflictException {
+                            message: crate::state::create_in_flight(
+                                "capability",
+                                input.client_token.as_deref().unwrap_or_default(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+                Some(crate::state::TokenReplay::Completed(minted)) => {
+                    if let Some(existing) = state.capabilities.get(&minted) {
+                        if existing.request_digest != digest {
+                            return Err(token_already_used(&minted));
+                        }
+                        return Ok(stored_capability_response(existing));
+                    }
+                }
+                None => {}
             }
         }
 
@@ -302,6 +367,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             r#type: input.r#type,
             configuration: input.configuration,
             instructions_documents: input.instructions_documents,
+            request_digest: digest,
             created_at: crate::state::now(),
             modified_at: None,
             tags: input.tags.unwrap_or_default(),

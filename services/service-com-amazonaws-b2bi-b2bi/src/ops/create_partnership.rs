@@ -164,6 +164,56 @@ impl From<CreatePartnershipErrorModeled> for CreatePartnershipError {
 /// `quotaCode` and `serviceCode` name the limit that was actually reached — this
 /// emulator's own storage bound and this service's own code — rather than an AWS quota
 /// code, which only AWS can assign.
+/// The modelled refusal for a repeat of a `clientToken` that asks for something else — the
+/// wording every create of this service refuses it with
+/// ([`crate::state::token_already_used`]).
+fn token_already_used(minted: &str) -> CreatePartnershipError {
+    CreatePartnershipErrorModeled::ConflictException(ConflictException {
+        message: crate::state::token_already_used("partnership", minted),
+    })
+    .into()
+}
+
+/// A digest of everything this create request asks for, as the `@idempotencyToken` replay
+/// check compares it ([`crate::state::request_digest`]). The tag list is sorted, so two
+/// requests differing only in tag ORDER are the same request; `clientToken` is excluded,
+/// being the key rather than part of the payload.
+fn request_digest(input: &CreatePartnershipInput) -> String {
+    // Destructured, not field-accessed, so the member set is EXHAUSTIVE at compile time: a
+    // member added by a model update breaks this line instead of being silently left out
+    // of the digest (which would answer a genuinely different request as a replay).
+    let CreatePartnershipInput {
+        profile_id,
+        name,
+        email,
+        phone,
+        capabilities,
+        capability_options,
+        client_token: _,
+        tags,
+    } = input;
+
+    let mut tags: Vec<(&str, &str)> = tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+
+    crate::state::request_digest(&format!(
+        "{:?}",
+        (
+            profile_id,
+            name,
+            email,
+            phone,
+            capabilities,
+            capability_options,
+            &tags,
+        )
+    ))
+}
+
 fn store_full() -> CreatePartnershipError {
     CreatePartnershipErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
         message: format!(
@@ -233,6 +283,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(CreatePartnershipErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(CreatePartnershipErrorModeled::InternalServerException(
                 InternalServerException {
@@ -245,18 +300,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
-        // same token answers with the resource the first call created, not a second one.
+        // same token answers with the resource the first call created, not a second one —
+        // and, while that first create is still in flight, is the racer AWS refuses with
+        // `ConflictException` (see [`crate::state::IDEMPOTENT_CREATE_IN_FLIGHT`]). A repeat
+        // under a token that already created a DIFFERENT partnership is the other
+        // conflict, which [`request_digest`] is what tells apart.
+        let digest = request_digest(&input);
         let idempotency_key = input
             .client_token
             .as_deref()
             .map(|token| crate::state::idempotency_key("partnership", token));
         if let Some(key) = idempotency_key.as_deref() {
-            if let Some(existing) = state
-                .idempotency
-                .get(key)
-                .and_then(|id| state.partnerships.get(id))
-            {
-                return Ok(stored_partnership_response(existing));
+            match state.replay(key, ::std::time::Instant::now()) {
+                Some(crate::state::TokenReplay::InFlight) => {
+                    return Err(CreatePartnershipErrorModeled::ConflictException(
+                        ConflictException {
+                            message: crate::state::create_in_flight(
+                                "partnership",
+                                input.client_token.as_deref().unwrap_or_default(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+                Some(crate::state::TokenReplay::Completed(minted)) => {
+                    if let Some(existing) = state.partnerships.get(&minted) {
+                        if existing.request_digest != digest {
+                            return Err(token_already_used(&minted));
+                        }
+                        return Ok(stored_partnership_response(existing));
+                    }
+                }
+                None => {}
             }
         }
 
@@ -315,6 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capabilities: input.capabilities,
             capability_options: input.capability_options,
             trading_partner_id: crate::state::new_resource_id("tp"),
+            request_digest: digest,
             created_at: crate::state::now(),
             modified_at: None,
             tags: input.tags.unwrap_or_default(),

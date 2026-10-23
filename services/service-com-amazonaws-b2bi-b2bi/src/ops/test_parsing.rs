@@ -11,8 +11,16 @@
 //! from the request's own members, and an `inputFile` that names no stored object is the
 //! modelled `ResourceNotFoundException`.
 //!
-//! This operation owns no resource — AWS persists nothing for it — so it neither reads
-//! nor writes [`crate::state`], and a call leaves what every later caller sees untouched.
+//! This operation owns no resource — AWS persists nothing for it — so it reads
+//! [`crate::state`] only for the authorization decision every operation of this service
+//! that models `AccessDeniedException` takes, and writes none of it: a call leaves what
+//! every later caller sees untouched.
+//!
+//! This file owns this service's X12 READER. [`parse_x12`] is the seam onto it, and
+//! `CreateStarterMappingTemplate` (its sample-driven path) and `StartTransformerJob` (a
+//! transformer's `inputConversion`) read a document through that seam, so no two
+//! operations of this service disagree about what an EDI file holds and none of them
+//! carries a second reader.
 //!
 //! ## The parsed document
 //!
@@ -282,7 +290,7 @@ const REQUIREMENT_MANDATORY: &str = "MANDATORY";
 /// names `CreateStarterMappingTemplate` keys a starter template's elements by, so a
 /// parsed document and a starter template describe the same tree with the same keys; that
 /// operation's table is private to its own file, which this change does not edit.
-const ISA_ELEMENTS: &[&str] = &[
+pub(crate) const ISA_ELEMENTS: &[&str] = &[
     "AuthorizationInformationQualifier",
     "AuthorizationInformation",
     "SecurityInformationQualifier",
@@ -309,10 +317,11 @@ const ISA11_FROM_4020: &str = "RepetitionSeparator";
 const ISA11_PRE_4020: &str = "InterchangeControlStandardsIdentifier";
 
 /// The element names of the interchange control trailer (IEA), in positional order.
-const IEA_ELEMENTS: &[&str] = &["NumberOfIncludedFunctionalGroups", "InterchangeControlNumber"];
+pub(crate) const IEA_ELEMENTS: &[&str] =
+    &["NumberOfIncludedFunctionalGroups", "InterchangeControlNumber"];
 
 /// The element names of the functional group header (GS), in positional order.
-const GS_ELEMENTS: &[&str] = &[
+pub(crate) const GS_ELEMENTS: &[&str] = &[
     "FunctionalIdentifierCode",
     "ApplicationSendersCode",
     "ApplicationReceiversCode",
@@ -324,17 +333,17 @@ const GS_ELEMENTS: &[&str] = &[
 ];
 
 /// The element names of the functional group trailer (GE), in positional order.
-const GE_ELEMENTS: &[&str] = &["NumberOfTransactionSetsIncluded", "GroupControlNumber"];
+pub(crate) const GE_ELEMENTS: &[&str] = &["NumberOfTransactionSetsIncluded", "GroupControlNumber"];
 
 /// The element names of the transaction set header (ST), in positional order.
-const ST_ELEMENTS: &[&str] = &[
+pub(crate) const ST_ELEMENTS: &[&str] = &[
     "TransactionSetIdentifierCode",
     "TransactionSetControlNumber",
     "ImplementationConventionReference",
 ];
 
 /// The element names of the transaction set trailer (SE), in positional order.
-const SE_ELEMENTS: &[&str] = &["NumberOfIncludedSegments", "TransactionSetControlNumber"];
+pub(crate) const SE_ELEMENTS: &[&str] = &["NumberOfIncludedSegments", "TransactionSetControlNumber"];
 
 /// The X12 segment ids the three envelopes are opened and closed with.
 const ISA: &str = "ISA";
@@ -344,8 +353,27 @@ const GE: &str = "GE";
 const ST: &str = "ST";
 const SE: &str = "SE";
 
+/// The key the interchanges of a document sit under, and the element name each repetition
+/// takes in the XML rendering.
+///
+/// These are the document's own member names, shared with
+/// `CreateStarterMappingTemplate`: a starter template describes the very document this
+/// reader builds, so the two cannot name its members differently.
+pub(crate) const INTERCHANGES_KEY: &str = "interchanges";
+pub(crate) const INTERCHANGE_ITEM: &str = "interchange";
+/// The same pair for the functional groups inside an interchange.
+pub(crate) const FUNCTIONAL_GROUPS_KEY: &str = "functional_groups";
+pub(crate) const FUNCTIONAL_GROUP_ITEM: &str = "functional_group";
+/// …for the transaction sets inside a functional group.
+pub(crate) const TRANSACTIONS_KEY: &str = "transactions";
+pub(crate) const TRANSACTION_ITEM: &str = "transaction";
+/// …and for the body segments of a transaction set, which only a PARSED document carries
+/// (a starter template generates the beginning segment of its transaction set instead).
+const SEGMENTS_KEY: &str = "segments";
+const SEGMENT_ITEM: &str = "segment";
+
 /// [`ISA_ELEMENTS`] with position 11 named for `release`.
-fn isa_element_names(release: u32) -> Vec<&'static str> {
+pub(crate) fn isa_element_names(release: u32) -> Vec<&'static str> {
     let mut names = ISA_ELEMENTS.to_vec();
     names[10] = if release < FIRST_REPETITION_SEPARATOR_RELEASE {
         ISA11_PRE_4020
@@ -360,7 +388,10 @@ fn isa_element_names(release: u32) -> Vec<&'static str> {
 ///
 /// A map keeps its members in INSERTION order — the positional order of an X12 segment's
 /// elements — which a `serde_json::Value` (a sorted map) would lose.
-enum Node {
+///
+/// Visible to the crate because [`parse_x12`] hands this tree to the two other operations
+/// that read an EDI document (see that function).
+pub(crate) enum Node {
     /// A leaf: one element's value, as the interchange carries it.
     Text(String),
     /// Named children, in order.
@@ -869,7 +900,7 @@ fn body_segments_member(
     Some((
         name.to_string(),
         Node::List {
-            item: "segment".to_string(),
+            item: SEGMENT_ITEM.to_string(),
             items: segments
                 .iter()
                 .map(|segment| body_segment_node(segment, delimiters))
@@ -905,7 +936,7 @@ impl Scope {
 fn transaction_node(transaction: &Transaction, delimiters: &Delimiters) -> Node {
     let mut members = envelope_members(&transaction.st, ST_ELEMENTS);
     members.extend(body_segments_member(
-        "segments",
+        SEGMENTS_KEY,
         &transaction.body,
         delimiters,
     ));
@@ -928,14 +959,14 @@ fn group_node(
 ) -> Node {
     let mut members = envelope_members(&group.gs, GS_ELEMENTS);
     members.extend(body_segments_member(
-        "segments",
+        SEGMENTS_KEY,
         scope.loose(&group.loose),
         delimiters,
     ));
     members.push((
-        "transactions".to_string(),
+        TRANSACTIONS_KEY.to_string(),
         Node::List {
-            item: "transaction".to_string(),
+            item: TRANSACTION_ITEM.to_string(),
             items: transactions
                 .iter()
                 .map(|transaction| transaction_node(transaction, delimiters))
@@ -966,14 +997,14 @@ fn interchange_node(
     let names = isa_element_names(release);
     let mut members = envelope_members(&interchange.isa, &names);
     members.extend(body_segments_member(
-        "segments",
+        SEGMENTS_KEY,
         scope.loose(&interchange.loose),
         delimiters,
     ));
     members.push((
-        "functional_groups".to_string(),
+        FUNCTIONAL_GROUPS_KEY.to_string(),
         Node::List {
-            item: "functional_group".to_string(),
+            item: FUNCTIONAL_GROUP_ITEM.to_string(),
             items: groups
                 .iter()
                 .map(|(group, transactions)| group_node(group, transactions, delimiters, scope))
@@ -1004,12 +1035,39 @@ fn document_node(interchanges: &[Interchange], delimiters: &Delimiters, release:
         })
         .collect();
     Node::Map(vec![(
-        "interchanges".to_string(),
+        INTERCHANGES_KEY.to_string(),
         Node::List {
-            item: "interchange".to_string(),
+            item: INTERCHANGE_ITEM.to_string(),
             items,
         },
     )])
+}
+
+/// The parsed document the X12 interchange `content` holds, as this operation answers it
+/// for the whole input file.
+///
+/// This is the SEAM onto this service's one X12 reader: `CreateStarterMappingTemplate`
+/// (its sample-driven path) and `StartTransformerJob` (a transformer's `inputConversion`)
+/// read a document through it too, so no two operations of this service disagree about
+/// what an EDI file holds, and none of them carries a second reader. The error is the
+/// reason the content is not an interchange, worded as [`unsupported_standard`] and
+/// [`unparsable`] word it, so a caller reads the same sentence whichever operation it
+/// reached — each operation puts it in the error ITS model declares.
+///
+/// The element names follow the release the interchange itself declares in ISA12; a
+/// caller that names a release (this operation's `ediType`) resolves it before building
+/// the tree, which is why this entry takes none.
+pub(crate) fn parse_x12(content: &str) -> Result<Node, String> {
+    // Leading whitespace is file formatting, not part of the interchange.
+    let content = content.trim_start();
+    let delimiters = detect_delimiters(content)?;
+    let segments = split_segments(content, &delimiters)?;
+    let interchanges = parse_interchanges(segments)?;
+    let release = interchanges
+        .first()
+        .and_then(|interchange| declared_release(&interchange.isa))
+        .unwrap_or_default();
+    Ok(document_node(&interchanges, &delimiters, release))
 }
 
 /// The document tree of ONE split file: a single transaction set, inside the functional
@@ -1024,9 +1082,9 @@ fn split_document_node(
 ) -> Node {
     let groups = vec![(group, vec![transaction])];
     Node::Map(vec![(
-        "interchanges".to_string(),
+        INTERCHANGES_KEY.to_string(),
         Node::List {
-            item: "interchange".to_string(),
+            item: INTERCHANGE_ITEM.to_string(),
             items: vec![interchange_node(
                 interchange,
                 &groups,
@@ -1289,40 +1347,6 @@ fn requirement_messages(
     messages
 }
 
-/// An Amazon S3 client over the in-process callback into this same emulator.
-///
-/// The callback is the framework's documented seam for calling another emulated service:
-/// it routes in process, so no network client is configured here and this service names
-/// no other service's crate. `region` is the request's own signing region, so the object
-/// is read where the caller's own S3 requests go.
-fn s3_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-) -> ::aws_sdk_s3::Client {
-    let config = ::aws_sdk_s3::Config::builder()
-        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
-        // The in-process transport routes on the request's own path, and a virtual-host
-        // bucket name is not a host this emulator resolves, so the bucket is addressed in
-        // the path.
-        .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
-        // The transport is in-process: there is nothing to retry, time out or watch for a
-        // stalled stream, and each of those would need a sleep implementation this client
-        // is not given. The same goes for caching the identity: the credentials are handed
-        // over directly.
-        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
-        .stalled_stream_protection(
-            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
-        )
-        .build();
-    ::aws_sdk_s3::Client::from_conf(config)
-}
-
 /// The S3 error codes that mean the object `inputFile` names is not there — which is the
 /// modelled `ResourceNotFoundException`, not a service fault.
 const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchKey", "NoSuchBucket", "NotFound"];
@@ -1363,7 +1387,10 @@ async fn read_input_file(
         ));
     };
 
-    let object = match s3_client(ctx, region)
+    // The ONE Amazon S3 client this service reads an object through
+    // (`crate::state::s3_client`): the in-process callback into this same emulator, so
+    // the object read here is the one a caller's own `s3:PutObject` stored.
+    let object = match crate::state::s3_client(ctx, region)
         .get_object()
         .bucket(bucket)
         .key(key)
@@ -1456,12 +1483,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No state is touched: this operation owns no resource (AWS persists nothing for
-        // it — the model gives a parse no id and no Get/List), so the answer is computed
-        // from the stored OBJECT the request names and nothing a later caller sees
-        // changes. The engine is bound (and not used) so the constructor seam every
-        // operation shares stays visible here.
-        let _ = &self.engine;
+        // Authorization first: nothing is read for a caller IAM refuses. A parse
+        // addresses no resource ARN, so the request is matched against the policy
+        // wildcard — the decision every operation of this service that models
+        // `AccessDeniedException` takes (`crate::state::authorize`).
+        if let Err(denied) =
+            crate::state::authorize(&*self.engine, ctx, Self::NAME, crate::state::ANY_RESOURCE)
+        {
+            return Err(TestParsingErrorModeled::AccessDeniedException(denied).into());
+        }
+
+        // Beyond that decision no state is touched: this operation owns no resource (AWS
+        // persists nothing for it — the model gives a parse no id and no Get/List), so the
+        // answer is computed from the stored OBJECT the request names and nothing a later
+        // caller sees changes.
 
         let Some(format) = DocumentFormat::decode(&input.file_format) else {
             return Err(validation(format!(

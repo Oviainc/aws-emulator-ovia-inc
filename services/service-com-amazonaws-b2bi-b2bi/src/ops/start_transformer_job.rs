@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTransformerJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTransformerJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Runs one transformer job: it resolves the transformer, enforces its status
+//! precondition, reads the input file out of Amazon S3, performs the transformation the
+//! transformer is configured for and writes the output file back — then answers with the
+//! job's id, which `GetTransformerJob` reports the run under.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTransformerJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two preconditions are the caller's, and are refused before anything is read or written:
+//! a `transformerId` this service does not hold is the modelled
+//! `ResourceNotFoundException` (404), and a transformer that is not ACTIVE is the modelled
+//! `ValidationException` (400) — "for the transformer to be used in a capability, its
+//! status must active" (`CreateTransformerResponse$status`), and a job is such a use.
+//!
+//! The run itself is performed by THIS call (nothing is deferred to a task that could
+//! outlive the request), and its outcome is revealed to `GetTransformerJob` once the job
+//! stops reporting the non-terminal `running` status it is answered with
+//! ([`crate::state::TRANSFORMER_JOB_RUNNING_FOR`]). A transformation this emulator cannot
+//! perform — an XSLT mapping, or the outbound direction, which generates EDI — ends in the
+//! job's own modelled `failed` state with a message that says so, never in a success that
+//! wrote something nothing computed.
+//!
+//! The mapping a job applies is caller-supplied code, and it is evaluated by the ONE
+//! JSONata evaluation this service has — `super::test_mapping`'s, with the whole
+//! containment stated there (an evaluation permit and a live-thread ceiling, a thread with
+//! its own sized stack, the interpreter's arena allocation limit, its time box and depth
+//! bound, an unwind guard, and the ceilings on the template, the document and the result).
+//! A job's mapping therefore runs under exactly what a `TestMapping` request's does, and
+//! what that evaluation refuses becomes this job's `failed` message.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +112,310 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The X12 reader and the document tree live with `TestParsing`, the operation whose whole
+/// job is parsing an EDI file: a transformer's `inputConversion` reads the SAME document
+/// through its [`parse_x12`](super::test_parsing::parse_x12) seam.
+use super::test_parsing::parse_x12;
+
+/// The `fromFormat` / `toFormat` value naming EDI: `X12` is the only one the model
+/// declares (`FROM_FORMAT_VALUES` / `TO_FORMAT_VALUES`).
+const FORMAT_X12: &str = "X12";
+
+/// The `Mapping$templateLanguage` values the model declares
+/// (`smithy_query(query="shape",shape="TemplateLanguage")` -> `JSONATA | XSLT`).
+const TEMPLATE_LANGUAGE_JSONATA: &str = "JSONATA";
+const TEMPLATE_LANGUAGE_XSLT: &str = "XSLT";
+
+/// The content type of the file a job writes: the output of an inbound transformation is
+/// the JSON document the mapping produced.
+const OUTPUT_CONTENT_TYPE: &str = "application/json";
+
+/// The extension the output file carries, for the same reason.
+const OUTPUT_EXTENSION: &str = ".json";
+
+/// The most characters of output one job writes.
+///
+/// The input is already bounded to [`crate::state::MAX_EDI_OBJECT_BYTES`]; a mapping can
+/// nevertheless construct a far larger document, so what the job writes is bounded too.
+/// The evaluation's own ceilings — on the template, the document it reads, the memory it
+/// may allocate, the time and depth it may use and the size of the document it produces —
+/// are the ones `super::test_mapping` states, because that is where this service's one
+/// JSONata evaluation lives.
+const MAX_OUTPUT_CHARS: usize = 8 * crate::state::MAX_EDI_OBJECT_BYTES;
+
+/// How a transformer's configuration says its job turns the input file into the output
+/// file.
+///
+/// Only the INBOUND direction is a transformation this emulator performs: an X12 file is
+/// parsed into the B2Bi document (`super::test_parsing`), and a `JSONATA` mapping is then
+/// evaluated over that document by a real JSONata interpreter. Everything else — an
+/// `XSLT` mapping, and any transformer that names an `outputConversion`, which generates
+/// EDI from a JSON/XML document — needs an engine this emulator does not have in process,
+/// so a job configured for it REACHES THE MODELLED `failed` STATE with a message that says
+/// so, rather than being reported as a success that wrote something it did not compute
+/// (a JSON document where an EDI file is owed).
+enum JobPlan {
+    /// Parse the X12 input file and evaluate this JSONata expression over the result.
+    ParseThenJsonata(String),
+    /// Parse the X12 input file; the output file is that document.
+    Parse,
+    /// This emulator does not run a transformer configured this way; the reason.
+    Unsupported(String),
+}
+
+/// What `transformer`'s configuration asks a job to do.
+///
+/// Both configuration styles the model offers are read: the current members
+/// (`inputConversion` / `mapping` / `outputConversion`) and the deprecated ones
+/// (`ediType` / `fileFormat` / `mappingTemplate`), whose template's language is the one
+/// its `fileFormat` names — a JSON file is produced by a JSONata expression and an XML
+/// file by an XSLT stylesheet.
+fn plan(transformer: &crate::state::Transformer) -> JobPlan {
+    // A transformer that names an outputConversion is configured to GENERATE an EDI file,
+    // whichever direction it also names: this emulator has no X12 writer, so it does not
+    // claim to have run one — not even when an inputConversion is named beside it, where
+    // parsing the input would produce a JSON document where an EDI file is owed.
+    if let Some(output) = &transformer.output_conversion {
+        return JobPlan::Unsupported(format!(
+            "This transformer is configured with outputConversion toFormat {}, which \
+             generates an EDI file from a JSON or XML document; this emulator does not \
+             generate EDI, so no output file was written.",
+            output.to_format
+        ));
+    }
+    let inbound_format = transformer
+        .input_conversion
+        .as_ref()
+        .map(|conversion| conversion.from_format.clone())
+        .or_else(|| transformer.edi_type.as_ref().map(|_| FORMAT_X12.to_string()));
+    match inbound_format.as_deref() {
+        Some(FORMAT_X12) => {}
+        Some(other) => {
+            return JobPlan::Unsupported(format!(
+                "This transformer reads the input file as {other}; this emulator reads X12 \
+                 interchanges only, so no output file was written."
+            ))
+        }
+        None => {
+            return JobPlan::Unsupported(
+                "This transformer names no input conversion, so there is nothing to \
+                 transform the input file with and no output file was written."
+                    .to_string(),
+            )
+        }
+    }
+
+    // The mapping, in whichever style the transformer carries it.
+    let (language, template) = match (&transformer.mapping, &transformer.mapping_template) {
+        (Some(mapping), _) => (
+            mapping.template_language.clone(),
+            mapping.template.clone().unwrap_or_default(),
+        ),
+        (None, Some(legacy)) => {
+            let language = match transformer.file_format.as_deref() {
+                Some("XML") => TEMPLATE_LANGUAGE_XSLT,
+                _ => TEMPLATE_LANGUAGE_JSONATA,
+            };
+            (language.to_string(), legacy.clone())
+        }
+        // No mapping at all: the output file is the parsed document itself, which is what
+        // the input conversion produced.
+        (None, None) => return JobPlan::Parse,
+    };
+    if template.trim().is_empty() {
+        return JobPlan::Parse;
+    }
+    match language.as_str() {
+        TEMPLATE_LANGUAGE_JSONATA => JobPlan::ParseThenJsonata(template),
+        TEMPLATE_LANGUAGE_XSLT => JobPlan::Unsupported(
+            "This transformer's mapping is an XSLT stylesheet; this emulator has no XSLT \
+             processor in process, so no output file was written."
+                .to_string(),
+        ),
+        other => JobPlan::Unsupported(format!(
+            "This transformer's mapping template language {other} is not one this emulator \
+             evaluates, so no output file was written."
+        )),
+    }
+}
+
+/// The modelled refusal for a repeat of a `clientToken` that asks for something else — the
+/// wording every operation of this service that carries an `@idempotencyToken` refuses it
+/// with ([`crate::state::token_already_used`]).
+fn token_already_used(started: &str) -> StartTransformerJobError {
+    StartTransformerJobErrorModeled::ConflictException(ConflictException {
+        message: crate::state::token_already_used("transformer job", started),
+    })
+    .into()
+}
+
+/// A digest of everything this request asks for, as the `@idempotencyToken` replay check
+/// compares it ([`crate::state::request_digest`]). `clientToken` itself is excluded: it is
+/// the key, not part of the payload.
+fn request_digest(input: &StartTransformerJobInput) -> String {
+    // Destructured, not field-accessed, so the member set is EXHAUSTIVE at compile time: a
+    // member added to `StartTransformerJobInput` by a model update breaks this line instead
+    // of being silently left out of the digest (which would answer a genuinely different
+    // request as an idempotent replay).
+    let StartTransformerJobInput {
+        input_file,
+        output_location,
+        transformer_id,
+        client_token: _,
+    } = input;
+
+    crate::state::request_digest(&format!(
+        "{:?}",
+        (input_file, output_location, transformer_id)
+    ))
+}
+
+/// The key the output file of job `job_id` is written under, inside the prefix
+/// `outputLocation` names.
+///
+/// `outputLocation` names "an Amazon S3 bucket and prefix", and the caller reads the full
+/// path back from `GetTransformerJob$outputFiles`: "if the caller specified a directory
+/// for the output, then this contains the full path to the output file, including the file
+/// name generated by the service". The generated name is the job's own id, so two runs
+/// into one prefix never overwrite each other.
+fn output_key(prefix: &str, job_id: &str) -> String {
+    let prefix = prefix.trim_start_matches('/');
+    if prefix.is_empty() {
+        return format!("{job_id}{OUTPUT_EXTENSION}");
+    }
+    if prefix.ends_with('/') {
+        return format!("{prefix}{job_id}{OUTPUT_EXTENSION}");
+    }
+    format!("{prefix}/{job_id}{OUTPUT_EXTENSION}")
+}
+
+/// What a run reported: the output file it wrote, or why it could not.
+struct Outcome {
+    status: &'static str,
+    output_files: Vec<S3Location>,
+    message: Option<String>,
+}
+
+impl Outcome {
+    /// The run wrote `location`.
+    fn succeeded(location: S3Location) -> Self {
+        Self {
+            status: crate::state::TRANSFORMER_JOB_SUCCEEDED,
+            output_files: vec![location],
+            message: None,
+        }
+    }
+
+    /// The run could not be performed, for the reason `message` gives. The job's own
+    /// modelled failure state, never a failure of the request that started it: the
+    /// transformer resolved and was active, so the request itself was served.
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            status: crate::state::TRANSFORMER_JOB_FAILED,
+            output_files: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
+}
+
+/// Run one transformer job: read the input file, perform the transformation the
+/// transformer is configured for, and write the output file.
+///
+/// The work is done by the call that starts the job — nothing is deferred to a task that
+/// could outlive the request — and what it REPORTS is revealed to `GetTransformerJob` once
+/// the job stops reporting `running` ([`crate::state::TRANSFORMER_JOB_RUNNING_FOR`]).
+async fn run_job(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    transformer: &crate::state::Transformer,
+    input: &S3Location,
+    output: &S3Location,
+    job_id: &str,
+) -> Outcome {
+    let template = match plan(transformer) {
+        JobPlan::Unsupported(reason) => return Outcome::failed(reason),
+        JobPlan::Parse => None,
+        JobPlan::ParseThenJsonata(template) => Some(template),
+    };
+    let text = match crate::state::read_edi_object(ctx, region, input, "inputFile").await {
+        Ok(text) => text,
+        Err(failure) => {
+            return Outcome::failed(format!(
+                "The input file could not be read: {}",
+                failure.message()
+            ))
+        }
+    };
+    // Parsing and rendering the input are synchronous CPU work over a caller-supplied
+    // document, so they run on a blocking thread, leaving the request interruptible; the
+    // rendered document is held to the same bound as the one the job writes, which is what
+    // keeps the amplification from a 250 KiB file bounded.
+    let parsed = match ::tokio::task::spawn_blocking(move || {
+        let document = parse_x12(&text)?;
+        // The reader's tree serialises to the same JSON document `TestParsing` answers
+        // with, which is what a transformer's JSONATA mapping is written against.
+        let parsed = ::serde_json::to_string_pretty(&document)
+            .map_err(|failure| format!("The parsed input could not be rendered: {failure}"))?;
+        if parsed.len() > MAX_OUTPUT_CHARS {
+            return Err(format!(
+                "The parsed input is {} characters, more than the {MAX_OUTPUT_CHARS} this \
+                 emulator transforms in one job.",
+                parsed.len()
+            ));
+        }
+        Ok(parsed)
+    })
+    .await
+    {
+        Ok(Ok(parsed)) => parsed,
+        Ok(Err(failure)) => return Outcome::failed(failure),
+        Err(error) => {
+            return Outcome::failed(format!("The input file could not be parsed: {error}"))
+        }
+    };
+    let body = match template {
+        None => parsed,
+        // The one JSONata evaluation this service has, with the whole containment it
+        // states — the permit and live-thread ceiling, the thread with its own stack, the
+        // arena's allocation limit, the time box and depth bound, the unwind guard and the
+        // size ceilings — so a job's mapping runs under exactly what a `TestMapping`
+        // request's does.
+        Some(template) => {
+            match super::test_mapping::evaluate_mapping_template(template, parsed).await {
+                Ok(body) => body,
+                Err(failure) => {
+                    return Outcome::failed(format!(
+                        "The transformer's JSONATA mapping could not be evaluated: {failure}"
+                    ))
+                }
+            }
+        }
+    };
+    if body.len() > MAX_OUTPUT_CHARS {
+        return Outcome::failed(format!(
+            "The transformed document is {} characters, more than the {MAX_OUTPUT_CHARS} \
+             this emulator writes in one job.",
+            body.len()
+        ));
+    }
+
+    let bucket = output.bucket_name.as_deref().unwrap_or_default();
+    if bucket.is_empty() {
+        return Outcome::failed("outputLocation names no Amazon S3 bucketName.");
+    }
+    let prefix = output.key.as_deref().unwrap_or_default();
+    let key = output_key(prefix, job_id);
+    if let Err(failure) =
+        crate::state::write_object(ctx, region, bucket, &key, OUTPUT_CONTENT_TYPE, body).await
+    {
+        return Outcome::failed(format!("The output file could not be written: {failure}"));
+    }
+    Outcome::succeeded(S3Location {
+        bucket_name: Some(bucket.to_string()),
+        key: Some(key),
+    })
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +489,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTransformerJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTransformerJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTransformerJob"))
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::state::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(&region, "transformer", &input.transformer_id),
+        ) {
+            return Err(StartTransformerJobErrorModeled::AccessDeniedException(denied).into());
+        }
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(StartTransformerJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // A location that names no bucket addresses no object at all, which is the caller's
+        // mistake and is refused before a job exists — for either location. `inputFile`
+        // additionally has to name a KEY, because it addresses one stored object; a
+        // key-less `outputLocation` is the bucket's own root, which is a prefix like any
+        // other ("an Amazon S3 bucket and prefix for the location of the output file").
+        for (location, member) in [
+            (&input.input_file, "inputFile"),
+            (&input.output_location, "outputLocation"),
+        ] {
+            if location
+                .bucket_name
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "{member} must name an Amazon S3 bucketName"
+                )));
+            }
+        }
+        if input.input_file.key.as_deref().unwrap_or_default().is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "inputFile must name the Amazon S3 key of the EDI file to transform",
+            ));
+        }
+
+        // What this request asks for, as the `@idempotencyToken` replay check compares it
+        // and as the job records it.
+        let digest = request_digest(&input);
+
+        // PHASE 1, under the lock: answer a replay, enforce the transformer's status
+        // precondition and mint the job id. The run itself takes in-process calls to
+        // Amazon S3, so no state lock may span it.
+        let (transformer, job_id) = {
+            let mut state = store.lock();
+
+            // `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the
+            // same token answers with the job the first call started, and a duplicate sent
+            // while that call is still in flight is the racer AWS refuses with
+            // `ConflictException` (see [`crate::state::IDEMPOTENT_CREATE_IN_FLIGHT`]).
+            //
+            // A SETTLED token used again for a DIFFERENT request is the other conflict a
+            // token can produce, and [`request_digest`] is what tells the two apart — the
+            // same request replays, a different one is refused, exactly as
+            // `CreateTransformer` treats its own token.
+            let idempotency_key = input
+                .client_token
+                .as_deref()
+                .map(|token| crate::state::idempotency_key("transformerJob", token));
+            if let Some(key) = idempotency_key.as_deref() {
+                match state.replay(key, ::std::time::Instant::now()) {
+                    Some(crate::state::TokenReplay::InFlight) => {
+                        return Err(StartTransformerJobErrorModeled::ConflictException(
+                            ConflictException {
+                                message: crate::state::create_in_flight(
+                                    "transformer job",
+                                    input.client_token.as_deref().unwrap_or_default(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                    Some(crate::state::TokenReplay::Completed(started)) => {
+                        if let Some(job) = state.transformer_jobs.get(&started) {
+                            if job.request_digest != digest {
+                                return Err(token_already_used(&started));
+                            }
+                            return Ok(StartTransformerJobOutput {
+                                transformer_job_id: started,
+                            });
+                        }
+                    }
+                    None => {}
+                }
+            }
+
+            // The transformer the job runs has to resolve, and has to be ACTIVE: "for the
+            // transformer to be used in a capability, its status must active"
+            // (`CreateTransformerResponse$status`), and a job is exactly such a use. An
+            // inactive transformer is the modelled `ValidationException` (400) — the
+            // caller's own configuration step is what fixes it — and nothing is read or
+            // written under the requested output prefix.
+            let Some(transformer) = state.transformers.get(&input.transformer_id) else {
+                return Err(StartTransformerJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::transformer_not_found(&input.transformer_id),
+                    },
+                )
+                .into());
+            };
+            if transformer.status != crate::state::TRANSFORMER_STATUS_ACTIVE {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Transformer {} must be active",
+                    input.transformer_id
+                )));
+            }
+            let transformer = transformer.clone();
+
+            let mut job_id = crate::state::new_transformer_job_id();
+            while state.transformer_jobs.contains_key(&job_id) {
+                job_id = crate::state::new_transformer_job_id();
+            }
+            // Remembered before the run, so a duplicate of THIS request is answered with
+            // this job rather than starting a second one.
+            if let Some(key) = idempotency_key {
+                state.record_idempotency(key, &job_id);
+            }
+            (transformer, job_id)
+        };
+
+        // PHASE 2, with no lock held: the run. It reads the input file, performs the
+        // transformation the transformer is configured for and writes the output file, all
+        // through the emulator's own S3 service.
+        let outcome = run_job(
+            ctx,
+            &region,
+            &transformer,
+            &input.input_file,
+            &input.output_location,
+            &job_id,
+        )
+        .await;
+
+        // PHASE 3, under the lock again: persist what the run reported. The job reports
+        // `running` until its outcome is due, which is the status AWS answers the start
+        // call with, and the terminal status afterwards.
+        store.lock().record_transformer_job(crate::state::TransformerJob {
+            transformer_job_id: job_id.clone(),
+            transformer_id: input.transformer_id,
+            request_digest: digest,
+            terminal_status: outcome.status.to_string(),
+            output_files: outcome.output_files,
+            message: outcome.message,
+            settles_at: ::std::time::Instant::now() + crate::state::TRANSFORMER_JOB_RUNNING_FOR,
+        });
+
+        Ok(StartTransformerJobOutput {
+            transformer_job_id: job_id,
+        })
     }
 }
