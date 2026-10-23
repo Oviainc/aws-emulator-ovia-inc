@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflowType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkflowType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkflowType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the ONE stored workflow-type record its `(domain, name, version)` triple
+//! addresses, so every later reader of that record (`DescribeWorkflowType`) answers
+//! `UnknownResourceFault` and the identity is free to be registered again. Deletion is
+//! available only once the record is `DEPRECATED`: a `REGISTERED` record is the modelled
+//! `TypeNotDeprecatedFault` and nothing is removed. The executions already started with
+//! the type carry their own copy of the identity and of the configuration they resolved
+//! at start, so the removal leaves them exactly as they were and they continue to run.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `DeleteWorkflowType::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
+//! The engine is held on `self` (constructor-injected), NOT passed per request, so
 //! engine access is guaranteed by the time any request runs. Reach the store through
 //! [`crate::state::service_state`] and read and write it through the guard it hands back:
 //!
@@ -30,7 +29,7 @@
 //!     state.lock().your_field = /* ... */;
 //! ```
 //!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only:
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -42,8 +41,8 @@
 //! # Modeled contract for `DeleteWorkflowType`
 //!
 //! What AWS documents for this operation, from this service's Smithy model. HTML is
-//! stripped and long entries are clipped at ` …`. For the FULL text of any one item,
-//! ask the model rather than reading the raw JSON:
+//! stripped and long entries are clipped. For the FULL text of any one item, ask the
+//! model rather than reading the raw JSON:
 //!
 //! ```text
 //! smithy_query(query="doc",shape="<Shape>",member="<Member>",model_path="services/service-com-amazonaws-swf-simpleworkflowservice/smithy-model/com-amazonaws-swf-simpleworkflowservice.json")
@@ -66,22 +65,28 @@
 //!
 //! ## Input
 //!
-//! * `domain` (DomainName, len 1..256) **required** — The name of the domain in which the
+//! * `domain` (DomainName, len 1..256) **required** - The name of the domain in which the
 //!   workflow type is registered.
-//! * `workflowType` (WorkflowType) **required** — The workflow type to delete.
+//! * `workflowType` (WorkflowType) **required** - The workflow type to delete.
 //!
 //! ## Errors
 //!
-//! * `OperationNotPermittedFault` (HTTP 400) — Returned when the caller doesn't have
+//! * `OperationNotPermittedFault` (HTTP 400) - Returned when the caller doesn't have
 //!   sufficient permissions to invoke the action.
-//! * `TypeNotDeprecatedFault` (HTTP 400) — Returned when the resource type has not been
+//! * `TypeNotDeprecatedFault` (HTTP 400) - Returned when the resource type has not been
 //!   deprecated.
-//! * `UnknownResourceFault` (HTTP 400) — Returned when the named resource cannot be found
+//! * `UnknownResourceFault` (HTTP 400) - Returned when the named resource cannot be found
 //!   with in the scope of this operation (region or domain). This could happen if the named
 //!   resource was never created or is no longer available for this operation.
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// What Amazon SWF reports when a delete addresses a type that is still `REGISTERED`:
+/// the state of the record, in one fixed sentence that names nothing out of the request,
+/// so every refused delete carries exactly this message.
+pub const TYPE_NOT_DEPRECATED_MESSAGE: &str =
+    "The type is currently registered and cannot be deleted in its current state";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -170,20 +175,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkflowType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkflowTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkflowType"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkflowTypeErrorModeled::OperationNotPermittedFault(
+                OperationNotPermittedFault {
+                    message: Some("the SWF domain store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut guard = state.lock();
+        let Some(domain) = guard.domains.get_mut(&input.domain) else {
+            return Err(DeleteWorkflowTypeErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!("Unknown domain: {}", input.domain)),
+                },
+            )
+            .into());
+        };
+
+        let key = (
+            input.workflow_type.name.clone(),
+            input.workflow_type.version.clone(),
+        );
+        let Some(workflow_type) = domain.workflow_types.get(&key) else {
+            return Err(DeleteWorkflowTypeErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(format!(
+                        "Unknown type: WorkflowType=[name={}, version={}]",
+                        input.workflow_type.name, input.workflow_type.version
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Prior to deletion, workflow types must first be deprecated": a record still
+        // on REGISTERED is the modelled `TypeNotDeprecatedFault` ("Returned when the
+        // resource type has not been deprecated"), and it stays in the store whole, so a
+        // refused delete changes nothing a later caller sees. Amazon SWF reports this
+        // state with one fixed sentence, naming no value out of the request.
+        if !workflow_type.is_deprecated() {
+            return Err(DeleteWorkflowTypeErrorModeled::TypeNotDeprecatedFault(
+                TypeNotDeprecatedFault {
+                    message: Some(TYPE_NOT_DEPRECATED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // With the record gone the identity is unregistered: a reader of it answers
+        // `UnknownResourceFault` and `RegisterWorkflowType` may mint it afresh. Only the
+        // addressed record of the addressed domain is removed; the runs started with it
+        // keep their own stored identity and the configuration they resolved at start.
+        domain.workflow_types.remove(&key);
+
+        Ok(DeleteWorkflowTypeOutput)
     }
 }
