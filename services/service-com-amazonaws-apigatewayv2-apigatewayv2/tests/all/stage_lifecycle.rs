@@ -19,12 +19,19 @@
 //!   than creating a stage: an api or a `DeploymentId` that does not exist is a 404, a
 //!   `StageName` that already names a stage of the api a 409, a request member that
 //!   breaks a documented rule a 400, and the api's stage quota a 429.
+//! * An `AccessLogSettings$Format` must select the request id ("The format must include
+//!   at least $context.requestId"), so a format that selects none is refused 400 and
+//!   stores nothing, while a settings block that names no format at all configures no
+//!   access logging and is stored as it came.
+//! * Deploying to a stage that already exists moves the stage onto that deployment,
+//!   which `GetStage` reports.
 //!
 //! The rows vary what the rules generalise over: the parent api's protocol type, the
 //! form and length of the stage name, which optional members the request carries, the
-//! `AutoDeploy` flag, where the stage's deployment came from, and the bounds of the
-//! shapes the members target. The recorded case that filed the issue — a `$default`
-//! stage created with `AutoDeploy` on under an HTTP api — is ONE row.
+//! `AutoDeploy` flag, where the stage's deployment came from, what an access log format
+//! selects, and the bounds of the shapes the members target. The recorded case that
+//! filed the issue — a `$default` stage created with `AutoDeploy` on under an HTTP api —
+//! is ONE row.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -721,6 +728,181 @@ async fn a_stage_is_reported_only_through_the_api_that_owns_it() {
             error_code(&body),
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_access_log_format_must_select_the_request_id() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the owning api", &http_api("access-log-api")).await;
+
+    // "The format must include at least $context.requestId"
+    // (`AccessLogSettings$Format`), so a format that selects none could never tie an
+    // entry to the request that produced it. The rows vary what the format DOES select
+    // and whether the settings name a destination.
+    for (case, stage_name, settings) in [
+        (
+            "a format selecting other context variables",
+            "other-variables",
+            json!({ "format": "$context.status $context.protocol" }),
+        ),
+        (
+            "a format at the lower bound of its shape: the empty string",
+            "empty-format",
+            json!({ "format": "" }),
+        ),
+        (
+            "a format naming a destination but selecting no request id",
+            "with-destination",
+            json!({
+                "destinationArn": "arn:aws:logs:eu-west-1:000000000000:log-group:api-logs",
+                "format": "$context.identity.sourceIp - $context.requestTime"
+            }),
+        ),
+    ] {
+        let (status, body) = create_stage(
+            &emulator,
+            &api_id,
+            json!({ "stageName": stage_name, "accessLogSettings": settings }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 from CreateStage, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {body}"
+        );
+
+        // A refused create stored nothing.
+        let (status, fetched) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/stages/{stage_name}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused CreateStage must store nothing, got {status} {fetched}"
+        );
+    }
+
+    // A format that DOES select the request id is stored as it came, and so is a
+    // settings block that names no format at all: that one configures no access logging,
+    // so there is no format to require anything of.
+    for (case, stage_name, settings) in [
+        (
+            "a format selecting the request id among other variables",
+            "logged",
+            json!({
+                "destinationArn": "arn:aws:logs:eu-west-1:000000000000:log-group:api-logs",
+                "format": "$context.requestId $context.status"
+            }),
+        ),
+        (
+            "a format selecting nothing but the request id",
+            "minimal-format",
+            json!({ "format": "$context.requestId" }),
+        ),
+        (
+            "no format at all, which configures no access logging",
+            "unformatted",
+            json!({ "destinationArn": "arn:aws:logs:eu-west-1:000000000000:log-group:api-logs" }),
+        ),
+    ] {
+        let (status, created) = create_stage(
+            &emulator,
+            &api_id,
+            json!({ "stageName": stage_name, "accessLogSettings": settings }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreateStage, got {status} {created}"
+        );
+        assert_eq!(
+            created.get("accessLogSettings"),
+            Some(&settings),
+            "case {case:?}: expected the settings the request carried, got {created}"
+        );
+        let (status, fetched) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/stages/{stage_name}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetStage, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched, created,
+            "case {case:?}: GetStage must report the record CreateStage stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deploying_to_a_stage_moves_it_onto_that_deployment() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the owning api", &http_api("redeployed-api")).await;
+    create_routes(&emulator, "the owning api", &api_id, &["GET /items"]).await;
+
+    // A stage that asked for no deployment serves none.
+    let (status, created) = create_stage(&emulator, &api_id, json!({ "stageName": "prod" })).await;
+    assert_eq!(
+        status, 201,
+        "expected 201 from CreateStage, got {status} {created}"
+    );
+    assert_eq!(
+        created.get("deploymentId"),
+        None,
+        "a stage created with no deployment must serve none, got {created}"
+    );
+
+    // Deploying to it, and then deploying again, moves the stage onto each deployment in
+    // turn: a `Deployment` "must be associated with a Stage for it to be callable over
+    // the internet" (the `Deployment` shape's own doc).
+    let mut released = Vec::new();
+    for case in ["the first deployment", "a second deployment"] {
+        let (status, deployment) = call(
+            &emulator,
+            "POST",
+            &format!("/v2/apis/{api_id}/deployments"),
+            Some(json!({ "stageName": "prod" })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreateDeployment, got {status} {deployment}"
+        );
+        let deployment_id = as_str(&deployment, "deploymentId");
+        assert!(
+            !released.contains(&deployment_id),
+            "case {case:?}: DeploymentId {deployment_id:?} was minted twice"
+        );
+        released.push(deployment_id.clone());
+
+        let (status, fetched) = call(
+            &emulator,
+            "GET",
+            &format!("/v2/apis/{api_id}/stages/prod"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetStage, got {status} {fetched}"
+        );
+        assert_eq!(
+            as_str(&fetched, "deploymentId"),
+            deployment_id,
+            "case {case:?}: expected the stage to serve the deployment released to it, got {fetched}"
         );
     }
 }

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStage
+//! IMPLEMENTED: reports the stage `CreateStage` persisted under its api, read out of
+//! this service's state and written nowhere.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
