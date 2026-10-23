@@ -4,8 +4,13 @@
 //! REPORTS one stored ingestion destination and writes nothing: the response is built
 //! from the stored record (see
 //! [`crate::state::IngestionDestinationRecord::to_ingestion_destination`]), so a read
-//! never changes what a later caller sees. A chain resource that does not exist is
-//! HTTP 404 `ResourceNotFoundException` on this reporting path.
+//! never changes what a later caller sees.
+//!
+//! A destination is reachable only THROUGH its parents, and the resource this
+//! operation reports on is the DESTINATION, so an `appBundleIdentifier` or an
+//! `ingestionIdentifier` that resolves to nothing means the destination named
+//! does not exist either: every unresolved link of the chain answers the one
+//! HTTP 404 `ResourceNotFoundException` ABOUT the ingestion destination.
 //!
 //! ## Shape of an operation
 //!
@@ -164,36 +169,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure report: this handler only reads the store.
         let store = state.lock();
-        let Some(bundle) = store.resolve_bundle(&input.app_bundle_identifier) else {
-            return Err(
-                GetIngestionDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::app_bundle_not_found(&input.app_bundle_identifier),
-                )
-                .into(),
-            );
+        // The resource this operation reports on is the DESTINATION, so an
+        // unresolved link anywhere in its chain is reported as that destination
+        // not existing — which is what it means for the bundle or the ingestion
+        // that would hold it to be absent. (The write path refuses the same
+        // identifiers as a validation failure instead; see
+        // `create_ingestion_destination`.)
+        let not_found = || {
+            GetIngestionDestinationErrorModeled::ResourceNotFoundException(
+                crate::state::ingestion_destination_not_found(
+                    &input.ingestion_destination_identifier,
+                ),
+            )
         };
-        // The REPORTING path answers a missing resource with HTTP 404, which is
-        // what this operation models (the write path refuses the same identifier
-        // as a validation failure).
+        let Some(bundle) = store.resolve_bundle(&input.app_bundle_identifier) else {
+            return Err(not_found().into());
+        };
         let Some(ingestion) = bundle.resolve_ingestion(&input.ingestion_identifier) else {
-            return Err(
-                GetIngestionDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::ingestion_not_found(&input.ingestion_identifier),
-                )
-                .into(),
-            );
+            return Err(not_found().into());
         };
         let Some(destination) =
             ingestion.resolve_destination(&input.ingestion_destination_identifier)
         else {
-            return Err(
-                GetIngestionDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::ingestion_destination_not_found(
-                        &input.ingestion_destination_identifier,
-                    ),
-                )
-                .into(),
-            );
+            return Err(not_found().into());
         };
         Ok(GetIngestionDestinationOutput {
             ingestion_destination: destination.to_ingestion_destination(),

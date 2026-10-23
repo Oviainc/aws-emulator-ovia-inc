@@ -14,7 +14,9 @@
 //!   UUID) at every level of the chain;
 //! * a WRITE naming an ingestion-chain child that does not exist is refused with
 //!   HTTP 400 `ValidationException`, while the READ path answers HTTP 404
-//!   `ResourceNotFoundException` for the same identifier;
+//!   `ResourceNotFoundException` for the same identifier — and that refusal is
+//!   ABOUT the destination the read names, whichever link of the chain is the
+//!   one that does not resolve;
 //! * a value outside a modelled bound is refused with HTTP 400;
 //! * a DELETE removes exactly the destination it resolves to and leaves every
 //!   sibling and every parent in place; it is `@idempotent` below the app bundle
@@ -670,6 +672,138 @@ async fn a_missing_chain_resource_is_a_validation_failure_on_writes_and_not_foun
         read.member("destinationConfiguration"),
         &s3_destination("audit-logs-bucket", None),
         "a refused write must leave the stored configuration alone, got {}",
+        read.body
+    );
+}
+
+/// AppFabric's not-found text for an ingestion destination: a constant naming
+/// the resource kind, which no identifier is interpolated into. The recorded
+/// `appfabric.update-ingestion-destination-changes-prefix-persists` unit asserts
+/// this message for a `GetIngestionDestination` whose parent ingestion does not
+/// resolve, which is what pins BOTH halves of the rule below.
+const DESTINATION_NOT_FOUND_MESSAGE: &str = "The specified ingestion destination does not exist";
+
+/// RULE: the reporting path's refusal is ABOUT THE RESOURCE IT REPORTS ON, so a
+/// `GetIngestionDestination` whose chain does not resolve — at the bundle, at
+/// the ingestion or at the destination itself — answers one and the same HTTP
+/// 404 `ResourceNotFoundException`: `resourceType` `IngestionDestination`,
+/// `resourceId` the destination identifier the caller named, and the constant
+/// message above rather than any identifier reflected back.
+///
+/// The table spans which link of the chain is the one that does not resolve, and
+/// both modelled `Identifier` forms of the unresolved identifier.
+#[tokio::test]
+async fn a_read_reports_the_destination_as_absent_whichever_link_is_missing() {
+    let emulator = Emulator::new();
+    let (bundle, ingestion) = emulator.bundle_with_ingestion().await;
+    let created = emulator
+        .create_destination(
+            &bundle,
+            &ingestion,
+            json!({
+                "processingConfiguration": processing("ocsf", "json"),
+                "destinationConfiguration": s3_destination("audit-logs-bucket", Some("slack/")),
+            }),
+        )
+        .await;
+    let destination = arn_of(&created.body, "ingestionDestination");
+    let unknown = unknown_uuid();
+    let unknown_bundle_arn = format!("arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{unknown}");
+    let unknown_destination_arn = format!(
+        "arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{}/ingestion/{}/ingestiondestination/{unknown}",
+        uuid_of(&bundle),
+        uuid_of(&ingestion)
+    );
+
+    // (which link does not resolve, bundle, ingestion, destination)
+    let cases: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "the bundle, named by bare UUID",
+            unknown.as_str(),
+            ingestion.as_str(),
+            destination.as_str(),
+        ),
+        (
+            "the bundle, named by ARN",
+            unknown_bundle_arn.as_str(),
+            ingestion.as_str(),
+            destination.as_str(),
+        ),
+        (
+            "the ingestion, named by bare UUID",
+            bundle.as_str(),
+            unknown.as_str(),
+            destination.as_str(),
+        ),
+        (
+            "the destination, named by bare UUID",
+            bundle.as_str(),
+            ingestion.as_str(),
+            unknown.as_str(),
+        ),
+        (
+            "the destination, named by ARN",
+            bundle.as_str(),
+            ingestion.as_str(),
+            unknown_destination_arn.as_str(),
+        ),
+        (
+            "the ingestion and the destination together",
+            bundle.as_str(),
+            unknown.as_str(),
+            unknown.as_str(),
+        ),
+    ];
+
+    for (case, bundle_identifier, ingestion_identifier, destination_identifier) in cases {
+        let answer = emulator
+            .get_destination(
+                bundle_identifier,
+                ingestion_identifier,
+                destination_identifier,
+            )
+            .await;
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected HTTP 404, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("resourceType").and_then(Value::as_str),
+            Some("IngestionDestination"),
+            "case {case:?}: expected the refusal to be about the destination, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("resourceId").and_then(Value::as_str),
+            Some(destination_identifier),
+            "case {case:?}: expected the named destination in resourceId, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("message").and_then(Value::as_str),
+            Some(DESTINATION_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the constant message \
+             {DESTINATION_NOT_FOUND_MESSAGE:?}, got {}",
+            answer.body
+        );
+    }
+
+    // None of those reads changed what the stored destination reports.
+    let read = emulator
+        .get_destination(&bundle, &ingestion, &destination)
+        .await;
+    assert_eq!(
+        read.destination(),
+        created.destination(),
+        "a refused read must leave the stored record alone, expected {}, got {}",
+        created.body,
         read.body
     );
 }
