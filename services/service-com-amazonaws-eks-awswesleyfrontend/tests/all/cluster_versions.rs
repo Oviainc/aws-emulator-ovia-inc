@@ -126,7 +126,7 @@ fn version_key(version: &str) -> (u32, u32) {
 
 /// The calendar a suite installs to put the clock in every support class at once:
 /// one row per class, plus a row the clock has not reached the release date of.
-/// Rows ascend by version, which is the order the calendar publishes.
+/// Rows are NEWEST VERSION FIRST, which is the order the calendar publishes.
 fn clock_relative_calendar(now: SystemTime) -> Vec<ClusterVersionRecord> {
     let row = |version: &str, default_version: bool, release: SystemTime, standard: SystemTime, extended: SystemTime| {
         ClusterVersionRecord {
@@ -139,14 +139,14 @@ fn clock_relative_calendar(now: SystemTime) -> Vec<ClusterVersionRecord> {
         }
     };
     vec![
-        // Extended support ended 200 days ago.
-        row("2.10", false, now - 1000 * DAY, now - 600 * DAY, now - 200 * DAY),
-        // Standard support ended 30 days ago, extended support runs on.
-        row("2.11", false, now - 500 * DAY, now - 30 * DAY, now + 300 * DAY),
-        // Inside standard support, and the default version.
-        row("2.12", true, now - 10 * DAY, now + 60 * DAY, now + 425 * DAY),
         // Not released yet, so not an available version.
         row("2.13", false, now + 30 * DAY, now + 500 * DAY, now + 900 * DAY),
+        // Inside standard support, and the default version.
+        row("2.12", true, now - 10 * DAY, now + 60 * DAY, now + 425 * DAY),
+        // Standard support ended 30 days ago, extended support runs on.
+        row("2.11", false, now - 500 * DAY, now - 30 * DAY, now + 300 * DAY),
+        // Extended support ended 200 days ago.
+        row("2.10", false, now - 1000 * DAY, now - 600 * DAY, now - 200 * DAY),
     ]
 }
 
@@ -156,8 +156,8 @@ fn seed_calendar(engine: &Arc<engine::InMemoryEngine>, calendar: Vec<ClusterVers
     store.lock().cluster_versions = calendar;
 }
 
-/// The calendar as it ships is reported in full, ascending, with both status
-/// spellings agreeing with the dates each row carries.
+/// The calendar as it ships is reported in full, newest version first, with both
+/// status spellings agreeing with the dates each row carries.
 #[tokio::test]
 async fn the_published_calendar_is_reported_from_state() {
     let (router, _engine) = emulator();
@@ -244,8 +244,23 @@ async fn the_published_calendar_is_reported_from_state() {
     let reported = reported_versions(&answer);
     let keys: Vec<(u32, u32)> = reported.iter().map(|version| version_key(version)).collect();
     assert!(
-        keys.windows(2).all(|pair| pair[0] < pair[1]),
-        "case ordering: expected ascending Kubernetes versions, got {reported:?}"
+        keys.windows(2).all(|pair| pair[0] > pair[1]),
+        "case ordering: expected the newest Kubernetes version first, got {reported:?}"
+    );
+
+    // The calendar must still be publishing versions the clock has not run past:
+    // a catalog whose every row is out of support is one a caller cannot create a
+    // cluster from, which is what a table of fixed dates decays into.
+    let in_standard_support: Vec<&String> = reported
+        .iter()
+        .zip(listed.iter())
+        .filter(|(_, row)| row["versionStatus"].as_str() == Some("STANDARD_SUPPORT"))
+        .map(|(version, _)| version)
+        .collect();
+    assert!(
+        !in_standard_support.is_empty(),
+        "case support window: the calendar must publish a version in standard support at now \
+         {now}, got {reported:?}"
     );
 }
 
@@ -367,7 +382,7 @@ async fn filters_narrow_the_listing() {
 
     // (case, query, expected versions in order)
     let cases: Vec<(&str, String, Vec<&str>)> = vec![
-        ("no filter", String::new(), vec!["2.10", "2.11", "2.12"]),
+        ("no filter", String::new(), vec!["2.12", "2.11", "2.10"]),
         (
             "one named version",
             "clusterVersions=2.11".to_string(),
@@ -376,7 +391,7 @@ async fn filters_narrow_the_listing() {
         (
             "two named versions",
             "clusterVersions=2.10&clusterVersions=2.12".to_string(),
-            vec!["2.10", "2.12"],
+            vec!["2.12", "2.10"],
         ),
         (
             "a version the calendar does not publish",
@@ -391,7 +406,7 @@ async fn filters_narrow_the_listing() {
         (
             "the published cluster type",
             format!("clusterType={CLUSTER_TYPE_EKS}"),
-            vec!["2.10", "2.11", "2.12"],
+            vec!["2.12", "2.11", "2.10"],
         ),
         (
             "another cluster type",
@@ -402,7 +417,7 @@ async fn filters_narrow_the_listing() {
         (
             "default only, off",
             "defaultOnly=false".to_string(),
-            vec!["2.10", "2.11", "2.12"],
+            vec!["2.12", "2.11", "2.10"],
         ),
         (
             "versionStatus STANDARD_SUPPORT",
@@ -437,7 +452,7 @@ async fn filters_narrow_the_listing() {
         (
             "includeAll only ever widens, and the calendar is already whole",
             "includeAll=true".to_string(),
-            vec!["2.10", "2.11", "2.12"],
+            vec!["2.12", "2.11", "2.10"],
         ),
         (
             "a status filter and a named version that satisfies it",
@@ -502,8 +517,8 @@ async fn pagination_walks_every_row_once() {
     let whole = reported_versions(&describe_versions(&router, "").await);
     assert_eq!(
         whole,
-        vec!["2.10", "2.11", "2.12"],
-        "case whole listing: expected the three released rows, got {whole:?}"
+        vec!["2.12", "2.11", "2.10"],
+        "case whole listing: expected the three released rows, newest first, got {whole:?}"
     );
 
     for page_size in [1usize, 2, 3, 100] {
@@ -557,6 +572,16 @@ async fn pagination_walks_every_row_once() {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("expected a nextToken on a 1-row page, got {:?}", first.body))
         .to_string();
+    // A token that names a row the differently filtered listing does NOT hold: the
+    // second page's token names `2.11`, which the `defaultOnly` listing (just the
+    // default version, `2.12`) has no position for.
+    let second = describe_versions(&router, "maxResults=2").await;
+    let foreign_filter_token = second
+        .body
+        .get("nextToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("expected a nextToken on a 2-row page, got {:?}", second.body))
+        .to_string();
     let refused = [
         ("a token this service never minted", "nextToken=not-a-token".to_string()),
         (
@@ -565,11 +590,11 @@ async fn pagination_walks_every_row_once() {
         ),
         (
             "a well-formed token minted by another listing",
-            format!("nextToken={}", state::encode_page_token("2.10")),
+            format!("nextToken={}", state::encode_page_token("2.12")),
         ),
         (
             "a token used with different filters",
-            format!("nextToken={token}&defaultOnly=true"),
+            format!("nextToken={foreign_filter_token}&defaultOnly=true"),
         ),
     ];
     for (case, query) in refused {

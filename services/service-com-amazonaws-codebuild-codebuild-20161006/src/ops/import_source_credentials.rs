@@ -195,6 +195,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // For the two auth types whose token the model documents as another
+        // resource's ARN — the connectionArn, the secretArn — a value that is not an
+        // ARN at all names no such resource, so it is refused rather than stored and
+        // reported back as `SourceCredentialsInfo$resource`.
+        if crate::state::token_is_resource_arn(&input.auth_type)
+            && !crate::state::is_arn(&input.token)
+        {
+            return Err(ImportSourceCredentialsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "token must be the ARN of the connection or secret for authType {}",
+                        input.auth_type
+                    )),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::source_credential_arn(&region, &input.server_type);
         // "Set to false to prevent overwriting the repository source credentials. Set
@@ -222,8 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // two auth types whose token is a resource identifier rather than a secret it
         // is kept as `resource` — `SourceCredentialsInfo$resource` is "The connection
         // ARN if your authType is CODECONNECTIONS or SECRETS_MANAGER".
-        let resource = crate::state::RESOURCE_ARN_AUTH_TYPES
-            .contains(&input.auth_type.as_str())
+        let resource = crate::state::token_is_resource_arn(&input.auth_type)
             .then(|| input.token.clone());
 
         guard.source_credentials.insert(

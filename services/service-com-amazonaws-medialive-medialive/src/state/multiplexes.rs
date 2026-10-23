@@ -25,7 +25,8 @@
 //! [`MultiplexTransition`]: the instant it comes due and the `MultiplexState` it
 //! settles into), because a multiplex is in at most one transient state at a
 //! time: `CREATING` settles into `IDLE`, the `STARTING` a start begins into
-//! `RUNNING`, and the `DELETING` a delete begins into the terminal `DELETED`.
+//! `RUNNING`, the `STOPPING` a stop begins back into `IDLE`, and the `DELETING`
+//! a delete begins into the terminal `DELETED`.
 //! The instants are stored and never slept on —
 //! [`ComAmazonawsMedialiveMedialiveState::settle`], which every operation runs
 //! first, is what materialises the ones the clock has already made due.
@@ -40,17 +41,16 @@ use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 /// The `MultiplexState` values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="MultiplexState")`:
 /// CREATING | CREATE_FAILED | IDLE | STARTING | RUNNING | RECOVERING | STOPPING
-/// | DELETING | DELETED). The four the model declares but this slice does not
-/// name are the ones nothing here can reach: `STOPPING` belongs to
-/// `StopMultiplex`, still a scaffold stub with its own issue, and
-/// `CREATE_FAILED` and `RECOVERING` report a failure of the transport-stream
-/// multiplexer the real service runs, which this emulator does not run and
-/// therefore never claims.
+/// | DELETING | DELETED). The two the model declares but this slice does not
+/// name are the ones nothing here can reach: `CREATE_FAILED` and `RECOVERING`
+/// report a failure of the transport-stream multiplexer the real service runs,
+/// which this emulator does not run and therefore never claims.
 pub mod multiplex_state {
     pub const CREATING: &str = "CREATING";
     pub const IDLE: &str = "IDLE";
     pub const STARTING: &str = "STARTING";
     pub const RUNNING: &str = "RUNNING";
+    pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
     pub const DELETED: &str = "DELETED";
 }
@@ -178,6 +178,19 @@ fn setting_out_of_range(settings: &MultiplexSettings) -> Option<MultiplexRefusal
             }
             _ => None,
         })
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::stop_multiplex`] stopped nothing.
+///
+/// One variant, because a multiplex's own state is NOT a precondition of a stop:
+/// `StopMultiplex` is documented as "Stops a running multiplex. If the multiplex
+/// isn't running, this action has no effect", so the only request the store
+/// cannot satisfy is one naming a multiplex it does not hold.
+#[derive(Debug)]
+pub enum MultiplexStopRefusal {
+    /// No multiplex in the store has the id the request named, so there is
+    /// nothing to stop and nothing to report.
+    NotFound,
 }
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::start_multiplex`] started
@@ -526,6 +539,13 @@ impl MultiplexRecord {
         self.state == multiplex_state::IDLE
     }
 
+    /// Whether this multiplex is RUNNING, which is the one state a stop has an
+    /// effect in: `StopMultiplex` "Stops a running multiplex. If the multiplex
+    /// isn't running, this action has no effect."
+    fn is_running(&self) -> bool {
+        self.state == multiplex_state::RUNNING
+    }
+
     /// Move this multiplex into `DELETING`, owing the terminal `DELETED` state
     /// it then keeps once [`TRANSIENT_STATE_SPAN`] has passed: the record stays
     /// in the account, so a reader goes on reporting the multiplex in that state
@@ -543,6 +563,15 @@ impl MultiplexRecord {
         self.begin_transition(multiplex_state::STARTING, multiplex_state::RUNNING, now);
     }
 
+    /// Move this multiplex into `STOPPING`, owing the stopped `IDLE` state once
+    /// [`TRANSIENT_STATE_SPAN`] has passed: stopping a multiplex is
+    /// asynchronous, exactly like the start it undoes, so a caller waits on
+    /// `State` (which is what the SDK's `MultiplexStopped` waiter polls
+    /// `DescribeMultiplex` for).
+    fn begin_stop(&mut self, now: SystemTime) {
+        self.begin_transition(multiplex_state::STOPPING, multiplex_state::IDLE, now);
+    }
+
     /// Put the multiplex into the transient `state` as of `now` and owe `to`
     /// once [`TRANSIENT_STATE_SPAN`] has passed. Stored, never slept on.
     fn begin_transition(&mut self, state: &str, to: &'static str, now: SystemTime) {
@@ -555,8 +584,8 @@ impl MultiplexRecord {
 
     /// Materialise the transition the clock has already made due: a multiplex
     /// AWS answers `CREATING` becomes `IDLE` once the span has passed, a
-    /// `STARTING` one becomes `RUNNING`, and a `DELETING` one becomes the
-    /// terminal `DELETED`.
+    /// `STARTING` one becomes `RUNNING`, a `STOPPING` one becomes `IDLE` again,
+    /// and a `DELETING` one becomes the terminal `DELETED`.
     fn settle(&mut self, now: SystemTime) {
         let Some(transition) = self.transition else {
             return;
@@ -719,6 +748,38 @@ impl ComAmazonawsMedialiveMedialiveState {
             ));
         }
         multiplex.begin_start(now);
+        Ok(())
+    }
+
+    /// Stop the multiplex `multiplex_id`: move it into `STOPPING`, owing the
+    /// stopped `IDLE`, or refuse because the store holds no such multiplex.
+    ///
+    /// The state a stop acts on and the transition live together here with the
+    /// write, for the same reason as
+    /// [`ComAmazonawsMedialiveMedialiveState::start_multiplex`]: a handler
+    /// cannot check the one and transition past the other.
+    ///
+    /// A multiplex that is NOT running is left exactly as it is, which is what
+    /// `StopMultiplex` documents — "Stops a running multiplex. If the multiplex
+    /// isn't running, this action has no effect." So a stop of a multiplex that
+    /// is still creating, still starting, already stopping, already stopped,
+    /// deleting or deleted writes nothing at all (in particular it never
+    /// resurrects a record a delete has taken away) and the caller is answered
+    /// with the multiplex as it stands. This is the one asymmetry with the
+    /// start, which the same documentation makes a precondition rather than a
+    /// no-op.
+    pub fn stop_multiplex(
+        &mut self,
+        multiplex_id: &str,
+        now: SystemTime,
+    ) -> Result<(), MultiplexStopRefusal> {
+        let multiplex = self
+            .multiplexes
+            .get_mut(multiplex_id)
+            .ok_or(MultiplexStopRefusal::NotFound)?;
+        if multiplex.is_running() {
+            multiplex.begin_stop(now);
+        }
         Ok(())
     }
 

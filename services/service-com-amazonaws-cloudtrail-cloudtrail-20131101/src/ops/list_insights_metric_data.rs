@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInsightsMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInsightsMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInsightsMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE Insights metric series — the API call rate (`ApiCallRateInsight`) or
+//! the error rate (`ApiErrorRateInsight`) of one `EventSource`/`EventName` pair — as
+//! a list of period-aligned timestamps and the value measured in each period.
+//!
+//! What this handler computes, and from what:
+//!
+//! * the SERIES IDENTITY (`EventSource`, `EventName`, `InsightType`, plus `ErrorCode`
+//!   for the error-rate type, which is keyed by the error it counts) is the one the
+//!   request names; the model declares all four on the response as well.
+//! * the WINDOW is `[StartTime, EndTime)` — the start "is inclusive", the end "is
+//!   exclusive" — defaulting to "90 days before the time of request" and to "the time
+//!   of request", then clamped to what the service can hold: no data point exists
+//!   after the time of request, and none before the requested `Period`'s retention
+//!   cutoff (60s/15 days, 300s/63 days, 3600s/90 days; each cutoff is inclusive). So
+//!   how many periods a report spans is the service's to bound, not the caller's.
+//! * the DATA POINTS sit on multiples of `Period` since the epoch, so one instant
+//!   falls in the same data point whatever window asks about it, and a `Period` the
+//!   service does not serve is refused with `InvalidParameterException`.
+//! * each point's VALUE is the rate CloudTrail measured for the series in that
+//!   period. CloudTrail derives an Insights metric from the Insights events it
+//!   generates out of the API traffic it observes on a trail; nothing in this
+//!   emulator observes that traffic and no operation records an Insights event, so no
+//!   period of any series carries a measurement. That is what makes the default
+//!   `DataType` of `NonZeroData` ("type of data points to return") report no data
+//!   point at all — it reports the measurements, of which there are none — while
+//!   `FillWithZeros` reports the window's periods with a zero where nothing was
+//!   measured.
+//! * `MaxResults` bounds the page (default 21600 — the most 1-minute points 15 days
+//!   of 60-second retention can hold) and `NextToken` names the epoch second of the
+//!   data point the next page resumes at.
+//! * `TrailARN` is the ARN of the trail the request named, resolved through the same
+//!   trail registry ([`crate::state`]) every other trail operation reads.
+//!
+//! Two of the contract's conditions are NOT applied, and `OperationNotPermittedException`
+//! is therefore never returned: the permissions the doc below lists
+//! (`cloudtrail:LookupEvents`, `cloudtrail:ListInsightsData`) and the organization
+//! rule for data-event Insights need a caller principal and an organization
+//! membership this emulator does not carry, and the "trails that have enabled
+//! Insights" condition needs Insights enabled on a trail, which no operation does yet
+//! (`PutInsightSelectors` is still a scaffold stub with its own issue). A series is
+//! reported to any caller instead — which, as above, holds no measurement.
+//!
+//! It is a REPORTING operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +188,78 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Each `Period` the service serves, and how many days back its data points reach.
+///
+/// From the operation doc: "The following are the available time periods for
+/// ListInsightsMetricData. Each cutoff is inclusive. Data points with a period of 60
+/// seconds (1-minute) are available for 15 days. Data points with a period of 300
+/// seconds (5-minute) are available for 63 days. Data points with a period of 3600
+/// seconds (1 hour) are available for 90 days."
+///
+/// It is also what refuses a `Period` the service does not serve: the model's own
+/// `range 60..3600` is enforced before this handler runs and admits 61 and 2999,
+/// which the doc ("Valid values are 60, 300, and 3600. If you specify any other
+/// value, you will get an error") does not.
+const PERIOD_RETENTION_DAYS: [(i32, i64); 3] = [(60, 15), (300, 63), (3600, 90)];
+
+/// From the model doc for `ListInsightsMetricDataRequest$Period`: "The default is
+/// 3600 seconds."
+const DEFAULT_PERIOD: i32 = 3600;
+
+/// From the model doc for `ListInsightsMetricDataRequest$MaxResults`: "Valid values
+/// are integers from 1 to 21600. The default value is 21600."
+const DEFAULT_MAX_RESULTS: i32 = 21_600;
+
+/// From the model doc for `ListInsightsMetricDataRequest$StartTime`: "The default is
+/// 90 days before the time of request."
+const DEFAULT_LOOKBACK_DAYS: i64 = 90;
+
+/// Seconds in a day, the unit the retention cutoffs above are documented in.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// `InsightsMetricDataType` as the model enumerates it
+/// (`super::types::INSIGHTS_METRIC_DATA_TYPE_VALUES`): report every period in the
+/// window, including the ones that measured nothing.
+const DATA_TYPE_FILL_WITH_ZEROS: &str = "FillWithZeros";
+
+/// `InsightType` as the model enumerates it (`super::types::INSIGHT_TYPE_VALUES`):
+/// the type whose series is keyed by an error code as well.
+const INSIGHT_TYPE_API_ERROR_RATE: &str = "ApiErrorRateInsight";
+
+/// How far back a data point of `period` seconds reaches, in seconds, or `None` for
+/// a period this service does not serve. See [`PERIOD_RETENTION_DAYS`].
+fn retention_seconds(period: i32) -> Option<i64> {
+    PERIOD_RETENTION_DAYS
+        .iter()
+        .find(|(served, _)| *served == period)
+        .map(|(_, days)| days * SECONDS_PER_DAY)
+}
+
+/// The periods this service serves, for a refusal that names the rule it broke.
+fn served_periods() -> String {
+    PERIOD_RETENTION_DAYS
+        .iter()
+        .map(|(period, _)| period.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The epoch second this call is served at — "the time of request", which both time
+/// bounds and every retention cutoff are measured from.
+fn request_time() -> i64 {
+    ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()).secs()
+}
+
+/// `InvalidParameterException` (HTTP 400): "the request includes a parameter that is
+/// not valid". The text is built from the request, naming the member and the rule it
+/// broke, so a caller can fix the call from it alone.
+fn invalid_parameter(message: String) -> ListInsightsMetricDataError {
+    ListInsightsMetricDataErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -224,18 +331,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInsightsMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInsightsMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let now = request_time();
+
+        // "Granularity of data to retrieve, in seconds": the grid the data points
+        // sit on, and — through its retention cutoff — how far back they reach.
+        let requested_period = input.period.unwrap_or(DEFAULT_PERIOD);
+        let Some(retention) = retention_seconds(requested_period) else {
+            return Err(invalid_parameter(format!(
+                "Period must be one of {} seconds, not {requested_period}.",
+                served_periods()
+            )));
+        };
+        let period = i64::from(requested_period);
+
+        // `ErrorCode` is "conditionally required if the InsightType parameter is set
+        // to ApiErrorRateInsight": that series counts one error, so without the
+        // error named there is no series to report. It is also "only returned if
+        // InsightType parameter was set to ApiErrorRateInsight", so a code sent with
+        // the call-rate type names nothing and is not echoed back.
+        let error_rate = input.insight_type == INSIGHT_TYPE_API_ERROR_RATE;
+        let error_code = input.error_code.clone().filter(|_| error_rate);
+        if error_rate && error_code.is_none() {
+            return Err(invalid_parameter(format!(
+                "ErrorCode is required when InsightType is {INSIGHT_TYPE_API_ERROR_RATE}."
+            )));
+        }
+
+        // The window: "the value specified is inclusive" for `StartTime`, "the value
+        // specified is exclusive" for `EndTime`, each defaulted from the time of
+        // request.
+        let requested_end = input.end_time.map_or(now, |at| at.secs());
+        let requested_start = input
+            .start_time
+            .map_or(now - DEFAULT_LOOKBACK_DAYS * SECONDS_PER_DAY, |at| at.secs());
+        if requested_start > requested_end {
+            return Err(invalid_parameter(format!(
+                "StartTime ({requested_start}) must not be later than EndTime \
+                 ({requested_end}), in seconds since the epoch."
+            )));
+        }
+        // No data point exists after the time of request — which is why that is
+        // `EndTime`'s own default — so a window extended past it ends there. Both
+        // bounds are clamped to what the service can hold, so the number of periods
+        // the window spans is the service's to bound and not the caller's.
+        let end = requested_end.min(now);
+        // "Each cutoff is inclusive": a data point of this period exists only back to
+        // the cutoff, so a window reaching further back simply starts at it.
+        let start = requested_start.max(now - retention);
+
+        // A token this service issued names the epoch second of the data point the
+        // next page resumes at, which is always on the period grid; anything else
+        // never came from here.
+        let resume = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                token
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|at| at.rem_euclid(period) == 0)
+                    .ok_or_else(|| {
+                        invalid_parameter(format!(
+                            "NextToken `{token}` was not issued by this service for a \
+                             Period of {requested_period} seconds."
+                        ))
+                    })?,
+            ),
+        };
+
+        // "The maximum number of data points to return" — the page size, which the
+        // model already bounds to 1..21600.
+        let max_results =
+            usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1)).unwrap_or(1);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInsightsMetricDataErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "ListInsightsMetricData needs the CloudTrail trail registry, which \
+                         this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // `TrailName` is "the Amazon Resource Name(ARN) or name of the trail", read
+        // the way every trail operation reads one.
+        let trail_arn = match input.trail_name.as_deref() {
+            None => None,
+            Some(identifier) => {
+                let store = state.lock();
+                let resolved = store.resolve(identifier, &crate::state::request_region(ctx.parts()));
+                // This operation models no `CloudTrailARNInvalidException`, so a
+                // malformed ARN and a malformed name are both refused with the one
+                // name error it does model.
+                let record = resolved.map_err(|rejection| {
+                    ListInsightsMetricDataErrorModeled::InvalidTrailNameException(
+                        InvalidTrailNameException {
+                            message: Some(rejection.message()),
+                        },
+                    )
+                })?;
+                // A well-formed identifier naming no trail in this account addresses
+                // no Insights events either: this operation models no not-found
+                // error, so there is no trail ARN to report and the series below is
+                // the empty one.
+                record.map(|record| record.trail_arn.clone())
+            }
+        };
+
+        // What this series measured, by the epoch second of the period it was
+        // measured in.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInsightsMetricData"))
+        // CloudTrail reports an Insights metric over the Insights events it generated
+        // out of the API traffic it observed on a trail logging management or data
+        // events. Nothing in this emulator observes that traffic and no operation
+        // records an Insights event, so no period of any series carries a
+        // measurement — which is what makes the `NonZeroData` page below empty.
+        let measured: ::std::collections::BTreeMap<i64, f64> =
+            ::std::collections::BTreeMap::new();
+
+        // The data points, on multiples of `period` since the epoch — so one instant
+        // falls in the same data point whatever window asks about it — reported from
+        // the first point at or after the window's start, or from where the previous
+        // page stopped.
+        let aligned = start.div_euclid(period).saturating_mul(period);
+        let first = if aligned == start {
+            aligned
+        } else {
+            aligned.saturating_add(period)
+        };
+        let begin = resume.map_or(first, |resume| resume.max(first));
+        let fill_with_zeros = input.data_type.as_deref() == Some(DATA_TYPE_FILL_WITH_ZEROS);
+        let mut timestamps = Vec::new();
+        let mut values = Vec::new();
+        let mut next_token = None;
+        if fill_with_zeros {
+            // "FillWithZeros": every period in the window, carrying what it measured
+            // and a zero where it measured nothing. The walk is over the window's
+            // periods, and every one of them is a data point, so `MaxResults` bounds
+            // it however wide the window is.
+            let mut at = begin;
+            while at < end {
+                if timestamps.len() == max_results {
+                    // One data point past a full page: report where to resume rather
+                    // than carrying it.
+                    next_token = Some(at.to_string());
+                    break;
+                }
+                timestamps.push(::aws_smithy_types::DateTime::from_secs(at));
+                values.push(measured.get(&at).copied().unwrap_or(0.0));
+                at = at.saturating_add(period);
+            }
+        } else {
+            // "NonZeroData", the default: only the periods that measured something.
+            // The walk is over the MEASUREMENTS rather than over the window's
+            // periods, so what this costs is bounded by what was recorded and not by
+            // how wide a window the caller asks about.
+            for (at, value) in measured.range(begin..end) {
+                if *value == 0.0 {
+                    continue;
+                }
+                if timestamps.len() == max_results {
+                    next_token = Some(at.to_string());
+                    break;
+                }
+                timestamps.push(::aws_smithy_types::DateTime::from_secs(*at));
+                values.push(*value);
+            }
+        }
+
+        Ok(ListInsightsMetricDataOutput {
+            trail_arn,
+            event_source: Some(input.event_source),
+            event_name: Some(input.event_name),
+            insight_type: Some(input.insight_type),
+            error_code,
+            // "The number of values is equal to the number of timestamps": the two
+            // lists are built together, point by point, and both are reported even
+            // when the window holds no data point.
+            timestamps: Some(timestamps),
+            values: Some(values),
+            next_token,
+        })
     }
 }

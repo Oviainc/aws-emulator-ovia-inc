@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +64,20 @@
 //! * `InternalServerException` (HTTP 500) — Internal service exception.
 //! * `ResourceNotFoundException` (HTTP 404) — Resource not found.
 //! * `ValidationException` (HTTP 400) — One of the arguments for the request is not valid.
+//!
+//! ## What this handler answers
+//!
+//! The tags are merged onto the ONE tag map the addressed app monitor holds
+//! (`AppMonitorRecord::tags`), which is also what `ListTagsForResource` reports and what
+//! `GetAppMonitor` reports as `AppMonitor$Tags` — a new key is appended and an existing
+//! key's value is replaced, as this operation's documentation states.
+//!
+//! Two refusals do NOT use the codes the model binds here, because RUM's tagging
+//! frontend does not put those codes on the wire: an ARN naming no app monitor is
+//! `NotFoundException`/404 and a request this operation refuses is
+//! `BadRequestException`/400 (see `NOT_FOUND_ERROR_CODE` / `BAD_REQUEST_ERROR_CODE`
+//! below), both carrying the modelled shape's own payload and status — the same codes the
+//! sibling `UntagResource` and `ListTagsForResource` answer through.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -96,18 +101,205 @@ pub enum TagResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// The error code RUM's tagging frontend names a resource it cannot find by on the wire,
+/// and the one it refuses an invalid request with.
+///
+/// The model declares `ResourceNotFoundException` and `ValidationException` here, and
+/// those shapes' `@httpError`s and members are what the responses carry — but the codes
+/// this frontend puts in the body's `__type` are the shorter `NotFoundException` and
+/// `BadRequestException`, which the model does not declare at all. The recorded units pin
+/// both: `rum.untag-resource-unknown-resource-rejected` asserts
+/// `err["Code"] == "NotFoundException"` for an ARN that resolves to nothing, and
+/// `rum.tag-resource-invalid-key-rejected` /
+/// `rum.tag-resource-invalid-key-format-rejected` assert
+/// `err["Code"] == "BadRequestException"` for a tag key this operation refuses. They are
+/// specific to the ARN-addressed tagging operations: RUM's app-monitor operations,
+/// addressed by `Name`, do answer the modelled codes. The sibling
+/// [`crate::ops::untag_resource`] and [`crate::ops::list_tags_for_resource`] name the same
+/// two values, and `crate::service` words a tag refusal the BOUNDARY makes with the
+/// second one.
+const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
+const BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// The most tags one RUM resource holds at once.
+///
+/// From the model: this operation's own documentation states "You can associate as many
+/// as 50 tags with a resource", and `UntagResource$TagKeys` carries the matching
+/// `@length(min: 0, max: 50)`. It is also what bounds the heap one app monitor's tag map
+/// can take: this operation merges keys on every call and `TagMap` itself declares no
+/// length.
+///
+/// The CEILING is documented; the wire code a request past it is refused with is not. No
+/// recorded unit exercises it, so it is answered with this frontend's own
+/// [`BAD_REQUEST_ERROR_CODE`] (the code the recorded units establish for a refused
+/// tagging request) rather than with a code nothing attests to.
+const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The `@pattern` the model declares on `TagKey` — the key shape of `TagMap`, which this
+/// operation's `Tags` targets.
+///
+/// Source: `smithy_query(query="shape", shape="TagKey")`. It is the text a refusal quotes;
+/// the two halves applied below are [`TAG_KEY_RESERVED_PREFIX`] and the character class
+/// [`is_tag_key_character`] tests membership of.
+const TAG_KEY_PATTERN: &str = "^(?!aws:)[a-zA-Z+-=._:/]+$";
+
+/// The prefix [`TAG_KEY_PATTERN`]'s leading `(?!aws:)` excludes: AWS's reserved tag
+/// namespace. Applied as a `starts_with`, which is what a negative lookahead anchored at
+/// the start of the pattern says.
+const TAG_KEY_RESERVED_PREFIX: &str = "aws:";
+
+/// Whether `character` is one the class `[a-zA-Z+-=._:/]` of [`TAG_KEY_PATTERN`] admits.
+///
+/// That class admits the ASCII letters, `_`, and — because `+-=` inside a character class
+/// is the RANGE from `+` (0x2B) to `=` (0x3D) — every character in that range: the
+/// digits, `,`, `-`, `.`, `/`, `:`, `;`, `<` and `=`. The `.`, `:` and `/` the class also
+/// lists explicitly are inside that range too, so the three terms below are the whole
+/// class.
+///
+/// A character class is a MEMBERSHIP test, not a pattern language, so it is written
+/// directly: that keeps the check linear in the key's length by construction (no regex
+/// engine on a path that reads request text) and keeps this operation's manifest out of
+/// the way of the other fixes changing this crate. The class is pinned from the outside
+/// rather than by this reading of it: the suite's `ADMITTED_TAG_KEYS` table has a row per
+/// character class the model admits and `REJECTED_TAG_KEYS` a row per way a key can fall
+/// outside it, both sourced from `smithy_query`.
+fn is_tag_key_character(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_' || ('+'..='=').contains(&character)
+}
+
+/// Whether `key` satisfies the modelled `TagKey` `@pattern`: it is outside AWS's reserved
+/// `aws:` namespace AND it is a non-empty run of characters the class admits — which is
+/// exactly what the pattern's lookahead, class and `+` quantifier say between the `^` and
+/// the `$`.
+fn tag_key_matches_pattern(key: &str) -> bool {
+    !key.starts_with(TAG_KEY_RESERVED_PREFIX)
+        && !key.is_empty()
+        && key.chars().all(is_tag_key_character)
+}
+
+/// Why the modelled `TagKey` `@pattern` rejects the key at `path`, worded as the
+/// framework's own validation envelope — or `None` when the key satisfies it.
+///
+/// This check belongs in the handler rather than at the boundary: `TagKey`'s pattern opens
+/// with the negative lookahead `(?!aws:)`, the vendored boundary validator compiles a
+/// `@pattern` with the `regex` crate, which has no look-around, and it treats a pattern it
+/// cannot compile as matching (`pattern_matches` in
+/// `vendor/smithy-schema-server/src/constraints.rs`). So the constraint the model declares
+/// would otherwise never be applied to a tag key at all.
+///
+/// The check IS the pattern: [`tag_key_matches_pattern`] applies both of its halves, so
+/// the clause — which quotes the model's own source text — cannot state a constraint this
+/// function does not apply. `path` is the dotted member path the framework would have
+/// reported for a `TagMap` entry, and the key is echoed into the clause exactly as the
+/// caller sent it, bounded by the 128-character `@length` the boundary already enforced.
+fn tag_key_violation(path: &str, key: &str) -> Option<String> {
+    if tag_key_matches_pattern(key) {
+        return None;
+    }
+    let clause = ::aws_smithy_schema_server::envelope(&[::aws_smithy_schema_server::Violation {
+        path: path.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(TAG_KEY_PATTERN.to_string()),
+        value: Some(key.to_string()),
+    }]);
+    // `envelope` answers `None` only for an EMPTY violation list, which the one-element
+    // slice above can never be. Fail closed anyway: a refused key stays refused, with a
+    // clause that states the constraint it failed.
+    Some(clause.unwrap_or_else(|| {
+        format!(
+            "Value '{key}' at '{path}' failed to satisfy constraint: Member must satisfy \
+             regular expression pattern: {TAG_KEY_PATTERN}"
+        )
+    }))
+}
+
+/// This operation's error channel, as the generated `impl Operation` names it
+/// (`crate::ops::tag_resource::TagResourceError`).
+///
+/// It is NOT `crate::scaffolded::Scaffolded` any more: this operation is implemented, so
+/// it needs neither the 501 (that variant is the stub signal) nor the framework's
+/// synthetic `ValidationException` (its own model declares one). What it does need, and
+/// what no generic wrapper can express, are the two wire codes above — so the channel is
+/// the modelled enum plus those two refusals, exactly as `UntagResource` declares it.
+#[derive(Debug)]
+pub enum TagResourceError {
+    /// One of the operation's modelled errors, rendered exactly as the model declares it.
+    Modeled(TagResourceErrorModeled),
+    /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
+    /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
+    NotFound(ResourceNotFoundException),
+    /// "That request is not valid", carrying the modelled `ValidationException` payload
+    /// and its 400 under the [`BAD_REQUEST_ERROR_CODE`] the service answers with.
+    BadRequest(ValidationException),
+}
+
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
+    }
+}
+
+impl ::std::fmt::Display for TagResourceError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Modeled(e) => write!(f, "{e}"),
+            Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
+            Self::BadRequest(e) => write!(f, "{BAD_REQUEST_ERROR_CODE}: {}", e.message),
+        }
+    }
+}
+
+impl ::std::error::Error for TagResourceError {}
+
+/// Every method delegates to the modelled error, so a modelled failure is rendered
+/// exactly as `#[operation_error]` renders it. The two refusal variants differ in ONE
+/// respect — the wire code, which the framework reads from `shape_name` rather than from
+/// the schema — and are otherwise the modelled shapes: each one's schema decides which
+/// members the body carries, and its `@httpError` is the status.
+impl ::smithy_server_runtime::OperationError for TagResourceError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
+            Self::NotFound(e) => e,
+            Self::BadRequest(e) => e,
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
+            Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+            Self::BadRequest(_) => &super::types::SCHEMA_VALIDATION_EXCEPTION,
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
+            Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
+            Self::BadRequest(_) => BAD_REQUEST_ERROR_CODE,
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
+            // Each modelled shape's own `@httpError`: the code on the wire changes, the
+            // status does not.
+            Self::NotFound(_) => 404,
+            Self::BadRequest(_) => 400,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
+            // restJson1 is this service's only protocol, and neither shape carries an
+            // `awsQueryError` trait to honour in any case.
+            Self::NotFound(_) => None,
+            Self::BadRequest(_) => None,
+        }
     }
 }
 
@@ -147,18 +339,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The resource is named by the `ResourceArn` label, not by the credential scope,
+        // so nothing about this call depends on the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // Sorted, so which key a multi-key refusal names is fixed by the request rather
+        // than by a `HashMap`'s iteration order.
+        let mut requested: Vec<(String, String)> = input.tags.into_iter().collect();
+        requested.sort();
+
+        // `TagKey`'s `@pattern` is the one modelled constraint the boundary validator
+        // cannot apply (it opens with a negative lookahead), so it is applied here,
+        // before anything is written.
+        for (key, _) in &requested {
+            if let Some(message) = tag_key_violation(&format!("tags.{key}.member"), key) {
+                return Err(TagResourceError::BadRequest(ValidationException { message }));
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.app_monitor_by_arn_mut(&input.resource_arn) else {
+            return Err(TagResourceError::NotFound(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            ));
+        };
+
+        // The documented ceiling, counted on the map this call would LEAVE behind: a key
+        // already on the resource replaces a value rather than adding an entry.
+        let resulting = record
+            .tags
+            .keys()
+            .chain(requested.iter().map(|(key, _)| key))
+            .collect::<::std::collections::BTreeSet<&String>>()
+            .len();
+        if resulting > MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceError::BadRequest(ValidationException {
+                message: format!(
+                    "These tags would leave {} tags on {}, more than the {} tags a resource \
+                     can be associated with.",
+                    resulting, input.resource_arn, MAX_TAGS_PER_RESOURCE
+                ),
+            }));
+        }
+
+        for (key, value) in requested {
+            // A key already present keeps its position and takes the new value; a key
+            // that is new is added. Values are stored verbatim — `TagValue` constrains
+            // only the length, so any UTF-8 text up to 256 characters, the empty string
+            // included, is a value this resource now carries.
+            record.tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

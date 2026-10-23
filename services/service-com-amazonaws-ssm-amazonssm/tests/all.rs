@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
+#[path = "all/managed_node_information.rs"]
+mod managed_node_information;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
 #[path = "all/state_roundtrip.rs"]

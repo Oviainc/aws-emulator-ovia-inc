@@ -190,6 +190,25 @@
 //! [`SecurityGroup`] shape itself, keyed by `GroupId` in a [`BTreeMap`], for the same
 //! reasons the VPC and subnet stores do.
 //!
+//! ## Transit gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateways`] holds the account's transit
+//! gateways as the modelled [`TransitGateway`] shape itself, keyed by `TransitGatewayId`,
+//! for the same reasons the VPC store does — every member a writer sets round-trips
+//! through `DescribeTransitGateways` without a field-by-field copy. The clock-owed
+//! `pending` -> `available` move lives beside it in
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_available_at`], on the same monotonic
+//! clock and the same [`TRANSITION_DELAY`] as a VPC's.
+//!
+//! The default transit gateway route table a create makes ("When you create a transit
+//! gateway, we create a default transit gateway route table and use it as the default
+//! association route table and the default propagation route table",
+//! `CreateTransitGateway`) is a resource of its own, so it is stored as one in
+//! [`ComAmazonawsEc2Amazonec2State::transit_gateway_route_tables`] rather than existing
+//! only as an id inside the gateway's options: the ids
+//! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
+//! `$PropagationDefaultRouteTableId` report name that record.
+//!
 //! ## Capacity Blocks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_blocks`] holds the account's Capacity Blocks
@@ -233,6 +252,7 @@ use crate::ops::types::{
     DnsEntry, PayerResponsibilityEntry,
     RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
     TagSpecification,
+    TransitGateway, TransitGatewayOptions, TransitGatewayRequestOptions, TransitGatewayRouteTable,
     UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState, VpcEndpointConnection,
 };
 use crate::scaffolded::Scaffolded;
@@ -941,6 +961,26 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every transit gateway the account holds, by `TransitGatewayId`, as the modelled
+    /// [`TransitGateway`] shape itself — so a member a writer sets round-trips through
+    /// `DescribeTransitGateways` without a field-by-field copy. Ordered by id, which is
+    /// the order the describe reports and pages over.
+    pub transit_gateways: BTreeMap<String, TransitGateway>,
+    /// When each transit gateway's `pending` -> `available` transition falls due, for the
+    /// gateways that have one.
+    ///
+    /// The transit gateway counterpart of [`Self::vpc_available_at`], for the same reason
+    /// and on the same clock: `CreateTransitGateway` answers a gateway in the non-terminal
+    /// `pending` state ("After the transit gateway enters the available state, you can
+    /// attach your VPCs and VPN connections to the transit gateway"), so the clock owes it
+    /// `available` [`TRANSITION_DELAY`] later whether or not anybody calls again. The
+    /// gateway's default route table moves with it.
+    pub transit_gateway_available_at: BTreeMap<String, Instant>,
+    /// Every transit gateway route table the account holds, by
+    /// `TransitGatewayRouteTableId` — starting with the default one each
+    /// `CreateTransitGateway` makes (see the module docs). Ordered by id, the stable order
+    /// every reader of it reports in.
+    pub transit_gateway_route_tables: BTreeMap<String, TransitGatewayRouteTable>,
     /// Every Dedicated Host the account holds, by `HostId`, as the modelled [`Host`]
     /// shape itself — so a member a writer sets round-trips through a describe without a
     /// field-by-field copy that can silently drop one. Ordered by id, which is the order
@@ -1000,6 +1040,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            transit_gateways: BTreeMap::new(),
+            transit_gateway_available_at: BTreeMap::new(),
+            transit_gateway_route_tables: BTreeMap::new(),
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
@@ -1895,8 +1938,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// a later caller would otherwise have seen. It covers every resource kind that
     /// has one — an instance's next state, a `pending` VPC becoming `available`
     /// with its IPv6 association moving `associating` -> `associated`, a `pending`
-    /// subnet becoming `available`, and a Windows fast launch configuration reaching
-    /// `enabled` or finishing the cleanup a disable started.
+    /// subnet becoming `available`, a `pending` transit gateway with the route tables that
+    /// come up with it, and a Windows fast launch configuration reaching `enabled` or
+    /// finishing the cleanup a disable started.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -1943,6 +1987,40 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        let transit_gateways = &mut self.transit_gateways;
+        let route_tables = &mut self.transit_gateway_route_tables;
+        self.transit_gateway_available_at
+            .retain(|transit_gateway_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                // The gateway's own route tables come up with it: a route table AWS
+                // reports as `pending` is `available` once the gateway is. They are
+                // reached through the ids the gateway's options name, so this costs a
+                // lookup per role rather than a scan of every route table the store holds.
+                let mut owed: Vec<String> = Vec::new();
+                if let Some(transit_gateway) = transit_gateways.get_mut(transit_gateway_id) {
+                    if transit_gateway.state.as_deref() == Some(TRANSIT_GATEWAY_STATE_PENDING) {
+                        transit_gateway.state = Some(TRANSIT_GATEWAY_STATE_AVAILABLE.to_string());
+                    }
+                    if let Some(options) = transit_gateway.options.as_ref() {
+                        owed.extend(options.association_default_route_table_id.clone());
+                        owed.extend(options.propagation_default_route_table_id.clone());
+                    }
+                }
+                for route_table_id in owed {
+                    if let Some(route_table) = route_tables.get_mut(&route_table_id) {
+                        if route_table.state.as_deref()
+                            == Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING)
+                        {
+                            route_table.state =
+                                Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_AVAILABLE.to_string());
+                        }
+                    }
+                }
+                // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
         self.fast_launch_images.retain(|_image_id, record| {
             let Some(pending) = record
                 .pending
@@ -5474,6 +5552,92 @@ impl ComAmazonawsEc2Amazonec2State {
         self.addresses.insert(allocation_id.clone(), address);
         allocation_id
     }
+
+    /// Whether another transit gateway fits inside the store's ceiling
+    /// ([`MAX_TRANSIT_GATEWAYS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`transit_gateway_limit_exceeded`] when it answers `false`.
+    pub fn has_transit_gateway_capacity(&self) -> bool {
+        self.transit_gateways.len() < MAX_TRANSIT_GATEWAYS
+    }
+
+    /// Insert a transit gateway in `pending`, with the default route table a create owes
+    /// it, and answer the `TransitGatewayId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the id, the ARN built from it, the owning account, the creation time, the
+    /// state and the default route table's id — so two writers cannot report the same
+    /// gateway differently. The option values in `spec.options` are the ones the request
+    /// resolved ([`transit_gateway_options`]); the two route-table ids are filled in here
+    /// because only this function knows the table it created.
+    ///
+    /// "When you create a transit gateway, we create a default transit gateway route table
+    /// and use it as the default association route table and the default propagation route
+    /// table … If you disable automatic route propagation, we do not create a default
+    /// transit gateway route table" (`CreateTransitGateway`), and "Either
+    /// `defaultRouteTableAssociation` or `defaultRouteTablePropagation` must be set to
+    /// `enable` for Amazon Web Services Transit Gateway to create the default transit
+    /// gateway route table" (`TransitGatewayOptions$DefaultRouteTableAssociation`) — so the
+    /// table is created exactly when at least one of the two is enabled, and each id is
+    /// reported only for the option that is.
+    ///
+    /// Like [`Self::insert_vpc`], the caller-chosen bytes of the record are charged against
+    /// the store's byte budget here, so a writer cannot store them uncharged, and the
+    /// clock-owed `available` move is recorded rather than slept for.
+    pub fn insert_transit_gateway(&mut self, spec: TransitGatewaySpec) -> String {
+        let transit_gateway_id = self.next_id("tgw");
+        let creation_time = system_time_to_date_time(spec.created_at);
+        let mut options = spec.options;
+        let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
+        let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
+        if associates || propagates {
+            let route_table_id = self.next_id("tgw-rtb");
+            self.transit_gateway_route_tables.insert(
+                route_table_id.clone(),
+                TransitGatewayRouteTable {
+                    transit_gateway_route_table_id: Some(route_table_id.clone()),
+                    transit_gateway_id: Some(transit_gateway_id.clone()),
+                    // The table comes up with its gateway, so it starts `pending` too.
+                    state: Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING.to_string()),
+                    default_association_route_table: Some(associates),
+                    default_propagation_route_table: Some(propagates),
+                    creation_time: Some(creation_time),
+                    // Nothing tags the default route table: a `CreateTransitGateway` tag
+                    // specification tags the gateway.
+                    tags: Some(Vec::new()),
+                },
+            );
+            if associates {
+                options.association_default_route_table_id = Some(route_table_id.clone());
+            }
+            if propagates {
+                options.propagation_default_route_table_id = Some(route_table_id);
+            }
+        }
+        let transit_gateway = TransitGateway {
+            transit_gateway_id: Some(transit_gateway_id.clone()),
+            transit_gateway_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("transit-gateway/{transit_gateway_id}"),
+            )),
+            state: Some(TRANSIT_GATEWAY_STATE_PENDING.to_string()),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            description: spec.description,
+            creation_time: Some(creation_time),
+            options: Some(options),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(transit_gateway_payload_bytes(&transit_gateway));
+        self.transit_gateways
+            .insert(transit_gateway_id.clone(), transit_gateway);
+        // What the clock now owes this gateway: `available`, one TRANSITION_DELAY from
+        // now — the same span, off the same monotonic clock, as a VPC's pending move.
+        self.transit_gateway_available_at
+            .insert(transit_gateway_id.clone(), Instant::now() + TRANSITION_DELAY);
+        transit_gateway_id
+    }
 }
 
 /// The caller-chosen bytes one stored Elastic IP address holds: its tags. Everything else
@@ -5571,6 +5735,305 @@ pub fn address_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
 /// one border group.
 pub fn network_border_group_of_region(region: &str) -> String {
     region.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Transit gateways
+// ---------------------------------------------------------------------------
+
+/// A transit gateway AWS is still creating: the `TransitGatewayState` enum's `pending`
+/// member, which is what `CreateTransitGateway` answers with until [`TRANSITION_DELAY`]
+/// has passed ("After the transit gateway enters the available state, you can attach your
+/// VPCs and VPN connections to the transit gateway" — `CreateTransitGateway`).
+pub const TRANSIT_GATEWAY_STATE_PENDING: &str = "pending";
+
+/// A transit gateway that has finished coming up: the `TransitGatewayState` enum's
+/// `available` member.
+pub const TRANSIT_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// A transit gateway route table still coming up with its gateway: the
+/// `TransitGatewayRouteTableState` enum's `pending` member.
+pub const TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING: &str = "pending";
+
+/// A transit gateway route table that is usable: the `TransitGatewayRouteTableState`
+/// enum's `available` member.
+pub const TRANSIT_GATEWAY_ROUTE_TABLE_STATE_AVAILABLE: &str = "available";
+
+/// A transit gateway option turned ON: the `enable` member every one of the option enums
+/// (`DnsSupportValue`, `VpnEcmpSupportValue`, …) is one of two values of.
+pub const OPTION_ENABLE: &str = "enable";
+
+/// A transit gateway option turned OFF: those enums' other member.
+pub const OPTION_DISABLE: &str = "disable";
+
+/// The `ResourceType` a `CreateTransitGateway` tag specification may name: the transit
+/// gateway it creates.
+pub const RESOURCE_TYPE_TRANSIT_GATEWAY: &str = "transit-gateway";
+
+/// The ASN a transit gateway gets when the request names none: "The default is `64512`"
+/// (`TransitGatewayRequestOptions$AmazonSideAsn`).
+pub const DEFAULT_AMAZON_SIDE_ASN: i64 = 64_512;
+
+/// The 16-bit private ASN range a transit gateway's Amazon-side ASN may come from: "The
+/// range is 64512 to 65534 for 16-bit ASNs"
+/// (`TransitGatewayRequestOptions$AmazonSideAsn`).
+pub const AMAZON_SIDE_ASN_16_BIT: ::std::ops::RangeInclusive<i64> = 64_512..=65_534;
+
+/// The 32-bit private ASN range: "and 4200000000 to 4294967294 for 32-bit ASNs"
+/// (`TransitGatewayRequestOptions$AmazonSideAsn`).
+pub const AMAZON_SIDE_ASN_32_BIT: ::std::ops::RangeInclusive<i64> = 4_200_000_000..=4_294_967_294;
+
+/// The longest IPv4 prefix a transit gateway CIDR block may have: "Must be a size /24 CIDR
+/// block or larger for IPv4" (`TransitGatewayRequestOptions$TransitGatewayCidrBlocks`) —
+/// larger block, so a prefix no longer than this.
+pub const MAX_TRANSIT_GATEWAY_IPV4_PREFIX: u8 = 24;
+
+/// The longest IPv6 prefix a transit gateway CIDR block may have: "or a size /64 CIDR block
+/// or larger for IPv6" (same member).
+pub const MAX_TRANSIT_GATEWAY_IPV6_PREFIX: u8 = 64;
+
+/// The largest number of transit gateways this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each gateway is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_transit_gateway_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`TRANSIT_GATEWAY_LIMIT_EXCEEDED`].
+pub const MAX_TRANSIT_GATEWAYS: usize = 1_000;
+
+/// EC2's error code for a create that would take the account past its transit gateway
+/// quota.
+pub const TRANSIT_GATEWAY_LIMIT_EXCEEDED: &str = "TransitGatewayLimitExceeded";
+
+/// EC2's error code for a request naming a transit gateway id this account holds no
+/// transit gateway for.
+pub const INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND: &str = "InvalidTransitGatewayID.NotFound";
+
+/// Everything [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway`] needs that it does
+/// not derive itself: what the REQUEST said, and the Region it was signed for.
+#[derive(Debug, Clone)]
+pub struct TransitGatewaySpec {
+    /// "A description of the transit gateway" (`CreateTransitGatewayRequest$Description`),
+    /// absent when the request gave none.
+    pub description: Option<String>,
+    /// The Region the request was signed for, which the gateway's ARN names.
+    pub region: String,
+    /// When the gateway was created, as the creation time every record of it reports.
+    pub created_at: SystemTime,
+    /// The resolved options ([`transit_gateway_options`]); the two default-route-table ids
+    /// are filled in by the insert, which is what creates that table.
+    pub options: TransitGatewayOptions,
+    /// The tags of a `transit-gateway` tag specification.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored transit gateway holds: its tags, its description and
+/// the CIDR blocks the request asked for. Everything else on the record — the ids, the
+/// ARN, the account, the state, the option flags — is derived by this module or bounded by
+/// the model, so it is fixed-size.
+///
+/// The ONE definition of that charge: `CreateTransitGateway` asks it before the write and
+/// charges exactly it, and a removal path must give back the same number.
+pub fn transit_gateway_payload_bytes(transit_gateway: &TransitGateway) -> usize {
+    let tags = tag_list_bytes(transit_gateway.tags.as_deref().unwrap_or_default());
+    let description = transit_gateway.description.as_deref().map_or(0, str::len);
+    let cidr_blocks: usize = transit_gateway
+        .options
+        .as_ref()
+        .and_then(|options| options.transit_gateway_cidr_blocks.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|block| block.len())
+        .sum();
+    tags.saturating_add(description).saturating_add(cidr_blocks)
+}
+
+/// A requested transit gateway CIDR block in canonical form, of whichever family it names.
+///
+/// "One or more IPv4 or IPv6 CIDR blocks for the transit gateway. Must be a size /24 CIDR
+/// block or larger for IPv4, or a size /64 CIDR block or larger for IPv6"
+/// (`TransitGatewayRequestOptions$TransitGatewayCidrBlocks`): the family is decided by the
+/// value itself, and each family's published minimum block size is the bound. The block is
+/// read by the same two readers the VPC path uses, so this crate keeps ONE rule for what a
+/// CIDR block is and only the published block size differs.
+pub fn canonical_transit_gateway_cidr(value: &str) -> Result<String, CidrProblem> {
+    if value.contains(':') {
+        let canonical = canonical_ipv6_cidr(value)?;
+        let (_, prefix_length) = canonical.split_once('/').ok_or(CidrProblem::Malformed)?;
+        let prefix_length: u8 = prefix_length.parse().map_err(|_| CidrProblem::Malformed)?;
+        if prefix_length > MAX_TRANSIT_GATEWAY_IPV6_PREFIX {
+            return Err(CidrProblem::PrefixLength);
+        }
+        return Ok(canonical);
+    }
+    let canonical = canonical_ipv4_cidr(value)?;
+    let (_, prefix_length) = split_ipv4_cidr(&canonical).ok_or(CidrProblem::Malformed)?;
+    if prefix_length > MAX_TRANSIT_GATEWAY_IPV4_PREFIX {
+        return Err(CidrProblem::PrefixLength);
+    }
+    Ok(canonical)
+}
+
+/// The options one transit gateway is created with: what the request asked for, each
+/// member it left out at the default its own documentation publishes.
+///
+/// This is the ONE place those defaults live, so `CreateTransitGateway` and every later
+/// reader of a gateway's options cannot disagree about a gateway nobody modified. The
+/// defaults, from `TransitGatewayRequestOptions`'s own member docs:
+///
+/// * `AutoAcceptSharedAttachments` — "Disabled by default".
+/// * `DefaultRouteTableAssociation` — "Enabled by default".
+/// * `DefaultRouteTablePropagation` — "Enabled by default".
+/// * `VpnEcmpSupport` — "Enabled by default".
+/// * `DnsSupport` — "Enabled by default".
+/// * `SecurityGroupReferencingSupport` — "This option is disabled by default".
+/// * `MulticastSupport` — multicast is a gateway the caller asks for, so `disable`.
+/// * `AmazonSideAsn` — [`DEFAULT_AMAZON_SIDE_ASN`].
+///
+/// A value outside the published range or an unknown enum member is REFUSED rather than
+/// defaulted, so a typo never reads as "the default". The two default-route-table ids are
+/// left absent: only [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway`], which
+/// creates that table, can name it.
+pub fn transit_gateway_options<E>(
+    requested: Option<&TransitGatewayRequestOptions>,
+) -> Result<TransitGatewayOptions, Scaffolded<E>> {
+    let asn = match requested.and_then(|options| options.amazon_side_asn) {
+        None => DEFAULT_AMAZON_SIDE_ASN,
+        Some(asn)
+            if AMAZON_SIDE_ASN_16_BIT.contains(&asn) || AMAZON_SIDE_ASN_32_BIT.contains(&asn) =>
+        {
+            asn
+        }
+        Some(asn) => {
+            return Err(invalid_parameter_value(format!(
+                "Value ({asn}) for parameter amazonSideAsn is invalid. \
+                 The range is {min_16} to {max_16} for 16-bit ASNs and \
+                 {min_32} to {max_32} for 32-bit ASNs.",
+                min_16 = AMAZON_SIDE_ASN_16_BIT.start(),
+                max_16 = AMAZON_SIDE_ASN_16_BIT.end(),
+                min_32 = AMAZON_SIDE_ASN_32_BIT.start(),
+                max_32 = AMAZON_SIDE_ASN_32_BIT.end(),
+            )))
+        }
+    };
+    let mut cidr_blocks: Vec<String> = Vec::new();
+    for requested_block in requested
+        .and_then(|options| options.transit_gateway_cidr_blocks.as_deref())
+        .unwrap_or_default()
+    {
+        match canonical_transit_gateway_cidr(requested_block) {
+            Ok(canonical) => cidr_blocks.push(canonical),
+            Err(CidrProblem::Malformed) => {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({requested_block}) for parameter transitGatewayCidrBlocks is \
+                     invalid. This is not a valid CIDR block."
+                )))
+            }
+            Err(CidrProblem::PrefixLength) => {
+                return Err(invalid_parameter_value(format!(
+                    "The CIDR '{requested_block}' is invalid. Must be a size \
+                     /{ipv4} CIDR block or larger for IPv4, or a size /{ipv6} CIDR block \
+                     or larger for IPv6.",
+                    ipv4 = MAX_TRANSIT_GATEWAY_IPV4_PREFIX,
+                    ipv6 = MAX_TRANSIT_GATEWAY_IPV6_PREFIX,
+                )))
+            }
+        }
+    }
+    Ok(TransitGatewayOptions {
+        amazon_side_asn: Some(asn),
+        // "One or more IPv4 or IPv6 CIDR blocks for the transit gateway": a gateway the
+        // request asked for none for carries no member at all rather than an empty list.
+        transit_gateway_cidr_blocks: (!cidr_blocks.is_empty()).then_some(cidr_blocks),
+        auto_accept_shared_attachments: Some(transit_gateway_option(
+            requested.and_then(|options| options.auto_accept_shared_attachments.as_deref()),
+            "autoAcceptSharedAttachments",
+            OPTION_DISABLE,
+        )?),
+        default_route_table_association: Some(transit_gateway_option(
+            requested.and_then(|options| options.default_route_table_association.as_deref()),
+            "defaultRouteTableAssociation",
+            OPTION_ENABLE,
+        )?),
+        // Filled in by the insert, which is what creates the default route table.
+        association_default_route_table_id: None,
+        default_route_table_propagation: Some(transit_gateway_option(
+            requested.and_then(|options| options.default_route_table_propagation.as_deref()),
+            "defaultRouteTablePropagation",
+            OPTION_ENABLE,
+        )?),
+        propagation_default_route_table_id: None,
+        vpn_ecmp_support: Some(transit_gateway_option(
+            requested.and_then(|options| options.vpn_ecmp_support.as_deref()),
+            "vpnEcmpSupport",
+            OPTION_ENABLE,
+        )?),
+        dns_support: Some(transit_gateway_option(
+            requested.and_then(|options| options.dns_support.as_deref()),
+            "dnsSupport",
+            OPTION_ENABLE,
+        )?),
+        security_group_referencing_support: Some(transit_gateway_option(
+            requested.and_then(|options| options.security_group_referencing_support.as_deref()),
+            "securityGroupReferencingSupport",
+            OPTION_DISABLE,
+        )?),
+        multicast_support: Some(transit_gateway_option(
+            requested.and_then(|options| options.multicast_support.as_deref()),
+            "multicastSupport",
+            OPTION_DISABLE,
+        )?),
+        // "Defines if the Transit Gateway supports VPC Encryption Control"
+        // (`TransitGatewayOptions$EncryptionSupport`): nothing in this request asks for
+        // VPC Encryption Control, and no operation that would turn it on is implemented,
+        // so no encryption state is reported rather than an invented one.
+        encryption_support: None,
+    })
+}
+
+/// One `enable`/`disable` transit gateway option: the requested value if the request
+/// carried one, otherwise `default`.
+///
+/// Every one of these members targets an enum whose only members are [`OPTION_ENABLE`] and
+/// [`OPTION_DISABLE`] (`smithy_query(query="shape",shape="DnsSupportValue")`), which the
+/// boundary validator already refuses anything outside — so this is the backstop that
+/// keeps a value no enum has out of the store whatever reaches the handler, and it never
+/// lets a typo read as the default.
+fn transit_gateway_option<E>(
+    requested: Option<&str>,
+    member: &str,
+    default: &str,
+) -> Result<String, Scaffolded<E>> {
+    match requested {
+        None => Ok(default.to_string()),
+        Some(value) if value == OPTION_ENABLE || value == OPTION_DISABLE => Ok(value.to_string()),
+        Some(value) => Err(invalid_parameter_value(format!(
+            "Value ({value}) for parameter {member} is invalid. \
+             Valid values are {OPTION_ENABLE} and {OPTION_DISABLE}."
+        ))),
+    }
+}
+
+/// Refuse a request that named a transit gateway id no transit gateway of the account has:
+/// HTTP 400 `InvalidTransitGatewayID.NotFound`.
+pub fn invalid_transit_gateway_id_not_found<E>(transit_gateway_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
+        400,
+        format!("Transit Gateway {transit_gateway_id} was deleted or does not exist."),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_TRANSIT_GATEWAYS`]: HTTP 400
+/// `TransitGatewayLimitExceeded`.
+pub fn transit_gateway_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        TRANSIT_GATEWAY_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of transit gateways has been reached ({MAX_TRANSIT_GATEWAYS})"
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------

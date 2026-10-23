@@ -62,6 +62,8 @@ mod security_groups;
 mod snapshot_block_public_access;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/transit_gateway_lifecycle.rs"]
+mod transit_gateway_lifecycle;
 #[path = "all/volume_lifecycle.rs"]
 mod volume_lifecycle;
 #[path = "all/vpc_attributes.rs"]

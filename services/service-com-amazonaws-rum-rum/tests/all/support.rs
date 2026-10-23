@@ -167,11 +167,7 @@ pub(crate) async fn create(router: &MultiServiceRouter, case: &str, body: Value)
 }
 
 /// The `AppMonitor` structure `GetAppMonitor` reports for `name`.
-pub(crate) async fn get_app_monitor(
-    router: &MultiServiceRouter,
-    case: &str,
-    name: &str,
-) -> Value {
+pub(crate) async fn get_app_monitor(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
     let reply = call(router, "GET", &format!("/appmonitor/{name}"), None).await;
     assert_eq!(
         reply.status,

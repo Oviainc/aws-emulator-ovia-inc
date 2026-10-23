@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/activity_type_registration.rs"]
 mod activity_type_registration;
+#[path = "all/count_open_workflow_executions.rs"]
+mod count_open_workflow_executions;
 #[path = "all/domain_deprecation.rs"]
 mod domain_deprecation;
 #[path = "all/domain_tagging.rs"]

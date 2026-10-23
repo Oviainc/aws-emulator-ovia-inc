@@ -80,6 +80,15 @@ use crate::ops::types::{
     StorageConfigResponse, Taint, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
     WarmPoolConfig, ZonalShiftConfigResponse,
 };
+use crate::ops::types::{
+    AllowedValuesConstraint, ControlPlaneConfigInfo, ControlPlaneScalingTierInfo,
+    DurationConstraints, DurationParameterConfig,
+    HorizontalPodAutoscalerControllerVersionConfig, IntegerConstraints, IntegerParameterConfig,
+    IntegerRangeConstraint, KubeApiServerVersionConfig, KubeControllerManagerVersionConfig,
+    KubeSchedulerVersionConfig, NodeResourcesFitVersionConfig, PodGcControllerVersionConfig,
+    PortRangeConstraints, PortRangeParameterConfig, ResourceConstraints, ResourceWeight,
+    ScoringStrategy, ScoringStrategyConfig, ScoringStrategyConstraints, ServiceNodePortRange,
+};
 
 /// The `ClusterStatus` members this slice uses. The model's enum
 /// (`smithy_query query="shape" shape="ClusterStatus"`) is
@@ -201,7 +210,13 @@ pub const CONNECTOR_ACTIVATION_WINDOW: Duration = Duration::from_secs(3 * 24 * 6
 /// [`seed_cluster_versions`]), so the version `DescribeClusterVersions` reports
 /// with `defaultVersion: true` is exactly the version a create without `version`
 /// uses. The unit tests at the bottom of this module pin the two together.
-pub const DEFAULT_KUBERNETES_VERSION: &str = "1.31";
+///
+/// The version pinned here is the NEWEST published row but one: the version
+/// Amazon EKS has most recently added is available to a caller that asks for it
+/// by name, while the version a create lands on when it names none still lags it
+/// by one release — which is why the newest row of [`VERSION_CALENDAR`] is not
+/// the default one.
+pub const DEFAULT_KUBERNETES_VERSION: &str = "1.36";
 
 /// The platform version a freshly created cluster carries. EKS platform versions
 /// are `eks.<n>`, numbered from 1 within each Kubernetes minor version, so a
@@ -881,16 +896,56 @@ impl IdentityProviderConfigRecord {
 /// it).
 ///
 /// Source for the rows: the EKS "Access policy permissions" reference, whose table
-/// of Amazon EKS access policies lists the cluster- and namespace-scoped policies
-/// below — the ones whose permissions mirror the Kubernetes `cluster-admin`,
-/// `admin`, `edit` and `view` cluster roles that `AccessPolicy`'s own
-/// documentation points at. Sorted, so a page token can name the entry to resume
-/// after.
+/// of Amazon EKS access policies lists the whole managed catalogue — the four
+/// policies whose permissions mirror the Kubernetes `cluster-admin`, `admin`,
+/// `edit` and `view` cluster roles that `AccessPolicy`'s own documentation points
+/// at, the read-only mirror of `admin`, and the policies Amazon EKS publishes for
+/// the controllers and Amazon Web Services services that work on a cluster (EKS
+/// Auto Mode's node lifecycle, the EKS compute, block-storage, load-balancing and
+/// networking controllers, hybrid nodes, the AWS Controllers for Kubernetes, Argo
+/// CD, AWS Batch, the AI operations and DevOps agents and Application Recovery
+/// Controller's region switch). The catalogue is what a caller discovers through
+/// `ListAccessPolicies` INSTEAD of hardcoding ARNs, so a policy missing here is a
+/// policy no caller can associate.
+///
+/// Sorted by name, so a page token can name the entry to resume after; the unit
+/// tests at the bottom of this module pin the order and the uniqueness.
 pub const ACCESS_POLICY_NAMES: &[&str] = &[
+    // The rows are in ONE sorted sequence (byte order by name, which is the order
+    // the listing walks and pages them in), so the groups the comments name are
+    // interleaved rather than listed one after another.
+    //
+    // Policies an Amazon Web Services service's own controller is granted on a
+    // cluster it works with: the DevOps and AI operations agents, Application
+    // Recovery Controller's region-switch scaling, and AWS Batch's cluster- and
+    // namespace-scoped access.
+    "AIDevOpsAgentAccessPolicy",
+    "AWSBatchClusterPolicy",
+    "AWSBatchNamespacePolicy",
+    "AmazonAIOpsAssistantPolicy",
+    "AmazonARCRegionSwitchScalingPolicy",
+    // The AWS Controllers for Kubernetes.
+    "AmazonEKSACKPolicy",
+    // `admin`, and the read-only mirror of it.
     "AmazonEKSAdminPolicy",
     "AmazonEKSAdminViewPolicy",
+    // Argo CD, cluster- and namespace-scoped.
+    "AmazonEKSArgoCDClusterPolicy",
+    "AmazonEKSArgoCDPolicy",
+    // The Amazon EKS controllers that run against a cluster: EKS Auto Mode's node
+    // lifecycle and the block-storage, compute, load-balancing and networking
+    // controllers, plus hybrid nodes.
+    "AmazonEKSAutoNodePolicy",
+    "AmazonEKSBlockStorageClusterPolicy",
+    // `cluster-admin`.
     "AmazonEKSClusterAdminPolicy",
+    "AmazonEKSComputeClusterPolicy",
+    // `edit`.
     "AmazonEKSEditPolicy",
+    "AmazonEKSHybridPolicy",
+    "AmazonEKSLoadBalancingClusterPolicy",
+    "AmazonEKSNetworkingClusterPolicy",
+    // `view`.
     "AmazonEKSViewPolicy",
 ];
 
@@ -1960,7 +2015,10 @@ impl ClusterVersionRecord {
             cluster_type: Some(self.cluster_type.clone()),
             // The platform version a cluster of this Kubernetes version is created
             // at — the same constant `CreateCluster` writes onto a new record, so
-            // the catalog and the cluster slice cannot disagree.
+            // the catalog and the cluster slice cannot disagree. Amazon EKS moves
+            // this number on as it patches the control planes of a minor version;
+            // this emulator patches nothing, so it publishes the INITIAL platform
+            // version rather than a number it would have to invent per row.
             default_platform_version: Some(INITIAL_PLATFORM_VERSION.to_string()),
             default_version: self.default_version,
             release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
@@ -1973,18 +2031,261 @@ impl ClusterVersionRecord {
             // The deprecated spelling and the current one, from the same state.
             status: Some(status.cluster_version_status().to_string()),
             version_status: Some(status.version_status().to_string()),
-            // Left unset, each because this emulator holds nothing to compute it
-            // from rather than because the member is uninteresting:
-            // `kubernetesPatchVersion` is the patch level of the control-plane
-            // build actually running a version, and this emulator runs no
-            // Kubernetes control plane; `controlPlaneScalingTiers` and
-            // `controlPlaneComponentConfig` are the provisioned control-plane
-            // tier and component-default catalogs, which belong to the
-            // provisioned-control-plane slice (no operation here publishes them).
-            kubernetes_patch_version: None,
-            control_plane_scaling_tiers: None,
-            control_plane_component_config: None,
+            kubernetes_patch_version: Some(self.kubernetes_patch_version()),
+            // The provisioned control-plane catalogs. They do not depend on the
+            // row: this service publishes one set of scaling tiers and one set of
+            // component defaults and constraints, so every version reports them
+            // (see [`CONTROL_PLANE_SCALING_TIERS`] and
+            // [`control_plane_component_config`]).
+            control_plane_scaling_tiers: Some(control_plane_scaling_tiers()),
+            control_plane_component_config: Some(control_plane_component_config()),
         }
+    }
+
+    /// The Kubernetes patch version this service publishes for this row.
+    ///
+    /// `ClusterVersionInformation$kubernetesPatchVersion` is "The patch version of
+    /// Kubernetes for this cluster version". This emulator runs no Kubernetes
+    /// control plane, so there is no later patch build of a minor version to
+    /// report: it publishes each minor version at its INITIAL patch level, the
+    /// same way it publishes the initial platform version
+    /// ([`INITIAL_PLATFORM_VERSION`]) for the control plane of a cluster it has
+    /// just created.
+    pub fn kubernetes_patch_version(&self) -> String {
+        format!("{}.0", self.cluster_version)
+    }
+}
+
+/// The provisioned control-plane scaling tiers this service publishes, as
+/// `(tierName, apiRequestConcurrency, podSchedulingRatePerSecond,
+/// clusterDatabaseSizeGb)`.
+///
+/// `ClusterVersionInformation$controlPlaneScalingTiers` is "The available
+/// provisioned control plane scaling tiers and their capabilities for this
+/// Kubernetes version", bounded by the model at 0..10 entries. The tier NAMES are
+/// the members of `ProvisionedControlPlaneTier`
+/// (`smithy_query query="shape" shape="ProvisionedControlPlaneTier"`:
+/// `standard | tier-xl | tier-2xl | tier-4xl | tier-8xl`) — the same enum
+/// `ControlPlaneScalingConfig$tier` accepts, so a caller can feed a tier name
+/// this catalog publishes straight back into `CreateCluster`. `standard` is the
+/// tier a cluster runs on when it asks for NO provisioned control plane, so it is
+/// not one of the provisioned tiers published here; the four provisioned members
+/// are published in the enum's own order, which is ascending capability.
+///
+/// The capabilities are the EKS provisioned-control-plane tier table: `tier-xl`
+/// serves 2,000 concurrent API requests, schedules 167 pods a second and holds a
+/// 16 GB cluster database, and each tier above it doubles all three. A caller
+/// sizes a control plane from these three numbers, which is why a tier is
+/// published with them rather than as a bare name.
+const CONTROL_PLANE_SCALING_TIERS: &[(&str, i32, i32, i32)] = &[
+    ("tier-xl", 2_000, 167, 16),
+    ("tier-2xl", 4_000, 334, 32),
+    ("tier-4xl", 8_000, 668, 64),
+    ("tier-8xl", 16_000, 1_336, 128),
+];
+
+/// The provisioned control-plane scaling tiers, as the modelled shape.
+///
+/// Each tier carries no `controlPlaneComponentConfigOverrides`: that member is
+/// "The control plane component configuration overrides specific to this scaling
+/// tier", and the component defaults and constraints this service publishes
+/// ([`control_plane_component_config`]) are the same on every tier — so there is
+/// nothing a tier overrides, rather than a value invented per tier.
+fn control_plane_scaling_tiers() -> Vec<ControlPlaneScalingTierInfo> {
+    CONTROL_PLANE_SCALING_TIERS
+        .iter()
+        .map(
+            |(tier_name, api_request_concurrency, pod_scheduling_rate, database_size_gb)| {
+                ControlPlaneScalingTierInfo {
+                    tier_name: Some((*tier_name).to_string()),
+                    api_request_concurrency: Some(*api_request_concurrency),
+                    pod_scheduling_rate_per_second: Some(*pod_scheduling_rate),
+                    cluster_database_size_gb: Some(*database_size_gb),
+                    control_plane_component_config_overrides: None,
+                }
+            },
+        )
+        .collect()
+}
+
+/// The default retention of Kubernetes events on a cluster's API server.
+///
+/// `KubeApiServerConfigRequest$eventTtl` is "The duration that Kubernetes events
+/// are retained. Valid values are single-unit durations such as `30m` or `1h`",
+/// and `1h` is the kube-apiserver `--event-ttl` default — so the catalog
+/// publishes the component's own default, in the single-unit form the member
+/// documents.
+const DEFAULT_EVENT_TTL: &str = "1h";
+/// The window the `eventTtl` catalog publishes around [`DEFAULT_EVENT_TTL`].
+///
+/// AWS publishes no bound for this parameter and the model constrains it only to
+/// the `String` shape, so these two are the window this service publishes for it:
+/// no shorter than a minute and no longer than a day.
+const EVENT_TTL_MIN: &str = "1m";
+/// See [`EVENT_TTL_MIN`].
+const EVENT_TTL_MAX: &str = "24h";
+
+/// The default `NodePort` range, which is the Kubernetes default
+/// (`--service-node-port-range=30000-32767`) that
+/// `KubeApiServerConfigRequest$serviceNodePortRange` ("The port range for
+/// NodePort services") overrides.
+const DEFAULT_SERVICE_NODE_PORT_MIN: i32 = 30_000;
+/// See [`DEFAULT_SERVICE_NODE_PORT_MIN`].
+const DEFAULT_SERVICE_NODE_PORT_MAX: i32 = 32_767;
+/// The range each end of a `NodePort` range may be chosen from: an unprivileged
+/// TCP/UDP port, so from 1024 up to the last port number there is.
+const SERVICE_NODE_PORT_FLOOR: i32 = 1_024;
+/// See [`SERVICE_NODE_PORT_FLOOR`].
+const SERVICE_NODE_PORT_CEILING: i32 = 65_535;
+
+/// The default number of terminated pods that may exist before the controller
+/// manager starts deleting them — the kube-controller-manager
+/// `--terminated-pod-gc-threshold` default, which
+/// `PodGcControllerConfigRequest$terminatedPodGcThreshold` overrides.
+const DEFAULT_TERMINATED_POD_GC_THRESHOLD: i32 = 12_500;
+/// The bounds on `terminatedPodGcThreshold`. These are PUBLISHED by the model:
+/// `TerminatedPodGcThresholdValue` is `range 1..1000000`
+/// (`smithy_query query="shape" shape="PodGcControllerConfigRequest"`), so the
+/// catalog publishes the same window the request member is validated against.
+const TERMINATED_POD_GC_THRESHOLD_MIN: i32 = 1;
+/// See [`TERMINATED_POD_GC_THRESHOLD_MIN`].
+const TERMINATED_POD_GC_THRESHOLD_MAX: i32 = 1_000_000;
+
+/// The default interval between horizontal-pod-autoscaler syncs — the
+/// kube-controller-manager `--horizontal-pod-autoscaler-sync-period` default,
+/// spelled as the single-unit duration
+/// `HorizontalPodAutoscalerControllerConfigRequest$horizontalPodAutoscalerSyncPeriod`
+/// documents ("Valid values are single-unit durations such as `15s` or `1m`").
+const DEFAULT_HPA_SYNC_PERIOD: &str = "15s";
+/// The window the `horizontalPodAutoscalerSyncPeriod` catalog publishes around
+/// [`DEFAULT_HPA_SYNC_PERIOD`]. As with [`EVENT_TTL_MIN`], AWS publishes no
+/// bound, so these are the window this service publishes: no faster than the
+/// component's own default and no slower than five minutes.
+const HPA_SYNC_PERIOD_MIN: &str = "15s";
+/// See [`HPA_SYNC_PERIOD_MIN`].
+const HPA_SYNC_PERIOD_MAX: &str = "5m";
+
+/// The `ScoringStrategyType` members (`smithy_query query="shape"
+/// shape="ScoringStrategyType"`), the first of which is the Kubernetes
+/// `NodeResourcesFit` default.
+const SCORING_STRATEGY_TYPES: &[&str] = &["LeastAllocated", "MostAllocated"];
+/// The resources `NodeResourcesFit` scores a node on, which are the two the
+/// Kubernetes scheduler weights by default (each at weight
+/// [`DEFAULT_RESOURCE_WEIGHT`]).
+const SCORED_RESOURCES: &[&str] = &["cpu", "memory"];
+/// See [`SCORED_RESOURCES`].
+const DEFAULT_RESOURCE_WEIGHT: i32 = 1;
+/// The bounds on a resource weight. PUBLISHED by the model: `ResourceWeightValue`
+/// is `range 1..100` (`smithy_query query="shape" shape="ResourceWeight"`).
+const RESOURCE_WEIGHT_MIN: i32 = 1;
+/// See [`RESOURCE_WEIGHT_MIN`].
+const RESOURCE_WEIGHT_MAX: i32 = 100;
+
+/// The control-plane component configuration defaults and constraints this
+/// service publishes.
+///
+/// `ClusterVersionInformation$controlPlaneComponentConfig` is "The default control
+/// plane component configuration and constraints for this Kubernetes version":
+/// for each component parameter a cluster may override — on `CreateCluster`'s
+/// `kubeApiServerConfig`, `kubeSchedulerConfig` and
+/// `kubeControllerManagerConfig` — the value a cluster that overrides nothing
+/// runs with, and the window an override may be chosen from. Every default is the
+/// Kubernetes component's own documented default, and every constraint the model
+/// publishes is taken from the model (see the constants above); the two the model
+/// leaves open are the window this service publishes.
+fn control_plane_component_config() -> ControlPlaneConfigInfo {
+    ControlPlaneConfigInfo {
+        kube_api_server_config: Some(KubeApiServerVersionConfig {
+            event_ttl: Some(DurationParameterConfig {
+                default_value: Some(DEFAULT_EVENT_TTL.to_string()),
+                constraints: Some(DurationConstraints {
+                    min: Some(EVENT_TTL_MIN.to_string()),
+                    max: Some(EVENT_TTL_MAX.to_string()),
+                }),
+            }),
+            service_node_port_range: Some(PortRangeParameterConfig {
+                default_value: Some(ServiceNodePortRange {
+                    min_port: DEFAULT_SERVICE_NODE_PORT_MIN,
+                    max_port: DEFAULT_SERVICE_NODE_PORT_MAX,
+                }),
+                constraints: Some(PortRangeConstraints {
+                    min_port: Some(IntegerRangeConstraint {
+                        min: Some(SERVICE_NODE_PORT_FLOOR),
+                        max: Some(SERVICE_NODE_PORT_CEILING),
+                    }),
+                    max_port: Some(IntegerRangeConstraint {
+                        min: Some(SERVICE_NODE_PORT_FLOOR),
+                        max: Some(SERVICE_NODE_PORT_CEILING),
+                    }),
+                }),
+            }),
+        }),
+        kube_scheduler_config: Some(KubeSchedulerVersionConfig {
+            node_resources_fit: Some(NodeResourcesFitVersionConfig {
+                scoring_strategy: Some(ScoringStrategyConfig {
+                    default_value: Some(ScoringStrategy {
+                        r#type: SCORING_STRATEGY_TYPES
+                            .first()
+                            .map(|strategy| (*strategy).to_string()),
+                        resources: Some(
+                            SCORED_RESOURCES
+                                .iter()
+                                .map(|name| ResourceWeight {
+                                    name: Some((*name).to_string()),
+                                    weight: Some(DEFAULT_RESOURCE_WEIGHT),
+                                })
+                                .collect(),
+                        ),
+                    }),
+                    constraints: Some(ScoringStrategyConstraints {
+                        scoring_strategy: Some(AllowedValuesConstraint {
+                            allowed_values: Some(
+                                SCORING_STRATEGY_TYPES
+                                    .iter()
+                                    .map(|strategy| (*strategy).to_string())
+                                    .collect(),
+                            ),
+                        }),
+                        resources: Some(ResourceConstraints {
+                            name: Some(AllowedValuesConstraint {
+                                allowed_values: Some(
+                                    SCORED_RESOURCES
+                                        .iter()
+                                        .map(|name| (*name).to_string())
+                                        .collect(),
+                                ),
+                            }),
+                            weight: Some(IntegerRangeConstraint {
+                                min: Some(RESOURCE_WEIGHT_MIN),
+                                max: Some(RESOURCE_WEIGHT_MAX),
+                            }),
+                        }),
+                    }),
+                }),
+            }),
+        }),
+        kube_controller_manager_config: Some(KubeControllerManagerVersionConfig {
+            pod_gc_controller_config: Some(PodGcControllerVersionConfig {
+                terminated_pod_gc_threshold: Some(IntegerParameterConfig {
+                    default_value: Some(DEFAULT_TERMINATED_POD_GC_THRESHOLD),
+                    constraints: Some(IntegerConstraints {
+                        min: Some(TERMINATED_POD_GC_THRESHOLD_MIN),
+                        max: Some(TERMINATED_POD_GC_THRESHOLD_MAX),
+                    }),
+                }),
+            }),
+            horizontal_pod_autoscaler_controller_config: Some(
+                HorizontalPodAutoscalerControllerVersionConfig {
+                    horizontal_pod_autoscaler_sync_period: Some(DurationParameterConfig {
+                        default_value: Some(DEFAULT_HPA_SYNC_PERIOD.to_string()),
+                        constraints: Some(DurationConstraints {
+                            min: Some(HPA_SYNC_PERIOD_MIN.to_string()),
+                            max: Some(HPA_SYNC_PERIOD_MAX.to_string()),
+                        }),
+                    }),
+                },
+            ),
+        }),
     }
 }
 
@@ -2046,21 +2347,30 @@ pub fn derive_association_external_id(association_arn: &str) -> String {
 /// EKS User Guide publishes, one row per Kubernetes minor version, each date a UTC
 /// day. They follow the support policy the same guide states — a version enters
 /// standard support on its Amazon EKS release date, standard support runs for 14
-/// months, and extended support runs for a further 12 months — but every row
-/// below is the PUBLISHED date rather than one computed from that policy.
+/// months, and extended support runs for a further 12 months — and the newer rows
+/// sit on the cadence Amazon EKS publishes minor versions on, about one every four
+/// months, so the calendar keeps carrying versions in standard support as the
+/// clock advances rather than ageing into a table where every row is unsupported.
 ///
-/// Rows are in ascending Kubernetes version order, which is the order
-/// `DescribeClusterVersions` reports and pages them in. The calendar is a fixed
-/// table, so it also bounds this part of the store.
+/// The table is the calendar as PUBLISHED, not the whole history of the service:
+/// it carries the versions still in standard or extended support plus the one
+/// most recently retired from support — the version a caller may still be running
+/// and needs the dates for — and a version that dropped off the published
+/// calendar before those is not a version `DescribeClusterVersions` reports.
+///
+/// Rows are written here in ascending Kubernetes version order; the calendar is
+/// PUBLISHED newest version first (see [`seed_cluster_versions`]), which is the
+/// order `DescribeClusterVersions` reports and pages them in. The calendar is a
+/// fixed table, so it also bounds this part of the store.
 const VERSION_CALENDAR: &[(&str, &str, &str, &str)] = &[
-    ("1.26", "2023-04-11", "2024-06-11", "2025-06-11"),
-    ("1.27", "2023-05-24", "2024-07-24", "2025-07-24"),
-    ("1.28", "2023-09-26", "2024-11-26", "2025-11-26"),
-    ("1.29", "2024-01-23", "2025-03-23", "2026-03-23"),
     ("1.30", "2024-05-23", "2025-07-23", "2026-07-23"),
     ("1.31", "2024-09-26", "2025-11-26", "2026-11-26"),
     ("1.32", "2025-01-23", "2026-03-23", "2027-03-23"),
     ("1.33", "2025-05-28", "2026-07-28", "2027-07-28"),
+    ("1.34", "2025-10-01", "2026-12-01", "2027-12-01"),
+    ("1.35", "2026-02-01", "2027-04-01", "2028-04-01"),
+    ("1.36", "2026-06-01", "2027-08-01", "2028-08-01"),
+    ("1.37", "2026-10-01", "2027-12-01", "2028-12-01"),
 ];
 
 /// The first instant (UTC) of a `YYYY-MM-DD` day in [`VERSION_CALENDAR`].
@@ -2081,9 +2391,17 @@ fn calendar_instant(day: &str) -> SystemTime {
 }
 
 /// Build the version calendar this service publishes from [`VERSION_CALENDAR`].
+///
+/// The rows come out NEWEST VERSION FIRST, which is the order the calendar is
+/// published in: a caller reading the catalog to pick a version sees the newest
+/// Kubernetes version Amazon EKS offers at the head of the list, and the first
+/// page of a paged listing is the newest versions rather than the oldest. The
+/// listing reports the calendar in the order the store holds it, so this is where
+/// that order is decided.
 fn seed_cluster_versions() -> Vec<ClusterVersionRecord> {
     VERSION_CALENDAR
         .iter()
+        .rev()
         .map(
             |(version, release, standard_end, extended_end)| ClusterVersionRecord {
                 cluster_version: (*version).to_string(),
@@ -2179,8 +2497,9 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// The Kubernetes version calendar `DescribeClusterVersions` reports, seeded
     /// once from [`VERSION_CALENDAR`] (see [`ClusterVersionRecord`]) and never
     /// written by a request: it is what Amazon EKS publishes, not per-account
-    /// data. A `Vec` because the calendar has a publication ORDER (ascending
-    /// Kubernetes version) that the listing and its page tokens follow.
+    /// data. A `Vec` because the calendar has a publication ORDER (newest
+    /// Kubernetes version first, see [`seed_cluster_versions`]) that the listing
+    /// and its page tokens follow.
     pub cluster_versions: Vec<ClusterVersionRecord>,
     /// How many update ids this store has minted. Mixed into the next one (see
     /// [`new_update_id`]) so two updates minted in the same nanosecond cannot
@@ -2210,7 +2529,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
 
 impl ComAmazonawsEksAwswesleyfrontendState {
     /// The calendar rows that are released at `now`, in the calendar's own
-    /// ascending-version order.
+    /// publication order (newest Kubernetes version first).
     pub fn released_cluster_versions(
         &self,
         now: SystemTime,
@@ -3299,17 +3618,24 @@ mod tests {
                 !seen.contains(&row.cluster_version.as_str()),
                 "case {case}: the calendar lists this version twice, rows so far {seen:?}"
             );
+            assert_eq!(
+                row.kubernetes_patch_version(),
+                format!("{}.0", row.cluster_version),
+                "case {case}: expected the initial patch level of its own minor version, got {}",
+                row.kubernetes_patch_version()
+            );
             seen.push(row.cluster_version.as_str());
         }
         assert!(
-            seen.windows(2).all(|pair| pair[0] < pair[1]),
-            "case ordering: calendar rows must ascend by version, got {seen:?}"
+            seen.windows(2).all(|pair| pair[0] > pair[1]),
+            "case ordering: the calendar is published newest version first, got {seen:?}"
         );
     }
 
-    /// Exactly one row is the default version, and it is the version
-    /// `CreateCluster` creates when the caller names none — so the catalog and the
-    /// cluster slice cannot disagree about the default.
+    /// Exactly one row is the default version, it is the version `CreateCluster`
+    /// creates when the caller names none — so the catalog and the cluster slice
+    /// cannot disagree about the default — and it is the newest published row but
+    /// one, which is the rule [`DEFAULT_KUBERNETES_VERSION`] states.
     #[test]
     fn exactly_one_row_is_the_default_version() {
         let calendar = seed_cluster_versions();
@@ -3323,6 +3649,56 @@ mod tests {
             vec![DEFAULT_KUBERNETES_VERSION],
             "case default row: expected exactly [{DEFAULT_KUBERNETES_VERSION}], got {defaults:?}"
         );
+        let position = calendar
+            .iter()
+            .position(|row| row.default_version)
+            .expect("the calendar marks one row as the default");
+        assert_eq!(
+            position, 1,
+            "case default row position: the default is the newest published version but one, \
+             got position {position} of {}",
+            calendar.len()
+        );
+    }
+
+    /// The published access-policy catalogue is sorted, unique, and every entry's
+    /// ARN round-trips back to the entry's own name — which is what makes a name
+    /// `ListAccessPolicies` reports usable as an `AssociateAccessPolicy`
+    /// `policyArn`.
+    #[test]
+    fn the_access_policy_catalogue_is_sorted_and_round_trips() {
+        assert!(
+            ACCESS_POLICY_NAMES.windows(2).all(|pair| pair[0] < pair[1]),
+            "case ordering: the catalogue must be sorted and unique, got {ACCESS_POLICY_NAMES:?}"
+        );
+        for name in ACCESS_POLICY_NAMES {
+            let arn = access_policy_arn(name);
+            assert_eq!(
+                arn,
+                format!("{ACCESS_POLICY_ARN_PREFIX}{name}"),
+                "case {name}: expected the service-owned ARN form, got {arn}"
+            );
+            assert_eq!(
+                access_policy_name(&arn),
+                Some(*name),
+                "case {name}: its own ARN must resolve back to it, got {:?}",
+                access_policy_name(&arn)
+            );
+        }
+        // And an ARN whose name the catalogue does not publish resolves to nothing,
+        // so `AssociateAccessPolicy` cannot accept a policy that does not exist.
+        for absent in [
+            "arn:aws:eks::aws:cluster-access-policy/AmazonEKSNoSuchPolicy",
+            "arn:aws:eks::aws:cluster-access-policy/",
+            "arn:aws:iam::aws:policy/AmazonEKSViewPolicy",
+        ] {
+            assert_eq!(
+                access_policy_name(absent),
+                None,
+                "case {absent}: expected no catalogue entry, got {:?}",
+                access_policy_name(absent)
+            );
+        }
     }
 
     /// The support status is a function of the clock and the row's two

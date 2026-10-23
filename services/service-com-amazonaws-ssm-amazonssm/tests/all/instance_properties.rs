@@ -174,6 +174,7 @@ fn seed(engine: &Arc<engine::InMemoryEngine>, region: &str, node: &Seed<'_>) {
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect::<BTreeMap<String, String>>(),
+        ..ManagedNodeRecord::default()
     };
     assert!(
         engine
