@@ -1590,6 +1590,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),
             secondary_network_client_tokens: HashMap::new(),
+            // A fresh account has brought no address range of its own.
             byoip_cidrs: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
@@ -2579,7 +2580,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// its IPv6 association moving `associating` -> `associated`, a `pending` subnet
     /// becoming `available`, a `pending` transit gateway with the route tables that come up
     /// with it, a VPC BPA exclusion reaching `create-complete`, a Windows fast launch
-    /// configuration reaching `enabled` or finishing the cleanup a disable started, and a
+    /// configuration reaching `enabled` or finishing the cleanup a disable started, a
+    /// `pending-withdrawal` BYOIP range reaching the end of its withdrawal, and a
     /// `pending-deprovision` BYOIP range reaching the end of its release — leaving the
     /// account, or landing in `failed-deprovision` when addresses are still allocated from
     /// it.
@@ -7885,6 +7887,13 @@ impl ComAmazonawsEc2Amazonec2State {
 /// (`ProvisionByoipCidr`).
 pub const BYOIP_CIDR_STATE_PENDING_PROVISION: &str = "pending-provision";
 
+/// The `ByoipCidrState` of a range whose withdrawal has been accepted and has not taken
+/// effect yet: "It can take a few minutes before traffic to the specified addresses stops
+/// routing to Amazon Web Services because of BGP propagation delays"
+/// (`WithdrawByoipCidr`) — the mirror of `pending-advertising`, declared beside the other
+/// pending state so one enum's transient words read together.
+pub const BYOIP_CIDR_STATE_PENDING_WITHDRAWAL: &str = "pending-withdrawal";
+
 /// The address family of a CIDR block: which of the two address spaces it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressFamily {
@@ -8218,7 +8227,8 @@ pub fn invalid_cidr_not_found<E>(cidr: &str) -> Scaffolded<E> {
 // The error code and refusal for a resource whose current state does not admit the request
 // — "The resource is not in the correct state for the request" (EC2 API error codes) — are
 // `INCORRECT_STATE` / `incorrect_state`, declared with the fast launch codes below;
-// `DeprovisionByoipCidr`'s state refusal uses that one rather than a second copy.
+// `WithdrawByoipCidr`'s and `DeprovisionByoipCidr`'s state refusals use that one rather
+// than a second copy.
 
 // ---------------------------------------------------------------------------
 // Capacity Blocks

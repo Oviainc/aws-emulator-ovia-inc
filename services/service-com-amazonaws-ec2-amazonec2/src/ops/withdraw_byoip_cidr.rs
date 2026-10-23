@@ -1,15 +1,42 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op WithdrawByoipCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `WithdrawByoipCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stops the advertisement of a BYOIP address range this account has
+//! provisioned, moving it out of `advertised` into the non-terminal `pending-withdrawal`
+//! state the clock settles into `provisioned`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`WithdrawByoipCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What this handler does, and what it deliberately does not
+//!
+//! A range is addressed by its `Cidr` rather than by an id — there is no other name for one
+//! on this surface — so the request's value is read into the canonical form the store keys
+//! ranges by ([`crate::state::canonical_byoip_cidr`]), an empty value is refused with
+//! `MissingParameter` and a value that is not an address range with `InvalidParameterValue`,
+//! both before anything is looked up — the same order and the same codes its sibling
+//! `DeprovisionByoipCidr` uses. Only a range that IS being advertised has an advertisement
+//! to stop: any other state is refused with `IncorrectState`, and a range this account has
+//! not provisioned with `InvalidCidr.NotFound`.
+//!
+//! The `DryRun` probe is answered BEFORE the account's BYOIP registry is read: "Checks
+//! whether you have the required permissions for the action, without actually making the
+//! request" (`DryRun`) — the probe is a question about the caller's permissions, and the
+//! recorded contract for this operation answers `DryRunOperation` for a range the account
+//! has not provisioned. So the probe never depends on the registry, and never writes to it.
+//!
+//! A KNOWN FIDELITY GAP, for the same reason every `DryRun` in this crate has it: the probe
+//! always answers `DryRunOperation`, never the `UnauthorizedOperation` of "otherwise, it is
+//! UnauthorizedOperation" (`DryRun`). This emulator has no principal or policy model — a
+//! request's signature is verified by the framework and nothing here can say which actions
+//! a caller may take — so a passing dry run means "this request is well formed and the
+//! range is addressable", not "this caller is authorised". When a caller model lands, the
+//! `UnauthorizedOperation` branch belongs in exactly this spot.
+//!
+//! "You can perform this operation at most once every 10 seconds, even if you specify
+//! different address ranges each time" is a request-RATE limit of the real service. This
+//! emulator throttles no operation — nothing in this crate answers `RequestLimitExceeded`
+//! for a call that arrived too soon — so that sentence is deliberately not emulated: a
+//! client of the emulator is never refused for calling twice in a row.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +163,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `WithdrawByoipCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(WithdrawByoipCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("WithdrawByoipCidr"))
+        // `ctx` carries request metadata only; this operation reads none of it — a BYOIP
+        // range is named by its CIDR, which is unique across the account. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The address range, in CIDR notation" (`WithdrawByoipCidrRequest$Cidr`) is a plain
+        // `String` with no `@pattern`, and the member is modelled `clientOptional`, so a
+        // request that leaves it out reaches this handler with an empty string: the boundary
+        // validator refuses neither, and this is the only place that can. The REQUEST is read
+        // before the dry run is answered, the same order `DeprovisionByoipCidr` reads its
+        // own: a value that is no address range is wrong whatever the caller's permissions
+        // are, and `DryRun` is about "the required permissions for the action" rather than
+        // about the request's syntax.
+        let requested = input.cidr.as_str();
+        if requested.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter cidr",
+            ));
+        }
+        // A value that is not an address range of either family names no range at all, so it
+        // is refused rather than looked up; the message names the value the request sent, in
+        // EC2's own "the value you sent, in parentheses" form. Reading it into the canonical
+        // form the store keys ranges by is also what makes `198.51.100.7/24` and
+        // `198.51.100.0/24` the one range they are.
+        let Ok(cidr) = state::canonical_byoip_cidr(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "The CIDR ({requested}) is not valid."
+            )));
+        };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST … If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`). The probe is a question about permissions, so it is
+        // answered here — before the account's BYOIP registry is read, which is what the
+        // recorded contract for this operation observes: a `DryRun` call for a range the
+        // account has not provisioned is answered `DryRunOperation`, not a not-found. The
+        // store is not even reached, so a probe cannot write anything.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // Which state the range is in is a question about the CURRENT state, so a settlement
+        // the clock already owed is applied before it is asked: a range whose withdrawal
+        // finished propagating a moment ago is `provisioned`, and the move was due at that
+        // instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // Addressing a range this account has not provisioned is a refusal, not a no-op: a
+        // caller has to be able to tell the withdrawal it performed from one it did not.
+        let record = store
+            .byoip_cidrs
+            .get_mut(&cidr)
+            // The range as the REQUEST wrote it, which is what the caller has to correct.
+            .ok_or_else(|| state::invalid_cidr_not_found(requested))?;
+        // "Stops advertising an address range that is provisioned as an address pool"
+        // (`WithdrawByoipCidr`): only a range that IS being advertised has an advertisement
+        // to stop. Every other state — provisioned but never advertised, already withdrawing,
+        // being released, or one whose provision failed — is the range existing in a state
+        // this request does not admit, which is `IncorrectState` rather than a not-found.
+        // The state is compared as the `&str` the record holds; only the refusal path renders
+        // a message, so the success path allocates nothing for the check.
+        let current = record.state();
+        if current != state::BYOIP_CIDR_STATE_ADVERTISED {
+            // The range as the REQUEST wrote it here too, so a caller can correlate both
+            // refusals with the value it sent.
+            let message = format!(
+                "The address range '{requested}' is in state '{current}' \
+                 and is not being advertised"
+            );
+            return Err(state::incorrect_state(message));
+        }
+
+        // "It can take a few minutes before traffic to the specified addresses stops routing
+        // to Amazon Web Services because of BGP propagation delays" (`WithdrawByoipCidr`), so
+        // the range is answered in the non-terminal `pending-withdrawal` it enters now, with
+        // the clock owing it `provisioned` — carried as the `PendingStateMove` every record
+        // of this store uses and applied by `materialize_due_transitions`, never slept for,
+        // so a caller reading straight after this call still sees `pending-withdrawal` and
+        // its refusals. The mirror image of `AdvertiseByoipCidr`'s move.
+        record.byoip_cidr.state = Some(state::BYOIP_CIDR_STATE_PENDING_WITHDRAWAL.to_string());
+        record.pending = Some(state::PendingStateMove::starting_now(
+            state::BYOIP_CIDR_STATE_PROVISIONED,
+        ));
+        Ok(WithdrawByoipCidrOutput {
+            byoip_cidr: Some(record.byoip_cidr.clone()),
+        })
     }
 }
