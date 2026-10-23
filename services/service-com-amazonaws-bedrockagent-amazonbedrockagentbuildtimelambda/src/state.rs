@@ -8,6 +8,11 @@
 //! record stored here, and the record -> wire projections
 //! ([`AgentRecord::to_agent`], [`AgentRecord::to_summary`]) live here so no two
 //! handlers can project the same record differently.
+//!
+//! The flow lifecycle (`CreateFlow`, `GetFlow`) is backed by the
+//! [`flows`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flows)
+//! map the same way, with [`FlowRecord::to_create_output`] /
+//! [`FlowRecord::to_get_output`] as its single projections.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -15,16 +20,18 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Agent, AgentSummary, CustomOrchestration, GuardrailConfiguration, MemoryConfiguration,
-    PromptOverrideConfiguration,
+    Agent, AgentSummary, CreateFlowOutput, CustomOrchestration, FlowDefinition, FlowValidation,
+    GetFlowOutput, GuardrailConfiguration, MemoryConfiguration, PromptOverrideConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
 /// credential-scope region. Matches the `agentArn` pattern's `[a-z0-9-]{1,20}`.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The only agent version `CreateAgent` mints: the `Agent$agentVersion` member is
-/// modelled `pattern ^DRAFT$`, so a stored agent has no other version.
+/// The only agent version `CreateAgent` mints, and the only flow version
+/// `CreateFlow` mints: both the `Agent$agentVersion` and the `DraftVersion`
+/// shapes are modelled `pattern ^DRAFT$`, so a stored agent or flow has no other
+/// version.
 pub const DRAFT_VERSION: &str = "DRAFT";
 
 /// `CreateAgent`'s default when the request omits `idleSessionTTLInSeconds`
@@ -181,6 +188,164 @@ impl AgentRecord {
     }
 }
 
+/// The most flows this store holds; past it `CreateFlow` answers the modelled
+/// `ServiceQuotaExceededException` instead of growing.
+///
+/// Amazon Bedrock publishes an adjustable quota on flows per account per Region,
+/// and this emulator models neither Service Quotas nor an account's adjustments —
+/// so this is the emulator's OWN bound on the store, set far above any workflow
+/// an emulator serves, and it is what stops the flow state growing without end.
+pub const FLOW_QUOTA: usize = 1_000;
+
+/// The `GetFlow$includedData` value that asks for resource metadata only: the
+/// member is documented "Set to METADATA_ONLY to return only resource metadata.
+/// Set to ALL_DATA or omit this field to return the full response", and the flow
+/// definition is the one non-metadata part of that response.
+pub const INCLUDED_DATA_METADATA_ONLY: &str = "METADATA_ONLY";
+
+/// Whether a `GetFlow` carrying this `includedData` is asking for the flow
+/// definition: every value but [`INCLUDED_DATA_METADATA_ONLY`] is, an omitted
+/// member included.
+pub fn included_data_carries_definition(included_data: Option<&str>) -> bool {
+    included_data != Some(INCLUDED_DATA_METADATA_ONLY)
+}
+
+/// The `FlowStatus` values this slice of the service can hold, named as the
+/// model's `FlowStatus` enum names them on the wire.
+///
+/// `CreateFlow` mints only [`FlowStatus::NotPrepared`] — the operation's own
+/// contract says "When you submit this request, the status will be NotPrepared" —
+/// and a flow leaves it only when a later call (`PrepareFlow`, `UpdateFlow`) moves
+/// it, never because the clock passed or because somebody read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowStatus {
+    /// Created or updated, but not prepared: `CreateFlow`'s result.
+    NotPrepared,
+    /// `PrepareFlow` accepted; the DRAFT version is being packaged.
+    Preparing,
+    /// The DRAFT version carries the latest changes.
+    Prepared,
+    /// The last operation invoked on the flow failed; `validations` says why.
+    Failed,
+}
+
+impl FlowStatus {
+    /// The member value for the modelled `FlowStatus` enum.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::NotPrepared => "NotPrepared",
+            Self::Preparing => "Preparing",
+            Self::Prepared => "Prepared",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// One stored flow: the single source of truth for every flow operation.
+#[derive(Debug, Clone)]
+pub struct FlowRecord {
+    pub flow_id: String,
+    pub name: String,
+    pub arn: String,
+    pub version: String,
+    pub status: FlowStatus,
+    pub description: Option<String>,
+    pub execution_role_arn: String,
+    pub customer_encryption_key_arn: Option<String>,
+    pub definition: Option<FlowDefinition>,
+    /// Validation findings from the last operation on the flow; empty while
+    /// nothing has failed.
+    pub validations: Vec<FlowValidation>,
+    pub tags: HashMap<String, String>,
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl FlowRecord {
+    /// This record as the `CreateFlow` response: every member comes from the
+    /// stored record, never from the request being served.
+    pub fn to_create_output(&self) -> CreateFlowOutput {
+        CreateFlowOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            id: self.flow_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+            version: self.version.clone(),
+            definition: self.definition.clone(),
+        }
+    }
+
+    /// This record as the `GetFlow` response. `with_definition` is false for a
+    /// metadata-only read, which drops the flow definition and nothing else;
+    /// `validations` is reported only while the flow actually carries findings.
+    pub fn to_get_output(&self, with_definition: bool) -> GetFlowOutput {
+        GetFlowOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            id: self.flow_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+            version: self.version.clone(),
+            definition: with_definition.then(|| self.definition.clone()).flatten(),
+            validations: (!self.validations.is_empty()).then(|| self.validations.clone()),
+        }
+    }
+}
+
+/// The modelled `FlowIdentifier` pattern, quoted verbatim so a refusal can name
+/// the constraint the value failed.
+pub const FLOW_IDENTIFIER_PATTERN: &str =
+    "^(arn:aws:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:flow/[0-9a-zA-Z]{10})|([0-9a-zA-Z]{10})$";
+
+/// Whether `value` is a modelled `FlowId` (`^[0-9a-zA-Z]{10}$`).
+fn is_flow_id(value: &str) -> bool {
+    value.len() == ID_LEN && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// The `flowId` a modelled `FlowIdentifier` names, or `None` when the value is
+/// neither form the shape admits.
+///
+/// `FlowIdentifier` is modelled [`FLOW_IDENTIFIER_PATTERN`]: either a flow ARN,
+/// whose `flow/<id>` segment carries the id, or the bare id. Both forms name the
+/// same flow, so both select the same stored record; anything else names no flow
+/// at all and is a bad request rather than a missing one.
+pub fn flow_id_from_identifier(identifier: &str) -> Option<&str> {
+    let id = match identifier.strip_prefix("arn:") {
+        None => identifier,
+        Some(rest) => {
+            // partition: aws | service | region | account | flow/<id>
+            let segments: Vec<&str> = rest.split(':').collect();
+            let [partition, service, region, account, resource] = segments[..] else {
+                return None;
+            };
+            let region_shaped = (1..=20).contains(&region.len())
+                && region.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                });
+            if partition != "aws"
+                || service != "bedrock"
+                || !region_shaped
+                || account.len() != 12
+                || !account.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            resource.strip_prefix("flow/")?
+        }
+    };
+    is_flow_id(id).then_some(id)
+}
+
 /// A `ListAgents` resume cursor, decoded back into the ordering it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageCursor {
@@ -218,6 +383,11 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// `clientToken` -> `agentId`, so a retried `CreateAgent` carrying the same
     /// `@idempotencyToken` returns the agent it already created.
     pub client_tokens: HashMap<String, String>,
+    /// Every flow that exists, keyed by its 10-character `flowId`.
+    pub flows: HashMap<String, FlowRecord>,
+    /// `clientToken` -> `flowId`, so a retried `CreateFlow` carrying the same
+    /// `@idempotencyToken` returns the flow it already created.
+    pub flow_client_tokens: HashMap<String, String>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }
@@ -230,22 +400,43 @@ const ID_ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk
 const ID_LEN: usize = 10;
 
 impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
+    /// The next candidate id drawn from the modelled `^[0-9a-zA-Z]{10}$` alphabet.
+    /// Whether it is free is the caller's question: every resource family keys its
+    /// own map.
+    fn next_id_candidate(&mut self, now: SystemTime) -> String {
+        self.id_sequence = self.id_sequence.wrapping_add(1);
+        let mut hasher = DefaultHasher::new();
+        self.id_sequence.hash(&mut hasher);
+        epoch_nanos(now).hash(&mut hasher);
+        let mut bits = hasher.finish();
+        let mut id = String::with_capacity(ID_LEN);
+        for _ in 0..ID_LEN {
+            id.push(char::from(ID_ALPHABET[(bits % 62) as usize]));
+            bits /= 62;
+        }
+        id
+    }
+
     /// Mint an unused `agentId` matching the modelled `^[0-9a-zA-Z]{10}$`, or
     /// `None` when every one of [`MINT_ATTEMPTS`] draws collided — answered with a
     /// modelled server error rather than by looping.
     pub fn mint_agent_id(&mut self, now: SystemTime) -> Option<String> {
         for _ in 0..MINT_ATTEMPTS {
-            self.id_sequence = self.id_sequence.wrapping_add(1);
-            let mut hasher = DefaultHasher::new();
-            self.id_sequence.hash(&mut hasher);
-            epoch_nanos(now).hash(&mut hasher);
-            let mut bits = hasher.finish();
-            let mut id = String::with_capacity(ID_LEN);
-            for _ in 0..ID_LEN {
-                id.push(char::from(ID_ALPHABET[(bits % 62) as usize]));
-                bits /= 62;
-            }
+            let id = self.next_id_candidate(now);
             if !self.agents.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Mint an unused `flowId`, which the modelled `FlowId` shape constrains to the
+    /// same `^[0-9a-zA-Z]{10}$` as an `agentId`. `None` when every one of
+    /// [`MINT_ATTEMPTS`] draws collided.
+    pub fn mint_flow_id(&mut self, now: SystemTime) -> Option<String> {
+        for _ in 0..MINT_ATTEMPTS {
+            let id = self.next_id_candidate(now);
+            if !self.flows.contains_key(&id) {
                 return Some(id);
             }
         }
