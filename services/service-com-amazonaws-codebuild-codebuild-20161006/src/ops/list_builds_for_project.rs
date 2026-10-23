@@ -192,9 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListBuildsForProjectOutput {
-            // The model bounds `ids` at 1..100 entries, so a project with no builds
-            // answers with the member absent rather than an empty list.
-            ids: (!page.is_empty()).then_some(page),
+            // The listing this call reports is always serialized, `[]` when the
+            // project holds no build: the `@length(min: 1)` on `BuildIds` bounds what
+            // a request may carry, not whether the answer states its result (see
+            // `crate::ops::list_builds`).
+            ids: Some(page),
             next_token,
         })
     }

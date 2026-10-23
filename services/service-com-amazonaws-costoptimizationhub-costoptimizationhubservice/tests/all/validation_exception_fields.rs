@@ -311,11 +311,10 @@ async fn a_constraint_refusal_names_every_member_and_its_constraint() {
             )],
         ),
         (
-            // A value outside the member's enum is refused for THAT, before the
-            // handler gets to the rule about who may write the member at all:
-            // the request is answered with the field list, not with the
-            // permission refusal `management_account_gating` covers.
-            "enum membership on a management-account-only member",
+            // The organization-scoped member is judged exactly like the others:
+            // a value outside its enum is answered with the field list, and a
+            // value inside it is stored (`preference_writes`).
+            "enum membership on the member-account visibility member",
             "UpdatePreferences",
             json!({"memberAccountDiscountVisibility": "Everyone"}),
             vec![enum_entry(
