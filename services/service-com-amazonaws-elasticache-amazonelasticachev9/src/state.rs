@@ -22,15 +22,18 @@
 //! `CreateSnapshot` mints one from a stored cluster and `DescribeSnapshots`
 //! reports it, so [`SnapshotRecord`] below is the one copy both read.
 //!
-//! Beside those customer-created resources sit the two catalogs this service
+//! Beside those customer-created resources sit the catalogs this service
 //! publishes rather than mints: the service updates AWS releases for its cache
-//! engines, and the cache engines and versions themselves. No operation creates
-//! either (the API has no such call), so the store starts out holding them and
-//! `DescribeServiceUpdates` / `DescribeCacheEngineVersions` report them. The
-//! engine-version catalog is also the one statement of which version is the
-//! newest of each engine and which parameter group family a version belongs to,
-//! so `CreateCacheCluster`'s defaults are read off it rather than from a second
-//! list.
+//! engines, the cache engines and versions themselves, and the ENGINE DEFAULT
+//! PARAMETERS of every cache parameter group family
+//! ([`published_engine_default_parameters`]). No operation creates or removes an
+//! entry of any of them (the API has no such call), so the store starts out
+//! holding each catalog and `DescribeServiceUpdates` /
+//! `DescribeCacheEngineVersions` / `DescribeEngineDefaultParameters` only report
+//! it. The engine-version catalog is also the one statement of which version is
+//! the newest of each engine and which parameter group family a version belongs
+//! to, so `CreateCacheCluster`'s defaults are read off it rather than from a
+//! second list.
 //!
 //! The reserved-cache-node offerings are a further such catalog, and the
 //! reservations bought from one ([`ReservedCacheNodeRecord`]) ARE an account
@@ -41,10 +44,11 @@
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
 //! holds the built-in `default` user every account already has.
 //!
-//! Everything else in this service (user groups, parameter groups, migrations,
-//! update actions) is still a scaffolded 501 and owns its own gap issue; where a
-//! member of an implemented operation belongs to one of those resources, the
-//! comment beside it says so.
+//! Everything else in this service (user groups, migrations, update actions,
+//! and the parameter-group operations that would change a parameter's value) is
+//! still a scaffolded 501 and owns its own gap issue; where a member of an
+//! implemented operation belongs to one of those resources, the comment beside
+//! it says so.
 //!
 //! The serverless cache is another customer-created resource this store holds:
 //! `CreateServerlessCache` mints one and `DescribeServerlessCaches` reports it.
@@ -64,12 +68,13 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Authentication, AuthenticationMode, AvailabilityZone, CacheCluster, CacheEngineVersion,
-    CacheNode, CacheParameterGroup, CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits,
-    CreateUserOutput, DestinationDetails, Endpoint, LogDeliveryConfiguration,
-    LogDeliveryConfigurationRequest, NodeGroup, NodeGroupConfiguration, NodeGroupMember,
-    NodeSnapshot, NotificationConfiguration, PendingModifiedValues, RecurringCharge,
-    ReplicationGroup, ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig,
-    SecurityGroupMembership, ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag,
+    CacheNode, CacheNodeTypeSpecificParameter, CacheNodeTypeSpecificValue, CacheParameterGroup,
+    CacheParameterGroupStatus, CacheSubnetGroup, CacheUsageLimits, CreateUserOutput,
+    DestinationDetails, Endpoint, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
+    NodeGroup, NodeGroupConfiguration, NodeGroupMember, NodeSnapshot, NotificationConfiguration,
+    Parameter, PendingModifiedValues, RecurringCharge, ReplicationGroup, ReservedCacheNode,
+    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
+    ServiceUpdate, Snapshot, Subnet, Tag,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -133,6 +138,20 @@ pub const SNAPSHOT_MAX_RECORDS_DEFAULT: i32 = 50;
 /// OSS, this value must be 1. For clusters running Memcached, this value must be
 /// between 1 and 40."
 pub const MEMCACHED_MAX_NODES: i32 = 40;
+
+/// The most nodes this emulator will MATERIALISE for one cluster, whatever a
+/// request asks for: the largest cluster any engine permits
+/// ([`MEMCACHED_MAX_NODES`]).
+///
+/// The handlers refuse a larger `NumCacheNodes` before a record is built (see
+/// [`validate_num_cache_nodes`]); this is the bound at the allocation site
+/// itself, so no path through [`CacheClusterRecord::resize_nodes`] can be made
+/// to allocate node records without end.
+pub const MAX_CACHE_NODES_PER_CLUSTER: i32 = MEMCACHED_MAX_NODES;
+
+/// The smallest cluster: a cluster always has at least one node, which is also
+/// the floor [`CacheClusterRecord::resize_nodes`] clamps to.
+pub const MIN_CACHE_NODES_PER_CLUSTER: i32 = 1;
 /// See [`MEMCACHED_MAX_NODES`].
 pub const REDIS_NUM_CACHE_NODES: i32 = 1;
 
@@ -334,8 +353,9 @@ pub const UNSNAPSHOTTABLE_NODE_TYPE: &str = "cache.t1.micro";
 
 /// The `ParameterApplyStatus` / `CacheNode$ParameterGroupStatus` of a cluster
 /// whose nodes all run the parameter group's current values — the only state
-/// this slice can be in, because every parameter-group operation is still a
-/// scaffolded 501, so no parameter value can ever be pending.
+/// this slice can be in, because every operation that would CHANGE a
+/// parameter's value (`ModifyCacheParameterGroup`, `ResetCacheParameterGroup`)
+/// is still a scaffolded 501, so no parameter value can ever be pending.
 pub const PARAMETER_APPLY_STATUS: &str = "in-sync";
 
 /// The `SecurityGroupMembership$Status` of a VPC security group a cluster was
@@ -521,6 +541,930 @@ impl CacheParameterGroupRecord {
             arn: Some(parameter_group_arn(region, &self.name)),
         }
     }
+}
+
+/// The `Parameter$Source` of a value that is the engine's own default rather
+/// than one a customer set.
+///
+/// `DescribeCacheParameters$Source` documents the sources a parameter is
+/// reported under ("The parameter types to return. Valid values: user | system |
+/// engine-default"); an engine default is the service's own value, so it is
+/// reported as `system`.
+pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// `ChangeType`'s values (`smithy_query(query="shape", shape="ChangeType")`:
+/// `immediate | requires-reboot`): whether a change to the parameter is applied
+/// at once or only once the nodes are rebooted.
+pub const CHANGE_TYPE_IMMEDIATE: &str = "immediate";
+/// See [`CHANGE_TYPE_IMMEDIATE`].
+pub const CHANGE_TYPE_REQUIRES_REBOOT: &str = "requires-reboot";
+
+/// The two parameter catalogs this service publishes, one per cache engine.
+///
+/// Valkey is the Redis OSS-compatible engine, so the Valkey families draw on the
+/// same catalog as the Redis OSS ones; Memcached has a catalog of its own.
+const PARAMETER_ENGINE_MEMCACHED: &str = "memcached";
+/// See [`PARAMETER_ENGINE_MEMCACHED`].
+const PARAMETER_ENGINE_REDIS: &str = "redis";
+
+/// The minor version of a family line that covers every minor of its major
+/// (`redis7` covers every Redis OSS 7.x), so every parameter that major
+/// introduced belongs to it.
+const ANY_MINOR: i32 = i32::MAX;
+
+/// Each published family's parameter catalog and the version its parameters are
+/// selected by.
+///
+/// A family's parameters are its ENGINE's, which is why each row names the
+/// catalog the family draws on. The version is the HIGHEST engine version the
+/// family's line covers, because a family carries every parameter any version on
+/// its line introduced: `redis6.x` covers Redis OSS 6.0 through 6.2, and
+/// `redis7` / `valkey7` / `valkey8` cover every minor of their major — see
+/// [`ANY_MINOR`].
+///
+/// The family names are [`PARAMETER_GROUP_FAMILIES`], this service's published
+/// set; this table says what each of them MEANS to the parameter catalog.
+pub const FAMILY_LINES: [(&str, &str, (i32, i32)); PARAMETER_GROUP_FAMILIES.len()] = [
+    ("memcached1.4", PARAMETER_ENGINE_MEMCACHED, (1, 4)),
+    ("memcached1.5", PARAMETER_ENGINE_MEMCACHED, (1, 5)),
+    ("memcached1.6", PARAMETER_ENGINE_MEMCACHED, (1, ANY_MINOR)),
+    ("redis2.6", PARAMETER_ENGINE_REDIS, (2, 6)),
+    ("redis2.8", PARAMETER_ENGINE_REDIS, (2, 8)),
+    ("redis3.2", PARAMETER_ENGINE_REDIS, (3, 2)),
+    ("redis4.0", PARAMETER_ENGINE_REDIS, (4, ANY_MINOR)),
+    ("redis5.0", PARAMETER_ENGINE_REDIS, (5, ANY_MINOR)),
+    ("redis6.x", PARAMETER_ENGINE_REDIS, (6, ANY_MINOR)),
+    ("redis7", PARAMETER_ENGINE_REDIS, (7, ANY_MINOR)),
+    ("valkey7", PARAMETER_ENGINE_REDIS, (7, ANY_MINOR)),
+    ("valkey8", PARAMETER_ENGINE_REDIS, (8, ANY_MINOR)),
+];
+
+/// The parameter catalog `family` draws on and the version its parameters are
+/// selected by, or `None` when no published family carries that name.
+pub fn family_line(family: &str) -> Option<(&'static str, (i32, i32))> {
+    FAMILY_LINES
+        .iter()
+        .find(|(name, _, _)| *name == family)
+        .map(|(_, engine, version)| (*engine, *version))
+}
+
+/// `version` as the `(major, minor)` pair a family line is compared against, so
+/// a parameter's `MinimumEngineVersion` ("2.6.13", "6.2.6") and a family's line
+/// are ordered by the same rule. A part that is not a number counts as 0, which
+/// keeps the comparison total.
+fn version_rank(version: &str) -> (i32, i32) {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    (major, minor)
+}
+
+/// One row of an engine's parameter catalog, in column order: the parameter's
+/// name, the engine's default value for it, its description, its data type, the
+/// values it may take (empty where the engine constrains it to none), whether a
+/// customer may modify it, the earliest engine version it applies to, whether a
+/// change to it is immediate or needs a reboot, and whether its value depends on
+/// the cache node type.
+struct ParameterRow(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+    &'static str,
+    &'static str,
+    bool,
+);
+
+/// The parameters ElastiCache publishes for its Redis OSS-compatible engines
+/// (Redis OSS and Valkey).
+///
+/// Source: the parameter tables of the ElastiCache User Guide's "Redis-specific
+/// parameters" / "Valkey-specific parameters" sections — the names, data types,
+/// value sets, modifiability, change types and minimum engine versions below are
+/// that published catalog, and the engine's own defaults are the values. Nothing
+/// in the Smithy model enumerates parameters (`Parameter` describes only the
+/// shape of one), so this table is the emulator's single statement of what the
+/// Redis OSS-compatible engine defaults ARE; it is deliberately a representative
+/// catalog rather than every parameter AWS ships, and every family that draws on
+/// it reports exactly the rows whose minimum engine version its line covers.
+const REDIS_PARAMETERS: &[ParameterRow] = &[
+    ParameterRow(
+        "acl-pubsub-default",
+        "resetchannels",
+        "The default pub/sub channel permissions a newly created user is given.",
+        "string",
+        "allchannels,resetchannels",
+        true,
+        "6.2.6",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "activedefrag",
+        "no",
+        "Whether active memory defragmentation is enabled.",
+        "string",
+        "yes,no",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "activerehashing",
+        "yes",
+        "Whether the main dictionary is actively rehashed.",
+        "string",
+        "yes,no",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-pubsub-hard-limit",
+        "33554432",
+        "The output buffer size, in bytes, a pub/sub client is disconnected at.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-pubsub-soft-limit",
+        "8388608",
+        "The output buffer size, in bytes, a pub/sub client may stay above only for \
+         client-output-buffer-limit-pubsub-soft-seconds.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "client-output-buffer-limit-pubsub-soft-seconds",
+        "60",
+        "How long, in seconds, a pub/sub client may stay above the soft limit.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "cluster-enabled",
+        "no",
+        "Whether cluster mode is enabled for the cluster.",
+        "string",
+        "yes,no",
+        false,
+        "3.2.4",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "databases",
+        "16",
+        "The number of logical databases a node holds.",
+        "integer",
+        "1-",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "hash-max-listpack-entries",
+        "128",
+        "The largest hash, in entries, kept in the memory-efficient listpack encoding.",
+        "integer",
+        "",
+        true,
+        "7.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "hash-max-ziplist-entries",
+        "512",
+        "The largest hash, in entries, kept in the memory-efficient ziplist encoding.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "hash-max-ziplist-value",
+        "64",
+        "The largest hash value, in bytes, kept in the memory-efficient ziplist encoding.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lazyfree-lazy-eviction",
+        "no",
+        "Whether an evicted key is freed in a background thread.",
+        "string",
+        "yes,no",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lazyfree-lazy-expire",
+        "no",
+        "Whether an expired key is freed in a background thread.",
+        "string",
+        "yes,no",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "list-max-ziplist-entries",
+        "128",
+        "The largest list, in entries, kept in the memory-efficient ziplist encoding.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lua-time-limit",
+        "5000",
+        "How long, in milliseconds, a Lua script may run before the node starts answering \
+         other clients with BUSY.",
+        "integer",
+        "",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "maxclients",
+        "65000",
+        "The maximum number of client connections a node accepts.",
+        "integer",
+        "",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "maxmemory-policy",
+        "volatile-lru",
+        "The eviction policy applied once the data stored reaches maxmemory.",
+        "string",
+        "volatile-lru,allkeys-lru,volatile-lfu,allkeys-lfu,volatile-random,allkeys-random,\
+         volatile-ttl,noeviction",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "maxmemory-samples",
+        "3",
+        "How many keys an approximated eviction policy samples before it picks one.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "min-replicas-max-lag",
+        "10",
+        "How long, in seconds, a replica may lag before it stops counting towards \
+         min-replicas-to-write.",
+        "integer",
+        "",
+        true,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "min-replicas-to-write",
+        "0",
+        "How many connected replicas the primary needs before it accepts writes.",
+        "integer",
+        "",
+        true,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "notify-keyspace-events",
+        "",
+        "The classes of keyspace event published to pub/sub.",
+        "string",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "repl-backlog-size",
+        "1048576",
+        "The size, in bytes, of the replication backlog a disconnected replica resynchronises \
+         from.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "repl-backlog-ttl",
+        "3600",
+        "How long, in seconds, the primary keeps the replication backlog after the last \
+         replica disconnects.",
+        "integer",
+        "",
+        true,
+        "2.8.6",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "reserved-memory-percent",
+        "25",
+        "The percentage of a node's memory reserved for non-data use.",
+        "integer",
+        "0-100",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "set-max-intset-entries",
+        "512",
+        "The largest set of integers, in entries, kept in the memory-efficient intset \
+         encoding.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "slowlog-log-slower-than",
+        "10000",
+        "How long, in microseconds, a command must take to be recorded in the slow log.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "slowlog-max-len",
+        "128",
+        "How many entries the slow log keeps.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "tcp-keepalive",
+        "300",
+        "How often, in seconds, a TCP ACK is sent to an idle client, or 0 to send none.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "timeout",
+        "0",
+        "How long, in seconds, a client may stay idle before it is closed, or 0 to never \
+         close one.",
+        "integer",
+        "0,20-",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "zset-max-ziplist-entries",
+        "128",
+        "The largest sorted set, in entries, kept in the memory-efficient ziplist encoding.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "zset-max-ziplist-value",
+        "64",
+        "The largest sorted set value, in bytes, kept in the memory-efficient ziplist \
+         encoding.",
+        "integer",
+        "",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "maxmemory",
+        "",
+        "The memory, in bytes, available to the data stored on a node.",
+        "integer",
+        "",
+        false,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        // The node's own capacity, so the value is per cache node type.
+        true,
+    ),
+];
+
+/// The parameters ElastiCache publishes for its Memcached engine.
+///
+/// Source: the parameter tables of the ElastiCache User Guide's "Memcached
+/// specific parameters" section, read the same way as [`REDIS_PARAMETERS`].
+const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
+    ParameterRow(
+        "backlog_queue_limit",
+        "1024",
+        "How many connections may wait in the backlog queue.",
+        "integer",
+        "",
+        false,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "binding_protocol",
+        "auto",
+        "The protocol a client connection is read as.",
+        "string",
+        "auto,ascii,binary",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "cas_disabled",
+        "0",
+        "Whether check-and-set (CAS) operations are disabled.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "chunk_size",
+        "48",
+        "The smallest chunk size, in bytes, a key-value pair is stored in.",
+        "integer",
+        "",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "chunk_size_growth_factor",
+        "1.25",
+        "The growth factor between the chunk sizes of consecutive slab classes.",
+        "float",
+        "",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "disable_flush_all",
+        "0",
+        "Whether the flush_all command is refused.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.14",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "error_on_memory_exhausted",
+        "1",
+        "Whether a store with no memory left is answered with an error instead of evicting.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.14",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "hashpower_init",
+        "0",
+        "The initial size of the hash table, as a power of two.",
+        "integer",
+        "",
+        true,
+        "1.4.14",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "large_memory_pages",
+        "0",
+        "Whether large memory pages are used.",
+        "boolean",
+        "0,1",
+        false,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "lock_down_paged_memory",
+        "0",
+        "Whether paged memory is locked down.",
+        "boolean",
+        "0,1",
+        false,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "max_item_size",
+        "1048576",
+        "The largest item, in bytes, that may be stored.",
+        "integer",
+        "",
+        true,
+        "1.4.14",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "maxconns_fast",
+        "0",
+        "Whether a connection over the limit is closed immediately rather than queued.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.14",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "memcached_connections_overhead",
+        "100",
+        "The memory, in megabytes, reserved for connection overhead.",
+        "integer",
+        "",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "requests_per_event",
+        "20",
+        "How many requests one connection is served per event before the next is served.",
+        "integer",
+        "",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "slab_automove",
+        "1",
+        "How a slab page is moved between slab classes.",
+        "integer",
+        "0,1,2",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "slab_chunk_max",
+        "524288",
+        "The largest chunk size, in bytes, a slab page is divided into.",
+        "integer",
+        "",
+        true,
+        "1.5.10",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "slab_reassign",
+        "1",
+        "Whether a slab page may be reassigned between slab classes.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "max_cache_memory",
+        "",
+        "The memory, in megabytes, available to the cache on a node.",
+        "integer",
+        "",
+        false,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        // The node's own capacity, so the value is per cache node type.
+        true,
+    ),
+    ParameterRow(
+        "num_threads",
+        "",
+        "How many threads a node serves requests with.",
+        "integer",
+        "",
+        false,
+        "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        // One per vCPU of the node type, so the value is per cache node type.
+        true,
+    ),
+];
+
+/// The memory, in mebibytes, and the vCPU count the emulator attributes to each
+/// cache node SIZE — the last segment of a `cache.<family>.<size>` node type.
+///
+/// Like [`OFFERING_NODE_TYPES`]' hourly rates these are the EMULATOR's own
+/// scale, not a claim about AWS's published node capacities: AWS publishes those
+/// outside this API and the values below are derived per node size rather than
+/// copied from it. They DO reach the wire — `DescribeEngineDefaultParameters`
+/// reports `maxmemory` / `max_cache_memory` / `num_threads` per cache node type
+/// from them — so read them as this emulator's approximations of those
+/// capacities, not as AWS's numbers. They rise with the
+/// node size, so the node-type-specific values this catalog reports keep the
+/// ordering a caller picks a node type for, and they are fixed, so every read
+/// reports the same ones.
+const NODE_SIZES: [(&str, i64, i64); 7] = [
+    ("micro", 512, 2),
+    ("small", 1_024, 2),
+    ("medium", 3_072, 2),
+    ("large", 6_144, 2),
+    ("xlarge", 12_288, 4),
+    ("2xlarge", 24_576, 8),
+    ("4xlarge", 49_152, 16),
+];
+
+/// The memory (mebibytes) and vCPU count of `cache_node_type`, or `None` when
+/// its size is not one [`NODE_SIZES`] carries.
+fn node_type_capacity(cache_node_type: &str) -> Option<(i64, i64)> {
+    let size = cache_node_type.split('.').next_back()?;
+    NODE_SIZES
+        .iter()
+        .find(|(name, _, _)| *name == size)
+        .map(|(_, memory_mib, vcpus)| (*memory_mib, *vcpus))
+}
+
+/// The value the parameter `name` takes on a node type of this capacity, or
+/// `None` when that parameter's value does not depend on the node type.
+///
+/// This is the one place a node-type-specific parameter's value is computed, so
+/// the two catalogs cannot derive it differently.
+fn node_type_specific_value(name: &str, memory_mib: i64, vcpus: i64) -> Option<String> {
+    /// Mebibytes to bytes.
+    const BYTES_PER_MIB: i64 = 1024 * 1024;
+    match name {
+        // The data a Redis OSS / Valkey node may hold, in bytes.
+        "maxmemory" => Some((memory_mib * BYTES_PER_MIB).to_string()),
+        // The cache a Memcached node may hold, in megabytes.
+        "max_cache_memory" => Some(memory_mib.to_string()),
+        // One Memcached worker thread per vCPU.
+        "num_threads" => Some(vcpus.to_string()),
+        _ => None,
+    }
+}
+
+/// One engine default parameter of one cache parameter group family, as this
+/// emulator persists it.
+///
+/// A parameter whose value depends on the cache node type carries that value per
+/// node type in `node_type_values` and no single `value`, which is what makes it
+/// a `CacheNodeTypeSpecificParameter` rather than a `Parameter` on the wire.
+#[derive(Debug, Clone)]
+pub struct ParameterRecord {
+    /// `Parameter$ParameterName`.
+    pub name: String,
+    /// `Parameter$ParameterValue` — the engine's default for it, `None` for a
+    /// parameter whose value is per cache node type.
+    pub value: Option<String>,
+    /// `Parameter$Description`.
+    pub description: String,
+    /// `Parameter$DataType`.
+    pub data_type: String,
+    /// `Parameter$AllowedValues`, absent where the engine constrains the value to
+    /// no published set.
+    pub allowed_values: Option<String>,
+    /// `Parameter$IsModifiable`.
+    pub is_modifiable: bool,
+    /// `Parameter$MinimumEngineVersion`.
+    pub minimum_engine_version: String,
+    /// `Parameter$ChangeType`: [`CHANGE_TYPE_IMMEDIATE`] or
+    /// [`CHANGE_TYPE_REQUIRES_REBOOT`].
+    pub change_type: String,
+    /// `(CacheNodeType, Value)` for every node type this service publishes —
+    /// non-empty exactly for a parameter whose value is per cache node type.
+    pub node_type_values: Vec<(String, String)>,
+}
+
+impl ParameterRecord {
+    /// Whether this parameter's value depends on the cache node type.
+    pub fn is_node_type_specific(&self) -> bool {
+        !self.node_type_values.is_empty()
+    }
+
+    /// The key this parameter is held and PAGED under.
+    ///
+    /// `EngineDefaults` carries two parameter lists and ONE `Marker`, so both are
+    /// paged as one sequence: the plain parameters first, then the
+    /// node-type-specific ones, each ordered by name. Prefixing the name with the
+    /// list's position is what puts the whole catalog in the single total order a
+    /// `Marker` resumes from.
+    pub fn page_key(&self) -> String {
+        let list = if self.is_node_type_specific() { 2 } else { 1 };
+        format!("{list}:{}", self.name)
+    }
+
+    /// This record as the modelled `Parameter`.
+    pub fn to_modeled(&self) -> Parameter {
+        Parameter {
+            parameter_name: Some(self.name.clone()),
+            parameter_value: self.value.clone(),
+            description: Some(self.description.clone()),
+            source: Some(PARAMETER_SOURCE_SYSTEM.to_string()),
+            data_type: Some(self.data_type.clone()),
+            allowed_values: self.allowed_values.clone(),
+            is_modifiable: Some(self.is_modifiable),
+            minimum_engine_version: Some(self.minimum_engine_version.clone()),
+            change_type: Some(self.change_type.clone()),
+        }
+    }
+
+    /// This record as the modelled `CacheNodeTypeSpecificParameter`, for a
+    /// parameter whose value is per cache node type.
+    pub fn to_node_type_specific(&self) -> CacheNodeTypeSpecificParameter {
+        CacheNodeTypeSpecificParameter {
+            parameter_name: Some(self.name.clone()),
+            description: Some(self.description.clone()),
+            source: Some(PARAMETER_SOURCE_SYSTEM.to_string()),
+            data_type: Some(self.data_type.clone()),
+            allowed_values: self.allowed_values.clone(),
+            is_modifiable: Some(self.is_modifiable),
+            minimum_engine_version: Some(self.minimum_engine_version.clone()),
+            cache_node_type_specific_values: Some(
+                self.node_type_values
+                    .iter()
+                    .map(|(cache_node_type, value)| CacheNodeTypeSpecificValue {
+                        cache_node_type: Some(cache_node_type.clone()),
+                        value: Some(value.clone()),
+                    })
+                    .collect(),
+            ),
+            change_type: Some(self.change_type.clone()),
+        }
+    }
+}
+
+/// Every engine default parameter of `family`, keyed by
+/// [`ParameterRecord::page_key`], or `None` when no published family carries
+/// that name.
+///
+/// A family reports the rows of its engine's catalog whose minimum engine
+/// version its line covers, so two families of one engine differ by exactly the
+/// parameters the later versions introduced.
+pub fn family_default_parameters(family: &str) -> Option<BTreeMap<String, ParameterRecord>> {
+    let (engine, line) = family_line(family)?;
+    let rows = if engine == PARAMETER_ENGINE_MEMCACHED {
+        MEMCACHED_PARAMETERS
+    } else {
+        REDIS_PARAMETERS
+    };
+    let mut parameters = BTreeMap::new();
+    for row in rows {
+        let ParameterRow(
+            name,
+            value,
+            description,
+            data_type,
+            allowed_values,
+            is_modifiable,
+            minimum_engine_version,
+            change_type,
+            node_type_specific,
+        ) = *row;
+        if version_rank(minimum_engine_version) > line {
+            continue;
+        }
+        // The node types a node-type-specific parameter carries a value for are
+        // [`OFFERING_NODE_TYPES`]' — the one list of cache node types this crate
+        // publishes, so a parameter and an offering cannot disagree about which
+        // node types exist.
+        let node_type_values: Vec<(String, String)> = if node_type_specific {
+            let values: Vec<(String, String)> = OFFERING_NODE_TYPES
+                .iter()
+                .filter_map(|(cache_node_type, _)| {
+                    let (memory_mib, vcpus) = node_type_capacity(cache_node_type)?;
+                    let value = node_type_specific_value(name, memory_mib, vcpus)?;
+                    Some(((*cache_node_type).to_string(), value))
+                })
+                .collect();
+            // A row flagged node-type-specific that no node type has a value
+            // for would be reported as a plain parameter with NO value at all,
+            // so it is refused here instead: it means a catalog row and
+            // [`node_type_specific_value`] (or [`NODE_SIZES`] and a node type
+            // added to [`OFFERING_NODE_TYPES`]) disagree, which is a bug in this
+            // module rather than anything a request can ask for — the same
+            // reading as [`offering_rate_share`]'s `expect`s.
+            assert!(
+                values.len() == OFFERING_NODE_TYPES.len(),
+                "the node-type-specific parameter {name} must carry a value for every node \
+                 type of OFFERING_NODE_TYPES, got {}",
+                values.len()
+            );
+            values
+        } else {
+            Vec::new()
+        };
+        let record = ParameterRecord {
+            name: name.to_string(),
+            value: (!node_type_specific).then(|| value.to_string()),
+            description: description.to_string(),
+            data_type: data_type.to_string(),
+            allowed_values: (!allowed_values.is_empty()).then(|| allowed_values.to_string()),
+            is_modifiable,
+            minimum_engine_version: minimum_engine_version.to_string(),
+            change_type: change_type.to_string(),
+            node_type_values,
+        };
+        parameters.insert(record.page_key(), record);
+    }
+    Some(parameters)
+}
+
+/// The engine default parameters of every published family, keyed by family.
+///
+/// Seeded into
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::engine_default_parameters`]
+/// when the store is created: the engine's defaults are the service's own
+/// catalog, which exists before anything has been created and which no operation
+/// creates or removes an entry from.
+pub fn published_engine_default_parameters() -> BTreeMap<String, BTreeMap<String, ParameterRecord>>
+{
+    PARAMETER_GROUP_FAMILIES
+        .iter()
+        .filter_map(|family| {
+            family_default_parameters(family).map(|parameters| ((*family).to_string(), parameters))
+        })
+        .collect()
 }
 
 /// The Availability Zone the emulator places the `index`-th subnet of a subnet
@@ -1660,18 +2604,19 @@ impl CacheClusterRecord {
         status: &str,
         new_zones: &[String],
     ) {
+        let target = target.clamp(MIN_CACHE_NODES_PER_CLUSTER, MAX_CACHE_NODES_PER_CLUSTER);
         if !ids_to_remove.is_empty() {
             self.nodes
                 .retain(|node| !ids_to_remove.contains(&node.cache_node_id));
         }
         // The growth loop below allocates one record per node, so the node
-        // count is bounded HERE — where both the create and the modify path go
-        // through it — rather than left to each caller's own validation. No
-        // engine permits more than [`MEMCACHED_MAX_NODES`] nodes, and no
-        // cluster has fewer than one (see [`validate_num_cache_nodes`]), so a
-        // count outside that range cannot be a cluster this service serves and
+        // count is bounded at the top of this function — where both the create
+        // and the modify path go through it — rather than left to each caller's
+        // own validation: no engine permits more than
+        // [`MAX_CACHE_NODES_PER_CLUSTER`] nodes and no cluster has fewer than
+        // [`MIN_CACHE_NODES_PER_CLUSTER`] (see [`validate_num_cache_nodes`]), so
+        // a count outside that range cannot be a cluster this service serves and
         // is clamped instead of allocated.
-        let target = target.clamp(1, MEMCACHED_MAX_NODES);
         let target_len = usize::try_from(target).unwrap_or(1);
         self.nodes
             .reserve(target_len.saturating_sub(self.nodes.len()));
@@ -4104,6 +5049,14 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// is created, because the catalog is the service's own and no operation
     /// creates or removes an entry: a describe only reports it.
     pub reserved_cache_nodes_offerings: BTreeMap<String, ReservedCacheNodesOffering>,
+    /// The engine default parameters this service publishes, keyed by cache
+    /// parameter group family and, inside a family, by
+    /// [`ParameterRecord::page_key`] — the total order
+    /// `DescribeEngineDefaultParameters`' `Marker` indexes into. Stocked from
+    /// [`published_engine_default_parameters`] when the store is created, for the
+    /// same reason as the offerings above: the defaults are the engine's, not an
+    /// account's, so no operation creates or removes one.
+    pub engine_default_parameters: BTreeMap<String, BTreeMap<String, ParameterRecord>>,
     /// Every reservation this account bought, keyed by its
     /// `ReservedCacheNodeId` — "the unique identifier for the reservation",
     /// which is "a customer-specified identifier" and so is held exactly as it
@@ -4138,6 +5091,7 @@ impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
             vpc_seq: 0,
             subnet_seq: 0,
             reserved_cache_nodes_offerings: offering_catalog(),
+            engine_default_parameters: published_engine_default_parameters(),
             reserved_cache_nodes: BTreeMap::new(),
         }
     }
@@ -4151,6 +5105,14 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// lookup is case-insensitive.
     pub fn parameter_group(&self, name: &str) -> Option<&CacheParameterGroupRecord> {
         self.cache_parameter_groups.get(&name.to_ascii_lowercase())
+    }
+
+    /// The engine default parameters of the family `family` names, or `None`
+    /// when this service publishes no such family — the one lookup a handler
+    /// resolving a `CacheParameterGroupFamily` goes through, so no two of them
+    /// can disagree about which families exist.
+    pub fn engine_defaults(&self, family: &str) -> Option<&BTreeMap<String, ParameterRecord>> {
+        self.engine_default_parameters.get(family)
     }
 
     /// Mint the DNS label a new cluster's endpoints carry: six lowercase

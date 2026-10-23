@@ -17,6 +17,8 @@ mod cache_cluster_lifecycle;
 mod cache_engine_versions;
 #[path = "all/cache_parameter_groups.rs"]
 mod cache_parameter_groups;
+#[path = "all/engine_default_parameters.rs"]
+mod engine_default_parameters;
 #[path = "all/rbac_users.rs"]
 mod rbac_users;
 #[path = "all/replication_group_lifecycle.rs"]
