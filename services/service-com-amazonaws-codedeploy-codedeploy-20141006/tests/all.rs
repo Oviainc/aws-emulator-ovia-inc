@@ -25,6 +25,8 @@ mod client_error_messages;
 mod codedeploy_deployment_outcome;
 #[path = "all/codedeploy_lifecycle.rs"]
 mod codedeploy_lifecycle;
+#[path = "all/delete_deployment_config.rs"]
+mod delete_deployment_config;
 #[path = "all/deployment_configs.rs"]
 mod deployment_configs;
 #[path = "all/delete_deployment_group.rs"]
