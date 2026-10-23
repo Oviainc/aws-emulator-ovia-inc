@@ -245,6 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             findings: std::collections::BTreeMap::new(),
             filters: std::collections::BTreeMap::new(),
             investigations: std::collections::BTreeMap::new(),
+            ip_sets: std::collections::BTreeMap::new(),
             // A new detector administers nobody: `CreateMembers` is what records a
             // member account against it.
             members: std::collections::BTreeMap::new(),
