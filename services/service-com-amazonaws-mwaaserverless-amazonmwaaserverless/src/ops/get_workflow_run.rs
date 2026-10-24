@@ -4,9 +4,15 @@
 //! IMPLEMENTED: reports a persisted run from this service's store (`crate::state`).
 //!
 //! This is a reporting operation, so the only write it makes is to materialise the
-//! status change the CLOCK already made due — the run's exit from `QUEUED`, owed at the
-//! same instant whether or not anybody called (see `crate::state::WorkflowRun::settle`).
+//! status changes the CLOCK already made due — the run's progress through its
+//! non-terminal statuses, owed at the same instants whether or not anybody called (see
+//! `crate::state::WorkflowRun::settle`).
 //! It moves no status, consumes no quota and bumps no counter because the run was read.
+//!
+//! Every optional member is reported only when the stored run HOLDS a value for it: a run
+//! started with no `OverrideParameters` and a run holding no task instance report neither
+//! member rather than an empty map or an empty list, the same way `GetTaskInstance` omits
+//! the `Xcom` of an instance that exchanged no cross-task data.
 //!
 //! The entity this operation resolves is the RUN, so neither a workflow nor a run the
 //! store does not hold resolves one: both are the modelled `ResourceNotFoundException`
@@ -220,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.run_id)
             .ok_or_else(unresolved_run)?;
 
-        // The ONE write a read may make: the transition the clock already owed.
+        // The ONE write a read may make: the transitions the clock already owed.
         run.settle(now);
 
         Ok(GetWorkflowRunOutput {
@@ -228,12 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workflow_version: Some(run.workflow_version.clone()),
             run_id: Some(run.run_id.clone()),
             run_type: Some(run.run_type.clone()),
-            override_parameters: Some(
+            // Absent, like every other unset optional member, for a run the caller
+            // started with no parameter overrides.
+            override_parameters: (!run.override_parameters.is_empty()).then(|| {
                 run.override_parameters
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect(),
-            ),
+                    .collect()
+            }),
             run_detail: Some(WorkflowRunDetail {
                 workflow_arn: Some(run.workflow_arn.clone()),
                 workflow_version: Some(run.workflow_version.clone()),
@@ -246,7 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 modified_at: Some(crate::state::timestamp(run.modified_at)),
                 duration: run.duration,
                 error_message: run.error_message.clone(),
-                task_instances: Some(run.task_instance_ids()),
+                // Absent for a run that holds no task instance, which is every run
+                // nothing executed the workflow definition for.
+                task_instances: {
+                    let ids = run.task_instance_ids();
+                    (!ids.is_empty()).then_some(ids)
+                },
                 run_state: Some(run.status.clone()),
             }),
         })

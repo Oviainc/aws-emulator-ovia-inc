@@ -4,11 +4,14 @@
 //! IMPLEMENTED: creates and persists a run under a stored workflow in this service's
 //! store (`crate::state`).
 //!
-//! The run is accepted into the modelled non-terminal `QUEUED` status. This emulator
-//! has no Apache Airflow engine, so nothing executes the workflow definition: the clock
-//! owes the run its exit from `QUEUED` into the modelled failure status `FAILED`, with an
-//! `ErrorMessage` that says exactly that (`crate::state::NO_AIRFLOW_ENGINE`). No status
-//! is ever reported for work that ran.
+//! The run is accepted into the modelled non-terminal `STARTING` status — the status the
+//! model documents a just-created run carries ("This is typically STARTING when you first
+//! create the run"). The clock then owes it the rest of the lifecycle
+//! (`crate::state::WorkflowRun::settle`): `STARTING` -> `QUEUED` once the control plane has
+//! admitted it, and then, because this emulator has no Apache Airflow engine to execute the
+//! workflow definition with, `QUEUED` -> the modelled failure status `FAILED` with an
+//! `ErrorMessage` that says exactly that (`crate::state::NO_AIRFLOW_ENGINE`). No status is
+//! ever reported for work that ran, and the run holds no task instance.
 //!
 //! To start a run this operation must resolve the workflow VERSION to run — the one
 //! the request names, else the workflow's latest — so a workflow or a version the
@@ -308,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workflow_version: version,
             // A run this operation starts is the caller's own, not the schedule's.
             run_type: crate::state::RUN_TYPE_ON_DEMAND.to_string(),
-            status: crate::state::RUN_STATUS_QUEUED.to_string(),
+            status: crate::state::RUN_STATUS_STARTING.to_string(),
             override_parameters: input
                 .override_parameters
                 .clone()
@@ -325,9 +328,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // definition, and this emulator has no Apache Airflow engine to do it
             // (`crate::state::NO_AIRFLOW_ENGINE`), so a started run holds none.
             task_instances: BTreeMap::new(),
-            // The instant the run's exit from `QUEUED` falls due. Recorded, never
-            // waited on, so a caller reading the run straight back still sees `QUEUED`.
-            settles_at: now + crate::state::RUN_SETTLE_AFTER,
+            // The instant the run's exit from `STARTING` falls due. Recorded, never
+            // waited on, so a caller reading the run straight back still sees the
+            // `STARTING` this call reported (`crate::state::WorkflowRun::settle`
+            // carries it on through the rest of the lifecycle).
+            next_status_at: now + crate::state::RUN_ADMITTED_AFTER,
         };
 
         let workflow = store
