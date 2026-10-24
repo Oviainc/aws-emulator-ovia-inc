@@ -139,6 +139,22 @@ pub const MAX_BASELINE_OPERATIONS: usize = 1024;
 /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 pub const MAX_ENABLED_BASELINES: usize = 512;
 
+/// The landing zone versions this service OFFERS, oldest first.
+///
+/// `LandingZoneVersion` (len 3..10, pattern `^\d+.\d+$`) bounds the SHAPE of a version
+/// string, not the set of versions that exist, and the member's docs give one by example
+/// ("The landing zone version, for example, 3.0"): a landing zone is created or updated
+/// at a version the service publishes, so a value outside this set is refused with the
+/// modelled `ValidationException` rather than minted. The set is the 2.x/3.x line the AWS
+/// Control Tower user guide's "Landing zone versions" table publishes — 2.0 through 3.3.
+///
+/// Every entry satisfies `LandingZoneVersion`, and the list is kept in NUMERIC order so
+/// its last entry is [`CATALOG_LANDING_ZONE_VERSION`].
+pub const CATALOG_LANDING_ZONE_VERSIONS: &[&str] = &[
+    "2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8", "2.9", "3.0", "3.1", "3.2",
+    "3.3",
+];
+
 /// The most tags one resource may carry.
 ///
 /// This is the model's OWN ceiling rather than a chosen one: `TagMap` carries
@@ -154,8 +170,229 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 ///
 /// Reported through `LandingZoneDetail$latestAvailableVersion` ("The latest available
 /// version of the landing zone"). Satisfies `LandingZoneVersion` (len 3..10, pattern
-/// `^\d+.\d+$`).
+/// `^\d+.\d+$`), and is the numerically newest entry of [`CATALOG_LANDING_ZONE_VERSIONS`].
 pub const CATALOG_LANDING_ZONE_VERSION: &str = "3.3";
+
+/// Whether this service offers `version` as a landing zone version.
+///
+/// The membership test behind every `version` refusal: a landing zone can only be created
+/// or updated at a version the catalog publishes. Private because a handler refuses with
+/// [`unsupported_version_message`], which is this test plus the wording.
+fn offers_landing_zone_version(version: &str) -> bool {
+    CATALOG_LANDING_ZONE_VERSIONS.contains(&version)
+}
+
+/// Why `version` cannot be deployed, or `None` when the catalog offers it.
+///
+/// The one place the refusal's wording is built, so `CreateLandingZone` and
+/// `UpdateLandingZone` refuse an unoffered version in the same words. The message is
+/// built from the request and from the catalog, so it tells the caller which versions it
+/// may ask for.
+pub fn unsupported_version_message(version: &str) -> Option<String> {
+    if offers_landing_zone_version(version) {
+        return None;
+    }
+    Some(format!(
+        "version {version:?} is not a landing zone version this service offers; the \
+         available versions are {}",
+        CATALOG_LANDING_ZONE_VERSIONS.join(", ")
+    ))
+}
+
+/// What one documented `Manifest` member's value must be.
+///
+/// The manifest's full schema "is not published, by design"
+/// (`UpdateLandingZoneInput$manifest`), so a member is constrained only as far as the
+/// user guide's example manifest documents it ("Launch your landing zone"): its JSON
+/// type, and for an account id the 12-digit form every AWS account id has. Anything the
+/// manifest carries beyond these members is accepted and stored unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestMemberKind {
+    /// A JSON object, whose own members are not constrained further.
+    Object,
+    /// A JSON array of strings — AWS Region names. May be empty: a manifest that governs
+    /// no region leaves the governed-region list empty rather than omitting it.
+    StringList,
+    /// A 12-digit Amazon Web Services account id, as a JSON string.
+    AccountId,
+    /// A JSON boolean.
+    Boolean,
+    /// A JSON object carrying a `name` string: an organizational unit's name.
+    NamedOrganizationalUnit,
+}
+
+impl ManifestMemberKind {
+    /// Whether `value` is of this kind.
+    pub fn accepts(self, value: &::aws_smithy_types::Document) -> bool {
+        use ::aws_smithy_types::Document;
+
+        match self {
+            Self::Object => matches!(value, Document::Object(_)),
+            Self::StringList => match value {
+                Document::Array(items) => {
+                    items.iter().all(|item| matches!(item, Document::String(_)))
+                }
+                _ => false,
+            },
+            Self::AccountId => match value {
+                Document::String(account_id) => {
+                    account_id.len() == 12 && account_id.bytes().all(|b| b.is_ascii_digit())
+                }
+                _ => false,
+            },
+            Self::Boolean => matches!(value, Document::Bool(_)),
+            Self::NamedOrganizationalUnit => match value {
+                Document::Object(members) => {
+                    matches!(members.get("name"), Some(Document::String(_)))
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// What this kind requires, for the refusal's message.
+    pub fn requirement(self) -> &'static str {
+        match self {
+            Self::Object => "a JSON object",
+            Self::StringList => "a JSON array of Amazon Web Services Region names",
+            Self::AccountId => "a 12-digit Amazon Web Services account id, as a string",
+            Self::Boolean => "a JSON boolean",
+            Self::NamedOrganizationalUnit => {
+                "a JSON object carrying the organizational unit's `name` as a string"
+            }
+        }
+    }
+}
+
+/// The members a landing zone `Manifest` must declare, as dotted paths into the document.
+///
+/// These are the required parameters of the example manifest the user guide publishes for
+/// `CreateLandingZone`/`UpdateLandingZone` ("Launch your landing zone"): the governed
+/// Regions, the organization structure's security OU, the centralized logging account and
+/// its configuration, the security roles account, and whether access management is
+/// enabled. A create or update whose manifest omits one of them describes no landing zone
+/// the service could deploy, so it is refused with the modelled `ValidationException`.
+///
+/// A parent path precedes its children, so a member whose container is of the wrong type
+/// is reported against the CONTAINER rather than as a missing child.
+///
+/// The nested entries (`centralizedLogging`'s account, configuration and flag,
+/// `securityRoles`' account, `accessManagement`'s flag) are here because the user guide
+/// lists them among the manifest's REQUIRED parameters, not merely because its example
+/// happens to carry them — a section present but hollow still describes nothing the
+/// service could deploy. Only these paths are checked, and only for their JSON kind:
+/// everything else the manifest carries is accepted and stored unchanged, because the
+/// schema as a whole is unpublished.
+pub const REQUIRED_MANIFEST_MEMBERS: &[(&str, ManifestMemberKind)] = &[
+    ("governedRegions", ManifestMemberKind::StringList),
+    ("organizationStructure", ManifestMemberKind::Object),
+    (
+        "organizationStructure.security",
+        ManifestMemberKind::NamedOrganizationalUnit,
+    ),
+    ("centralizedLogging", ManifestMemberKind::Object),
+    ("centralizedLogging.accountId", ManifestMemberKind::AccountId),
+    (
+        "centralizedLogging.configurations",
+        ManifestMemberKind::Object,
+    ),
+    ("centralizedLogging.enabled", ManifestMemberKind::Boolean),
+    ("securityRoles", ManifestMemberKind::Object),
+    ("securityRoles.accountId", ManifestMemberKind::AccountId),
+    ("accessManagement", ManifestMemberKind::Object),
+    ("accessManagement.enabled", ManifestMemberKind::Boolean),
+];
+
+/// Manifest members the documented example carries OPTIONALLY: absent is fine, but a
+/// value of the wrong type is not.
+///
+/// The sandbox OU is optional in the example manifest (a landing zone may be launched
+/// without one), unlike the security OU.
+pub const OPTIONAL_MANIFEST_MEMBERS: &[(&str, ManifestMemberKind)] = &[(
+    "organizationStructure.sandbox",
+    ManifestMemberKind::NamedOrganizationalUnit,
+)];
+
+/// The member `path` names, resolved through nested objects, or `None` when any step of
+/// the path is absent or is not an object.
+fn manifest_member<'a>(
+    manifest: &'a ::aws_smithy_types::Document,
+    path: &str,
+) -> Option<&'a ::aws_smithy_types::Document> {
+    use ::aws_smithy_types::Document;
+
+    let mut node = manifest;
+    for segment in path.split('.') {
+        let Document::Object(members) = node else {
+            return None;
+        };
+        node = members.get(segment)?;
+    }
+    Some(node)
+}
+
+/// The JSON kind of `document`, for a refusal's message.
+fn document_kind(document: &::aws_smithy_types::Document) -> &'static str {
+    use ::aws_smithy_types::Document;
+
+    match document {
+        Document::Object(_) => "an object",
+        Document::Array(_) => "an array",
+        Document::String(_) => "a string",
+        Document::Number(_) => "a number",
+        Document::Bool(_) => "a boolean",
+        Document::Null => "null",
+    }
+}
+
+/// The first way `manifest` fails to describe a landing zone configuration, or `None`
+/// when it describes one.
+///
+/// The message names the member and the constraint it failed, so a caller is told what to
+/// change; it is built from the request, never from a recorded example.
+pub fn manifest_defect(manifest: &::aws_smithy_types::Document) -> Option<String> {
+    use ::aws_smithy_types::Document;
+
+    if !matches!(manifest, Document::Object(_)) {
+        return Some(format!(
+            "manifest must be a JSON object describing the landing zone configuration, got {}",
+            document_kind(manifest)
+        ));
+    }
+
+    for (path, kind) in REQUIRED_MANIFEST_MEMBERS {
+        match manifest_member(manifest, path) {
+            None => {
+                return Some(format!(
+                    "manifest is missing the required member {path:?}, which must be {}",
+                    kind.requirement()
+                ))
+            }
+            Some(value) if !kind.accepts(value) => {
+                return Some(format!(
+                    "manifest member {path:?} must be {}, got {}",
+                    kind.requirement(),
+                    document_kind(value)
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (path, kind) in OPTIONAL_MANIFEST_MEMBERS {
+        if let Some(value) = manifest_member(manifest, path) {
+            if !kind.accepts(value) {
+                return Some(format!(
+                    "manifest member {path:?} must be {}, got {}",
+                    kind.requirement(),
+                    document_kind(value)
+                ));
+            }
+        }
+    }
+
+    None
+}
 
 /// `LandingZoneStatus`: the landing zone's deployment status.
 ///
@@ -1424,6 +1661,10 @@ fn version_order(version: &str) -> Option<(u64, u64)> {
 /// Compared NUMERICALLY per component, so `3.10` is newer than `3.3`. A deployed
 /// version at or beyond the catalog's — or one this cannot order — is its own latest
 /// available version, so the answer is never older than what is deployed.
+///
+/// A create or update only accepts a version [`CATALOG_LANDING_ZONE_VERSIONS`] offers, so
+/// in practice the answer is the catalog's newest; the comparison is what keeps the
+/// invariant when the catalog is retuned around an already-deployed landing zone.
 pub fn latest_available_version(deployed: &str, catalog: &str) -> String {
     match (version_order(deployed), version_order(catalog)) {
         (Some(deployed_order), Some(catalog_order)) if catalog_order > deployed_order => {

@@ -169,6 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `version` must name a landing zone version the service OFFERS: the modelled
+        // `LandingZoneVersion` pattern bounds the shape of the string, not the set of
+        // versions that exist, so the catalog is what decides.
+        if let Some(refusal) = crate::state::unsupported_version_message(&input.version) {
+            return Err(
+                CreateLandingZoneErrorModeled::ValidationException(ValidationException {
+                    message: refusal,
+                })
+                .into(),
+            );
+        }
+
         // `LandingZoneDetail$manifest` is `@required`, so a landing zone cannot exist
         // without one: a create that supplies none could never be reported back.
         let Some(manifest) = input.manifest else {
@@ -181,6 +193,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The manifest is the landing zone's CONFIGURATION document, not an opaque blob:
+        // a manifest that is not an object, or that omits a parameter the configuration
+        // requires, describes no landing zone this service could deploy.
+        if let Some(defect) = crate::state::manifest_defect(&manifest) {
+            return Err(
+                CreateLandingZoneErrorModeled::ValidationException(ValidationException {
+                    message: defect,
+                })
+                .into(),
+            );
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

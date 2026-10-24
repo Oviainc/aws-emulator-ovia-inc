@@ -141,12 +141,12 @@ pub(crate) fn constrained_field(case: &str, data: &Value) -> String {
 type WarningRow = (&'static str, Box<dyn Fn(&mut Map<String, Value>)>, bool);
 
 /// An `UpdateDeployment` request body.
-fn update_body(id: &str, specifications: &Map<String, Value>) -> Value {
+pub(crate) fn update_body(id: &str, specifications: &Map<String, Value>) -> Value {
     json!({"deploymentId": id, "specifications": Value::Object(specifications.clone())})
 }
 
 /// `body` with one extra member — `force`, `dryRun` or a version name.
-fn with_member(body: &Value, member: &str, value: Value) -> Value {
+pub(crate) fn with_member(body: &Value, member: &str, value: Value) -> Value {
     let mut object = body
         .as_object()
         .expect("an update request body is an object")
@@ -165,7 +165,7 @@ pub(crate) fn error_message(body: &Value) -> String {
 }
 
 /// The deployment events of `id`, oldest first.
-async fn events(harness: &Harness, case: &str, id: &str) -> Vec<Value> {
+pub(crate) async fn events(harness: &Harness, case: &str, id: &str) -> Vec<Value> {
     let body = harness
         .ok(case, "/listDeploymentEvents", json!({"deploymentId": id}))
         .await;
@@ -173,6 +173,18 @@ async fn events(harness: &Harness, case: &str, id: &str) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: ListDeploymentEvents reported no list: {body}"))
         .clone()
+}
+
+/// The description of the LAST `DeploymentUpdateInProgress` event of `history` — where
+/// the versions a deployment deploys are observable, since no output shape in this
+/// model carries them. Empty when the history holds no such event.
+pub(crate) fn last_update_description(history: &[Value]) -> String {
+    history
+        .iter()
+        .filter(|event| event["name"].as_str() == Some("DeploymentUpdateInProgress"))
+        .filter_map(|event| event["description"].as_str().map(ToString::to_string))
+        .next_back()
+        .unwrap_or_default()
 }
 
 /// Every `(workload, pattern)` pair the catalogue holds, in the order it reports them.
@@ -337,11 +349,7 @@ async fn an_update_replaces_the_settings_and_every_reader_reports_the_record() {
                 "case {case:?}: event status {status:?} is not an EventStatus value"
             );
         }
-        let described = history
-            .iter()
-            .find(|event| event["name"].as_str() == Some("DeploymentUpdateInProgress"))
-            .map(|event| event["description"].as_str().unwrap_or_default().to_string())
-            .unwrap_or_default();
+        let described = last_update_description(&history);
         assert!(
             described.contains(version),
             "case {case:?}: the update event must name the version {version:?} the \
@@ -775,14 +783,10 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
                 "case {case:?}: a version the catalogue holds must be applied, got {answered}"
             );
             // Whichever version was named, the event records the one the deployment now
-            // deploys — which is the catalogue's, since that is the only one it holds.
-            let described = events(&harness, &case, &id)
-                .await
-                .into_iter()
-                .filter(|event| event["name"].as_str() == Some("DeploymentUpdateInProgress"))
-                .filter_map(|event| event["description"].as_str().map(ToString::to_string))
-                .next_back()
-                .unwrap_or_default();
+            // deploys — which is the version it was created against, since each row
+            // either names that version or names none, and a row that names none leaves
+            // the deployment on the version it already deploys.
+            let described = last_update_description(&events(&harness, &case, &id).await);
             for version in [&workload_version, &pattern_version] {
                 assert!(
                     described.contains(version.as_str()),
