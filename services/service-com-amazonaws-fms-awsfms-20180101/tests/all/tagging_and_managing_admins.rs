@@ -26,7 +26,12 @@ use crate::policy_lifecycle::{call, emulator, error_code, ACCOUNT, REGION};
 
 /// A minimal policy document: every required `Policy` member and nothing else.
 /// What is varied in these tests is the TAGS and the ARN, not the policy.
-fn minimal_policy(name: &str) -> Value {
+///
+/// This suite owns the tagging harness for this test target (`minimal_policy`,
+/// [`tag_list`], [`owned`], [`tag_pairs`] and [`list_tags`]), and they are
+/// `pub(crate)` so the sibling `tagging_across_resource_kinds` suite builds and
+/// reads a `TagList` through the SAME helpers rather than a second copy of them.
+pub(crate) fn minimal_policy(name: &str) -> Value {
     json!({
         "PolicyName": name,
         "SecurityServicePolicyData": {
@@ -62,7 +67,7 @@ async fn put_policy(
 }
 
 /// A `TagList` wire value built from key/value pairs.
-fn tag_list(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     Value::Array(
         pairs
             .iter()
@@ -72,7 +77,7 @@ fn tag_list(pairs: &[(&str, &str)]) -> Value {
 }
 
 /// `pairs` as the owned, sorted set the assertions compare against.
-fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut owned: Vec<(String, String)> = pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -83,7 +88,7 @@ fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// A wire `TagList` as the same sorted set: tags are a key:value MAP, so the
 /// comparison is order-insensitive.
-fn tag_pairs(value: &Value) -> Vec<(String, String)> {
+pub(crate) fn tag_pairs(value: &Value) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = match value.as_array() {
         Some(items) => items
             .iter()
@@ -101,7 +106,7 @@ fn tag_pairs(value: &Value) -> Vec<(String, String)> {
 }
 
 /// `ListTagsForResource` for `arn`, as `(status, error code or "", tag set)`.
-async fn list_tags(
+pub(crate) async fn list_tags(
     router: &smithy_server_runtime::MultiServiceRouter,
     arn: &str,
 ) -> (u16, String, Vec<(String, String)>) {

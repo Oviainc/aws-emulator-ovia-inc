@@ -162,11 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // A read: it resolves the ARN and reports the tags the resource carries,
         // and writes nothing — so two reads in a row answer identically.
-        let tags = store
-            .policy_id_for_arn(&input.resource_arn)
-            .and_then(|policy_id| store.policies.get(&policy_id))
-            .map(|record| record.tags.clone());
-        let Some(tag_list) = tags else {
+        //
+        // `ResourceArn` is GENERIC: nothing in the request says which kind of
+        // Firewall Manager resource the ARN names, so the resolution covers every
+        // taggable kind this service stores (policies, resource sets,
+        // applications lists, protocols lists) rather than one of them.
+        let Some(tag_list) = store.tags_for_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )

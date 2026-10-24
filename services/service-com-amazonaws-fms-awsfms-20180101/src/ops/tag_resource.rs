@@ -203,13 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A well-formed ARN that names no stored resource is not-found, and the
         // call must leave NO tag state behind — so the resource is resolved
         // before any write, and nothing is inserted on this path.
+        //
+        // `ResourceArn` is GENERIC: the request does not say which kind of
+        // Firewall Manager resource it names, so the resolution covers every
+        // taggable kind this service stores rather than one of them, and it
+        // hands back the tags the resource carries along with it.
         let resolved = store
-            .policy_id_for_arn(&input.resource_arn)
-            .and_then(|policy_id| {
-                let record = store.policies.get(&policy_id)?;
-                Some((policy_id, record.policy_arn.clone(), record.tags.clone()))
-            });
-        let Some((policy_id, arn, held)) = resolved else {
+            .tagged_resource_for_arn(&input.resource_arn)
+            .map(|(resource, held)| (resource, held.to_vec()));
+        let Some((resource, held)) = resolved else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )
@@ -234,13 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `PolicyRecord::tags` is authoritative and `tags_by_arn` is the index
-        // maintained from it, so the record is written first and the index
-        // refreshed from the same value: the two can never disagree.
-        if let Some(record) = store.policies.get_mut(&policy_id) {
-            record.tags = tags.clone();
-        }
-        store.tags_by_arn.insert(arn, tags);
+        // The tags on the resource's own record are authoritative and
+        // `tags_by_arn` is the index maintained from them, so the write goes
+        // through the one helper that writes both from the same value: the two
+        // can never disagree, whatever kind of resource this is.
+        //
+        // `set_tags` answers whether the resource was still there to write to.
+        // It cannot be false here: the resource was resolved under the SAME lock
+        // this write holds, so nothing could have deleted it in between — hence
+        // the debug assertion rather than an error path no request can take.
+        let written = store.set_tags(&resource, tags);
+        debug_assert!(
+            written,
+            "the resource resolved under this lock must still be there to tag"
+        );
         Ok(TagResourceOutput {})
     }
 }

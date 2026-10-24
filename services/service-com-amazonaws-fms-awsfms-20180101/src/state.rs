@@ -383,6 +383,31 @@ impl ThirdPartyFirewallRecord {
     }
 }
 
+/// One stored Firewall Manager resource that carries TAGS, named by the kind of
+/// resource it is and the key its record is stored under.
+///
+/// Firewall Manager's tagging operations take a generic `ResourceArn`, so what
+/// an ARN resolves to is "some taggable resource of some kind" rather than a
+/// policy: this is that resolution's answer (see
+/// [`ComAmazonawsFmsAwsfms20180101State::tagged_resource_for_arn`]), and it is
+/// what the tag read and the tag write then work from, so neither of them has to
+/// know which kind of resource it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// A policy, keyed by its `PolicyId` in
+    /// [`ComAmazonawsFmsAwsfms20180101State::policies`].
+    Policy(String),
+    /// A resource set, keyed by its `Base62Id` `Id` in
+    /// [`ComAmazonawsFmsAwsfms20180101State::resource_sets`].
+    ResourceSet(String),
+    /// An applications list, keyed by its `ListId` in
+    /// [`ComAmazonawsFmsAwsfms20180101State::apps_lists`].
+    AppsList(String),
+    /// A protocols list, keyed by its `ListId` in
+    /// [`ComAmazonawsFmsAwsfms20180101State::protocols_lists`].
+    ProtocolsList(String),
+}
+
 /// One DDoS attack Shield Advanced recorded against a resource that a Firewall
 /// Manager Shield Advanced policy protects — what `GetProtectionStatus`
 /// projects into its `ProtectionData` document.
@@ -555,17 +580,20 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// Stored policies, keyed by the `PolicyId` this service minted.
     pub policies: BTreeMap<String, PolicyRecord>,
     /// Tags of every Firewall Manager resource, keyed by its ARN: the ARN-keyed
-    /// INDEX the later `ListTagsForResource` / `TagResource` / `UntagResource`
-    /// slice needs (those operations resolve a resource by ARN, not by policy
-    /// id), still a 501 tracked by its own gap issues.
+    /// INDEX the tagging operations (`ListTagsForResource`, `TagResource`,
+    /// `UntagResource`) work from, since they name a resource by ARN rather than
+    /// by the id of its own kind.
     ///
-    /// Which copy wins: for a policy, [`PolicyRecord::tags`] is authoritative and
-    /// this map is maintained from it — `PutPolicy` writes the record's tags into
-    /// it under the minted ARN and `DeletePolicy` removes the entry. A tagging
-    /// operation must write the record first and refresh this entry from it, or
-    /// (better) the index can be derived by iterating `policies` by `policy_arn`
-    /// and this map dropped, once a Firewall Manager resource other than a policy
-    /// is stored here too.
+    /// Which copy wins: the TAGS ON THE RECORD of the resource are authoritative
+    /// ([`PolicyRecord::tags`], [`ResourceSetRecord::tags`],
+    /// [`AppsListRecord::tags`], [`ProtocolsListRecord::tags`]) and this map is
+    /// maintained from them — each writer inserts the record's tags under the
+    /// resource's ARN and each deleter removes the entry. A tag write therefore
+    /// goes through [`ComAmazonawsFmsAwsfms20180101State::set_tags`], which writes
+    /// the record and refreshes this entry from the SAME value, so the two cannot
+    /// disagree; a tag read goes through
+    /// [`ComAmazonawsFmsAwsfms20180101State::tags_for_arn`], which reads the
+    /// authoritative record rather than this index.
     pub tags_by_arn: HashMap<String, Vec<Tag>>,
     /// Stored resource sets, keyed by the `Base62Id` this service minted. A
     /// `BTreeMap` for the same reason as `policies`: a page boundary is a key in
@@ -660,19 +688,112 @@ impl ComAmazonawsFmsAwsfms20180101State {
         self.admin_account.as_mut().filter(|a| a.is_active_at(now))
     }
 
-    /// The `PolicyId` of the stored policy whose ARN is `arn`, or `None` when no
-    /// stored Firewall Manager resource carries that ARN.
+    /// The stored Firewall Manager resource whose ARN is `arn` — whatever KIND of
+    /// taggable resource it is — together with the tags it carries, or `None`
+    /// when this store holds no resource under that ARN.
     ///
-    /// This is the ARN -> resource resolution every tagging operation does
-    /// before it reads or writes a tag: a policy is the only taggable Firewall
-    /// Manager resource this service persists today (applications lists and
-    /// protocols lists are still 501s), so an ARN naming anything else resolves
-    /// to nothing and the caller gets the modelled not-found.
-    pub fn policy_id_for_arn(&self, arn: &str) -> Option<String> {
-        self.policies
-            .iter()
-            .find(|(_, record)| record.policy_arn == arn)
-            .map(|(policy_id, _)| policy_id.clone())
+    /// This is the ARN -> resource resolution every tagging operation does before
+    /// it reads or writes a tag. A `ResourceArn` is generic — nothing in it tells
+    /// the operation which kind of resource it names — so the resolution searches
+    /// EVERY kind of resource this store holds that carries tags, and an ARN
+    /// naming none of them is the modelled not-found.
+    ///
+    /// The tags come back WITH the resolution, read off the record that owns them
+    /// (the authoritative copy): a resolved resource always has a tag set, an
+    /// empty one when it carries no tags, so no caller has to handle a resolved
+    /// resource whose tags are missing. Each kind is scanned only until one
+    /// matches.
+    pub fn tagged_resource_for_arn(&self, arn: &str) -> Option<(TaggedResource, &[Tag])> {
+        let in_policies = || {
+            self.policies
+                .iter()
+                .find(|(_, record)| record.policy_arn == arn)
+                .map(|(id, record)| {
+                    (TaggedResource::Policy(id.clone()), record.tags.as_slice())
+                })
+        };
+        let in_resource_sets = || {
+            self.resource_sets
+                .iter()
+                .find(|(_, record)| record.arn == arn)
+                .map(|(id, record)| {
+                    (
+                        TaggedResource::ResourceSet(id.clone()),
+                        record.tags.as_slice(),
+                    )
+                })
+        };
+        let in_apps_lists = || {
+            self.apps_lists
+                .iter()
+                .find(|(_, record)| record.list_arn == arn)
+                .map(|(id, record)| {
+                    (TaggedResource::AppsList(id.clone()), record.tags.as_slice())
+                })
+        };
+        let in_protocols_lists = || {
+            self.protocols_lists
+                .iter()
+                .find(|(_, record)| record.list_arn == arn)
+                .map(|(id, record)| {
+                    (
+                        TaggedResource::ProtocolsList(id.clone()),
+                        record.tags.as_slice(),
+                    )
+                })
+        };
+        in_policies()
+            .or_else(in_resource_sets)
+            .or_else(in_apps_lists)
+            .or_else(in_protocols_lists)
+    }
+
+    /// The tags the resource named by `arn` carries, which is what a tag READER
+    /// needs: the resolution of [`Self::tagged_resource_for_arn`], keeping only
+    /// the tags. `None` when no stored resource carries that ARN.
+    ///
+    /// An existing resource that carries no tags answers an EMPTY list: it exists
+    /// and holds nothing, which is not the same as nothing being known about it.
+    pub fn tags_for_arn(&self, arn: &str) -> Option<Vec<Tag>> {
+        self.tagged_resource_for_arn(arn)
+            .map(|(_, tags)| tags.to_vec())
+    }
+
+    /// Make `tags` the tag set `resource` carries, for a resource of ANY taggable
+    /// kind.
+    ///
+    /// The record is written first and [`Self::tags_by_arn`] refreshed from the
+    /// same value under the record's OWN ARN, so the authoritative copy and the
+    /// index can never disagree. Answers whether the resource was still there to
+    /// write to.
+    pub fn set_tags(&mut self, resource: &TaggedResource, tags: Vec<Tag>) -> bool {
+        let arn = match resource {
+            TaggedResource::Policy(id) => self.policies.get_mut(id).map(|record| {
+                record.tags = tags.clone();
+                record.policy_arn.clone()
+            }),
+            TaggedResource::ResourceSet(id) => self.resource_sets.get_mut(id).map(|record| {
+                record.tags = tags.clone();
+                record.arn.clone()
+            }),
+            TaggedResource::AppsList(id) => self.apps_lists.get_mut(id).map(|record| {
+                record.tags = tags.clone();
+                record.list_arn.clone()
+            }),
+            TaggedResource::ProtocolsList(id) => {
+                self.protocols_lists.get_mut(id).map(|record| {
+                    record.tags = tags.clone();
+                    record.list_arn.clone()
+                })
+            }
+        };
+        match arn {
+            Some(arn) => {
+                self.tags_by_arn.insert(arn, tags);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The Firewall Manager administrator accounts that manage the calling

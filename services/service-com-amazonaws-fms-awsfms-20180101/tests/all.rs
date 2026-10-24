@@ -31,5 +31,7 @@ mod protocols_lists_enumeration;
 mod resource_set_deletion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_across_resource_kinds.rs"]
+mod tagging_across_resource_kinds;
 #[path = "all/tagging_and_managing_admins.rs"]
 mod tagging_and_managing_admins;
