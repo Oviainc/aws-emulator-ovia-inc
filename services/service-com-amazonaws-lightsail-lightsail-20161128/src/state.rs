@@ -503,6 +503,8 @@ pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_REBOOT_RELATIONAL_DATABASE: &str = "RebootRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE: &str = "UpdateRelationalDatabase";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_START_RELATIONAL_DATABASE: &str = "StartRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_STOP_RELATIONAL_DATABASE: &str = "StopRelationalDatabase";
@@ -2307,6 +2309,26 @@ impl RelationalDatabaseBlueprintSpec {
         format!("{}_{}", self.engine, self.major_version.replace('.', "_"))
     }
 
+    /// This blueprint's major version as the NUMBERS it is written with (`8.4`
+    /// -> `[8, 4]`), so two major versions of one engine order by version rather
+    /// than by the text they are spelled in — where `13` would sort before
+    /// `8.4`. A component that is not a number counts as zero, so an entry added
+    /// to the catalog in any other form still orders rather than panicking.
+    fn major_version_numbers(&self) -> Vec<u32> {
+        self.major_version
+            .split('.')
+            .map(|component| component.parse().unwrap_or(0))
+            .collect()
+    }
+
+    /// Whether this blueprint describes a LATER major version of the engine than
+    /// `other` does: a database's major version moves forward (`8.0` -> `8.4`),
+    /// which is the direction `UpdateRelationalDatabase$relationalDatabaseBlueprintId`
+    /// updates it in.
+    pub fn is_newer_than(&self, other: &Self) -> bool {
+        self.major_version_numbers() > other.major_version_numbers()
+    }
+
     /// This entry as the modelled `RelationalDatabaseBlueprint`.
     pub fn view(&self) -> crate::ops::types::RelationalDatabaseBlueprint {
         crate::ops::types::RelationalDatabaseBlueprint {
@@ -2649,8 +2671,8 @@ pub fn relational_database_bundle_page(
 /// service publishes no such plan.
 ///
 /// This is the lookup a call that NAMES a plan resolves it through:
-/// `CreateRelationalDatabase`'s `relationalDatabaseBundleId` and
-/// `UpdateRelationalDatabase`, each still a scaffold stub with its own issue.
+/// `CreateRelationalDatabase`'s and `CreateRelationalDatabaseFromSnapshot`'s
+/// `relationalDatabaseBundleId`.
 pub fn relational_database_bundle_spec(bundle_id: &str) -> Option<RelationalDatabaseBundleSpec> {
     RELATIONAL_DATABASE_BUNDLE_SPECS
         .iter()
@@ -5016,6 +5038,47 @@ pub const PARAMETER_APPLY_STATUS_IN_SYNC: &str = "in-sync";
 /// default does.
 pub const RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER: &str = "rds-ca-rsa2048-g1";
 
+/// The certificate authorities a database's server certificate can be issued
+/// under — the identifiers `caCertificateIdentifier` may name.
+///
+/// Source: the certificate authorities "Using SSL/TLS to encrypt a connection to
+/// a DB instance" (Amazon RDS User Guide) publishes for a DB instance — the
+/// 2019 authority and the three current ones, which differ in the key the
+/// certificate carries (RSA 2048, RSA 4096 and ECC P-384). Each is a value AWS
+/// allocated, so the published list is the only honest source; an authority AWS
+/// adds or retires is a row added or removed here.
+pub const RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIERS: &[&str] = &[
+    "rds-ca-2019",
+    "rds-ca-rsa2048-g1",
+    "rds-ca-rsa4096-g1",
+    "rds-ca-ecc384-g1",
+];
+
+/// The published certificate authority `identifier` names, compared exactly —
+/// an identifier is a name AWS allocated, not a presentation form.
+pub fn relational_database_ca_certificate(identifier: &str) -> Option<&'static str> {
+    RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIERS
+        .iter()
+        .copied()
+        .find(|published| *published == identifier)
+}
+
+/// The identifiers [`relational_database_ca_certificate`] accepts, for a refusal
+/// that names them.
+pub fn relational_database_ca_certificate_identifiers() -> String {
+    RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIERS.join(", ")
+}
+
+/// What `PendingModifiedRelationalDatabaseValues$masterUserPassword` reports
+/// while a password change is waiting for the database's next maintenance
+/// window.
+///
+/// The master user password is a secret, and the operation that answers with one
+/// is `GetRelationalDatabaseMasterUserPassword`; a database read may say only
+/// THAT a new password is pending, never what it is. Amazon RDS masks the same
+/// member of its own `PendingModifiedValues` the same way.
+pub const MASKED_MASTER_USER_PASSWORD: &str = "****";
+
 /// The DNS suffix a Lightsail managed database's master endpoint carries.
 ///
 /// A Lightsail managed database IS an Amazon RDS DB instance — which is why
@@ -5233,6 +5296,25 @@ pub fn validate_master_user_password(
     }
     Ok(())
 }
+
+/// How many characters the master user password
+/// [`ComAmazonawsLightsailLightsail20161128State::mint_master_user_password`]
+/// generates carries.
+///
+/// CHOSEN: Lightsail publishes no length for the "new strong password generated
+/// by Lightsail" (the modelled `rotateMasterUserPassword` documentation), only
+/// that it is strong. It sits inside the narrowest range any engine this service
+/// serves accepts ([`master_credential_limits`]: MySQL's 8 to 41 characters),
+/// so a minted password satisfies the same rule a caller-supplied one is held
+/// to, whichever engine the database runs.
+const MINTED_MASTER_USER_PASSWORD_LEN: usize = 20;
+
+/// The characters a minted master user password is drawn from: printable ASCII
+/// other than a space, `/`, `"` and `@` — exactly the set
+/// [`validate_master_user_password`] accepts, from the modelled
+/// `masterUserPassword` documentation.
+const MINTED_MASTER_USER_PASSWORD_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'()*+,-.:;<=>?[\\]^_`{|}~";
 
 /// Minutes in a day, and in a week: the clock a backup (daily) and a
 /// maintenance (weekly) window are measured on.
@@ -5485,6 +5567,94 @@ pub fn default_preferred_maintenance_window(
     })
 }
 
+/// The members of a database one `UpdateRelationalDatabase` call changes that
+/// can be left WAITING: the master user password, the engine version (which a
+/// major-version blueprint update moves) and the backup retention setting.
+///
+/// Exactly the three the modelled `PendingModifiedRelationalDatabaseValues`
+/// carries — the structure `RelationalDatabase$pendingModifiedValues` reports a
+/// pending modification through — so a change to any OTHER member has no way to
+/// be reported pending and therefore takes effect at once.
+///
+/// An entry is `None` when the call did not ask for that member to change.
+#[derive(Debug, Clone, Default)]
+pub struct RelationalDatabaseModification {
+    /// The password the master user gets, whether the caller supplied it or
+    /// asked the service to mint one.
+    pub master_user_password: Option<String>,
+    /// The blueprint the database moves to: a later major version of the engine
+    /// it already runs, which is what `engineVersion` then reports.
+    pub blueprint: Option<RelationalDatabaseBlueprintSpec>,
+    /// Whether automated backup retention is on.
+    pub backup_retention_enabled: Option<bool>,
+}
+
+impl RelationalDatabaseModification {
+    /// Whether this call asked for none of the three to change, so there is
+    /// nothing to apply and nothing to leave pending.
+    pub fn is_empty(&self) -> bool {
+        self.master_user_password.is_none()
+            && self.blueprint.is_none()
+            && self.backup_retention_enabled.is_none()
+    }
+
+    /// Take `later`'s entries over this one's: a second call that modifies the
+    /// same member while the first is still waiting replaces what it will be
+    /// applied with, and leaves the members it says nothing about pending.
+    fn merge(&mut self, later: Self) {
+        if let Some(password) = later.master_user_password {
+            self.master_user_password = Some(password);
+        }
+        if let Some(blueprint) = later.blueprint {
+            self.blueprint = Some(blueprint);
+        }
+        if let Some(enabled) = later.backup_retention_enabled {
+            self.backup_retention_enabled = Some(enabled);
+        }
+    }
+}
+
+/// A modification an `UpdateRelationalDatabase` call left for the database's
+/// next maintenance window, and the instant the clock applies it at.
+#[derive(Debug, Clone)]
+pub struct PendingRelationalDatabaseModification {
+    /// Epoch milliseconds at which the modification becomes due.
+    ///
+    /// AWS applies a deferred modification in the database's own
+    /// `preferredMaintenanceWindow`, which is up to a week away and no caller
+    /// can be made to wait for here, so the instant is the one every other
+    /// clock-owed change of this service uses
+    /// ([`STATE_TRANSITION_MILLIS`] after the call). The span is deliberately
+    /// NON-ZERO, so a caller that reads straight after the call still observes
+    /// the modification pending exactly as it does against AWS.
+    pub at_ms: i64,
+    /// What becomes of the database when it is due.
+    pub change: RelationalDatabaseModification,
+}
+
+impl PendingRelationalDatabaseModification {
+    /// This modification as the modelled
+    /// `PendingModifiedRelationalDatabaseValues`.
+    ///
+    /// A member nothing is waiting on is left out rather than reported null, and
+    /// a waiting password is reported MASKED
+    /// ([`MASKED_MASTER_USER_PASSWORD`]).
+    pub fn view(&self) -> crate::ops::types::PendingModifiedRelationalDatabaseValues {
+        crate::ops::types::PendingModifiedRelationalDatabaseValues {
+            master_user_password: self
+                .change
+                .master_user_password
+                .as_ref()
+                .map(|_| MASKED_MASTER_USER_PASSWORD.to_string()),
+            engine_version: self
+                .change
+                .blueprint
+                .map(|blueprint| blueprint.engine_version.to_string()),
+            backup_retention_enabled: self.change.backup_retention_enabled,
+        }
+    }
+}
+
 /// One stored managed relational database: every member `GetRelationalDatabase`
 /// reports, the master user password `GetRelationalDatabaseMasterUserPassword`
 /// answers with, and the clock-owed transition its state is waiting on.
@@ -5522,6 +5692,12 @@ pub struct StoredRelationalDatabase {
     /// The master endpoint address, assigned at creation so every later read
     /// reports the same one. See [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
     pub endpoint_address: String,
+    /// The certificate authority this database's server certificate is issued
+    /// under, as `caCertificateIdentifier` reports it: the service's default
+    /// ([`RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER`]) until an
+    /// `UpdateRelationalDatabase` call associates another published one with the
+    /// database.
+    pub ca_certificate_identifier: String,
     /// The current state: [`RELATIONAL_DATABASE_STATE_CREATING`],
     /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`],
     /// [`RELATIONAL_DATABASE_STATE_REBOOTING`],
@@ -5538,6 +5714,10 @@ pub struct StoredRelationalDatabase {
     /// parameter nothing has set is absent, and reports what the engine and this
     /// database's own hardware give it.
     pub parameter_overrides: BTreeMap<String, StoredParameterOverride>,
+    /// The modification an `UpdateRelationalDatabase` call left for this
+    /// database's next maintenance window, while one is outstanding — what
+    /// `pendingModifiedValues` reports until the clock applies it.
+    pub pending_modification: Option<PendingRelationalDatabaseModification>,
 }
 
 impl StoredRelationalDatabase {
@@ -5588,6 +5768,86 @@ impl StoredRelationalDatabase {
                 pending_reboot,
             },
         );
+    }
+
+    /// Change the three members of this database a modification can carry,
+    /// either now (`immediately`) or at its next maintenance window.
+    ///
+    /// "When true, applies changes immediately. When false, applies changes
+    /// during the preferred maintenance window" (the modelled
+    /// `applyImmediately` documentation), which is why a deferred change is held
+    /// on the record and reported by `pendingModifiedValues` rather than written
+    /// into it. Applying immediately applies what an EARLIER call left waiting
+    /// too — the member it set is a change the database is already carrying
+    /// towards, and nothing may be left waiting once a call has said to apply
+    /// now — with this call's own value winning where both name one. Answers the
+    /// instant the change takes effect at, or `None` when it already has —
+    /// which is also what a call that changes none of the three answers.
+    pub fn modify(
+        &mut self,
+        change: RelationalDatabaseModification,
+        immediately: bool,
+        now_ms: i64,
+    ) -> Option<i64> {
+        if immediately {
+            let mut merged = self
+                .pending_modification
+                .take()
+                .map(|pending| pending.change)
+                .unwrap_or_default();
+            merged.merge(change);
+            if !merged.is_empty() {
+                self.apply_modification(merged);
+            }
+            return None;
+        }
+        if change.is_empty() {
+            return None;
+        }
+        let at_ms = now_ms.saturating_add(STATE_TRANSITION_MILLIS);
+        match &mut self.pending_modification {
+            Some(pending) => {
+                pending.at_ms = at_ms;
+                pending.change.merge(change);
+            }
+            None => {
+                self.pending_modification = Some(PendingRelationalDatabaseModification {
+                    at_ms,
+                    change,
+                })
+            }
+        }
+        Some(at_ms)
+    }
+
+    /// Write `change` into this record: the database carries the new values from
+    /// here on, and nothing is waiting on them any more.
+    fn apply_modification(&mut self, change: RelationalDatabaseModification) {
+        if let Some(password) = change.master_user_password {
+            self.master_user_password = Some(password);
+        }
+        if let Some(blueprint) = change.blueprint {
+            self.blueprint = blueprint;
+        }
+        if let Some(enabled) = change.backup_retention_enabled {
+            self.backup_retention_enabled = enabled;
+        }
+    }
+
+    /// Apply the modification the clock owes this database, once its maintenance
+    /// window is due. A no-op while nothing is waiting, or while the instant is
+    /// still ahead.
+    pub fn apply_due_modification(&mut self, now_ms: i64) {
+        if self
+            .pending_modification
+            .as_ref()
+            .is_none_or(|pending| pending.at_ms > now_ms)
+        {
+            return;
+        }
+        if let Some(pending) = self.pending_modification.take() {
+            self.apply_modification(pending.change);
+        }
     }
 
     /// Start the restart of this database's engine: the database reports
@@ -5706,10 +5966,14 @@ impl StoredRelationalDatabase {
             state: Some(self.state.to_string()),
             secondary_availability_zone: self.secondary_availability_zone.clone(),
             backup_retention_enabled: Some(self.backup_retention_enabled),
-            // Nothing is mid-modification on a database this slice created:
-            // `UpdateRelationalDatabase` is what leaves a value pending, so there
-            // is nothing to report rather than an empty structure.
-            pending_modified_values: None,
+            // What an `UpdateRelationalDatabase` call left for this database's
+            // next maintenance window, while something is waiting; a database
+            // with nothing mid-modification reports nothing rather than an
+            // empty structure.
+            pending_modified_values: self
+                .pending_modification
+                .as_ref()
+                .map(PendingRelationalDatabaseModification::view),
             engine: Some(self.blueprint.engine.to_string()),
             engine_version: Some(self.blueprint.engine_version.to_string()),
             // "The latest point in time to which the database can be restored":
@@ -5737,9 +6001,7 @@ impl StoredRelationalDatabase {
             // maintenance action is pending on a database this slice holds, and
             // an absent member hands a typed caller a null where it iterates.
             pending_maintenance_actions: Some(Vec::new()),
-            ca_certificate_identifier: Some(
-                RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER.to_string(),
-            ),
+            ca_certificate_identifier: Some(self.ca_certificate_identifier.clone()),
         }
     }
 }
@@ -8595,52 +8857,64 @@ impl ComAmazonawsLightsailLightsail20161128State {
         );
     }
 
-    /// A token for one container service's default domain: see
-    /// [`DOMAIN_TOKEN_LEN`].
+    /// A token of `len` characters drawn from `alphabet`, for the purpose
+    /// `label` names.
     ///
     /// Draws from the SAME `next_id` counter [`Self::mint_uuid`] does, on
     /// purpose: one counter means two values minted in this process are never
-    /// built from the same input, and the hash is domain-separated by its own
-    /// label so a token and a uuid of the same counter value still differ.
-    pub fn mint_domain_token(&mut self) -> String {
+    /// built from the same input, and the hash is domain-separated by `label`
+    /// so two tokens of the same counter value still differ. Every minted token
+    /// of this store goes through here, so they cannot drift apart.
+    fn mint_token(&mut self, label: &[u8], len: usize, alphabet: &[u8]) -> String {
+        // One SHA-256 digest is 32 bytes, so a token asked for longer than that
+        // would be silently cut short rather than drawn.
+        debug_assert!(len <= 32, "a minted token draws at most 32 characters");
+        if alphabet.is_empty() {
+            return String::new();
+        }
         self.next_id = self.next_id.wrapping_add(1);
         let mut hasher = Sha256::new();
         hasher.update(self.next_id.to_be_bytes());
         hasher.update(process_seed().to_be_bytes());
-        hasher.update(b"container-service-domain");
+        hasher.update(label);
         hasher
             .finalize()
             .iter()
-            .take(DOMAIN_TOKEN_LEN)
-            .map(|byte| {
-                char::from(DOMAIN_TOKEN_ALPHABET[usize::from(*byte) % DOMAIN_TOKEN_ALPHABET.len()])
-            })
+            .take(len)
+            .map(|byte| char::from(alphabet[usize::from(*byte) % alphabet.len()]))
             .collect()
+    }
+
+    /// A token for one container service's default domain: see
+    /// [`DOMAIN_TOKEN_LEN`].
+    pub fn mint_domain_token(&mut self) -> String {
+        self.mint_token(
+            b"container-service-domain",
+            DOMAIN_TOKEN_LEN,
+            DOMAIN_TOKEN_ALPHABET,
+        )
     }
 
     /// The DNS label of one managed relational database's master endpoint: see
     /// [`RELATIONAL_DATABASE_HOST_LABEL_LEN`].
-    ///
-    /// Draws from the SAME `next_id` counter [`Self::mint_uuid`] does, for the
-    /// reason [`Self::mint_domain_token`] gives, and is domain-separated by its
-    /// own label so a host label and a uuid of the same counter value differ.
     pub fn mint_endpoint_host_label(&mut self) -> String {
-        self.next_id = self.next_id.wrapping_add(1);
-        let mut hasher = Sha256::new();
-        hasher.update(self.next_id.to_be_bytes());
-        hasher.update(process_seed().to_be_bytes());
-        hasher.update(b"relational-database-endpoint");
-        hasher
-            .finalize()
-            .iter()
-            .take(RELATIONAL_DATABASE_HOST_LABEL_LEN)
-            .map(|byte| {
-                char::from(
-                    RELATIONAL_DATABASE_HOST_LABEL_ALPHABET
-                        [usize::from(*byte) % RELATIONAL_DATABASE_HOST_LABEL_ALPHABET.len()],
-                )
-            })
-            .collect()
+        self.mint_token(
+            b"relational-database-endpoint",
+            RELATIONAL_DATABASE_HOST_LABEL_LEN,
+            RELATIONAL_DATABASE_HOST_LABEL_ALPHABET,
+        )
+    }
+
+    /// A strong master user password for one managed relational database: the
+    /// password `UpdateRelationalDatabase$rotateMasterUserPassword` asks the
+    /// service to generate, which
+    /// `GetRelationalDatabaseMasterUserPassword` is then what answers with.
+    pub fn mint_master_user_password(&mut self) -> String {
+        self.mint_token(
+            b"relational-database-master-user-password",
+            MINTED_MASTER_USER_PASSWORD_LEN,
+            MINTED_MASTER_USER_PASSWORD_ALPHABET,
+        )
     }
 
     /// The next private/public IPv4 offset, consumed so no two instances in this
@@ -8928,6 +9202,10 @@ impl ComAmazonawsLightsailLightsail20161128State {
             service.advance(now_ms);
         }
         for database in self.relational_databases.values_mut() {
+            // A modification left for the database's maintenance window is
+            // applied when that window is due, whatever state the database is
+            // in — the window comes round on the clock, not on a state change.
+            database.apply_due_modification(now_ms);
             let Some(due) = database.due else { continue };
             if due.at_ms <= now_ms {
                 // The states whose engine is DOWN and coming back up: one being

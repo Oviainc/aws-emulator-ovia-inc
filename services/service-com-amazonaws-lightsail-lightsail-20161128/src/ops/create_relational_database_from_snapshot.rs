@@ -467,6 +467,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &host_label,
                     &region,
                 ),
+                // The certificate authority a new database's server
+                // certificate is issued under, until an
+                // `UpdateRelationalDatabase` call associates another one with
+                // it.
+                ca_certificate_identifier: crate::state::RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER
+                    .to_string(),
                 state: crate::state::RELATIONAL_DATABASE_STATE_CREATING,
                 due: Some(due),
                 // A restored database runs the engine's own defaults: a snapshot
@@ -474,6 +480,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // parameter of THIS database, which is why it reports `in-sync`
                 // until `UpdateRelationalDatabaseParameters` sets one.
                 parameter_overrides: Default::default(),
+                // Nothing has asked this database to change yet, so nothing is
+                // waiting for its maintenance window.
+                pending_modification: None,
             });
             // `operations` is a list because other Lightsail creates act on
             // several resources at once; `CreateRelationalDatabaseFromSnapshot`

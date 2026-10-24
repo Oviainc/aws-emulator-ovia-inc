@@ -111,6 +111,8 @@ mod relational_database_restore_from_snapshot;
 mod relational_database_snapshot_listing;
 #[path = "all/relational_database_start_stop.rs"]
 mod relational_database_start_stop;
+#[path = "all/relational_database_update.rs"]
+mod relational_database_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRelationalDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRelationalDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates one or more attributes of a stored managed relational database: the
+//! windows, the public accessibility and the certificate authority are written
+//! straight away, while the three members the modelled
+//! `PendingModifiedRelationalDatabaseValues` can report — the master user
+//! password, the engine version a major-version blueprint update moves, and
+//! automated backup retention — are applied at once only when the caller asks
+//! for it and otherwise wait for the database's next maintenance window. The
+//! call is recorded in the operation log.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRelationalDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -205,18 +206,288 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRelationalDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRelationalDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRelationalDatabase"))
+        // A database is addressed by name alone, and everything this call
+        // changes is resolved against the stored record — nothing about the
+        // request metadata takes part.
+        let _ = ctx;
+
+        // `relationalDatabaseName` is a modelled `@required` member carrying the
+        // modelled `ResourceName` pattern, so the centralized walk refused
+        // anything outside it before this body ran. What is left is what the
+        // model cannot express. Two of those rules are about the REQUEST alone,
+        // so they are checked before the store is reached at all: a request may
+        // not ask for a new master user password in both ways at once, and it
+        // may not ask to turn automated backup retention on and off in the same
+        // call.
+        if input.master_user_password.is_some() && input.rotate_master_user_password == Some(true) {
+            return Err(invalid(
+                "masterUserPassword and rotateMasterUserPassword both ask for a new master user \
+                 password: name the password you want, or ask the service to generate one, but \
+                 not both"
+                    .to_string(),
+            ));
+        }
+        let enable_backup_retention = input.enable_backup_retention.unwrap_or(false);
+        let disable_backup_retention = input.disable_backup_retention.unwrap_or(false);
+        if enable_backup_retention && disable_backup_retention {
+            return Err(invalid(
+                "enableBackupRetention and disableBackupRetention both ask to change automated \
+                 backup retention, in opposite directions: name one of them"
+                    .to_string(),
+            ));
+        }
+
+        // The certificate authority and the blueprint must name entries this
+        // service publishes, which is resolved against the published catalogs
+        // rather than against the store.
+        let ca_certificate_identifier = input
+            .ca_certificate_identifier
+            .as_deref()
+            .map(|identifier| {
+                crate::state::relational_database_ca_certificate(identifier).ok_or_else(|| {
+                    invalid(format!(
+                        "caCertificateIdentifier '{identifier}' is not a certificate authority \
+                         this service issues a database certificate under ([{}])",
+                        crate::state::relational_database_ca_certificate_identifiers()
+                    ))
+                })
+            })
+            .transpose()?;
+        let requested_blueprint = input
+            .relational_database_blueprint_id
+            .as_deref()
+            .map(|blueprint_id| {
+                crate::state::relational_database_blueprint(blueprint_id).ok_or_else(|| {
+                    invalid(format!(
+                        "relationalDatabaseBlueprintId '{blueprint_id}' is not a database \
+                         blueprint this service offers; use GetRelationalDatabaseBlueprints to \
+                         list the blueprint IDs you can specify ([{}])",
+                        crate::state::relational_database_blueprint_ids()
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // "When true, applies changes immediately. When false, applies changes
+        // during the preferred maintenance window": a request that says nothing
+        // gets the default the member documents, `false`.
+        let apply_immediately = input.apply_immediately.unwrap_or(false);
+        let name = input.relational_database_name.clone();
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // EVERYTHING is resolved against the stored record before the first
+            // write, so a request with one bad member changes none of the
+            // others either.
+            let (engine, location, current_blueprint, backup_retention_enabled, windows) = {
+                let database = store
+                    .relational_database(&name)
+                    .ok_or_else(|| not_found(&name))?;
+                (
+                    database.blueprint.engine,
+                    database.location.clone(),
+                    database.blueprint,
+                    database.backup_retention_enabled,
+                    windows(
+                        &input,
+                        &database.preferred_backup_window,
+                        &database.preferred_maintenance_window,
+                    )
+                    .map_err(invalid)?,
+                )
+            };
+
+            // The master-credential rules are the ENGINE's, so a password the
+            // caller names is held to the limits of the engine THIS database
+            // runs.
+            if let Some(password) = input.master_user_password.as_deref() {
+                let limits = crate::state::master_credential_limits(engine);
+                crate::state::validate_master_user_password(password, limits.password_chars)
+                    .map_err(invalid)?;
+            }
+
+            // "This parameter is used to update the major version of the
+            // database": a blueprint update moves the database to another MAJOR
+            // VERSION of the engine it already runs, and forward — the engine
+            // itself cannot be swapped under the data, and a major version
+            // cannot be rolled back. Naming the blueprint the database already
+            // runs asks for no change at all.
+            let blueprint = match requested_blueprint {
+                Some(requested) if requested.blueprint_id() == current_blueprint.blueprint_id() => {
+                    None
+                }
+                Some(requested) if requested.engine != current_blueprint.engine => {
+                    return Err(invalid(format!(
+                        "relationalDatabaseBlueprintId '{}' installs {} where the database \
+                         '{name}' runs {}: a blueprint update moves a database to another major \
+                         version of the engine it already runs, never to another engine",
+                        requested.blueprint_id(),
+                        requested.engine,
+                        current_blueprint.engine
+                    )));
+                }
+                Some(requested) if !requested.is_newer_than(&current_blueprint) => {
+                    return Err(invalid(format!(
+                        "relationalDatabaseBlueprintId '{}' is major version {} of {}, which is \
+                         not later than the {} the database '{name}' runs: a blueprint update \
+                         moves the major version forward",
+                        requested.blueprint_id(),
+                        requested.major_version,
+                        requested.engine,
+                        current_blueprint.major_version
+                    )));
+                }
+                Some(requested) => Some(requested),
+                None => None,
+            };
+
+            // "When true, enables automated backup retention" / "When true,
+            // disables automated backup retention": each member ASKS for its
+            // own direction, so a member the request leaves out or sets to
+            // false asks for nothing, and asking for the setting the database
+            // already has changes nothing.
+            let backup_retention = if enable_backup_retention {
+                Some(true)
+            } else if disable_backup_retention {
+                Some(false)
+            } else {
+                None
+            }
+            .filter(|wanted| *wanted != backup_retention_enabled);
+
+            // "When true, the master user password is changed to a new strong
+            // password generated by Lightsail": the password is the store's own,
+            // minted here rather than derived from anything the request carried,
+            // and `GetRelationalDatabaseMasterUserPassword` is what answers with
+            // it.
+            let master_user_password = match input.master_user_password.clone() {
+                Some(password) => Some(password),
+                None => (input.rotate_master_user_password == Some(true))
+                    .then(|| store.mint_master_user_password()),
+            };
+
+            let database = store
+                .relational_database_mut(&name)
+                .ok_or_else(|| not_found(&name))?;
+
+            // The members no `pendingModifiedValues` entry can report are
+            // written straight away: the model carries no way to say they are
+            // waiting, so they are not deferred.
+            let (backup_window, maintenance_window) = windows;
+            if let Some(window) = backup_window {
+                database.preferred_backup_window = window;
+            }
+            if let Some(window) = maintenance_window {
+                database.preferred_maintenance_window = window;
+            }
+            if let Some(publicly_accessible) = input.publicly_accessible {
+                database.publicly_accessible = publicly_accessible;
+            }
+            if let Some(identifier) = ca_certificate_identifier {
+                database.ca_certificate_identifier = identifier.to_string();
+            }
+
+            // The three the model CAN report pending: applied now when the
+            // request asked for that, and otherwise left for the database's next
+            // maintenance window, which is what `pendingModifiedValues` reports
+            // until the clock applies it.
+            let settles_at_ms = database.modify(
+                crate::state::RelationalDatabaseModification {
+                    master_user_password,
+                    blueprint,
+                    backup_retention_enabled: backup_retention,
+                },
+                apply_immediately,
+                now,
+            );
+
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one acts on exactly one database,
+            // so it answers exactly one entry, located where that database is.
+            // The entry is terminal when every change the call made is already
+            // in the record, and non-terminal while one is waiting for the
+            // maintenance window.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                &name,
+                &location,
+                settles_at_ms,
+            );
+            Ok(UpdateRelationalDatabaseOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The backup and maintenance windows this call sets, each present only when the
+/// request names it — or a refusal naming the member that is wrong and the
+/// constraint it broke.
+///
+/// A window the request names is kept verbatim, once it parses, and the two MAY
+/// NOT conflict (`preferredBackupWindow`: "Must not conflict with the preferred
+/// maintenance window"). A request that names one window is checked against the
+/// one the database already carries, because that is the pair the database ends
+/// up with.
+fn windows(
+    input: &UpdateRelationalDatabaseInput,
+    current_backup_window: &str,
+    current_maintenance_window: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let backup_window = input.preferred_backup_window.clone();
+    let maintenance_window = input.preferred_maintenance_window.clone();
+    if backup_window.is_none() && maintenance_window.is_none() {
+        return Ok((None, None));
+    }
+
+    let effective_backup = backup_window.as_deref().unwrap_or(current_backup_window);
+    let effective_maintenance = maintenance_window
+        .as_deref()
+        .unwrap_or(current_maintenance_window);
+    let backup_span = crate::state::parse_daily_window("preferredBackupWindow", effective_backup)?;
+    let maintenance_span =
+        crate::state::parse_weekly_window("preferredMaintenanceWindow", effective_maintenance)?;
+    if crate::state::windows_conflict(backup_span, maintenance_span) {
+        return Err(format!(
+            "preferredBackupWindow '{effective_backup}' conflicts with \
+             preferredMaintenanceWindow '{effective_maintenance}': the daily backup window and \
+             the weekly maintenance window may not overlap"
+        ));
+    }
+    Ok((backup_window, maintenance_window))
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> UpdateRelationalDatabaseError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> UpdateRelationalDatabaseError {
+    UpdateRelationalDatabaseErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateRelationalDatabaseError {
+    UpdateRelationalDatabaseErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
