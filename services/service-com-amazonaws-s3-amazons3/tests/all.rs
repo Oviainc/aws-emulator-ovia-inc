@@ -39,6 +39,8 @@ mod bucket_policy_status;
 mod bucket_public_access_block;
 #[path = "all/bucket_replication.rs"]
 mod bucket_replication;
+#[path = "all/bucket_subresource_absent_messages.rs"]
+mod bucket_subresource_absent_messages;
 #[path = "all/bucket_tagging.rs"]
 mod bucket_tagging;
 #[path = "all/bucket_versioning.rs"]
