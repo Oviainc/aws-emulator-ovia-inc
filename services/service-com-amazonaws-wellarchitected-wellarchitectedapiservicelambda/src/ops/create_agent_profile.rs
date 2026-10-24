@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgentProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgentProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an `AgentProfileArn` for a new agent profile, persists every
+//! member the request carried, and answers the stored profile — its request members
+//! unchanged plus the ones the SERVICE owns (`arn`, `createdBy`, `createdAt`) and the
+//! ones it DERIVES from the stored profile (`eligibleForScheduledGeneration`,
+//! `eligibleForArchitectureGeneration`, `fieldErrors`). A later `GetAgentProfile` of
+//! that ARN reports the same profile, and the profile is what the `/goals` operations
+//! resolve a `profileArn` against.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgentProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `clientToken` makes the create idempotent: the same token with the same parameters
+//! answers the profile the original request created, and the same token with different
+//! parameters is a `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +195,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgentProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgentProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `Pillar` is an
+        // enum, so the boundary walk in `crate::service` already refuses a value outside
+        // its published set with this same 400 before the handler runs. It is kept so a
+        // profile is never STORED naming a pillar the enum does not publish.
+        if let Some(unknown) = input
+            .pillars
+            .iter()
+            .find(|pillar| !PILLAR_VALUES.contains(&pillar.as_str()))
+        {
+            return Err(CreateAgentProfileErrorModeled::ValidationException(
+                crate::state::member_constraint_exception(
+                    crate::state::PILLARS_MEMBER,
+                    &format!(
+                        "Member must satisfy enum value set: [{}], got {unknown}",
+                        PILLAR_VALUES.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let tags: std::collections::BTreeMap<String, String> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "aggregationConfiguration": input
+                .aggregation_configuration
+                .iter()
+                .map(|configuration| {
+                    serde_json::json!({
+                        "accessRoleArn": &configuration.access_role_arn,
+                        "accountId": &configuration.account_id,
+                        "regions": &configuration.regions,
+                    })
+                })
+                .collect::<Vec<serde_json::Value>>(),
+            "businessOverview": &input.business_overview,
+            "deletionProtection": input.deletion_protection,
+            "description": &input.description,
+            "displayName": &input.display_name,
+            "executionRoleArn": &input.execution_role_arn,
+            "name": &input.name,
+            "pillars": &input.pillars,
+            "tags": &tags,
+        }));
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters answers the
+        // profile the original request created instead of minting a second one. The token
+        // is OPTIONAL on this operation, so a request that carries none is never a replay.
+        if let Some(client_token) = input.client_token.clone() {
+            if let Some(token) = store.create_agent_profile_tokens.get(&client_token) {
+                let profile_arn = token.profile_arn.clone();
+                if token.fingerprint != fingerprint {
+                    return Err(CreateAgentProfileErrorModeled::ConflictException(
+                        crate::state::idempotency_token_conflict(
+                            crate::state::AGENT_PROFILE_RESOURCE_TYPE,
+                            profile_arn,
+                            &client_token,
+                        ),
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.agent_profiles.get(&profile_arn) {
+                    return Ok(profile_output(existing));
+                }
+                // The token names a profile that is no longer stored, so there is no
+                // original result to answer with: forget the token and let this request
+                // create afresh, which is what the caller asked for.
+                store.create_agent_profile_tokens.forget(&client_token);
+            }
+        }
+
+        // Agent profiles are metered, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: the create tokens are 1:1 with a live profile.
+        if store.agent_profiles.len() >= crate::state::MAX_AGENT_PROFILES {
+            return Err(CreateAgentProfileErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The agent profile quota of {} has been reached",
+                        crate::state::MAX_AGENT_PROFILES
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::AGENT_PROFILE_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own signing name; the model publishes no
+                    // numeric Service Quotas code for this quota, so the quota is named
+                    // by what it meters.
+                    quota_code: "AgentProfiles".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let arn = store.mint_agent_profile_arn(&region);
+        let record = crate::state::AgentProfileRecord {
+            arn: arn.clone(),
+            name: input.name,
+            display_name: input.display_name,
+            description: input.description,
+            business_overview: input.business_overview,
+            pillars: input.pillars,
+            deletion_protection: input.deletion_protection,
+            execution_role_arn: input.execution_role_arn,
+            aggregation_configuration: input.aggregation_configuration,
+            tags,
+            // "The identifier of the user or system that created this profile": every
+            // request this emulator serves is attributed to its one account, so that is
+            // the identity the create is recorded under — never a value read off the
+            // request.
+            created_by: ::engine::emulator_account_id().to_string(),
+            created_at: std::time::SystemTime::now(),
+            // Nothing has modified a profile that has just been created, so the
+            // `lastModified…` members are absent rather than echoing the create.
+            last_modified_by: None,
+            last_modified_at: None,
+        };
+        let output = profile_output(&record);
+        store.agent_profiles.insert(arn.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_token) = input.client_token {
+            store.create_agent_profile_tokens.remember(
+                client_token,
+                crate::state::CreateAgentProfileToken {
+                    profile_arn: arn,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(output)
+    }
+}
+
+/// The stored profile as THIS operation answers it.
+///
+/// `GetAgentProfile` answers the same members from the same record through its own
+/// output shape — the model declares `CreateAgentProfileResponse` and
+/// `GetAgentProfileResponse` as separate structures, so the two projections are separate
+/// Rust types over one stored record rather than one shared function.
+fn profile_output(record: &crate::state::AgentProfileRecord) -> CreateAgentProfileOutput {
+    CreateAgentProfileOutput {
+        name: record.name.clone(),
+        display_name: record.display_name.clone(),
+        description: record.description.clone(),
+        business_overview: record.business_overview.clone(),
+        pillars: record.pillars.clone(),
+        deletion_protection: record.deletion_protection,
+        execution_role_arn: record.execution_role_arn.clone(),
+        aggregation_configuration: record.aggregation_configuration.clone(),
+        arn: record.arn.clone(),
+        eligible_for_scheduled_generation: Some(record.eligible_for_generation()),
+        eligible_for_architecture_generation: Some(record.eligible_for_generation()),
+        field_errors: record.field_errors(),
+        tags: record.tag_list(),
+        created_by: record.created_by.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+        last_modified_by: record.last_modified_by.clone(),
+        last_modified_at: record
+            .last_modified_at
+            .map(::aws_smithy_types::DateTime::from),
     }
 }

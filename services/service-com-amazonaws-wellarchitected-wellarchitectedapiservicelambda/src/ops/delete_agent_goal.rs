@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAgentGoal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAgentGoal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the goal the request's `(profileArn, id)` pair resolves to from
+//! the agent profile that holds it, together with the create tokens that resolved to
+//! it, so a later `GetAgentGoal` or `DeleteAgentGoal` for that id answers
+//! `ResourceNotFoundException` (404) and no other goal of that profile is touched.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAgentGoal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `profileArn` that names no stored agent profile is a `ResourceNotFoundException`
+//! too, and so is an `id` that names a goal of a DIFFERENT profile: a goal is reached
+//! only through the profile it belongs to.
 //!
 //! ## Shape of an operation
 //!
@@ -142,20 +141,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAgentGoal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAgentGoalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAgentGoal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAgentGoalErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // "Deletes an optimization goal from a profile": the profile the goal is deleted
+        // FROM is resolved first, so a well-formed `AgentProfileArn` that names no stored
+        // profile is reported as the missing profile rather than as a missing goal.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(DeleteAgentGoalErrorModeled::ResourceNotFoundException(
+                crate::state::agent_profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // The goal is resolved by the SAME lookup `GetAgentGoal` uses, so an id that
+        // names no goal of this profile — never created, already deleted, or belonging to
+        // another profile — is that lookup's 404 and nothing is removed.
+        if store
+            .remove_agent_goal(&input.profile_arn, &input.id)
+            .is_none()
+        {
+            return Err(DeleteAgentGoalErrorModeled::ResourceNotFoundException(
+                crate::state::agent_goal_not_found(&input.profile_arn, &input.id),
+            )
+            .into());
+        }
+
+        Ok(DeleteAgentGoalOutput {})
     }
 }
