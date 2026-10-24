@@ -10,6 +10,11 @@
 //! and the clock owes its move to `ACTIVE` — see
 //! [`crate::state::DATASTORE_ACTIVATION_DELAY`]. Nothing here sleeps.
 //!
+//! The `tags` map is validated before anything is minted, by the rules of the TAG MAP
+//! rather than of this operation: a key outside `TagKey`'s modelled constraints, or more
+//! entries than one resource may hold ([`crate::state::MAX_TAGS_PER_RESOURCE`]), is
+//! refused with `ValidationException` and creates no data store.
+//!
 //! ---
 //!
 //! # Modeled contract for `CreateDatastore`
@@ -141,6 +146,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
+
+        // The tag map is validated BEFORE anything is read or written: a refused
+        // request mints no data store and consumes no `clientToken`, so an illegal tag
+        // map is observable nowhere. Both rules below belong to the TAG MAP rather than
+        // to this operation, so they are the same two `TagResource` applies — a map one
+        // write path refuses cannot be installed through the other.
+        //
+        // The ENTRY COUNT first, as the boundary validator checks a collection's size
+        // before its elements: one call may not install more tags than a resource
+        // holds ([`crate::state::MAX_TAGS_PER_RESOURCE`]).
+        if let Some(tags) = &input.tags {
+            if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(CreateDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::too_many_tags_message(tags.len()),
+                    },
+                )
+                .into());
+            }
+            // Then the KEYS, against every constraint the model puts on a `TagKey`.
+            // The boundary validator never visits a map key, so this is the only place
+            // the key rules are applied — see `crate::state::tag_map_violation`.
+            if let Some(violation) = crate::state::tag_map_violation("tags", tags) {
+                return Err(CreateDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::one_validation_error(&violation),
+                    },
+                )
+                .into());
+            }
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateDatastoreErrorModeled::InternalServerException(InternalServerException {

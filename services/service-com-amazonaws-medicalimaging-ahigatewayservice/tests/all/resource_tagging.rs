@@ -44,7 +44,10 @@ fn unheld_datastore_arn() -> String {
 /// Percent-encode `value` for a NON-GREEDY `@httpLabel`, the way an AWS SDK does:
 /// every byte outside RFC 3986's unreserved set, so an ARN's own `:` and `/` are
 /// carried as one path segment instead of being read as path structure.
-fn label(value: &str) -> String {
+///
+/// `pub(crate)` with the three route helpers below: the sibling suite that drives the
+/// same `/tags/{resourceArn}` routes uses these rather than spelling them a second time.
+pub(crate) fn label(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::new();
     for byte in value.as_bytes() {
@@ -61,7 +64,7 @@ fn label(value: &str) -> String {
 }
 
 /// `POST /tags/{resourceArn}` — `TagResource`.
-async fn tag(emulator: &Emulator, arn: &str, tags: Value) -> Answer {
+pub(crate) async fn tag(emulator: &Emulator, arn: &str, tags: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -72,7 +75,7 @@ async fn tag(emulator: &Emulator, arn: &str, tags: Value) -> Answer {
 }
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`.
-async fn untag(emulator: &Emulator, arn: &str, tag_keys: &[&str]) -> Answer {
+pub(crate) async fn untag(emulator: &Emulator, arn: &str, tag_keys: &[&str]) -> Answer {
     let query: Vec<String> = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", label(key)))
@@ -87,7 +90,7 @@ async fn untag(emulator: &Emulator, arn: &str, tag_keys: &[&str]) -> Answer {
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(emulator: &Emulator, arn: &str) -> Answer {
+pub(crate) async fn list_tags(emulator: &Emulator, arn: &str) -> Answer {
     emulator
         .call("GET", &format!("/tags/{}", label(arn)), None)
         .await
@@ -110,7 +113,10 @@ async fn tagging_call(emulator: &Emulator, route: &str, arn: &str) -> Answer {
 }
 
 /// A JSON object from key/value pairs, for comparing a reported tag map whole.
-fn tag_object(pairs: &[(String, String)]) -> Value {
+///
+/// `pub(crate)`, like the route helpers above: the sibling tag-validation suite builds
+/// its request bodies and expectations the same way.
+pub(crate) fn tag_object(pairs: &[(String, String)]) -> Value {
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
         map.insert(key.clone(), Value::String(value.clone()));
