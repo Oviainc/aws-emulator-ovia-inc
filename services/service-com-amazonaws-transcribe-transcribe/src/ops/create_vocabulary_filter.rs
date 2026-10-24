@@ -220,11 +220,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can use Words or VocabularyFilterFileUri, but you can't use both." The
         // model can express neither requirement, so the handler is where they are
         // refused.
-        let words = match crate::state::content_source(
+        let (words, file_uri) = match crate::state::content_source(
             input.words.as_deref(),
             input.vocabulary_filter_file_uri.as_deref(),
         ) {
-            crate::state::ContentSource::Inline(words) => words.to_vec(),
+            crate::state::ContentSource::Inline(words) => (words.to_vec(), None),
+            // Building this filter's word list would mean READING the object at that
+            // URI, which this emulator cannot do: it reads no object store and makes no
+            // outbound request. The RECORD is still real and is kept — the name, the
+            // language, the timestamps and the tag set are the control plane every
+            // later operation of this family reports — and the only thing a filter no
+            // words were loaded for does not report is a file of its own to download
+            // (`crate::state::VocabularyFilterRecord::download_uri`). No operation of
+            // this service reports a filter's words, so there is nothing else a filter
+            // recorded this way could be asked for.
+            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Words or VocabularyFilterFileUri. Add \
@@ -237,18 +247,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      the words of your custom vocabulary filter one way or the other and \
                      try your request again.",
                 ))
-            }
-            // Building this filter would mean READING the object at that URI. This
-            // emulator reads no object store and makes no outbound request, so the file
-            // is unreachable to it and the request is refused with the error this
-            // operation models for a file it cannot access — rather than recording a
-            // filter whose words nothing ever loaded.
-            crate::state::ContentSource::File(uri) => {
-                return Err(bad_request(&format!(
-                    "The VocabularyFilterFileUri {uri} can't be read by this emulator: \
-                     it builds a custom vocabulary filter only from the words a request \
-                     lists in Words. Send the words in Words and try your request again."
-                )))
             }
         };
 
@@ -309,6 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
             language_code: input.language_code,
             words,
+            file_uri,
             last_modified_time: now,
             region,
             data_access_role_arn: input.data_access_role_arn,
@@ -326,6 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = "CreateVocabularyFilter",
             filter = %record.name,
             words = record.words.len(),
+            from_file = record.file_uri.is_some(),
             "custom vocabulary filter created"
         );
         store

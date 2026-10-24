@@ -31,7 +31,7 @@
 //! and stored — so the create response, a later read and the list projection all report
 //! the same concrete value.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aws_smithy_schema_server::{Violation, ViolationKind};
 use sha2::{Digest, Sha256};
@@ -2898,6 +2898,175 @@ pub fn is_policy_document(policy: &str) -> bool {
         return false;
     };
     document.contains_key("Statement")
+}
+
+// =============================================================================
+// Caller-supplied ARNs: what a member documented as another service's resource names
+// =============================================================================
+
+/// What an input member this model DOCUMENTS as the ARN of another AWS resource has to
+/// name.
+///
+/// Every such member is a plain string whose model states a `@length` and nothing else
+/// (`smithy_query(query="shape",shape="CdnAuthConfiguration")`, `shape="SpekeKeyProvider"`),
+/// so the boundary validator admits any text of the right size and reading the ARN form is
+/// the handler's job. It HAS to be read: the service assumes the role and reads the secret
+/// those members name, so a value that is not an ARN of the documented service and resource
+/// type names neither and the request is an input failure rather than a configuration that
+/// happens not to work.
+///
+/// The type and the constants are the SHARED ones ([`::service_common::arn::Requirement`]),
+/// so this service and every other that binds a caller-supplied resource ARN read it
+/// against one requirement rather than against a copy each. What stays here is which of
+/// THIS model's members are ARNs ([`cdn_auth_rejection`], [`speke_role_arn_rejection`]) and
+/// the envelope its refusal travels in.
+pub type ArnRequirement = ::service_common::arn::Requirement;
+
+/// A secret in AWS Secrets Manager: `CdnAuthConfiguration$CdnIdentifierSecretArns` is
+/// "The ARN for the secret in Secrets Manager that your CDN uses for authorization to
+/// access the endpoint".
+pub const SECRETS_MANAGER_SECRET_ARN: ArnRequirement =
+    ::service_common::arn::SECRETS_MANAGER_SECRET;
+
+/// An IAM role: `CdnAuthConfiguration$SecretsRoleArn` is "The ARN for the IAM role that
+/// gives MediaPackage read access to Secrets Manager and KMS for CDN authorization", and
+/// `SpekeKeyProvider$RoleArn` "The ARN for the IAM role granted by the key provider that
+/// provides access to the key provider API" — whose doc also states the form,
+/// `arn:aws:iam::{accountID}:role/{name}`.
+pub const IAM_ROLE_ARN: ArnRequirement = ::service_common::arn::IAM_ROLE;
+
+/// `ValidationExceptionType` values a refused caller-supplied ARN carries, from the
+/// model's `ValidationExceptionType` enum.
+///
+/// The enum names one value per way such a value can be wrong, which is what a caller
+/// branches on: the ARN's FORM ([`VALIDATION_MALFORMED_SECRET_ARN`],
+/// [`VALIDATION_ROLE_ARN_INVALID_FORMAT`]), the scope it names
+/// ([`VALIDATION_SECRET_FROM_DIFFERENT_REGION`],
+/// [`VALIDATION_SECRET_FROM_DIFFERENT_ACCOUNT`]) and a list that names one secret twice
+/// ([`VALIDATION_DUPLICATED_SECRET`]).
+pub const VALIDATION_MALFORMED_SECRET_ARN: &str = "MALFORMED_SECRET_ARN";
+/// See [`VALIDATION_MALFORMED_SECRET_ARN`].
+pub const VALIDATION_SECRET_FROM_DIFFERENT_REGION: &str = "SECRET_FROM_DIFFERENT_REGION";
+/// See [`VALIDATION_MALFORMED_SECRET_ARN`].
+pub const VALIDATION_SECRET_FROM_DIFFERENT_ACCOUNT: &str = "SECRET_FROM_DIFFERENT_ACCOUNT";
+/// See [`VALIDATION_MALFORMED_SECRET_ARN`].
+pub const VALIDATION_DUPLICATED_SECRET: &str = "DUPLICATED_SECRET";
+/// See [`VALIDATION_MALFORMED_SECRET_ARN`].
+pub const VALIDATION_ROLE_ARN_INVALID_FORMAT: &str = "ROLE_ARN_INVALID_FORMAT";
+
+/// The requirement an ARN member that names the wrong KIND of thing failed, worded the way
+/// this service words every other requirement: the rule about the member, then the sentence
+/// telling the caller to look at what it sent (see [`constraint_detail`]).
+fn arn_requirement_detail(requirement: ArnRequirement) -> String {
+    format!("Member {}. {CHECK_THE_VALUE}", requirement.phrase())
+}
+
+/// The requirement a well-formed ARN naming another `scope` (a Region, an account) failed.
+fn arn_scope_detail(scope: &str, expected: &str) -> String {
+    format!("Member must name a resource in {scope} {expected}. {CHECK_THE_VALUE}")
+}
+
+/// The member path a list element is at, spelled as the framework's own constraint walk
+/// spells it: the list's path, the element's 1-BASED position, then the collection step
+/// (`aws_smithy_schema_server::constraints::path`). One spelling, so a refusal from a
+/// handler names a position the same way a refusal from the boundary does.
+fn element_path(list_path: &str, index: usize) -> String {
+    format!("{list_path}.{}.member", index + 1)
+}
+
+/// Refuse a `CdnAuthConfiguration` whose ARNs are not ones this service could ever read.
+///
+/// CDN authorization makes MediaPackage fetch the named secrets through the named role, so
+/// each entry of `CdnIdentifierSecretArns` has to be the ARN of a Secrets Manager secret in
+/// the SAME account and Region as the endpoint the policy is attached to (the account every
+/// resource here belongs to, [`::engine::emulator_account_id`], and `region`, the Region the
+/// request is served in), the list must name each secret once, and `SecretsRoleArn` has to
+/// be the ARN of an IAM role. A value outside that is an input failure whose
+/// `ValidationExceptionType` names which of those it is, and `None` means the block is one
+/// the service could act on.
+///
+/// How MANY secrets the list may carry is the model's own `@length 1..100` on
+/// `CdnIdentifierSecretArns`, so the boundary validator refuses a list outside it before any
+/// handler runs; this reads only what the model says nothing about.
+pub fn cdn_auth_rejection(
+    configuration: &CdnAuthConfiguration,
+    region: &str,
+) -> Option<ValidationException> {
+    /// The wire path of the block's members, under the member the request carries it at.
+    const SECRETS: &str = "cdnAuthConfiguration.cdnIdentifierSecretArns";
+    const ROLE: &str = "cdnAuthConfiguration.secretsRoleArn";
+
+    let account = ::engine::emulator_account_id();
+    for (index, secret) in configuration.cdn_identifier_secret_arns.iter().enumerate() {
+        let path = element_path(SECRETS, index);
+        let Some(arn) = ::service_common::arn::parse(secret)
+            .filter(|_| SECRETS_MANAGER_SECRET_ARN.admits(secret))
+        else {
+            return Some(validation_failed(
+                &path,
+                &arn_requirement_detail(SECRETS_MANAGER_SECRET_ARN),
+                VALIDATION_MALFORMED_SECRET_ARN,
+            ));
+        };
+        if arn.region != region {
+            return Some(validation_failed(
+                &path,
+                &arn_scope_detail("the Region", region),
+                VALIDATION_SECRET_FROM_DIFFERENT_REGION,
+            ));
+        }
+        if arn.account != account {
+            return Some(validation_failed(
+                &path,
+                &arn_scope_detail("the account", account),
+                VALIDATION_SECRET_FROM_DIFFERENT_ACCOUNT,
+            ));
+        }
+    }
+
+    // Repetition is judged after the forms are, so a list of junk is told what an entry has
+    // to BE before it is told it sent one twice. The model puts no `@uniqueItems` on the
+    // list, so this is the handler's to read.
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    for (index, secret) in configuration.cdn_identifier_secret_arns.iter().enumerate() {
+        if !named.insert(secret.as_str()) {
+            let requirement = format!(
+                "Member must name a secret the list does not already name. {CHECK_THE_VALUE}"
+            );
+            return Some(validation_failed(
+                &element_path(SECRETS, index),
+                &requirement,
+                VALIDATION_DUPLICATED_SECRET,
+            ));
+        }
+    }
+
+    (!IAM_ROLE_ARN.admits(&configuration.secrets_role_arn)).then(|| {
+        validation_failed(
+            ROLE,
+            &arn_requirement_detail(IAM_ROLE_ARN),
+            VALIDATION_ROLE_ARN_INVALID_FORMAT,
+        )
+    })
+}
+
+/// Refuse a segment whose SPEKE key provider names something other than an IAM role.
+///
+/// `SpekeKeyProvider$RoleArn` is the role MediaPackage ASSUMES to reach the key provider, so
+/// the same rule as the CDN authorization role applies to it: a value that is not the ARN of
+/// an IAM role names no role to assume. Shared by the writers of an endpoint's segment
+/// (`CreateOriginEndpoint` and `UpdateOriginEndpoint`) so both read it the same way.
+/// `SpekeKeyProvider$CertificateArn` states its own `@pattern` in the model, so the boundary
+/// validator reads that one and this does not.
+pub fn speke_role_arn_rejection(segment: Option<&Segment>) -> Option<ValidationException> {
+    let role_arn = &segment?.encryption.as_ref()?.speke_key_provider.role_arn;
+    (!IAM_ROLE_ARN.admits(role_arn)).then(|| {
+        validation_failed(
+            "segment.encryption.spekeKeyProvider.roleArn",
+            &arn_requirement_detail(IAM_ROLE_ARN),
+            VALIDATION_ROLE_ARN_INVALID_FORMAT,
+        )
+    })
 }
 
 /// The pagination token for a list that stopped after `last` — opaque to the caller,

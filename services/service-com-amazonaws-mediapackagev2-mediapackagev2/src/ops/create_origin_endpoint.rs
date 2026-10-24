@@ -331,6 +331,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Another rule about the request alone: a segment's key provider names the IAM role
+        // MediaPackage assumes to reach it, so a value that is not the ARN of a role names
+        // none and is refused before the endpoint is minted. The crate's one reading of a
+        // caller-supplied ARN, shared with the CDN authorization a policy carries.
+        if let Some(rejection) = crate::state::speke_role_arn_rejection(input.segment.as_ref()) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
         let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),

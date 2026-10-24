@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SignUp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SignUp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SignUp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a user with an app client: the `ClientId` resolves the stored app client
+//! and the pool that holds it, the proposed password is checked against THAT pool's
+//! password policy, the attributes against its schema, and the user is stored
+//! `UNCONFIRMED` with a freshly minted `sub` — which is the `UserSub` the response
+//! carries and what `AdminGetUser` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -258,20 +254,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SignUp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SignUpErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SignUp"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // This operation models no `UserPoolId` at all: the app client the request
+        // names is what resolves the pool the user is registered in.
+        let pool = guard
+            .pool_of_client(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+        let user_pool_id = pool.id.clone();
+
+        // "The password must comply with the password requirements of your user pool"
+        // (`SignUp.Password`). The member is optional — "To create a user with no
+        // password, omit this parameter or submit a blank value" — so only a password
+        // that was actually proposed is checked against the policy.
+        let password = input
+            .password
+            .as_deref()
+            .filter(|password| !password.is_empty());
+        if let Some(message) = password.and_then(|password| pool.check_password(password)) {
+            return Err(invalid_password(message));
+        }
+
+        // Every attribute written has to be one the pool's schema declares, and every
+        // attribute that schema marks required has to be given a value: a sign-up that
+        // left one out would store a user the pool's own schema says is incomplete.
+        let requested_attributes = input.user_attributes.clone().unwrap_or_default();
+        let requested_names: Vec<String> = requested_attributes
+            .iter()
+            .map(|attribute| attribute.name.clone())
+            .collect();
+        if let Some(unknown) = pool.unknown_attribute(&requested_names) {
+            return Err(invalid_parameter(format!(
+                "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
+            )));
+        }
+        let mut attributes: ::std::collections::BTreeMap<String, String> = requested_attributes
+            .into_iter()
+            .filter_map(|attribute| attribute.value.map(|value| (attribute.name, value)))
+            .collect();
+        let missing = pool.unset_required_attributes(&attributes);
+        if let Some(name) = missing.first() {
+            return Err(invalid_parameter(format!(
+                "Attributes did not conform to the schema: {name}: The attribute is required"
+            )));
+        }
+
+        let key = pool.user_key(&input.username);
+        if pool.users.contains_key(&key) {
+            return Err(username_exists(&input.username));
+        }
+        // This emulator holds a pool's users in memory, so the store is bounded; the
+        // operation's own `LimitExceededException` is "thrown when a user exceeds the
+        // limit for a requested Amazon Web Services resource" (this service's model).
+        if pool.users.len() >= crate::state::MAX_USERS_PER_POOL {
+            return Err(limit_exceeded(format!(
+                "User pool {user_pool_id} holds at most {} users.",
+                crate::state::MAX_USERS_PER_POOL
+            )));
+        }
+
+        let sub = crate::state::new_uuid();
+        // `sub` is the user's own id, not something the caller may set.
+        attributes.insert("sub".to_string(), sub.clone());
+        let user = crate::state::User {
+            username: input.username.clone(),
+            sub: sub.clone(),
+            attributes,
+            password: password.map(str::to_string),
+            // The user chose this password itself, so there is nothing to change at the
+            // next sign-in: it is permanent, unlike the one `AdminCreateUser` sets.
+            password_permanent: true,
+            password_set_at: password.map(|_| now),
+            // "When you get this exception in the response, the user is successfully
+            // created and is in an UNCONFIRMED state" (this operation's own doc): a
+            // signed-up user is unconfirmed until a confirmation confirms it.
+            status: crate::state::UserStatus::Unconfirmed,
+            enabled: true,
+            mfa_options: Vec::new(),
+            preferred_mfa_setting: None,
+            mfa_setting_list: Vec::new(),
+            user_create_date: now,
+            user_last_modified_date: now,
+            groups: ::std::collections::BTreeSet::new(),
+            // A registered user has no remembered device: a device is known only once a
+            // sign-in has minted a key for one.
+            devices: ::std::collections::BTreeMap::new(),
+        };
+        let pool = guard
+            .pool_mut(&user_pool_id)
+            .ok_or_else(internal_error)?;
+        pool.users.insert(key.clone(), user);
+
+        // Read back from the STORED user, so the response reports what a later read of
+        // this pool reports.
+        let stored = pool.users.get(&key).ok_or_else(internal_error)?;
+        Ok(SignUpOutput {
+            // "Indicates whether the user was automatically confirmed. You can
+            // auto-confirm users with a pre sign-up Lambda trigger" (`UserConfirmed`):
+            // the stored status is what decides it.
+            user_confirmed: stored.status == crate::state::UserStatus::Confirmed,
+            user_sub: stored.sub.clone(),
+            // `CodeDeliveryDetails` is "information about the delivery destination for
+            // that link or code" of a message Amazon Cognito sent. This emulator sends
+            // no mail or SMS, so it reports no delivery: a destination for a message
+            // nothing delivered would be an answer about work nothing performed.
+            code_delivery_details: None,
+            // `Session` is "a session Id that you can pass to ConfirmSignUp when you
+            // want to immediately sign in your user with the USER_AUTH flow": that flow
+            // is not served here, so no session is started for it.
+            session: None,
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> SignUpError {
+    SignUpErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UsernameExistsException` for a username already taken.
+fn username_exists(username: &str) -> SignUpError {
+    SignUpErrorModeled::UsernameExistsException(UsernameExistsException {
+        message: Some(format!("User account already exists for {username}")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidPasswordException`, carrying `message`.
+fn invalid_password(message: String) -> SignUpError {
+    SignUpErrorModeled::InvalidPasswordException(InvalidPasswordException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> SignUpError {
+    SignUpErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException`, carrying `message`.
+fn limit_exceeded(message: String) -> SignUpError {
+    SignUpErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> SignUpError {
+    SignUpErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

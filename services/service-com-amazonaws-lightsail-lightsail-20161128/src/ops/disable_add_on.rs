@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableAddOn
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableAddOn`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableAddOn::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disabling an add-on is the REMOVAL of that add-on from the set of add-ons the
+//! resource the request names has enabled: an `addOns` member reports "the add-ons
+//! enabled on" the resource, so a later read of it reports every other add-on the
+//! resource still has and no longer this one. The resource is resolved by name alone,
+//! whichever kind of add-on-carrying resource it turns out to be (see
+//! `crate::state::ComAmazonawsLightsailLightsail20161128State::with_add_on_record`),
+//! and the change is logged in the account's operation log like every other mutating
+//! call.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +163,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableAddOn` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableAddOnErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableAddOn"))
+        // `ctx` carries request metadata only: an add-on is held on the stored
+        // record of the resource the request names, and every operation of the
+        // resources that carry one addresses it by name alone, wherever the
+        // call is made from.
+        let _ = ctx;
+
+        // `addOnType` and `resourceName` are modelled `@required` members, the
+        // type targets the modelled `AddOnType` enum and the name carries the
+        // modelled `ResourceName` pattern, so the centralized walk refused
+        // anything outside them before this body ran.
+        let name = input.resource_name;
+        let add_on_type = input.add_on_type;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let resolved = store.with_add_on_record(&name, |record, resource_type| {
+                // Removal, not a status change: what a read reports is the
+                // add-ons the resource has ENABLED, and a disabled one is no
+                // longer among them. A type the resource has not enabled is
+                // already disabled, so there is nothing to remove and the call
+                // stands — the resource ends in the state the request asked
+                // for either way.
+                let kept = crate::state::add_ons_without(record, &add_on_type);
+                record.set_add_ons(kept);
+                (resource_type, record.location().clone())
+            });
+            // A name this account holds no add-on-carrying resource of is
+            // Lightsail's `DoesNotExist` rejection, the same envelope every
+            // other not-found path in this crate answers with.
+            let Some((resource_type, location)) = resolved else {
+                return Err(not_found(&name));
+            };
+            // The add-on is disabled by the time this call answers, so its
+            // operation is terminal rather than one the clock still owes.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DISABLE_ADD_ON,
+                resource_type,
+                &name,
+                &location,
+                None,
+            );
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one changes exactly the one
+            // resource it names, so it answers exactly one entry.
+            Ok(DisableAddOnOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No add-on-carrying resource of this account is stored under that name:
+/// Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist`, and a message built from the
+/// request.
+///
+/// The message names the request's own member rather than one resource type,
+/// because the request names a resource without saying what kind it is.
+fn not_found(name: &str) -> DisableAddOnError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "resourceName '{name}' does not name a resource of this account that carries add-ons"
+    ))
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DisableAddOnError {
+    DisableAddOnErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

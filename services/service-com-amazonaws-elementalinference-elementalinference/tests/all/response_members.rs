@@ -291,27 +291,29 @@ struct ConfigCase {
 
 /// The rows span every member of the `OutputConfig` union
 /// (`smithy_query(query="shape",shape="OutputConfig")`: cropping, clipping,
-/// subtitling, contextualMetadata) and, for the one carrying a service-resolved
+/// subtitling, contextualMetadata) and, for those carrying a service-resolved
 /// member, both the omitted and the supplied case.
 fn config_cases() -> Vec<ConfigCase> {
     vec![
         ConfigCase {
-            label: "subtitling without an aspect ratio",
+            label: "subtitling without an aspect ratio or a profanity filter",
             submitted: json!({"subtitling": {"language": "eng"}}),
             expected: json!({"subtitling": {
                 "language": "eng",
-                "aspectRatio": default_aspect_ratio()
+                "aspectRatio": default_aspect_ratio(),
+                "profanityFilter": "DISABLED"
             }}),
         },
         ConfigCase {
-            label: "subtitling with a supplied 4:3 aspect ratio",
+            label: "subtitling with a supplied 4:3 aspect ratio and no profanity filter",
             submitted: json!({"subtitling": {
                 "language": "fra",
                 "aspectRatio": {"width": 4, "height": 3}
             }}),
             expected: json!({"subtitling": {
                 "language": "fra",
-                "aspectRatio": {"width": 4, "height": 3}
+                "aspectRatio": {"width": 4, "height": 3},
+                "profanityFilter": "DISABLED"
             }}),
         },
         ConfigCase {
@@ -338,9 +340,17 @@ fn config_cases() -> Vec<ConfigCase> {
             expected: output_config("clipping"),
         },
         ConfigCase {
-            label: "contextualMetadata, which models no service-resolved member",
+            label: "contextualMetadata with both modes supplied",
             submitted: output_config("contextualMetadata"),
             expected: output_config("contextualMetadata"),
+        },
+        ConfigCase {
+            label: "contextualMetadata stating neither of its modes",
+            submitted: json!({"contextualMetadata": {}}),
+            expected: json!({"contextualMetadata": {
+                "summaryGeneration": "ENABLED",
+                "extendedAnalysis": "ENABLED"
+            }}),
         },
     ]
 }

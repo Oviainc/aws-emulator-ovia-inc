@@ -23,6 +23,10 @@
 //! * a VLAN holds at most [`MAX_EIP_ASSOCIATIONS_PER_VLAN`] associations — the store's
 //!   own bound on the growth a caller choosing `allocationId` values can drive — and an
 //!   associate past it is refused rather than admitted.
+//!
+//! Every `allocationId` an accepted row here names is an allocation of the account's own
+//! Amazon EC2 store, because an id that store holds no allocation for is refused — the
+//! rule `tests/all/eip_allocation_existence.rs` owns.
 
 use serde_json::{json, Value};
 
@@ -36,15 +40,23 @@ use crate::environment_lifecycle::{call, emulator, error_type, settle, vlans_wit
 const ABSENT_ENVIRONMENT: &str = "env-0000000000";
 
 /// Register one Elastic IP allocation in the account's own Amazon EC2 store, which is
-/// where this service reads the address of an allocation from.
-fn register_elastic_ip(engine: &engine::InMemoryEngine, allocation_id: &str, public_ip: &str) {
+/// where this service reads the allocations of the account from.
+///
+/// `public_ip` is the address Amazon EC2 holds for the allocation, and is absent for an
+/// allocation that store holds no address for: the allocation EXISTS either way, which
+/// is what `AssociateEipToVlan` requires of an `allocationId`.
+pub(crate) fn register_elastic_ip(
+    engine: &engine::InMemoryEngine,
+    allocation_id: &str,
+    public_ip: Option<&str>,
+) {
     let ec2_state = ec2::state::service_state(engine)
         .expect("the in-memory engine carries the account's EC2 store");
     ec2_state.lock().addresses.insert(
         allocation_id.to_string(),
         ec2::ops::types::Address {
             allocation_id: Some(allocation_id.to_string()),
-            public_ip: Some(public_ip.to_string()),
+            public_ip: public_ip.map(str::to_string),
             ..Default::default()
         },
     );
@@ -55,7 +67,7 @@ fn register_elastic_ip(engine: &engine::InMemoryEngine, allocation_id: &str, pub
 /// The environment is SETTLED before it is returned, because every test here reads its
 /// HCX VLAN back through `ListEnvironmentVlans` and a list addressed to an environment
 /// that is still initializing is refused (`tests/all/list_while_initializing.rs`).
-async fn create_public_hcx(router: &Emulator, name: &str) -> String {
+pub(crate) async fn create_public_hcx(router: &Emulator, name: &str) -> String {
     let mut request = router.create_request(Some(name));
     let mut vlans = vlans_with_prefix(28);
     vlans["isHcxPublic"] = json!(true);
@@ -76,7 +88,7 @@ async fn create_public_hcx(router: &Emulator, name: &str) -> String {
 }
 
 /// The HCX VLAN of `environment_id`, read back through `ListEnvironmentVlans`.
-async fn hcx_vlan(router: &Emulator, environment_id: &str) -> Value {
+pub(crate) async fn hcx_vlan(router: &Emulator, environment_id: &str) -> Value {
     let (status, body) = call(
         router,
         "ListEnvironmentVlans",
@@ -97,7 +109,11 @@ async fn hcx_vlan(router: &Emulator, environment_id: &str) -> Value {
 async fn an_eip_associates_with_the_public_hcx_vlan_and_is_read_back() {
     let router = emulator();
     let environment = create_public_hcx(&router, "eip-env").await;
-    register_elastic_ip(&router.engine, "eipalloc-0123456789abcdef0", "198.51.100.7");
+    register_elastic_ip(
+        &router.engine,
+        "eipalloc-0123456789abcdef0",
+        Some("198.51.100.7"),
+    );
 
     let (status, body) = call(
         &router,
@@ -174,8 +190,10 @@ async fn an_eip_associates_with_the_public_hcx_vlan_and_is_read_back() {
         repeat["vlan"]["eipAssociations"]
     );
 
-    // A DIFFERENT allocation is a second association. This one EC2 holds no record of,
-    // so no address is reported for it rather than one nothing allocated.
+    // A DIFFERENT allocation of the account is a second association. EC2 holds this one
+    // with no address, so no address is reported for it rather than one nothing
+    // allocated.
+    register_elastic_ip(&router.engine, "eipalloc-00000000", None);
     let (status, second) = call(
         &router,
         "AssociateEipToVlan",
@@ -199,7 +217,7 @@ async fn an_eip_associates_with_the_public_hcx_vlan_and_is_read_back() {
     assert_eq!(
         after_second[1]["ipAddress"],
         Value::Null,
-        "second associate: an allocation EC2 does not hold has no address to report, got {}",
+        "second associate: an allocation EC2 holds no address for has none to report, got {}",
         after_second[1]["ipAddress"]
     );
 
@@ -249,6 +267,9 @@ async fn a_vlan_holds_at_most_the_stores_bound_of_eip_associations() {
 
     for index in 0..=MAX_EIP_ASSOCIATIONS_PER_VLAN {
         let allocation_id = format!("eipalloc-{index:017x}");
+        // Every one of them is an allocation the account really holds, so what the bound
+        // refuses is the growth and nothing else.
+        register_elastic_ip(&router.engine, &allocation_id, None);
         let (status, body) = call(
             &router,
             "AssociateEipToVlan",
@@ -327,6 +348,13 @@ async fn only_the_public_hcx_vlan_of_a_stored_environment_takes_an_eip() {
     // An environment whose HCX VLAN is private, which is the default a create makes.
     let private_hcx =
         crate::environment_lifecycle::create_settled(&router, Some("private-hcx")).await;
+    // The allocation every row names is one the account holds, so no row is refused for
+    // the allocation rather than for the rule it is testing.
+    register_elastic_ip(
+        &router.engine,
+        "eipalloc-0123456789abcdef0",
+        Some("198.51.100.7"),
+    );
 
     // Each row: the case, the environment the request names, the `vlanName` it gives,
     // and the error code the rule answers with — `""` for a row that is accepted.

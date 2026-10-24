@@ -39,6 +39,8 @@ mod code_repository_deletion;
 mod compute_quota_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
 mod control_plane_preconditions;
+#[path = "all/custom_image_deletion.rs"]
+mod custom_image_deletion;
 #[path = "all/custom_images.rs"]
 mod custom_images;
 #[path = "all/endpoint_config_deletion.rs"]

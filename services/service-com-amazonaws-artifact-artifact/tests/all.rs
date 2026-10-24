@@ -27,6 +27,8 @@ mod compliance_inquiry_listing;
 mod compliance_inquiry_name_projection;
 #[path = "all/compliance_inquiry_queries.rs"]
 mod compliance_inquiry_queries;
+#[path = "all/compliance_inquiry_support_mode.rs"]
+mod compliance_inquiry_support_mode;
 #[path = "all/customer_agreements.rs"]
 mod customer_agreements;
 #[path = "all/document_data_plane.rs"]

@@ -59,3 +59,5 @@ mod vocabularies;
 mod vocabulary_delete_and_tag_sets;
 #[path = "all/vocabulary_file_uri.rs"]
 mod vocabulary_file_uri;
+#[path = "all/vocabulary_filter_file_uri.rs"]
+mod vocabulary_filter_file_uri;

@@ -194,18 +194,16 @@ async fn a_created_vocabulary_is_pending_then_ready_and_reads_back() {
 /// vocabulary and the vocabulary-filter operations: each is the modelled
 /// `BadRequestException`, and nothing is stored.
 ///
-/// A request that names a file as the source of its terms is NOT one of them for the
-/// vocabulary family: it is accepted and recorded, which `crate::vocabulary_file_uri`
-/// spans. The filter family has no `VocabularyState` anywhere in its model, so there
-/// is no modelled state a filter whose words nothing could read may end in, and its
-/// file form stays refused at the call.
+/// A request that names a file as the source of its terms is NOT one of them for
+/// EITHER family: it is accepted and recorded, which `crate::vocabulary_file_uri` and
+/// `crate::vocabulary_filter_file_uri` span.
 #[tokio::test]
 async fn a_create_without_usable_inline_terms_is_a_bad_request() {
     let transcribe = Transcribe::new();
 
     // Rows differ along the axis the rule generalises over: which of the two content
-    // members the request carries (neither, both, the file one), and the form of the
-    // file URI the model's `Uri` pattern allows (`s3://`, `http://`, `https://`).
+    // members the request carries (neither, both), whether the inline list is empty,
+    // and whether the content is past the published size ceiling.
     let rows: Vec<(&str, &str, Value)> = vec![
         (
             "vocabulary with neither Phrases nor VocabularyFileUri",
@@ -239,15 +237,6 @@ async fn a_create_without_usable_inline_terms_is_a_bad_request() {
                 "VocabularyFilterName": "both-word-sources",
                 "LanguageCode": "en-US",
                 "Words": ["crud"],
-                "VocabularyFilterFileUri": "s3://example-bucket/words.txt"
-            }),
-        ),
-        (
-            "filter from an s3 file this emulator cannot read",
-            "CreateVocabularyFilter",
-            json!({
-                "VocabularyFilterName": "words-from-s3",
-                "LanguageCode": "en-US",
                 "VocabularyFilterFileUri": "s3://example-bucket/words.txt"
             }),
         ),
