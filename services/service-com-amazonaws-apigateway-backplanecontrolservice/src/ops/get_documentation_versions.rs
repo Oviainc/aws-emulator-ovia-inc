@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDocumentationVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDocumentationVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDocumentationVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored `DocumentationVersion` snapshots of `restApiId` in
+//! creation order, cut into a `position`/`limit` page. A pure read: it reports the stored
+//! records and writes nothing, so a later caller sees exactly what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDocumentationVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDocumentationVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDocumentationVersions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A pure read, under the shared lock: the records are reported as they stand and
+        // nothing is written back.
+        let store = state.lock();
+        let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
+            GetDocumentationVersionsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // Creation order, which is the stable sequence a `position` cursor walks: the
+        // snapshots are keyed by version identifier, so map order would reorder the
+        // collection whenever a new identifier sorted before an older one.
+        let ordered = api.documentation_version_ids_in_creation_order();
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetDocumentationVersionsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        // Each item is rendered from the stored record by the one `DocumentationVersion`
+        // renderer this crate has, so a listed snapshot reads exactly as
+        // `GetDocumentationVersion` reports it.
+        let items = page
+            .ids
+            .iter()
+            .filter_map(|version| api.documentation_versions.get(version))
+            .map(super::create_documentation_version::documentation_version_body)
+            .collect();
+        Ok(GetDocumentationVersionsOutput {
+            items: Some(items),
+            position: page.next_position,
+        })
     }
 }

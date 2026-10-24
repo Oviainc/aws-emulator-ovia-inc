@@ -45,6 +45,8 @@ mod delete_stage;
 mod documentation_part_import_bulk;
 #[path = "all/documentation_parts.rs"]
 mod documentation_parts;
+#[path = "all/documentation_version_collection.rs"]
+mod documentation_version_collection;
 #[path = "all/documentation_versions.rs"]
 mod documentation_versions;
 #[path = "all/domain_name_access_association_reject.rs"]
