@@ -31,7 +31,7 @@ use crate::ops::types::{
     NetworkFrameworkAttributes, NetworkSummary, Node,
     NodeEthereumAttributes, NodeFabricAttributes, NodeFrameworkAttributes,
     NodeLogPublishingConfiguration, NodeSummary, Proposal, ProposalActions, ProposalSummary,
-    ResourceNotFoundException, VoteSummary, VotingPolicy,
+    ResourceNotFoundException, ResourceNotReadyException, VoteSummary, VotingPolicy,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service (the model's
@@ -215,6 +215,36 @@ pub const STATUS_CREATING: &str = "CREATING";
 
 /// The settled status the clock owes a created network, member or node.
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `NetworkStatus` / `MemberStatus` / `NodeStatus` value of a record the service has
+/// begun removing ("`DELETING` - The Amazon Web Services account is in the process of
+/// deleting …"). No record is ever STORED in it here — a delete removes the record
+/// outright — but it is one of the transient statuses [`is_transient_status`] names, so a
+/// record that does carry it is judged by the same rule.
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// The statuses in which a resource exists but is not in service: the service has not
+/// finished creating it, or has already begun taking it out.
+///
+/// Read off the status enums a taggable record reports (`NetworkStatus`, `MemberStatus`,
+/// `NodeStatus`, `AccessorStatus`): `CREATING` is a creation still running, `DELETING` and
+/// `PENDING_DELETION` a removal already under way. Every OTHER value of those enums is one
+/// the record is settled in — in service (`AVAILABLE`, `UPDATING`, `UNHEALTHY`) or ended
+/// (`CREATE_FAILED`, `FAILED`, `DELETED`, `INACCESSIBLE_ENCRYPTION_KEY`) — which is why
+/// `DeleteMember` and `DeleteNode` likewise refuse only the transient one.
+pub const TRANSIENT_STATUSES: &[&str] = &[
+    STATUS_CREATING,
+    STATUS_DELETING,
+    ACCESSOR_STATUS_PENDING_DELETION,
+];
+
+/// Whether `status` is one of the transient statuses ([`TRANSIENT_STATUSES`]) — the
+/// statuses an operation on the resource cannot be completed in, which is what the
+/// modelled `ResourceNotReadyException` ("The requested resource exists but isn't in a
+/// status that can complete the operation") answers.
+pub fn is_transient_status(status: &str) -> bool {
+    TRANSIENT_STATUSES.contains(&status)
+}
 
 /// The `ProposalStatus` a freshly created proposal is reported in: "`IN_PROGRESS` - The
 /// proposal is active and open for member voting" (`Proposal$Status`). It is NOT a
@@ -1255,6 +1285,67 @@ impl StoredInvitation {
     }
 }
 
+/// One stored record that carries a tag set, as a lookup by ARN resolves it.
+///
+/// The five record types here are exactly the shapes whose model declares a `Tags` member
+/// (see [`TAGGABLE_RESOURCE_TYPES`]), so every tagging request resolves to one of them
+/// through [`ComAmazonawsManagedblockchainTaigawebserviceState::tagged_record`] — one walk
+/// of the store, from which both the tag set the operation reads or writes
+/// ([`Self::tags`]) and the status it keys its refusals on ([`Self::status_not_ready`])
+/// are read.
+#[derive(Debug, Clone, Copy)]
+pub enum TaggedRecord<'a> {
+    Accessor(&'a StoredAccessor),
+    Network(&'a StoredNetwork),
+    Member(&'a StoredMember),
+    Node(&'a StoredNode),
+    Proposal(&'a StoredProposal),
+}
+
+impl<'a> TaggedRecord<'a> {
+    /// The tag set this record holds.
+    pub fn tags(self) -> &'a BTreeMap<String, String> {
+        match self {
+            Self::Accessor(accessor) => &accessor.tags,
+            Self::Network(network) => &network.tags,
+            Self::Member(member) => &member.tags,
+            Self::Node(node) => &node.tags,
+            Self::Proposal(proposal) => &proposal.tags,
+        }
+    }
+
+    /// This record's status when the resource is not in a status that can complete an
+    /// operation on it, and `None` when it is.
+    ///
+    /// A network, member, node or accessor whose status is a TRANSIENT one
+    /// ([`is_transient_status`]) exists but is not in service yet: the service has not
+    /// finished creating it, or has already begun taking it out. That is exactly what
+    /// `ResourceNotReadyException` ("The requested resource exists but isn't in a status
+    /// that can complete the operation") describes, and it is the same transient status
+    /// the state-changing operations on these records refuse (`CreateMember`,
+    /// `CreateNode`, `CreateProposal`, `DeleteMember`, `DeleteNode`) — every SETTLED
+    /// status, including the ended ones, can complete an operation.
+    ///
+    /// A proposal is in service from the moment `CreateProposal` mints it: `ProposalStatus`
+    /// (`IN_PROGRESS | APPROVED | REJECTED | EXPIRED | ACTION_FAILED`) declares no creation
+    /// or deletion status at all, so no status of one blocks an operation.
+    pub fn status_not_ready(self) -> Option<&'a str> {
+        match self {
+            Self::Accessor(accessor) => transient_status(&accessor.status),
+            Self::Network(network) => transient_status(&network.status),
+            Self::Member(member) => transient_status(&member.status),
+            Self::Node(node) => transient_status(&node.status),
+            Self::Proposal(_) => None,
+        }
+    }
+}
+
+/// `status` itself when it is a transient one ([`is_transient_status`]), and `None` when
+/// the record is settled in it.
+fn transient_status(status: &str) -> Option<&str> {
+    is_transient_status(status).then_some(status)
+}
+
 /// Per-service state for com-amazonaws-managedblockchain-taigawebservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
@@ -1470,25 +1561,67 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// and proposals that belong to it — so one tag set is read and written through this
     /// one lookup rather than a copy per operation.
     pub fn tags_for_resource(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.tagged_record(arn).map(TaggedRecord::tags)
+    }
+
+    /// The status of the resource `arn` names when that status is one the service cannot
+    /// complete an operation on it in ([`TaggedRecord::status_not_ready`]), and `None`
+    /// when the resource is in service or when no stored record carries that ARN — a
+    /// request naming nothing this store holds is a resource that is not found, which the
+    /// tag lookups above answer.
+    ///
+    /// This is what the tagging operations refuse a still-provisioning (or already
+    /// deleted) resource with: `ResourceNotReadyException`, HTTP 409.
+    pub fn status_not_ready(&self, arn: &str) -> Option<&str> {
+        self.tagged_record(arn)
+            .and_then(TaggedRecord::status_not_ready)
+    }
+
+    /// The `ResourceNotReadyException` a tagging operation refuses `arn` with, or `None`
+    /// when the resource it names can complete the operation (and when the ARN names
+    /// nothing this store holds, which is the not-found answer the tag lookups give).
+    ///
+    /// The one place the three tagging operations get that refusal, so they cannot drift
+    /// apart: it is Region-gated exactly as the tag lookups are ([`arn_in_region`]), so an
+    /// ARN this Region does not reach stays a resource that is NOT FOUND rather than one
+    /// that is not ready, and it only READS, so a caller is refused before any write.
+    pub fn not_ready_refusal(
+        &self,
+        region: &str,
+        resource_type: &str,
+        arn: &str,
+    ) -> Option<ResourceNotReadyException> {
+        if !arn_in_region(arn, region) {
+            return None;
+        }
+        self.status_not_ready(arn)
+            .map(|status| not_ready_arn(resource_type, arn, status))
+    }
+
+    /// The record the resource `arn` names, resolved by the ARN each record was minted
+    /// with and STORED — the one walk of the store [`Self::tags_for_resource`] and
+    /// [`Self::status_not_ready`] both read through, so the status a refusal keys on and
+    /// the tag set a reply reports always come from the same record.
+    pub fn tagged_record(&self, arn: &str) -> Option<TaggedRecord<'_>> {
         if let Some(accessor) = self.accessors.values().find(|accessor| accessor.arn == arn) {
-            return Some(&accessor.tags);
+            return Some(TaggedRecord::Accessor(accessor));
         }
         for network in self.networks.values() {
             if network.arn == arn {
-                return Some(&network.tags);
+                return Some(TaggedRecord::Network(network));
             }
             if let Some(member) = network.members.values().find(|member| member.arn == arn) {
-                return Some(&member.tags);
+                return Some(TaggedRecord::Member(member));
             }
             if let Some(node) = network.nodes.values().find(|node| node.arn == arn) {
-                return Some(&node.tags);
+                return Some(TaggedRecord::Node(node));
             }
             if let Some(proposal) = network
                 .proposals
                 .values()
                 .find(|proposal| proposal.arn == arn)
             {
-                return Some(&proposal.tags);
+                return Some(TaggedRecord::Proposal(proposal));
             }
         }
         None
@@ -2220,6 +2353,23 @@ pub fn not_found_arn(resource_type: &str, arn: &str) -> ResourceNotFoundExceptio
     ResourceNotFoundException {
         message: Some(format!("{resource_type} {arn} not found.")),
         resource_name: Some(arn.to_string()),
+    }
+}
+
+/// The `ResourceNotReadyException` ("The requested resource exists but isn't in a status
+/// that can complete the operation", HTTP 409) for a resource a request named BY ARN that
+/// this service holds in a status it cannot act on it in
+/// ([`TaggedRecord::status_not_ready`] answered the status).
+///
+/// The prose states the status the resource is actually in, so the caller can see what to
+/// wait for; `resource_type` is how this service names the type the ARN spells (see
+/// [`taggable_resource_type`]). The shape declares `Message` and nothing else.
+pub fn not_ready_arn(resource_type: &str, arn: &str, status: &str) -> ResourceNotReadyException {
+    ResourceNotReadyException {
+        message: Some(format!(
+            "{resource_type} {arn} is {status}, which is not a status that can complete the \
+             operation."
+        )),
     }
 }
 

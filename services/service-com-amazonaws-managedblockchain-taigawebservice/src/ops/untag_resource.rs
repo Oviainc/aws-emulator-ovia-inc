@@ -5,7 +5,10 @@
 //! [`crate::state`] — the one tag set `ListTagsForResource` and that resource's own
 //! Get/Describe report. A key in the reserved namespace
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key a
-//! caller may remove, so such a request is refused whole and removes nothing.
+//! caller may remove, so such a request is refused whole and removes nothing. Nor is a
+//! resource the service is still creating, or has already begun removing, in a status that
+//! can complete the operation ([`crate::state::is_transient_status`]): that request too is
+//! refused whole, leaving every tag where it was.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +187,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`, HTTP 409): a resource the service has
+        // not finished creating, or has already begun removing, cannot be untagged either.
+        // Judged before the write borrow is taken, so every tag the resource holds stays
+        // where it was.
+        if let Some(refusal) =
+            guard.not_ready_refusal(&region, resource_type, &input.resource_arn)
+        {
+            return Err(UntagResourceErrorModeled::ResourceNotReadyException(refusal).into());
+        }
 
         // An ARN of another Region names no resource this Region holds — see the same
         // Region check in `tag_resource.rs`.
