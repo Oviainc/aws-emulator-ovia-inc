@@ -149,7 +149,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: it reads stored state, and the one write it makes is
         // materialising the status transition the clock already owed.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so the lookups below
+        // are scoped to it.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetNodeErrorModeled::InternalServiceErrorException(
@@ -163,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `GET /networks/{NetworkId}/nodes/{NodeId}` nests the node INSIDE the network,
         // so the path labels resolve left to right: a `NetworkId` this service does not
-        // hold is itself the missing resource, and the node inside it is never reached.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // hold in this Region is itself the missing resource, and the node inside it is
+        // never reached.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(GetNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -194,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation was asked for, and `MemberId` — a QUERY member, not a path label —
         // only scopes that lookup, so a node the named member does not own is not found
         // under it, exactly as an unknown node id is not.
-        let found = network.nodes.get(&input.node_id).filter(|node| {
+        let found = network.node(&region, &input.node_id).filter(|node| {
             input
                 .member_id
                 .as_deref()

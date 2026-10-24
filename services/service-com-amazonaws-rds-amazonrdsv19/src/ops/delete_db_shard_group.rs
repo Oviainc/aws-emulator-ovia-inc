@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBShardGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBShardGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBShardGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +161,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBShardGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBShardGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBShardGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteDBShardGroupError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a delete of nothing reported as a success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        let key = (
+            region.clone(),
+            crate::state::db_shard_group_key(&input.db_shard_group_identifier),
+        );
+        // "The specified DB shard group name wasn't found": a name no create stored in this
+        // region — and one whose delete has already run its course — is the modelled
+        // not-found fault.
+        let Some(record) = store.db_shard_groups.get_mut(&key) else {
+            return Err(DeleteDBShardGroupErrorModeled::DBShardGroupNotFoundFault(
+                DBShardGroupNotFoundFault {
+                    message: Some(format!(
+                        "DBShardGroup {} not found.",
+                        input.db_shard_group_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        // `InvalidDBShardGroupStateFault`: "the DB shard group must be in the available
+        // state". That covers both a shard group this emulator's clock has yet to finish
+        // provisioning and one whose delete is already running — a delete "can't be
+        // canceled or reverted after it begins", so a second one inside the window is the
+        // same state fault rather than a second acknowledgement.
+        if !record.is_available() {
+            return Err(
+                DeleteDBShardGroupErrorModeled::InvalidDBShardGroupStateFault(
+                    InvalidDBShardGroupStateFault {
+                        message: Some(format!(
+                            "DB shard group {} must be in the available state to be deleted \
+                             (status {})",
+                            record.identifier, record.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The delete is accepted: the shard group reports `deleting` from now on and the
+        // clock owes its removal, which the next call materialises. The answer is the
+        // record as it now stands, which is what AWS reports for an accepted delete.
+        record.begin_deletion();
+        let deleting = record.to_wire();
+        // The generated types declare ONE struct per operation for the modelled
+        // `DBShardGroup` shape, so the projection every DB shard group operation shares
+        // (`DbShardGroupRecord::to_wire`) is mapped onto this operation's own output rather
+        // than written out a second time here.
+        Ok(DeleteDBShardGroupOutput {
+            db_shard_group_resource_id: deleting.db_shard_group_resource_id,
+            db_shard_group_identifier: deleting.db_shard_group_identifier,
+            db_cluster_identifier: deleting.db_cluster_identifier,
+            max_acu: deleting.max_acu,
+            min_acu: deleting.min_acu,
+            compute_redundancy: deleting.compute_redundancy,
+            status: deleting.status,
+            publicly_accessible: deleting.publicly_accessible,
+            endpoint: deleting.endpoint,
+            db_shard_group_arn: deleting.db_shard_group_arn,
+            tag_list: deleting.tag_list,
+        })
     }
 }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationCheckOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationCheckOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationCheckOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configuration check operations filed against one registered application
+//! in the Region the request was signed for: the records `StartConfigurationChecks`
+//! wrote and `GetConfigurationCheckOperation` reads back, projected by
+//! [`crate::state::StoredConfigurationCheckOperation::view`]. `ListMode` chooses
+//! between every run (`ALL_OPERATIONS`) and the latest run of each check
+//! (`LATEST_PER_CHECK`, see
+//! [`crate::state::RegionState::configuration_check_operations_for`]), `Filters` narrow
+//! the result by the members the listing itself reports
+//! ([`crate::state::CONFIGURATION_CHECK_FILTER_NAMES`]), and the page is taken by
+//! [`crate::state::page`] so a `NextToken` resumes exactly where the previous page
+//! stopped. The listing REPORTS: it materialises only the status changes the clock
+//! already owed ([`crate::state::ComAmazonawsSsmsapSsmsapState::settle`]) and writes
+//! nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +88,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ConfigurationCheckOperationListingMode` that lists every run of every check
+/// (`smithy_query(query="shape", shape="ConfigurationCheckOperationListingMode")`: one
+/// of `ALL_OPERATIONS` | `LATEST_PER_CHECK`, see
+/// [`CONFIGURATION_CHECK_OPERATION_LISTING_MODE_VALUES`]). The other mode is the
+/// member's default, so anything that is not this one lists the latest run per check.
+const LIST_MODE_ALL_OPERATIONS: &str = "ALL_OPERATIONS";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +165,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationCheckOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationCheckOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationCheckOperations"))
+        // The Region this request was signed for: a listing reports what was started at
+        // THIS regional endpoint and nothing of any other Region.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListConfigurationCheckOperationsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        // Materialise what the clock already owed, so this listing agrees with a
+        // `GetConfigurationCheckOperation` made at the same instant.
+        state.settle(::std::time::SystemTime::now());
+
+        // `ListMode` is a modelled enum carrying a default, so the boundary validator
+        // has already refused any value outside the catalogue and supplied the default
+        // when the member was absent; this reads the one value that means "every run".
+        let latest_per_check = input.list_mode != LIST_MODE_ALL_OPERATIONS;
+
+        let filters = input.filters.unwrap_or_default();
+        // The bounds the model declares on `FilterList`, `FilterName` and `FilterValue`,
+        // re-stated before any filtering runs so the work this request does over the
+        // store is bounded by a check in this crate rather than by request size.
+        crate::state::filters_within_bounds(&filters)
+            .map_err(ListConfigurationCheckOperationsErrorModeled::ValidationException)?;
+        for filter in &filters {
+            if !FILTER_OPERATOR_VALUES.contains(&filter.operator.as_str()) {
+                return Err(
+                    ListConfigurationCheckOperationsErrorModeled::ValidationException(
+                        crate::state::validation(format!(
+                            "Filter Operator must be one of {}, but was {}",
+                            FILTER_OPERATOR_VALUES.join(", "),
+                            filter.operator
+                        )),
+                    )
+                    .into(),
+                );
+            }
+            if !crate::state::CONFIGURATION_CHECK_FILTER_NAMES.contains(&filter.name.as_str()) {
+                return Err(
+                    ListConfigurationCheckOperationsErrorModeled::ValidationException(
+                        crate::state::validation(format!(
+                            "Filter Name must be one of {}, but was {}",
+                            crate::state::CONFIGURATION_CHECK_FILTER_NAMES.join(", "),
+                            filter.name
+                        )),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let region_state = state.region(&region);
+        // `ApplicationId` is required, so the listing is always scoped to ONE
+        // application — which must be registered in this Region, an absent one being the
+        // `ResourceNotFoundException` this operation models.
+        if !region_state.applications.contains_key(&input.application_id) {
+            return Err(
+                ListConfigurationCheckOperationsErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(crate::state::application_not_found_message(
+                        &input.application_id,
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // The records the mode selects, narrowed by every filter the request carries
+        // (several filters narrow together), each paired with the key the listing is
+        // ordered and paged by: its own `OperationId`.
+        let matching: Vec<(String, ConfigurationCheckOperation)> = region_state
+            .configuration_check_operations_for(&input.application_id, latest_per_check)
+            .into_iter()
+            .filter(|record| {
+                filters.iter().all(|filter| {
+                    crate::state::filter_matches_attribute(
+                        record.filter_attribute(&filter.name),
+                        filter,
+                    )
+                })
+            })
+            .map(|record| (record.id.clone(), record.view()))
+            .collect();
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListConfigurationCheckOperationsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListConfigurationCheckOperationsOutput {
+            configuration_check_operations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
+

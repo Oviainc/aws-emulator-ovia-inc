@@ -430,34 +430,69 @@ async fn updating_a_multiview_channel_releases_the_sources_it_drops() {
     }
 }
 
-/// The emulator does not yet enforce the model's requirement that a multiview channel's
-/// sources be OTHER, CMAF channels of the same group, so a channel that lists its own
-/// name is storable. A self-reference must not make it undeletable: deleting the channel
-/// removes the listing along with the channel, so no dangling reference is left behind.
+/// The store never holds a multiview channel whose available sources name a channel that
+/// is not a CMAF channel of the same group — a channel that names ITSELF among them being
+/// the limit case, since it is a MULTIVIEW channel and not a CMAF one. So no delete ever
+/// has to reason about a self-reference: the create that would have made one is refused,
+/// and the group is left exactly as it was.
+///
+/// The rows vary where the self-name sits in the list (alone, beside a real CMAF source)
+/// and whether anything else in the group names the channel.
 #[tokio::test]
-async fn a_multiview_channel_that_lists_its_own_name_stays_deletable() {
+async fn a_multiview_channel_cannot_name_itself_among_its_sources() {
     let emulator = Emulator::new();
     assert_eq!(emulator.create_group(GROUP, json!({})).await.0, 200);
+    let (status, body) = emulator
+        .create_channel(GROUP, "alpha", json!({"InputType": "CMAF"}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateChannel alpha expected 200, got {status} {body}"
+    );
+
     for (label, name, sources) in [
         ("only its own name", "self-only", vec!["self-only"]),
-        ("its own name beside another", "self-plus", vec!["alpha", "self-plus"]),
+        (
+            "its own name beside a real CMAF source",
+            "self-plus",
+            vec!["alpha", "self-plus"],
+        ),
+        (
+            "its own name before a real CMAF source",
+            "self-first",
+            vec!["self-first", "alpha"],
+        ),
     ] {
         let (status, body) = emulator
             .create_channel(GROUP, name, multiview_body(&sources))
             .await;
         assert_eq!(
-            status, 200,
-            "case {label:?}: CreateChannel {name} expected 200, got {status} {body}"
+            status, 400,
+            "case {label:?}: CreateChannel {name} must be refused, got {status} {body}"
         );
-        let (status, body) = emulator.delete_channel(GROUP, name).await;
         assert_eq!(
-            status, 200,
-            "case {label:?}: a self-listing channel must stay deletable, got {status} {body}"
+            error_type(&body),
+            "ValidationException",
+            "case {label:?}: expected a ValidationException envelope, got {body}"
+        );
+        assert_eq!(
+            body.get("ValidationExceptionType").and_then(Value::as_str),
+            Some("MULTIVIEW_SOURCE_NOT_FOUND"),
+            "case {label:?}: a source no channel of the group carries is the not-found \
+             discriminator, got {body}"
         );
         let (status, body) = emulator.get_channel(GROUP, name).await;
         assert_eq!(
             status, 404,
-            "case {label:?}: expected the deleted channel to be gone, got {status} {body}"
+            "case {label:?}: the refused create must have stored nothing, got {status} {body}"
         );
     }
+
+    // The CMAF channel the refused creates named is untouched: nothing attached it, so it
+    // is still deletable.
+    let (status, body) = emulator.delete_channel(GROUP, "alpha").await;
+    assert_eq!(
+        status, 200,
+        "alpha must still be deletable after the refused creates, got {status} {body}"
+    );
 }

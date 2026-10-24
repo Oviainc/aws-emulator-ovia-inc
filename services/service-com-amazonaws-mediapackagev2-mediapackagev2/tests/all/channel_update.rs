@@ -181,6 +181,20 @@ async fn a_committed_update_is_what_the_list_reports() {
         let channel = format!("chan-{index}");
         let emulator = Emulator::new();
         assert_eq!(emulator.create_group("grp", json!({})).await.0, 200);
+        // The sources a multiview row names have to be CMAF channels of the same group,
+        // which the model's `MultiviewConfiguration` doc requires of a tile source. They
+        // are seeded for every row: the rows the list assertions address are named
+        // `chan-<index>`, so these never stand in for one.
+        for source in ["src-a", "src-b"] {
+            assert_eq!(
+                emulator
+                    .create_channel("grp", source, json!({"InputType": "CMAF"}))
+                    .await
+                    .0,
+                200,
+                "case {label:?}: seeding the CMAF source {source} must succeed"
+            );
+        }
         let (status, created) = emulator
             .create_channel("grp", &channel, (case.create)())
             .await;

@@ -53,8 +53,9 @@
 //! baseline session ([`SessionKind`]) is the only kind this store records, and
 //! `GetSession` reports it out of that one record
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::session`]). No operation of this model
-//! records an approver's vote, so a session waits in `PENDING` until its expiration comes
-//! due and no response is ever reported as anything but `NO_RESPONSE`. A team's
+//! records an approver's vote, so a session waits in `PENDING` until either its expiration
+//! comes due or `CancelSession` ends it ([`Session::cancel`]), and no response is ever
+//! reported as anything but `NO_RESPONSE`. A team's
 //! outstanding baseline session is also what `GetApprovalTeam` reports for each approver
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]), so the
 //! two reads cannot disagree.
@@ -609,10 +610,10 @@ impl IdentitySource {
 /// `PENDING` the one it waits for its approvers in
 /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] owes that transition).
 /// `FAILED` is what a session that was never answered reaches when its expiration comes
-/// due. `APPROVED` and `CANCELLED` are the other two terminal statuses the model
-/// declares — no operation of this model records an approver's vote, and `CancelSession`
-/// is still scaffolded — so nothing constructs them today; they are carried here so the
-/// enum is the model's whole token catalog rather than the subset one operation reaches.
+/// due, and `CANCELLED` is what `CancelSession` records ([`Session::cancel`]). `APPROVED`
+/// is the one terminal status nothing constructs today — no operation of this model
+/// records an approver's vote — and is carried here so the enum is the model's whole
+/// token catalog rather than the subset one operation reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
     Creating,
@@ -839,6 +840,27 @@ impl Session {
     #[must_use]
     pub fn number_of_approvers(&self) -> i32 {
         i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
+    }
+
+    /// End this session in the terminal `CANCELLED` status, completed at `now`.
+    ///
+    /// IDEMPOTENT: a session already `CANCELLED` keeps the completion instant the first
+    /// call recorded, so cancelling twice reports one and the same record.
+    ///
+    /// No `SessionStatusCode` token stands for a cancellation (the four the model
+    /// declares are `REJECTED | EXPIRED | CONFIGURATION_CHANGED |
+    /// ALL_APPROVERS_IN_SESSION`), so a cancelled session reports no status code, and no
+    /// approver is claimed to have answered: every response stays as it stood.
+    pub fn cancel(&mut self, now: SystemTime) {
+        if self.status == SessionStatus::Cancelled {
+            return;
+        }
+        self.status = SessionStatus::Cancelled;
+        self.status_code = None;
+        self.completion_time = Some(now);
+        // A cancelled session is over, so the activation the clock still owed one that
+        // was `CREATING` is dropped: nothing may move it out of a terminal status.
+        self.activation_due = None;
     }
 
     /// Whether `approver_id` is one of the approvers this session asks.

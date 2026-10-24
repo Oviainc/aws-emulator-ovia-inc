@@ -14,8 +14,13 @@
 //! here, before anything is stored:
 //!
 //! * a member the docs restrict to particular `InputType`s is refused on any other
-//!   input type, with the `ValidationExceptionType` the model names for it (see
-//!   [`INPUT_TYPE_RULES`]);
+//!   input type, and a member the docs call REQUIRED on an input type is refused when it
+//!   is absent on one, each with the `ValidationExceptionType` the model names for it
+//!   (see [`crate::state::channel_input_type_violation`] and
+//!   [`crate::state::channel_required_member_violation`]). A submitted multiview
+//!   configuration is checked through as well: each of its two lists admits an entry at
+//!   most once, and every available source it names has to be a channel of this same
+//!   group whose input type a tile source may have;
 //! * `@idempotency`: a repeat under a `ClientToken` that already created a channel
 //!   replays that channel when the request is unchanged, and is a `ConflictException` /
 //!   `IDEMPOTENT_PARAMETER_MISMATCH` when any member differs.
@@ -254,12 +259,14 @@ fn submitted_members(input: &CreateChannelInput) -> crate::state::SubmittedChann
 }
 
 /// The first `InputType` restriction this request breaks, as the modeled
-/// `ValidationException` to answer it with.
+/// `ValidationException` to answer it with: a member submitted on an input type that may
+/// not carry it, or one an input type REQUIRES that the request leaves out. A create
+/// describes a whole channel, so both directions of the shared rule table apply to it.
 fn input_type_violation(input: &CreateChannelInput) -> Option<ValidationException> {
-    crate::state::channel_input_type_violation(
-        submitted_members(input),
-        effective_input_type(input),
-    )
+    let submitted = submitted_members(input);
+    let input_type = effective_input_type(input);
+    crate::state::channel_input_type_violation(submitted, input_type)
+        .or_else(|| crate::state::channel_required_member_violation(submitted, input_type))
 }
 
 /// The response for a stored channel. Both the create and its idempotent replay answer
@@ -347,6 +354,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(violation) = input_type_violation(&input) {
             return Err(CreateChannelErrorModeled::ValidationException(violation).into());
         }
+        // The contents of a submitted multiview configuration, in the same place and for
+        // the same reason: a list that repeats an entry is refused before anything is
+        // stored. Resolving the sources themselves needs the parent group, so that part
+        // waits until the group has been found.
+        if let Some(violation) = input
+            .multiview_configuration
+            .as_ref()
+            .and_then(crate::state::multiview_repetition_violation)
+        {
+            return Err(CreateChannelErrorModeled::ValidationException(violation).into());
+        }
 
         // A channel only exists inside a channel group, so the parent has to be there.
         // An absent parent is reported exactly as `GetChannelGroup` reports it: the
@@ -357,6 +375,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Now that the group is in hand, every available source the multiview
+        // configuration names is resolved against it: a tile source must be a channel of
+        // this same group, of the input type a source must have.
+        if let Some(violation) = input
+            .multiview_configuration
+            .as_ref()
+            .and_then(|multiview| crate::state::multiview_source_violation(group, multiview))
+        {
+            return Err(CreateChannelErrorModeled::ValidationException(violation).into());
+        }
 
         // The request's own fingerprint: every member it carried EXCEPT the token that
         // identifies the attempt.

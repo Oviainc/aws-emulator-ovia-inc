@@ -8,7 +8,10 @@
 //! as the create materialises them; every member the model restricts to particular input
 //! types is refused on the channel's STORED (immutable) input type through the same rule
 //! table `CreateChannel` uses; and the multiview configuration — which the model says
-//! can be changed but neither added nor removed — is preserved when the request omits it.
+//! can be changed but neither added nor removed — is preserved when the request omits it,
+//! and, when it carries one, is held to the same contents rules the create holds it to:
+//! neither of its lists may repeat an entry, and each available source must name a
+//! channel of the same group whose input type a tile source may have.
 //! The read-only `AttachedMultiviewChannels` member is DERIVED from the group after the
 //! write, as on every other channel reader, since an update neither adds nor removes an
 //! attachment.
@@ -259,12 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+        let Some(channel) = group.channels.get(&input.channel_name) else {
             return Err(UpdateChannelErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::Channel.not_found(),
             )
             .into());
         };
+        // What the checks below need from the channel, taken by value: the rules that
+        // follow read the WHOLE group (an available source is another of its channels),
+        // which they cannot do while a borrow of one channel is alive.
+        let stored_etag = channel.etag.clone();
+        let stored_input_type = channel.input_type.clone();
 
         // The precondition: a presented entity tag that is not the committed one means
         // somebody else committed first, which is what the model's `ConflictException` /
@@ -272,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input
             .e_tag
             .as_deref()
-            .is_some_and(|presented| presented != channel.etag)
+            .is_some_and(|presented| presented != stored_etag)
         {
             return Err(UpdateChannelErrorModeled::ConflictException(
                 crate::state::conflicting_operation(),
@@ -312,8 +320,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             multiview_configuration: input.multiview_configuration.is_some(),
         };
         if let Some(violation) =
-            crate::state::channel_input_type_violation(submitted, &channel.input_type)
+            crate::state::channel_input_type_violation(submitted, &stored_input_type)
         {
+            return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
+        }
+        // A submitted multiview configuration REPLACES the stored one, so its contents are
+        // held to the rules the create holds them to: neither list may repeat an entry,
+        // and every available source has to be a channel of this same group whose input
+        // type a tile source may have. The required-member direction is not an update's:
+        // an absent configuration leaves the stored one in place (below), so the channel
+        // still has the one its input type requires.
+        if let Some(violation) = input.multiview_configuration.as_ref().and_then(|multiview| {
+            crate::state::multiview_repetition_violation(multiview)
+                .or_else(|| crate::state::multiview_source_violation(group, multiview))
+        }) {
             return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
         }
 
@@ -326,6 +346,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // MATERIALISED, not echoed, by the same functions the create uses, so an update
         // that omits them leaves the channel with the state the service reports rather
         // than with nothing.
+        // Every refusal is behind us, so the channel can be taken mutably for the write.
+        // The group holds it under the name the request addressed, which the read above
+        // already resolved, so the lookup cannot miss: ONE hold of the store's lock
+        // covers both.
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(UpdateChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
         channel.description = input.description;
         channel.input_switch_configuration =
             crate::state::materialized_input_switch_configuration(input.input_switch_configuration);

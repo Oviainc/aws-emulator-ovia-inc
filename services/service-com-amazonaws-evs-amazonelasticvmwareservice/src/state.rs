@@ -1621,6 +1621,42 @@ pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
         .map(|line| line.esx_version)
 }
 
+/// The ESX versions Amazon EVS offers for `vcf_version` — the versions a caller finds
+/// with `GetVersions`: "To find the available ESX versions for a particular VCF version,
+/// use the GetVersions action" (`CreateEnvironmentHost` doc).
+///
+/// Taken from the catalogue `GetVersions` itself reports, so the two cannot disagree about
+/// which versions exist: a provided VCF version offers the ESX version its Bill Of
+/// Materials names ([`default_esx_version`]), which is the version
+/// `VcfVersionInfo$defaultEsxVersion` and `InstanceTypeEsxVersionsInfo$esxVersions` carry
+/// for it. EMPTY for a VCF version no [`VCF_RELEASE_LINES`] entry covers — the catalogue
+/// then states no versions for it, which is no evidence about any particular version
+/// rather than evidence against all of them.
+pub fn available_esx_versions(vcf_version: &str) -> Vec<&'static str> {
+    default_esx_version(vcf_version).into_iter().collect()
+}
+
+/// The `fieldList` entry for an `esxVersion` that is not one of the versions
+/// [`available_esx_versions`] offers for the environment's VCF version.
+///
+/// The sentence is built from the request and the catalogue: the version that was asked
+/// for, the VCF version it was asked for, and the versions that ARE available for it — so
+/// a caller can correct the request without a second call.
+pub fn unavailable_esx_version_failure(
+    esx_version: &str,
+    vcf_version: &str,
+    available: &[&str],
+) -> crate::ops::types::ValidationExceptionField {
+    field_failure_stated(
+        "esxVersion",
+        format!(
+            "esxVersion {esx_version} is not an ESX version Amazon EVS provides for VCF \
+             version {vcf_version}. The available ESX versions for it are {available}.",
+            available = available.join(", ")
+        ),
+    )
+}
+
 /// Every VCF version Amazon EVS PROVIDES, with the status, default ESX version and EC2
 /// instance types of each — what `GetVersions` reports as `vcfVersions`.
 ///

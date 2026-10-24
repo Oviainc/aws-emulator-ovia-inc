@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An idempotent operation completes no more than one time"
         // (`CreateProposal$ClientRequestToken`): a token already used replays the
         // proposal id its first call minted instead of creating a second proposal.
-        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         if let Some(created) = guard.replay_idempotent(&token) {
             return Ok(CreateProposalOutput {
                 proposal_id: created.proposal_id.clone(),
@@ -259,8 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The proposal this call creates does not exist yet, so the resources it was
         // asked to act on are the network it is put to and the member making it: those
-        // are the ones a not-found failure here names.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // are the ones a not-found failure here names. A network of another Region is not
+        // one this request can put a proposal to.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(CreateProposalErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -288,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MemberId` is "the unique identifier of the member that is creating the
         // proposal", and "any member can create a proposal": the member must be one of
         // this network's own.
-        let Some(member) = network.members.get(&input.member_id) else {
+        let Some(member) = network.member(&region, &input.member_id) else {
             return Err(CreateProposalErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.member_id),
             )
@@ -344,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::proposal_arn(&region, &proposal_id),
         };
 
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+        let Some(network) = guard.network_mut(&region, &input.network_id) else {
             return Err(CreateProposalErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )
@@ -363,11 +364,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // Answer from the STORED record, so this is the id every later read of the
-        // proposal answers to.
+        // proposal answers to — read back through the same Region-scoped resolver every
+        // other read goes through.
         let stored = guard
-            .networks
-            .get(&input.network_id)
-            .and_then(|network| network.proposals.get(&proposal_id));
+            .network(&region, &input.network_id)
+            .and_then(|network| network.proposal(&region, &proposal_id));
         let Some(stored) = stored else {
             return Err(CreateProposalErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},

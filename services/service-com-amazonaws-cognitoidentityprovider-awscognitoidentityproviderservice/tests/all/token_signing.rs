@@ -194,7 +194,7 @@ fn verify_against_jwks(token: &str, jwks: &Value) -> Result<Value, Rejected> {
     assert_eq!(key["use"], "sig", "the published JWK must be for signing");
     // RFC 7518 §6.2.1.2: each coordinate is the full-width octet string of the
     // field element, so both are exactly 32 bytes on P-256.
-    let coordinate = |member: &str| {
+    let coordinate = |member: &str| -> Vec<u8> {
         let bytes = decode_base64url(
             key[member]
                 .as_str()

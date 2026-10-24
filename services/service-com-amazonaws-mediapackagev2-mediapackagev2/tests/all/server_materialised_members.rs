@@ -531,10 +531,28 @@ async fn a_channel_reports_the_documented_defaults_the_service_applied() {
             status, 200,
             "case {label:?}: CreateChannelGroup expected 200, got {status} {body}"
         );
+        // A multiview row's available sources have to be CMAF channels of the same group
+        // before the row's own channel can name them, so each named source is seeded.
+        let body_json = (case.body)();
+        let sources = body_json
+            .pointer("/MultiviewConfiguration/AvailableSources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for source in &sources {
+            let source = source.as_str().unwrap_or_default();
+            let (status, seeded) = emulator
+                .create_channel(&group, source, json!({"InputType": "CMAF"}))
+                .await;
+            assert!(
+                // A row may name the same source twice over its lists; 409 is it already
+                // being there.
+                status == 200 || status == 409,
+                "case {label:?}: seeding source {source} expected 200 or 409, got {status} {seeded}"
+            );
+        }
 
-        let (status, created) = emulator
-            .create_channel(&group, &channel, (case.body)())
-            .await;
+        let (status, created) = emulator.create_channel(&group, &channel, body_json).await;
         assert_eq!(
             status, 200,
             "case {label:?}: CreateChannel expected 200, got {status} {created}"
@@ -562,7 +580,21 @@ async fn a_channel_reports_the_documented_defaults_the_service_applied() {
             status, 200,
             "case {label:?}: ListChannels expected 200, got {status} {listed}"
         );
-        let item = at(&listed, "/Items/0");
+        // The group may hold the seeded CMAF sources beside the row's own channel, so the
+        // list item is found by name rather than by position.
+        let item = listed["Items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item["ChannelName"] == json!(channel))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null);
+        assert!(
+            item.is_object(),
+            "case {label:?}: ListChannels must carry an item for {channel}, got {listed}"
+        );
 
         for (projection, body) in [
             ("CreateChannel", &created),

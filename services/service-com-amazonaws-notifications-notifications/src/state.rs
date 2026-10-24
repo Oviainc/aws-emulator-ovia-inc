@@ -482,8 +482,140 @@ impl OrganizationAccessRecord {
     }
 }
 
+/// `ACCOUNT_PRIMARY`, the account's primary contact.
+///
+/// One of the contact identifiers the `ChannelIdentifier` pattern accepts
+/// verbatim (beside `ACCOUNT_ALTERNATE_BILLING`,
+/// `ACCOUNT_ALTERNATE_OPERATIONS` and `ACCOUNT_ALTERNATE_SECURITY`, and the arn
+/// of a chatbot, console-app or contact channel). Every managed notification
+/// configuration this store publishes starts associated with it, so the
+/// `channelIdentifier` filter of a managed listing has a channel to select on
+/// before any association operation runs. The model does not say which
+/// associations an account starts with, so this seed is the EMULATOR's, not a
+/// claim about AWS's.
+pub const MANAGED_DEFAULT_CHANNEL_IDENTIFIER: &str = "ACCOUNT_PRIMARY";
+
+/// The managed notification configurations this store publishes, as
+/// `(category, subCategory, description)`.
+///
+/// A managed notification configuration is published BY the service: the model
+/// declares no create or delete for one, only `GetManagedNotificationConfiguration`
+/// and `ListManagedNotificationConfigurations` (plus the operations that
+/// associate channels with one), so the catalog is store state from boot rather
+/// than something a request inserts. The model does not enumerate the catalog
+/// either, so these entries are the EMULATOR's published set; their SHAPE is
+/// modelled — `ManagedNotificationConfigurationOsArn` is
+/// `managed-notification-configuration/category/<category>/sub-category/<subCategory>`
+/// with each segment `[a-zA-Z0-9\-]{3,64}` — and the sub-categories are the
+/// event-type categories of the service whose events AWS publishes managed
+/// notifications for.
+const MANAGED_NOTIFICATION_CATALOG: &[(&str, &str, &str)] = &[
+    (
+        "AWS-Health",
+        "Issue",
+        "Managed notifications for AWS Health issues that affect resources in this account.",
+    ),
+    (
+        "AWS-Health",
+        "AccountNotification",
+        "Managed notifications for AWS Health account notifications about this account.",
+    ),
+    (
+        "AWS-Health",
+        "ScheduledChange",
+        "Managed notifications for AWS Health scheduled changes to resources in this account.",
+    ),
+    (
+        "AWS-Health",
+        "Investigation",
+        "Managed notifications for AWS Health investigations into resources in this account.",
+    ),
+];
+
+/// One published `ManagedNotificationConfiguration`.
+///
+/// `ListManagedNotificationConfigurations` reports the `arn`/`name`/`description`
+/// of each of these as a `ManagedNotificationConfigurationStructure`, and
+/// `GetManagedNotificationConfiguration` reports the same record with its
+/// `category` and `subCategory` — which are the two segments its arn is built
+/// from, so a listed entry and the read of its arn can never disagree.
+#[derive(Debug, Clone)]
+pub struct ManagedNotificationConfigurationRecord {
+    /// The arn, built from `category` and `sub_category` — the single key for
+    /// lookup.
+    pub arn: String,
+    /// `name`, as both operations report it.
+    pub name: String,
+    /// `description`, as both operations report it.
+    pub description: String,
+    /// `category`, the arn's `category/` segment.
+    pub category: String,
+    /// `subCategory`, the arn's `sub-category/` segment.
+    pub sub_category: String,
+    /// Publication order within this store, counting from 1.
+    /// `ListManagedNotificationConfigurations` reports the catalog newest-first
+    /// by this order and pages through it, so a listing is stable and a page
+    /// token keeps its meaning.
+    pub sequence: u64,
+    /// The channel identifiers this managed configuration delivers to, each
+    /// mapped to the association sequence it was given — what the
+    /// `channelIdentifier` filter of a managed listing matches a configuration
+    /// on, and what `ListManagedNotificationChannelAssociations` reports once it
+    /// is implemented. Seeded with
+    /// [`MANAGED_DEFAULT_CHANNEL_IDENTIFIER`]; the associate and disassociate
+    /// operations add and remove entries.
+    pub channel_identifiers: BTreeMap<String, u64>,
+}
+
+/// How many channel-association sequences the seeded catalog consumes: one per
+/// published entry, for the [`MANAGED_DEFAULT_CHANNEL_IDENTIFIER`] each starts
+/// associated with. Derived from the catalog itself, so it cannot drift when
+/// entries are added or removed.
+pub const SEEDED_CHANNEL_ASSOCIATIONS: u64 = MANAGED_NOTIFICATION_CATALOG.len() as u64;
+
+/// The catalog as stored: arn -> record, in [`MANAGED_NOTIFICATION_CATALOG`]
+/// order. Built once per store so every read sees the same published set
+/// without a read ever writing to it.
+fn seeded_managed_configurations() -> BTreeMap<String, ManagedNotificationConfigurationRecord> {
+    MANAGED_NOTIFICATION_CATALOG
+        .iter()
+        .enumerate()
+        .map(|(index, (category, sub_category, description))| {
+            // `notifications` arns carry no region (`notifications::<account>:`).
+            let arn = ::engine::emulator_arn(
+                "notifications",
+                "",
+                &format!(
+                    "managed-notification-configuration/category/{category}/sub-category/{sub_category}"
+                ),
+            );
+            let record = ManagedNotificationConfigurationRecord {
+                arn: arn.clone(),
+                // `ManagedNotificationConfigurationName` is `[A-Za-z0-9\-]+`
+                // (len 1..64), which both arn segments already satisfy, so the
+                // name is derived from them rather than stored twice.
+                name: format!("{category}-{sub_category}"),
+                description: (*description).to_string(),
+                category: (*category).to_string(),
+                sub_category: (*sub_category).to_string(),
+                sequence: index as u64 + 1,
+                // The seeded association draws its sequence from the same
+                // counter every other association in this store uses (see
+                // `channel_associations_minted`), so a later minted association
+                // never reuses a seeded sequence and an association listing
+                // stays unambiguously ordered.
+                channel_identifiers: BTreeMap::from([(
+                    MANAGED_DEFAULT_CHANNEL_IDENTIFIER.to_string(),
+                    index as u64 + 1,
+                )]),
+            };
+            (arn, record)
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-notifications-notifications. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsNotificationsNotificationsState {
     /// arn -> configuration.
     pub configurations: BTreeMap<String, NotificationConfigurationRecord>,
@@ -511,15 +643,55 @@ pub struct ComAmazonawsNotificationsNotificationsState {
     /// [`NotificationConfigurationRecord::channel_arns`], so a `ListChannels`
     /// page token keeps its meaning across associations and disassociations —
     /// including a re-association of a channel that was removed, which lands
-    /// after the associations that outlived it.
+    /// after the associations that outlived it. It starts at
+    /// [`SEEDED_CHANNEL_ASSOCIATIONS`], the sequences the published catalog's
+    /// own associations already hold.
     pub channel_associations_minted: u64,
     /// Service Trust Enablement between User Notifications and Amazon Web
     /// Services Organizations for this account. One record per account, holding
     /// `DISABLED` until an enable asks for trust.
     pub organization_access: OrganizationAccessRecord,
+    /// arn -> published ManagedNotificationConfiguration. Seeded from
+    /// [`MANAGED_NOTIFICATION_CATALOG`] when the store is created, because the
+    /// service publishes these rather than a caller creating them.
+    pub managed_configurations: BTreeMap<String, ManagedNotificationConfigurationRecord>,
+}
+
+impl Default for ComAmazonawsNotificationsNotificationsState {
+    /// A fresh store holds no configuration, rule or hub a caller creates, has
+    /// service trust off — and already publishes the managed notification
+    /// catalog, which no request mints.
+    fn default() -> Self {
+        let managed_configurations = seeded_managed_configurations();
+        Self {
+            configurations: BTreeMap::new(),
+            configurations_minted: 0,
+            event_rules: BTreeMap::new(),
+            event_rules_minted: 0,
+            hubs: BTreeMap::new(),
+            hubs_registered: 0,
+            // The seeded associations of the published catalog already hold
+            // these sequences, so the next minted association lands after them.
+            channel_associations_minted: SEEDED_CHANNEL_ASSOCIATIONS,
+            organization_access: OrganizationAccessRecord::default(),
+            managed_configurations,
+        }
+    }
 }
 
 impl ComAmazonawsNotificationsNotificationsState {
+    /// Every published managed notification configuration in publication order
+    /// — the order `ListManagedNotificationConfigurations` reports (reversed, so
+    /// newest first) and pages through.
+    pub fn managed_configurations_in_publication_order(
+        &self,
+    ) -> Vec<&ManagedNotificationConfigurationRecord> {
+        let mut records: Vec<&ManagedNotificationConfigurationRecord> =
+            self.managed_configurations.values().collect();
+        records.sort_by_key(|record| record.sequence);
+        records
+    }
+
     /// Whether another configuration fits under
     /// [`MAX_NOTIFICATION_CONFIGURATIONS`]. A create that cannot must be
     /// refused with the modelled quota error, not served by growing the store.

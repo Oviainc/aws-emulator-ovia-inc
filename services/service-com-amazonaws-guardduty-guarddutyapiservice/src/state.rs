@@ -2546,6 +2546,25 @@ impl Detector {
             .find(|set| set.client_token.as_deref() == Some(token))
     }
 
+    /// The ids of the LIVE threat entity sets this detector holds, in
+    /// `ThreatEntitySetId` order (the id is the key they are stored under, so the
+    /// order is TOTAL — what makes a page token mean the same thing on the call
+    /// that handed it back).
+    ///
+    /// LIVE excludes a set whose delete has already been accepted
+    /// ([`EntitySetRecord::is_deleting`]): such a record is no longer one of the
+    /// detector's entity sets, so `ListThreatEntitySets` stops naming it, even
+    /// though it is retained ([`DELETED_ENTITY_SETS_RETAINED`]) so
+    /// `GetThreatEntitySet` can report the status the delete moved it to — the
+    /// same rule [`Self::live_ip_set_ids`] follows for a deleted IPSet.
+    pub fn live_threat_entity_set_ids(&self) -> Vec<String> {
+        self.threat_entity_sets
+            .values()
+            .filter(|set| !set.is_deleting())
+            .map(|set| set.id.clone())
+            .collect()
+    }
+
     /// The IPSet a create already minted for `token`, if any — the seam that makes
     /// `CreateIPSet` idempotent under a replayed `ClientToken`.
     ///

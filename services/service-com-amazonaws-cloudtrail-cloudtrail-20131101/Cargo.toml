@@ -47,8 +47,9 @@ sqlparser = { version = "0.59", features = ["visitor"] }
 # query run (36 characters of `^[a-f0-9\-]+$`): a v4 UUID, the form CloudTrail Lake
 # uses.
 uuid = { version = "1", features = ["v4"] }
-# Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`) and
-# the opaque `LookupEvents` one (`src/ops/lookup_events.rs`), which it also reads back.
+# Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`), the
+# opaque `LookupEvents` one (`src/ops/lookup_events.rs`), which it also reads back, and
+# the one `ListEventDataStores` issues through the shared `state::page_token` reader.
 hex = { workspace = true }
 
 [build-dependencies]

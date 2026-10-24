@@ -2270,6 +2270,11 @@ struct ChannelInputTypeRule {
     allowed: &'static [&'static str],
     /// The `ValidationExceptionType` the model declares for this combination.
     exception_type: &'static str,
+    /// The `ValidationExceptionType` for the OPPOSITE direction, on a member whose doc
+    /// also calls it REQUIRED on the input types that may carry it: the one the model
+    /// names for the member being absent on such an input type. `None` on a member the
+    /// docs only permit, never require.
+    required_as: Option<&'static str>,
     /// What the member is called in the sentence the refusal states.
     label: &'static str,
     /// Whether the request carries the member at all.
@@ -2290,6 +2295,9 @@ const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
         member: "outputLockingMode",
         allowed: &["CMAF", "MULTIVIEW"],
         exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE",
+        // The member has a documented DEFAULT, so an absent one is materialised rather
+        // than refused: see `materialized_output_locking_mode`.
+        required_as: None,
         label: "OutputLockingMode",
         present: |submitted| submitted.output_locking_mode,
     },
@@ -2297,6 +2305,7 @@ const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
         member: "inputSwitchConfiguration.mqcsInputSwitching",
         allowed: &["CMAF"],
         exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_INPUT_SWITCHING",
+        required_as: None,
         label: "MQCS input switching",
         present: |submitted| submitted.mqcs_input_switching,
     },
@@ -2304,6 +2313,7 @@ const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
         member: "inputSwitchConfiguration.preferredInput",
         allowed: &["CMAF"],
         exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_PREFERRED_INPUT_CONFIGURATION",
+        required_as: None,
         label: "PreferredInput",
         present: |submitted| submitted.preferred_input,
     },
@@ -2311,6 +2321,7 @@ const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
         member: "outputHeaderConfiguration.publishMqcs",
         allowed: &["CMAF"],
         exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_OUTPUT_CONFIGURATION",
+        required_as: None,
         label: "PublishMQCS",
         present: |submitted| submitted.publish_mqcs,
     },
@@ -2318,6 +2329,9 @@ const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
         member: "multiviewConfiguration",
         allowed: &[INPUT_TYPE_MULTIVIEW],
         exception_type: "MULTIVIEW_CONFIGURATION_NOT_ALLOWED",
+        // The only member the docs state in BOTH directions: "required when InputType is
+        // MULTIVIEW, and can't be set for any other input type".
+        required_as: Some("MULTIVIEW_CONFIGURATION_REQUIRED"),
         label: "MultiviewConfiguration",
         present: |submitted| submitted.multiview_configuration,
     },
@@ -2351,6 +2365,137 @@ pub fn channel_input_type_violation(
                 rule.exception_type,
             )
         })
+}
+
+/// The member an input type REQUIRES that the request does not carry, as the modeled
+/// `ValidationException` to answer it with, or `None` when every member `input_type`
+/// requires is there.
+///
+/// The other direction of [`channel_input_type_violation`], off the SAME rule table: a
+/// member whose doc both restricts it to particular input types and calls it required on
+/// them is refused when it is MISSING on one of those types, with the
+/// `ValidationExceptionType` the model names for that case.
+///
+/// Only a request that describes a WHOLE channel can be judged this way — the create. On
+/// an update, an absent member means "leave what is stored", not "the channel has none",
+/// so an update checks the present-but-not-allowed direction alone.
+pub fn channel_required_member_violation(
+    submitted: SubmittedChannelMembers,
+    input_type: &str,
+) -> Option<ValidationException> {
+    CHANNEL_INPUT_TYPE_RULES
+        .iter()
+        .find_map(|rule| {
+            let exception_type = rule.required_as?;
+            let missing = rule.allowed.contains(&input_type) && !(rule.present)(&submitted);
+            missing.then_some((rule, exception_type))
+        })
+        .map(|(rule, exception_type)| {
+            validation_failed(
+                rule.member,
+                &format!(
+                    "{} is required when the channel InputType is {}. Specify {}, or use \
+                     another input type, and then try again",
+                    rule.label,
+                    rule.allowed.join(" or "),
+                    rule.label
+                ),
+                exception_type,
+            )
+        })
+}
+
+/// The `InputType` a multiview channel's source channels must have, from
+/// `MultiviewConfiguration$AvailableSources`' doc ("must have an `InputType` of `CMAF`").
+pub const MULTIVIEW_SOURCE_INPUT_TYPE: &str = "CMAF";
+
+/// The member path of a submitted multiview configuration's source list, as a validation
+/// message names it (lowerCamel, as on the wire).
+const MULTIVIEW_SOURCES_MEMBER: &str = "multiviewConfiguration.availableSources";
+
+/// The member path of a submitted multiview configuration's layout list.
+const MULTIVIEW_LAYOUTS_MEMBER: &str = "multiviewConfiguration.availableLayouts";
+
+/// The first entry a list repeats, or `None` when every entry is distinct.
+fn first_repeated_entry(entries: &[String]) -> Option<&str> {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    entries
+        .iter()
+        .find(|entry| !seen.insert(entry.as_str()))
+        .map(String::as_str)
+}
+
+/// The first repetition a submitted multiview configuration carries, as the modeled
+/// `ValidationException` to answer it with.
+///
+/// Each of the two lists names a SET — the sources a player may be given as tiles and the
+/// layouts it may request — so "each must appear at most once"
+/// (`MultiviewConfiguration$AvailableLayouts`' doc), and each list has its own
+/// `ValidationExceptionType` for a repeat. About the request alone, so it is decided
+/// before the store is consulted.
+pub fn multiview_repetition_violation(
+    multiview: &MultiviewConfiguration,
+) -> Option<ValidationException> {
+    if first_repeated_entry(&multiview.available_sources).is_some() {
+        return Some(validation_failed(
+            MULTIVIEW_SOURCES_MEMBER,
+            &format!(
+                "Each source channel can appear at most once in a multiview channel's \
+                 available sources. {CHECK_THE_VALUE}"
+            ),
+            "MULTIVIEW_DUPLICATE_SOURCE",
+        ));
+    }
+    first_repeated_entry(&multiview.available_layouts).map(|_| {
+        validation_failed(
+            MULTIVIEW_LAYOUTS_MEMBER,
+            &format!(
+                "Each layout can appear at most once in a multiview channel's available \
+                 layouts. {CHECK_THE_VALUE}"
+            ),
+            "MULTIVIEW_DUPLICATE_LAYOUT",
+        )
+    })
+}
+
+/// The first available source a submitted multiview configuration names that `group`
+/// cannot serve as a tile, as the modeled `ValidationException` to answer it with.
+///
+/// `AvailableSources` names other CHANNELS, so it is resolved against the store the way
+/// every other reference to a resource is: a name no channel of the SAME group carries is
+/// the model's not-found discriminator, and one whose channel is not of the input type a
+/// tile source must have is its invalid-input-type one
+/// (`MultiviewConfiguration$AvailableSources`: "Each source channel must be in the same
+/// channel group as the multiview channel, and must have an `InputType` of `CMAF`"). The
+/// sources are walked in the order the request listed them, so the refusal is a function
+/// of the request and not of the store's iteration.
+pub fn multiview_source_violation(
+    group: &ChannelGroup,
+    multiview: &MultiviewConfiguration,
+) -> Option<ValidationException> {
+    for source in &multiview.available_sources {
+        let Some(channel) = group.channels.get(source) else {
+            return Some(validation_failed(
+                MULTIVIEW_SOURCES_MEMBER,
+                &format!(
+                    "Each source channel of a multiview channel must be a channel of the \
+                     same channel group. {CHECK_THE_VALUE}"
+                ),
+                "MULTIVIEW_SOURCE_NOT_FOUND",
+            ));
+        };
+        if channel.input_type != MULTIVIEW_SOURCE_INPUT_TYPE {
+            return Some(validation_failed(
+                MULTIVIEW_SOURCES_MEMBER,
+                &format!(
+                    "Each source channel of a multiview channel must have an InputType of \
+                     {MULTIVIEW_SOURCE_INPUT_TYPE}. {CHECK_THE_VALUE}"
+                ),
+                "MULTIVIEW_SOURCE_INVALID_INPUT_TYPE",
+            ));
+        }
+    }
+    None
 }
 
 /// Why a pagination token this service did not issue is refused — the detail

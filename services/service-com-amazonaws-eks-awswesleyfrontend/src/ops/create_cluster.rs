@@ -666,6 +666,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // operations that start one (`AssociateEncryptionConfig` and friends)
             // write into this map.
             updates: ::std::collections::BTreeMap::new(),
+            // No on-demand insights refresh has been started for a cluster that
+            // has just been created; `StartInsightsRefresh` writes this slot.
+            insights_refresh: None,
         };
 
         let cluster = record.to_cluster();

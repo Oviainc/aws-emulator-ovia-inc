@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-route53resolver-route53resolver service.
 //!
 //! Besides the state struct this module owns the small pieces the Resolver
-//! endpoint, Resolver rule and Resolver-on-Outpost operations share, so no two
+//! endpoint, Resolver rule, Resolver-on-Outpost and DNS Firewall domain-list
+//! operations share, so no two
 //! handlers grow their own copy: id minting, the RFC 3339 clock read, the
 //! clock-owed status transition, the opaque pagination cursor the `@paginated`
 //! list operations mint and verify, the record -> modelled-shape projections,
@@ -15,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    IpAddressResponse, OutpostResolver, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
-    ResourceNotFoundException, Tag, TargetAddress,
+    FirewallDomainList, IpAddressResponse, OutpostResolver, ResolverEndpoint, ResolverRule,
+    ResolverRuleAssociation, ResourceNotFoundException, Tag, TargetAddress,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -218,6 +219,33 @@ pub const MAX_STORED_RULES: usize = 1_000;
 /// See [`MAX_STORED_RULES`].
 pub const MAX_STORED_RULE_ASSOCIATIONS: usize = 1_000;
 
+/// The `FirewallDomainListStatus` a domain list this account owns reports once
+/// no import or update is under way.
+///
+/// The model's enum (`smithy_query(query="shape",shape="FirewallDomainListStatus")`,
+/// re-exported as [`crate::ops::types::FIREWALL_DOMAIN_LIST_STATUS_VALUES`]) is
+/// `COMPLETE | COMPLETE_IMPORT_FAILED | IMPORTING | DELETING | UPDATING`: the
+/// other values describe an import, an update or a delete in flight, none of
+/// which a create performs — `CreateFirewallDomainList` "creates an empty
+/// firewall domain list", which is settled the moment it exists, so the clock
+/// owes it no transition.
+pub const FIREWALL_DOMAIN_LIST_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `ResourceNotFoundException$ResourceType` for a firewall domain list: the
+/// modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_FIREWALL_DOMAIN_LIST: &str = "FirewallDomainList";
+
+/// The most firewall domain lists this store holds, for the same reason as
+/// [`MAX_STORED_ENDPOINTS`]: `CreateFirewallDomainList` admits any new
+/// `CreatorRequestId`, so without a bound a caller looping creates would grow
+/// one emulator process without limit. A create past this count is REFUSED by
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::can_store_another_firewall_domain_list`]
+/// with the `LimitExceededException` the operation models; a retry of a
+/// `CreatorRequestId` already stored stays allowed, because it allocates no new
+/// record.
+pub const MAX_STORED_FIREWALL_DOMAIN_LISTS: usize = 1_000;
+
 /// The most `TargetIps` one Resolver rule may be created with.
 ///
 /// The model's `TargetList` declares a minimum of 1 and NO maximum, so this is
@@ -303,6 +331,99 @@ pub fn resolver_rule_association_not_found(
             r#"Resolver rule association with ID "{resolver_rule_association_id}" does not exist."#
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
+    }
+}
+
+/// Whether `name` satisfies the model's `Name` pattern,
+/// `^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`
+/// (`smithy_query(query="shape",shape="Name")`): at least one character, every
+/// character a letter, a digit, a hyphen, an underscore, an apostrophe or a
+/// space, and not digits alone.
+///
+/// The pattern's negative lookahead is outside the syntax the boundary
+/// validator's regex engine accepts, so a name the pattern excludes reaches a
+/// handler; the operations that accept a `Name` refuse it here instead, with the
+/// client error each of them models.
+pub fn name_satisfies_pattern(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '\'' | ' '))
+        && !name.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The `ResourceNotFoundException` the firewall domain-list operations answer
+/// for an id they hold no list under, built here so every operation that
+/// resolves a `FirewallDomainListId` reports the same body. See
+/// [`resolver_rule_not_found`] on the absent `RSLVR-nnnnn` service error code.
+pub fn firewall_domain_list_not_found(
+    firewall_domain_list_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Firewall domain list with ID "{firewall_domain_list_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string()),
+    }
+}
+
+/// A firewall domain list, as stored.
+///
+/// `DomainCount` is DERIVED from [`Self::domains`] and never held separately, so
+/// the count and the domains cannot disagree.
+#[derive(Debug, Clone, Default)]
+pub struct FirewallDomainListRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// list order and the source of the minted id.
+    pub seq: u64,
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    pub creator_request_id: String,
+    /// The domain names this list holds, in the order they were added. A list
+    /// is "created empty" and is populated by `ImportFirewallDomains` or
+    /// `UpdateFirewallDomains`.
+    pub domains: Vec<String>,
+    /// The `FirewallDomainListStatus` this list reports; see
+    /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] on why a created list is
+    /// already settled.
+    pub status: String,
+    pub status_message: Option<String>,
+    /// `CreateFirewallDomainList$Tags`, kept with the record so they are not
+    /// silently discarded. `FirewallDomainList` models no `Tags` member, so no
+    /// response reports them: `ListTagsForResource` is a separate operation.
+    pub tags: Vec<Tag>,
+    pub creation_time: String,
+    pub modification_time: String,
+}
+
+impl FirewallDomainListRecord {
+    /// `DomainCount`: "The number of domain names that are specified in the
+    /// domain list."
+    pub fn domain_count(&self) -> i32 {
+        i32::try_from(self.domains.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Project the record onto the modelled `FirewallDomainList`.
+    pub fn to_domain_list(&self) -> FirewallDomainList {
+        FirewallDomainList {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            domain_count: Some(self.domain_count()),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            // `ManagedOwnerName`, `Category` and `ManagedListType` describe "the
+            // managed domain list" kinds AWS itself publishes; a list this
+            // account created is not one, so all three stay unset.
+            managed_owner_name: None,
+            creator_request_id: Some(self.creator_request_id.clone()),
+            creation_time: Some(self.creation_time.clone()),
+            modification_time: Some(self.modification_time.clone()),
+            category: None,
+            managed_list_type: None,
+        }
     }
 }
 
@@ -696,6 +817,13 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     pub rule_creator_request_id_index: HashMap<String, String>,
     /// Every stored rule-to-VPC association, keyed by its `Id`.
     pub resolver_rule_associations: HashMap<String, ResolverRuleAssociationRecord>,
+    /// Every stored firewall domain list, keyed by its `Id`.
+    pub firewall_domain_lists: HashMap<String, FirewallDomainListRecord>,
+    /// `CreatorRequestId` -> firewall domain list id, the same retry index as
+    /// [`Self::creator_request_id_index`] for the other resources: a
+    /// `CreatorRequestId` identifies a request to ONE operation, so this map is
+    /// kept apart from theirs.
+    pub firewall_domain_list_creator_request_ids: HashMap<String, String>,
     /// Monotonic counter behind every minted id (endpoint, IP, Resolver on an
     /// Outpost, rule, association), so ids are reproducible within a run and
     /// never collide — across resources as well as within one.
@@ -758,6 +886,13 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// answers `ServiceQuotaExceededException` and writes nothing.
     pub fn can_store_another_outpost_resolver(&self) -> bool {
         self.outpost_resolvers.len() < MAX_STORED_OUTPOST_RESOLVERS
+    }
+
+    /// Whether one more firewall domain list may be stored, i.e. the store is
+    /// still below [`MAX_STORED_FIREWALL_DOMAIN_LISTS`]. A create that this
+    /// refuses answers `LimitExceededException` and writes nothing.
+    pub fn can_store_another_firewall_domain_list(&self) -> bool {
+        self.firewall_domain_lists.len() < MAX_STORED_FIREWALL_DOMAIN_LISTS
     }
 
     /// Every stored Resolver on an Outpost in creation order — the order
@@ -847,6 +982,13 @@ pub fn mint_rule_id(seq: u64) -> String {
 /// Resolver rule association `rslvr-rrassoc-<hex>`.
 pub fn mint_rule_association_id(seq: u64) -> String {
     format!("rslvr-rrassoc-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of a firewall domain list from the id sequence. AWS names a
+/// DNS Firewall domain list `rslvr-fdl-<hex>`. Every result fits `ResourceId`
+/// (length 1..64).
+pub fn mint_firewall_domain_list_id(seq: u64) -> String {
+    format!("rslvr-fdl-{:016x}", scramble(seq))
 }
 
 /// The `HostVPCId` of an endpoint placed in `subnet_ids`.

@@ -846,10 +846,12 @@ async fn max_results_bounds_the_page_and_the_token_is_stable() {
 }
 
 /// `MaxResults` outside the bounds the model declares (`range 1..50`) is refused at the
-/// boundary, before the handler runs: the framework words a modelled-constraint violation
-/// as `ValidationException` (HTTP 400) for every service, and this service cannot narrow
-/// that to `InvalidMaxResultsException` without mis-coding the dozen other operations
-/// that carry a `MaxResults` member and model different errors for it.
+/// boundary, before the handler runs, with the error THIS operation's model declares for a
+/// limit that is not valid: `InvalidMaxResultsException` ("this exception is thrown if the
+/// limit specified is not valid"), HTTP 400. `ValidationException` is not an error
+/// `LookupEvents` declares, so a client catching the modelled one would miss the refusal
+/// altogether; the narrowing is wired per operation — only those whose model carries the
+/// shape — in `src/service.rs`.
 #[tokio::test]
 async fn a_max_results_outside_its_bounds_is_refused() {
     let emulator = Emulator::new();
@@ -859,7 +861,11 @@ async fn a_max_results_outside_its_bounds_is_refused() {
         emulator
             .lookup(&json!({"MaxResults": case}))
             .await
-            .expect_error(&format!("MaxResults={case}"), 400, "ValidationException");
+            .expect_error(
+                &format!("MaxResults={case}"),
+                400,
+                "InvalidMaxResultsException",
+            );
     }
     for case in [1, 25, 50] {
         emulator

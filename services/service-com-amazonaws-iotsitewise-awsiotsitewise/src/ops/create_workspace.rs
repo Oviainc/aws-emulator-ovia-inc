@@ -185,25 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
-        // `kmsKeyId`'s own documentation states the rule the enum cannot: it is
+        // "You must specify an encryption configuration when you create a workspace":
+        // the rules the shape states — a modelled `EncryptionType`, and a `kmsKeyId`
         // "Required for KMS_BASED_ENCRYPTION; must be omitted for
-        // SITEWISE_DEFAULT_ENCRYPTION".
+        // SITEWISE_DEFAULT_ENCRYPTION" — are checked in the one place that holds them
+        // for every operation supplying this shape, and before anything is written, so
+        // a refused create stores no workspace.
         let encryption = &input.encryption_configuration;
-        let key_named = encryption.kms_key_id.is_some();
-        match encryption.encryption_type.as_str() {
-            crate::state::ENCRYPTION_TYPE_KMS_BASED if !key_named => {
-                return Err(invalid_request(format!(
-                    "kmsKeyId is required for {} encryption.",
-                    crate::state::ENCRYPTION_TYPE_KMS_BASED
-                )));
-            }
-            crate::state::ENCRYPTION_TYPE_SITEWISE_DEFAULT if key_named => {
-                return Err(invalid_request(format!(
-                    "kmsKeyId must be omitted for {} encryption.",
-                    crate::state::ENCRYPTION_TYPE_SITEWISE_DEFAULT
-                )));
-            }
-            _ => {}
+        crate::state::check_workspace_encryption(encryption).map_err(invalid_request)?;
+
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, the way `CreatePipeline` enforces it,
+        // and before anything is stored.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
         }
 
         let mut store = state.lock();
@@ -260,6 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             active_at: now + crate::state::ACTIVATION_DELAY,
             settling_state: crate::state::STATE_CREATING.to_string(),
             client_token: input.client_token.clone(),
+            // Only an accepted `UpdateWorkspace` sets this.
+            update_token: None,
             tags: input.tags.clone().unwrap_or_default(),
         };
 

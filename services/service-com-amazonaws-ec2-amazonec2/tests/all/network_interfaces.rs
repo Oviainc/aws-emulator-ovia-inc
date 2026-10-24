@@ -230,6 +230,112 @@ async fn every_stored_interface_is_reported_and_a_later_write_is_visible() {
     );
 }
 
+/// Describing is a READ whatever the request asks for, so no shape of request may change
+/// what a later caller sees. The rows differ along everything a request can name — nothing
+/// at all, one id, every id, a filter that selects a subset, a filter that selects nothing,
+/// two filters joined, a tag filter, a page smaller than the store, the managed-resource
+/// flag, a dry run, and the two refusals — and after each one the store is exactly what it
+/// was and a second identical call answers identically. One request reporting the store is
+/// not evidence of that: the rule holds over the SET of request shapes.
+#[tokio::test]
+async fn no_shape_of_describe_changes_the_store_or_a_later_answer() {
+    let (router, engine) = super::ec2_query::emulator();
+    let seeded = seed(&engine);
+    let every_id: Vec<&str> = seeded.ids.iter().map(String::as_str).collect();
+
+    /// A well-formed interface id the account holds no interface for.
+    const UNHELD_ID: &str = "eni-00000000000000fed";
+
+    let shapes: Vec<(&str, Vec<(String, String)>)> = vec![
+        ("the whole store", Vec::new()),
+        (
+            "one named id",
+            indexed("NetworkInterfaceId", &[seeded.ids[0].as_str()]),
+        ),
+        ("every named id", indexed("NetworkInterfaceId", &every_id)),
+        (
+            "a filter that selects a subset",
+            filters(&[("subnet-id", &[seeded.subnet_ids[0].as_str()])]),
+        ),
+        (
+            "a filter that selects nothing",
+            filters(&[("description", &["no interface carries this description"])]),
+        ),
+        (
+            "two filters joined with an AND",
+            filters(&[
+                ("status", &["available"]),
+                ("interface-type", &["interface"]),
+            ]),
+        ),
+        ("a tag filter", filters(&[("tag:Name", &["web"])])),
+        (
+            "a page smaller than the store",
+            vec![param("MaxResults", "5")],
+        ),
+        (
+            "the managed-resource flag",
+            vec![param("IncludeManagedResources", "true")],
+        ),
+        ("a dry run", vec![param("DryRun", "true")]),
+        (
+            "an id the account holds no interface for",
+            indexed("NetworkInterfaceId", &[UNHELD_ID]),
+        ),
+        (
+            "a filter name the operation does not document",
+            filters(&[("not-a-filter", &["anything"])]),
+        ),
+    ];
+
+    // The interfaces and the subnets they take their addresses from: what a write by this
+    // operation would have to show up in.
+    let snapshot = || {
+        let state = engine.state::<Ec2State>();
+        let store = state.lock();
+        format!("{:?}|{:?}", store.network_interfaces, store.subnets)
+    };
+    let before = snapshot();
+    assert!(
+        !seeded.ids.is_empty(),
+        "the invariant is asserted against a POPULATED store, which holds {} interfaces",
+        seeded.ids.len()
+    );
+
+    for (case, params) in shapes {
+        let (first_status, first_body) = describe(&router, &params).await;
+        let (second_status, second_body) = describe(&router, &params).await;
+        assert_eq!(
+            first_status, second_status,
+            "case {case:?}: expected the repeat to answer HTTP {first_status}, got \
+             {second_status} with body {second_body}"
+        );
+        let first_ids = elements(&first_body, "networkInterfaceId");
+        let second_ids = elements(&second_body, "networkInterfaceId");
+        assert_eq!(
+            first_ids, second_ids,
+            "case {case:?}: expected the repeat to report {first_ids:?}, got {second_ids:?}"
+        );
+        assert_eq!(
+            element(&first_body, "nextToken"),
+            element(&second_body, "nextToken"),
+            "case {case:?}: expected the repeat to carry the same token, got {second_body}"
+        );
+        assert_eq!(
+            error_code(&first_body),
+            error_code(&second_body),
+            "case {case:?}: expected the repeat to carry the same error code, got \
+             {second_body}"
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "case {case:?}: describing network interfaces must write nothing, and the \
+             answer was HTTP {first_status} with body {first_body}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Create, then read it back
 // ---------------------------------------------------------------------------

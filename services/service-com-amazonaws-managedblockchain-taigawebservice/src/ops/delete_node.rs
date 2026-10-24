@@ -150,7 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The deletion is driven entirely by stored state; the request carries no
         // region-dependent value to mint.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so a node of another
+        // Region is not this request's to delete.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteNodeErrorModeled::InternalServiceErrorException(
@@ -164,8 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DELETE /networks/{NetworkId}/nodes/{NodeId}` nests the node INSIDE the
         // network, so the path labels resolve left to right: a `NetworkId` this service
-        // does not hold is itself the missing resource, and nothing inside it is reached.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // does not hold in this Region is itself the missing resource, and nothing inside
+        // it is reached.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(DeleteNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -193,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The network resolved, so the leaf label is next: the NODE is the resource this
         // operation was asked to delete, and `MemberId` — a query member, not a path
         // label — only scopes that lookup.
-        let found = network.nodes.get(&input.node_id).filter(|node| {
+        let found = network.node(&region, &input.node_id).filter(|node| {
             input
                 .member_id
                 .as_deref()
@@ -223,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+        let Some(network) = guard.network_mut(&region, &input.network_id) else {
             return Err(DeleteNodeErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )

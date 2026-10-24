@@ -17,6 +17,8 @@ mod channel_associations;
 mod event_rules;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/managed_notification_configurations.rs"]
+mod managed_notification_configurations;
 #[path = "all/notification_configurations.rs"]
 mod notification_configurations;
 #[path = "all/notification_hubs.rs"]

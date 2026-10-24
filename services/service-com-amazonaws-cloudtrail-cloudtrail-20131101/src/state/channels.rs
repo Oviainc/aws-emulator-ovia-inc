@@ -43,24 +43,12 @@ const AWS_PARTITION: &str = "aws";
 /// lowercase-hex groups of 8-4-4-4-12 digits, the canonical form AWS mints a channel
 /// id and an event data store id in.
 ///
-/// It lives in this module because the channel path is what reads it: a minted channel
-/// id, and the `<uuid>` of a `Destination$Location`. (`widget_query::is_event_data_store_id`
-/// and `ops::list_imports::is_import_id` read the same form for their own ids; folding the
-/// three into one reader belongs with whichever of those operations is worked next.)
+/// It is [`super::is_minted_uuid_id`], this service's ONE statement of that form,
+/// which reads exactly the canonical lowercase hyphenated rendering through the `uuid`
+/// crate; this name is what the channel path calls it by (a minted channel id, and the
+/// `<uuid>` of a `Destination$Location`).
 fn is_uuid(value: &str) -> bool {
-    /// The 8-4-4-4-12 group lengths that make up the 36 characters of a `UUID`.
-    const GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
-
-    let mut groups = value.split('-');
-    let grouped_as_a_uuid = GROUP_LENGTHS.iter().all(|length| {
-        groups.next().is_some_and(|group| {
-            group.len() == *length
-                && group
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b.is_ascii_lowercase() && b.is_ascii_hexdigit()))
-        })
-    });
-    grouped_as_a_uuid && groups.next().is_none()
+    super::is_minted_uuid_id(value)
 }
 
 /// A fresh channel id in the modelled `UUID` form — "the `UUID` value of the channel"
@@ -326,17 +314,18 @@ pub fn channel_arn(region: &str, channel_id: &str) -> String {
 /// Whether `value` has the shape of an id CloudTrail minted: the modelled `UUID`
 /// (`com.amazonaws.cloudtrail#UUID`, `@length 36` of `^[a-f0-9\-]+$` in `8-4-4-4-12`
 /// groups), which is the `<uuid>` of `DeleteChannelRequest$Channel` ("The ARN or the
-/// UUID value of the channel"). It is the ONE reading of that form in this crate
-/// ([`is_uuid`]), shared with the service's other `UUID`-shaped ids.
+/// UUID value of the channel").
+///
+/// It reads that form through [`is_uuid`], i.e. [`super::is_minted_uuid_id`] — the
+/// service's ONE statement of what a minted UUID id looks like. The channel id and the
+/// event data store id are the same shape, and the shared page-token reader checks a
+/// resume key through whichever of these names the listing hands it, so a predicate of
+/// its own here could accept a position the other refuses.
 ///
 /// It is what a MINTED id looks like, not a rule a caller-supplied id is checked
 /// against: an id CloudTrail never minted names no channel, which is an absent channel
 /// and not a malformed identifier. Only the ARN FORM is checked, because only an ARN
 /// has a format to get wrong.
-///
-/// Only a MINTER needs this (`CreateChannel`, to mint one, and a caller that wants to
-/// know whether an id could be one): resolving an identifier does not, because an id of
-/// any other shape simply names no channel.
 pub fn is_minted_channel_id(value: &str) -> bool {
     is_uuid(value)
 }

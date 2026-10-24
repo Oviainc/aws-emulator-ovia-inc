@@ -19,6 +19,8 @@ mod error_envelope;
 mod hosted_zone_config;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
+#[path = "all/hosted_zones_by_vpc.rs"]
+mod hosted_zones_by_vpc;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

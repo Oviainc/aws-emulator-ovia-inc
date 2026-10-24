@@ -129,7 +129,11 @@ pub(crate) async fn create_goal(client: &Client, profile_arn: &str, body: Value)
         .await
 }
 
-async fn get_goal(client: &Client, profile_arn: &str, id: &str) -> Answer {
+/// `GET /api/v1/agent-profiles/{profileArn}/goals/{goalId}`.
+///
+/// `pub(crate)` because the listing suite beside this one reads a listed goal back
+/// through the single-goal reader, and a goal is read by exactly one operation.
+pub(crate) async fn get_goal(client: &Client, profile_arn: &str, id: &str) -> Answer {
     client
         .send(
             "GET",

@@ -147,7 +147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The update is driven entirely by stored state and the request body; nothing
         // region-dependent is minted here (the member's ARN and CA endpoint were minted by
         // its create and are never recomputed).
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so a member of another
+        // Region is not this request's to update.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateMemberErrorModeled::InternalServiceErrorException(
@@ -161,9 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `PATCH /networks/{NetworkId}/members/{MemberId}` nests the member INSIDE the
         // network, so the path labels resolve left to right: a `NetworkId` this service
-        // does not hold is itself the missing resource, and the member inside it is never
-        // reached (and nothing is written for the request).
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+        // does not hold in this Region is itself the missing resource, and the member
+        // inside it is never reached (and nothing is written for the request).
+        let Some(network) = guard.network_mut(&region, &input.network_id) else {
             return Err(UpdateMemberErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -171,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The network resolved, so the leaf label is next: the MEMBER is the resource this
-        // operation was asked to update, and one the network does not hold is the resource
-        // the request asked for and did not get.
-        let Some(member) = network.members.get_mut(&input.member_id) else {
+        // operation was asked to update, and one the network does not hold in this Region
+        // is the resource the request asked for and did not get.
+        let Some(member) = network.member_mut(&region, &input.member_id) else {
             return Err(UpdateMemberErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.member_id),
             )

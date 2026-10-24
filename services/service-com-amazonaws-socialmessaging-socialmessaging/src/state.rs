@@ -82,6 +82,56 @@ pub const MAX_RETAINED_SENT_MESSAGES: usize = 128;
 /// The newest send is always retained, even on its own.
 pub const MAX_RETAINED_SENT_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// How many accepted conversion events the store retains, oldest evicted first.
+/// Emulator-chosen for the same reason as [`MAX_RETAINED_SENT_MESSAGES`]:
+/// `SendWhatsAppConversionEvent` appends a caller-sized blob per call and models no quota
+/// error, so the record is trimmed rather than the call refused.
+pub const MAX_RETAINED_CONVERSION_EVENTS: usize = 128;
+
+/// The bytes of retained conversion-event payloads, which with
+/// [`MAX_RETAINED_CONVERSION_EVENTS`] bounds the record whatever size the modelled
+/// `1..1024000` blob arrives at. The newest event is always retained, even on its own.
+pub const MAX_RETAINED_CONVERSION_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many digits a minted dataset id carries.
+///
+/// The model's `WhatsAppDatasetId` is `len 10..20, pattern ^[0-9]+$` and documents a
+/// Meta-generated "numeric string of 10 to 20 digits"; 15 sits inside that range at both
+/// ends, so a minted id satisfies the constraint with room on either side.
+const DATASET_ID_DIGITS: u32 = 15;
+
+/// The message this service's `ResourceNotFoundException` carries.
+///
+/// The text is CONSTANT: nothing of the request reaches it, so a client's match on it does
+/// not depend on what it asked for and the lookup key never reaches an error the service
+/// keeps opaque. The model documents the error only as "The resource was not found."; this
+/// text is the one the service's READS were recorded answering, identically for two
+/// accounts named by 36- and 115-character ids, which is what shows it is not derived from
+/// the request. Every not-found path takes a constant; the Conversions API's own is
+/// [`DATASET_NOT_FOUND_MESSAGE`] and the phone-number lookups' is
+/// [`ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE`].
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found.";
+
+/// The message the PHONE-NUMBER lookup paths' `ResourceNotFoundException` carries.
+///
+/// A constant too, and the one that lookup was recorded answering for a phone number this
+/// account has not registered: it names the KIND of key that resolved to no resource — an
+/// origination phone number id — and nothing of the value itself, so it does not vary
+/// with the request. The rule is the one [`RESOURCE_NOT_FOUND_MESSAGE`] states — a
+/// not-found message is a constant, not a formatted one — with each lookup stating the
+/// constant it was recorded with; every operation that resolves a phone-number id (the
+/// phone-number read, the send) states this one.
+pub const ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE: &str =
+    "Origination phone number id not found for account.";
+
+/// The message the Conversions API's `ResourceNotFoundException` carries.
+///
+/// A constant too, and the one `SendWhatsAppConversionEvent` was recorded answering: that
+/// path states its own text rather than the one the account reads state
+/// ([`RESOURCE_NOT_FOUND_MESSAGE`]), so the rule — a not-found message is a constant, not
+/// a formatted one — holds with each path stating the constant it was recorded with.
+pub const DATASET_NOT_FOUND_MESSAGE: &str = "Id not found for account.";
+
 /// A WhatsApp Business Account linked to this account, as
 /// `AssociateWhatsAppBusinessAccount` stored it.
 #[derive(Debug, Clone)]
@@ -164,6 +214,21 @@ pub struct SentMessage {
     pub sent_at: SystemTime,
 }
 
+/// One accepted `SendWhatsAppConversionEvent` call.
+#[derive(Debug, Clone)]
+pub struct ConversionEvent {
+    /// The minted, per-call `requestId` returned to the caller.
+    pub request_id: String,
+    /// The [`LinkedAccount::id`] the event was sent for.
+    pub linked_account_id: String,
+    /// The [`LinkedAccount::dataset_id`] the event was sent to.
+    pub dataset_id: String,
+    /// The Conversions API payload exactly as the caller supplied it.
+    pub event_data: Vec<u8>,
+    /// When the call was accepted.
+    pub sent_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-socialmessaging-socialmessaging. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSocialmessagingSocialmessagingState {
@@ -178,6 +243,12 @@ pub struct ComAmazonawsSocialmessagingSocialmessagingState {
     pub sent_messages: VecDeque<SentMessage>,
     /// The bytes of the message bodies `sent_messages` currently holds.
     pub retained_message_bytes: usize,
+    /// Every accepted conversion event, oldest first. Bounded by
+    /// [`MAX_RETAINED_CONVERSION_EVENTS`] and [`MAX_RETAINED_CONVERSION_EVENT_BYTES`];
+    /// see [`Self::record_conversion_event`].
+    pub conversion_events: VecDeque<ConversionEvent>,
+    /// The bytes of the payloads `conversion_events` currently holds.
+    pub retained_conversion_event_bytes: usize,
     /// ARN -> resource id, so an ARN-form `id` input resolves to the same record
     /// as the short form.
     pub arn_index: HashMap<String, String>,
@@ -231,6 +302,27 @@ impl ComAmazonawsSocialmessagingSocialmessagingState {
         }
     }
 
+    /// Record an accepted conversion event, evicting the oldest records until the
+    /// retained set is back inside [`MAX_RETAINED_CONVERSION_EVENTS`] and
+    /// [`MAX_RETAINED_CONVERSION_EVENT_BYTES`]. The event just accepted is always kept.
+    pub fn record_conversion_event(&mut self, event: ConversionEvent) {
+        self.retained_conversion_event_bytes += event.event_data.len();
+        self.conversion_events.push_back(event);
+        while self.conversion_events.len() > MAX_RETAINED_CONVERSION_EVENTS
+            || (self.retained_conversion_event_bytes > MAX_RETAINED_CONVERSION_EVENT_BYTES
+                && self.conversion_events.len() > 1)
+        {
+            match self.conversion_events.pop_front() {
+                Some(evicted) => {
+                    self.retained_conversion_event_bytes = self
+                        .retained_conversion_event_bytes
+                        .saturating_sub(evicted.event_data.len());
+                }
+                None => break,
+            }
+        }
+    }
+
     /// 32 lowercase hex characters, unique per call: the digest of `kind` and this
     /// store's monotonic sequence number. Distinct `kind`s never collide, so a
     /// linked-account suffix is never also a phone-number suffix.
@@ -269,6 +361,33 @@ impl ComAmazonawsSocialmessagingSocialmessagingState {
         format!("wamid.{}", self.next_hex32("message"))
     }
 
+    /// Mint the Meta Conversions API dataset id `CreateWhatsAppDataset` returns:
+    /// [`DATASET_ID_DIGITS`] decimal digits with a non-zero lead, read off this store's
+    /// own unique digest, so it satisfies `WhatsAppDatasetId` and two datasets never get
+    /// the same id.
+    pub fn mint_dataset_id(&mut self) -> String {
+        let digest = self.next_hex32("dataset");
+        // 15 hex characters are 60 bits, which a u64 holds.
+        let value = u64::from_str_radix(&digest[..15], 16).unwrap_or(self.id_seq);
+        let lead = 10_u64.pow(DATASET_ID_DIGITS - 1);
+        (lead + value % (9 * lead)).to_string()
+    }
+
+    /// Mint the `requestId` `SendWhatsAppConversionEvent` returns: the 8-4-4-4-12 form a
+    /// request id takes, over this store's own unique digest, so each accepted call
+    /// reports its own id.
+    pub fn mint_request_id(&mut self) -> String {
+        let hex = self.next_hex32("conversion-event");
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    }
+
     /// The stored linked account an `id` input names, accepting both the
     /// `waba-...` short form and the account ARN.
     pub fn resolve_linked_account(&self, id: &str) -> Option<&LinkedAccount> {
@@ -303,6 +422,23 @@ impl ComAmazonawsSocialmessagingSocialmessagingState {
             .get(id)
             .filter(|resolved| self.phone_numbers.contains_key(resolved.as_str()))
             .cloned()
+    }
+
+    /// The tags of the resource `arn` names, or `None` when this store holds no
+    /// resource under that ARN.
+    ///
+    /// Both resource kinds this service tags — a linked account and a registered
+    /// phone number — keep their tags on their own record and are reachable through
+    /// [`Self::arn_index`], so a tag read is over the SAME map the resource was
+    /// created with and reports nothing a write did not put there.
+    pub fn tags_for_arn(&self, arn: &str) -> Option<Vec<Tag>> {
+        let id = self.arn_index.get(arn)?;
+        let tags = self
+            .linked_accounts
+            .get(id)
+            .map(|account| &account.tags)
+            .or_else(|| self.phone_numbers.get(id).map(|number| &number.tags))?;
+        Some(tag_list(tags))
     }
 
     /// Every linked account whose setup is not finished, keyed by its Meta
@@ -379,6 +515,22 @@ pub fn tag_map(tags: Vec<Tag>) -> HashMap<String, String> {
     tags.into_iter()
         .map(|tag| (tag.key, tag.value.unwrap_or_default()))
         .collect()
+}
+
+/// A resource's stored tags as the modelled `TagList` a read reports.
+///
+/// Ordered by key, because a `HashMap` has no order of its own and two reads of one
+/// unchanged resource report the same list.
+pub fn tag_list(tags: &HashMap<String, String>) -> Vec<Tag> {
+    let mut list: Vec<Tag> = tags
+        .iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: Some(value.clone()),
+        })
+        .collect();
+    list.sort_by(|left, right| left.key.cmp(&right.key));
+    list
 }
 
 /// A stored instant as the wire timestamp the model's `timestamp` members carry.

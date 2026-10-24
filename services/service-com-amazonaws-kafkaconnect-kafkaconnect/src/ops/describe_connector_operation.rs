@@ -203,16 +203,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every value `ConnectorOperationStepType` models names a step of an
             // UPDATE (`INITIALIZE_UPDATE`, `VALIDATE_UPDATE`,
             // `UPDATE_WORKER_SETTING`, `UPDATE_CONNECTOR_CONFIGURATION`,
-            // `FINALIZE_UPDATE`), so a restart has no modelled step to report
-            // and none is invented for it.
-            operation_steps: None,
+            // `FINALIZE_UPDATE`), so an operation that is not an update carries
+            // no step and none is invented for it.
+            operation_steps: operation.steps(),
             // The origin and target settings are the before and after of an
-            // update; a restart changes neither the connector's worker setting
-            // nor its configuration, so there is no pair to report.
-            origin_worker_setting: None,
-            origin_connector_configuration: None,
-            target_worker_setting: None,
-            target_connector_configuration: None,
+            // update, reported from the pair the stored operation holds: the
+            // worker setting for an update to the connector's capacity, the
+            // configuration for an update to its configuration, and neither
+            // for an operation (a restart) that changes no settings.
+            origin_worker_setting: operation
+                .origin
+                .as_ref()
+                .and_then(crate::state::ConnectorSettings::worker_setting),
+            origin_connector_configuration: operation
+                .origin
+                .as_ref()
+                .and_then(crate::state::ConnectorSettings::configuration),
+            target_worker_setting: operation
+                .target
+                .as_ref()
+                .and_then(crate::state::ConnectorSettings::worker_setting),
+            target_connector_configuration: operation
+                .target
+                .as_ref()
+                .and_then(crate::state::ConnectorSettings::configuration),
             // `errorInfo` describes a FAILED operation; nothing in this
             // emulator's progression fails.
             error_info: None,

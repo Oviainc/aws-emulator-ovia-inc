@@ -169,10 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(SendWhatsAppMessageErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no WhatsApp phone number with id '{}'",
-                        input.origination_phone_number_id
-                    )),
+                    message: Some(
+                        crate::state::ORIGINATION_PHONE_NUMBER_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
