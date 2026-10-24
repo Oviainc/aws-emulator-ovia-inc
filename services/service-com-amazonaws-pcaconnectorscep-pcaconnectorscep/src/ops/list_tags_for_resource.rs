@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags stored on the connector or challenge `ResourceArn` names, read straight
+//! off that record. A reporting operation: the one write it makes is materialising the
+//! transition the clock already owes the connectors, so a resource whose teardown has come
+//! due is reported as gone rather than as tagged.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        // The only write a report may make: the transition the clock already owes.
+        store.settle(now);
+
+        // Both of this service's resources carry their tags on their own record, so one
+        // lookup keyed by the ARN's shape answers for a connector and for a challenge alike.
+        let tags = store
+            .tags_of(&input.resource_arn)
+            .ok_or_else(|| not_found(&input.resource_arn))?;
+        Ok(ListTagsForResourceOutput {
+            // `Tags` is the map as stored: empty for a resource created without tags, which
+            // is a resource with no tags and not a missing member.
+            tags: Some(
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// This service holds no connector or challenge under this ARN — HTTP 404
+/// `ResourceNotFoundException`, whose own doc covers both the resource that is gone and the
+/// one "incorrectly specified". A listing after the resource (or its owning connector) was
+/// deleted lands here.
+fn not_found(resource_arn: &str) -> ListTagsForResourceError {
+    let resource_type = crate::state::resource_type_of(resource_arn);
+    ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("{resource_type} {resource_arn} could not be found"),
+        resource_id: resource_arn.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+        message: "the Connector for SCEP connector store is unavailable".to_string(),
+    })
+    .into()
 }

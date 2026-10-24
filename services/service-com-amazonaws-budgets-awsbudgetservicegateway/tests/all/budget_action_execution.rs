@@ -57,7 +57,9 @@ fn budget(name: &str) -> Value {
 }
 
 /// Create `name` under `account_id` and fail the test if the setup call did not take.
-async fn seed_budget(router: &MultiServiceRouter, account_id: &str, name: &str) {
+///
+/// `pub(crate)` so the sibling deletion suite seeds its budgets the same way.
+pub(crate) async fn seed_budget(router: &MultiServiceRouter, account_id: &str, name: &str) {
     let (status, body) = call(
         router,
         "CreateBudget",
@@ -77,7 +79,7 @@ const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/budget-action-e
 
 /// `Definition.IamActionDefinition` — `PolicyArn` satisfies `PolicyArn`'s
 /// `@length(25, 684)` and pattern; `Roles` is one of the three optional attach lists.
-fn iam_definition() -> Value {
+pub(crate) fn iam_definition() -> Value {
     json!({
         "IamActionDefinition": {
             "PolicyArn": "arn:aws:iam::111122223333:policy/DenyExpensiveLaunches",
@@ -112,7 +114,7 @@ fn ssm_definition() -> Value {
 
 /// The `Definition` member each `ActionType` is written with — "this field also
 /// determines the format for definition" (`Action$ActionType`).
-fn definition_for(action_type: &str) -> Value {
+pub(crate) fn definition_for(action_type: &str) -> Value {
     match action_type {
         "APPLY_IAM_POLICY" => iam_definition(),
         "APPLY_SCP_POLICY" => scp_definition(),
@@ -123,12 +125,12 @@ fn definition_for(action_type: &str) -> Value {
 
 /// An email subscriber; `Address` satisfies `SubscriberAddress`'s `@length(min: 1)` and
 /// its "can't contain line breaks" rule.
-fn email_subscriber(n: usize) -> Value {
+pub(crate) fn email_subscriber(n: usize) -> Value {
     json!({"SubscriptionType": "EMAIL", "Address": format!("ops{n}@example.com")})
 }
 
 /// The SNS subscriber: "either an SNS topic or an email".
-fn sns_subscriber() -> Value {
+pub(crate) fn sns_subscriber() -> Value {
     json!({
         "SubscriptionType": "SNS",
         "Address": "arn:aws:sns:us-east-1:111122223333:budget-action-alerts"
@@ -137,7 +139,7 @@ fn sns_subscriber() -> Value {
 
 /// A `CreateBudgetAction` request body.
 #[allow(clippy::too_many_arguments)]
-fn create_body(
+pub(crate) fn create_body(
     account_id: &str,
     budget_name: &str,
     action_type: &str,
@@ -167,7 +169,7 @@ fn create_body(
 
 /// The simplest action a row can create, for the tests that vary something other than
 /// the action's own members.
-fn simple_create_body(account_id: &str, budget_name: &str) -> Value {
+pub(crate) fn simple_create_body(account_id: &str, budget_name: &str) -> Value {
     create_body(
         account_id,
         budget_name,
@@ -183,7 +185,11 @@ fn simple_create_body(account_id: &str, budget_name: &str) -> Value {
 
 /// Create one action and answer its minted `ActionId`, failing the test if the setup
 /// call did not take.
-async fn seed_action(router: &MultiServiceRouter, account_id: &str, budget_name: &str) -> String {
+pub(crate) async fn seed_action(
+    router: &MultiServiceRouter,
+    account_id: &str,
+    budget_name: &str,
+) -> String {
     let (status, body) = call(
         router,
         "CreateBudgetAction",
@@ -203,7 +209,7 @@ async fn seed_action(router: &MultiServiceRouter, account_id: &str, budget_name:
 /// Whether `value` has the shape `ActionId`'s modelled pattern requires
 /// (`smithy_query(query="shape",shape="ActionId")`:
 /// `^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`).
-fn is_action_id(value: &str) -> bool {
+pub(crate) fn is_action_id(value: &str) -> bool {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == GROUPS.len()
@@ -217,7 +223,7 @@ fn is_action_id(value: &str) -> bool {
 
 /// The `Action` one `DescribeBudgetAction` call reports, or `Value::Null` when the read
 /// was refused.
-async fn describe_action(
+pub(crate) async fn describe_action(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -254,7 +260,7 @@ async fn read_status(
 }
 
 /// One `ExecuteBudgetAction` call.
-async fn execute_action(
+pub(crate) async fn execute_action(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -277,7 +283,7 @@ async fn execute_action(
 /// Put the stored action into `status` with nothing owed, so the state machine can be
 /// asserted from statuses no request in this emulator reaches (the `*_FAILURE` ones,
 /// which nothing here mints because nothing here fails an action's work).
-fn seed_status(
+pub(crate) fn seed_status(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
     budget_name: &str,

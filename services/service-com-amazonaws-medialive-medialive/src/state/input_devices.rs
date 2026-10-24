@@ -36,6 +36,14 @@
 //! pending on a device at a time, so a reader of the device and a reader of the
 //! transfer cannot drift apart.
 //!
+//! A device's RUN STATE is one stored flag on the record: whether the device is
+//! producing video right now. `StartInputDevice` sets it and `StopInputDevice`
+//! clears it, and it is reported as the `DeviceState` of the device's own
+//! type settings — the one member of those settings this service knows without
+//! a unit to read the rest off, because it is the state the commands the
+//! service accepted put the device in rather than a characteristic of the video
+//! a connected unit is producing.
+//!
 //! A device's MAINTENANCE WINDOW is one stored instant on the record: the
 //! moment the window the clock owes closes. `StartInputDeviceMaintenanceWindow`
 //! opens it, which is what puts the device's `DeviceUpdateStatus` in `UPDATING`,
@@ -46,7 +54,10 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use crate::ops::types::{InputDeviceSummary, TransferringInputDeviceSummary};
+use crate::ops::types::{
+    InputDeviceHdSettings, InputDeviceSummary, InputDeviceUhdSettings,
+    TransferringInputDeviceSummary,
+};
 
 use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 
@@ -77,6 +88,16 @@ pub mod input_device_connection_state {
 /// store holds no pending configuration change for.
 pub mod device_settings_sync_state {
     pub const SYNCED: &str = "SYNCED";
+}
+
+/// The `InputDeviceState` values, spelled exactly as the model declares them
+/// (`smithy_query(query="shape", shape="InputDeviceState")`: IDLE | STREAMING).
+/// The enum is "The state of the input device": `STREAMING` while the device is
+/// producing video, `IDLE` while it is not. Both are reported by this slice —
+/// they are the two states a start and a stop move a device between.
+pub mod input_device_state {
+    pub const IDLE: &str = "IDLE";
+    pub const STREAMING: &str = "STREAMING";
 }
 
 /// The `InputDeviceType` values, spelled exactly as the model declares them
@@ -261,6 +282,14 @@ pub struct InputDeviceRecord {
     /// [`InputDeviceRecord::begin_transfer`] and the only way to read it is
     /// [`InputDeviceRecord::pending_transfer`].
     transfer: Option<InputDeviceTransferRecord>,
+    /// Whether the device is producing video right now, which is what its
+    /// `InputDeviceState` reports.
+    ///
+    /// PRIVATE, so the only way in is
+    /// [`InputDeviceRecord::start_streaming`] and
+    /// [`InputDeviceRecord::stop_streaming`], and the only way to read it is
+    /// [`InputDeviceRecord::device_state`].
+    streaming: bool,
 }
 
 impl InputDeviceRecord {
@@ -314,6 +343,42 @@ impl InputDeviceRecord {
         }
     }
 
+    /// Whether the device is producing video right now.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming
+    }
+
+    /// The device's `InputDeviceState` ("The state of the input device"):
+    /// `STREAMING` while the device is producing video and `IDLE` while it is
+    /// not. A device nothing has started is `IDLE`, which is the state of a Link
+    /// unit that has been claimed and told to do nothing yet.
+    pub fn device_state(&self) -> &'static str {
+        if self.is_streaming() {
+            input_device_state::STREAMING
+        } else {
+            input_device_state::IDLE
+        }
+    }
+
+    /// Put the device in `STREAMING`: it is producing video from now until a
+    /// stop ends it.
+    ///
+    /// IDEMPOTENT — a device already streaming is left streaming, because a
+    /// start asks for exactly the state it is already in. There is no transient
+    /// state between the two: `InputDeviceState` declares only `IDLE` and
+    /// `STREAMING`, so the clock owes this device nothing.
+    pub fn start_streaming(&mut self) {
+        self.streaming = true;
+    }
+
+    /// Put the device in `IDLE`: it is no longer producing video.
+    ///
+    /// IDEMPOTENT, for the same reason [`InputDeviceRecord::start_streaming`]
+    /// is.
+    pub fn stop_streaming(&mut self) {
+        self.streaming = false;
+    }
+
     /// The transfer pending on this device, or `None` while none is.
     pub fn pending_transfer(&self) -> Option<&InputDeviceTransferRecord> {
         self.transfer.as_ref()
@@ -348,6 +413,8 @@ pub fn new_input_device(id: String, arn: String, device_type: &str) -> InputDevi
         tags: HashMap::new(),
         maintenance_window_close: None,
         transfer: None,
+        // A claimed device is producing nothing until a start says so.
+        streaming: false,
     }
 }
 
@@ -508,15 +575,29 @@ impl ComAmazonawsMedialiveMedialiveState {
         } else {
             input_device_output_type::MEDIALIVE_INPUT
         };
+        // The device's run state is the one member of a device's settings this
+        // service knows without a unit to read the rest off: it is the state the
+        // start and stop commands the service accepted put the device in, not a
+        // characteristic of the video a connected unit is producing. It is
+        // reported in the settings of the device's own TYPE, which is what each
+        // member documents ("Settings that describe an input device that is type
+        // HD" / "... type UHD"); every other member of those settings is read
+        // off the unit, and no unit is connected to this emulator.
+        let device_state = Some(device.device_state().to_string());
+        let is_hd = device.r#type == input_device_type::HD;
         InputDeviceSummary {
             arn: Some(device.arn.clone()),
             connection_state: Some(device.connection_state.clone()),
             device_settings_sync_state: Some(device.device_settings_sync_state.clone()),
             device_update_status: Some(device.device_update_status().to_string()),
-            // The settings that describe the video a Link unit is producing are
-            // read off the unit, and no unit is connected to this emulator.
-            hd_device_settings: None,
-            uhd_device_settings: None,
+            hd_device_settings: is_hd.then(|| InputDeviceHdSettings {
+                device_state: device_state.clone(),
+                ..InputDeviceHdSettings::default()
+            }),
+            uhd_device_settings: (!is_hd).then(|| InputDeviceUhdSettings {
+                device_state,
+                ..InputDeviceUhdSettings::default()
+            }),
             id: Some(device.id.clone()),
             // Hardware properties of a unit this emulator does not have.
             mac_address: None,

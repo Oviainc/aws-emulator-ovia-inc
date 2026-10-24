@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRelationalDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRelationalDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes ONE managed relational database from this service's store, taking the
+//! final snapshot of it the request asked for first, and answers the
+//! operation-log entries those writes appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRelationalDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRelationalDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRelationalDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRelationalDatabase"))
+        // A database is addressed by name alone, and the final snapshot is
+        // located where that database is — nothing about the request metadata
+        // takes part.
+        let _ = ctx;
+
+        // `relationalDatabaseName` is modelled `@required` and both names carry
+        // the modelled `ResourceName` pattern, so the centralized walk refused
+        // anything outside them before this body ran. What is left is what the
+        // model cannot express: the two snapshot members have to agree with each
+        // other, the database has to exist, and a final snapshot's name has to be
+        // one this account can still take.
+        let final_snapshot_name = final_snapshot_name(&input)?;
+        let name = input.relational_database_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Every refusal is decided here, BEFORE the first write, so a refused
+            // delete leaves the database and the snapshot store exactly as they
+            // were.
+            if store.relational_database(&name).is_none() {
+                return Err(not_found(&name));
+            }
+            if let Some(snapshot_name) = final_snapshot_name.as_deref() {
+                // A snapshot name addresses one snapshot, so taking the final
+                // snapshot under a name this account already holds is refused
+                // rather than silently replacing a record a restore may be
+                // using — and refused BEFORE the database is removed, because a
+                // delete that cannot take the final snapshot it was asked for
+                // must not delete the data either.
+                if store.relational_database_snapshot(snapshot_name).is_some() {
+                    return Err(invalid(format!(
+                        "a relational database snapshot named '{snapshot_name}' already exists"
+                    )));
+                }
+                if store.relational_database_snapshots.len()
+                    >= crate::state::MAX_RELATIONAL_DATABASE_SNAPSHOTS
+                {
+                    return Err(invalid(format!(
+                        "taking a final relational database snapshot would take this account \
+                         past the {} this emulator holds",
+                        crate::state::MAX_RELATIONAL_DATABASE_SNAPSHOTS
+                    )));
+                }
+            }
+
+            // The record leaves the store in the same step the snapshot of it is
+            // taken in, so no read can observe the database gone without its
+            // final snapshot, or the snapshot without the database gone. The
+            // `None` arm cannot be reached — the database was just found above,
+            // under this same guard — and answers the same refusal rather than
+            // panicking.
+            let Some(database) = store.remove_relational_database(&name) else {
+                return Err(not_found(&name));
+            };
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once, and this one does when it is asked for a final
+            // snapshot: that snapshot is a resource of its own, logged as its own
+            // create and left non-terminal until the copy the clock owes it is
+            // due.
+            let mut operations = Vec::new();
+            if let Some(snapshot_name) = final_snapshot_name {
+                let snapshot = store.snapshot_relational_database(
+                    &database,
+                    snapshot_name,
+                    // `DeleteRelationalDatabase` carries no `tags` member, so the
+                    // final snapshot is created with none.
+                    Vec::new(),
+                    now,
+                );
+                let operation = store.start_operation(
+                    now,
+                    crate::state::OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT,
+                    crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT,
+                    &snapshot.name,
+                    &snapshot.location,
+                    snapshot.due.map(|due| due.at_ms),
+                );
+                operations.push(operation.view());
+            }
+            // The database's record is gone as this call returns, so the work
+            // this entry describes is already done and the entry is terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_RELATIONAL_DATABASE,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                &name,
+                &database.location,
+                None,
+            );
+            operations.push(operation.view());
+            Ok(DeleteRelationalDatabaseOutput {
+                operations: Some(operations),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
 }
+
+/// The name the final snapshot of the database must be taken under, or `None`
+/// when the request asked for no final snapshot — and a refusal when the two
+/// members that decide it disagree.
+///
+/// `skipFinalSnapshot` "[d]etermines whether a final database snapshot is created
+/// before your database is deleted", and its documented default is `false`, so a
+/// request that says nothing about it asks for a final snapshot. The two members
+/// that decide it are bound together both ways:
+///
+/// * "You must specify the final relational database snapshot name parameter if
+///   the skip final snapshot parameter is false" (the modelled
+///   `skipFinalSnapshot` documentation), so a delete that takes a snapshot has to
+///   name it; and
+/// * "Specifying this parameter and also specifying the skip final snapshot
+///   parameter to true results in an error" (the modelled
+///   `finalRelationalDatabaseSnapshotName` documentation), so a delete that skips
+///   the snapshot may not name one.
+fn final_snapshot_name(
+    input: &DeleteRelationalDatabaseInput,
+) -> Result<Option<String>, DeleteRelationalDatabaseError> {
+    // "Default: false".
+    let skip = input.skip_final_snapshot.unwrap_or(false);
+    match (skip, input.final_relational_database_snapshot_name.clone()) {
+        (true, Some(snapshot_name)) => Err(invalid(format!(
+            "finalRelationalDatabaseSnapshotName '{snapshot_name}' cannot be specified with \
+             skipFinalSnapshot true: skipping the final snapshot leaves no snapshot to name"
+        ))),
+        (true, None) => Ok(None),
+        (false, None) => Err(invalid(
+            "finalRelationalDatabaseSnapshotName must name the snapshot to create when \
+             skipFinalSnapshot is false, which is its default"
+                .to_string(),
+        )),
+        (false, Some(snapshot_name)) => Ok(Some(snapshot_name)),
+    }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name. Deleting a database twice therefore fails the second time rather than
+/// reporting a deletion that did not happen.
+fn not_found(name: &str) -> DeleteRelationalDatabaseError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> DeleteRelationalDatabaseError {
+    DeleteRelationalDatabaseErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteRelationalDatabaseError {
+    DeleteRelationalDatabaseErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+

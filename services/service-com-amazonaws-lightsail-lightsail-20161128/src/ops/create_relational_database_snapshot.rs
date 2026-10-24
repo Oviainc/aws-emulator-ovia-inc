@@ -220,70 +220,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // Everything about the source is read out of the SOURCE record as it
             // stands now, so the snapshot keeps it even if the database later changes
-            // or is deleted.
-            let database = store.relational_database(&source_name).ok_or_else(|| {
-                // The source the request named is not a resource this account
-                // holds: Lightsail's `DoesNotExist` rejection — HTTP 400, wire
-                // error `NotFoundException`, body `code` `DoesNotExist` and a
-                // message naming the resource type and the requested name.
-                crate::scaffolded::Scaffolded::resource_does_not_exist(
-                    crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
-                    &source_name,
-                )
-            })?;
-            let location = database.location.clone();
-            let engine = database.blueprint.engine.to_string();
-            let engine_version = database.blueprint.engine_version.to_string();
-            // The snapshotted disk is the database bundle's own storage — the size
-            // `GetRelationalDatabase` reports as its hardware disk size.
-            let size_in_gb = database.bundle.disk_size_in_gb;
-            // A snapshot is a copy of the DATABASE, so the database name and the
-            // master credentials it was created with are captured here too: a
-            // later `CreateRelationalDatabaseFromSnapshot` restores a database
-            // reached with them, and it must still do so after the source has
-            // been deleted. No member of `RelationalDatabaseSnapshot` reports
-            // them, exactly as no member of `RelationalDatabase` reports a
-            // password.
-            let master_database_name = database.master_database_name.clone();
-            let master_username = database.master_username.clone();
-            let master_user_password = database.master_user_password.clone();
-            let from_relational_database_name = database.name.clone();
-            let from_relational_database_arn = database.arn.clone();
-            let from_relational_database_bundle_id = database.bundle.bundle_id.to_string();
-            let from_relational_database_blueprint_id = database.blueprint.blueprint_id();
-
-            let id = store.mint_uuid();
+            // or is deleted — which is why the copy is taken from an OWNED read of
+            // that record, by the one store helper every database snapshot is built
+            // through (`DeleteRelationalDatabase`'s final snapshot included).
+            let database = store
+                .relational_database(&source_name)
+                .cloned()
+                .ok_or_else(|| {
+                    // The source the request named is not a resource this account
+                    // holds: Lightsail's `DoesNotExist` rejection — HTTP 400, wire
+                    // error `NotFoundException`, body `code` `DoesNotExist` and a
+                    // message naming the resource type and the requested name.
+                    crate::scaffolded::Scaffolded::resource_does_not_exist(
+                        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                        &source_name,
+                    )
+                })?;
             // A snapshot is not restorable yet: the clock owes it `available`, which
             // is why a read straight after this call still reports `creating`.
-            let due = crate::state::DueNamedState::after(
-                now,
-                crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE,
-            );
-            store.insert_relational_database_snapshot(
-                crate::state::StoredRelationalDatabaseSnapshot {
-                    name: name.clone(),
-                    arn: crate::state::relational_database_snapshot_arn(
-                        &location.region_name,
-                        &id,
-                    ),
-                    support_code: crate::state::support_code(&id),
-                    created_at_ms: now,
-                    location: location.clone(),
-                    tags,
-                    engine,
-                    engine_version,
-                    size_in_gb,
-                    master_database_name,
-                    master_username,
-                    master_user_password,
-                    state: crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING,
-                    due: Some(due),
-                    from_relational_database_name,
-                    from_relational_database_arn,
-                    from_relational_database_bundle_id,
-                    from_relational_database_blueprint_id,
-                },
-            );
+            let snapshot = store.snapshot_relational_database(&database, name, tags, now);
             // `operations` is a list because other Lightsail creates act on several
             // resources at once; `CreateRelationalDatabaseSnapshot` creates exactly
             // one snapshot, so it answers exactly one entry, left non-terminal until
@@ -292,9 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
                 crate::state::OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT,
                 crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT,
-                &name,
-                &location,
-                Some(due.at_ms),
+                &snapshot.name,
+                &snapshot.location,
+                snapshot.due.map(|due| due.at_ms),
             );
             Ok(CreateRelationalDatabaseSnapshotOutput {
                 operations: Some(vec![operation.view()]),
