@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request names (`description`, `vectorOptions`,
+//! `deletionProtection`) to the `CollectionRecord` stored under the requested id, moves it
+//! to the non-terminal `UPDATING` status — from which it settles back to `ACTIVE` once the
+//! clock makes that due — and answers `updateCollectionDetail` from the stored record. A
+//! collection that is not `ACTIVE` (one being created, deleted, or already mid-update) is
+//! refused with `ConflictException`, which is what a second concurrent writer gets.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCollection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCollectionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The enum members the boundary validator does not narrow, refused against the
+        // model's own value lists — the same check `CreateCollection` makes for them.
+        if let Some(value) = input.deletion_protection.as_deref() {
+            if !DELETION_PROTECTION_VALUES.contains(&value) {
+                return Err(UpdateCollectionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "deletionProtection must be one of [{}], got {value:?}",
+                            DELETION_PROTECTION_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        if let Some(options) = &input.vector_options {
+            let supplied = options.serverless_vector_acceleration.as_str();
+            if !SERVERLESS_VECTOR_ACCELERATION_STATUS_VALUES.contains(&supplied) {
+                return Err(UpdateCollectionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "vectorOptions.ServerlessVectorAcceleration must be one of [{}], got {supplied:?}",
+                            SERVERLESS_VECTOR_ACCELERATION_STATUS_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A replayed `clientToken` is a retry of the call that already applied this
+        // update, so it answers the record that call left rather than applying it twice.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.replayed_collection(Self::NAME, token) {
+                return Ok(UpdateCollectionOutput {
+                    update_collection_detail: Some(record.update_detail()),
+                });
+            }
+        }
+
+        // `UpdateCollection` models no not-found error (its errors are `ConflictException`,
+        // `InternalServerException` and `ValidationException`), so an id that names no
+        // collection is refused as invalid input rather than with an error this operation
+        // does not declare.
+        let Some(record) = store.collections.get(&input.id) else {
+            return Err(UpdateCollectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::collection_not_found_message(&input.id)),
+                },
+            )
+            .into());
+        };
+        // A collection can only be updated from the state it is "ready to use" in: one
+        // still being created, already being deleted, or mid-update is the state conflict
+        // `ConflictException` describes — which is also what the LOSER of two concurrent
+        // updates gets, since the winner leaves the collection in `UPDATING`.
+        if record.status != crate::state::COLLECTION_ACTIVE {
+            return Err(
+                UpdateCollectionErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Collection with ID {} is in status {} and cannot be updated; it must be {}",
+                        input.id,
+                        record.status,
+                        crate::state::COLLECTION_ACTIVE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let updated_at = crate::state::now_epoch_millis();
+        let Some(record) = store.collections.get_mut(&input.id) else {
+            return Err(UpdateCollectionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::collection_not_found_message(&input.id)),
+                },
+            )
+            .into());
+        };
+        // Only the members the request NAMES are applied: one it omits is left as it was,
+        // so two writers that each set a different member do not undo each other.
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(options) = input.vector_options {
+            record.vector_options = Some(options);
+        }
+        if let Some(protection) = input.deletion_protection {
+            record.deletion_protection = protection;
+        }
+        record.begin_update(updated_at);
+        let detail = record.update_detail();
+        if let Some(token) = input.client_token.as_deref() {
+            let id = input.id.clone();
+            store.remember_token(Self::NAME, token, &id);
+        }
+
+        // Answered from the STORED record, so the update cannot report anything a later
+        // `BatchGetCollection` would not.
+        Ok(UpdateCollectionOutput {
+            update_collection_detail: Some(detail),
+        })
     }
 }

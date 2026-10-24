@@ -820,7 +820,12 @@ impl StoredStack {
             // The record of the same resource this stack already created. Judged by
             // identity first; for a type whose id the OWNING SERVICE assigns, a record
             // under the same logical id and type IS that resource, because nothing here
-            // can recompute the id it was created with.
+            // can recompute the id it was created with — as long as the declaration still
+            // asks for the same resource, which for such a type is what the NAME it
+            // declares says. A declaration that RENAMES it is a different resource (AWS
+            // replaces such a resource when the template changes its name), and a type
+            // with no name property declares none on either side, so the test is vacuous
+            // for it.
             let existing = already_created
                 .iter()
                 .find(|existing| {
@@ -833,6 +838,7 @@ impl StoredStack {
                                 existing.materialised
                                     && existing.logical_id == resource.logical_id
                                     && existing.resource_type == resource.resource_type
+                                    && declared_name(existing) == declared_name(resource)
                             })
                         })
                         .flatten()
@@ -1184,6 +1190,28 @@ impl StoredStack {
             pending.and_then(|p| p.client_request_token),
         );
     }
+}
+
+/// The `Name` a resource's own declaration asks for, if it declares one — read through
+/// [`template::name_property_candidates`], the one list of the properties a type takes its
+/// name from, so this comparison and the deployment's own naming cannot disagree.
+///
+/// For a type whose identifier the OWNING SERVICE assigns, the declaration no longer
+/// carries that identifier, so the name it asks for is what is left to say WHICH resource
+/// a re-deploy means: AWS replaces such a resource when the template renames it, while a
+/// declaration that names none leaves the name to CloudFormation and so still means the
+/// same resource on the next deployment. Read off the evaluated properties, never off the
+/// physical id, which for such a type is what the owning service minted.
+fn declared_name(resource: &StoredResource) -> Option<String> {
+    template::name_property_candidates(&resource.resource_type)
+        .into_iter()
+        .find_map(|property| {
+            resource
+                .properties
+                .get(&property)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 /// The resources a completed create or update leaves the stack with, each carrying the

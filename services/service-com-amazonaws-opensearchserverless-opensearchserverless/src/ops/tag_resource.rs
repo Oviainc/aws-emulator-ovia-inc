@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds the tags the request carries to the `CollectionRecord` whose stored
+//! ARN is `resourceArn`, replacing the value of a key the resource already carries, so
+//! `ListTagsForResource` reports them. A `resourceArn` that names no collection this
+//! account holds — including one whose deletion has been accepted — is refused with
+//! `ResourceNotFoundException`, and a write that would take the resource past the
+//! documented 50-tag quota with `ServiceQuotaExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +146,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A tag belongs to a LIVE resource: a collection whose deletion has been accepted
+        // is on its way out and its tags are no longer addressable, so it answers the same
+        // not-found refusal as one that was never there.
+        let taggable = store
+            .collection_by_arn(&input.resource_arn)
+            .is_some_and(|record| !record.is_deleting());
+        if !taggable {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The resulting tag set, computed before anything is stored: a key the resource
+        // already carries takes the new value (a tag set is a map keyed by `key`), and a
+        // key it does not is added.
+        let mut tags = store
+            .collection_by_arn(&input.resource_arn)
+            .map(|record| record.tags.clone())
+            .unwrap_or_default();
+        for tag in input.tags {
+            match tags.iter_mut().find(|stored| stored.key == tag.key) {
+                Some(stored) => stored.value = tag.value,
+                None => tags.push(tag),
+            }
+        }
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                TagResourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Maximum number of tags exceeded: {}",
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        ),
+                        resource_id: Some(input.resource_arn.clone()),
+                        resource_type: Some(
+                            crate::state::TAGGED_RESOURCE_TYPE.to_string(),
+                        ),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(record) = store.collection_by_arn_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        record.tags = tags;
+
+        // `TagResourceResponse` models no members: what the call produced is the stored
+        // tag set, which `ListTagsForResource` reports.
+        Ok(TagResourceOutput {})
     }
 }

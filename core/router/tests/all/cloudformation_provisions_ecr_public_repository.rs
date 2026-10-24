@@ -116,7 +116,10 @@ fn ecr_public(
 }
 
 /// Undo the XML text escaping the serializer applies.
-fn xml_unescape(text: &str) -> String {
+///
+/// Published to the other suites of this crate that read an awsQuery answer, so the
+/// scraper below is written once.
+pub(crate) fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -125,7 +128,7 @@ fn xml_unescape(text: &str) -> String {
 }
 
 /// Every `<tag>` text in document order.
-fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
@@ -140,7 +143,7 @@ fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The first `<tag>` text, or `None` when the response carries none.
-fn xml_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
 }
 
