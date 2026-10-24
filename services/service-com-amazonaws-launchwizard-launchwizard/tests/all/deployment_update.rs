@@ -47,7 +47,7 @@ const UPDATE_COMPLETED: &str = "UPDATE_COMPLETED";
 
 /// The `WorkloadDeploymentPatternData` the service reports for one pattern — the
 /// source of every specification name, allowed value and version this suite submits.
-async fn pattern_data(harness: &Harness, case: &str, workload: &str, pattern: &str) -> Value {
+pub(crate) async fn pattern_data(harness: &Harness, case: &str, workload: &str, pattern: &str) -> Value {
     let body = harness
         .ok(
             case,
@@ -64,7 +64,7 @@ async fn pattern_data(harness: &Harness, case: &str, workload: &str, pattern: &s
 }
 
 /// The reported specification schema of `data`.
-fn schema_fields(case: &str, data: &Value) -> Vec<Value> {
+pub(crate) fn schema_fields(case: &str, data: &Value) -> Vec<Value> {
     let fields = data["specifications"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: the pattern reports no specifications: {data}"))
@@ -80,7 +80,11 @@ fn schema_fields(case: &str, data: &Value) -> Vec<Value> {
 /// the schema marks required, and one of the values it allows wherever it publishes
 /// any. With `include_optional`, every field it publishes — so two rows of the same
 /// pattern differ in how many settings they carry.
-fn conforming_specifications(case: &str, data: &Value, include_optional: bool) -> Map<String, Value> {
+pub(crate) fn conforming_specifications(
+    case: &str,
+    data: &Value,
+    include_optional: bool,
+) -> Map<String, Value> {
     let mut specifications = Map::new();
     for field in schema_fields(case, data) {
         let name = field["name"]
@@ -106,7 +110,7 @@ fn conforming_specifications(case: &str, data: &Value, include_optional: bool) -
 
 /// The first value a schema field publishes in `allowedValues`, or `None` when it
 /// publishes none.
-fn first_allowed_value(field: &Value) -> Option<String> {
+pub(crate) fn first_allowed_value(field: &Value) -> Option<String> {
     field["allowedValues"]
         .as_array()
         .and_then(|values| values.first())
@@ -115,7 +119,7 @@ fn first_allowed_value(field: &Value) -> Option<String> {
 }
 
 /// The name of the first field `data`'s schema marks required.
-fn required_field(case: &str, data: &Value) -> String {
+pub(crate) fn required_field(case: &str, data: &Value) -> String {
     schema_fields(case, data)
         .into_iter()
         .find(|field| field["required"].as_str() == Some("Yes"))
@@ -124,7 +128,7 @@ fn required_field(case: &str, data: &Value) -> String {
 }
 
 /// The name of the first field `data`'s schema restricts to `allowedValues`.
-fn constrained_field(case: &str, data: &Value) -> String {
+pub(crate) fn constrained_field(case: &str, data: &Value) -> String {
     schema_fields(case, data)
         .into_iter()
         .find(|field| first_allowed_value(field).is_some())
@@ -152,7 +156,7 @@ fn with_member(body: &Value, member: &str, value: Value) -> Value {
 }
 
 /// The `message` an error body carries.
-fn error_message(body: &Value) -> String {
+pub(crate) fn error_message(body: &Value) -> String {
     body["message"]
         .as_str()
         .or_else(|| body["Message"].as_str())
@@ -172,7 +176,7 @@ async fn events(harness: &Harness, case: &str, id: &str) -> Vec<Value> {
 }
 
 /// Every `(workload, pattern)` pair the catalogue holds, in the order it reports them.
-async fn every_pattern(harness: &Harness) -> Vec<(String, String)> {
+pub(crate) async fn every_pattern(harness: &Harness) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for workload in catalogue(harness).await {
         let body = harness
@@ -201,7 +205,7 @@ async fn every_pattern(harness: &Harness) -> Vec<(String, String)> {
 }
 
 /// The first pattern of each workload — the smaller table the refusal rules run over.
-async fn one_pattern_per_workload(harness: &Harness) -> Vec<(String, String)> {
+pub(crate) async fn one_pattern_per_workload(harness: &Harness) -> Vec<(String, String)> {
     let every = every_pattern(harness).await;
     let mut first: Vec<(String, String)> = Vec::new();
     for (workload, pattern) in every {

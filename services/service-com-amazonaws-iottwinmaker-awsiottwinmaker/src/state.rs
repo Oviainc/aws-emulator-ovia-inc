@@ -17,6 +17,14 @@
 //! non-terminal `CREATING`, so its record also carries the instant its
 //! transition to `ACTIVE` falls due (`ComponentType::settles_at`), which a
 //! reader materialises rather than sleeps for.
+//!
+//! Not everything is inside that tree: a *metadata transfer job* is addressed
+//! with no workspace in its path and may name a different workspace at each
+//! end of the transfer, so the jobs live beside the workspaces
+//! (`metadata_transfer_jobs`). A job is accepted in the non-terminal
+//! `VALIDATING` state and carries the instant its outcome falls due
+//! (`MetadataTransferJob::settles_at`), the same way a component type carries
+//! its own.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -132,6 +140,70 @@ pub const MAX_ENTITIES_PER_WORKSPACE: usize = 1000;
 pub const MAX_COMPONENT_TYPES_PER_WORKSPACE: usize = 1000;
 /// See [`MAX_WORKSPACES`].
 pub const MAX_SCENES_PER_WORKSPACE: usize = 1000;
+/// See [`MAX_WORKSPACES`]. A metadata transfer job is an ACCOUNT-level
+/// resource (`/metadata-transfer-jobs/{metadataTransferJobId}` names no
+/// workspace), so its ceiling is per account rather than per workspace, and
+/// `CreateMetadataTransferJob` answers the `ServiceQuotaExceededException` it
+/// models once the account holds this many.
+pub const MAX_METADATA_TRANSFER_JOBS: usize = 1000;
+
+/// The `MetadataTransferJobState` a job the service has just accepted is in,
+/// and the terminal state it reaches.
+///
+/// `VALIDATING` is the state `CreateMetadataTransferJob` answers with: the job
+/// has been accepted and nothing has transferred yet, so it is non-terminal and
+/// the clock owes its outcome ([`METADATA_TRANSFER_JOB_SETTLE_SPAN`]). `ERROR`
+/// is the modelled failure state that outcome is in this emulator — see
+/// [`MetadataTransferJob::settle`] — and `CANCELLED`/`CANCELLING` belong to
+/// `CancelMetadataTransferJob`, which owns them. The full value list is
+/// `METADATA_TRANSFER_JOB_STATE_VALUES` in `ops::types`.
+pub const METADATA_TRANSFER_JOB_STATE_VALIDATING: &str = "VALIDATING";
+/// See [`METADATA_TRANSFER_JOB_STATE_VALIDATING`].
+pub const METADATA_TRANSFER_JOB_STATE_ERROR: &str = "ERROR";
+
+/// How long a metadata transfer job stays in
+/// [`METADATA_TRANSFER_JOB_STATE_VALIDATING`] before the clock makes its
+/// outcome due.
+///
+/// AWS documents no duration for a metadata transfer, so this span is CHOSEN by
+/// this emulator, the same way (and for the same reasons) as
+/// [`COMPONENT_TYPE_SETTLE_SPAN`]: deliberately non-zero, so a caller that
+/// reads the job back in the same breath as the create still observes the
+/// non-terminal state the create answered with, and deliberately short, so a
+/// client that polls reaches the terminal state without a long wait. Nothing
+/// sleeps for it: the instant it is due is stored on the record
+/// ([`MetadataTransferJob::settles_at`]) and a reader materialises the
+/// transition the clock already owed.
+pub const METADATA_TRANSFER_JOB_SETTLE_SPAN: Duration = Duration::from_millis(500);
+
+/// The `ErrorCode` a metadata transfer job that never ran carries
+/// (`ops::types::ERROR_CODE_VALUES`), and the message that says why.
+///
+/// Transferring metadata means reading an Amazon S3 object, an IoT SiteWise
+/// asset model or another workspace's metadata document and writing what it
+/// describes into the destination — work this emulator does not perform.
+/// Nothing therefore runs for an accepted job, and a job nothing ran ends in
+/// the service's own modelled failure state with the reason that says so,
+/// rather than being reported `COMPLETED` for a transfer that never happened.
+/// The message is this emulator's, not AWS's: it states the emulator's
+/// limitation, which no AWS rule produces.
+pub const METADATA_TRANSFER_JOB_ERROR_CODE: &str = "PROCESSING_ERROR";
+/// See [`METADATA_TRANSFER_JOB_ERROR_CODE`].
+pub const METADATA_TRANSFER_JOB_ERROR_MESSAGE: &str =
+    "this emulator transfers no metadata: nothing was read from the job's sources and nothing \
+     was written to its destination";
+
+/// The resource portion of the ARN of the service-linked role a metadata
+/// transfer job runs under.
+///
+/// `GetMetadataTransferJob` reports `metadataTransferJobRole` as `@required`,
+/// but `CreateMetadataTransferJobRequest` has no role member at all, so the
+/// role is the SERVICE's own and never the caller's input: the role IoT
+/// TwinMaker assumes to transfer metadata. The ARN is built through
+/// [`metadata_transfer_job_role`], so its account segment is the emulator's
+/// canonical one.
+pub const METADATA_TRANSFER_JOB_ROLE_PATH: &str =
+    "role/aws-service-role/iottwinmaker.amazonaws.com/AWSServiceRoleForIoTTwinMaker";
 
 /// The `PricingMode` an account that has never changed its pricing plan is on,
 /// and the `UpdateReason` such a plan carries.
@@ -171,6 +243,19 @@ pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
     /// nothing is pending, which is what an account whose plan nobody has
     /// changed looks like. Written by `UpdatePricingPlan`.
     pub pending_pricing_plan: Option<PricingPlanRecord>,
+    /// The metadata transfer jobs this account holds, keyed by
+    /// `metadataTransferJobId`.
+    ///
+    /// Account-wide, beside the workspaces rather than inside one: a job is
+    /// addressed as `/metadata-transfer-jobs/{metadataTransferJobId}`, which
+    /// names no workspace, and one job's source and destination may name
+    /// different workspaces (or none at all, for an Amazon S3 or an IoT
+    /// SiteWise end), so no single workspace can own it. A job's ARN is
+    /// deliberately NOT in [`arn_index`](Self::arn_index): that index exists to
+    /// resolve an id-or-ARN input and to find a taggable resource's tag map,
+    /// and a metadata transfer job is addressed only by its id and carries no
+    /// `tags` member on any of its shapes.
+    pub metadata_transfer_jobs: BTreeMap<String, MetadataTransferJob>,
 }
 
 impl Default for ComAmazonawsIottwinmakerAwsiottwinmakerState {
@@ -183,6 +268,7 @@ impl Default for ComAmazonawsIottwinmakerAwsiottwinmakerState {
             // rather than by whichever call happens to read it first.
             pricing_plan: PricingPlanRecord::default_plan(SystemTime::now()),
             pending_pricing_plan: None,
+            metadata_transfer_jobs: BTreeMap::new(),
         }
     }
 }
@@ -473,6 +559,126 @@ pub struct Scene {
     pub tags: BTreeMap<String, String>,
     pub creation_date_time: SystemTime,
     pub update_date_time: SystemTime,
+}
+
+/// One stored metadata transfer job.
+///
+/// The job's `sources` and `destination` are kept as the modelled REQUEST
+/// shapes the caller supplied — the same choice [`ComponentType`] makes for a
+/// component type's definitions — so a read reports back exactly what was
+/// persisted rather than a lossy projection of it.
+#[derive(Debug, Clone)]
+pub struct MetadataTransferJob {
+    pub metadata_transfer_job_id: String,
+    pub arn: String,
+    /// The job's description, absent when the create named none: `description`
+    /// is optional on `CreateMetadataTransferJobRequest` AND on
+    /// `GetMetadataTransferJobResponse`, so it is carried as an option rather
+    /// than resolved to the empty string, as a [`Scene`]'s is.
+    pub description: Option<String>,
+    /// The job's sources, in the order the create gave them
+    /// (`SourceConfigurations` is a `@length(1..1)` LIST).
+    pub sources: Vec<crate::ops::types::SourceConfiguration>,
+    pub destination: crate::ops::types::DestinationConfiguration,
+    /// The ARN of the role the job runs under
+    /// ([`metadata_transfer_job_role`]): the service's own, since the create
+    /// accepts no role.
+    pub metadata_transfer_job_role: String,
+    pub creation_date_time: SystemTime,
+    /// When the job last changed — the create, until the clock settles its
+    /// outcome, which moves it to the instant that outcome fell due.
+    pub update_date_time: SystemTime,
+    /// The job's `MetadataTransferJobState`, as STORED:
+    /// [`METADATA_TRANSFER_JOB_STATE_VALIDATING`] from the create until
+    /// [`settles_at`](Self::settles_at) passes, then the terminal state
+    /// [`settle`](Self::settle) writes.
+    pub state: String,
+    /// Why the job is in a failed state, and `None` while nothing has failed.
+    pub error: Option<crate::ops::types::ErrorDetails>,
+    /// The instant the transition out of
+    /// [`METADATA_TRANSFER_JOB_STATE_VALIDATING`] falls due — the instant of
+    /// the create plus [`METADATA_TRANSFER_JOB_SETTLE_SPAN`]. Stored, never
+    /// slept for, so a reader can materialise a transition the clock already
+    /// owed without any caller having had to poll.
+    pub settles_at: SystemTime,
+}
+
+impl MetadataTransferJob {
+    /// The job a `CreateMetadataTransferJob` call accepted at `now`: accepted,
+    /// nothing transferred yet, and its outcome due
+    /// [`METADATA_TRANSFER_JOB_SETTLE_SPAN`] later.
+    pub fn accepted(
+        metadata_transfer_job_id: String,
+        arn: String,
+        description: Option<String>,
+        sources: Vec<crate::ops::types::SourceConfiguration>,
+        destination: crate::ops::types::DestinationConfiguration,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            metadata_transfer_job_id,
+            arn,
+            description,
+            sources,
+            destination,
+            metadata_transfer_job_role: metadata_transfer_job_role(),
+            creation_date_time: now,
+            // Nothing has changed the job yet, so it was last updated when it
+            // was created.
+            update_date_time: now,
+            state: METADATA_TRANSFER_JOB_STATE_VALIDATING.to_string(),
+            error: None,
+            settles_at: now + METADATA_TRANSFER_JOB_SETTLE_SPAN,
+        }
+    }
+
+    /// Materialise the lifecycle transition the CLOCK has already made due.
+    ///
+    /// Called by a reader before it reports this job, exactly as
+    /// [`ComponentType::settle`] is: the outcome was owed at
+    /// [`settles_at`](Self::settles_at) whether or not anybody called, so
+    /// writing it here makes the record say what was already true rather than
+    /// changing anything a read caused.
+    ///
+    /// The outcome is the modelled failure state: no metadata was transferred,
+    /// because this emulator transfers none (see
+    /// [`METADATA_TRANSFER_JOB_ERROR_CODE`]), so the job carries the error that
+    /// says so instead of a `COMPLETED` nothing earned. Idempotent, a no-op
+    /// before the instant falls due, and a no-op on a job some other operation
+    /// has already moved out of the non-terminal state.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.state != METADATA_TRANSFER_JOB_STATE_VALIDATING || now < self.settles_at {
+            return;
+        }
+        self.state = METADATA_TRANSFER_JOB_STATE_ERROR.to_string();
+        self.error = Some(crate::ops::types::ErrorDetails {
+            code: Some(METADATA_TRANSFER_JOB_ERROR_CODE.to_string()),
+            message: Some(METADATA_TRANSFER_JOB_ERROR_MESSAGE.to_string()),
+        });
+        // The change fell due at `settles_at`, not at the instant a caller
+        // happened to ask, so that is when the job was last updated: two reads
+        // of a settled job report the same instant.
+        self.update_date_time = self.settles_at;
+    }
+
+    /// The job's modelled `MetadataTransferJobStatus`: its stored state and,
+    /// when it has failed, why.
+    ///
+    /// The `error` structure is reported WHOLE, the way every other status of
+    /// this service is (see [`status`]): a job that has not failed carries an
+    /// `ErrorDetails` with neither a code nor a message, so a client that reads
+    /// `status.error` needs no null guard.
+    ///
+    /// `queuedPosition` is left absent: it is a job's place in the queue of
+    /// jobs waiting to run, and this emulator queues no transfer behind
+    /// another, so there is no position to report.
+    pub fn status(&self) -> crate::ops::types::MetadataTransferJobStatus {
+        crate::ops::types::MetadataTransferJobStatus {
+            state: Some(self.state.clone()),
+            error: Some(self.error.clone().unwrap_or_default()),
+            queued_position: None,
+        }
+    }
 }
 
 /// One stored entity.
@@ -983,6 +1189,32 @@ pub fn scene_arn(region: &str, workspace_id: &str, scene_id: &str) -> String {
         region,
         &format!("workspace/{workspace_id}/scene/{scene_id}"),
     )
+}
+
+/// The ARN of a metadata transfer job. An ACCOUNT-level resource, so — unlike
+/// [`scene_arn`] — its resource portion nests under no workspace.
+pub fn metadata_transfer_job_arn(region: &str, metadata_transfer_job_id: &str) -> String {
+    ::engine::emulator_arn(
+        "iottwinmaker",
+        region,
+        &format!("metadata-transfer-job/{metadata_transfer_job_id}"),
+    )
+}
+
+/// The ARN of the role a metadata transfer job runs under: the service-linked
+/// role at [`METADATA_TRANSFER_JOB_ROLE_PATH`], in this emulator's account.
+///
+/// IAM is global, so the ARN carries no region — which is also what the
+/// modelled `RoleArn` pattern (`^arn:…:iam::[0-9]{12}:role/`) requires.
+pub fn metadata_transfer_job_role() -> String {
+    ::engine::emulator_arn("iam", "", METADATA_TRANSFER_JOB_ROLE_PATH)
+}
+
+/// The message for a metadata transfer job this account does not hold. Built
+/// from the request, naming the job that was looked for — the same construction
+/// as [`workspace_not_found_message`], one resource across.
+pub fn metadata_transfer_job_not_found_message(metadata_transfer_job_id: &str) -> String {
+    format!("MetadataTransferJob {metadata_transfer_job_id} not found.")
 }
 
 /// A stored instant as the modelled `Timestamp` the wire carries.

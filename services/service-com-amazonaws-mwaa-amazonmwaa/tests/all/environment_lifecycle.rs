@@ -296,10 +296,26 @@ impl EnvCase {
             .unwrap_or(state::LATEST_AIRFLOW_VERSION)
     }
 
+    /// The class the environment ends up on: the requested one, or the class MWAA assigns
+    /// a create that named none.
+    fn expected_environment_class(&self) -> &str {
+        self.environment_class
+            .unwrap_or(state::DEFAULT_ENVIRONMENT_CLASS)
+    }
+
     /// The documented default for `Schedulers` / `MinWebservers` / `MaxWebservers` when
     /// the create names none: 2 for every class except `mw1.micro`, which gets 1.
     fn default_units(&self) -> i64 {
-        i64::from(state::default_unit_count(self.environment_class))
+        i64::from(state::default_unit_count(self.expected_environment_class()))
+    }
+
+    /// The weekly maintenance window the environment ends up with: the requested one, or
+    /// the window MWAA assigns a create that named none.
+    fn expected_weekly_window(&self) -> String {
+        self.weekly_window.map_or_else(
+            || state::default_weekly_maintenance_window_start(self.name),
+            str::to_string,
+        )
     }
 }
 
@@ -470,23 +486,51 @@ fn assert_matches_case(case: &EnvCase, environment: &Value) {
         json!(case.max_webservers.unwrap_or_else(|| case.default_units())),
         "case {name}: MaxWebservers"
     );
-    for (member, requested) in [
-        ("EnvironmentClass", case.environment_class),
-        ("WebserverAccessMode", case.webserver_access_mode),
-        ("EndpointManagement", case.endpoint_management),
-        ("WeeklyMaintenanceWindowStart", case.weekly_window),
-        ("KmsKey", case.kms_key),
+    // Every member MWAA assigns a value for: the requested one, or the service default
+    // for a create that named none. None of them is ever absent.
+    for (member, expected) in [
+        (
+            "EnvironmentClass",
+            json!(case.expected_environment_class()),
+        ),
+        (
+            "WebserverAccessMode",
+            json!(case
+                .webserver_access_mode
+                .unwrap_or(state::DEFAULT_WEBSERVER_ACCESS_MODE)),
+        ),
+        (
+            "EndpointManagement",
+            json!(case
+                .endpoint_management
+                .unwrap_or(state::DEFAULT_ENDPOINT_MANAGEMENT)),
+        ),
+        (
+            "WeeklyMaintenanceWindowStart",
+            json!(case.expected_weekly_window()),
+        ),
+        (
+            "MinWorkers",
+            json!(case
+                .min_workers
+                .unwrap_or_else(|| i64::from(state::DEFAULT_MIN_WORKERS))),
+        ),
+        (
+            "MaxWorkers",
+            json!(case
+                .max_workers
+                .unwrap_or_else(|| i64::from(state::DEFAULT_MAX_WORKERS))),
+        ),
     ] {
-        let expected = requested.map_or(Value::Null, |value| json!(value));
         assert_eq!(field(member), expected, "case {name}: {member}");
     }
-    for (member, requested) in [
-        ("MinWorkers", case.min_workers),
-        ("MaxWorkers", case.max_workers),
-    ] {
-        let expected = requested.map_or(Value::Null, |value| json!(value));
-        assert_eq!(field(member), expected, "case {name}: {member}");
-    }
+    // `KmsKey` is NOT service-assigned: an environment encrypted with an Amazon Web
+    // Services owned CMK names no customer key, so an absent one stays absent.
+    assert_eq!(
+        field("KmsKey"),
+        case.kms_key.map_or(Value::Null, |value| json!(value)),
+        "case {name}: KmsKey"
+    );
     for (member, value) in case.s3_pairs {
         assert_eq!(field(member), json!(value), "case {name}: {member}");
     }
@@ -525,19 +569,34 @@ fn assert_matches_case(case: &EnvCase, environment: &Value) {
     assert_minted(case, environment);
 }
 
-/// Every configured log type reads back with its level, and carries a CloudWatch log-group
-/// ARN exactly when it is enabled; a log type the create did not name stays absent.
+/// All five log types read back: a configured one with its own level, an unconfigured one
+/// with the service default (off, at the default level). Each carries a CloudWatch
+/// log-group ARN exactly when it is enabled.
 fn assert_logging(case: &EnvCase, logging: &Value) {
     let name = case.name;
-    if case.logging.is_empty() {
-        assert_eq!(
-            logging,
-            &Value::Null,
-            "case {name}: LoggingConfiguration must be absent when no log type was configured"
-        );
-        return;
-    }
-    for (member, enabled, level) in case.logging {
+    let configured: Vec<(&str, bool, &str)> = case
+        .logging
+        .iter()
+        .map(|(member, enabled, level)| (*member, *enabled, *level))
+        .collect();
+    let all_five = [
+        "DagProcessingLogs",
+        "SchedulerLogs",
+        "TaskLogs",
+        "WebserverLogs",
+        "WorkerLogs",
+    ];
+    let expected: Vec<(&str, bool, &str)> = all_five
+        .iter()
+        .map(|member| {
+            configured
+                .iter()
+                .copied()
+                .find(|(configured, _, _)| configured == member)
+                .unwrap_or((member, false, state::DEFAULT_LOG_LEVEL))
+        })
+        .collect();
+    for (member, enabled, level) in &expected {
         let module = logging
             .get(member)
             .unwrap_or_else(|| panic!("case {name}: LoggingConfiguration.{member} is missing"));
@@ -565,21 +624,6 @@ fn assert_logging(case: &EnvCase, logging: &Value) {
             assert_eq!(
                 group, None,
                 "case {name}: disabled {member} must report no CloudWatchLogGroupArn, got {group:?}"
-            );
-        }
-    }
-    for member in [
-        "DagProcessingLogs",
-        "SchedulerLogs",
-        "TaskLogs",
-        "WebserverLogs",
-        "WorkerLogs",
-    ] {
-        if !case.logging.iter().any(|(name, _, _)| *name == member) {
-            assert_eq!(
-                logging.get(member),
-                None,
-                "case {name}: unconfigured {member} must stay absent"
             );
         }
     }

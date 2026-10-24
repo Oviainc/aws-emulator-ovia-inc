@@ -264,6 +264,23 @@ impl Emulator {
         .await
     }
 
+    /// `CreateMetadataTransferJob`: POST /metadata-transfer-jobs, with every
+    /// member (including the optional `metadataTransferJobId`) in the body.
+    pub(crate) async fn create_metadata_transfer_job(&self, body: Value) -> Resp {
+        self.call("POST", "/metadata-transfer-jobs", Some(body)).await
+    }
+
+    /// `GetMetadataTransferJob`: GET on the job's own path, with the id as the
+    /// only `@httpLabel` and no body.
+    pub(crate) async fn get_metadata_transfer_job(&self, metadata_transfer_job_id: &str) -> Resp {
+        self.call(
+            "GET",
+            &format!("/metadata-transfer-jobs/{metadata_transfer_job_id}"),
+            None,
+        )
+        .await
+    }
+
     /// `TagResource`: POST /tags with the ARN and the tag map in the body.
     pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
         self.call(
@@ -311,6 +328,14 @@ pub(crate) fn component_type_arn(workspace_id: &str, component_type_id: &str) ->
 
 pub(crate) fn scene_arn(workspace_id: &str, scene_id: &str) -> String {
     format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/scene/{scene_id}")
+}
+
+/// A metadata transfer job's ARN: an account-level resource, so — unlike a
+/// scene's — it nests under no workspace.
+pub(crate) fn metadata_transfer_job_arn(metadata_transfer_job_id: &str) -> String {
+    format!(
+        "arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:metadata-transfer-job/{metadata_transfer_job_id}"
+    )
 }
 
 /// Percent-encode a value for use as a query-parameter value, the way an SDK

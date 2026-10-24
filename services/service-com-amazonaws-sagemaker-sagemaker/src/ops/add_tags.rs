@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches tags to the resource `ResourceArn` names and answers that resource's whole
+//! tag set, which is what the modelled output documents ("A list of tags associated with
+//! the SageMaker resource").
+//!
+//! A tag set is a MAP keyed by `TagKey`: "Adds or overwrites one or more tags", "Tag
+//! keys must be unique per resource", so a key the resource already carries takes the
+//! request's value in place rather than being appended a second time. The tags are
+//! stored on the resource's OWN record (through
+//! [`crate::state::ComAmazonawsSagemakerSagemakerState::tags_mut`]), beside the ones its
+//! `Create*` stored, so one resource has exactly one tag set however it was tagged.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +154,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTags"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        // A tag belongs to a resource, so an ARN this account holds no resource under has
+        // nothing to tag: refused, never a 200 for a write that landed nowhere. The
+        // message names the ARN the request sent, the only identifier the caller gave.
+        let tags = store.tags_mut(&input.resource_arn).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::does_not_exist(
+                crate::state::TAGGED_RESOURCE_ENTITY,
+                &input.resource_arn,
+            ))
+        })?;
+
+        // How many keys this request would ADD: a key already on the resource, or
+        // repeated within the request, overwrites rather than growing the set. Counted
+        // BEFORE anything is written, so a request that cannot fit leaves the stored set
+        // exactly as it was instead of landing half of itself.
+        let mut added_keys: Vec<&str> = Vec::new();
+        for tag in &input.tags {
+            let known = tags.iter().any(|held| held.key == tag.key)
+                || added_keys.contains(&tag.key.as_str());
+            if !known {
+                added_keys.push(tag.key.as_str());
+            }
+        }
+        let resulting = tags.len() + added_keys.len();
+        if resulting > crate::state::TAGS_PER_RESOURCE_QUOTA {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "A SageMaker resource holds at most {} tags; {} already carries {} and \
+                 this request would take it to {}.",
+                crate::state::TAGS_PER_RESOURCE_QUOTA,
+                input.resource_arn,
+                tags.len(),
+                resulting
+            )));
+        }
+
+        let mut changed = false;
+        for tag in input.tags {
+            match tags.iter_mut().find(|held| held.key == tag.key) {
+                // "Adds or OVERWRITES one or more tags": the key keeps its place in the
+                // set and takes the request's value. The same key sent twice in ONE
+                // request is the same rule applied twice, so the later pair wins and the
+                // set still holds the key once, which is what "Tag keys must be unique
+                // per resource" requires of the RESULT. (A `Create*` refuses a repeated
+                // key instead, because a create states a resource's tags rather than
+                // overwriting any.)
+                Some(held) => {
+                    changed |= held.value != tag.value;
+                    held.value = tag.value;
+                }
+                None => {
+                    changed = true;
+                    tags.push(tag);
+                }
+            }
+        }
+        // The output is the resource's whole tag set after the merge, which is what the
+        // modelled `Tags` member documents, read back out of the store rather than echoed
+        // from the request: what a caller reads here is what `ListTags` reports.
+        let associated = tags.clone();
+        drop(store);
+
+        // Recorded only where the merge really moved the stored set, the same rule
+        // `DeleteTags` applies: a request that re-sends values the resource already
+        // carries (or carries no tags at all) changed nothing to record.
+        if changed {
+            crate::state::record_state_change(Self::NAME, &input.resource_arn, ctx);
+        }
+        Ok(AddTagsOutput {
+            tags: Some(associated),
+        })
     }
 }

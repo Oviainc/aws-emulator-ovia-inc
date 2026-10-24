@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags of the resource `ResourceArn` names, exactly as they are stored on
+//! that resource's record (what its `Create*` stored plus what `AddTags` merged in,
+//! through [`crate::state::ComAmazonawsSagemakerSagemakerState::tags_of`]) and in that
+//! stored order, so the page boundaries of one tag set are stable across calls.
+//!
+//! A pure READ: nothing here writes, so listing a resource's tags changes nothing a
+//! later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -136,20 +135,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let store = state.lock();
+        // Tags are a property of a resource, so an ARN this account holds no resource
+        // under has no tag set to report: refused, rather than an empty list that a
+        // caller cannot tell from a resource carrying no tags.
+        let tags = store.tags_of(&input.resource_arn).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::does_not_exist(
+                crate::state::TAGGED_RESOURCE_ENTITY,
+                &input.resource_arn,
+            ))
+        })?;
+
+        // The token names the KEY the previous page stopped at (keys are unique per
+        // resource), so resuming lands exactly after it even though the token is opaque;
+        // same format every paginated listing in this service mints.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|key| tags.iter().position(|tag| tag.key == key))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this resource's \
+                             tags; restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling
+        // ([`crate::state::MAX_PAGE_SIZE`]). Both ceilings and the tag set's own bound
+        // ([`crate::state::TAGS_PER_RESOURCE_QUOTA`]) are 50 today, and the modelled
+        // `MaxResults` floor is 50 as well, so a listing that starts at the beginning
+        // reports the whole set and emits NO token: the arithmetic below is what keeps
+        // that an observation about the bounds rather than an assumption, and what keeps
+        // one call from serialising more than the ceiling if either bound ever changes.
+        // Resuming from a token is reachable whatever the bounds are, which is why the
+        // boundary above is resolved rather than ignored.
+        let start = start.min(tags.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(tags.len());
+        let page = &tags[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < tags.len() => Some(crate::state::encode_page_token(&last.key)),
+            _ => None,
+        };
+
+        Ok(ListTagsOutput {
+            tags: Some(page.to_vec()),
+            next_token,
+        })
     }
 }

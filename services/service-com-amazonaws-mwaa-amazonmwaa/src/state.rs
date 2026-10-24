@@ -83,6 +83,48 @@ pub const LATEST_AIRFLOW_VERSION: &str = "3.0.6";
 /// than 2; see [`default_unit_count`].
 pub const MICRO_ENVIRONMENT_CLASS: &str = "mw1.micro";
 
+/// The environment class an environment runs on when the create names none.
+///
+/// MWAA assigns a class to every environment — the `EnvironmentClass` member is reported
+/// for an environment that never named one — and the class it assigns is the small one
+/// ("mw1.small" in the member's own valid-value list, the default the MWAA console and
+/// the *Amazon MWAA environment class* guide start a new environment on).
+pub const DEFAULT_ENVIRONMENT_CLASS: &str = "mw1.small";
+
+/// The worker floor an environment runs with when the create names no `MinWorkers`: one
+/// worker, the single worker "that is included with your environment" the `MaxWorkers`
+/// doc describes as what MWAA scales back down to.
+pub const DEFAULT_MIN_WORKERS: i32 = 1;
+
+/// The worker ceiling an environment runs with when the create names no `MaxWorkers`:
+/// the service-assigned maximum worker count MWAA gives a new environment.
+pub const DEFAULT_MAX_WORKERS: i32 = 10;
+
+/// The Apache Airflow web-server access mode of an environment whose create named none.
+///
+/// `WebserverAccessMode` is one of PRIVATE_ONLY | PUBLIC_AND_PRIVATE | PUBLIC_ONLY, and
+/// an environment that asked for no VPC-only web server gets the public one.
+pub const DEFAULT_WEBSERVER_ACCESS_MODE: &str = "PUBLIC_ONLY";
+
+/// Who manages an environment's VPC endpoints when the create named nobody.
+///
+/// The `EndpointManagement` doc gives the two modes: "If set to SERVICE, Amazon MWAA will
+/// create and manage the required VPC endpoints in your VPC. If set to CUSTOMER, you must
+/// create, and manage, the VPC endpoints in your VPC." — so MWAA manages them unless the
+/// caller asks to.
+pub const DEFAULT_ENDPOINT_MANAGEMENT: &str = "SERVICE";
+
+/// The Apache Airflow log level a log type carries when nothing configured it.
+///
+/// A `LoggingLevel` value (CRITICAL | ERROR | WARNING | INFO | DEBUG); INFO is the level
+/// Apache Airflow itself logs at by default, and the one MWAA reports for a log type that
+/// was never enabled.
+pub const DEFAULT_LOG_LEVEL: &str = "INFO";
+
+/// The days `WeeklyMaintenanceWindowStart`'s own pattern accepts
+/// (`(MON|TUE|WED|THU|FRI|SAT|SUN):([01]\\d|2[0-3]):(00|30)`), in the order it lists them.
+const MAINTENANCE_WINDOW_DAYS: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+
 /// CloudWatch log-group suffix of each Apache Airflow log type, as MWAA names the groups
 /// it publishes to (`airflow-<EnvironmentName>-<LogType>`).
 const LOG_TYPE_DAG_PROCESSING: &str = "DAGProcessing";
@@ -100,19 +142,36 @@ const LOG_TYPE_WORKER: &str = "Worker";
 ///
 /// The `Schedulers`, `MinWebservers` and `MaxWebservers` docs all state the same rule:
 /// "Defaults to 2 for all environment sizes except mw1.micro, which defaults to 1."
-pub fn default_unit_count(environment_class: Option<&str>) -> i32 {
-    if environment_class == Some(MICRO_ENVIRONMENT_CLASS) {
+///
+/// The class is the one the environment ends up on, which for a create that named none is
+/// [`DEFAULT_ENVIRONMENT_CLASS`].
+pub fn default_unit_count(environment_class: &str) -> i32 {
+    if environment_class == MICRO_ENVIRONMENT_CLASS {
         1
     } else {
         2
     }
 }
 
-/// One Apache Airflow log type's logging settings, as a create or update supplied them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// One Apache Airflow log type's logging settings, as a create or update supplied them —
+/// or, for a log type nobody configured, the service-assigned default ([`Default`]:
+/// publishing off, at [`DEFAULT_LOG_LEVEL`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleLoggingRecord {
     pub enabled: bool,
     pub log_level: String,
+}
+
+impl Default for ModuleLoggingRecord {
+    /// A log type MWAA was never asked to publish: not enabled, and at the default log
+    /// level. MWAA reports every one of the five log types for every environment, so the
+    /// absence of a request to publish one is a reported setting, not a missing member.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
+        }
+    }
 }
 
 impl ModuleLoggingRecord {
@@ -141,15 +200,18 @@ impl ModuleLoggingRecord {
     }
 }
 
-/// The five Apache Airflow log types' settings, as a create or update left them. A log
-/// type nobody configured stays `None` rather than being invented with a made-up level.
+/// The five Apache Airflow log types' settings, as a create or update left them.
+///
+/// Every log type is always present: MWAA reports a `LoggingConfiguration` carrying all
+/// five module blocks for every environment, so a log type no request named carries the
+/// service-assigned default ([`ModuleLoggingRecord::default`]) rather than being absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoggingConfigurationRecord {
-    pub dag_processing_logs: Option<ModuleLoggingRecord>,
-    pub scheduler_logs: Option<ModuleLoggingRecord>,
-    pub task_logs: Option<ModuleLoggingRecord>,
-    pub webserver_logs: Option<ModuleLoggingRecord>,
-    pub worker_logs: Option<ModuleLoggingRecord>,
+    pub dag_processing_logs: ModuleLoggingRecord,
+    pub scheduler_logs: ModuleLoggingRecord,
+    pub task_logs: ModuleLoggingRecord,
+    pub webserver_logs: ModuleLoggingRecord,
+    pub worker_logs: ModuleLoggingRecord,
 }
 
 impl LoggingConfigurationRecord {
@@ -158,58 +220,41 @@ impl LoggingConfigurationRecord {
     /// member.
     pub fn merge(&mut self, input: &LoggingConfigurationInput) {
         if let Some(module) = input.dag_processing_logs.as_ref() {
-            self.dag_processing_logs = Some(ModuleLoggingRecord::from_input(module));
+            self.dag_processing_logs = ModuleLoggingRecord::from_input(module);
         }
         if let Some(module) = input.scheduler_logs.as_ref() {
-            self.scheduler_logs = Some(ModuleLoggingRecord::from_input(module));
+            self.scheduler_logs = ModuleLoggingRecord::from_input(module);
         }
         if let Some(module) = input.task_logs.as_ref() {
-            self.task_logs = Some(ModuleLoggingRecord::from_input(module));
+            self.task_logs = ModuleLoggingRecord::from_input(module);
         }
         if let Some(module) = input.webserver_logs.as_ref() {
-            self.webserver_logs = Some(ModuleLoggingRecord::from_input(module));
+            self.webserver_logs = ModuleLoggingRecord::from_input(module);
         }
         if let Some(module) = input.worker_logs.as_ref() {
-            self.worker_logs = Some(ModuleLoggingRecord::from_input(module));
+            self.worker_logs = ModuleLoggingRecord::from_input(module);
         }
     }
 
-    /// True when no log type has been configured at all.
-    fn is_empty(&self) -> bool {
-        self.dag_processing_logs.is_none()
-            && self.scheduler_logs.is_none()
-            && self.task_logs.is_none()
-            && self.webserver_logs.is_none()
-            && self.worker_logs.is_none()
-    }
-
-    /// The modelled `LoggingConfiguration`, or `None` when nothing was configured.
-    fn to_modelled(&self, region: &str, name: &str) -> Option<LoggingConfiguration> {
-        if self.is_empty() {
-            return None;
+    /// The modelled `LoggingConfiguration`: all five module blocks, always.
+    fn to_modelled(&self, region: &str, name: &str) -> LoggingConfiguration {
+        LoggingConfiguration {
+            dag_processing_logs: Some(self.dag_processing_logs.to_modelled(
+                region,
+                name,
+                LOG_TYPE_DAG_PROCESSING,
+            )),
+            scheduler_logs: Some(
+                self.scheduler_logs
+                    .to_modelled(region, name, LOG_TYPE_SCHEDULER),
+            ),
+            task_logs: Some(self.task_logs.to_modelled(region, name, LOG_TYPE_TASK)),
+            webserver_logs: Some(
+                self.webserver_logs
+                    .to_modelled(region, name, LOG_TYPE_WEBSERVER),
+            ),
+            worker_logs: Some(self.worker_logs.to_modelled(region, name, LOG_TYPE_WORKER)),
         }
-        Some(LoggingConfiguration {
-            dag_processing_logs: self
-                .dag_processing_logs
-                .as_ref()
-                .map(|m| m.to_modelled(region, name, LOG_TYPE_DAG_PROCESSING)),
-            scheduler_logs: self
-                .scheduler_logs
-                .as_ref()
-                .map(|m| m.to_modelled(region, name, LOG_TYPE_SCHEDULER)),
-            task_logs: self
-                .task_logs
-                .as_ref()
-                .map(|m| m.to_modelled(region, name, LOG_TYPE_TASK)),
-            webserver_logs: self
-                .webserver_logs
-                .as_ref()
-                .map(|m| m.to_modelled(region, name, LOG_TYPE_WEBSERVER)),
-            worker_logs: self
-                .worker_logs
-                .as_ref()
-                .map(|m| m.to_modelled(region, name, LOG_TYPE_WORKER)),
-        })
     }
 }
 
@@ -251,17 +296,18 @@ pub struct EnvironmentSpec {
     /// A `BTreeMap` so two equal option sets compare equal and read back in a stable
     /// order.
     pub airflow_configuration_options: BTreeMap<String, String>,
-    pub environment_class: Option<String>,
+    /// Resolved at create time: the requested class, or [`DEFAULT_ENVIRONMENT_CLASS`].
+    pub environment_class: String,
     pub airflow_version: String,
     pub kms_key: Option<String>,
-    pub max_workers: Option<i32>,
-    pub min_workers: Option<i32>,
+    pub max_workers: i32,
+    pub min_workers: i32,
     pub schedulers: i32,
     pub min_webservers: i32,
     pub max_webservers: i32,
-    pub webserver_access_mode: Option<String>,
-    pub weekly_maintenance_window_start: Option<String>,
-    pub endpoint_management: Option<String>,
+    pub webserver_access_mode: String,
+    pub weekly_maintenance_window_start: String,
+    pub endpoint_management: String,
     pub logging_configuration: LoggingConfigurationRecord,
 }
 
@@ -359,13 +405,13 @@ impl EnvironmentRecord {
             // honest answer when none was.
             airflow_configuration_options: (!self.spec.airflow_configuration_options.is_empty())
                 .then(|| map_of(&self.spec.airflow_configuration_options)),
-            environment_class: self.spec.environment_class.clone(),
-            max_workers: self.spec.max_workers,
+            environment_class: Some(self.spec.environment_class.clone()),
+            max_workers: Some(self.spec.max_workers),
             network_configuration: Some(self.spec.network_configuration.to_modelled()),
-            logging_configuration: self
-                .spec
-                .logging_configuration
-                .to_modelled(&self.region, &self.name),
+            logging_configuration: Some(self.spec.logging_configuration.to_modelled(
+                &self.region,
+                &self.name,
+            )),
             last_update: self.last_update.as_ref().map(|last_update| LastUpdate {
                 status: Some(last_update.status.clone()),
                 created_at: Some(::aws_smithy_types::DateTime::from(last_update.created_at)),
@@ -375,17 +421,19 @@ impl EnvironmentRecord {
                 source: Some(last_update.source.clone()),
                 worker_replacement_strategy: last_update.worker_replacement_strategy.clone(),
             }),
-            weekly_maintenance_window_start: self.spec.weekly_maintenance_window_start.clone(),
+            weekly_maintenance_window_start: Some(
+                self.spec.weekly_maintenance_window_start.clone(),
+            ),
             // `TagMap` is `@length(1, 50)`, so an untagged environment reports no `Tags`
             // member rather than an empty map outside that bound.
             tags: (!self.tags.is_empty()).then(|| map_of(&self.tags)),
-            webserver_access_mode: self.spec.webserver_access_mode.clone(),
-            min_workers: self.spec.min_workers,
+            webserver_access_mode: Some(self.spec.webserver_access_mode.clone()),
+            min_workers: Some(self.spec.min_workers),
             schedulers: Some(self.spec.schedulers),
             webserver_vpc_endpoint_service: Some(self.webserver_vpc_endpoint_service.clone()),
             database_vpc_endpoint_service: Some(self.database_vpc_endpoint_service.clone()),
             celery_executor_queue: Some(self.celery_executor_queue.clone()),
-            endpoint_management: self.spec.endpoint_management.clone(),
+            endpoint_management: Some(self.spec.endpoint_management.clone()),
             min_webservers: Some(self.spec.min_webservers),
             max_webservers: Some(self.spec.max_webservers),
         }
@@ -545,6 +593,21 @@ pub fn log_group_arn(region: &str, name: &str, log_type: &str) -> String {
         region,
         &format!("log-group:airflow-{name}-{log_type}"),
     )
+}
+
+/// The weekly maintenance window MWAA assigns an environment whose create named none.
+///
+/// `WeeklyMaintenanceWindowStart` is reported for every environment, so the service picks
+/// a window when the caller does not. The choice here is derived from the environment's
+/// own name, so it is stable across reads, differs between environments, and leaks
+/// neither a clock nor a request id; it lands on a day and a 30-minute boundary the
+/// member's own pattern accepts.
+pub fn default_weekly_maintenance_window_start(name: &str) -> String {
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(format!("window/{name}").as_bytes());
+    let day = MAINTENANCE_WINDOW_DAYS[usize::from(digest[0]) % MAINTENANCE_WINDOW_DAYS.len()];
+    let hour = u32::from(digest[1]) % 24;
+    let minute = if digest[2] % 2 == 0 { "00" } else { "30" };
+    format!("{day}:{hour:02}:{minute}")
 }
 
 /// The service-linked role ARN of an environment, as the `ServiceRoleArn` doc describes
