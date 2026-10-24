@@ -77,6 +77,19 @@
 //! one way a group is stored, and it derives every member the service owns (the group id,
 //! its ARN and the owning account) rather than taking it from a caller.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_table_vpc_associations`] holds the
+//! associations between a local gateway route table of
+//! [`ComAmazonawsEc2Amazonec2State::local_gateway_route_tables`] and a VPC, keyed by
+//! `LocalGatewayRouteTableVpcAssociationId`, as the modelled shape beside the move the clock
+//! owes it: an association is answered in the non-terminal `associating` state, so the clock
+//! owes it `associated` one [`TRANSITION_DELAY`] later
+//! ([`LocalGatewayRouteTableVpcAssociationRecord::pending`]).
+//! [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_vpc_association`] is the
+//! one way an association is stored, and
+//! [`require_known_local_gateway_route_table`] the one way the route table it is made in is
+//! resolved — which answers [`INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_NOT_FOUND`] for every
+//! well-formed id while the route table store is empty.
+//!
 //! A fact of a VPC that the modelled [`Vpc`] shape carries no member for is stored beside
 //! it under the same id rather than on it:
 //! [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds the `VpcAttributeName`
@@ -1765,6 +1778,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
         String,
         crate::ops::types::LocalGatewayRouteTableVirtualInterfaceGroupAssociation,
     >,
+    /// Every association between a local gateway route table and a VPC the account holds, by
+    /// `LocalGatewayRouteTableVpcAssociationId`, as the modelled
+    /// [`crate::ops::types::LocalGatewayRouteTableVpcAssociation`] shape beside the move the
+    /// clock owes it ([`LocalGatewayRouteTableVpcAssociationRecord`]) — the association a
+    /// writer answers `associating` still owes `associated`, which the modelled shape carries
+    /// no member for. Ordered by id, which is the order
+    /// `DescribeLocalGatewayRouteTableVpcAssociations` reports and pages over.
+    ///
+    /// Starts EMPTY, for the reason [`Self::local_gateway_route_tables`] does: there is no
+    /// route table to associate a VPC with until one has been stored.
+    /// [`Self::insert_local_gateway_route_table_vpc_association`] is the one way an
+    /// association is stored.
+    pub local_gateway_route_table_vpc_associations:
+        BTreeMap<String, LocalGatewayRouteTableVpcAssociationRecord>,
     /// Every local gateway route table the account holds, by `LocalGatewayRoutetableId`,
     /// with the routes IN that table held on the record beside the modelled
     /// [`crate::ops::types::LocalGatewayRouteTable`] shape
@@ -2375,6 +2402,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             verified_access_endpoints: BTreeMap::new(),
             verified_access_endpoint_client_tokens: HashMap::new(),
             local_gateway_route_table_virtual_interface_group_associations: BTreeMap::new(),
+            local_gateway_route_table_vpc_associations: BTreeMap::new(),
             // A local gateway route table lives on an Outpost, which no EC2 call creates.
             local_gateway_route_tables: BTreeMap::new(),
             local_gateway_virtual_interface_groups: BTreeMap::new(),
@@ -4059,7 +4087,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
     /// calls. So is a NAT gateway address an association left `associating` reaching
     /// `succeeded` ([`NatGatewayAddressTransition`]), and a `running` Network Access Scope
-    /// analysis reaching its terminal `AnalysisStatus`.
+    /// analysis reaching its terminal `AnalysisStatus`. So is an `associating` local gateway
+    /// route table / VPC association reaching `associated`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // A volume whose Recycle Bin retention period has run out was permanently deleted
@@ -4165,6 +4194,20 @@ impl ComAmazonawsEc2Amazonec2State {
                 // asked about it, so "when the exclusion was last updated"
                 // (`VpcBlockPublicAccessExclusion$LastUpdateTimestamp`) is the due instant.
                 record.view.last_update_timestamp = Some(system_time_to_date_time(pending.at));
+                record.pending = None;
+            }
+        }
+        // An association `CreateLocalGatewayRouteTableVpcAssociation` answered as
+        // `associating` reaches `associated` once its due instant has passed, whether or not
+        // anybody called — the same contract as the `pending` VPC above.
+        for record in self.local_gateway_route_table_vpc_associations.values_mut() {
+            let due = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string);
+            if let Some(state) = due {
+                record.view.state = Some(state);
                 record.pending = None;
             }
         }
@@ -7965,6 +8008,107 @@ pub fn local_gateway_route_table_payload_bytes(spec: &LocalGatewayRouteTableSpec
         .saturating_add(spec.state.len())
 }
 
+/// The one resource type a `TagSpecifications` entry on a create of a local gateway route
+/// table / VPC association may name: `ResourceType`'s
+/// `local-gateway-route-table-vpc-association` member
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+pub const RESOURCE_TYPE_LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION: &str =
+    "local-gateway-route-table-vpc-association";
+
+/// The id prefix EC2 mints an association between a local gateway route table and a VPC
+/// with: `lgw-vpc-assoc-`, as the AWS Outposts and EC2 documentation's own ids read (for
+/// example `lgw-vpc-assoc-0e0f27af15EXAMPLE`). The model puts no pattern on
+/// `LocalGatewayRouteTableVpcAssociationId`, so the prefix is the one thing that says which
+/// resource an id names.
+pub const LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_ID_PREFIX: &str = "lgw-vpc-assoc";
+
+/// How many local gateway route table / VPC associations this emulator stores before a write
+/// must refuse — CHOSEN, for the reason [`MAX_LOCAL_GATEWAY_VIF_GROUP_ASSOCIATIONS`] is.
+pub const MAX_LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATIONS: usize = 4096;
+
+/// The code EC2 answers when a request would take the account past the VPC associations it
+/// may hold, in the `<Resource>LimitExceeded` family this service's other quotas are refused
+/// with ([`SECONDARY_NETWORK_LIMIT_EXCEEDED`]).
+pub const LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_LIMIT_EXCEEDED: &str =
+    "LocalGatewayRouteTableVpcAssociationLimitExceeded";
+
+/// An association being carried out, which is what a create answers with until its
+/// clock-owed move falls due: `associating`, the member every association-state enum of this
+/// model spells it with (`smithy_query(query="shape",shape="TransitGatewayAssociationState")`
+/// — `associating`, `associated`, `disassociating`, `disassociated`), the local gateway
+/// association's own `State` being an unconstrained string.
+pub const LOCAL_GATEWAY_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// An association in force: that same vocabulary's `associated`, the state the clock owes an
+/// `associating` association one [`TRANSITION_DELAY`] later.
+pub const LOCAL_GATEWAY_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// One association between a local gateway route table and a VPC: the modelled shape every
+/// operation that reports one answers with, plus the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other store
+/// here holds one: a member a writer sets round-trips through
+/// `DescribeLocalGatewayRouteTableVpcAssociations` without a field-by-field copy that can
+/// silently drop one. The pending move lives beside it because the shape carries no member
+/// for when the association's next state falls due.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteTableVpcAssociationRecord {
+    /// The association as the model shapes it, carrying the state reached so far.
+    pub view: crate::ops::types::LocalGatewayRouteTableVpcAssociation,
+    /// The move an association still `associating` owes; `None` for one in a state the clock
+    /// owes nothing on.
+    pub pending: Option<PendingStateMove>,
+}
+
+/// What one association between a local gateway route table and a VPC is written with: the
+/// route table it is made in (with the ARN and local gateway the route table itself
+/// reports), the VPC it joins, the state it starts in, the state the clock owes it, and its
+/// tags.
+///
+/// Every member the service itself owns — the association id and the owning account — is
+/// derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route_table_vpc_association`] rather
+/// than taken from the caller.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteTableVpcAssociationSpec {
+    /// "The ID of the local gateway route table" the association is made in.
+    pub local_gateway_route_table_id: String,
+    /// "The Amazon Resource Name (ARN) of the local gateway route table for the
+    /// association", as the stored route table reports it.
+    pub local_gateway_route_table_arn: String,
+    /// "The ID of the local gateway", as the stored route table reports it.
+    pub local_gateway_id: String,
+    /// "The ID of the VPC" the route table is associated with.
+    pub vpc_id: String,
+    /// "The state of the association" (`LocalGatewayRouteTableVpcAssociation$State`), which
+    /// the model leaves an unconstrained string.
+    pub state: String,
+    /// The state the clock owes this association, [`TRANSITION_DELAY`] from the write;
+    /// `None` for one written in a state nothing is owed on.
+    pub becomes: Option<String>,
+    /// "The tags assigned to the association".
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored VPC association holds: its tags, the state a writer
+/// pinned on it, and the ids and ARN of the resources it joins. Everything else on the record
+/// — the association id, the owning account — is derived by this module.
+///
+/// The ONE definition of that charge, the way
+/// [`local_gateway_vif_group_association_payload_bytes`] is for the virtual interface group
+/// associations: the insert charges exactly it, and a removal path must give back the same
+/// number.
+pub fn local_gateway_route_table_vpc_association_payload_bytes(
+    spec: &LocalGatewayRouteTableVpcAssociationSpec,
+) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.state.len())
+        .saturating_add(spec.local_gateway_route_table_id.len())
+        .saturating_add(spec.local_gateway_route_table_arn.len())
+        .saturating_add(spec.local_gateway_id.len())
+        .saturating_add(spec.vpc_id.len())
+}
+
 /// The caller-chosen bytes one stored route holds: its destination, its target and the
 /// type and state it carries. The ONE definition of that charge, so
 /// [`ComAmazonawsEc2Amazonec2State::insert_local_gateway_route`] charges exactly what
@@ -8161,6 +8305,87 @@ impl ComAmazonawsEc2Amazonec2State {
         self.release_stored_bytes(local_gateway_route_payload_bytes(&route));
         route.state = Some(LOCAL_GATEWAY_ROUTE_STATE_DELETED.to_string());
         Some(route)
+    }
+}
+
+// =============================================================================
+// Local gateway route table / VPC associations
+// =============================================================================
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` local gateway route table / VPC associations fit inside the
+    /// store's ceiling ([`MAX_LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATIONS`]).
+    pub fn has_local_gateway_route_table_vpc_association_capacity(&self, count: usize) -> bool {
+        self.local_gateway_route_table_vpc_associations
+            .len()
+            .saturating_add(count)
+            <= MAX_LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATIONS
+    }
+
+    /// The id of the association that already joins `route_table_id` and `vpc_id`, if the
+    /// account holds one.
+    ///
+    /// An association IS the pair it joins, so this is what a writer asks before making a
+    /// second one: without it the store would hold two association ids for one fact. The
+    /// scan is bounded by the store's own ceiling
+    /// ([`MAX_LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATIONS`]).
+    pub fn local_gateway_route_table_vpc_association_of(
+        &self,
+        route_table_id: &str,
+        vpc_id: &str,
+    ) -> Option<&str> {
+        self.local_gateway_route_table_vpc_associations
+            .iter()
+            .find(|(_, record)| {
+                record.view.local_gateway_route_table_id.as_deref() == Some(route_table_id)
+                    && record.view.vpc_id.as_deref() == Some(vpc_id)
+            })
+            .map(|(association_id, _)| association_id.as_str())
+    }
+
+    /// Store one association between a local gateway route table and a VPC, and answer the id
+    /// it was given — or `None` when the store cannot take it.
+    ///
+    /// Both of the store's bounds are enforced HERE, before an id is minted or a byte
+    /// charged: the count ceiling
+    /// ([`Self::has_local_gateway_route_table_vpc_association_capacity`]) and the byte budget
+    /// ([`Self::would_exceed_stored_bytes`] over
+    /// [`local_gateway_route_table_vpc_association_payload_bytes`]). A caller that gets `None`
+    /// must refuse the request with
+    /// [`LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_LIMIT_EXCEEDED`].
+    ///
+    /// The state the clock owes the association is RECORDED, never slept for:
+    /// [`Self::materialize_due_transitions`] applies it once [`TRANSITION_DELAY`] has passed,
+    /// so a caller asking straight after the write still sees the transient state the
+    /// association starts in.
+    pub fn insert_local_gateway_route_table_vpc_association(
+        &mut self,
+        spec: LocalGatewayRouteTableVpcAssociationSpec,
+    ) -> Option<String> {
+        let payload_bytes = local_gateway_route_table_vpc_association_payload_bytes(&spec);
+        if !self.has_local_gateway_route_table_vpc_association_capacity(1)
+            || self.would_exceed_stored_bytes(payload_bytes)
+        {
+            return None;
+        }
+        let association_id = self.next_id(LOCAL_GATEWAY_ROUTE_TABLE_VPC_ASSOCIATION_ID_PREFIX);
+        let record = LocalGatewayRouteTableVpcAssociationRecord {
+            view: crate::ops::types::LocalGatewayRouteTableVpcAssociation {
+                local_gateway_route_table_vpc_association_id: Some(association_id.clone()),
+                local_gateway_route_table_id: Some(spec.local_gateway_route_table_id),
+                local_gateway_route_table_arn: Some(spec.local_gateway_route_table_arn),
+                local_gateway_id: Some(spec.local_gateway_id),
+                vpc_id: Some(spec.vpc_id),
+                owner_id: Some(::engine::emulator_account_id().to_string()),
+                state: Some(spec.state),
+                tags: Some(spec.tags),
+            },
+            pending: spec.becomes.map(PendingStateMove::starting_now),
+        };
+        self.add_stored_bytes(payload_bytes);
+        self.local_gateway_route_table_vpc_associations
+            .insert(association_id.clone(), record);
+        Some(association_id)
     }
 }
 
