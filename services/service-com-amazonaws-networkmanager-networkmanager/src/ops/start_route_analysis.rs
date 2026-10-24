@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRouteAnalysis
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRouteAnalysis`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRouteAnalysis::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a Route Analyzer analysis on the addressed global network: this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRouteAnalysis` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRouteAnalysisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRouteAnalysis"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartRouteAnalysisErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // A route analysis is started ON a global network, which the URI addresses
+        // (`POST /global-networks/{GlobalNetworkId}/route-analyses`), so one the store does
+        // not hold is the missing-resource answer rather than a field failure.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(StartRouteAnalysisErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+
+        // A quota bounds how many analyses one global network can be made to hold: at the
+        // cap the start is refused and nothing is recorded, so repeated calls cannot grow
+        // the store without end. This operation models no quota error, so the refusal is
+        // its modelled `ValidationException` against stored state.
+        if store.route_analysis_count_of(&input.global_network_id)
+            >= crate::state::MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK
+        {
+            return Err(StartRouteAnalysisErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "global network {} already holds the maximum of {} route analyses",
+                        input.global_network_id,
+                        crate::state::MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // The analysis runs here, against what the global network holds at this instant,
+        // and is stored with the paths it found: `GetRouteAnalysis` reports that same
+        // record, and a resource created after this call cannot change what it reports.
+        // Only the `RUNNING` -> `COMPLETED` transition is left to the clock, so the answer
+        // below reports the analysis still running.
+        let now = ::std::time::SystemTime::now();
+        let record = store.start_route_analysis(
+            &input.global_network_id,
+            &input.source,
+            &input.destination,
+            input.include_return_path,
+            input.use_middleboxes,
+            now,
+        );
+
+        Ok(StartRouteAnalysisOutput {
+            route_analysis: Some(record.to_shape(now)),
+        })
     }
 }

@@ -22,6 +22,10 @@
 //! Beside that tree a global network holds the telemetry-bearing connections registered
 //! with it (a Connect peer of either kind, a VPN connection), whose session health is what
 //! `GetNetworkTelemetry` reports.
+//! A global network also holds the ROUTE ANALYSES started on it: each is a Route Analyzer
+//! job that analysed the routing path between two attachments against what the global
+//! network held when it was started, and holds the paths it found for `GetRouteAnalysis`
+//! to read back.
 //! Everything
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
@@ -36,7 +40,9 @@ use crate::ops::types::{
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
     Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
     NetworkResource, NetworkTelemetry, OrganizationStatus,
-    ResourceNotFoundException, Site, SiteToSiteVpnAttachment, Tag, ValidationException,
+    ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
+    RouteAnalysisEndpointOptions, RouteAnalysisEndpointOptionsSpecification, RouteAnalysisPath,
+    Site, SiteToSiteVpnAttachment, Tag, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
 
@@ -116,6 +122,11 @@ pub const CORE_NETWORK_POLICY_KIND: &str = "core-network-policy";
 /// `attachment` entry of [`NETWORK_RESOURCE_TYPES`], so one name serves the id prefix,
 /// the ARN resource type and the network-resource inventory.
 pub const ATTACHMENT_KIND: &str = "attachment";
+/// See [`GLOBAL_NETWORK_KIND`]. A ROUTE ANALYSIS is a job of its global network rather
+/// than a resource with an ARN — the modelled `RouteAnalysis` carries only a
+/// `RouteAnalysisId` (`smithy_query shape=RouteAnalysis`) — so this name serves the id
+/// prefix (`route-analysis-<hex>`) and the `ResourceType` a not-found refusal reports.
+pub const ROUTE_ANALYSIS_KIND: &str = "route-analysis";
 
 /// The state an attachment is in while a CHANGE to one that already exists is in flight,
 /// as against the [`STATE_CREATING`] of one whose creation is.
@@ -356,7 +367,7 @@ pub fn dependents_block_delete(
 /// carries only a length and a permissive pattern, so a value outside this set is refused
 /// here rather than by the schema.
 pub const NETWORK_RESOURCE_TYPES: [&str; 17] = [
-    "attachment",
+    ATTACHMENT_KIND,
     "connect-peer",
     "connection",
     "core-network",
@@ -369,11 +380,22 @@ pub const NETWORK_RESOURCE_TYPES: [&str; 17] = [
     "peering",
     "site",
     "transit-gateway",
-    "transit-gateway-attachment",
+    TRANSIT_GATEWAY_ATTACHMENT_TYPE,
     "transit-gateway-connect-peer",
     "transit-gateway-route-table",
     "vpn-connection",
 ];
+
+/// The network-resource type of an attachment on a TRANSIT GATEWAY registered with a
+/// global network — an Amazon VPC resource, unlike the Cloud WAN attachments this service
+/// mints itself ([`ATTACHMENT_KIND`]).
+///
+/// One of [`NETWORK_RESOURCE_TYPES`], and the only kind a ROUTE ANALYSIS can run a routing
+/// path through: the Route Analyzer analyses the path between two transit gateway
+/// attachments ([`RouteAnalysisEndpointOptions`]), so resolving an endpoint means finding
+/// the global network's network resource of this type with the ARN the endpoint names (see
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::analyze_route_path`]).
+pub const TRANSIT_GATEWAY_ATTACHMENT_TYPE: &str = "transit-gateway-attachment";
 
 /// Whether `resource_type` is one of the values [`NETWORK_RESOURCE_TYPES`] lists.
 pub fn is_network_resource_type(resource_type: &str) -> bool {
@@ -503,6 +525,17 @@ pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
 /// [`VALIDATION_REASON_OTHER`] — the request is invalid against stored state, no single
 /// member is at fault — and stores nothing.
 pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
+
+/// How many route analyses one global network may hold here.
+///
+/// CHOSEN, like [`MAX_ATTACHMENTS_PER_CORE_NETWORK`]: every `StartRouteAnalysis` records
+/// one more analysis a later `GetRouteAnalysis` can read back, and neither the model nor
+/// the published quotas state a number, so this bound exists only so that repeated calls
+/// cannot grow the store without end. `StartRouteAnalysis` models no quota error
+/// (`smithy_query query="operation" operation="StartRouteAnalysis"`), so a start past this
+/// cap is refused with its modelled `ValidationException` (HTTP 400) carrying
+/// [`VALIDATION_REASON_OTHER`] and records nothing.
+pub const MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK: usize = 100;
 
 /// How long after the creating call a `PENDING` resource settles to `AVAILABLE`.
 ///
@@ -1927,6 +1960,281 @@ impl OrganizationServiceAccessRecord {
     }
 }
 
+/// The members of `RouteAnalysisStatus` a route analysis of this service reports
+/// (`smithy_query shape=RouteAnalysisStatus`: RUNNING, COMPLETED, FAILED — mirrored in
+/// `ops::types::ROUTE_ANALYSIS_STATUS_VALUES`).
+///
+/// An analysis starts `RUNNING` and reaches `COMPLETED` when the transition the clock owes
+/// falls due ([`RouteAnalysisRecord::status_at`]). `FAILED` is the analysis itself failing
+/// rather than finding no route — a path that does not reach the destination COMPLETES,
+/// carrying [`ROUTE_ANALYSIS_NOT_CONNECTED`] — so nothing here reports it.
+pub const ROUTE_ANALYSIS_RUNNING: &str = "RUNNING";
+/// See [`ROUTE_ANALYSIS_RUNNING`].
+pub const ROUTE_ANALYSIS_COMPLETED: &str = "COMPLETED";
+
+/// The members of `RouteAnalysisCompletionResultCode` (`smithy_query
+/// shape=RouteAnalysisCompletionResultCode`: CONNECTED, NOT_CONNECTED — mirrored in
+/// `ops::types::ROUTE_ANALYSIS_COMPLETION_RESULT_CODE_VALUES`): whether the analysed path
+/// reached its destination. A `NOT_CONNECTED` path also carries the reason code for where
+/// it stopped ("The reason code. Available only if a connection is not found.",
+/// `smithy_query query="doc" shape="RouteAnalysisCompletion" member="ReasonCode"`).
+pub const ROUTE_ANALYSIS_CONNECTED: &str = "CONNECTED";
+/// See [`ROUTE_ANALYSIS_CONNECTED`].
+pub const ROUTE_ANALYSIS_NOT_CONNECTED: &str = "NOT_CONNECTED";
+
+/// The members of `RouteAnalysisCompletionReasonCode` a path of this service completes
+/// with, each documented on the member itself (`smithy_query query="doc"
+/// shape="RouteAnalysisCompletion" member="ReasonCode"`, mirrored in
+/// `ops::types::ROUTE_ANALYSIS_COMPLETION_REASON_CODE_VALUES`):
+///
+/// * this one — the request named no attachment ARN for the endpoint the path runs
+///   TOWARDS, so there is no destination to analyse a path to;
+/// * [`REASON_TRANSIT_GATEWAY_ATTACHMENT_NOT_FOUND`] — "Cannot find an attachment": the
+///   ARN an endpoint named is not an attachment the global network holds;
+/// * [`REASON_TRANSIT_GATEWAY_ATTACHMENT_NOT_IN_TRANSIT_GATEWAY`] — "Found an attachment,
+///   but not to the correct transit gateway": the ARN names an attachment of the global
+///   network that is not one on a transit gateway;
+/// * [`REASON_ROUTE_NOT_FOUND`] — "Cannot find a route table with the destination CIDR
+///   block": both endpoints are attachments on transit gateways of the global network, and
+///   no route table of them carries the destination.
+pub const REASON_NO_DESTINATION_ARN_PROVIDED: &str = "NO_DESTINATION_ARN_PROVIDED";
+/// See [`REASON_NO_DESTINATION_ARN_PROVIDED`].
+pub const REASON_TRANSIT_GATEWAY_ATTACHMENT_NOT_FOUND: &str =
+    "TRANSIT_GATEWAY_ATTACHMENT_NOT_FOUND";
+/// See [`REASON_NO_DESTINATION_ARN_PROVIDED`].
+pub const REASON_TRANSIT_GATEWAY_ATTACHMENT_NOT_IN_TRANSIT_GATEWAY: &str =
+    "TRANSIT_GATEWAY_ATTACHMENT_NOT_IN_TRANSIT_GATEWAY";
+/// See [`REASON_NO_DESTINATION_ARN_PROVIDED`].
+pub const REASON_ROUTE_NOT_FOUND: &str = "ROUTE_NOT_FOUND";
+
+/// The request members a route analysis's two endpoints come from, which is how a reason
+/// context names the endpoint whose attachment ARN a path could not get past
+/// ([`RouteEndpoint::reason_context`]).
+pub const ENDPOINT_SOURCE: &str = "Source";
+/// See [`ENDPOINT_SOURCE`].
+pub const ENDPOINT_DESTINATION: &str = "Destination";
+
+/// The reason-context key naming the `TransitGatewayAttachmentArn` of the endpoint
+/// [`ENDPOINT_SOURCE`] / [`ENDPOINT_DESTINATION`] names.
+///
+/// `ReasonContext` is "Additional information about the path. Available only if a
+/// connection is not found." (`smithy_query query="doc" shape="RouteAnalysisCompletion"
+/// member="ReasonContext"`) — an unconstrained map — so the key names the request member
+/// whose value the analysis could not resolve, and the value is that ARN.
+pub fn reason_context_key(endpoint_member: &str) -> String {
+    format!("{endpoint_member}.TransitGatewayAttachmentArn")
+}
+
+/// What the global network's network-resource inventory holds for the
+/// `TransitGatewayAttachmentArn` one endpoint of a route analysis names.
+///
+/// A routing path runs between two attachments on transit gateways registered with the
+/// global network, so this is what decides whether the path can start at an endpoint at
+/// all, and the reason code it completes with when it cannot.
+#[derive(Debug, Clone)]
+enum RouteEndpointResolution {
+    /// The endpoint named no attachment ARN at all.
+    Unspecified,
+    /// The ARN names no network resource of this global network.
+    Unknown,
+    /// The ARN names an attachment on a transit gateway registered with this global
+    /// network ([`TRANSIT_GATEWAY_ATTACHMENT_TYPE`]), carrying the ARN of the gateway it
+    /// was registered through where the inventory records one.
+    TransitGatewayAttachment { transit_gateway_arn: Option<String> },
+    /// The ARN names a network resource of this global network of some OTHER type,
+    /// carrying that `NetworkResource$ResourceType`.
+    OtherResource { resource_type: String },
+}
+
+/// One endpoint of a route analysis: the request member it came from, what it named, and
+/// what the global network knows about the attachment ARN it named.
+#[derive(Debug, Clone)]
+struct RouteEndpoint {
+    /// [`ENDPOINT_SOURCE`] or [`ENDPOINT_DESTINATION`].
+    member: &'static str,
+    /// The `TransitGatewayAttachmentArn` the endpoint named, if any.
+    attachment_arn: Option<String>,
+    /// The `IpAddress` the endpoint named, if any. The analysis carries it through to the
+    /// endpoint options it reports; no route table of this global network holds a CIDR to
+    /// match it against (see [`REASON_ROUTE_NOT_FOUND`]).
+    ip_address: Option<String>,
+    /// See [`RouteEndpointResolution`].
+    resolution: RouteEndpointResolution,
+}
+
+impl RouteEndpoint {
+    /// The modelled endpoint options this endpoint reports: the ARN and the IP address the
+    /// request named, plus the transit gateway the attachment belongs to — which is
+    /// RESOLVED from the inventory, not supplied by the caller, and is therefore absent
+    /// for an endpoint the global network holds no such attachment for.
+    fn options(&self) -> RouteAnalysisEndpointOptions {
+        RouteAnalysisEndpointOptions {
+            transit_gateway_attachment_arn: self.attachment_arn.clone(),
+            transit_gateway_arn: match &self.resolution {
+                RouteEndpointResolution::TransitGatewayAttachment {
+                    transit_gateway_arn,
+                } => transit_gateway_arn.clone(),
+                _ => None,
+            },
+            ip_address: self.ip_address.clone(),
+        }
+    }
+
+    /// The reason code a path stops with at this endpoint, or `None` for one a path can run
+    /// through — an attachment on a transit gateway of this global network.
+    fn reason_code(&self) -> Option<&'static str> {
+        match &self.resolution {
+            RouteEndpointResolution::TransitGatewayAttachment { .. } => None,
+            // An attachment of the global network that is not one on a transit gateway: a
+            // Cloud WAN attachment ([`ATTACHMENT_KIND`]) is an attachment, so the reason is
+            // the "found an attachment, but not to the correct transit gateway" one rather
+            // than "cannot find an attachment".
+            RouteEndpointResolution::OtherResource { resource_type }
+                if resource_type == ATTACHMENT_KIND =>
+            {
+                Some(REASON_TRANSIT_GATEWAY_ATTACHMENT_NOT_IN_TRANSIT_GATEWAY)
+            }
+            _ => Some(REASON_TRANSIT_GATEWAY_ATTACHMENT_NOT_FOUND),
+        }
+    }
+
+    /// The reason context a path carries when it stopped at this endpoint: the request
+    /// member and the ARN the analysis could not resolve, or `None` for an endpoint that
+    /// named no ARN at all — there is nothing further to report about it.
+    fn reason_context(&self) -> Option<std::collections::HashMap<String, String>> {
+        let arn = self.attachment_arn.clone()?;
+        Some(std::collections::HashMap::from([(
+            reason_context_key(self.member),
+            arn,
+        )]))
+    }
+}
+
+/// A stored route analysis: the Route Analyzer job one `StartRouteAnalysis` records on its
+/// global network, which `GetRouteAnalysis` reads back.
+///
+/// The paths are computed ONCE, by the call that starts the analysis, out of what the
+/// global network held at that instant — an analysis is a snapshot of the routing it
+/// found, so a resource created afterwards cannot change the answer a completed analysis
+/// reports. What the CLOCK owes is the `RUNNING` -> `COMPLETED` transition
+/// ([`Self::completed_at`]), so `Status` is a function of the clock rather than a stored
+/// field and reading an analysis never writes.
+#[derive(Debug, Clone)]
+pub struct RouteAnalysisRecord {
+    /// The minted `route-analysis-<hex>` id, this record's identity.
+    pub id: String,
+    /// The global network the analysis was started on: the only one it can be read back
+    /// through.
+    pub global_network_id: String,
+    /// "The time that the analysis started" (`smithy_query query="doc"
+    /// shape="RouteAnalysis" member="StartTimestamp"`).
+    pub started_at: SystemTime,
+    /// The instant the `RUNNING` -> `COMPLETED` transition the clock owes falls due:
+    /// [`SETTLE_DELAY`] after the call that started the analysis, so a caller that reads
+    /// straight afterwards still sees it `RUNNING`.
+    pub completed_at: SystemTime,
+    /// The source as the analysis ran it: the ARN and IP address the request named, plus
+    /// the transit gateway resolved for that attachment.
+    pub source: RouteAnalysisEndpointOptions,
+    /// The destination as the analysis ran it; see [`Self::source`].
+    pub destination: RouteAnalysisEndpointOptions,
+    pub include_return_path: bool,
+    pub use_middleboxes: bool,
+    /// The forward path, as the analysis completed it.
+    pub forward_path: RouteAnalysisPath,
+    /// The return path, or `None` where none was analysed: "The return path is not
+    /// analyzed if the forward path analysis does not succeed" (`smithy_query query="doc"
+    /// shape="RouteAnalysis" member="IncludeReturnPath"`), and none is analysed at all
+    /// unless the request asked for one.
+    pub return_path: Option<RouteAnalysisPath>,
+}
+
+impl RouteAnalysisRecord {
+    /// This analysis's status as of `now`: [`ROUTE_ANALYSIS_RUNNING`] until the transition
+    /// the clock owes falls due, [`ROUTE_ANALYSIS_COMPLETED`] after it.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.completed_at {
+            ROUTE_ANALYSIS_COMPLETED
+        } else {
+            ROUTE_ANALYSIS_RUNNING
+        }
+    }
+
+    /// The modelled `RouteAnalysis` for this record as of `now`.
+    ///
+    /// The paths are "The status of the analysis at completion" (`smithy_query query="doc"
+    /// shape="RouteAnalysisPath" member="CompletionStatus"`), so they are reported only
+    /// once the analysis has completed; while it is still `RUNNING` there is no completion
+    /// to report. Both are already stored, so no read computes them a second time.
+    pub fn to_shape(&self, now: SystemTime) -> RouteAnalysis {
+        let completed = self.status_at(now) == ROUTE_ANALYSIS_COMPLETED;
+        RouteAnalysis {
+            global_network_id: Some(self.global_network_id.clone()),
+            // "The ID of the AWS account that created the route analysis": this emulator
+            // presents exactly one account, which is the one every call runs as.
+            owner_account_id: Some(::engine::emulator_account_id().to_string()),
+            route_analysis_id: Some(self.id.clone()),
+            start_timestamp: Some(epoch_seconds(self.started_at)),
+            status: Some(self.status_at(now).to_string()),
+            source: Some(self.source.clone()),
+            destination: Some(self.destination.clone()),
+            include_return_path: self.include_return_path,
+            use_middleboxes: self.use_middleboxes,
+            forward_path: completed.then(|| self.forward_path.clone()),
+            return_path: completed.then(|| self.return_path.clone()).flatten(),
+        }
+    }
+}
+
+/// The path `from` -> `to`, as the analysis completes it.
+///
+/// A routing path runs from one attachment on a transit gateway of the global network to
+/// another, so the completion is decided by what the global network holds for the two
+/// endpoints ([`RouteEndpoint::reason_code`]), in the order the path depends on them:
+///
+/// 1. the endpoint the path runs TOWARDS must name an attachment ARN at all, or there is
+///    no destination to analyse towards ([`REASON_NO_DESTINATION_ARN_PROVIDED`]);
+/// 2. the endpoint it starts FROM must be an attachment on a transit gateway of this
+///    global network, then the one it runs towards must be too;
+/// 3. with both of them attachments on transit gateways of this global network, the path
+///    needs a route table of those gateways carrying the destination. A transit gateway's
+///    route tables are Amazon VPC's, learned through the gateway's registration with the
+///    global network, and the inventory holds none, so no route table carries it
+///    ([`REASON_ROUTE_NOT_FOUND`]).
+///
+/// The path carries no component: nothing was traversed, since the analysis stopped at an
+/// endpoint or at the missing route table. `UseMiddleboxes` asks for "the location of
+/// middlebox appliances in the route analysis" (`smithy_query query="doc"
+/// shape="RouteAnalysis" member="UseMiddleboxes"`), which is a property of the components
+/// of a path, so it changes nothing about a path that has none.
+fn analyze_route_path(from: &RouteEndpoint, to: &RouteEndpoint) -> RouteAnalysisPath {
+    let (reason_code, reason_context) = if to.attachment_arn.is_none() {
+        (REASON_NO_DESTINATION_ARN_PROVIDED, None)
+    } else if let Some(reason) = from.reason_code() {
+        (reason, from.reason_context())
+    } else if let Some(reason) = to.reason_code() {
+        (reason, to.reason_context())
+    } else {
+        (REASON_ROUTE_NOT_FOUND, to.reason_context())
+    };
+    RouteAnalysisPath {
+        completion_status: Some(RouteAnalysisCompletion {
+            result_code: Some(ROUTE_ANALYSIS_NOT_CONNECTED.to_string()),
+            reason_code: Some(reason_code.to_string()),
+            reason_context,
+        }),
+        path: Some(Vec::new()),
+    }
+}
+
+/// Whether `path` reached its destination.
+fn route_path_connected(path: &RouteAnalysisPath) -> bool {
+    path.completion_status
+        .as_ref()
+        .and_then(|completion| completion.result_code.as_deref())
+        == Some(ROUTE_ANALYSIS_CONNECTED)
+}
+
 /// The key the telemetry store holds one registration under: the global network, then the
 /// resource ARN, so the map groups a global network's connections into one contiguous run
 /// ordered by ARN and a pagination token can name an offset into it.
@@ -2020,6 +2328,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// registration exists only for a stored global network, which the per-account global
     /// network quota bounds, and only once per resource ARN.
     pub telemetry_resources: BTreeMap<String, TelemetryResourceRecord>,
+    /// Route analyses by `RouteAnalysisId`, each carrying the global network it was
+    /// started on and the paths the analysis found there ([`RouteAnalysisRecord`]). A
+    /// `BTreeMap`, so the store has one stable order like every other map here.
+    ///
+    /// Bounded by [`MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK`] per global network, so
+    /// repeated `StartRouteAnalysis` calls cannot grow it without end.
+    pub route_analyses: BTreeMap<String, RouteAnalysisRecord>,
     /// This account's organization service-access record, or `None` while no
     /// `StartOrganizationServiceAccessUpdate` has ever been called: this service then
     /// knows of no organization, so `ListOrganizationServiceAccessStatus` reports no
@@ -2359,6 +2674,113 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             telemetry_key(&record.global_network_id, &record.resource_arn),
             record,
         );
+    }
+
+    /// How many route analyses the global network `global_network_id` holds, for the
+    /// per-global-network quota ([`MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK`]).
+    pub fn route_analysis_count_of(&self, global_network_id: &str) -> usize {
+        self.route_analyses
+            .values()
+            .filter(|analysis| analysis.global_network_id == global_network_id)
+            .count()
+    }
+
+    /// What the global network `global_network_id` holds for one endpoint of a route
+    /// analysis: the `member` the endpoint came from ([`ENDPOINT_SOURCE`] /
+    /// [`ENDPOINT_DESTINATION`]) and the ARN and IP address it named.
+    ///
+    /// The endpoint's attachment ARN is looked up in the global network's one
+    /// network-resource inventory ([`Self::network_resources_of`]) — the same inventory
+    /// `GetNetworkResources` reports and `GetNetworkResourceCounts` counts — so a route
+    /// analysis and that inventory cannot disagree about which attachments the global
+    /// network holds. An attachment on a transit gateway appears there once the gateway is
+    /// registered with the global network (`RegisterTransitGateway`, still a scaffold stub
+    /// with its own issue), so until then no ARN resolves to one and the analysis reports
+    /// the "cannot find an attachment" it really found rather than a placeholder.
+    fn resolve_route_endpoint(
+        &self,
+        global_network_id: &str,
+        member: &'static str,
+        spec: &RouteAnalysisEndpointOptionsSpecification,
+        now: SystemTime,
+    ) -> RouteEndpoint {
+        let resolution = match spec.transit_gateway_attachment_arn.as_deref() {
+            None => RouteEndpointResolution::Unspecified,
+            Some(arn) => {
+                let held = self
+                    .network_resources_of(global_network_id, now)
+                    .into_iter()
+                    .map(|(_, resource)| resource)
+                    .find(|resource| resource.resource_arn.as_deref() == Some(arn));
+                match held {
+                    None => RouteEndpointResolution::Unknown,
+                    Some(resource) => {
+                        let resource_type = resource.resource_type.unwrap_or_default();
+                        if resource_type == TRANSIT_GATEWAY_ATTACHMENT_TYPE {
+                            RouteEndpointResolution::TransitGatewayAttachment {
+                                // The gateway the attachment was registered through, which
+                                // is the transit gateway it belongs to.
+                                transit_gateway_arn: resource.registered_gateway_arn,
+                            }
+                        } else {
+                            RouteEndpointResolution::OtherResource { resource_type }
+                        }
+                    }
+                }
+            }
+        };
+        RouteEndpoint {
+            member,
+            attachment_arn: spec.transit_gateway_attachment_arn.clone(),
+            ip_address: spec.ip_address.clone(),
+            resolution,
+        }
+    }
+
+    /// Start a route analysis on the global network `global_network_id` and answer the
+    /// record it leaves behind.
+    ///
+    /// The analysis is run HERE, by the starting call, against what the global network
+    /// holds at `now` ([`analyze_route_path`]): the paths are stored with the record, so
+    /// every later read of the analysis reports the routing it found and nothing created
+    /// afterwards changes it. The record is the whole answer — `StartRouteAnalysis` and
+    /// `GetRouteAnalysis` both report it through [`RouteAnalysisRecord::to_shape`] — so the
+    /// two cannot disagree about one analysis.
+    pub fn start_route_analysis(
+        &mut self,
+        global_network_id: &str,
+        source: &RouteAnalysisEndpointOptionsSpecification,
+        destination: &RouteAnalysisEndpointOptionsSpecification,
+        include_return_path: bool,
+        use_middleboxes: bool,
+        now: SystemTime,
+    ) -> RouteAnalysisRecord {
+        let source_endpoint =
+            self.resolve_route_endpoint(global_network_id, ENDPOINT_SOURCE, source, now);
+        let destination_endpoint =
+            self.resolve_route_endpoint(global_network_id, ENDPOINT_DESTINATION, destination, now);
+        let forward_path = analyze_route_path(&source_endpoint, &destination_endpoint);
+        // "The return path is not analyzed if the forward path analysis does not succeed"
+        // (`smithy_query query="doc" shape="RouteAnalysis" member="IncludeReturnPath"`), so
+        // a forward path that did not reach the destination leaves the return path absent
+        // even where the request asked for one.
+        let return_path = (include_return_path && route_path_connected(&forward_path))
+            .then(|| analyze_route_path(&destination_endpoint, &source_endpoint));
+        let id = self.next_id(ROUTE_ANALYSIS_KIND);
+        let record = RouteAnalysisRecord {
+            id: id.clone(),
+            global_network_id: global_network_id.to_string(),
+            started_at: now,
+            completed_at: now + SETTLE_DELAY,
+            source: source_endpoint.options(),
+            destination: destination_endpoint.options(),
+            include_return_path,
+            use_middleboxes,
+            forward_path,
+            return_path,
+        };
+        self.route_analyses.insert(id, record.clone());
+        record
     }
 
     /// How many links `site_id` holds, for the per-site quota.
