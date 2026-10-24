@@ -50,17 +50,20 @@ const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/service-role/cp";
 /// Each step becomes due `state::execution::ACTION_STEP` (300 ms) after the one before
 /// it, so a three-stage pipeline needs a few seconds of polling; this is the ceiling at
 /// which a test gives up and reports what it last saw.
-const WAIT: Duration = Duration::from_secs(20);
+///
+/// `pub(crate)` with the harness below: the `stop_pipeline_execution` suite drives the
+/// same execution plane through it rather than growing a second copy.
+pub(crate) const WAIT: Duration = Duration::from_secs(20);
 
 /// One emulator: the shared engine, CodePipeline and S3 mounted on it, and the router
 /// that dispatches to both — the execution engine reaches S3 through the framework's
 /// in-process callback, so both have to be there.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -76,7 +79,7 @@ impl Emulator {
     }
 
     /// Call one CodePipeline operation.
-    async fn cp(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn cp(&self, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = "AWS4-HMAC-SHA256 \
              Credential=AKIDEXAMPLE/20260101/us-east-1/codepipeline/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0123456789abcdef";
@@ -103,7 +106,7 @@ impl Emulator {
     }
 
     /// Call one CodePipeline operation that must succeed.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, response) = self.cp(operation, body).await;
         assert_eq!(
             status, 200,
@@ -113,7 +116,7 @@ impl Emulator {
     }
 
     /// The `__type` of a CodePipeline error answer.
-    async fn error_code(&self, operation: &str, body: &Value) -> (u16, String) {
+    pub(crate) async fn error_code(&self, operation: &str, body: &Value) -> (u16, String) {
         let (status, response) = self.cp(operation, body).await;
         let code = response
             .get("__type")
@@ -151,7 +154,7 @@ impl Emulator {
     }
 
     /// Create a bucket with versioning enabled — what a CodePipeline source bucket is.
-    async fn bucket(&self, name: &str) {
+    pub(crate) async fn bucket(&self, name: &str) {
         let (status, _, body) = self.s3("PUT", &format!("/{name}"), &[], b"").await;
         assert_eq!(
             status, 200,
@@ -172,7 +175,7 @@ impl Emulator {
     }
 
     /// Write an object, answering the version id the write reported.
-    async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Option<String> {
+    pub(crate) async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Option<String> {
         let (status, headers, answer) = self
             .s3("PUT", &format!("/{bucket}/{key}"), &[], body)
             .await;
@@ -187,14 +190,14 @@ impl Emulator {
     }
 
     /// Read an object: the status and the bytes.
-    async fn get_object(&self, bucket: &str, key: &str) -> (u16, Vec<u8>) {
+    pub(crate) async fn get_object(&self, bucket: &str, key: &str) -> (u16, Vec<u8>) {
         let (status, _, body) = self.s3("GET", &format!("/{bucket}/{key}"), &[], b"").await;
         (status, body.to_vec())
     }
 }
 
 /// A pipeline declaration from its stages.
-fn declaration(name: &str, stages: Value, execution_mode: Option<&str>) -> Value {
+pub(crate) fn declaration(name: &str, stages: Value, execution_mode: Option<&str>) -> Value {
     let mut pipeline = json!({
         "name": name,
         "roleArn": ROLE_ARN,
@@ -208,12 +211,12 @@ fn declaration(name: &str, stages: Value, execution_mode: Option<&str>) -> Value
 }
 
 /// The artifact-store bucket one test pipeline uses.
-fn artifact_bucket(name: &str) -> String {
+pub(crate) fn artifact_bucket(name: &str) -> String {
     format!("{name}-artifacts")
 }
 
 /// An S3 source stage producing `output` from `bucket`/`key`.
-fn source_stage(bucket: &str, key: &str, output: &str) -> Value {
+pub(crate) fn source_stage(bucket: &str, key: &str, output: &str) -> Value {
     json!({
         "name": "Source",
         "actions": [{
@@ -229,7 +232,7 @@ fn source_stage(bucket: &str, key: &str, output: &str) -> Value {
 }
 
 /// An S3 deploy stage delivering `input` to `bucket`/`key`.
-fn deploy_stage(name: &str, input: &str, bucket: &str, key: &str, extract: bool) -> Value {
+pub(crate) fn deploy_stage(name: &str, input: &str, bucket: &str, key: &str, extract: bool) -> Value {
     json!({
         "name": name,
         "actions": [{
@@ -248,7 +251,7 @@ fn deploy_stage(name: &str, input: &str, bucket: &str, key: &str, extract: bool)
 }
 
 /// Poll `GetPipelineExecution` until the execution reaches a terminal status.
-async fn wait_for_terminal(emulator: &Emulator, pipeline: &str, execution: &str) -> Value {
+pub(crate) async fn wait_for_terminal(emulator: &Emulator, pipeline: &str, execution: &str) -> Value {
     let deadline = Instant::now() + WAIT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
@@ -271,7 +274,7 @@ async fn wait_for_terminal(emulator: &Emulator, pipeline: &str, execution: &str)
 }
 
 /// The status of one execution right now.
-async fn status_of(emulator: &Emulator, pipeline: &str, execution: &str) -> String {
+pub(crate) async fn status_of(emulator: &Emulator, pipeline: &str, execution: &str) -> String {
     let answer = emulator
         .ok(
             "GetPipelineExecution",
