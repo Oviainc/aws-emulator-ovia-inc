@@ -15,7 +15,8 @@ use std::hash::BuildHasher;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, Tag, VpcConfiguration,
+    Connection, Host, RepositoryLinkInfo, SyncBlocker, SyncBlockerContext, SyncBlockerSummary, Tag,
+    VpcConfiguration,
 };
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
@@ -377,7 +378,9 @@ pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     pub hosts: BTreeMap<String, StoredHost>,
     /// Every sync blocker in this emulator, keyed by its `Id` — the id
     /// `UpdateSyncBlocker` addresses a blocker by, alongside the resource and sync type
-    /// it belongs to. The service models no operation that RAISES one (a blocker is
+    /// it belongs to, and the rows `GetSyncBlockerSummary` reports for one
+    /// `(SyncType, ResourceName)` pair. The service models no operation that
+    /// RAISES one (a blocker is
     /// `AUTOMATED`: the Git-sync component raises it), so this map holds whatever that
     /// side of the service has put there and an id naming no entry is the modeled
     /// `SyncBlockerDoesNotExistException`.
@@ -416,6 +419,61 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
         let mut hosts: Vec<&StoredHost> = self.hosts.values().collect();
         hosts.sort_unstable_by_key(|host| host.sequence);
         hosts
+    }
+
+    /// Every sync blocker recorded for one `(sync_type, resource_name)` pair, MOST
+    /// RECENT FIRST, borrowed out of the one blocker store.
+    ///
+    /// A blocker carries the pair it belongs to (see [`StoredSyncBlocker`]), so the
+    /// blockers of a resource are the rows matching BOTH members: an id raised under
+    /// another resource, or under another sync type, belongs to that pair and not to
+    /// this one. The order is by `CreatedAt` descending, with the blocker's own id
+    /// breaking ties, so it is total and stable for blockers raised within one clock
+    /// tick.
+    pub fn blockers_for(&self, sync_type: &str, resource_name: &str) -> Vec<&StoredSyncBlocker> {
+        let mut blockers: Vec<&StoredSyncBlocker> = self
+            .sync_blockers
+            .values()
+            .filter(|blocker| {
+                blocker.sync_type == sync_type && blocker.resource_name == resource_name
+            })
+            .collect();
+        blockers.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        blockers
+    }
+
+    /// The modeled `SyncBlockerSummary` for one `(sync_type, resource_name)` pair.
+    ///
+    /// The ONE projection of the stored blockers onto the summary shape, so a reader of
+    /// a resource's blockers and the operation that resolves one of them cannot render
+    /// the same rows differently: both answer out of [`StoredSyncBlocker`].
+    ///
+    /// `ResourceName` is the resource that was addressed; `ParentResourceName` is taken
+    /// from the NEWEST blocker record that carries one (the parent is a property of the
+    /// resource's place in the sync hierarchy, so the rows of one resource normally
+    /// agree on it; where they disagree, the most recently raised record is the one
+    /// reported) and stays absent when the pair holds no blocker to read it from.
+    /// `LatestBlockers` is present-and-EMPTY for a pair holding no blockers rather than
+    /// absent: the member is a list, so "this resource has no blockers" is `[]`.
+    pub fn blocker_summary(&self, sync_type: &str, resource_name: &str) -> SyncBlockerSummary {
+        let blockers = self.blockers_for(sync_type, resource_name);
+        SyncBlockerSummary {
+            resource_name: resource_name.to_string(),
+            parent_resource_name: blockers
+                .iter()
+                .find_map(|blocker| blocker.parent_resource_name.clone()),
+            latest_blockers: Some(
+                blockers
+                    .iter()
+                    .map(|blocker| blocker.to_sync_blocker())
+                    .collect(),
+            ),
+        }
     }
 
     /// The repository link already registered for this connection, owner and repository,
