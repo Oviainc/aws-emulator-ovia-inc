@@ -65,6 +65,9 @@ mod review_template_deletion;
 #[path = "all/review_template_lens_review.rs"]
 mod review_template_lens_review;
 
+#[path = "all/review_template_lens_review_reads.rs"]
+mod review_template_lens_review_reads;
+
 #[path = "all/review_template_lifecycle.rs"]
 mod review_template_lifecycle;
 
