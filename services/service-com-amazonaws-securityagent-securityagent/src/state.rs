@@ -23,7 +23,7 @@
 //! the modelled projections and the pagination cursor codec) are shared by those
 //! handlers rather than duplicated per operation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -116,24 +116,27 @@ pub const TARGET_DOMAIN_STATUS_PENDING: &str = "PENDING";
 /// The label prefixed onto the domain to name the TXT record a `DNS_TXT` target
 /// domain's owner publishes.
 ///
-/// CHOSEN, not cited: the model pins the record TYPE (`DNSRecordType` admits only
+/// RECORDED, not modelled: the model pins the record TYPE (`DNSRecordType` admits only
 /// `TXT`) and says the details carry "the name of the DNS record to create for
-/// verification", but not which label the real service picks. An underscore-prefixed
-/// label cannot collide with a hostname the domain already serves.
-const DNS_CHALLENGE_LABEL: &str = "_securityagent-challenge";
+/// verification", but not the label. The recorded `dnsRecordName` of a pending
+/// `DNS_TXT` domain is this label prefixed onto the requested domain, and the label is
+/// the actionable part of the response: a client that publishes the TXT record under
+/// any other name publishes it where the real service never looks.
+const DNS_CHALLENGE_LABEL: &str = "_aws_securityagent-challenge";
 
 /// The type of that record. NOT chosen: `DNSRecordType` admits exactly one value,
 /// `TXT` ("Currently, only TXT is supported").
 const DNS_CHALLENGE_RECORD_TYPE: &str = "TXT";
 
-/// The directory of the HTTP route an `HTTP_ROUTE` target domain's owner serves its
-/// token at; the token itself is the last segment, so two target domains never share
-/// one path.
+/// The route an `HTTP_ROUTE` target domain's owner serves its verification document at.
 ///
-/// CHOSEN, not cited: the model says the details carry "the HTTP route path where the
-/// verification token must be served" without pinning the path. It sits under the
-/// `/.well-known/` prefix reserved for exactly this kind of challenge (RFC 8615).
-const HTTP_CHALLENGE_ROUTE_PREFIX: &str = "/.well-known/securityagent-domain-verification";
+/// RECORDED, not modelled: the model says the details carry "the HTTP route path where
+/// the verification token must be served" without pinning the path. The recorded
+/// `routePath` is this one FIXED, token-free relative path — the token travels beside
+/// it in `httpRoute.token`, not inside the path — so every domain serves the challenge
+/// at the same place, and a client wires its web server for a static `.json` document
+/// rather than for a per-domain route.
+const HTTP_CHALLENGE_ROUTE_PATH: &str = ".well-known/aws/securityagent-domain-verification.json";
 
 /// The domain-separation prefix hashed into every verification token, so a token can
 /// only ever stand for a target domain of this service.
@@ -147,6 +150,16 @@ const VERIFICATION_TOKEN_CONTEXT: &str = "securityagent-domain-verification:";
 /// agent space count, so normal use never meets it, while the store a caller can grow
 /// stays bounded.
 pub const MAX_AGENT_SPACES: usize = 1_000;
+
+/// The most target domains ONE agent space may be associated with.
+///
+/// CHOSEN, not cited: `TargetDomainIdList` carries no `@length` in the model, so nothing
+/// pins this value. It bounds BOTH the list one create stores and the work every later
+/// read of that record does — each associated id is expanded into the full stored target
+/// domain record in the response's `targetDomains` — so neither the store nor one
+/// response can be grown without end by a single request. It is set far above any
+/// plausible client's association count, so normal use never meets it.
+pub const MAX_AGENT_SPACE_TARGET_DOMAINS: usize = 100;
 
 /// The most security requirement packs this emulator stores for the account before
 /// `CreateSecurityRequirementPack` answers the service's
@@ -258,6 +271,10 @@ impl Application {
 #[derive(Debug, Clone)]
 pub struct AgentSpaceRecord {
     pub agent_space_id: String,
+    /// The agent space's ARN, minted at create time from the region the create was
+    /// signed for — stored rather than recomputed per read, so every read of the record
+    /// reports the one ARN the create answered, whatever region a later read arrives in.
+    pub arn: String,
     pub name: String,
     pub description: Option<String>,
     pub aws_resources: Option<AWSResources>,
@@ -273,9 +290,22 @@ pub struct AgentSpaceRecord {
 }
 
 impl AgentSpaceRecord {
-    /// This agent space projected onto the modelled [`AgentSpace`] shape the batch read
-    /// returns: the stored record's own fields, never request input.
-    pub fn modelled(&self) -> AgentSpace {
+    /// This agent space projected onto the [`AgentSpace`] shape every agent space
+    /// response carries: the stored record's own fields, never request input.
+    ///
+    /// `target_domains` is the store's target domain map, so each id the agent space is
+    /// associated with is echoed RESOLVED — the stored record of that domain, carrying
+    /// the challenge it is waiting on. An id no target domain record answers
+    /// contributes no entry: the association is reported for the domains that exist,
+    /// never as a fabricated record. Each DISTINCT id contributes at most one entry, and
+    /// the stored list is capped at create time, so this projection's size is bounded by
+    /// [`MAX_AGENT_SPACE_TARGET_DOMAINS`] however long a list the caller sent.
+    ///
+    /// `id`, `ownerId` and `arn` are recorded-but-unmodelled members (see
+    /// `crate::ops::types::wire_shape`): the id again under the name the service's own
+    /// record uses, the account every resource of this emulator belongs to, and the
+    /// ARN minted at create time.
+    pub fn modelled(&self, target_domains: &BTreeMap<String, TargetDomainRecord>) -> AgentSpace {
         AgentSpace {
             agent_space_id: self.agent_space_id.clone(),
             name: self.name.clone(),
@@ -286,9 +316,47 @@ impl AgentSpaceRecord {
             kms_key_id: self.kms_key_id.clone(),
             created_at: Some(timestamp(self.created_at)),
             updated_at: Some(timestamp(self.updated_at)),
+            id: self.agent_space_id.clone(),
+            owner_id: ::engine::emulator_account_id().to_string(),
+            arn: self.arn.clone(),
+            target_domains: self.target_domain_ids.as_ref().map(|ids| {
+                // Each DISTINCT id contributes at most one record, in the order it was
+                // first named, so a list that repeats an id does not multiply the
+                // answer. With the stored list capped at create time
+                // ([`MAX_AGENT_SPACE_TARGET_DOMAINS`]) this expansion is bounded by that
+                // cap whatever the request asked for.
+                let mut answered = BTreeSet::new();
+                ids.iter()
+                    .filter(|id| answered.insert(id.as_str()))
+                    .filter_map(|id| target_domains.get(id))
+                    .map(TargetDomainRecord::modelled)
+                    .collect()
+            }),
         }
     }
 }
+
+/// The ARN of one agent space: `arn:aws:securityagent:<region>:<account>:agent-instance/<id>`.
+///
+/// The namespace is the service's own `arnNamespace`, `securityagent`
+/// (`smithy_query(query="service_info")`); the account segment is the emulator's
+/// canonical account, through [`::engine::emulator_arn`]. RECORDED, not modelled: the
+/// resource type is `agent-instance` — the name the service's own records use for an
+/// agent space, the same one the batch read reports its list of them under.
+pub fn agent_space_arn(region: &str, agent_space_id: &str) -> String {
+    ::engine::emulator_arn(
+        AGENT_SPACE_ARN_SERVICE,
+        region,
+        &format!("{AGENT_SPACE_ARN_KIND}/{agent_space_id}"),
+    )
+}
+
+/// The ARN namespace (and SigV4 signing name) of this service
+/// (`smithy_query(query="service_info")`: `arnNamespace` `securityagent`).
+pub const AGENT_SPACE_ARN_SERVICE: &str = "securityagent";
+
+/// The ARN resource type an agent space carries; see [`agent_space_arn`].
+pub const AGENT_SPACE_ARN_KIND: &str = "agent-instance";
 
 /// A stored instant on the wire, as the modelled timestamp members of an agent space
 /// carry it (`smithy_query(query="shape",shape="AgentSpace")`).
@@ -568,33 +636,38 @@ impl TargetDomainRecord {
         format!("{DNS_CHALLENGE_LABEL}.{}", self.domain_name)
     }
 
-    /// The path an `HTTP_ROUTE` target domain's owner serves the token at.
+    /// The path an `HTTP_ROUTE` target domain's owner serves the token at — the one
+    /// fixed route, the same for every domain (see [`HTTP_CHALLENGE_ROUTE_PATH`]).
     pub fn http_route_path(&self) -> String {
-        format!("{HTTP_CHALLENGE_ROUTE_PREFIX}/{}", self.verification_token)
+        HTTP_CHALLENGE_ROUTE_PATH.to_string()
     }
 
     /// Why this record is still `PENDING`: what the domain's owner has to do before a
     /// verification call can find the proof.
+    ///
+    /// RECORDED, not modelled: one CONSTANT sentence per verification method — the
+    /// reason names the method's challenge, not this request's domain or token, so it
+    /// carries nothing the caller sent. The `DNS_TXT` and `HTTP_ROUTE` sentences are the
+    /// recorded ones.
     fn pending_status_reason(&self) -> String {
         match self.verification_method.as_str() {
-            VERIFICATION_METHOD_DNS_TXT => format!(
-                "Awaiting domain ownership verification: publish a {DNS_CHALLENGE_RECORD_TYPE} \
-                 record named {} whose value is the verification token",
-                self.dns_record_name()
-            ),
-            VERIFICATION_METHOD_HTTP_ROUTE => format!(
-                "Awaiting domain ownership verification: serve the verification token at \
-                 https://{}{}",
-                self.domain_name,
-                self.http_route_path()
-            ),
+            VERIFICATION_METHOD_DNS_TXT => "Target domain is pending ownership verification. \
+                 Add the DNS TXT record to the DNS resolver associated with your domain \
+                 before attempting verification"
+                .to_string(),
+            VERIFICATION_METHOD_HTTP_ROUTE => "Target domain is pending ownership \
+                 verification. Add the HTTP route path and token directly under your \
+                 configured domain before attempting verification"
+                .to_string(),
             // The remaining enum member, `PRIVATE_VPC`, proves ownership by IP from
             // inside the VPC that reaches the domain, so there is nothing to publish
             // on the domain itself. No other value reaches a stored record:
             // `verification_method_violation` refuses anything outside the enum before
-            // the record is created.
-            _ => "Awaiting domain ownership verification from the private VPC that reaches \
-                  this domain"
+            // the record is created. CHOSEN, not recorded: the corpus carries no
+            // `PRIVATE_VPC` registration, so this sentence is this emulator's, worded
+            // like the two above.
+            _ => "Target domain is pending ownership verification. Reach the domain by IP \
+                  from the private VPC associated with it before attempting verification"
                 .to_string(),
         }
     }
@@ -632,8 +705,12 @@ impl TargetDomainRecord {
         details
     }
 
-    /// This target domain projected onto the modelled [`TargetDomain`] shape the reads
-    /// return: the stored record's own fields, never request input.
+    /// This target domain projected onto the [`TargetDomain`] shape the reads return:
+    /// the stored record's own fields, never request input.
+    ///
+    /// `status` carries the same `TargetDomainStatus` as the modelled
+    /// `verificationStatus`: the recorded wire reports the domain's status under both
+    /// names, and one stored field feeds both, so they cannot disagree.
     pub fn modelled(&self) -> TargetDomain {
         TargetDomain {
             target_domain_id: self.target_domain_id.clone(),
@@ -641,8 +718,9 @@ impl TargetDomainRecord {
             verification_status: Some(self.verification_status.clone()),
             verification_status_reason: self.verification_status_reason.clone(),
             verification_details: Some(self.verification_details()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            verified_at: self.verified_at.map(::aws_smithy_types::DateTime::from),
+            created_at: Some(timestamp(self.created_at)),
+            verified_at: self.verified_at.map(timestamp),
+            status: Some(self.verification_status.clone()),
         }
     }
 }
@@ -1094,8 +1172,9 @@ pub fn decode_connection_page_token(token: &str) -> Option<String> {
 /// [`DEFAULT_REGION`] when it carries none.
 ///
 /// The scope is caller-controlled text and the value lands inside a derived domain
-/// name, so anything that is not a plausible region label is refused here and the
-/// default used instead: a generated domain can never carry arbitrary request text.
+/// name and inside an ARN, so anything that is not a plausible region label is refused
+/// here and the default used instead: a generated domain or ARN can never carry
+/// arbitrary request text.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
