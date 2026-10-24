@@ -2,6 +2,21 @@
 
 //! @op TagResource
 //!
+//! Adds tags to one Firewall Manager resource, named by a generic `ResourceArn`.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association for the
+//! organisation the call is refused by [`crate::state::require_administrator`]
+//! BEFORE the ARN's form is checked, before the `TagList` is validated and
+//! before anything is looked up or written — so an unauthorised caller learns
+//! nothing about what the organisation holds and leaves no tag state behind. The
+//! association is organisation-wide (one default administrator, whose
+//! `AdminScope` is the whole organisation), so the gate answers the same in every
+//! Region and the request's Region only composes the refusal's message.
+//! With an administrator associated, a malformed ARN is a `ValidationException`,
+//! an ARN naming no stored resource is `ResourceNotFoundException`, and the
+//! written tags are merged into the resource's persisted set.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -168,7 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -178,7 +192,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The ARN's FORM first: a string that is not an ARN at all is a caller
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate FIRST, on the ordering
+        // [`crate::state::require_administrator`]'s own documentation states:
+        // this is an organisation-scoped call, so it is answered only while the
+        // organisation has a Firewall Manager administrator, and the decision is
+        // taken before the ARN's form, the `TagList` and any lookup — hence the
+        // lock is held across the request-local checks below rather than taken
+        // after them.
+        crate::state::require_administrator(&store, &region)?;
+
+        // The ARN's FORM next: a string that is not an ARN at all is a caller
         // programming error, refused before anything is looked up or written.
         // The modelled `ResourceArn` pattern cannot express this, so the service
         // check does — as a 400 `ValidationException`, never a 501.
@@ -199,7 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
         // A well-formed ARN that names no stored resource is not-found, and the
         // call must leave NO tag state behind — so the resource is resolved
         // before any write, and nothing is inserted on this path.

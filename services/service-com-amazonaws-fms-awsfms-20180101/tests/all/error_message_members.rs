@@ -76,7 +76,10 @@ const REGIONS: &[&str] = &[REGION, "eu-central-1", "ap-southeast-4"];
 /// The message member of an awsJson1_1 error body, read under the EXACT name the
 /// service's error shapes declare. Deliberately NOT tolerant of other casings:
 /// the key is what a client reads the exception message from.
-fn message_member(body: &Value) -> Option<&str> {
+///
+/// `pub(crate)` so a sibling suite in this test target reads an error's message
+/// under the same member-name rule rather than keeping a second copy of it.
+pub(crate) fn message_member(body: &Value) -> Option<&str> {
     body.get("Message").and_then(Value::as_str)
 }
 
@@ -115,8 +118,8 @@ fn policy_update(policy_id: &str) -> Value {
 }
 
 /// Not-found lookups that need NO administrator association: the two that are
-/// not-found precisely BECAUSE nothing is associated, the policy lookups and the
-/// ARN-keyed tagging lookups (none of which is organisation-scoped).
+/// not-found precisely BECAUSE nothing is associated, and the policy lookups
+/// (whose own gate is tracked by the open `fms-putpolicy-error-response` issue).
 fn not_found_without_administrator() -> Vec<Row> {
     vec![
         Row {
@@ -154,38 +157,6 @@ fn not_found_without_administrator() -> Vec<Row> {
             operation: "PutPolicy",
             body: json!({ "Policy": policy_update(OTHER_UNKNOWN_POLICY_ID) }),
             lookup: Some(OTHER_UNKNOWN_POLICY_ID.to_string()),
-        },
-        Row {
-            case: "ListTagsForResource with a policy ARN naming no policy",
-            operation: "ListTagsForResource",
-            body: json!({ "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8") }),
-            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
-        },
-        Row {
-            case: "ListTagsForResource with a resource-set ARN naming nothing",
-            operation: "ListTagsForResource",
-            body: json!({ "ResourceArn": unknown_arn("resource-set/0123456789AbCdEfGhIjKl") }),
-            lookup: Some(unknown_arn("resource-set/0123456789AbCdEfGhIjKl")),
-        },
-        Row {
-            case: "TagResource with a policy ARN naming no policy",
-            operation: "TagResource",
-            body: json!({
-                "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8"),
-                "TagList": [{ "Key": "stage", "Value": "test" }],
-            }),
-            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
-        },
-        Row {
-            case: "TagResource with an applications-list ARN naming nothing",
-            operation: "TagResource",
-            body: json!({
-                "ResourceArn": unknown_arn("applications-list/11111111-2222-3333-4444-555555555555"),
-                "TagList": [{ "Key": "owner", "Value": "team" }],
-            }),
-            lookup: Some(unknown_arn(
-                "applications-list/11111111-2222-3333-4444-555555555555",
-            )),
         },
     ]
 }
@@ -238,6 +209,41 @@ fn not_found_with_administrator() -> Vec<Row> {
             operation: "GetNotificationChannel",
             body: json!({}),
             lookup: None,
+        },
+        // The tagging operations are organisation-scoped too, so their
+        // ARN-keyed lookups only reach the store once an administrator is
+        // associated.
+        Row {
+            case: "ListTagsForResource with a policy ARN naming no policy",
+            operation: "ListTagsForResource",
+            body: json!({ "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8") }),
+            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
+        },
+        Row {
+            case: "ListTagsForResource with a resource-set ARN naming nothing",
+            operation: "ListTagsForResource",
+            body: json!({ "ResourceArn": unknown_arn("resource-set/0123456789AbCdEfGhIjKl") }),
+            lookup: Some(unknown_arn("resource-set/0123456789AbCdEfGhIjKl")),
+        },
+        Row {
+            case: "TagResource with a policy ARN naming no policy",
+            operation: "TagResource",
+            body: json!({
+                "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8"),
+                "TagList": [{ "Key": "stage", "Value": "test" }],
+            }),
+            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
+        },
+        Row {
+            case: "TagResource with an applications-list ARN naming nothing",
+            operation: "TagResource",
+            body: json!({
+                "ResourceArn": unknown_arn("applications-list/11111111-2222-3333-4444-555555555555"),
+                "TagList": [{ "Key": "owner", "Value": "team" }],
+            }),
+            lookup: Some(unknown_arn(
+                "applications-list/11111111-2222-3333-4444-555555555555",
+            )),
         },
     ]
 }
@@ -367,6 +373,17 @@ async fn the_authorization_refusal_carries_a_message_built_from_the_request() {
         ("GetProtocolsList", json!({ "ListId": OTHER_UNKNOWN_LIST_ID, "DefaultList": false })),
         ("GetNotificationChannel", json!({})),
         ("GetResourceSet", json!({ "Identifier": UNKNOWN_RESOURCE_SET_ID })),
+        (
+            "ListTagsForResource",
+            json!({ "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8") }),
+        ),
+        (
+            "TagResource",
+            json!({
+                "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8"),
+                "TagList": [{ "Key": "stage", "Value": "test" }],
+            }),
+        ),
     ];
 
     let mut per_region: Vec<String> = Vec::new();
