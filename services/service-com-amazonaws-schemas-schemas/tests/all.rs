@@ -25,6 +25,8 @@ mod code_bindings;
 mod discovered_schema_inference;
 #[path = "all/discoverer_state.rs"]
 mod discoverer_state;
+#[path = "all/duplicate_create_refusals.rs"]
+mod duplicate_create_refusals;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/error_body_codes.rs"]

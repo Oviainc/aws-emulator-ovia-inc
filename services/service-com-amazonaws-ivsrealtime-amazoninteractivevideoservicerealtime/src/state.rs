@@ -19,9 +19,11 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, ConflictException, EncoderConfiguration,
-    IngestConfiguration, InternalServerException, ParticipantRecordingHlsConfiguration,
-    ParticipantReplica, ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken,
+    AutoParticipantRecordingConfiguration, Composition, ConflictException, Destination,
+    DestinationConfiguration, DestinationDetail, EncoderConfiguration, GridConfiguration,
+    IngestConfiguration, InternalServerException, LayoutConfiguration,
+    ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
+    ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSessionSummary, StageSummary,
     StorageConfiguration, StorageConfigurationSummary, ValidationException, Video,
@@ -500,6 +502,164 @@ pub const DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS: i32 = 0;
 /// stage of a replica is deleted.
 pub const MAX_PARTICIPANT_REPLICAS_PER_STAGE: usize = 1_000;
 
+// ---------------------------------------------------------------------------
+// Compositions
+//
+// `StartComposition` composites a stage into one or two destinations, and
+// `GetComposition` reports the composition back. The values no request supplies — the
+// layout members a request leaves out, the state a started composition is in, and when
+// the clock owes it the next one — are fixed here, each from the model's own doc or
+// value list.
+// ---------------------------------------------------------------------------
+
+/// `CompositionState` a composition is in from the moment `StartComposition` returns
+/// until the clock owes it [`COMPOSITION_ACTIVATION_SPAN`] later.
+///
+/// From `CompositionState`'s value list (`STARTING` | `ACTIVE` | `STOPPING` | `FAILED` |
+/// `STOPPED`, `crate::ops::types::COMPOSITION_STATE_VALUES`): a composition that has just
+/// been started is starting, not yet running.
+pub const COMPOSITION_STATE_STARTING: &str = "STARTING";
+
+/// `CompositionState` a started composition settles into, from the same value list.
+pub const COMPOSITION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// `DestinationState` a destination of a starting composition is in, from
+/// `DestinationState`'s value list (`crate::ops::types::DESTINATION_STATE_VALUES`).
+pub const DESTINATION_STATE_STARTING: &str = "STARTING";
+
+/// `DestinationState` a destination settles into with its composition.
+pub const DESTINATION_STATE_ACTIVE: &str = "ACTIVE";
+
+/// How long after `StartComposition` the clock owes a composition and its destinations
+/// the `STARTING` -> `ACTIVE` transition.
+///
+/// AWS publishes no span for it, so this is the emulator's own, inside the band this
+/// tree fixes for a transition the clock owes. It is deliberately NOT zero: a caller
+/// that reads the composition back straight after starting it must still observe
+/// `STARTING`, the way it would against AWS.
+pub const COMPOSITION_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+/// Aspect ratio of a grid layout's non-featured tiles when the request sets none.
+///
+/// Documented on `GridConfiguration$videoAspectRatio`: "`VIDEO` is 16:9, `SQUARE` is
+/// 1:1, and `PORTRAIT` is 3:4. Default: `VIDEO`."
+pub const DEFAULT_GRID_VIDEO_ASPECT_RATIO: &str = "VIDEO";
+
+/// Fill mode of a grid layout's tiles when the request sets none.
+///
+/// Documented on `GridConfiguration$videoFillMode`: "When not set, `videoFillMode`
+/// defaults to `COVER` fill mode for participants in the grid" — the tiles the grid
+/// lays out, which is what this member configures.
+pub const DEFAULT_GRID_VIDEO_FILL_MODE: &str = "COVER";
+
+/// Fill mode of a picture-in-picture layout's tiles when the request sets none.
+///
+/// Documented on `PipConfiguration$videoFillMode`: "Default: `COVER`."
+pub const DEFAULT_PIP_VIDEO_FILL_MODE: &str = "COVER";
+
+/// What a picture-in-picture window does when every participant has left, when the
+/// request does not say.
+///
+/// Documented on `PipConfiguration$pipBehavior`: "`STATIC` (maintains original
+/// position/size) or `DYNAMIC` (expands to full composition). Default: `STATIC`."
+pub const DEFAULT_PIP_BEHAVIOR: &str = "STATIC";
+
+/// Corner a picture-in-picture window sits in when the request does not say.
+///
+/// Documented on `PipConfiguration$pipPosition`: "Default: `BOTTOM_RIGHT`."
+pub const DEFAULT_PIP_POSITION: &str = "BOTTOM_RIGHT";
+
+/// Compositions this emulator keeps for one engine. Not an AWS quota — this emulator's
+/// own resource guard on the one store `StartComposition` grows, set the same way
+/// [`MAX_STAGES`] is and answered with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_COMPOSITIONS: usize = 1_000;
+
+/// Characters in a minted composition id. The model's `CompositionArn` pattern allows
+/// `[a-zA-Z0-9-]+` after `composition/`, and caps the whole ARN at 128 characters.
+pub const COMPOSITION_ID_LEN: usize = 12;
+
+/// Characters in a minted destination id. `Destination$id` is a plain `String`
+/// ("Unique identifier for this destination, assigned by IVS"), so the id charset
+/// [`mint_id`] produces satisfies it.
+pub const DESTINATION_ID_LEN: usize = 12;
+
+/// The composition ARN for `composition_id`, in the form the model's `CompositionArn`
+/// pattern requires: `arn:aws:ivs:<region>:<account>:composition/<id>`.
+pub fn composition_arn(region: &str, composition_id: &str) -> String {
+    ::engine::emulator_arn("ivs", region, &format!("composition/{composition_id}"))
+}
+
+/// The grid layout `requested` describes, with the documented default for every member
+/// it left out.
+///
+/// The members the model carries a `@default` trait for (`omitStoppedVideo`, `gridGap`)
+/// arrive already filled in by the framework's deserializer — they are not optional on
+/// the Rust shape — so only the two the model documents a default for in prose are
+/// applied here.
+fn effective_grid(requested: GridConfiguration) -> GridConfiguration {
+    GridConfiguration {
+        video_aspect_ratio: Some(
+            requested
+                .video_aspect_ratio
+                .unwrap_or_else(|| DEFAULT_GRID_VIDEO_ASPECT_RATIO.to_string()),
+        ),
+        video_fill_mode: Some(
+            requested
+                .video_fill_mode
+                .unwrap_or_else(|| DEFAULT_GRID_VIDEO_FILL_MODE.to_string()),
+        ),
+        ..requested
+    }
+}
+
+/// The picture-in-picture layout `requested` describes, with the documented default for
+/// every member it left out.
+///
+/// `pipWidth` and `pipHeight` are deliberately left absent when the request omits them:
+/// the model documents that each is then "based on the size of the composition and the
+/// aspect ratio of the participant's video" rather than taking a fixed value.
+fn effective_pip(requested: PipConfiguration) -> PipConfiguration {
+    PipConfiguration {
+        video_fill_mode: Some(
+            requested
+                .video_fill_mode
+                .unwrap_or_else(|| DEFAULT_PIP_VIDEO_FILL_MODE.to_string()),
+        ),
+        pip_behavior: Some(
+            requested
+                .pip_behavior
+                .unwrap_or_else(|| DEFAULT_PIP_BEHAVIOR.to_string()),
+        ),
+        pip_position: Some(
+            requested
+                .pip_position
+                .unwrap_or_else(|| DEFAULT_PIP_POSITION.to_string()),
+        ),
+        ..requested
+    }
+}
+
+/// The layout a composition runs with, from what the request asked for.
+///
+/// `Composition$layout` is `@required`, so every composition reports one even when the
+/// starting request named none: the model documents the fallback on
+/// `LayoutConfiguration$grid` — "Default: Grid layout" — so a request that configures
+/// neither layout gets a grid with every documented grid default.
+pub fn effective_layout(requested: Option<LayoutConfiguration>) -> LayoutConfiguration {
+    let requested = requested.unwrap_or_default();
+    if let Some(pip) = requested.pip {
+        return LayoutConfiguration {
+            grid: None,
+            pip: Some(effective_pip(pip)),
+        };
+    }
+    LayoutConfiguration {
+        grid: Some(effective_grid(requested.grid.unwrap_or_default())),
+        pip: None,
+    }
+}
+
 /// Marks a `ListStages` page token as this service's, so a token from elsewhere is
 /// refused rather than silently read as a position.
 const PAGE_TOKEN_PREFIX: &str = "ivs-realtime-stage-after:";
@@ -788,6 +948,132 @@ impl StorageConfigurationRecord {
     fn to_s3(&self) -> S3StorageConfiguration {
         S3StorageConfiguration {
             bucket_name: self.bucket_name.clone(),
+        }
+    }
+}
+
+/// One destination of a composition, as `StartComposition` persisted it.
+#[derive(Debug, Clone)]
+pub struct DestinationRecord {
+    /// The id IVS assigns the destination (`Destination$id`), minted at start.
+    pub id: String,
+    /// One of `crate::ops::types::DESTINATION_STATE_VALUES`;
+    /// [`DESTINATION_STATE_STARTING`] until the composition's
+    /// [`CompositionRecord::active_at`].
+    pub state: String,
+    /// When the destination started, which is when its composition did.
+    pub started_at: SystemTime,
+    /// When it stopped; `None` while it is running.
+    pub ended_at: Option<SystemTime>,
+    /// What the starting request asked this destination to be —
+    /// `Destination$configuration`, "configuration used to create this destination".
+    pub configuration: DestinationConfiguration,
+    /// Where an S3 destination's recording lands; `None` for a channel destination,
+    /// which records nothing. See [`recording_prefix`].
+    pub detail: Option<DestinationDetail>,
+}
+
+impl DestinationRecord {
+    /// The modelled `Destination` this record reports.
+    pub fn to_destination(&self) -> Destination {
+        Destination {
+            id: self.id.clone(),
+            state: self.state.clone(),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
+            configuration: self.configuration.clone(),
+            detail: self.detail.clone(),
+        }
+    }
+}
+
+/// The S3 prefix an S3 destination's recording is stored under.
+///
+/// `S3Detail$recordingPrefix` is documented only as "The S3 bucket prefix under which
+/// the recording is stored" and the model publishes no format for it, so the prefix is
+/// DERIVED from the two ids that identify the recording — the composition and the
+/// destination within it. That makes it unique per destination and stable across reads,
+/// which is what a caller can rely on; it is not read back off any request.
+pub fn recording_prefix(composition_id: &str, destination_id: &str) -> String {
+    format!("{composition_id}/{destination_id}")
+}
+
+/// One composition, as `StartComposition` persisted it and `GetComposition` reports it.
+#[derive(Debug, Clone)]
+pub struct CompositionRecord {
+    /// The composition ARN, and the single key every lookup uses.
+    pub arn: String,
+    /// The id the ARN ends in, which [`recording_prefix`] is built from.
+    pub composition_id: String,
+    /// The stage being composited.
+    pub stage_arn: String,
+    /// One of `crate::ops::types::COMPOSITION_STATE_VALUES`;
+    /// [`COMPOSITION_STATE_STARTING`] until [`Self::active_at`].
+    pub state: String,
+    /// The layout the composition runs with: what the request asked for, with the
+    /// model's documented default for everything it left out
+    /// ([`effective_layout`]). Not optional — `Composition$layout` is `@required`.
+    pub layout: LayoutConfiguration,
+    /// The composition's destinations, in the order the request listed them.
+    pub destinations: Vec<DestinationRecord>,
+    pub tags: HashMap<String, String>,
+    /// The `@idempotencyToken` the starting request carried, if any: a repeat of that
+    /// same request answers with this composition instead of starting a second one.
+    pub idempotency_token: Option<String>,
+    /// What the starting request asked for, as one comparable value — see
+    /// [`composition_fingerprint`]. A repeat under [`Self::idempotency_token`] is only a
+    /// repeat when it asks for the same thing; a token reused for a different request is
+    /// refused rather than answered with this composition.
+    pub request_fingerprint: String,
+    /// When the composition started (`Composition$startTime`).
+    pub started_at: SystemTime,
+    /// When it stopped (`Composition$endTime`); `None` while it is running.
+    pub ended_at: Option<SystemTime>,
+    /// The instant the clock owes this composition the `STARTING` -> `ACTIVE`
+    /// transition: its start plus [`COMPOSITION_ACTIVATION_SPAN`]. Stored, never
+    /// slept on.
+    pub active_at: SystemTime,
+    /// Start order, and the stable key a listing of compositions pages over.
+    pub sequence: u64,
+}
+
+impl CompositionRecord {
+    /// Materialise the transition the clock has already made due.
+    ///
+    /// A starting composition — and every destination of it — becomes `ACTIVE`
+    /// [`COMPOSITION_ACTIVATION_SPAN`] after the call that started it, whether or not
+    /// anybody calls again: this only writes down a change that was already owed at
+    /// `now`, so a reporting operation may call it.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        if self.state != COMPOSITION_STATE_STARTING || now < self.active_at {
+            return;
+        }
+        self.state = COMPOSITION_STATE_ACTIVE.to_string();
+        for destination in &mut self.destinations {
+            if destination.state == DESTINATION_STATE_STARTING {
+                destination.state = DESTINATION_STATE_ACTIVE.to_string();
+            }
+        }
+    }
+
+    /// The modelled `Composition` this record reports.
+    pub fn to_composition(&self) -> Composition {
+        Composition {
+            arn: self.arn.clone(),
+            stage_arn: self.stage_arn.clone(),
+            state: self.state.clone(),
+            layout: self.layout.clone(),
+            destinations: self
+                .destinations
+                .iter()
+                .map(DestinationRecord::to_destination)
+                .collect(),
+            // Always reported, empty map included: `tags` is how a caller reads the
+            // tags back, and an absent member is not the same answer as "none" — the
+            // same rule [`StageRecord::to_stage`] follows.
+            tags: Some(self.tags.clone()),
+            start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
+            end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
         }
     }
 }
@@ -1218,6 +1504,8 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     pub encoder_configurations: HashMap<String, EncoderConfigurationRecord>,
     /// Every live storage configuration, keyed by its ARN.
     pub storage_configurations: HashMap<String, StorageConfigurationRecord>,
+    /// Every composition that has been started and not stopped, keyed by its ARN.
+    pub compositions: HashMap<String, CompositionRecord>,
     /// The started replications of a stage's participants, keyed by that SOURCE stage's
     /// ARN and held in start order — the order `ListParticipantReplicas` pages over.
     /// Removed when either stage a replica names is deleted.
@@ -1276,6 +1564,29 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
             .get(stage_arn)?
             .iter()
             .find(|session| session.session_id == session_id)
+    }
+
+    /// Write down every composition transition the clock has already made due.
+    ///
+    /// Each one was owed at [`CompositionRecord::active_at`] whether or not anybody
+    /// called, so this changes no composition that a caller reading at the same instant
+    /// would have seen differently — which is why a reporting operation may call it.
+    pub fn materialize_due_compositions(&mut self, now: SystemTime) {
+        for composition in self.compositions.values_mut() {
+            composition.materialize_due(now);
+        }
+    }
+
+    /// The composition started under the `@idempotencyToken` `token`, if this store
+    /// holds one.
+    ///
+    /// A composition is keyed by its own ARN, so the token is searched for rather than
+    /// indexed: the store is bounded by [`MAX_COMPOSITIONS`], and a repeat of a start
+    /// request is what this answers.
+    pub fn composition_by_idempotency_token(&self, token: &str) -> Option<&CompositionRecord> {
+        self.compositions
+            .values()
+            .find(|composition| composition.idempotency_token.as_deref() == Some(token))
     }
 }
 
@@ -1895,6 +2206,70 @@ pub fn mutually_exclusive_members_message(
     )
 }
 
+/// How this service states a request that supplied the wrong number of a set of members
+/// exactly one of which must be given: it names the members the request actually carried
+/// (none, when it carried none) and then the whole set, in the construction every other
+/// member refusal of this service uses (`<Operation>.<member> …`).
+///
+/// The companion of [`mutually_exclusive_members_message`], for a set whose members are
+/// not merely exclusive but required as a choice — the place a destination publishes to,
+/// say, where naming none describes no destination at all.
+pub fn exactly_one_member_message(
+    operation: &str,
+    supplied: &[&str],
+    exclusive: &[&str],
+) -> String {
+    format!(
+        "{operation} is required to have exactly one of {}, found {}",
+        exclusive.join(", "),
+        if supplied.is_empty() {
+            "none".to_string()
+        } else {
+            supplied.join(", ")
+        },
+    )
+}
+
+/// What one start request asked for, as one comparable value.
+///
+/// `@idempotencyToken` makes a retry of ONE request answer with what the first call
+/// created; it does not make one token stand for two different requests. So the token is
+/// stored beside a fingerprint of the rest of the request — the stage, the effective
+/// layout, the destination configurations in the order they were given, and the tag set —
+/// and a token offered again with a different fingerprint is refused instead of answered
+/// with the wrong composition.
+///
+/// The tag pairs are sorted first: a `Tags` map has no request order, so two spellings of
+/// one tag set must fingerprint alike. Nothing else here is a map, so the rendering is
+/// stable.
+pub fn composition_fingerprint(
+    stage_arn: &str,
+    layout: &LayoutConfiguration,
+    destinations: &[DestinationConfiguration],
+    tags: &HashMap<String, String>,
+) -> String {
+    let mut pairs: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    format!("{stage_arn}|{layout:?}|{destinations:?}|{pairs:?}")
+}
+
+/// How this service states an `@idempotencyToken` offered again for a DIFFERENT request:
+/// it names the operation, the member and the token, so the caller can see which token
+/// already stands for something else.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request, the way every other refusal of this service is.
+pub fn idempotency_token_reused_message(operation: &str, token: &str) -> String {
+    format!(
+        "{operation}.idempotencyToken is required to name the request it was first used \
+         for, found {token} which already names a different request"
+    )
+}
+
 /// The `ResourceNotFoundException` (HTTP 404) a handler answers when a request names a
 /// resource this service does not hold. See [`resource_not_found_message`].
 ///
@@ -2322,19 +2697,24 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// The tags attached to the resource `arn` names, or `None` when this store holds no
 /// such resource.
 ///
-/// A stage, an ingest configuration, an encoder configuration and a storage
-/// configuration are the resource types this store can hold: `CreateStage`,
-/// `CreateIngestConfiguration`, `CreateEncoderConfiguration` and
-/// `CreateStorageConfiguration` are the creates this service implements, so every other
-/// resource type in its ARN shapes names nothing, and a well-formed ARN naming one is
-/// answered exactly as an ARN naming a deleted stage is — not found. Each such create is
-/// its own gap issue, and when one lands its record joins the match below.
+/// A stage, an ingest configuration, an encoder configuration, a storage configuration
+/// and a composition are the resource types this store can hold: `CreateStage`,
+/// `CreateIngestConfiguration`, `CreateEncoderConfiguration`,
+/// `CreateStorageConfiguration` and `StartComposition` are the operations of this
+/// service that mint one, so every other resource type in its ARN shapes names nothing,
+/// and a well-formed ARN naming one is answered exactly as an ARN naming a deleted stage
+/// is — not found. Each remaining create is its own gap issue, and when one lands its
+/// record joins the match below.
 pub fn resource_tags(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
 ) -> Option<HashMap<String, String>> {
     match arn_resource_type(arn)? {
         "stage" => state.stages.get(arn).map(|stage| stage.tags.clone()),
+        "composition" => state
+            .compositions
+            .get(arn)
+            .map(|composition| composition.tags.clone()),
         "ingest-configuration" => state
             .ingest_configurations
             .get(arn)
@@ -2359,6 +2739,10 @@ pub fn resource_tags_mut<'a>(
 ) -> Option<&'a mut HashMap<String, String>> {
     match arn_resource_type(arn)? {
         "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
+        "composition" => state
+            .compositions
+            .get_mut(arn)
+            .map(|composition| &mut composition.tags),
         "ingest-configuration" => state
             .ingest_configurations
             .get_mut(arn)

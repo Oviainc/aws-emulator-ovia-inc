@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckCapacity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckCapacity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckCapacity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the web ACL capacity units (WCUs) a rule list consumes, computed from the
+//! rules in the request and from the capacity of every rule group they reference in
+//! this service's state. This operation REPORTS — it writes nothing. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -185,20 +180,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckCapacity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckCapacityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `Scope` "specifies whether this is for a global resource type" and is one of
+        // the two values the enum declares; it is also the namespace every reference in
+        // the rule list resolves in, so it is judged first.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the rules' references resolve in, \
+                     and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        // The rule tree comes straight off the wire and nests, so its depth is bounded
+        // here, before anything walks it — the same ingress bound the save path applies.
+        if let Err(reason) = crate::state::validate_statement_nesting(&input.rules) {
+            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
+            )
+            .into());
+        }
+
+        // These are "the rules you want to use in a RuleGroup or WebACL", so a rule's
+        // own top-level statement may run a rule group (what a web ACL rule does), while
+        // a rule-group-running statement reached THROUGH a nesting is the misplacement
+        // `WAFInvalidParameterException` names ("Your nested statement isn't valid").
+        if let Some((field, reason)) =
+            crate::state::misplaced_rule_group_statement(&input.rules, true)
+        {
+            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(field, "Rules", &reason),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CheckCapacityErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // WAF prices a statement that runs a rule group from that group's own reported
+        // capacity, so a reference naming an entity this service does not hold in this
+        // scope cannot be priced at all: it is refused the way the save path refuses it,
+        // rather than silently costing nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckCapacity"))
+        // The diagnostic the resolution answers is deliberately dropped rather than put
+        // in the response: `WAFNonexistentItemException` carries the one constant
+        // sentence that exception type always carries, whatever the request named (see
+        // `crate::state::NONEXISTENT_ITEM_MESSAGE` and `tests/all/exception_messages.rs`),
+        // and there is no audit record either, because `crate::state::audit` records what
+        // a STATE-CHANGING call did and this call changes nothing.
+        if state
+            .unresolvable_rule_reference(&input.scope, &input.rules)
+            .is_some()
+        {
+            return Err(CheckCapacityErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        }
+
+        // The same derivation `WebACL$Capacity` is computed with, over the rules the
+        // request carries: "the capacity required by the rules and scope", summed per
+        // rule, with each rule-group reference costing the referenced group's own
+        // `Capacity`. This is a read: nothing is written to the store.
+        let capacity =
+            crate::state::web_acl_capacity(&input.rules, &state.rule_group_capacities(&input.scope));
+
+        Ok(CheckCapacityOutput { capacity })
     }
 }

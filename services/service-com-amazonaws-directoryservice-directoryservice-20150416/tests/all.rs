@@ -15,6 +15,8 @@
 mod ad_assessment;
 #[path = "all/computers.rs"]
 mod computers;
+#[path = "all/conditional_forwarders.rs"]
+mod conditional_forwarders;
 #[path = "all/directory_data_access.rs"]
 mod directory_data_access;
 #[path = "all/directory_lifecycle.rs"]

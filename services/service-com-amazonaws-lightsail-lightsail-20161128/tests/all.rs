@@ -19,6 +19,8 @@ mod blueprint_catalog;
 mod bucket_access_keys;
 #[path = "all/bucket_bundles.rs"]
 mod bucket_bundles;
+#[path = "all/bucket_error_envelope.rs"]
+mod bucket_error_envelope;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
 #[path = "all/bucket_object_data_plane.rs"]

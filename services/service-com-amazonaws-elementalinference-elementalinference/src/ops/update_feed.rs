@@ -6,7 +6,13 @@
 //! payload replaces the existing one, so an omitted `accessRoleArn` clears the role.
 //! The overwrite is complete when the call answers (HTTP 200), so the response
 //! reports the feed's settled status — `AVAILABLE` with no resource associated,
-//! `ACTIVE` while one holds it — rather than a transient one.
+//! `ACTIVE` while one holds it — rather than a transient one. The replacement list
+//! still has to describe a feed the service would hold: output names are unique within
+//! a feed (`ConflictException`, HTTP 409) and `fromAssociation` is service-owned, so a
+//! request that disagrees with the stored provenance is refused (`ValidationException`,
+//! HTTP 400) while one that omits it keeps that provenance. A replacement list past the
+//! feed's output quota is refused too (`ServiceQuotaExceededException`, HTTP 402), so a
+//! PUT cannot put the stored list past the bound every writer of it is held to.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +220,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An output's name identifies it within the feed, so a replacement list that
+        // names one output twice describes a feed no output of which is addressable by
+        // name. That is a property of the REQUEST, decided before the feed is resolved
+        // exactly as `AssociateFeed` decides it, and it is the same conflict (HTTP 409).
+        if let Some(duplicate) = crate::state::first_duplicate_output_name(
+            input.outputs.iter().map(|output| output.name.as_str()),
+        ) {
+            return Err(UpdateFeedErrorModeled::ConflictException(ConflictException {
+                message: crate::state::duplicate_output_name_message(duplicate),
+            })
+            .into());
+        }
+
+        // A feed's output list is BOUNDED, and this PUT SETS that list, so a
+        // replacement longer than the bound is refused rather than stored — the same
+        // quota, and the same modelled refusal (HTTP 402), that an append past it
+        // earns. Decided from the REQUEST's own length, before the lock is taken, so
+        // the list this call then walks is at most that many entries and the stored
+        // list it compares against is too.
+        if input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED {
+            return Err(UpdateFeedErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::too_many_outputs_message(),
+                },
+            )
+            .into());
+        }
+
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
@@ -237,25 +271,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // PUT: the payload completely overwrites the existing one, so the new list
-        // replaces the stored outputs and an omitted access role clears it.
-        feed.name = input.name;
-        feed.outputs = input
-            .outputs
-            .into_iter()
-            .map(|output| {
-                crate::state::Output::new(
+        // `fromAssociation` is SERVICE-OWNED: the service sets it when an output enters
+        // the feed — true through `AssociateFeed`, false through a create or an update —
+        // and the request may not change it. So the value STORED for the output of this
+        // name decides it: an output the feed already holds keeps its provenance whether
+        // the request echoes it or omits it, and an output this call introduces did not
+        // come from an association. A request that supplies a DIFFERENT value is asking
+        // to rewrite a fact it does not own, which is refused (HTTP 400) — and refused
+        // before anything is written, so a rejected PUT leaves the feed as it was.
+        //
+        // The stored provenance is indexed ONCE and then looked up per listed output,
+        // so the work is the sum of the two list lengths rather than their product, and
+        // both are bounded by `MAX_OUTPUTS_PER_FEED` (the request's length is checked
+        // above; the stored length is what every writer of the list is held to). The
+        // index borrows the stored feed, so it is scoped to end before the write below.
+        let outputs = {
+            let held_provenance: std::collections::HashMap<&str, bool> = feed
+                .outputs
+                .iter()
+                .map(|held| (held.name.as_str(), held.from_association))
+                .collect();
+            let mut outputs = Vec::with_capacity(input.outputs.len());
+            for (index, output) in input.outputs.into_iter().enumerate() {
+                let from_association = held_provenance
+                    .get(output.name.as_str())
+                    .copied()
+                    .unwrap_or(false);
+                if let Some(supplied) = output
+                    .from_association
+                    .filter(|supplied| *supplied != from_association)
+                {
+                    return Err(UpdateFeedErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::from_association_not_changeable_message(
+                                index + 1,
+                                supplied,
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                outputs.push(crate::state::Output::new(
                     output.name,
                     output.output_config,
                     output.status,
                     output.description,
-                    // `fromAssociation` is carried by the caller (it is an
-                    // UpdateOutput member); an output the caller does not mark came
-                    // from this call, not from AssociateFeed.
-                    output.from_association.unwrap_or(false),
-                )
-            })
-            .collect();
+                    from_association,
+                ));
+            }
+            outputs
+        };
+
+        // PUT: the payload completely overwrites the existing one, so the new list
+        // replaces the stored outputs and an omitted access role clears it.
+        feed.name = input.name;
+        feed.outputs = outputs;
         feed.access_role_arn = input.access_role_arn;
         // The feed's LIFECYCLE status is not what an update moves: UpdateFeed answers
         // HTTP 200, not 202, so the overwrite is complete when the call answers and the

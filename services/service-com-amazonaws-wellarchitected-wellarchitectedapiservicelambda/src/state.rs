@@ -6,7 +6,8 @@
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
 //! (`CreateReviewTemplate`, `GetReviewTemplate`, `ListReviewTemplates`,
-//! `DeleteReviewTemplate`), the answers of
+//! `DeleteReviewTemplate`), the lens reviews of a workload (`GetLensReview`,
+//! `ListLensReviews`), the answers of
 //! a workload's lens reviews (`ListAnswers`), the improvement plan of one of those lens
 //! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
 //! reviews (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a
@@ -1325,6 +1326,23 @@ impl WorkloadRecord {
             .any(|attached| lens_alias(attached) == lens_alias(lens))
     }
 
+    /// The lens reviews this workload has: every attached lens's [`lens_alias`] — the
+    /// identity the lens is ONE lens under, so a lens attached under two spellings has
+    /// exactly one review — beside the name the attach recorded it under, which is how a
+    /// `LensAlias` of a custom lens is its ARN.
+    ///
+    /// The map's own key order is the list order a page over these reviews follows: it is
+    /// TOTAL and stable, so a cursor carrying the last alias served resumes the
+    /// enumeration without repeating or skipping a review, whatever lenses are attached
+    /// or detached in between.
+    pub fn lens_reviews(&self) -> BTreeMap<&str, &str> {
+        let mut reviews = BTreeMap::new();
+        for lens in &self.lenses {
+            reviews.entry(lens_alias(lens)).or_insert(lens.as_str());
+        }
+        reviews
+    }
+
     /// This workload's risk roll-up: one entry for every `Risk` the enum publishes, so
     /// a caller that reads a bucket to report review progress always finds it.
     ///
@@ -1335,11 +1353,10 @@ impl WorkloadRecord {
     /// does.
     pub fn risk_counts(&self) -> BTreeMap<String, i32> {
         let mut counts = empty_risk_counts();
-        // A lens is attached once however many ways the request named it, so resolve
-        // each name to its lens and count that lens's questions once.
-        let attached: std::collections::BTreeSet<&str> =
-            self.lenses.iter().map(|lens| lens_alias(lens)).collect();
-        for lens in attached {
+        // A lens is attached once however many ways the request named it, so count the
+        // questions of each lens the workload reviews once ([`Self::lens_reviews`] is the
+        // one place that identity rule lives).
+        for lens in self.lens_reviews().keys() {
             for (risk, count) in self.lens_risk_counts(lens) {
                 counts
                     .entry(risk)
@@ -4624,6 +4641,21 @@ pub fn encode_lens_next_token(key: &str) -> String {
 /// the token is not one this service issued.
 pub fn decode_lens_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("c")?.as_str()?.to_string())
+}
+
+/// Encode a `ListLensReviews` cursor: the [`lens_alias`] of the last lens review the page
+/// served, in the same opaque scheme as [`encode_next_token`]. A workload's lens reviews
+/// are enumerated in lens-alias order and a lens is attached once however it was named,
+/// so that alias is the whole cursor. Its own key, so a cursor issued by another
+/// paginated operation is not a cursor here.
+pub fn encode_lens_review_next_token(alias: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "r": alias }))
+}
+
+/// The [`lens_alias`] a `ListLensReviews` `NextToken` points just past, or `None` when the
+/// token is not one this service issued.
+pub fn decode_lens_review_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("r")?.as_str()?.to_string())
 }
 
 /// Encode a cursor over a lens's questions: the `QuestionId` last served, in the same

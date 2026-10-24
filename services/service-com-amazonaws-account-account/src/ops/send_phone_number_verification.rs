@@ -197,16 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The passcode goes to "the phone number in the primary contact
-        // information": with no primary contact stored there is no number to
-        // send it to, which is the resource this call names not being found.
-        let Some(phone_number) = account.primary_phone_number().map(str::to_string) else {
-            return Err(
-                SendPhoneNumberVerificationErrorModeled::ResourceNotFoundException(
-                    crate::state::contact_information_not_set(&account_id),
-                )
-                .into(),
-            );
-        };
+        // information": every account record carries a complete primary contact,
+        // so there is always a number to send it to.
+        let phone_number = account.primary_phone_number().to_string();
 
         // Sending REPLACES any earlier verification of that number: the passcode
         // just sent is the only one outstanding, so a resend invalidates the one

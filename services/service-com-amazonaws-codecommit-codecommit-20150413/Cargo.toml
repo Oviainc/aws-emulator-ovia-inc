@@ -33,6 +33,10 @@ sha1 = "0.10"
 # zlib, which is how a packfile carries each object's bytes (and how a git
 # client may gzip a request body).
 flate2 = "1"
+# The three-way content merge behind a line-level mergeability answer: a common
+# ancestor and two sides merged the way git merges them (see
+# `src/state/merge.rs`).
+diffy = "0.4"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

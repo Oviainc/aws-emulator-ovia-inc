@@ -132,6 +132,70 @@ pub fn initial_account_name(account_id: &str) -> String {
     format!("Account {account_id}")
 }
 
+/// The first line of the postal address an account record carries before any
+/// `PutContactInformation` replaces it. Inside `AddressLine`'s
+/// `@length(min: 1, max: 60)`.
+const INITIAL_ADDRESS_LINE_1: &str = "1 Example Street";
+
+/// The city of that address, inside `City`'s `@length(min: 1, max: 50)`.
+const INITIAL_CITY: &str = "Seattle";
+
+/// The state of that address. `ContactInformation`'s own documentation of
+/// `StateOrRegion` states it "is required in the following countries: US, CA,
+/// GB, DE, JP, IN and BR", and [`INITIAL_COUNTRY_CODE`] is one of them, so the
+/// seeded address carries one: the two-character state code of [`INITIAL_CITY`],
+/// inside `StateOrRegion`'s `@length(min: 1, max: 50)`.
+const INITIAL_STATE_OR_REGION: &str = "WA";
+
+/// The postal code of that address, inside `PostalCode`'s
+/// `@length(min: 1, max: 20)`.
+const INITIAL_POSTAL_CODE: &str = "98101";
+
+/// The country of that address: an ISO-3166 two-letter country code, which is
+/// what `CountryCode` is documented to hold and what its `@length(min: 2,
+/// max: 2)` admits.
+const INITIAL_COUNTRY_CODE: &str = "US";
+
+/// The phone number of that address: a number in the range reserved for
+/// examples, written in the international form `ContactInformationPhoneNumber`'s
+/// `^[+][\s0-9()-]+$` admits and inside its `@length(min: 1, max: 20)`.
+const INITIAL_PHONE_NUMBER: &str = "+1 206-555-0100";
+
+/// The PRIMARY contact information an account record carries from the moment it
+/// exists, before any `PutContactInformation` replaces it.
+///
+/// Every Amazon Web Services account HAS primary contact information: it is
+/// captured when the account is signed up for and inherited by an account
+/// created inside an organization, and `ContactInformation` models `FullName`,
+/// `AddressLine1`, `City`, `PostalCode`, `CountryCode` and `PhoneNumber` as
+/// `@required` — a complete structure, not optional data. So a read of an
+/// account this emulator holds reports a primary contact, exactly as it reports
+/// a name (see [`initial_account_name`]), rather than refusing until a caller
+/// has written one.
+///
+/// Every member satisfies its modelled constraint (see the constants above), and
+/// `FullName` names the account by its id, which keeps the seeded structure
+/// distinct per record: 8 characters of prefix, a 12-digit id and 16 of suffix
+/// is 36, inside `FullName`'s `@length(min: 1, max: 50)`. The optional members
+/// this emulator has not been told anything about stay absent — an address with
+/// no second line, district or company is a complete address.
+pub fn initial_contact_information(account_id: &str) -> ContactInformation {
+    ContactInformation {
+        full_name: format!("Account {account_id} Primary Contact"),
+        address_line1: INITIAL_ADDRESS_LINE_1.to_string(),
+        address_line2: None,
+        address_line3: None,
+        city: INITIAL_CITY.to_string(),
+        state_or_region: Some(INITIAL_STATE_OR_REGION.to_string()),
+        district_or_county: None,
+        postal_code: INITIAL_POSTAL_CODE.to_string(),
+        country_code: INITIAL_COUNTRY_CODE.to_string(),
+        phone_number: INITIAL_PHONE_NUMBER.to_string(),
+        company_name: None,
+        website_url: None,
+    }
+}
+
 /// How many account records the store holds before a call that would create a
 /// NEW one is refused.
 ///
@@ -600,12 +664,13 @@ pub struct Account {
     /// At most one contact per `AlternateContactType`, which is what makes
     /// `PutAlternateContact` an upsert rather than an append.
     pub alternate_contacts: BTreeMap<AlternateContactType, AlternateContactRecord>,
-    /// The account's PRIMARY contact information, exactly as the last
-    /// `PutContactInformation` stored it, and `None` until one has: this
-    /// emulator learns an account's postal address only by being told it, and
-    /// never invents one. There is at most one primary contact per account, so
-    /// a second put replaces the whole structure rather than merging into it.
-    pub contact_information: Option<ContactInformation>,
+    /// The account's PRIMARY contact information:
+    /// [`initial_contact_information`] at creation, and exactly what the last
+    /// `PutContactInformation` stored after that. Never absent — every account
+    /// has primary contact information (see [`initial_contact_information`]).
+    /// There is at most one primary contact per account, so a put replaces the
+    /// whole structure rather than merging into it.
+    pub contact_information: ContactInformation,
     /// The `RegionOptStatus` this account carries for a Region it has been opted
     /// into or out of, keyed by Region code. A Region ABSENT from this map still
     /// reports its [`REGION_CATALOG`] status, so the map holds only what an
@@ -641,11 +706,11 @@ impl Account {
     pub fn new(account_id: String, now: SystemTime) -> Self {
         Self {
             account_name: initial_account_name(&account_id),
+            contact_information: initial_contact_information(&account_id),
             account_id,
             created_date: now,
             state: ACTIVE_ACCOUNT_STATE.to_string(),
             alternate_contacts: BTreeMap::new(),
-            contact_information: None,
             region_opt_status: BTreeMap::new(),
             primary_email_update: None,
             primary_email: None,
@@ -672,13 +737,11 @@ impl Account {
         }
     }
 
-    /// The phone number in this account's primary contact information, or `None`
-    /// while no contact information is stored. `PhoneNumber` is `@required` on
-    /// `ContactInformation`, so a stored contact always has one.
-    pub fn primary_phone_number(&self) -> Option<&str> {
-        self.contact_information
-            .as_ref()
-            .map(|contact| contact.phone_number.as_str())
+    /// The phone number in this account's primary contact information.
+    /// `PhoneNumber` is `@required` on `ContactInformation` and every account
+    /// carries one of those, so there is always a number to report.
+    pub fn primary_phone_number(&self) -> &str {
+        self.contact_information.phone_number.as_str()
     }
 
     /// The `PhoneNumberVerificationStatus` this account reports for the phone
@@ -694,9 +757,7 @@ impl Account {
     /// account") is never reported: every account this emulator holds can run
     /// the passcode flow.
     pub fn phone_number_verification_status(&self) -> &'static str {
-        let Some(phone_number) = self.primary_phone_number() else {
-            return UNVERIFIED_PHONE_NUMBER;
-        };
+        let phone_number = self.primary_phone_number();
         match &self.phone_verification {
             Some(verification) if verification.phone_number == phone_number => {
                 verification.state.as_wire()
@@ -709,7 +770,7 @@ impl Account {
     /// phone number currently in the primary contact information — what
     /// `VerifyPhoneNumber` checks a submitted passcode against.
     pub fn current_phone_verification_mut(&mut self) -> Option<&mut PhoneNumberVerification> {
-        let phone_number = self.primary_phone_number()?.to_string();
+        let phone_number = self.primary_phone_number().to_string();
         self.phone_verification
             .as_mut()
             .filter(|verification| verification.phone_number == phone_number)
@@ -1025,16 +1086,6 @@ pub fn cannot_target_own_account() -> AccessDeniedException {
         message: "The operation failed because the management account can't specify its own \
                   AccountId; this operation updates a member account of the organization"
             .to_string(),
-        error_type: None,
-    }
-}
-
-/// The `ResourceNotFoundException` payload for an account whose primary contact
-/// information this emulator holds no record of — "the operation failed because
-/// it specified a resource that can't be found".
-pub fn contact_information_not_set(account_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("No primary contact information is set for account {account_id}"),
         error_type: None,
     }
 }

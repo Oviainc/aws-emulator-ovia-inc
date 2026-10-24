@@ -172,21 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deleted = crate::state::with_state(&*self.engine, |store| {
             let bucket = store
                 .bucket_mut(&region, &input.bucket_name)
-                .ok_or_else(|| {
-                    not_found(format!(
-                        "bucketName '{}' does not name a bucket of this account in {region}",
-                        input.bucket_name
-                    ))
-                })?;
+                .ok_or_else(|| bucket_not_found(&input.bucket_name))?;
             let held = bucket
                 .access_keys
                 .iter()
                 .position(|key| key.access_key_id == input.access_key_id)
                 .ok_or_else(|| {
-                    not_found(format!(
-                        "accessKeyId '{}' does not name an access key of bucket '{}'",
-                        input.access_key_id, input.bucket_name
-                    ))
+                    access_key_not_found(&input.access_key_id, &input.bucket_name)
                 })?;
             bucket.access_keys.remove(held);
             let location = bucket.location.clone();
@@ -238,15 +230,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's 404 for a bucket or an access key this account holds none of:
-/// the modelled `NotFoundException`, which the model documents as what "Lightsail
-/// throws when it cannot find a resource".
-fn not_found(message: String) -> DeleteBucketAccessKeyError {
-    DeleteBucketAccessKeyErrorModeled::NotFoundException(NotFoundException {
-        message: Some(message),
-        ..Default::default()
-    })
-    .into()
+/// No bucket of that name is stored in this Region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn bucket_not_found(name: &str) -> DeleteBucketAccessKeyError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_BUCKET, name)
+}
+
+/// The bucket holds no access key carrying that id, so the request addresses
+/// nothing to delete: the same `DoesNotExist` envelope, with the wording for a
+/// thing that is not a resource of the modelled `ResourceType` enum — a key
+/// INSIDE a bucket.
+fn access_key_not_found(access_key_id: &str, bucket_name: &str) -> DeleteBucketAccessKeyError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "The bucket access key does not exist: {access_key_id} is not an access key of the {} \
+         {bucket_name}",
+        crate::state::RESOURCE_TYPE_BUCKET
+    ))
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

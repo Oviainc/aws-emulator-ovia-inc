@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMergeOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMergeOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMergeOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which strategies a merge of the source commit into the destination commit admits,
+//! computed from this repository's stored history and object bytes: the merge base of
+//! the two tips, a fast-forward where the destination tip is already an ancestor of the
+//! source tip, and a squash or three-way merge where the two sides carry no conflict the
+//! request's detail level and resolution strategy leaves unresolved. The evaluation
+//! itself is [`crate::state::merge`], which every merge question in this service shares,
+//! and it is charged to one per-request budget — paths compared, content bytes loaded and
+//! time — so a comparison past it is refused with the modelled
+//! `MaximumItemsToCompareExceededException` / `MaximumFileContentToLoadExceededException`
+//! rather than run to completion. The evaluation runs off the async worker, because it
+//! holds the store guard it reads the two snapshots through for its whole span.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +207,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMergeOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMergeOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMergeOptions"))
+        let _ = ctx;
+
+        // Both specifiers are required, so the boundary already refused an absent
+        // one; a blank one names no commit either.
+        let source_specifier = input.source_commit_specifier.trim();
+        let destination_specifier = input.destination_commit_specifier.trim();
+        if source_specifier.is_empty() || destination_specifier.is_empty() {
+            return Err(GetMergeOptionsErrorModeled::CommitRequiredException(
+                CommitRequiredException {
+                    message: Some("a commit was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A value outside `ConflictDetailLevelTypeEnum` or
+        // `ConflictResolutionStrategyTypeEnum` is already refused at the boundary
+        // (as `InvalidConflictDetailLevelException` /
+        // `InvalidConflictResolutionStrategyException`, see `crate::service`); these
+        // keep the handler's own invariant explicit, and apply the documented
+        // defaults for a request that names neither.
+        let conflict_detail_level = input
+            .conflict_detail_level
+            .clone()
+            .unwrap_or_else(|| crate::state::merge::CONFLICT_DETAIL_FILE_LEVEL.to_string());
+        if !crate::state::merge::CONFLICT_DETAIL_LEVELS.contains(&conflict_detail_level.as_str()) {
+            return Err(
+                GetMergeOptionsErrorModeled::InvalidConflictDetailLevelException(
+                    InvalidConflictDetailLevelException {
+                        message: Some(format!(
+                            "the conflict detail level {conflict_detail_level} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let conflict_resolution_strategy = input
+            .conflict_resolution_strategy
+            .clone()
+            .unwrap_or_else(|| crate::state::merge::CONFLICT_RESOLUTION_NONE.to_string());
+        if !crate::state::merge::CONFLICT_RESOLUTION_STRATEGIES
+            .contains(&conflict_resolution_strategy.as_str())
+        {
+            return Err(
+                GetMergeOptionsErrorModeled::InvalidConflictResolutionStrategyException(
+                    InvalidConflictResolutionStrategyException {
+                        message: Some(format!(
+                            "the conflict resolution strategy {conflict_resolution_strategy} is not valid"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        // Reporting only: the evaluation reads stored history and stored blobs, and
+        // writes nothing, so asking whether two commits merge leaves the repository
+        // exactly as the next caller would have found it.
+        let store = state.lock();
+        let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
+            GetMergeOptionsErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        &input.repository_name,
+                    )),
+                },
+            )
+        })?;
+
+        let commit_does_not_exist = |specifier: &str| {
+            GetMergeOptionsErrorModeled::CommitDoesNotExistException(CommitDoesNotExistException {
+                message: Some(format!(
+                    "the commit {specifier} does not exist in the repository {}",
+                    input.repository_name
+                )),
+            })
+        };
+        let source = repository
+            .resolve_commit(source_specifier)
+            .ok_or_else(|| commit_does_not_exist(source_specifier))?;
+        let destination = repository
+            .resolve_commit(destination_specifier)
+            .ok_or_else(|| commit_does_not_exist(destination_specifier))?;
+
+        let evaluation = crate::service::off_the_async_worker(|| {
+            // One budget for this request's whole evaluation: the paths it
+            // compares, the content bytes it loads and the time it may spend
+            // are charged to it, so the cost of a merge question is bounded
+            // whatever the two snapshots hold.
+            let mut budget = crate::state::merge::MergeBudget::for_one_request();
+            crate::state::merge::evaluate(
+                repository,
+                source,
+                destination,
+                &conflict_detail_level,
+                &conflict_resolution_strategy,
+                &mut budget,
+            )
+        })
+        .map_err(|problem| match problem {
+            // No merge base at all: the two tips share no commit, so there is no
+            // common ancestor to evaluate either tip's changes against and no
+            // merge option can be reported for them.
+            crate::state::merge::MergeProblem::NoMergeBase => {
+                GetMergeOptionsErrorModeled::TipsDivergenceExceededException(
+                    TipsDivergenceExceededException {
+                        message: Some(format!(
+                            "the divergence between {source_specifier} and {destination_specifier} is too great to determine whether there might be any merge conflicts"
+                        )),
+                    },
+                )
+            }
+            crate::state::merge::MergeProblem::ItemsToCompare => {
+                GetMergeOptionsErrorModeled::MaximumItemsToCompareExceededException(
+                    MaximumItemsToCompareExceededException {
+                        message: Some(format!(
+                            "comparing {source_specifier} and {destination_specifier} exceeds the \
+                             {} items this emulator compares against the merge base at once",
+                            crate::state::merge::MAX_ITEMS_TO_COMPARE_PER_REQUEST
+                        )),
+                    },
+                )
+            }
+            crate::state::merge::MergeProblem::Deadline => {
+                GetMergeOptionsErrorModeled::MaximumItemsToCompareExceededException(
+                    MaximumItemsToCompareExceededException {
+                        message: Some(format!(
+                            "comparing {source_specifier} and {destination_specifier} took longer \
+                             than the {} seconds this emulator spends comparing two commits",
+                            crate::state::merge::MAX_MERGE_SECONDS
+                        )),
+                    },
+                )
+            }
+            crate::state::merge::MergeProblem::ContentToLoad => {
+                GetMergeOptionsErrorModeled::MaximumFileContentToLoadExceededException(
+                    MaximumFileContentToLoadExceededException {
+                        message: Some(format!(
+                            "comparing {source_specifier} and {destination_specifier} line by line \
+                             exceeds the {} bytes of file content this emulator loads at once",
+                            crate::state::merge::MAX_CONTENT_BYTES_PER_REQUEST
+                        )),
+                    },
+                )
+            }
+        })?;
+
+        Ok(GetMergeOptionsOutput {
+            merge_options: evaluation.merge_options(),
+            source_commit_id: evaluation.source_commit_id,
+            destination_commit_id: evaluation.destination_commit_id,
+            base_commit_id: evaluation.base_commit_id,
+        })
     }
 }

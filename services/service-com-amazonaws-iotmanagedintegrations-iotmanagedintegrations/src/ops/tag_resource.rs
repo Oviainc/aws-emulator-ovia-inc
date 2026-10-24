@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the tags a request names to the resource its `ResourceArn` addresses: the pairs
+//! are ASSIGNED onto the resource's one tag map — a key the request names is added or
+//! overwritten, every other key keeps the value it had — and nothing else about the
+//! resource changes. The ARN is resolved through the region the request was signed for
+//! ([`crate::state::ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::tags_of_mut`]),
+//! so one ARN names at most one resource and an ARN this account's region holds nothing
+//! under is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -66,6 +65,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource does not exist.
 //! * `ThrottlingException` (HTTP 429) — The rate exceeds the limit.
 //! * `UnauthorizedException` (HTTP 401) — You are not authorized to perform this operation.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   this operation's own error list omits the shape, which the SERVICE models, so an
+//!   unreachable store has a modelled failure to answer with.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -81,10 +83,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotmanagedintegrations-
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotmanagedintegrations#TagResource")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// (and most of its operations declare it) though this operation's own error list omits it,
+// so an unreachable store has a MODELLED failure to answer with instead of a 501, which
+// means "not written yet".
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotmanagedintegrations#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
@@ -142,18 +152,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the resource store is unavailable".to_string()),
+            })
+        })?;
+
+        // Every resource of this service is regional, so the ARN is resolved through the
+        // region the request was signed for: an ARN another region minted names nothing
+        // here, exactly as an identifier of another region does.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let tags = store
+            .tags_of_mut(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::tagged_resource_not_found(&input.resource_arn),
+                )
+            })?;
+
+        // The MERGED map is what the resource would carry, so it is what the
+        // tags-per-resource bound applies to — a key the request re-states does not grow
+        // it. Checked before the first insert, so a refused call stores no pair at all.
+        let merged = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if merged > crate::state::MAX_RESOURCE_TAGS {
+            return Err(TagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::too_many_tags_message(merged)),
+                },
+            )
+            .into());
+        }
+
+        // Tags are ASSIGNED, not replaced: a key the request names is added or
+        // overwritten in place, and every other key the resource carries is left alone.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -2871,8 +2871,29 @@ pub fn not_found(message: impl Into<String>) -> NotFoundException {
 
 /// A `ConflictException` for a create whose resource already exists.
 /// `Code` is [`CODE_RESOURCE_ALREADY_EXIST`].
+///
+/// Only a create whose OWN modelled error set carries the conflict shape refuses a
+/// duplicate with this; one whose error set does not takes
+/// [`already_exists_bad_request`] instead.
 pub fn already_exists(message: impl Into<String>) -> ConflictException {
     ConflictException {
+        code: CODE_RESOURCE_ALREADY_EXIST.to_string(),
+        message: message.into(),
+    }
+}
+
+/// A `BadRequestException` for a create whose resource already exists, for an
+/// operation the model gives no conflict shape to: `BadRequestException` is then the
+/// client-refusal class its error set does carry, so that is the class the duplicate
+/// is refused with.
+///
+/// `Code` is [`CODE_RESOURCE_ALREADY_EXIST`], exactly as in [`already_exists`]: the
+/// CONDITION is the same one either way — the resource already exists — and `Code`
+/// names the condition, not the shape (see the note above). So a client branching on
+/// the error code reads one code for a duplicate create whichever resource it was
+/// creating, while the shape and its status follow what the operation models.
+pub fn already_exists_bad_request(message: impl Into<String>) -> BadRequestException {
+    BadRequestException {
         code: CODE_RESOURCE_ALREADY_EXIST.to_string(),
         message: message.into(),
     }
@@ -2994,10 +3015,21 @@ pub fn schema_not_found(schema: &str) -> NotFoundException {
     not_found(format!("Schema with name {schema} does not exist."))
 }
 
+/// The sentence a duplicate create is refused with, for any resource kind: the
+/// service's own template, built from the name the request sent and naming the kind
+/// of resource that name is taken for. One template here, so no two creates can
+/// drift apart on the wording.
+fn already_exists_sentence(resource: &str, name: &str) -> String {
+    format!("{resource} with name {name} already exists.")
+}
+
 /// Refuse a `CreateRegistry` for a name the store already holds. The template is
 /// AWS's own, built from the request's `RegistryName`.
+///
+/// `CreateRegistry` models `ConflictException` (409), so that is the class its
+/// duplicate is refused with.
 pub fn registry_already_exists(registry: &str) -> ConflictException {
-    already_exists(format!("Registry with name {registry} already exists."))
+    already_exists(already_exists_sentence("Registry", registry))
 }
 
 /// Message for a discoverer this store does not hold, named by the request's
@@ -3054,8 +3086,13 @@ pub fn is_arn(candidate: &str) -> bool {
 /// Refuse a `CreateSchema` for a name its registry already holds. The template is
 /// AWS's own, built from the request's `SchemaName` — and from that member ALONE:
 /// AWS keeps the registry out of this sentence.
-pub fn schema_already_exists(schema: &str) -> ConflictException {
-    already_exists(format!("Schema with name {schema} already exists."))
+///
+/// `CreateSchema`'s modelled error set carries no conflict shape — the service
+/// declares one on `CreateRegistry` and not here — so the refusal is the 400
+/// `BadRequestException` that set does carry, with the already-exists condition code
+/// unchanged. See [`already_exists_bad_request`].
+pub fn schema_already_exists(schema: &str) -> BadRequestException {
+    already_exists_bad_request(already_exists_sentence("Schema", schema))
 }
 
 /// Refuse a `DeleteRegistry` that would take a registry's schemas with it. Names no

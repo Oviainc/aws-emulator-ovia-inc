@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeployment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDeploymentErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let created_at = crate::state::now_millis();
+
+        // `fileMap` is "an optional file map that contains the file name as the key
+        // and the file content md5 hash as the value", and a per-file upload URL is
+        // generated for each file it names: a request that names NO file — whether by
+        // omitting the member or by sending it empty — names nothing to generate a URL
+        // per, so it is the "otherwise" branch of the same sentence and gets the
+        // single upload of the zipped deployment.
+        let declared: ::std::collections::BTreeMap<String, String> =
+            input.file_map.unwrap_or_default().into_iter().collect();
+
+        let mut store = state.lock();
+
+        // The reservation is refused BEFORE anything is minted or stored, so a refused
+        // call leaves the store exactly as it was.
+        let job_id = {
+            let branch = branch_of(&mut store, &input.app_id, &input.branch_name)?;
+            // The reservations the clock has already let expire are dropped first:
+            // that is owed whether or not anybody called, and a reservation that can
+            // no longer be started must not hold a branch at its cap.
+            branch.expire_deployments();
+            if branch.deployments.len() >= crate::state::MAX_PENDING_DEPLOYMENTS_PER_BRANCH {
+                return Err(CreateDeploymentErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Number of pending deployments exceeds the limit of {} for branch {}",
+                            crate::state::MAX_PENDING_DEPLOYMENTS_PER_BRANCH,
+                            input.branch_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The id the caller "will supply to start deployment api": it is spent on
+            // this reservation, so no job started on this branch afterwards is handed
+            // it, and no job exists under it until that start call.
+            branch.reserve_job_id()
+        };
+
+        // One destination per file the request named, or one for the zipped
+        // deployment; each carries its own token, so no two uploads share a URL.
+        let files: ::std::collections::BTreeMap<String, crate::state::DeploymentFile> = declared
+            .into_iter()
+            .map(|(file_name, content_md5)| {
+                let token = store.mint_upload_token();
+                (
+                    file_name,
+                    crate::state::DeploymentFile {
+                        content_md5,
+                        upload_url: upload_url(&region, &input.app_id, &job_id, &token),
+                    },
+                )
+            })
+            .collect();
+        let zip_upload_url = if files.is_empty() {
+            let token = store.mint_upload_token();
+            upload_url(&region, &input.app_id, &job_id, &token)
+        } else {
+            // `zipUploadUrl` is returned "when the fileMap argument is not provided in
+            // the request", and this request provided one, so there is no single
+            // upload of a zipped deployment to point at. The member is @required with
+            // a `length` minimum of 0 (`smithy_query(query="shape",shape="UploadUrl")`),
+            // so the empty value is how "not returned" is expressed on the wire.
+            String::new()
+        };
+
+        let pending = crate::state::PendingDeployment {
+            job_id,
+            files,
+            zip_upload_url,
+            created_at,
+            // The window this deployment has to be started in; see
+            // `crate::state::DEPLOYMENT_WINDOW_MILLIS`.
+            expires_at: created_at.saturating_add(crate::state::DEPLOYMENT_WINDOW_MILLIS),
+        };
+
+        // Persisted on the branch, because the call that STARTS this deployment is a
+        // later one that knows only the job id handed back here.
+        branch_of(&mut store, &input.app_id, &input.branch_name)?
+            .deployments
+            .insert(pending.job_id.clone(), pending.clone());
+
+        Ok(CreateDeploymentOutput {
+            // The id of the job this deployment runs under once it is started, which
+            // is what `StartDeployment` is called with.
+            job_id: Some(pending.job_id),
+            // "When the fileMap argument is provided in the request, fileUploadUrls
+            // will contain a map of file names to upload URLs" — the same file names
+            // the request named, each with the destination minted for it.
+            file_upload_urls: pending
+                .files
+                .iter()
+                .map(|(file_name, file)| (file_name.clone(), file.upload_url.clone()))
+                .collect(),
+            zip_upload_url: pending.zip_upload_url,
+        })
     }
+}
+
+/// The branch `branch_name` of the app `app_id`, as the one entity a reservation is
+/// made on.
+///
+/// A deployment is reserved ON a branch of an app
+/// (`POST /apps/{appId}/branches/{branchName}/deployments`), so neither an unknown app
+/// nor a branch that app does not carry is created on the way. `NotFoundException` is
+/// NOT among this operation's modelled errors
+/// (`smithy_query(query="operation",operation="CreateDeployment")` lists
+/// `BadRequestException`, `InternalFailureException`, `LimitExceededException` and
+/// `UnauthorizedException`), so an identifier that names nothing is refused with the
+/// modelled 400 — the refusal a client of THIS operation can branch on — and the
+/// message names the entity and the identifier the request used for it, as every other
+/// refusal in this crate words it.
+fn branch_of<'store>(
+    store: &'store mut crate::state::ComAmazonawsAmplifyAmplifyState,
+    app_id: &str,
+    branch_name: &str,
+) -> Result<&'store mut crate::state::AmplifyBranch, CreateDeploymentErrorModeled> {
+    fn absent(entity: &str, identifier: &str) -> CreateDeploymentErrorModeled {
+        CreateDeploymentErrorModeled::BadRequestException(BadRequestException {
+            message: Some(crate::state::not_found_message(entity, identifier)),
+        })
+    }
+
+    store
+        .apps
+        .get_mut(app_id)
+        .ok_or_else(|| absent(crate::state::APP_ENTITY, app_id))?
+        .branches
+        .get_mut(branch_name)
+        .ok_or_else(|| absent(crate::state::BRANCH_ENTITY, branch_name))
+}
+
+/// Where ONE upload of a reserved deployment goes.
+///
+/// A deployment's content is uploaded to the Amplify deployment bucket of the
+/// request's region, under the reservation's own prefix (`{appId}/{jobId}`) and the
+/// `token` minted for that one upload — so an app id and a job id, which the caller
+/// already knows, are not by themselves enough to write to a deployment.
+///
+/// The file name is NOT part of the URL: which upload a token stands for is recorded
+/// on the reservation (`crate::state::PendingDeployment::files`), which keeps every
+/// URL returned inside `UploadUrl`'s modelled `length 0..1000`
+/// (`smithy_query(query="shape",shape="UploadUrl")`) whatever a request named its
+/// files — a `FileName` is itself modelled up to 255 characters.
+fn upload_url(region: &str, app_id: &str, job_id: &str, token: &str) -> String {
+    format!(
+        "https://aws-amplify-{region}-deployment.s3.{region}.amazonaws.com\
+         /{app_id}/{job_id}/{token}"
+    )
 }

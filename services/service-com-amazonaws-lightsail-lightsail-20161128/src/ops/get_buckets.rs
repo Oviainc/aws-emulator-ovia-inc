@@ -204,11 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A named bucket is one record or a refusal: the caller asked about a
             // bucket, so an answer with an empty list would say it exists.
             if let Some(name) = &input.bucket_name {
-                let bucket = store.bucket(&region, name).ok_or_else(|| {
-                    not_found(format!(
-                        "bucketName '{name}' does not name a bucket of this account in {region}"
-                    ))
-                })?;
+                let bucket = store
+                    .bucket(&region, name)
+                    .ok_or_else(|| not_found(name))?;
                 return Ok(GetBucketsOutput {
                     buckets: Some(vec![bucket.view(
                         endpoint.as_deref(),
@@ -264,15 +262,11 @@ fn invalid(message: String) -> GetBucketsError {
     .into()
 }
 
-/// This operation's 404 for a bucket name this account holds no bucket under: the
-/// modelled `NotFoundException`, which the model documents as what "Lightsail
-/// throws when it cannot find a resource".
-fn not_found(message: String) -> GetBucketsError {
-    GetBucketsErrorModeled::NotFoundException(NotFoundException {
-        message: Some(message),
-        ..Default::default()
-    })
-    .into()
+/// No bucket of that name is stored in this Region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> GetBucketsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_BUCKET, name)
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

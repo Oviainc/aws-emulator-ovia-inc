@@ -288,11 +288,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if managed_login_version == crate::state::MANAGED_LOGIN_BRANDING
             && pool.user_pool_tier == crate::state::LITE_USER_POOL_TIER
         {
-            return Err(feature_unavailable_in_tier(format!(
-                "Managed login branding version {} is not included in the {} feature plan.",
-                crate::state::MANAGED_LOGIN_BRANDING,
-                crate::state::LITE_USER_POOL_TIER
-            )));
+            return Err(feature_unavailable_in_tier(
+                crate::state::feature_unavailable_in_tier_message(
+                    &pool.user_pool_tier,
+                    &crate::state::managed_login_feature_name(
+                        crate::state::MANAGED_LOGIN_BRANDING,
+                    ),
+                ),
+            ));
         }
 
         // `UserPoolType.Domain` and `UserPoolType.CustomDomain` are single

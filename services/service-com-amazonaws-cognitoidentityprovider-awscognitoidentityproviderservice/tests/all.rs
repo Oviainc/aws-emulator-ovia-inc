@@ -17,6 +17,8 @@ mod admin_group_listing;
 mod admin_user_pool_lifecycle;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
+#[path = "all/error_message_wording.rs"]
+mod error_message_wording;
 #[path = "all/group_lifecycle.rs"]
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]

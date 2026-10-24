@@ -159,7 +159,7 @@ pub(crate) fn sqli_statement() -> Value {
 }
 
 /// An `XssMatchStatement` over the query string.
-fn xss_statement() -> Value {
+pub(crate) fn xss_statement() -> Value {
     json!({
         "XssMatchStatement": {
             "FieldToMatch": { "QueryString": {} },
@@ -1035,7 +1035,7 @@ async fn ids_and_lock_tokens_are_fresh_and_modelled() {
 
 /// A statement nesting `depth` levels deep: `depth - 1` `NotStatement`s wrapped
 /// around `innermost`.
-fn nested_statement(depth: u32, innermost: Value) -> Value {
+pub(crate) fn nested_statement(depth: u32, innermost: Value) -> Value {
     let mut statement = innermost;
     for _ in 1..depth {
         statement = json!({ "NotStatement": { "Statement": statement } });

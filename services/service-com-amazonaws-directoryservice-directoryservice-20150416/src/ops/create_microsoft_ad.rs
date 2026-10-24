@@ -303,6 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_authentication_settings: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
+            // No conditional forwarder until `CreateConditionalForwarder` points the
+            // directory at a remote domain's DNS servers.
+            conditional_forwarders: ::std::collections::BTreeMap::new(),
             // No computer account until `CreateComputer` creates one; the RID pool starts
             // where Active Directory starts handing them out.
             computers: ::std::collections::BTreeMap::new(),

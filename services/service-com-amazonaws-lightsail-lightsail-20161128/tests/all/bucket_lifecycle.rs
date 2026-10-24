@@ -562,9 +562,14 @@ async fn every_published_bundle_is_accepted_and_an_unpublished_one_is_refused() 
             .call_in(None, "GetBuckets", json!({"bucketName": name}))
             .await;
         assert_eq!(
-            missing_status, 404,
+            missing_status, 400,
             "case bundleId {unpublished:?}: a refused create must store nothing, got \
              {missing_status} {missing:?}"
+        );
+        assert_eq!(
+            missing["code"].as_str(),
+            Some("DoesNotExist"),
+            "case bundleId {unpublished:?}: expected the body code DoesNotExist, got {missing:?}"
         );
     }
 
@@ -667,8 +672,9 @@ async fn a_taken_name_is_refused_in_every_region() {
 }
 
 /// What `GetBuckets` is asked for is what it answers: a name that names nothing
-/// is a 404, the two include flags select the members they document, and
-/// `includeCors` outside the single-bucket form it documents is refused.
+/// is the service's `DoesNotExist` refusal, the two include flags select the
+/// members they document, and `includeCors` outside the single-bucket form it
+/// documents is refused.
 #[tokio::test]
 async fn get_buckets_answers_what_the_request_selects() {
     let emulator = Emulator::new();
@@ -679,19 +685,26 @@ async fn get_buckets_answers_what_the_request_selects() {
     )
     .await;
 
-    // A name that names nothing is a 404, whatever shape it has.
+    // A name that names nothing is the service's `DoesNotExist` envelope — HTTP
+    // 400, wire error `NotFoundException`, body `code` `DoesNotExist` — whatever
+    // shape the name has. `bucket_error_envelope.rs` is the table for that rule.
     for absent in ["never-created", "selected-bucket-2", "abc"] {
         let (status, missing) = emulator
             .call_in(None, "GetBuckets", json!({"bucketName": absent}))
             .await;
         assert_eq!(
-            status, 404,
-            "case bucketName {absent:?}: expected a 404, got {status} {missing:?}"
+            status, 400,
+            "case bucketName {absent:?}: expected a 400, got {status} {missing:?}"
         );
         assert_eq!(
             error_code(&missing),
             "NotFoundException",
             "case bucketName {absent:?}: expected NotFoundException, got {missing:?}"
+        );
+        assert_eq!(
+            missing["code"].as_str(),
+            Some("DoesNotExist"),
+            "case bucketName {absent:?}: expected the body code DoesNotExist, got {missing:?}"
         );
     }
 
@@ -868,8 +881,13 @@ async fn the_pre_write_bounds_accept_the_bound_and_refuse_past_it_without_persis
         )
         .await;
     assert_eq!(
-        missing_status, 404,
+        missing_status, 400,
         "case {over} tags: a refused create must store nothing, got {missing_status} {missing:?}"
+    );
+    assert_eq!(
+        missing["code"].as_str(),
+        Some("DoesNotExist"),
+        "case {over} tags: expected the body code DoesNotExist, got {missing:?}"
     );
 
     // Fill the store to its bound (the tagged bucket above is the first of them),

@@ -29,6 +29,8 @@ mod reserved_tag_keys;
 mod resource_arn_classification;
 #[path = "all/resource_arn_validation.rs"]
 mod resource_arn_validation;
+#[path = "all/response_request_id.rs"]
+mod response_request_id;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

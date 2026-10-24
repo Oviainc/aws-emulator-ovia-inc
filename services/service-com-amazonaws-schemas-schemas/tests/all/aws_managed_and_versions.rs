@@ -166,7 +166,9 @@ async fn deleting_a_registry_that_still_holds_a_schema_is_refused() {
 }
 
 /// RULE: a refused duplicate create answers the sentence AWS builds from the name the
-/// request sent — the registry's for a registry, the schema's ALONE for a schema.
+/// request sent — the registry's for a registry, the schema's ALONE for a schema —
+/// in the error class the operation itself models (a conflict where its error set
+/// declares one, its 400 client error where it does not).
 #[tokio::test]
 async fn a_duplicate_create_answers_the_name_it_was_sent() {
     // Rows: names differing in shape, length and alphabet; the message template is
@@ -213,14 +215,14 @@ async fn a_duplicate_create_answers_the_name_it_was_sent() {
             .call("POST", &schema_uri(name, name), Some(schema_body("other")))
             .await;
         assert_eq!(
-            recreated.status, 409,
-            "case {name:?}: expected 409, got {} {:?}",
+            recreated.status, 400,
+            "case {name:?}: expected 400, got {} {:?}",
             recreated.status, recreated.body
         );
         assert_eq!(
             recreated.error_code(),
-            "ConflictException",
-            "case {name:?}: expected ConflictException, got {:?}",
+            "BadRequestException",
+            "case {name:?}: expected BadRequestException, got {:?}",
             recreated.body
         );
         assert_eq!(

@@ -193,7 +193,11 @@ impl Emulator {
             200 => body["buckets"]
                 .as_array()
                 .is_some_and(|buckets| !buckets.is_empty()),
-            404 => false,
+            // The service's not-found refusal: Lightsail answers HTTP 400 with the
+            // body's `code` set to `DoesNotExist`. 400 is also the status of a
+            // constraint refusal, so the `code` is what tells them apart — anything
+            // else at 400 is a failure of the call, not an absent bucket.
+            400 if body["code"].as_str() == Some("DoesNotExist") => false,
             other => panic!("GetBuckets for {name:?} answered {other}: {body:?}"),
         }
     }
@@ -813,8 +817,8 @@ async fn delete_bucket_refuses_what_a_force_delete_is_required_for() {
     }
 }
 
-/// A delete that names no bucket of this account is the modelled 404, and it deletes
-/// nothing — whatever `forceDelete` says.
+/// A delete that names no bucket of this account is the service's `DoesNotExist`
+/// refusal, and it deletes nothing — whatever `forceDelete` says.
 #[tokio::test]
 async fn deleting_a_bucket_that_does_not_exist_is_a_not_found() {
     let emulator = Emulator::new();
@@ -837,13 +841,18 @@ async fn deleting_a_bucket_that_does_not_exist_is_a_not_found() {
         }
         let (status, body) = emulator.lightsail("DeleteBucket", request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
         );
         assert_eq!(
             error_code(&body),
             "NotFoundException",
             "case {case:?}: expected NotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {case:?}: expected the body code DoesNotExist, got {body:?}"
         );
         assert!(
             emulator.bucket_exists("surviving-store").await,

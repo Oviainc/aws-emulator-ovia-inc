@@ -317,6 +317,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "When you add or modify the rules in a rule group, WAF enforces this limit"
+        // (`Capacity`'s doc): the rules are priced with the SAME derivation
+        // `CheckCapacity` reports ("you can check the capacity for a set of rules using
+        // CheckCapacity"), and a rule list that needs more WCUs than the group declares
+        // is refused rather than stored under a capacity it does not fit.
+        //
+        // The price is the one this service PUBLISHES through `CheckCapacity`, which is
+        // what `Capacity`'s doc tells a caller to size the limit against, so the two can
+        // never disagree: a save is accepted exactly when the capacity the caller could
+        // have checked fits. Each figure [`crate::state::web_acl_capacity`] sums comes
+        // from the WAF Developer Guide's rule-statement list, with
+        // `BYTE_MATCH_WCU`/`RATE_BASED_WCU`/`RATE_BASED_CUSTOM_KEYS_WCU` additionally
+        // pinned by recorded responses, and a statement kind that table does not price
+        // contributes nothing — so the requirement understates rather than overstates a
+        // cost it does not know, and this refusal does not invent one. NOTE for whoever
+        // re-prices that table next: its figures now decide a SAVE as well as a report,
+        // so a figure moved above the published cost of its statement kind would refuse
+        // a save WAF accepts. Re-price and re-read this refusal together.
+        let required_capacity = crate::state::web_acl_capacity(
+            input.rules.as_deref().unwrap_or_default(),
+            &state.rule_group_capacities(&input.scope),
+        );
+        if required_capacity > input.capacity {
+            crate::state::audit(
+                "CreateRuleGroup",
+                &input.scope,
+                &input.name,
+                "",
+                &format!(
+                    "WAFLimitsExceededException: the rules require {required_capacity} WCUs, \
+                     above the declared capacity {}",
+                    input.capacity
+                ),
+            );
+            return Err(CreateRuleGroupErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
         let id = crate::state::new_uuid();
         let lock_token = crate::state::new_uuid();
         let arn = crate::state::resource_arn(
@@ -332,11 +372,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "When you create your own rule group, you define this, and you cannot
             // change it after creation" (`Capacity`'s doc): the declared value is
             // stored verbatim, unlike `WebACL$Capacity`, which is derived from the
-            // rules. The rules are NOT priced against it here — the WCU table this
-            // crate carries is pinned from the Developer Guide and a few recorded
-            // responses rather than published per statement, so refusing a save on
-            // it would invent refusals WAF does not make (`CheckCapacity`, which
-            // reports that price, is its own gap issue).
+            // rules. The rules are priced against it above, where "WAF enforces
+            // this limit" refuses a rule list that does not fit, but the stored
+            // `Capacity` is the one the request declared, not the cost of the rules.
             capacity: input.capacity,
             arn: arn.clone(),
             description: input.description.clone(),

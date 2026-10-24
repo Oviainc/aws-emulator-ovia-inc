@@ -270,6 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `RegisterEventTopic` is what associates an Amazon SNS topic with the
             // directory; a fresh directory publishes to none.
             event_topics: ::std::collections::BTreeMap::new(),
+            // `CreateConditionalForwarder` is what points the directory at a remote
+            // domain's DNS servers; a fresh directory forwards to none.
+            conditional_forwarders: ::std::collections::BTreeMap::new(),
             // `CreateComputer` is what creates a computer account in the directory; a
             // fresh directory holds none, and its RID pool starts where Active Directory
             // starts handing them out.

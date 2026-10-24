@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let held = crate::state::with_state(&*self.engine, |store| {
             let bucket = store
                 .bucket(&region, &input.bucket_name)
-                .ok_or_else(|| not_found(&region, &input.bucket_name))?;
+                .ok_or_else(|| not_found(&input.bucket_name))?;
             Ok::<_, DeleteBucketError>(HeldBucket {
                 access_keys: bucket.access_keys.len(),
                 resources_receiving_access: bucket.resources_receiving_access.len(),
@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // never named one.
             let bucket = store
                 .remove_bucket(&region, &input.bucket_name)
-                .ok_or_else(|| not_found(&region, &input.bucket_name))?;
+                .ok_or_else(|| not_found(&input.bucket_name))?;
             let access_key_ids: Vec<String> = bucket
                 .access_keys
                 .iter()
@@ -358,17 +358,14 @@ fn invalid(message: String) -> DeleteBucketError {
     .into()
 }
 
-/// This operation's 404 for a bucket name this account holds no bucket under in this
-/// region: the modelled `NotFoundException`, which the model documents as what "Lightsail
-/// throws when it cannot find a resource".
-fn not_found(region: &str, bucket_name: &str) -> DeleteBucketError {
-    DeleteBucketErrorModeled::NotFoundException(NotFoundException {
-        message: Some(format!(
-            "bucketName '{bucket_name}' does not name a bucket of this account in {region}"
-        )),
-        ..Default::default()
-    })
-    .into()
+/// No bucket of that name is stored in this Region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(bucket_name: &str) -> DeleteBucketError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_BUCKET,
+        bucket_name,
+    )
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A modelled

@@ -3,8 +3,11 @@
 //! @op GetContactInformation
 //!
 //! Reports the primary contact information the store holds for the resolved
-//! account, with the verification status of that contact's phone number. A
-//! REPORTING operation (`@readonly`): it never writes the store.
+//! account, with the verification status of that contact's phone number. Every
+//! account record carries a complete primary contact from the moment it exists
+//! (`crate::state::initial_contact_information`), so this read reports one
+//! whether or not a `PutContactInformation` has replaced it. A REPORTING
+//! operation (`@readonly`): it never writes the store.
 //!
 //! ## Shape of an operation
 //!
@@ -186,14 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let Some(contact_information) = account.contact_information.clone() else {
-            // The account exists but no `PutContactInformation` has stored its
-            // primary contact: the resource this call names can't be found.
-            return Err(GetContactInformationErrorModeled::ResourceNotFoundException(
-                crate::state::contact_information_not_set(&account_id),
-            )
-            .into());
-        };
+        let contact_information = account.contact_information.clone();
 
         Ok(GetContactInformationOutput {
             contact_information: Some(contact_information),

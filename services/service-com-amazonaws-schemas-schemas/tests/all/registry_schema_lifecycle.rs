@@ -473,10 +473,12 @@ async fn arns_name_the_region_the_request_was_signed_for() {
     }
 }
 
-/// RULE: creating a resource under a name that already exists is refused as a
-/// conflict (409) and leaves the stored resource untouched.
+/// RULE: creating a resource under a name that already exists is refused — in the
+/// error class that operation models (409 `ConflictException` for a registry, the 400
+/// `BadRequestException` for a schema, whose error set declares no conflict shape) —
+/// and leaves the stored resource untouched.
 #[tokio::test]
-async fn creating_an_existing_name_is_a_conflict() {
+async fn creating_an_existing_name_is_refused() {
     let emulator = Emulator::new();
     let registry = "dup-registry";
 
@@ -533,8 +535,8 @@ async fn creating_an_existing_name_is_a_conflict() {
         )
         .await;
     assert_eq!(
-        recreated.status, 409,
-        "case schema-again: expected 409, got {} {:?}",
+        recreated.status, 400,
+        "case schema-again: expected 400, got {} {:?}",
         recreated.status, recreated.body
     );
     let described = emulator.call("GET", &schema, None).await;

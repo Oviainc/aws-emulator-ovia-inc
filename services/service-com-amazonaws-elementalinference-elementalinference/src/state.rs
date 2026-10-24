@@ -248,6 +248,51 @@ pub fn dictionary_referenced_message(feed_count: usize) -> String {
 /// members, so the recorded refusal names the members and not the dates they carried.
 pub const END_DATE_BEFORE_START_DATE_MESSAGE: &str = "endDate must not be earlier than startDate.";
 
+/// The first name `names` yields twice, if any.
+///
+/// An output's `name` IDENTIFIES it within its feed: it is how `AssociateFeed` decides
+/// that an appended output would collide with one the feed holds, and how a caller
+/// reading a feed tells one output from another. So a request that lists one name twice
+/// describes a feed in which an output is not addressable at all, and every operation
+/// that supplies a feed's output list goes through this one scan — `CreateFeed` and
+/// `UpdateFeed`, which REPLACE the list, and `AssociateFeed`, which appends to it — so
+/// none of them can disagree about what a feed's outputs may look like.
+pub fn first_duplicate_output_name<'a>(
+    mut names: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let mut seen = std::collections::BTreeSet::new();
+    names.find(|name| !seen.insert(*name))
+}
+
+/// A request that lists more than one output under `name`: the rule is about ONE value's
+/// own validity (the name that is not unique), so the message names the value the
+/// REQUEST supplied, and the same sentence answers whichever operation carried the list.
+pub fn duplicate_output_name_message(name: &str) -> String {
+    format!(
+        "The request lists more than one output named {name}. \
+         Output names must be unique within a feed."
+    )
+}
+
+/// An `UpdateFeed` output whose `fromAssociation` disagrees with the value the service
+/// holds for the output of that name.
+///
+/// `UpdateOutput$fromAssociation` is set by the service — true for an output
+/// `AssociateFeed` appended, false for one a create or an update introduced — and the
+/// member exists so a caller can echo the value it read back; the request may not change
+/// it. The violated rule is about ONE value's own validity, so the message names the
+/// value the request supplied and the member it sat on, with the list position (1-based,
+/// as a validation message indexes a list) rather than the stored value, which is not
+/// the request's to know from the refusal.
+pub fn from_association_not_changeable_message(position: usize, supplied: bool) -> String {
+    format!(
+        "1 validation error detected: Value '{supplied}' at \
+         'outputs.{position}.member.fromAssociation' failed to satisfy constraint: Member is \
+         set by Elemental Inference and must not be changed. Use GetFeed to read its current \
+         value."
+    )
+}
+
 /// The `OutputStatus` value a disabled output reports — one of the two values that
 /// enum admits (`OUTPUT_STATUS_VALUES`: `DISABLED`, `ENABLED`).
 pub const OUTPUT_STATUS_DISABLED: &str = "DISABLED";
@@ -257,11 +302,29 @@ pub const OUTPUT_STATUS_DISABLED: &str = "DISABLED";
 /// `AssociateFeed` APPENDS outputs ("New outputs will be appended"), so without a
 /// bound a caller could grow one feed's record by another output on every call. AWS
 /// does not publish the figure, so this one is the emulator's own: it is the BOUND on
-/// a feed's output list, and past it `AssociateFeed` refuses with the modelled
+/// a feed's output list, and past it a request refuses with the modelled
 /// `ServiceQuotaExceededException` (HTTP 402) — the answer the real service gives
-/// when a request would exceed a service quota. `CreateFeed` and `UpdateFeed` need no
-/// such bound: each one REPLACES the list, so one request's size bounds it.
+/// when a request would exceed a service quota.
+///
+/// It binds EVERY operation that sets a feed's output list, not only the append:
+/// `CreateFeed` and `UpdateFeed` each REPLACE the list, so one request of theirs would
+/// otherwise put a stored feed arbitrarily far past the bound in a single call. Holding
+/// it on all three is what makes the stored list short — and the stored list is what a
+/// later call reads, compares against and reports, so the bound on it bounds that work
+/// too.
 pub const MAX_OUTPUTS_PER_FEED: usize = 20;
+
+/// A request whose output list is longer than [`MAX_OUTPUTS_PER_FEED`], for the
+/// operations that SET the list (`CreateFeed`, `UpdateFeed`).
+///
+/// The quota is the rule, so the message states the quota and nothing about the request
+/// or the stored feed — exactly as the append's own refusal does.
+pub fn too_many_outputs_message() -> String {
+    format!(
+        "A feed holds at most {MAX_OUTPUTS_PER_FEED} outputs. Specify fewer outputs or \
+         request a quota increase."
+    )
+}
 
 /// The `DictionaryStatus` values this slice of the service produces.
 ///
