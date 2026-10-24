@@ -181,39 +181,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_secs();
         let mut store = state.lock();
+        // Every composite-alarm evaluation the clock has already made due is materialised
+        // first, so this write lands on the states the store owes rather than on stale ones.
+        store.evaluate_composite_alarms(now);
 
-        let Some(stored) = store.alarms.get_mut(&input.alarm_name) else {
+        // The alarm named is either a metric alarm or a composite alarm. Both carry the same
+        // three state members and record the same kind of history item; what differs is the
+        // item's `AlarmType` and, for a composite alarm, that the forced state suspends the
+        // rule evaluation that would otherwise own the alarm's state.
+        let transition = if let Some(stored) = store.alarms.get_mut(&input.alarm_name) {
+            // The state this call moves the alarm OUT of: a history item reports a
+            // transition, so the state before the write is as much a part of the record as
+            // the state after it.
+            let previous = crate::state::AlarmStateSnapshot::of_metric_alarm(&stored.alarm);
+            // `StateTransitionedTimestamp` is "the time stamp of the last change to the
+            // alarm's StateValue", so it only moves when the state value itself changes; the
+            // state update itself always refreshes `StateUpdatedTimestamp`.
+            let changed = stored.alarm.state_value.as_deref() != Some(input.state_value.as_str());
+            stored.alarm.state_value = Some(input.state_value.clone());
+            stored.alarm.state_reason = Some(input.state_reason.clone());
+            stored.alarm.state_reason_data = input.state_reason_data.clone();
+            stored.alarm.state_updated_timestamp = Some(crate::state::to_timestamp(now));
+            if changed {
+                stored.alarm.state_transitioned_timestamp = Some(crate::state::to_timestamp(now));
+            }
+            let updated = crate::state::AlarmStateSnapshot::of_metric_alarm(&stored.alarm);
+            Some((crate::state::ALARM_TYPE_METRIC, previous, updated))
+        } else {
+            // "If you use SetAlarmState on a composite alarm, the composite alarm is not
+            // guaranteed to return to its actual state. It returns to its actual state only
+            // once any of its children alarms change state." — so the forced state is stored
+            // together with the children's states as they stand now, and the evaluation
+            // takes the alarm back over as soon as that snapshot no longer holds.
+            let snapshot = store
+                .composite_alarms
+                .get(&input.alarm_name)
+                .map(|stored| store.child_states(&stored.rule))
+                .unwrap_or_default();
+            if let Some(stored) = store.composite_alarms.get_mut(&input.alarm_name) {
+                let previous =
+                    crate::state::AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
+                let changed =
+                    stored.alarm.state_value.as_deref() != Some(input.state_value.as_str());
+                stored.alarm.state_value = Some(input.state_value.clone());
+                stored.alarm.state_reason = Some(input.state_reason.clone());
+                stored.alarm.state_reason_data = input.state_reason_data.clone();
+                stored.alarm.state_updated_timestamp = Some(crate::state::to_timestamp(now));
+                if changed {
+                    stored.alarm.state_transitioned_timestamp =
+                        Some(crate::state::to_timestamp(now));
+                }
+                stored.forced_child_states = Some(snapshot);
+                let updated = crate::state::AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
+                Some((crate::state::ALARM_TYPE_COMPOSITE, previous, updated))
+            } else {
+                None
+            }
+        };
+
+        let Some((alarm_type, previous, updated)) = transition else {
             return Err(SetAlarmStateErrorModeled::ResourceNotFound(ResourceNotFound {
                 message: Some(format!("alarm {} does not exist", input.alarm_name)),
             })
             .into());
         };
 
-        // The state this call moves the alarm OUT of: a history item reports a transition, so
-        // the state before the write is as much a part of the record as the state after it.
-        let previous = stored.alarm.clone();
-
-        // `StateTransitionedTimestamp` is "the time stamp of the last change to the alarm's
-        // StateValue", so it only moves when the state value itself changes; the state
-        // update itself always refreshes `StateUpdatedTimestamp`.
-        let changed = stored.alarm.state_value.as_deref() != Some(input.state_value.as_str());
-        stored.alarm.state_value = Some(input.state_value.clone());
-        stored.alarm.state_reason = Some(input.state_reason.clone());
-        stored.alarm.state_reason_data = input.state_reason_data.clone();
-        stored.alarm.state_updated_timestamp = Some(crate::state::to_timestamp(now));
-        if changed {
-            stored.alarm.state_transitioned_timestamp = Some(crate::state::to_timestamp(now));
-        }
-
-        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — for a
-        // state update, the alarm's state before and after this write, read off the stored
-        // alarm rather than off the request.
-        let history_data = crate::state::state_update_history_data(&previous, &stored.alarm);
-        // "A summary of the alarm history, in text format." (`AlarmHistoryItem$HistorySummary`)
-        // — which state the alarm moved from and which it moved to.
+        // "A summary of the alarm history, in text format."
+        // (`AlarmHistoryItem$HistorySummary`) — which state the alarm moved from and which
+        // it moved to.
         let history_summary = format!(
             "Alarm updated from {} to {}",
-            previous.state_value.as_deref().unwrap_or("INSUFFICIENT_DATA"),
+            previous
+                .state_value
+                .as_deref()
+                .unwrap_or(crate::state::ALARM_STATE_INSUFFICIENT_DATA),
             input.state_value
         );
 
@@ -223,14 +264,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             AlarmHistoryItem {
                 alarm_name: Some(input.alarm_name.clone()),
                 alarm_contributor_id: None,
-                alarm_type: Some("MetricAlarm".to_string()),
+                alarm_type: Some(alarm_type.to_string()),
                 timestamp: Some(crate::state::to_timestamp(now)),
                 history_item_type: Some("StateUpdate".to_string()),
                 history_summary: Some(history_summary),
-                history_data: Some(history_data),
+                // "Data about the alarm, in JSON format."
+                // (`AlarmHistoryItem$HistoryData`) — for a state update, the alarm's state
+                // before and after this write, read off the stored alarm rather than off the
+                // request.
+                history_data: Some(crate::state::state_transition_history_data(
+                    &previous, &updated,
+                )),
                 alarm_contributor_attributes: None,
             },
         );
+
+        // This alarm's new state is an input to every composite alarm whose rule references
+        // it, so the alarms downstream of this write are evaluated now rather than at
+        // whatever call happens to read them next.
+        store.evaluate_composite_alarms(now);
 
         Ok(SetAlarmStateOutput)
     }

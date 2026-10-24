@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCloudWatchAlarmTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCloudWatchAlarmTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCloudWatchAlarmTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: "Updates the specified cloudwatch alarm template". This call is a
+//! PARTIAL WRITE onto the stored template — every member the request supplies
+//! replaces the stored one, every member it omits keeps the value the template
+//! already holds, and `ModifiedAt` becomes the instant of the call. The response
+//! is projected from the stored record, so what this answers is what the next
+//! `GetCloudWatchAlarmTemplate` answers.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +207,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCloudWatchAlarmTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCloudWatchAlarmTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCloudWatchAlarmTemplate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The bounds the input members' target shapes carry in their names
+        // (`__stringMin1Max255PatternS` for `Name`, `__stringMin0Max1024` for
+        // `Description`, `__stringMax64` for `MetricName`). The modelled
+        // constraints are refused before this handler runs where the model
+        // declares them; these checks are what makes the bounds hold either way,
+        // and each names the member and the bound it broke. A member the request
+        // omits changes nothing, so there is nothing to check for it.
+        bounded(
+            "name",
+            input.name.as_deref(),
+            1,
+            crate::state::MAX_RESOURCE_NAME_LEN,
+        )?;
+        bounded(
+            "description",
+            input.description.as_deref(),
+            0,
+            crate::state::MAX_RESOURCE_DESCRIPTION_LEN,
+        )?;
+        bounded(
+            "metricName",
+            input.metric_name.as_deref(),
+            0,
+            crate::state::MAX_METRIC_NAME_LEN,
+        )?;
+
+        // Each of the four enum members is a CLOSED set, so a value outside its
+        // catalog names nothing the service can evaluate — the same rule the
+        // create applies, because these are the same members of the same
+        // resource. The catalogs are the model's own, generated into
+        // `super::types`.
+        for (member, values, value) in [
+            (
+                "comparisonOperator",
+                CLOUD_WATCH_ALARM_TEMPLATE_COMPARISON_OPERATOR_VALUES,
+                input.comparison_operator.as_deref(),
+            ),
+            (
+                "statistic",
+                CLOUD_WATCH_ALARM_TEMPLATE_STATISTIC_VALUES,
+                input.statistic.as_deref(),
+            ),
+            (
+                "targetResourceType",
+                CLOUD_WATCH_ALARM_TEMPLATE_TARGET_RESOURCE_TYPE_VALUES,
+                input.target_resource_type.as_deref(),
+            ),
+            (
+                "treatMissingData",
+                CLOUD_WATCH_ALARM_TEMPLATE_TREAT_MISSING_DATA_VALUES,
+                input.treat_missing_data.as_deref(),
+            ),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            if !values.contains(&value) {
+                return Err(bad_request(format!(
+                    "{member} must be one of {}, but was {value}",
+                    values.join(", ")
+                )));
+            }
+        }
+
+        // The numeric bounds the same way: `Period` is
+        // `__integerMin10Max86400`, and `EvaluationPeriods` and
+        // `DatapointsToAlarm` are both `__integerMin1`.
+        in_range(
+            "period",
+            input.period,
+            crate::state::MIN_ALARM_PERIOD_SECONDS,
+            crate::state::MAX_ALARM_PERIOD_SECONDS,
+        )?;
+        in_range(
+            "evaluationPeriods",
+            input.evaluation_periods,
+            crate::state::MIN_ALARM_DATAPOINTS,
+            i32::MAX,
+        )?;
+        in_range(
+            "datapointsToAlarm",
+            input.datapoints_to_alarm,
+            crate::state::MIN_ALARM_DATAPOINTS,
+            i32::MAX,
+        )?;
+
+        // `Threshold` is a `__double` with no modelled bound, but a value that is
+        // not a real number is no threshold to compare a statistic against.
+        if let Some(threshold) = input.threshold {
+            if !threshold.is_finite() {
+                return Err(bad_request(format!(
+                    "threshold must be a finite number, but was {threshold}"
+                )));
+            }
+        }
+
+        // A template is visible to — and updatable from — the region it was
+        // created in, which is the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+
+        // The identifier resolution, the group resolution, the name-uniqueness
+        // rule and the partial write are one step in the store, so nothing can
+        // pass one check and write past another; what is left here is turning
+        // each refusal into this operation's own modelled error.
+        let id = state
+            .update_alarm_template(
+                &region,
+                &input.identifier,
+                crate::state::CloudWatchAlarmTemplateChanges {
+                    group_identifier: input.group_identifier,
+                    name: input.name,
+                    description: input.description,
+                    comparison_operator: input.comparison_operator,
+                    datapoints_to_alarm: input.datapoints_to_alarm,
+                    evaluation_periods: input.evaluation_periods,
+                    metric_name: input.metric_name,
+                    period: input.period,
+                    statistic: input.statistic,
+                    target_resource_type: input.target_resource_type,
+                    threshold: input.threshold,
+                    treat_missing_data: input.treat_missing_data,
+                },
+                now,
+            )
+            .map_err(refused)?;
+
+        // The response is read back out of the stored record, never built from
+        // `input`: a member the request omitted reports what the template still
+        // holds.
+        let template = state.alarm_template(&region, &id).ok_or_else(unavailable)?;
+        Ok(crate::state::alarm_template_output!(
+            UpdateCloudWatchAlarmTemplateOutput,
+            template
+        ))
     }
+}
+
+/// Turn a store refusal into this operation's own modelled error: an identifier
+/// no template in the region has and a group identifier no group in it has are
+/// both its 404 (neither leaves a template to change, or a group to move it
+/// into), and a name another template in the region already holds is its 409.
+fn refused(
+    refusal: crate::state::AlarmTemplateUpdateRefusal,
+) -> UpdateCloudWatchAlarmTemplateError {
+    match refusal {
+        crate::state::AlarmTemplateUpdateRefusal::NotFound { identifier } => {
+            UpdateCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "cloudwatch alarm template",
+                    &identifier,
+                )),
+            })
+            .into()
+        }
+        crate::state::AlarmTemplateUpdateRefusal::GroupNotFound { identifier } => {
+            UpdateCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "cloudwatch alarm template group",
+                    &identifier,
+                )),
+            })
+            .into()
+        }
+        crate::state::AlarmTemplateUpdateRefusal::NameTaken { .. } => {
+            UpdateCloudWatchAlarmTemplateErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// Refuse a member whose length is outside the bounds its target shape names,
+/// with the operation's own modelled client error and a message built from the
+/// request: the member, the bound and the length that broke it.
+fn bounded(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), UpdateCloudWatchAlarmTemplateError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{member} must be between {min} and {max} characters long, but was {len}"
+    )))
+}
+
+/// Refuse a numeric member outside the range its target shape names, the same
+/// way [`bounded`] refuses a string outside its length bounds.
+fn in_range(
+    member: &str,
+    value: Option<i32>,
+    min: i32,
+    max: i32,
+) -> Result<(), UpdateCloudWatchAlarmTemplateError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value >= min && value <= max {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "{member} must be between {min} and {max}, but was {value}"
+    )))
+}
+
+/// This operation's modelled 400, for a request the model's own constraints do
+/// not already refuse.
+fn bad_request(message: String) -> UpdateCloudWatchAlarmTemplateError {
+    UpdateCloudWatchAlarmTemplateErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the template in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateCloudWatchAlarmTemplateError {
+    UpdateCloudWatchAlarmTemplateErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

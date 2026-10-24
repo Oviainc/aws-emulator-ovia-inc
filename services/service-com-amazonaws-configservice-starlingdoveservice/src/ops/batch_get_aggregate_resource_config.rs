@@ -218,24 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut items = Vec::new();
         let mut unprocessed = Vec::new();
         for identifier in requested {
-            // The identity of an aggregated resource is the source account, the source
-            // Region, the resource type and the resource id — every required member of
-            // `AggregateResourceIdentifier`. `ResourceName` is optional, so it names no
-            // resource on its own and is not part of the lookup.
-            let aggregated = aggregator
-                .aggregates_source(&identifier.source_account_id, &identifier.source_region)
-                && aggregator.aggregates_resource_type(&identifier.resource_type)
-                && identifier.source_account_id == account_id
-                && identifier.source_region == region;
-            let recorded = store
-                .discovered_resources
-                .get(&(
-                    identifier.resource_type.clone(),
-                    identifier.resource_id.clone(),
-                ))
-                // "The API does not return results for deleted resources."
-                .filter(|entry| entry.deleted_at.is_none());
-            match recorded.filter(|_| aggregated) {
+            // Which resource an aggregate identifier names, and whether this
+            // aggregator holds a current configuration item for it, is the same
+            // question the single-resource read asks, so it is asked in one place
+            // (`state::aggregated_resource`) for both.
+            match store.aggregated_resource(aggregator, &identifier, account_id, &region) {
                 Some(entry) => items.push(entry.to_base_configuration_item(
                     &identifier.source_region,
                     store.recording_frequency_of(&entry.resource_type),
