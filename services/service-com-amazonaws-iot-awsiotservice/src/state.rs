@@ -53,6 +53,10 @@
 //! reason: the name is the package's identity and the `@httpLabel` of
 //! `/packages/{packageName}`. One record carries everything a reader hands back, so
 //! `GetPackage` after `CreatePackage` returns the created package member-for-member.
+//! A package's VERSIONS hang off that record, keyed by `versionName` — the version's
+//! identity is the pair `(packageName, versionName)`, which is what the model binds as
+//! the two `@httpLabel`s of `/packages/{packageName}/versions/{versionName}` — so a
+//! version lives inside the package it belongs to and disappears with it.
 //!
 //! Finally it holds the account's COMMANDS, keyed by `commandId` ("A unique
 //! identifier for the command", and the `@httpLabel` of `/commands/{commandId}`),
@@ -71,8 +75,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Action, AuthorizerDescription, CommandParameter, CommandParameterValue, CommandPayload,
     CommandPreprocessor, GetCommandExecutionOutput, GetCommandOutput, JobExecution,
-    JobExecutionStatusDetails, ThingGroupIndexingConfiguration, ThingIndexingConfiguration,
-    TopicRule, TopicRulePayload,
+    JobExecutionStatusDetails, PackageVersionArtifact, Sbom, ThingGroupIndexingConfiguration,
+    ThingIndexingConfiguration, TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -2029,6 +2033,9 @@ pub const MAX_PACKAGES: usize = 500;
 /// the rest is what `GetPackage` reports member for member, so a reader clones this
 /// record and the writer and the reader cannot drift.
 ///
+/// Its VERSIONS live on the record because a version is identified by the pair
+/// `(packageName, versionName)`: there is no version without the package that holds it.
+///
 /// `description` and `default_version_name` stay `Option` because ABSENT is
 /// distinguishable from a value: a package created without a summary has no
 /// description, and a package with no version promoted yet has no default version
@@ -2063,6 +2070,17 @@ pub struct RegisteredPackage {
     /// (`PackageSummary$lastModifiedDate`). A package nobody has updated was last
     /// modified when it was created.
     pub last_modified_date: SystemTime,
+    /// Every version of this package that exists, keyed by `versionName`.
+    ///
+    /// The version name is the version's identity within its package — the model binds
+    /// it as the second `@httpLabel` of `/packages/{packageName}/versions/{versionName}`
+    /// on every single-version operation — so a `BTreeMap` keyed by name is the version
+    /// set itself. `BTreeMap` (not `HashMap`) because `ListPackageVersions` is
+    /// `@paginated` and a page boundary is only meaningful over a stable order.
+    ///
+    /// A caller grows this set, so it is bounded: [`MAX_PACKAGE_VERSIONS`] is the
+    /// ceiling `CreatePackageVersion` refuses past.
+    pub versions: BTreeMap<String, RegisteredPackageVersion>,
 }
 
 impl RegisteredPackage {
@@ -2084,6 +2102,147 @@ impl RegisteredPackage {
             default_version_name: None,
             tags,
             client_token,
+            creation_date: created_at,
+            last_modified_date: created_at,
+            versions: BTreeMap::new(),
+        }
+    }
+}
+
+/// The ARN of one version of a software package:
+/// `arn:aws:iot:<region>:<account>:package/<packageName>/version/<versionName>`.
+///
+/// A package version's ARN extends its package's ARN with the `version/<versionName>`
+/// segment, which is what an `iot:GetPackageVersion` policy statement names and what
+/// `CreatePackageVersion$packageVersionArn` / `GetPackageVersion$packageVersionArn`
+/// report (`PackageVersionArn` is an opaque string in the model,
+/// `smithy_query(query="shape",shape="PackageVersionArn")`, so the form comes from the
+/// service's documented ARN layout); the namespace and account segments are the ones
+/// [`thing_arn`] documents.
+pub fn package_version_arn(region: &str, package_name: &str, version_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        "iot",
+        region,
+        &format!("package/{package_name}/version/{version_name}"),
+    )
+}
+
+/// How many versions of ONE software package this emulator keeps.
+///
+/// AWS publishes a service quota on the versions a package may hold; the exact figure
+/// is not in the model, so this is the emulator's own ceiling on a set a caller can
+/// grow — the same reason [`MAX_PACKAGES`] exists — and `CreatePackageVersion` past it
+/// refuses with the modelled `ServiceQuotaExceededException` ("Service quota has been
+/// exceeded", HTTP 402) rather than growing without bound.
+pub const MAX_PACKAGE_VERSIONS: usize = 100;
+
+/// The status a freshly created package version carries.
+///
+/// `PackageVersionStatus` is `DRAFT | PUBLISHED | DEPRECATED`
+/// ([`crate::ops::types::PACKAGE_VERSION_STATUS_VALUES`]) and the lifecycle the status
+/// documents is entered at `DRAFT`: `UpdatePackageVersion$action` (`PUBLISH` /
+/// `DEPRECATE`) is what moves a version on from there, so a create records `DRAFT` and
+/// nothing else does.
+pub const NEW_PACKAGE_VERSION_STATUS: &str = "DRAFT";
+
+/// One version of a software package, as this service persists it.
+///
+/// A version is the pair `(packageName, versionName)` — its identity, bound as the two
+/// `@httpLabel`s of `/packages/{packageName}/versions/{versionName}` — plus the
+/// artifact, attributes, recipe and description that describe what it contains and the
+/// status it holds in the package version lifecycle. The rest is what
+/// `GetPackageVersion` reports member for member, so a reader clones this record and
+/// the writer and the reader cannot drift.
+///
+/// `sbom` and `sbom_validation_status` stay `Option` because a version created without
+/// a software bill of materials HAS none: `AssociateSbomWithPackageVersion` is what
+/// attaches one, so a create records neither.
+#[derive(Debug, Clone)]
+pub struct RegisteredPackageVersion {
+    /// The name of the package this version belongs to.
+    pub package_name: String,
+    /// The name the version was created under; also its key in its package's version
+    /// set.
+    pub version_name: String,
+    /// `arn:aws:iot:<region>:<account>:package/<packageName>/version/<versionName>`,
+    /// minted on create.
+    pub package_version_arn: String,
+    /// "A summary of the package version being created", when the create carried one.
+    pub description: Option<String>,
+    /// "Metadata that can be used to define a package version's configuration", keyed
+    /// by attribute key — `ResourceAttributes` is a map, so the key is the identity and
+    /// a `BTreeMap` keeps one stable order for every reader.
+    pub attributes: BTreeMap<String, String>,
+    /// "The various build components created during the build process", when the create
+    /// carried them.
+    pub artifact: Option<PackageVersionArtifact>,
+    /// "The inline job document associated with a software package version used for a
+    /// quick job deployment", when the create carried one.
+    pub recipe: Option<String>,
+    /// "Metadata that can be used to manage the package version", keyed by tag key.
+    pub tags: BTreeMap<String, String>,
+    /// The `clientToken` the create carried, when it carried one.
+    ///
+    /// `CreatePackageVersion$clientToken` is "A unique case-sensitive identifier that
+    /// you can provide to ensure the idempotency of the request", so a repeat of the
+    /// create that minted this record — same package, same version, same token — is
+    /// that one request arriving twice and answers from the record instead of
+    /// conflicting with it.
+    pub client_token: Option<String>,
+    /// Where this version stands in the package version lifecycle: one of
+    /// [`crate::ops::types::PACKAGE_VERSION_STATUS_VALUES`].
+    pub status: String,
+    /// "Error reason for a package version failure during creation or update" — absent
+    /// on a version that did not fail.
+    pub error_reason: Option<String>,
+    /// "The software bill of materials for a software package version", once one is
+    /// associated.
+    pub sbom: Option<Sbom>,
+    /// "The status of the validation for a new software bill of materials added to a
+    /// software package version", once one is associated.
+    pub sbom_validation_status: Option<String>,
+    /// "The date when the package version was created"
+    /// (`GetPackageVersion$creationDate`).
+    pub creation_date: SystemTime,
+    /// "The date when the package version was last updated"
+    /// (`GetPackageVersion$lastModifiedDate`). A version nobody has updated was last
+    /// modified when it was created.
+    pub last_modified_date: SystemTime,
+}
+
+impl RegisteredPackageVersion {
+    /// Record a package version created now: the package name, version name and ARN are
+    /// its identity, the description, attributes, artifact, recipe and tags are what the
+    /// create supplied, it enters the lifecycle at [`NEW_PACKAGE_VERSION_STATUS`] with
+    /// no failure and no bill of materials, and both dates are the instant of the
+    /// create.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        package_name: String,
+        version_name: String,
+        package_version_arn: String,
+        description: Option<String>,
+        attributes: BTreeMap<String, String>,
+        artifact: Option<PackageVersionArtifact>,
+        recipe: Option<String>,
+        tags: BTreeMap<String, String>,
+        client_token: Option<String>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            package_name,
+            version_name,
+            package_version_arn,
+            description,
+            attributes,
+            artifact,
+            recipe,
+            tags,
+            client_token,
+            status: NEW_PACKAGE_VERSION_STATUS.to_string(),
+            error_reason: None,
+            sbom: None,
+            sbom_validation_status: None,
             creation_date: created_at,
             last_modified_date: created_at,
         }

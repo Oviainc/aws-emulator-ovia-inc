@@ -29,6 +29,8 @@ mod job_execution_read;
 mod job_targeting;
 #[path = "all/package_catalog.rs"]
 mod package_catalog;
+#[path = "all/package_versions.rs"]
+mod package_versions;
 #[path = "all/policy_registry.rs"]
 mod policy_registry;
 #[path = "all/state_roundtrip.rs"]

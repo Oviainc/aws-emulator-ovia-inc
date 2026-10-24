@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePackageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePackageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records one version of an existing software package in this service's state, keyed
+//! by `versionName` inside the package named by `packageName`, and answers with the
+//! record it persisted — so `GetPackageVersion` reads back what this call reported.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePackageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePackageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePackageVersion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePackageVersionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `ResourceAttributes` and `TagMap` are maps, so each key is the identity of its
+        // entry; the record keeps them ordered so every reader reports them the same
+        // way. How many entries a request may carry is already bounded by the members'
+        // modelled constraints, refused before this handler runs.
+        let attributes: ::std::collections::BTreeMap<String, String> =
+            input.attributes.unwrap_or_default().into_iter().collect();
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+
+        let mut store = state.lock();
+
+        // "Creates a new version for an EXISTING IoT software package": the package is
+        // what holds the version, so a name the catalog does not hold holds no version
+        // and the request is refused instead of conjuring the package. This operation
+        // models no not-found error, so the refusal is its modelled
+        // `ValidationException` (HTTP 400, "The request is not valid").
+        let package = store.packages.get_mut(&input.package_name).ok_or_else(|| {
+            CreatePackageVersionErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("Package {} does not exist", input.package_name)),
+            })
+        })?;
+
+        if let Some(existing) = package.versions.get(&input.version_name) {
+            // `clientToken` is "a unique case-sensitive identifier that you can provide
+            // to ensure the idempotency of the request", so a create repeating the
+            // token that minted this record is the SAME request arriving twice: it
+            // answers from the record and writes nothing.
+            if input.client_token.is_some() && input.client_token == existing.client_token {
+                return Ok(created_version_output(existing));
+            }
+            // Otherwise the version name, which is this version's identity inside its
+            // package, is already taken — what this operation's `ConflictException`
+            // (HTTP 409, "The request conflicts with the current state of the resource")
+            // names. Changing a version that exists is `UpdatePackageVersion`'s job, so
+            // nothing is overwritten here.
+            return Err(CreatePackageVersionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Version {} of package {} already exists",
+                        existing.version_name, existing.package_name
+                    )),
+                    resource_id: Some(existing.version_name.clone()),
+                },
+            )
+            .into());
+        }
+
+        // A package's version set is one a CALLER grows, a version at a time, so how
+        // many it holds is bounded. The ceiling is read AFTER the conflict check,
+        // because a version name already taken adds no record. The modelled refusal for
+        // exactly this is `ServiceQuotaExceededException` (HTTP 402), never a 200 that
+        // records nothing.
+        if package.versions.len() >= crate::state::MAX_PACKAGE_VERSIONS {
+            return Err(
+                CreatePackageVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the maximum of {} versions of package {} is already reached",
+                            crate::state::MAX_PACKAGE_VERSIONS,
+                            package.package_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let package_version_arn =
+            crate::state::package_version_arn(&region, &package.package_name, &input.version_name);
+        let version = crate::state::RegisteredPackageVersion::new(
+            package.package_name.clone(),
+            input.version_name,
+            package_version_arn,
+            input.description,
+            attributes,
+            input.artifact,
+            input.recipe,
+            tags,
+            input.client_token,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `GetPackageVersion` reads are one value,
+        // not two that could drift.
+        let output = created_version_output(&version);
+        package
+            .versions
+            .insert(version.version_name.clone(), version);
+        Ok(output)
+    }
+}
+
+/// This operation's response for `version`: the members the model binds on
+/// `CreatePackageVersionResponse`, read off the persisted record.
+///
+/// `attributes` is reported only when the version carries any, because the member is
+/// optional and a version created without attributes HAS none — an empty map would
+/// claim otherwise.
+fn created_version_output(
+    version: &crate::state::RegisteredPackageVersion,
+) -> CreatePackageVersionOutput {
+    CreatePackageVersionOutput {
+        package_version_arn: Some(version.package_version_arn.clone()),
+        package_name: Some(version.package_name.clone()),
+        version_name: Some(version.version_name.clone()),
+        description: version.description.clone(),
+        attributes: (!version.attributes.is_empty()).then(|| {
+            version
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }),
+        status: Some(version.status.clone()),
+        error_reason: version.error_reason.clone(),
     }
 }
