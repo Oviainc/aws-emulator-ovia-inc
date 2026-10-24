@@ -5,7 +5,9 @@
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
 //! (a virtual private server), the **block storage disk** (additional storage an
 //! instance can attach), the **disk snapshot** (a point-in-time copy of a disk
-//! or of an instance's system volume) together with the **export snapshot
+//! or of an instance's system volume), the **instance snapshot** (a point-in-time
+//! copy of a whole instance — its system volume, its blueprint and bundle, and
+//! the block storage disks attached to it) together with the **export snapshot
 //! record** (what an export of one of those snapshots to Amazon EC2 leaves
 //! behind), the **domain** (a DNS zone the account holds
 //! recordsets in), the **container service** (a compute resource containers are
@@ -179,6 +181,17 @@ pub const DISK_SNAPSHOT_ARN_RESOURCE_PREFIX: &str = "DiskSnapshot/";
 /// (`DiskSnapshot`)").
 pub const RESOURCE_TYPE_DISK_SNAPSHOT: &str = "DiskSnapshot";
 
+/// The resource portion an instance snapshot ARN carries before its id, from the
+/// modelled `InstanceSnapshot$arn` documentation
+/// (`arn:aws:lightsail:us-east-2:123456789101:InstanceSnapshot/d23b5706-…`).
+pub const INSTANCE_SNAPSHOT_ARN_RESOURCE_PREFIX: &str = "InstanceSnapshot/";
+
+/// The `resourceType` an instance snapshot and its operations report, from the
+/// modelled `ResourceType` enum — the value the modelled
+/// `InstanceSnapshot$resourceType` documentation names ("The type of resource
+/// (usually `InstanceSnapshot`)").
+pub const RESOURCE_TYPE_INSTANCE_SNAPSHOT: &str = "InstanceSnapshot";
+
 /// The resource portion an export snapshot record ARN carries before its id.
 /// Mirrors the `Instance/<uuid>` form the modelled `Instance$arn` documentation
 /// shows, with this resource's own `ResourceType` value.
@@ -326,6 +339,16 @@ pub const DISK_SNAPSHOT_STATE_PENDING: &str = "pending";
 /// See [`DISK_SNAPSHOT_STATE_PENDING`].
 pub const DISK_SNAPSHOT_STATE_COMPLETED: &str = "completed";
 
+/// `InstanceSnapshotState` values this slice uses, from the modelled
+/// `InstanceSnapshotState` enum and the `InstanceSnapshot$state` documentation
+/// ("The state the snapshot is in"): a snapshot Lightsail is still taking is
+/// `pending` and one that can be restored is `available`. The enum's third
+/// member, `error`, describes a snapshot that failed, which this store cannot
+/// produce — nothing here fails a copy.
+pub const INSTANCE_SNAPSHOT_STATE_PENDING: &str = "pending";
+/// See [`INSTANCE_SNAPSHOT_STATE_PENDING`].
+pub const INSTANCE_SNAPSHOT_STATE_AVAILABLE: &str = "available";
+
 /// `RecordState` values this slice uses, from the modelled `RecordState` enum
 /// and the `ExportSnapshotRecord$state` documentation ("The state of the export
 /// snapshot record"): an export is answered `Started` and settles into
@@ -448,6 +471,8 @@ pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_INSTANCE_SNAPSHOT: &str = "CreateInstanceSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT: &str = "CreateDiskFromSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY: &str = "CreateBucketAccessKey";
@@ -529,6 +554,12 @@ pub const MAX_RELATIONAL_DATABASES: usize = 500;
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DISK_SNAPSHOTS: usize = 500;
 
+/// The most instance snapshots this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_INSTANCE_SNAPSHOTS: usize = 500;
+
 /// The most managed relational database snapshots this emulator will hold.
 ///
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
@@ -594,6 +625,14 @@ pub const INSTANCE_PAGE_SIZE: usize = 10;
 /// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
 /// the same way.
 pub const RELATIONAL_DATABASE_SNAPSHOT_PAGE_SIZE: usize = 10;
+
+/// How many instance snapshots one `GetInstanceSnapshots` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more snapshots remain. Matches
+/// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
+/// the same way.
+pub const INSTANCE_SNAPSHOT_PAGE_SIZE: usize = 10;
 
 /// How many export snapshot records one `GetExportSnapshotRecords` page carries.
 ///
@@ -4579,6 +4618,88 @@ impl StoredDiskSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Instance snapshots
+// ---------------------------------------------------------------------------
+
+/// One stored instance snapshot: every member `GetInstanceSnapshot` and
+/// `GetInstanceSnapshots` report, plus the clock-owed transition its state is
+/// waiting on.
+///
+/// A snapshot is a point-in-time copy, so everything it says about its SOURCE is
+/// copied out of the instance record at the instant the snapshot was taken and
+/// never followed afterwards: the snapshot keeps reporting the blueprint, bundle,
+/// system disk size and attached block storage disks the instance had then, even
+/// after the instance is changed or deleted.
+#[derive(Debug, Clone)]
+pub struct StoredInstanceSnapshot {
+    /// The snapshot name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The size of the snapshotted system volume in GB, copied from the source
+    /// instance's bundle — "The size in GB of the SSD".
+    pub size_in_gb: i32,
+    /// The current `InstanceSnapshotState` value:
+    /// [`INSTANCE_SNAPSHOT_STATE_PENDING`] or
+    /// [`INSTANCE_SNAPSHOT_STATE_AVAILABLE`].
+    pub state: &'static str,
+    /// The state the clock owes this snapshot, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The name of the instance the snapshot was taken of.
+    pub from_instance_name: String,
+    /// That instance's ARN.
+    pub from_instance_arn: String,
+    /// That instance's blueprint id.
+    pub from_blueprint_id: String,
+    /// That instance's bundle id.
+    pub from_bundle_id: String,
+    /// Every block storage disk attached to the source instance at the instant
+    /// the snapshot was taken, copied whole: `InstanceSnapshot$fromAttachedDisks`
+    /// is "an array of disk objects containing information about all block
+    /// storage disks", and a disk later detached from the instance was still
+    /// part of what this snapshot captured.
+    pub from_attached_disks: Vec<StoredDisk>,
+}
+
+impl StoredInstanceSnapshot {
+    /// This record as the modelled `InstanceSnapshot`.
+    pub fn view(&self) -> crate::ops::types::InstanceSnapshot {
+        crate::ops::types::InstanceSnapshot {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_INSTANCE_SNAPSHOT.to_string()),
+            tags: Some(self.tags.clone()),
+            state: Some(self.state.to_string()),
+            // The modelled `InstanceSnapshot$progress` documentation says this
+            // member "is populated only for disk snapshots, and is null for
+            // instance snapshots", so an instance snapshot reports none.
+            progress: None,
+            from_attached_disks: Some(
+                self.from_attached_disks
+                    .iter()
+                    .map(StoredDisk::view)
+                    .collect(),
+            ),
+            from_instance_name: Some(self.from_instance_name.clone()),
+            from_instance_arn: Some(self.from_instance_arn.clone()),
+            from_blueprint_id: Some(self.from_blueprint_id.clone()),
+            from_bundle_id: Some(self.from_bundle_id.clone()),
+            // `CreateInstanceSnapshot` is an explicit snapshot the caller asked
+            // for, so it is not one the `AutoSnapshot` add-on took.
+            is_from_auto_snapshot: Some(false),
+            size_in_gb: Some(self.size_in_gb),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Export snapshot records
 // ---------------------------------------------------------------------------
 
@@ -7065,6 +7186,10 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// disk snapshot operation takes. A `BTreeMap` so `GetDiskSnapshots` walks a
     /// stable, total order and a page token can name the next snapshot.
     pub disk_snapshots: BTreeMap<String, StoredDiskSnapshot>,
+    /// Every instance snapshot, keyed by its snapshot name — the identifier every
+    /// instance snapshot operation takes. A `BTreeMap` so `GetInstanceSnapshots`
+    /// walks a stable, total order and a page token can name the next snapshot.
+    pub instance_snapshots: BTreeMap<String, StoredInstanceSnapshot>,
     /// Every export snapshot record, keyed by the name this store minted for it
     /// — the only identifier an export snapshot record has, because the caller
     /// names none. A `BTreeMap` so `GetExportSnapshotRecords` walks a stable,
@@ -7227,6 +7352,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created disk snapshot.
     pub fn insert_disk_snapshot(&mut self, snapshot: StoredDiskSnapshot) {
         self.disk_snapshots.insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// The instance snapshot `name` names, for a reporting operation.
+    pub fn instance_snapshot(&self, name: &str) -> Option<&StoredInstanceSnapshot> {
+        self.instance_snapshots.get(name)
+    }
+
+    /// Store a newly created instance snapshot.
+    pub fn insert_instance_snapshot(&mut self, snapshot: StoredInstanceSnapshot) {
+        self.instance_snapshots
+            .insert(snapshot.name.clone(), snapshot);
     }
 
     /// The export snapshot record `name` names, for a reporting operation.
@@ -7709,7 +7845,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance, a disk, a disk snapshot, an export snapshot record, a managed
+    /// an instance, a disk, a disk snapshot, an instance snapshot, an export
+    /// snapshot record, a managed
     /// relational database, one of its snapshots, or a load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
@@ -7720,7 +7857,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// cannot show a caller anything a later caller would not also see.
     ///
     /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
-    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_EXPORT_SNAPSHOT_RECORDS`],
+    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_INSTANCE_SNAPSHOTS`],
+    /// [`MAX_EXPORT_SNAPSHOT_RECORDS`],
     /// [`MAX_CONTAINER_SERVICES`],
     /// [`MAX_RELATIONAL_DATABASES`],
     /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`], [`MAX_LOAD_BALANCERS_PER_REGION`] and
@@ -7756,6 +7894,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             }
         }
         for snapshot in self.disk_snapshots.values_mut() {
+            let Some(due) = snapshot.due else { continue };
+            if due.at_ms <= now_ms {
+                snapshot.state = due.state;
+                snapshot.due = None;
+            }
+        }
+        for snapshot in self.instance_snapshots.values_mut() {
             let Some(due) = snapshot.due else { continue };
             if due.at_ms <= now_ms {
                 snapshot.state = due.state;
@@ -8179,6 +8324,15 @@ pub fn disk_snapshot_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{DISK_SNAPSHOT_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the instance snapshot `id` in `region`.
+pub fn instance_snapshot_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{INSTANCE_SNAPSHOT_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 
