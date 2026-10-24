@@ -303,7 +303,9 @@ async fn one_summary_per_discovered_service_round_trips_through_get_service() {
         let case = format!("summary {}", identity_key(&summary["KeyAttributes"]));
         // `MetricReferences` reports the standard metrics Application Signals collects for
         // the discovered service, dimensioned by the identity reported here; the
-        // telemetry-derived members stay absent rather than being invented.
+        // telemetry-derived members stay absent rather than being invented, and so do the
+        // service groups while this store holds no grouping configuration (the groups a
+        // stored configuration produces are covered in `service_groups.rs`).
         assert_eq!(
             metric_set(&summary["MetricReferences"]),
             standard_metrics(),
@@ -312,7 +314,7 @@ async fn one_summary_per_discovered_service_round_trips_through_get_service() {
         );
         assert!(
             summary.get("AttributeMaps").is_none() && summary.get("ServiceGroups").is_none(),
-            "case {case:?}: expected no telemetry-derived members, got {summary:?}"
+            "case {case:?}: expected no telemetry-derived members and no groups, got {summary:?}"
         );
 
         // The round trip: the identity the list reported is one `GetService` answers for
