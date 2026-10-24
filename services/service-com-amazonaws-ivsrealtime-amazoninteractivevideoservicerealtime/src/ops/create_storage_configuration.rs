@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStorageConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStorageConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStorageConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +80,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource a storage-configuration quota refusal names, as
+/// `crate::state::quota_exceeded_message` states it.
+const STORAGE_CONFIGURATION_QUOTA_RESOURCE: &str = "storage-configuration";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -163,18 +158,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStorageConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStorageConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStorageConfiguration"))
+        // "Creates a new storage configuration, used to enable recording to Amazon S3":
+        // a mutation the spec names, so this call mints the configuration's ARN and
+        // persists it. The bucket policy the real service modifies belongs to S3, which
+        // this emulator does not hold, so nothing outside this service's store is
+        // touched.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                CreateStorageConfigurationErrorModeled::InternalServerException,
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The store grows only here, and a record is reclaimed only by an explicit
+        // `DeleteStorageConfiguration`, so the bound is checked before anything is
+        // minted or persisted.
+        if store.storage_configurations.len() >= crate::state::MAX_STORAGE_CONFIGURATIONS {
+            return Err(crate::state::quota_exceeded(
+                CreateStorageConfigurationErrorModeled::ServiceQuotaExceededException,
+                STORAGE_CONFIGURATION_QUOTA_RESOURCE,
+                crate::state::MAX_STORAGE_CONFIGURATIONS,
+            ));
+        }
+
+        // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
+        // digest already names a live configuration, so one ARN never denotes two of
+        // them — the uniqueness rule `CreateStage` applies to a minted stage ARN. The
+        // NAME is not an identity: `CreateStorageConfigurationRequest$name` states "The
+        // value does not need to be unique", so two configurations may share one.
+        let sequence = store.next_sequence();
+        let mut arn = crate::state::storage_configuration_arn(
+            &region,
+            &crate::state::mint_id(sequence, crate::state::STORAGE_CONFIGURATION_ID_LEN),
+        );
+        while store.storage_configurations.contains_key(&arn) {
+            let retry = store.next_sequence();
+            arn = crate::state::storage_configuration_arn(
+                &region,
+                &crate::state::mint_id(retry, crate::state::STORAGE_CONFIGURATION_ID_LEN),
+            );
+        }
+
+        let record = crate::state::StorageConfigurationRecord {
+            arn: arn.clone(),
+            name: input.name,
+            // `s3` is `@required`, and `S3StorageConfiguration$bucketName` is
+            // `@required` inside it, so the destination is always the one the request
+            // named. The bucket is not looked up: this emulator holds no S3 state, so a
+            // `ResourceNotFoundException` here would be a verdict nothing checked.
+            bucket_name: input.s3.bucket_name,
+            tags: input.tags.unwrap_or_default(),
+            created_at: ::std::time::SystemTime::now(),
+            sequence,
+        };
+
+        let storage_configuration = record.to_storage_configuration();
+        store.storage_configurations.insert(arn, record);
+
+        Ok(CreateStorageConfigurationOutput {
+            storage_configuration: Some(storage_configuration),
+        })
     }
 }

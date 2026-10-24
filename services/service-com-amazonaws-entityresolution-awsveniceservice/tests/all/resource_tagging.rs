@@ -55,7 +55,10 @@ fn encoded_label(resource_arn: &str) -> String {
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite asserting that a deleted resource takes its tags
+/// with it drives the SAME path instead of cloning a second tagging helper.
+pub(crate) async fn list_tags(emulator: &Emulator, resource_arn: &str) -> Reply {
     emulator
         .call("GET", &format!("/tags/{}", encoded_label(resource_arn)), None)
         .await

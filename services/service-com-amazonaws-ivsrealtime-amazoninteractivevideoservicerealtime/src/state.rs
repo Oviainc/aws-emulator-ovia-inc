@@ -22,8 +22,9 @@ use crate::ops::types::{
     AutoParticipantRecordingConfiguration, ConflictException, IngestConfiguration,
     InternalServerException, ParticipantRecordingHlsConfiguration, ParticipantReplica,
     ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken,
-    RedundantIngestCredential, ResourceNotFoundException, ServiceQuotaExceededException, Stage,
-    StageEndpoints, StageSummary, ValidationException,
+    RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
+    ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary, StorageConfiguration,
+    StorageConfigurationSummary, ValidationException,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -313,6 +314,31 @@ pub const MAX_PARTICIPANT_TOKENS_PER_STAGE: usize = 1_000;
 /// `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_INGEST_CONFIGURATIONS: usize = 1_000;
 
+/// Storage configurations this emulator keeps for one engine. Not an AWS quota — this
+/// emulator's own resource guard on the one store `CreateStorageConfiguration` grows,
+/// set the same way [`MAX_STAGES`] is and answered with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_STORAGE_CONFIGURATIONS: usize = 1_000;
+
+/// The ceiling the model puts on one `ListStorageConfigurations` page, from
+/// `MaxStorageConfigurationResults`' `@range(1..100)`
+/// (`smithy_query(query="shape",shape="MaxStorageConfigurationResults")`).
+pub const MAX_STORAGE_CONFIGURATION_RESULTS: usize = 100;
+
+/// Page size `ListStorageConfigurations` uses when the request omits `maxResults`.
+///
+/// The model documents it on `ListStorageConfigurationsRequest$maxResults`: "Default:
+/// your service quota or 100, whichever is smaller." The quota on this store is
+/// [`MAX_STORAGE_CONFIGURATIONS`] and the published 100 is the member's own modelled
+/// maximum, so the default is computed from the two rather than written out — a listing
+/// with a smaller quota than 100 pages by the quota, exactly as documented.
+pub const DEFAULT_STORAGE_CONFIGURATION_PAGE_SIZE: usize =
+    if MAX_STORAGE_CONFIGURATIONS < MAX_STORAGE_CONFIGURATION_RESULTS {
+        MAX_STORAGE_CONFIGURATIONS
+    } else {
+        MAX_STORAGE_CONFIGURATION_RESULTS
+    };
+
 /// Stage sessions this emulator keeps per stage. Not an AWS quota — this emulator's
 /// own resource guard on the store [`join_stage_session`] grows, set the same way
 /// [`MAX_STAGES`] is. A session is not created by an API call (see
@@ -422,6 +448,11 @@ const PARTICIPANT_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-participant-after:";
 /// [`PAGE_TOKEN_PREFIX`] so a token issued by one listing names no position in the
 /// other and is refused there.
 const REPLICA_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-replica-after:";
+
+/// The same marker for a `ListStorageConfigurations` page, kept distinct from the two
+/// above so a token issued by one listing names no position in another and is refused
+/// there.
+const STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-storage-configuration-after:";
 
 /// One stage, as `CreateStage` persisted it and `GetStage` / `ListStages` report it.
 #[derive(Debug, Clone)]
@@ -597,6 +628,65 @@ impl IngestConfigurationRecord {
             // Always reported, empty map included: `tags` is how a caller reads the tags
             // back, exactly as on a stage.
             tags: Some(self.tags.clone()),
+        }
+    }
+}
+
+/// One storage configuration, as `CreateStorageConfiguration` persisted it and
+/// `GetStorageConfiguration` / `ListStorageConfigurations` report it.
+#[derive(Debug, Clone)]
+pub struct StorageConfigurationRecord {
+    /// The storage-configuration ARN, and the single key every lookup uses.
+    pub arn: String,
+    /// The name the creating request gave, which "does not need to be unique"
+    /// (`CreateStorageConfigurationRequest$name`), or `None` when it named none.
+    pub name: Option<String>,
+    /// The S3 bucket recorded video is written to. `@required` on the creating
+    /// request, so every record has one.
+    pub bucket_name: String,
+    pub tags: HashMap<String, String>,
+    /// When the configuration was created. Reported by no member of the modelled
+    /// `StorageConfiguration`, and recorded for the same reason
+    /// [`StageRecord::created_at`] is.
+    pub created_at: SystemTime,
+    /// Creation order, and the stable key `ListStorageConfigurations` pages over — the
+    /// same role [`StageRecord::sequence`] plays for `ListStages`.
+    pub sequence: u64,
+}
+
+impl StorageConfigurationRecord {
+    /// The modelled `StorageConfiguration` this record reports.
+    pub fn to_storage_configuration(&self) -> StorageConfiguration {
+        StorageConfiguration {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            s3: Some(self.to_s3()),
+            // Always reported, empty map included: `tags` is how a caller reads the tags
+            // back, exactly as on a stage.
+            tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// The modelled `StorageConfigurationSummary` this record reports in a
+    /// `ListStorageConfigurations` page.
+    ///
+    /// `StorageConfigurationSummary` carries the same four members as
+    /// `StorageConfiguration` (`smithy_query(query="shape",
+    /// shape="StorageConfiguration,StorageConfigurationSummary")`), so a summary and a
+    /// read answer alike, member for member.
+    pub fn to_summary(&self) -> StorageConfigurationSummary {
+        StorageConfigurationSummary {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            s3: Some(self.to_s3()),
+            tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// The S3 destination both projections report, built once so they cannot differ.
+    fn to_s3(&self) -> S3StorageConfiguration {
+        S3StorageConfiguration {
+            bucket_name: self.bucket_name.clone(),
         }
     }
 }
@@ -1009,6 +1099,8 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     pub stage_sessions: HashMap<String, Vec<StageSessionRecord>>,
     /// Every live ingest configuration, keyed by its ARN.
     pub ingest_configurations: HashMap<String, IngestConfigurationRecord>,
+    /// Every live storage configuration, keyed by its ARN.
+    pub storage_configurations: HashMap<String, StorageConfigurationRecord>,
     /// The started replications of a stage's participants, keyed by that SOURCE stage's
     /// ARN and held in start order — the order `ListParticipantReplicas` pages over.
     /// Removed when either stage a replica names is deleted.
@@ -1030,6 +1122,15 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         let mut stages: Vec<&StageRecord> = self.stages.values().collect();
         stages.sort_by_key(|record| record.sequence);
         stages
+    }
+
+    /// Every storage configuration in creation order — the order
+    /// `ListStorageConfigurations` pages over.
+    pub fn storage_configurations_in_order(&self) -> Vec<&StorageConfigurationRecord> {
+        let mut configurations: Vec<&StorageConfigurationRecord> =
+            self.storage_configurations.values().collect();
+        configurations.sort_by_key(|record| record.sequence);
+        configurations
     }
 
     /// The session `session_id` of the stage `stage_arn`, or `None` when this store
@@ -1123,6 +1224,11 @@ pub const PARTICIPANT_ID_LEN: usize = 12;
 /// `ingest-configuration/`, and caps the whole ARN at 128 characters.
 pub const INGEST_CONFIGURATION_ID_LEN: usize = 12;
 
+/// Characters in a minted storage-configuration id. The model's
+/// `StorageConfigurationArn` pattern allows `[a-zA-Z0-9-]+` after
+/// `storage-configuration/`, and caps the whole ARN at 128 characters.
+pub const STORAGE_CONFIGURATION_ID_LEN: usize = 12;
+
 /// Characters a minted stage session id carries after its `st-` prefix.
 ///
 /// The model's `StageSessionId` is `@length 16..16` with `@pattern ^st-[a-zA-Z0-9]+$`,
@@ -1163,6 +1269,17 @@ pub fn ingest_configuration_arn(region: &str, ingest_configuration_id: &str) -> 
         "ivs",
         region,
         &format!("ingest-configuration/{ingest_configuration_id}"),
+    )
+}
+
+/// The storage-configuration ARN for `storage_configuration_id`, in the form the
+/// model's `StorageConfigurationArn` pattern requires:
+/// `arn:aws:ivs:<region>:<account>:storage-configuration/<id>`.
+pub fn storage_configuration_arn(region: &str, storage_configuration_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ivs",
+        region,
+        &format!("storage-configuration/{storage_configuration_id}"),
     )
 }
 
@@ -1528,6 +1645,20 @@ pub fn encode_replica_page_token(after_sequence: u64) -> String {
 /// included.
 pub fn decode_replica_page_token(token: &str) -> Option<u64> {
     decode_after(REPLICA_PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListStorageConfigurations` page: the creation sequence
+/// the next page of storage configurations resumes after, under that listing's own
+/// marker.
+pub fn encode_storage_configuration_page_token(after_sequence: u64) -> String {
+    encode_after(STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The creation sequence a storage-configuration `nextToken` resumes after, or `None`
+/// when the token was not issued by [`encode_storage_configuration_page_token`] — a
+/// token from another listing included.
+pub fn decode_storage_configuration_page_token(token: &str) -> Option<u64> {
+    decode_after(STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX, token)
 }
 
 /// The one page-token codec, so the listings cannot encode a position two ways.
@@ -1967,12 +2098,12 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// The tags attached to the resource `arn` names, or `None` when this store holds no
 /// such resource.
 ///
-/// A stage and an ingest configuration are the resource types this store can hold:
-/// `CreateStage` and `CreateIngestConfiguration` are the creates this service
-/// implements, so every other resource type in its ARN shapes names nothing, and a
-/// well-formed ARN naming one is answered exactly as an ARN naming a deleted stage is —
-/// not found. Each such create is its own gap issue, and when one lands its record joins
-/// the match below.
+/// A stage, an ingest configuration and a storage configuration are the resource types
+/// this store can hold: `CreateStage`, `CreateIngestConfiguration` and
+/// `CreateStorageConfiguration` are the creates this service implements, so every other
+/// resource type in its ARN shapes names nothing, and a well-formed ARN naming one is
+/// answered exactly as an ARN naming a deleted stage is — not found. Each such create is
+/// its own gap issue, and when one lands its record joins the match below.
 pub fn resource_tags(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
@@ -1981,6 +2112,10 @@ pub fn resource_tags(
         "stage" => state.stages.get(arn).map(|stage| stage.tags.clone()),
         "ingest-configuration" => state
             .ingest_configurations
+            .get(arn)
+            .map(|configuration| configuration.tags.clone()),
+        "storage-configuration" => state
+            .storage_configurations
             .get(arn)
             .map(|configuration| configuration.tags.clone()),
         _ => None,
@@ -1997,6 +2132,10 @@ pub fn resource_tags_mut<'a>(
         "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
         "ingest-configuration" => state
             .ingest_configurations
+            .get_mut(arn)
+            .map(|configuration| &mut configuration.tags),
+        "storage-configuration" => state
+            .storage_configurations
             .get_mut(arn)
             .map(|configuration| &mut configuration.tags),
         _ => None,

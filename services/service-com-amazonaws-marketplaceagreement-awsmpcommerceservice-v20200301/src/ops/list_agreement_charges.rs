@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgreementCharges
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgreementCharges`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the charges of the agreements this store holds, with the purchase order
+//! reference each charge carries. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgreementCharges::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! A pure report, computed from the stored agreements and the quotes they were accepted
+//! from: the charges of an agreement are the `ChargeSummary$expectedCharges` its quote
+//! minted (`crate::state::charges_of`), each reported with the agreement that resulted
+//! in it and the purchase-order association recorded on it — "all charges regardless of
+//! whether a purchase order is linked to each charge". `agreementId`, `agreementType`
+//! and `catalog` select on the agreement; an `agreementId` the store holds no agreement
+//! for is refused as an invalid value for that member, as the sibling listings of this
+//! service refuse it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +157,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgreementCharges` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgreementChargesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgreementCharges"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAgreementChargesErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // A pure report: it reads the stored agreements and their quotes and
+        // writes nothing.
+        let store = state.lock();
+
+        // "The unique identifier of the agreement": an `agreementId` the store
+        // holds no agreement for names no agreement of this account, so it is
+        // not a valid value for the member rather than a filter that selects
+        // nothing. This operation models no `ResourceNotFoundException`, so the
+        // refusal is its modelled `ValidationException` carrying the
+        // `INVALID_AGREEMENT_ID` reason a client branches on — the same refusal
+        // the sibling listings of this service answer the same member with.
+        if let Some(agreement_id) = input.agreement_id.as_deref() {
+            if !store.agreements.contains_key(agreement_id) {
+                return Err(ListAgreementChargesErrorModeled::ValidationException(
+                    crate::state::validation_exception("INVALID_AGREEMENT_ID", "agreementId"),
+                )
+                .into());
+            }
+        }
+
+        // "details about all charges regardless of whether a purchase order is
+        // linked to each charge": every charge of every selected agreement, in
+        // the store's own order over agreement ids and then the order each
+        // agreement's quote minted its charges in — a total order, so a page
+        // token indexes into the same sequence on every call.
+        let mut matched: Vec<Charge> = Vec::new();
+        for agreement in store.agreements.values() {
+            if input
+                .agreement_id
+                .as_deref()
+                .is_some_and(|id| id != agreement.id)
+            {
+                continue;
+            }
+            // "Filter to retrieve charges of a specific agreement type" and
+            // "The catalog in which the charges were created": both are
+            // attributes of the agreement that resulted in the charge.
+            if input
+                .agreement_type
+                .as_deref()
+                .is_some_and(|kind| kind != agreement.agreement_type)
+            {
+                continue;
+            }
+            if input
+                .catalog
+                .as_deref()
+                .is_some_and(|catalog| catalog != agreement.catalog)
+            {
+                continue;
+            }
+            matched.extend(store.charges_of(agreement));
+        }
+
+        // The token resumes THIS listing: one minted for a different selector
+        // indexes into a different sequence.
+        let scope = crate::state::charge_scope(
+            input.agreement_id.as_deref(),
+            input.agreement_type.as_deref(),
+            input.catalog.as_deref(),
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    // The token names no page of this listing: a token is bound
+                    // to the query it was minted for.
+                    return Err(ListAgreementChargesErrorModeled::ValidationException(
+                        crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let Some((items, next_token)) = crate::state::paginate(
+            &matched,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of what this listing selects, which no
+            // token this operation minted for it ever named.
+            return Err(ListAgreementChargesErrorModeled::ValidationException(
+                crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+            )
+            .into());
+        };
+
+        Ok(ListAgreementChargesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
