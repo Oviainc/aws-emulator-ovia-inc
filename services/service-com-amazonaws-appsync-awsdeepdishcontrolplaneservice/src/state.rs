@@ -496,7 +496,7 @@ pub const REALTIME_ENDPOINT: &str = "REALTIME";
 pub const GRAPHQL_ENDPOINT: &str = "GRAPHQL";
 
 /// A `BTreeMap` field as the modelled map shape (`HashMap`).
-fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
+pub fn map_out(map: &BTreeMap<String, String>) -> std::collections::HashMap<String, String> {
     map.iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
