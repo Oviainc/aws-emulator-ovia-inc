@@ -31,6 +31,12 @@ hex = { workspace = true }
 # The stable `LocationHash` of a dynamic instrumentation configuration: the maintained
 # SHA-256 implementation, rather than a hand-written digest.
 sha2 = { workspace = true }
+# Calendar arithmetic: a calendar-month SLO evaluation interval is aligned with the
+# calendar, so its tiles are stepped by whole months rather than by a fixed span. No clock
+# is needed from it (`default-features = false` drops the time-zone lookup), only the
+# month-length and leap-year rules — from the release that introduced the month stepping
+# (`Months`/`checked_add_months`) and the epoch-seconds constructor this uses.
+chrono = { version = "0.4.31", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
