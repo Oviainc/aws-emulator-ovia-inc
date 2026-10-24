@@ -17,6 +17,8 @@ mod auto_scaling_propagation;
 mod column_types_and_auto_scaling;
 #[path = "all/delete_table_in_flight.rs"]
 mod delete_table_in_flight;
+#[path = "all/delete_type.rs"]
+mod delete_type;
 #[path = "all/get_keyspace.rs"]
 mod get_keyspace;
 #[path = "all/keyspace_table_lifecycle.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one user-defined type from a keyspace: the type enters the transient
+//! `DELETING` status ([`crate::state::TYPE_STATUS_DELETING`]) that the clock settles
+//! into absence, so `GetType` reports the deletion in flight and then stops finding the
+//! type at all. A type that something still uses is NOT deleted — "You can only delete a
+//! type that is not used in a table or another UDT" — and neither is one with an action
+//! already in progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteType"))
+        // `keyspaceName`'s pattern and length and `typeName`'s length are modelled, so
+        // the boundary validator has already refused a request that breaks one with 400
+        // `ValidationException`. What is left here is what the model cannot state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // This operation takes the formatted name every other type operation takes
+        // (`CreateType` answers with "the formatted name of the user-defined type ...
+        // Amazon Keyspaces requires the formatted name of the type for other
+        // operations"), so the supplied name goes through the same formatting before it
+        // is looked up: an unquoted name is case-folded, a double-quoted one is used
+        // verbatim. A string that is neither form names no type at all.
+        let type_name = crate::state::format_type_name(&input.type_name).map_err(|message| {
+            DeleteTypeErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The service-managed keyspaces are part of the account before any call.
+        store.ensure_service_managed_catalog(&region);
+        store.settle(now);
+
+        // A service-managed keyspace holds none of the caller's resources: Cassandra
+        // refuses DDL against a system keyspace as an invalid query ("system keyspace is
+        // not user-modifiable"), which is this operation's `ValidationException`.
+        if crate::state::is_service_managed_keyspace(&input.keyspace_name) {
+            return Err(DeleteTypeErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::service_managed_rejection(&input.keyspace_name)),
+            })
+            .into());
+        }
+
+        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+            return Err(DeleteTypeErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.keyspace_name),
+            )
+            .into());
+        };
+        // "The operation tried to access a keyspace, table, or type that doesn't exist."
+        let Some(udt) = keyspace.types.get(&type_name) else {
+            return Err(DeleteTypeErrorModeled::ResourceNotFoundException(
+                crate::state::type_not_found(&region, &input.keyspace_name, &type_name),
+            )
+            .into());
+        };
+
+        // A type whose status is not `ACTIVE` has an action of its own already in flight
+        // — the creation `CreateType` started, or a deletion a previous call to this
+        // operation started — and that is exactly what this operation's
+        // `ConflictException` names: "Amazon Keyspaces couldn't complete the requested
+        // action. This error may occur if you try to perform an action and the same or a
+        // different action is already in progress." The caller's recourse is to wait for
+        // that action to finish, so the status it is waiting on is in the message.
+        if udt.status != crate::state::TYPE_STATUS_ACTIVE {
+            return Err(DeleteTypeErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Type '{}.{type_name}' is in status {} and cannot be deleted until it is {}.",
+                    input.keyspace_name,
+                    udt.status,
+                    crate::state::TYPE_STATUS_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        // "You can only delete a type that is not used in a table or another UDT." The
+        // users of a type are derived from the keyspace as it stands now — the same
+        // derivation `GetType` reports as `directReferringTables` and
+        // `directParentTypes` — so a table or type created after this one counts, and a
+        // reference dropped by deleting its table stops counting. The type stays exactly
+        // as it was: the request is answered with the conflict and nothing is written.
+        let referring_tables = keyspace.direct_referring_tables(&type_name);
+        let parent_types = keyspace.direct_parent_types(&type_name);
+        if !referring_tables.is_empty() || !parent_types.is_empty() {
+            let mut users: Vec<String> = referring_tables
+                .iter()
+                .map(|table| format!("table '{}.{table}'", input.keyspace_name))
+                .collect();
+            users.extend(
+                parent_types
+                    .iter()
+                    .map(|parent| format!("type '{}.{parent}'", input.keyspace_name)),
+            );
+            return Err(DeleteTypeErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Type '{}.{type_name}' is still used by {} and can only be deleted once \
+                     nothing uses it.",
+                    input.keyspace_name,
+                    users.join(", ")
+                )),
+            })
+            .into());
+        }
+
+        let keyspace_arn = keyspace.resource_arn.clone();
+        // `TypeStatus` models `DELETING` and `GetType` reports a type's status, so the
+        // deletion is observable rather than instantaneous: the type enters `DELETING`
+        // now and the clock owes its removal one span from here. `settle` materialises
+        // that removal, and nothing sleeps for it.
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        if let Some(udt) = keyspace.types.get_mut(&type_name) {
+            udt.status = crate::state::TYPE_STATUS_DELETING.to_string();
+            udt.status_due_at = Some(settles_at);
+        }
+        // Tell the store the earliest instant at which `settle` has to look at the
+        // keyspaces again.
+        store.note_transition_due(settles_at);
+
+        Ok(DeleteTypeOutput {
+            keyspace_arn,
+            type_name,
+        })
     }
 }
