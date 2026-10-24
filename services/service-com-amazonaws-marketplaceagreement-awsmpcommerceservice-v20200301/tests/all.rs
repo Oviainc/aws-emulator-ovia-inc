@@ -29,6 +29,8 @@ mod charge_amounts;
 mod error_bodies;
 #[path = "all/payment_request_cancellation.rs"]
 mod payment_request_cancellation;
+#[path = "all/payment_request_rejection.rs"]
+mod payment_request_rejection;
 #[path = "all/payment_requests.rs"]
 mod payment_requests;
 #[path = "all/purchase_order_associations.rs"]
