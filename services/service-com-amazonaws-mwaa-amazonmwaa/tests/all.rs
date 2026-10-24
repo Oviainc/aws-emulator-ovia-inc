@@ -17,6 +17,8 @@ mod env_endpoint_not_found_wording;
 mod env_endpoint_payload;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
+#[path = "all/environment_service_defaults.rs"]
+mod environment_service_defaults;
 #[path = "all/rejection_contract.rs"]
 mod rejection_contract;
 #[path = "all/state_roundtrip.rs"]

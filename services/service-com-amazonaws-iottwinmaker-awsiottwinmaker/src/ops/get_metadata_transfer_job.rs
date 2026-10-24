@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMetadataTransferJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMetadataTransferJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one metadata transfer job from [`crate::state`], so a caller reads
+//! back the job `CreateMetadataTransferJob` persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMetadataTransferJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation (`@readonly`): the only thing it writes is the
+//! lifecycle transition the CLOCK had already made due — the job's outcome,
+//! owed at [`crate::state::MetadataTransferJob::settles_at`] whether or not
+//! anybody called — exactly as `GetComponentType` settles a component type.
+//!
+//! `metadataTransferJobRole` is reported as the role the service runs the
+//! transfer under ([`crate::state::metadata_transfer_job_role`]): the create
+//! accepts no role, so this member is never the caller's input.
+//! `progress` and `reportUrl` are left ABSENT: both describe a transfer that
+//! ran — how many entries it moved, and where it wrote its report — and this
+//! emulator transfers no metadata, so there is no count and no report to name
+//! (see [`crate::state::METADATA_TRANSFER_JOB_ERROR_CODE`], the error such a
+//! job carries once its outcome falls due).
+//!
+//! The refusals this handler owns: a job this account does not hold — the
+//! `ResourceNotFoundException` this operation models. Authorization is not
+//! emulated, so the modelled `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +174,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMetadataTransferJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMetadataTransferJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMetadataTransferJob"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetMetadataTransferJob",
+            metadata_transfer_job_id = %input.metadata_transfer_job_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMetadataTransferJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let Some(job) = state
+            .metadata_transfer_jobs
+            .get_mut(&input.metadata_transfer_job_id)
+        else {
+            return Err(GetMetadataTransferJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::metadata_transfer_job_not_found_message(
+                        &input.metadata_transfer_job_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The clock, not this call, is what moves the job on: its outcome was
+        // due at `settles_at`, so reporting the state without materialising it
+        // would report a state that stopped being true before the request
+        // arrived.
+        job.settle(::std::time::SystemTime::now());
+
+        Ok(GetMetadataTransferJobOutput {
+            metadata_transfer_job_id: job.metadata_transfer_job_id.clone(),
+            arn: job.arn.clone(),
+            description: job.description.clone(),
+            // Reported as STORED: the modelled request shapes the create
+            // supplied, so a read reports back exactly what was persisted.
+            sources: job.sources.clone(),
+            destination: job.destination.clone(),
+            metadata_transfer_job_role: job.metadata_transfer_job_role.clone(),
+            // Absent: nothing produced a report, because nothing transferred.
+            report_url: None,
+            creation_date_time: crate::state::timestamp(job.creation_date_time),
+            update_date_time: crate::state::timestamp(job.update_date_time),
+            // Carries the stored state (settled above) and, once the job has
+            // failed, why.
+            status: job.status(),
+            // Absent for the same reason `reportUrl` is: a progress count
+            // counts what a transfer moved, and no transfer ran.
+            progress: None,
+        })
     }
 }
