@@ -717,6 +717,51 @@ const EC2_INSTANCE_FAMILIES: [&str; 18] = [
     "t3a", "t4g", "i3", "i4i", "x2idn",
 ];
 
+/// The product types a **Compute** Savings Plan covers
+/// (`SavingsPlanOffering$productTypes`, a `SavingsPlanProductType` list).
+///
+/// AWS documents the coverage of each plan type, and that is what fixes these
+/// lists: a Compute Savings Plan "applies to usage across Amazon EC2, AWS
+/// Lambda, and AWS Fargate" in any region. The order a coverage list is reported
+/// in carries no meaning on the wire; this one mirrors the recorded AWS catalog
+/// row so a client diffing the two sees the same row.
+const COMPUTE_PRODUCT_TYPES: [&str; 3] = ["Fargate", "EC2", "Lambda"];
+
+/// The product types an **EC2 Instance** Savings Plan covers: EC2 usage of one
+/// instance family in one region, so EC2 alone. See [`COMPUTE_PRODUCT_TYPES`].
+const EC2_INSTANCE_PRODUCT_TYPES: [&str; 1] = ["EC2"];
+
+/// The product types a **SageMaker** Savings Plan covers: SageMaker usage alone.
+/// See [`COMPUTE_PRODUCT_TYPES`].
+const SAGEMAKER_PRODUCT_TYPES: [&str; 1] = ["SageMaker"];
+
+/// The product types a **Database** Savings Plan covers: every
+/// `SavingsPlanProductType` the model enumerates that no other plan type sells.
+///
+/// The model declares exactly four `SavingsPlanType` values (Compute,
+/// EC2Instance, SageMaker, Database) and fourteen `SavingsPlanProductType`
+/// values. Compute, EC2 Instance and SageMaker plans cover the compute and ML
+/// products AWS documents for them ([`COMPUTE_PRODUCT_TYPES`] and friends), so
+/// the remaining products — the database and database-adjacent ones — are sold
+/// by the one plan type left, and a search narrowed to any of them must find the
+/// offerings that cover it.
+///
+/// Derived from the generated value set of the model's own enum
+/// ([`crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES`]) rather than written
+/// out by hand, so a product type the model gains is covered by the catalog
+/// without anyone remembering to add it here.
+fn database_product_types() -> Vec<&'static str> {
+    crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES
+        .iter()
+        .copied()
+        .filter(|product| {
+            !COMPUTE_PRODUCT_TYPES.contains(product)
+                && !EC2_INSTANCE_PRODUCT_TYPES.contains(product)
+                && !SAGEMAKER_PRODUCT_TYPES.contains(product)
+        })
+        .collect()
+}
+
 /// Build the catalog: one offering per plan type x term x payment option, times
 /// the region (and, for EC2 Instance plans, the instance family) each plan type
 /// is scoped to.
@@ -731,22 +776,20 @@ const EC2_INSTANCE_FAMILIES: [&str; 18] = [
 /// carry one row per term and payment option; the scoped ones carry one per
 /// region, and EC2 Instance plans one per instance family within the region.
 ///
-/// The product types of each plan type are the ones AWS covers with it:
-/// Compute Savings Plans apply to EC2, Fargate and Lambda usage in any region;
-/// EC2 Instance Savings Plans to one instance family in one region; SageMaker
-/// and Database Savings Plans to their own products.
+/// The product types of each plan type are the ones AWS covers with it
+/// ([`COMPUTE_PRODUCT_TYPES`], [`EC2_INSTANCE_PRODUCT_TYPES`],
+/// [`SAGEMAKER_PRODUCT_TYPES`] and [`database_product_types`]), and between them
+/// those four lists cover EVERY `SavingsPlanProductType` the model enumerates:
+/// every product type the service sells Savings Plans for is carried by at least
+/// one purchasable offering, so a search narrowed to any of them answers with
+/// the offerings that cover it and a plan bought from one reports it.
 fn seed_offerings(id_seed: u128) -> Vec<Offering> {
     let mut offerings = Vec::new();
     for (duration_seconds, term_label, term_token) in TERMS {
         for payment_option in PAYMENT_OPTIONS {
             offerings.push(offering(
                 "Compute",
-                // The order a Compute Savings Plan's coverage is reported in,
-                // as the recorded AWS catalog row lists it. The order of a
-                // coverage list carries no meaning on the wire; the catalog
-                // mirrors the recorded one so a client diffing the two sees the
-                // same row.
-                &["Fargate", "EC2", "Lambda"],
+                &COMPUTE_PRODUCT_TYPES,
                 &offering_description(term_label, payment_option, "Compute"),
                 payment_option,
                 duration_seconds,
@@ -764,7 +807,7 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
                 for family in EC2_INSTANCE_FAMILIES {
                     offerings.push(offering(
                         "EC2Instance",
-                        &["EC2"],
+                        &EC2_INSTANCE_PRODUCT_TYPES,
                         &offering_description(term_label, payment_option, "EC2 Instance"),
                         payment_option,
                         duration_seconds,
@@ -790,7 +833,7 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
             for (region, currency) in REGIONS {
                 offerings.push(offering(
                     "SageMaker",
-                    &["SageMaker"],
+                    &SAGEMAKER_PRODUCT_TYPES,
                     &offering_description(term_label, payment_option, "SageMaker"),
                     payment_option,
                     duration_seconds,
@@ -812,18 +855,25 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
             for (region, currency) in REGIONS {
                 offerings.push(offering(
                     "Database",
-                    &["RDS", "DocDB", "Neptune", "ElastiCache"],
+                    &database_product_types(),
                     &offering_description(term_label, payment_option, "Database"),
                     payment_option,
                     duration_seconds,
                     currency,
-                    "AmazonRDS",
+                    // A plan type that spans several services bills under its
+                    // OWN Savings Plans line item rather than under one member
+                    // service's — the way a Compute plan bills under
+                    // `ComputeSavingsPlans` with no single service operation —
+                    // so a Database plan, which covers every database product
+                    // the model enumerates, reports the plan's line item here
+                    // and no per-service `operation`.
+                    "DatabaseSavingsPlans",
                     &offering_usage_type(
                         &format!("{region}-DatabaseSP"),
                         term_token,
                         payment_option,
                     ),
-                    "CreateDBInstance",
+                    "",
                     vec![(PROPERTY_REGION.to_string(), region.to_string())],
                 ));
             }
