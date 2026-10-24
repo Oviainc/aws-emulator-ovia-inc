@@ -6,8 +6,9 @@
 //! persists the submitted `scheduledReport` configuration under it with
 //! `scheduleConfig.state` resolved to `ENABLED` when the request left it unset, and
 //! `GetScheduledReport` answers that stored record — every optional member exactly as
-//! it was stored, `createdAt == updatedAt` on a report that was never updated, and
-//! neither an execution time nor a health status until something executes the report.
+//! it was stored, `createdAt == updatedAt` on a report that was never updated, and no
+//! execution time until something executes the report (its health reads HEALTHY from
+//! the moment the service accepted it).
 //! A `clientToken` is an at-most-once create key, and a `dashboardArn` no stored
 //! dashboard answers to is refused.
 //!
@@ -350,14 +351,17 @@ async fn create_scheduled_report_persists_the_configuration_and_get_reads_it_bac
             "case {label}: createdAt {created_at} is not a plausible epoch-seconds instant"
         );
 
-        // Nothing has executed the report, so there is no execution time and no health.
+        // Nothing has executed the report, so there is no execution time — and the
+        // health a report the service accepted carries before any refresh is HEALTHY,
+        // with neither a refresh instant nor reasons.
         assert!(
             report.get("lastExecutionAt").is_none(),
             "case {label}: a report that never ran has no lastExecutionAt: {report}"
         );
-        assert!(
-            report.get("healthStatus").is_none(),
-            "case {label}: a report that never ran has no healthStatus: {report}"
+        assert_eq!(
+            report.get("healthStatus"),
+            Some(&json!({"statusCode": "HEALTHY"})),
+            "case {label}: an unrefreshed report reports HEALTHY and nothing else: {report}"
         );
 
         // A read changes nothing a later reader sees.

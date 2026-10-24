@@ -314,6 +314,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        use crate::state::TokenOutcome;
+
         // The configuration is checked BEFORE the store is reached, so a volume the
         // backing EBS service could not provision is refused whatever the store holds:
         // it neither replays an idempotency token nor is charged against the quota, and
@@ -337,14 +339,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // `@idempotent` + `@idempotencyToken`: "Unique token to prevent duplicate volume
-        // creation" — a repeat call carrying a token this service has already created a
-        // volume for replays the SAME id and creates nothing.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = state.volume_client_tokens.get(token) {
+        // creation" — a token identifies ONE request, so a repeat call carrying a token
+        // this service has already created a volume FOR THE SAME PARAMETERS replays the
+        // SAME id and creates nothing, while a call that reuses a spent token with
+        // different parameters is a different request under a spent token and is refused
+        // with the modelled `ConflictException` (the backing Amazon EBS `CreateVolume`
+        // answers its `IdempotentParameterMismatch` here). Nothing is written on that
+        // refusal: the volume the token did create keeps its configuration, and the
+        // caller cannot believe a differently-sized or differently-typed volume exists.
+        //
+        // The fingerprint is taken over the request with its token cleared, so every
+        // member except the token itself is compared.
+        let mut parameters = input.clone();
+        parameters.client_token = None;
+        let fingerprint = crate::state::request_fingerprint(&parameters);
+        match crate::state::resolve_client_token(
+            &state.volume_client_tokens,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            TokenOutcome::Replay(volume_id) => {
                 return Ok(CreateVolumeOutput {
-                    volume_id: Some(existing.clone()),
-                });
+                    volume_id: Some(volume_id),
+                })
             }
+            TokenOutcome::Mismatch(volume_id) => {
+                return Err(CreateVolumeErrorModeled::ConflictException(
+                    crate::state::idempotent_parameter_mismatch(
+                        &volume_id,
+                        crate::state::VOLUME_RESOURCE_TYPE,
+                    ),
+                )
+                .into())
+            }
+            TokenOutcome::Unclaimed => {}
         }
 
         // A real account has a Service Quotas limit on volumes, and this operation
@@ -395,7 +423,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(token) = input.client_token {
-            state.volume_client_tokens.insert(token, volume_id.clone());
+            state.volume_client_tokens.insert(
+                token,
+                crate::state::IdempotencyClaim {
+                    resource_id: volume_id.clone(),
+                    fingerprint,
+                },
+            );
         }
         state.volumes.insert(volume_id.clone(), record);
 

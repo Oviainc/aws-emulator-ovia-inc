@@ -20,13 +20,10 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use super::dashboard_lifecycle::{call, ok_call, router};
+// The `HealthStatusCode` a report whose health nothing has refreshed reports, declared
+// once for the crate's suites beside the other health constants.
+use super::scheduled_report_execution::HEALTHY;
 use super::scheduled_report_lifecycle::{error_code, source_dashboard, EXECUTION_ROLE_ARN};
-
-/// The `HealthStatusCode` a report whose health nothing has refreshed summarises as.
-/// Source: `HealthStatusCode` (`smithy_query(query="shape",shape="HealthStatus")`),
-/// whose `HEALTHY` value the model documents as "the scheduled report is configured
-/// properly and has all required permissions to execute".
-const HEALTHY: &str = "HEALTHY";
 
 /// One row of the listing table: the `scheduleConfig` a report is created with, and
 /// the summary members that configuration must be projected onto.

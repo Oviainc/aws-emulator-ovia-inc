@@ -21,14 +21,17 @@
 //!   service's private registry, so a digest nothing pushed there is refused with
 //!   the same `DoesNotExist` envelope, and the registry it reports stays
 //!   unchanged.
-//! * `DeleteContainerImage` drops the named image from that registry if it is
-//!   there and answers success either way — the delete is idempotent — while a
-//!   request naming no container service in the request's region is refused with
-//!   the modelled `InvalidInputException`.
+//! * `DeleteContainerImage` deletes an image that registry HOLDS, so it succeeds
+//!   only for a name `GetContainerImages` reports and refuses a name the registry
+//!   does not hold — including a second delete of a name it just dropped — with
+//!   this service's not-found rejection, while a request naming no container
+//!   service in the request's region is refused with the modelled
+//!   `InvalidInputException`.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_lightsail_lightsail_20161128::state::{self, StoredContainerImage};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire
@@ -46,6 +49,9 @@ const LABEL_AT_MAX_LEN: &str = "maximum-length-label-abcdefghijabcdefghijabcdefg
 /// One emulator with one Lightsail service mounted on one shared engine.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The same engine the mounted service reads, kept so a test can seed a
+    /// registry — see [`Emulator::push`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -57,9 +63,42 @@ impl Emulator {
         // is what names the region a request is made in.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_lightsail_lightsail_20161128::EmulatedService::new(engine),
+            service_com_amazonaws_lightsail_lightsail_20161128::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// Put `images` in the registry of the container service `name` in `region`,
+    /// as a `docker push` to that service's private registry followed by a
+    /// registration would.
+    ///
+    /// No API call can do this: the emulator serves no container image registry
+    /// to push to, so `RegisterContainerImage` refuses every digest and the
+    /// registry is otherwise always empty. Seeding the store the handlers read
+    /// (`state::with_state`) is therefore the only way to drive the case where
+    /// the registry HOLDS the image a delete names.
+    fn push(&self, region: &str, name: &str, images: &[&str]) {
+        let seeded = state::with_state(&*self.engine, |store| {
+            let Some(service) = store.container_service_mut(region, name) else {
+                return false;
+            };
+            for (index, image) in images.iter().enumerate() {
+                service.images.push(StoredContainerImage {
+                    image: (*image).to_string(),
+                    digest: format!("sha256:{:064x}", index + 1),
+                    created_at_ms: 1_770_000_000_000 + index as i64,
+                });
+            }
+            true
+        });
+        assert_eq!(
+            seeded,
+            Some(true),
+            "case seeding the registry of {name} in {region}: expected the store to hold \
+             that container service, got {seeded:?}"
+        );
     }
 
     /// Call `operation` in `region` with `body`, answering its HTTP status and
@@ -133,6 +172,26 @@ impl Emulator {
                 panic!("case reading {service} in {region}: expected an array, got {registry:?}")
             })
             .clone()
+    }
+
+    /// The `image` member of every image that registry reports, in the order it
+    /// reports them.
+    async fn image_names(&self, region: &str, service: &str) -> Vec<String> {
+        self.images(region, service)
+            .await
+            .iter()
+            .map(|image| image["image"].as_str().unwrap_or("<no image>").to_string())
+            .collect()
+    }
+
+    /// Call `DeleteContainerImage` for `image` of `service` in `region`.
+    async fn delete_image(&self, region: &str, service: &str, image: &str) -> (u16, Value) {
+        self.call(
+            region,
+            "DeleteContainerImage",
+            json!({"serviceName": service, "image": image}),
+        )
+        .await
     }
 }
 
@@ -253,23 +312,75 @@ const DIGEST_ROWS: &[DigestRow] = &[
     },
 ];
 
-/// The image names a delete is driven with — none of which any registry here
-/// holds, since nothing can be pushed to one. The rows differ along the form the
-/// modelled `DeleteContainerImageRequest$image` documentation distinguishes: a
-/// name "sourced from your Lightsail container service, that [is] registered and
-/// stored on your service", which starts with a colon, and one "sourced from a
-/// public registry like Docker Hub", which does not.
-const IMAGE_NAMES: &[(&str, &str)] = &[
+/// One image a registry is seeded with and then asked to delete. The registered
+/// name is built the way the modelled `RegisterContainerImageRequest$label`
+/// documentation gives it — "if the name of your container service is
+/// `mycontainerservice`, and the label that you specify is `mystaticwebsite`,
+/// then the name of the registered container image will be
+/// `:mycontainerservice.mystaticwebsite.1`" — and the rows differ along what the
+/// rule generalises over: the label and the version that label is at.
+#[derive(Debug, Clone, Copy)]
+struct HeldImage {
+    case: &'static str,
+    label: &'static str,
+    version: u32,
+}
+
+/// The table of images a registry holds.
+const HELD_IMAGES: &[HeldImage] = &[
+    HeldImage {
+        case: "the first version of a label",
+        label: "roundtrip",
+        version: 1,
+    },
+    HeldImage {
+        case: "a later version of the same label",
+        label: "roundtrip",
+        version: 7,
+    },
+    HeldImage {
+        case: "another label entirely",
+        label: "mystaticwebsite",
+        version: 2,
+    },
+    HeldImage {
+        case: "a label at the modelled maximum length",
+        label: LABEL_AT_MAX_LEN,
+        version: 11,
+    },
+];
+
+impl HeldImage {
+    /// The name this service assigned the image.
+    fn name(&self, service: &str) -> String {
+        format!(":{service}.{}.{}", self.label, self.version)
+    }
+}
+
+/// The image names a delete is driven with that the registry does NOT hold. The
+/// rows differ along the form the modelled `DeleteContainerImageRequest$image`
+/// documentation distinguishes: a name "sourced from your Lightsail container
+/// service, that [is] registered and stored on your service", which starts with
+/// a colon, and one "sourced from a public registry like Docker Hub", which does
+/// not — plus a registered name differing from a held one only in its version,
+/// and one differing only in the service it names. `{service}` is replaced with
+/// the name of the service the request is made against.
+const UNHELD_IMAGES: &[(&str, &str)] = &[
     (
-        "a registered image name, in the form GetContainerImages reports",
-        ":empty-registry.roundtrip.1",
+        "a registered image name nothing registered",
+        ":{service}.absent.1",
     ),
     (
-        "a registered image name at a later version",
-        ":empty-registry.roundtrip.7",
+        "a registered name differing from a held one only in its version",
+        ":{service}.roundtrip.8",
+    ),
+    (
+        "a registered name of another container service",
+        ":another-service.roundtrip.1",
     ),
     ("a public registry name with a tag", "nginx:latest"),
     ("a public registry name with no tag", "nginx"),
+    ("a name in no registry form at all", "not an image name"),
 ];
 
 /// RULE: a container service nothing has been pushed to reports an EMPTY
@@ -414,39 +525,141 @@ async fn registering_a_digest_nothing_pushed_is_refused() {
     }
 }
 
-/// RULE: `DeleteContainerImage` is idempotent for a container service that
-/// exists: the named image is dropped from that service's registry if it is
-/// there, and a name the registry does not hold leaves it as it was — either way
-/// the call answers success (HTTP 204, the operation's modelled success status)
-/// with no body, and the registry stays readable.
+/// RULE: `DeleteContainerImage` deletes an image the named service's registry
+/// HOLDS — the call answers success (HTTP 204, the operation's modelled success
+/// status) with no body, that image is gone from what `GetContainerImages`
+/// reports, and every other image of the registry is left exactly as it was.
 #[tokio::test]
-async fn deleting_an_image_the_registry_does_not_hold_still_succeeds() {
+async fn deleting_an_image_the_registry_holds_removes_it() {
+    for service in SERVICE_ROWS {
+        // Each held image is deleted from its own freshly seeded registry, so
+        // every row is driven against the same starting registry.
+        for held in HELD_IMAGES {
+            let case = format!("{} on {}", held.case, service.case);
+            let emulator = Emulator::new();
+            emulator.create_service(service.region, service.name).await;
+            let seeded: Vec<String> = HELD_IMAGES
+                .iter()
+                .map(|image| image.name(service.name))
+                .collect();
+            let borrowed: Vec<&str> = seeded.iter().map(String::as_str).collect();
+            emulator.push(service.region, service.name, &borrowed);
+
+            let target = held.name(service.name);
+            let (status, body) = emulator
+                .delete_image(service.region, service.name, &target)
+                .await;
+            assert_eq!(
+                status, 204,
+                "case {case}: expected HTTP 204 for an image the registry holds, \
+                 got {status} {body:?}"
+            );
+            // The modelled output has no members, so the 204 carries nothing
+            // beyond the empty envelope (awsJson renders it as `{}`).
+            assert!(
+                body == Value::Null || body == json!({}),
+                "case {case}: expected the 204 to carry no output members, got {body:?}"
+            );
+
+            let want: Vec<String> = seeded
+                .iter()
+                .filter(|name| **name != target)
+                .cloned()
+                .collect();
+            let got = emulator.image_names(service.region, service.name).await;
+            assert_eq!(
+                got, want,
+                "case {case}: expected the registry to report {want:?} after the delete, got {got:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a delete can only remove an image the registry holds, so a name it does
+/// not hold — a never-registered name, a name belonging to another service, a
+/// public-registry name the service cannot hold at all, or a name this very call
+/// already deleted — is refused with this service's not-found rejection, and the
+/// registry is left as it was. The delete is therefore NOT unconditionally
+/// idempotent: repeating it answers the refusal, not a second success.
+#[tokio::test]
+async fn deleting_an_image_the_registry_does_not_hold_is_refused() {
+    for service in SERVICE_ROWS {
+        let emulator = Emulator::new();
+        emulator.create_service(service.region, service.name).await;
+        let seeded: Vec<String> = HELD_IMAGES
+            .iter()
+            .map(|image| image.name(service.name))
+            .collect();
+        let borrowed: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        emulator.push(service.region, service.name, &borrowed);
+
+        for (row, image) in UNHELD_IMAGES {
+            let image = image.replace("{service}", service.name);
+            let case = format!("{row} on {}", service.case);
+            // Twice: the refusal is the same answer every time, and neither
+            // attempt changes the registry.
+            for attempt in 1..=2 {
+                let (status, refused) = emulator
+                    .delete_image(service.region, service.name, &image)
+                    .await;
+                assert_does_not_exist(&format!("{case} (attempt {attempt})"), status, &refused);
+                assert!(
+                    refused["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(&image)),
+                    "case {case} (attempt {attempt}): expected the message to name the image \
+                     the request carried, got {refused:?}"
+                );
+            }
+            let got = emulator.image_names(service.region, service.name).await;
+            assert_eq!(
+                got, seeded,
+                "case {case}: a refused delete must leave the registry as it was ({seeded:?}), \
+                 got {got:?}"
+            );
+        }
+
+        // The second delete of a name that WAS held is the same refusal: the
+        // image is gone, so there is nothing left to delete.
+        let target = HELD_IMAGES[0].name(service.name);
+        let case = format!("a second delete of a held name on {}", service.case);
+        let (status, body) = emulator
+            .delete_image(service.region, service.name, &target)
+            .await;
+        assert_eq!(
+            status, 204,
+            "case {case}: expected the first delete to succeed, got {status} {body:?}"
+        );
+        let (status, refused) = emulator
+            .delete_image(service.region, service.name, &target)
+            .await;
+        assert_does_not_exist(&case, status, &refused);
+    }
+}
+
+/// RULE: an empty registry holds nothing, so EVERY delete against a service
+/// nothing has been pushed to is refused — which is the state every service of
+/// this emulator is in until a container image registry can be pushed to (see
+/// `RegisterContainerImage`).
+#[tokio::test]
+async fn deleting_from_an_empty_registry_is_always_refused() {
     for service in SERVICE_ROWS {
         let emulator = Emulator::new();
         emulator.create_service(service.region, service.name).await;
 
-        for (case, image) in IMAGE_NAMES {
-            let case = format!("{case} on {}", service.case);
-            // Twice: an idempotent delete answers the same the second time.
-            for attempt in 1..=2 {
-                let (status, body) = emulator
-                    .call(
-                        service.region,
-                        "DeleteContainerImage",
-                        json!({"serviceName": service.name, "image": image}),
-                    )
-                    .await;
-                assert_eq!(
-                    status, 204,
-                    "case {case} (attempt {attempt}): expected HTTP 204, got {status} {body:?}"
-                );
-            }
-            assert!(
-                emulator.images(service.region, service.name).await.is_empty(),
-                "case {case}: the registry must still read as empty, got {:?}",
-                emulator.images(service.region, service.name).await
-            );
+        for held in HELD_IMAGES {
+            let case = format!("{} on an empty registry of {}", held.case, service.case);
+            let (status, refused) = emulator
+                .delete_image(service.region, service.name, &held.name(service.name))
+                .await;
+            assert_does_not_exist(&case, status, &refused);
         }
+        assert!(
+            emulator.images(service.region, service.name).await.is_empty(),
+            "case {}: the registry must still read as empty, got {:?}",
+            service.case,
+            emulator.images(service.region, service.name).await
+        );
     }
 }
 
