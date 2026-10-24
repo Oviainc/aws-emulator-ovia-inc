@@ -44,7 +44,7 @@ const ARN_SYNTAX_CODE: &str = "BadRequestException";
 /// member, or a case that sends none) is no tags at all, which is what an untagged
 /// resource has. ONE conversion, so a case's expectation and the emulator's answer
 /// cannot be compared through two different readings.
-fn tag_map(tags: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(tags: &Value) -> BTreeMap<String, String> {
     tags.as_object()
         .map(|tags| {
             tags.iter()
@@ -54,8 +54,9 @@ fn tag_map(tags: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-/// The tags a `ListTagsForResource` answer reports, as a comparable map.
-fn reported_tags(body: &Value) -> BTreeMap<String, String> {
+/// The tags a `ListTagsForResource` answer — or a resource's own projection —
+/// reports, as a comparable map.
+pub(crate) fn reported_tags(body: &Value) -> BTreeMap<String, String> {
     body.get("Tags").map(tag_map).unwrap_or_default()
 }
 

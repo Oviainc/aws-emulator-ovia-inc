@@ -21,6 +21,8 @@ mod error_message_rules;
 mod private_connectivity;
 #[path = "all/quote_lifecycle.rs"]
 mod quote_lifecycle;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/site_and_outpost_lifecycle.rs"]
 mod site_and_outpost_lifecycle;
 #[path = "all/site_and_outpost_projection.rs"]
