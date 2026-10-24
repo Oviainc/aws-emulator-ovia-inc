@@ -276,6 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.next_graph_id();
+        let create_time = ::std::time::SystemTime::now();
         let graph = crate::state::Graph {
             arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
@@ -297,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             )),
             status_reason: None,
-            create_time: ::std::time::SystemTime::now(),
+            create_time,
             provisioned_memory: input.provisioned_memory,
             // Absent means "not enabled": the model declares no default for either
             // boolean, so an unsupplied member is stored as `false`.
@@ -314,6 +315,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // Nothing has deleted this graph.
             deletes_at: None,
+            // A new graph holds no data: nothing has written a node or an edge to it,
+            // and the statistics over that empty data are the ones the graph came up
+            // with.
+            data: crate::state::GraphData::empty(create_time),
         };
 
         // Report the record that was stored, so this response cannot drift from what a
