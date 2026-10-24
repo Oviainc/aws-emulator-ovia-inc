@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/baseline_operations.rs"]
 mod baseline_operations;
+#[path = "all/enabled_baseline_update.rs"]
+mod enabled_baseline_update;
 #[path = "all/enabled_control_lifecycle.rs"]
 mod enabled_control_lifecycle;
 #[path = "all/front_door_validation.rs"]

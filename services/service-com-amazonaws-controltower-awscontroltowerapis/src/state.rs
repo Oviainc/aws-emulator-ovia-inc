@@ -12,8 +12,8 @@
 //! identifier a `DeleteLandingZone` returned.
 //!
 //! Baselines work the same way one level down: an `EnabledBaseline` is a baseline applied
-//! to a target, and `EnableBaseline`/`DisableBaseline` each start an asynchronous
-//! operation whose record lands in a SECOND log keyed by `operationIdentifier`
+//! to a target, and `EnableBaseline`/`UpdateEnabledBaseline`/`DisableBaseline` each start
+//! an asynchronous operation whose record lands in a SECOND log keyed by `operationIdentifier`
 //! ([`ComAmazonawsControltowerAwscontroltowerapisState::baseline_operations`]), which
 //! `GetBaselineOperation` resolves. The two logs are separate: an identifier a landing
 //! zone call returned is not a baseline operation and vice versa.
@@ -427,7 +427,8 @@ impl EnablementStatus {
 ///
 /// `parameters` keeps the caller's `EnabledBaselineParameters` as key/`Document` pairs in
 /// the order supplied, so the enablement parameters a later reporting call reports are the
-/// ones `EnableBaseline` was given.
+/// ones the last call that applied them — `EnableBaseline`, or an `UpdateEnabledBaseline`
+/// the clock has made due — was given.
 #[derive(Debug, Clone)]
 pub struct EnabledBaseline {
     pub arn: String,
@@ -443,6 +444,33 @@ pub struct EnabledBaseline {
     /// started against this resource.
     pub last_operation_identifier: String,
     pub created_at: SystemTime,
+    /// The change an `UPDATE_ENABLED_BASELINE` still in flight will apply, or `None`
+    /// when nothing is pending. `settle` applies it once that operation is due, so the
+    /// applied version and parameters change when the asynchronous update completes and
+    /// not when the call that asked for it returned.
+    pub pending_update: Option<PendingEnabledBaselineUpdate>,
+}
+
+/// A change `UpdateEnabledBaseline` accepted and the clock has yet to apply.
+///
+/// `UpdateEnabledBaseline` "updates an `EnabledBaseline` resource's applied parameters or
+/// version" through an asynchronous operation, so the request's values are parked here
+/// and become the resource's once the clock has made that operation due.
+#[derive(Debug, Clone)]
+pub struct PendingEnabledBaselineUpdate {
+    /// The `UPDATE_ENABLED_BASELINE` operation whose completion applies this change.
+    pub operation_identifier: String,
+    /// The instant the clock owes this change its application — the same instant that
+    /// operation becomes due, held here so applying it never depends on the operation's
+    /// record still being in the (bounded) log. Stored, never slept on.
+    pub due_at: SystemTime,
+    /// The `baselineVersion` the update moves the enablement to. Required on the
+    /// request, so always present.
+    pub baseline_version: String,
+    /// The applied parameters the update replaces the enablement's with, or `None` when
+    /// the request carried no `parameters` member at all — the applied parameters then
+    /// stay as they are, while a present (even empty) list is the new applied set.
+    pub parameters: Option<Vec<(String, ::aws_smithy_types::Document)>>,
 }
 
 /// One entry of the baseline operation log.
@@ -588,6 +616,36 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         }
 
         let baseline_operations = &self.baseline_operations;
+
+        // An UPDATE_ENABLED_BASELINE the clock has made due has finished applying the
+        // change it carried, so the new version and parameters are the resource's whether
+        // or not anybody called. The due instant is the pending change's OWN, not read
+        // back off the operation log: `enforce_log_bound` evicts the oldest in-flight
+        // record when every record is in flight, and a missing record must not be read as
+        // "due" and apply a change the clock does not owe yet.
+        for enabled_baseline in self.enabled_baselines.values_mut() {
+            let Some(pending) = enabled_baseline.pending_update.take() else {
+                continue;
+            };
+            if now < pending.due_at {
+                // Not due yet: park it again, unchanged.
+                enabled_baseline.pending_update = Some(pending);
+                continue;
+            }
+            if baseline_operations
+                .get(&pending.operation_identifier)
+                .is_some_and(|operation| operation.status == BaselineOperationStatus::Failed)
+            {
+                // A failed update applied nothing, so the enablement keeps the version
+                // and parameters it had.
+                continue;
+            }
+            enabled_baseline.baseline_version = pending.baseline_version;
+            if let Some(parameters) = pending.parameters {
+                enabled_baseline.parameters = parameters;
+            }
+        }
+
         for (arn, enabled_baseline) in self.enabled_baselines.iter_mut() {
             // A FAILED enablement is not re-derived from the log, for the same reason as
             // a FAILED landing zone: a reader must not overwrite a failure.
@@ -839,8 +897,53 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 status: EnablementStatus::UnderChange,
                 last_operation_identifier: operation_identifier.clone(),
                 created_at: now,
+                pending_update: None,
             },
         );
+        Some(operation_identifier)
+    }
+
+    /// Start an `UPDATE_ENABLED_BASELINE` against the enablement `arn` names, parking the
+    /// change for [`settle`] to apply once that operation is due, and return the
+    /// operation's `operationIdentifier`.
+    ///
+    /// `None` when `arn` names no stored enablement, so a handler answers the modelled
+    /// `ResourceNotFoundException` and NOTHING is written. Writes no new resource, so it
+    /// is not bounded by [`MAX_ENABLED_BASELINES`]; the operation it appends is bounded by
+    /// the log's own retention rule.
+    ///
+    /// The caller refuses an update that overlaps a baseline operation still in flight
+    /// against `arn` with the modelled `ConflictException` (`UpdateEnabledBaseline` is not
+    /// `@idempotent`), which is what keeps the single pending slot from being overwritten
+    /// while the change it holds is still owed: every accepted update is applied before
+    /// another can be accepted.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn record_enabled_baseline_update(
+        &mut self,
+        arn: &str,
+        baseline_version: &str,
+        parameters: Option<Vec<(String, ::aws_smithy_types::Document)>>,
+        now: SystemTime,
+    ) -> Option<String> {
+        if !self.enabled_baselines.contains_key(arn) {
+            return None;
+        }
+
+        let operation_identifier =
+            self.record_baseline_operation(BaselineOperationType::UpdateEnabledBaseline, arn, now);
+        let enabled_baseline = self.enabled_baselines.get_mut(arn)?;
+        // The enablement is changing until the update is due; the status is derived from
+        // the log by `settle`, and set to match here so a caller reading straight after
+        // the call sees the transient state.
+        enabled_baseline.status = EnablementStatus::UnderChange;
+        enabled_baseline.last_operation_identifier = operation_identifier.clone();
+        enabled_baseline.pending_update = Some(PendingEnabledBaselineUpdate {
+            operation_identifier: operation_identifier.clone(),
+            due_at: now + OPERATION_SETTLE_AFTER,
+            baseline_version: baseline_version.to_string(),
+            parameters,
+        });
         Some(operation_identifier)
     }
 }

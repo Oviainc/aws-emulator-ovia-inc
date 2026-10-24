@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEnabledBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEnabledBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEnabledBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates an `EnabledBaseline`'s applied version and parameters: starts the asynchronous
+//! `UPDATE_ENABLED_BASELINE` operation `GetBaselineOperation` reports and parks the change
+//! in [`crate::state`], which applies it once the clock has made that operation due.
+//!
+//! `GetEnabledBaseline` is implemented in the same change, because the applied version and
+//! parameters this operation writes are observable nowhere else (its own stub issue names
+//! it); `ListEnabledBaselines` keeps its stub issue.
+//!
+//! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
+//! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
+//! unreachable from this handler: the emulator verifies the request signature at its
+//! front door and models no per-principal policy or request budget. The modelled
+//! `ServiceQuotaExceededException` (402) is unreachable too — an update creates no
+//! resource, so it cannot take the account past the enablement cap.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +167,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEnabledBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEnabledBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEnabledBaselineErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(arn) = store.resolve_enabled_baseline_arn(&input.enabled_baseline_identifier)
+        else {
+            return Err(UpdateEnabledBaselineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled baseline matches enabledBaselineIdentifier {}",
+                        input.enabled_baseline_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // An operation still changing this enablement owns it: a change starting now
+        // would apply on top of one half applied, which is the inconsistent state
+        // `ConflictException` reports. This operation is not `@idempotent`, so a repeat
+        // is refused rather than reported as the same operation.
+        if let Some(in_flight) = store.baseline_operation_in_flight(&arn) {
+            return Err(UpdateEnabledBaselineErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "baseline operation {in_flight} is still in progress against \
+                         {arn}; updating it now would leave this enablement in an \
+                         inconsistent state"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The baseline catalog is not in this slice (`ListBaselines`/`GetBaseline` own
+        // it), so the requested version is persisted as given rather than checked against
+        // a catalog this service cannot yet consult.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEnabledBaseline"))
+        // An absent `parameters` member leaves the applied parameters as they are, while a
+        // present list — empty included — is the new applied set: the operation updates an
+        // enablement's "applied parameters OR version" (model docs), so a version-only
+        // update must not silently clear them.
+        let parameters: Option<Vec<(String, ::aws_smithy_types::Document)>> =
+            input.parameters.map(|parameters| {
+                parameters
+                    .into_iter()
+                    .map(|parameter| (parameter.key, parameter.value))
+                    .collect()
+            });
+
+        let Some(operation_identifier) =
+            store.record_enabled_baseline_update(&arn, &input.baseline_version, parameters, now)
+        else {
+            // The ARN resolved against this same locked store above, so nothing can have
+            // removed the enablement in between; the modelled 404 is the answer if it
+            // ever did.
+            return Err(UpdateEnabledBaselineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no enabled baseline matches enabledBaselineIdentifier {arn}"),
+                },
+            )
+            .into());
+        };
+
+        Ok(UpdateEnabledBaselineOutput {
+            operation_identifier,
+        })
     }
 }

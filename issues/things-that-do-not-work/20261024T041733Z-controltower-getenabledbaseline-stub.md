@@ -23,3 +23,19 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the controltower emulator
 2. Call GetEnabledBaseline and observe HTTP 501 with no state persisted
+
+## Update: already implemented by the UpdateEnabledBaseline fix
+
+The fix for `issues/things-that-now-work/20261024T041734Z-controltower-updateenabledbaseline-stub.md`
+implemented this operation as the reader that makes `UpdateEnabledBaseline`'s writes
+observable (an update's applied version and parameters are reported nowhere else):
+`src/ops/get_enabled_baseline.rs` now reports `EnabledBaselineDetails` from
+`crate::state` — arn, baselineIdentifier, baselineVersion, targetIdentifier,
+`statusSummary{status,lastOperationIdentifier}` and the applied `parameters` — and answers
+the modelled `ResourceNotFoundException` (404) for an identifier naming no enablement; its
+`//! SCAFFOLDED, NOT IMPLEMENTED:` census line is deleted and
+`tests/all/enabled_baseline_update.rs` exercises it end to end over HTTP. Nothing is left
+to implement here: this report only needs closing, and the stub census (which no longer
+carries the operation) is the authority. `driftStatusSummary` and `parentIdentifier` are
+deliberately absent — this emulator assesses no inheritance drift and models no
+parent/child enablement, and the model makes both members optional.

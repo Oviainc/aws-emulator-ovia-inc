@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEnabledBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEnabledBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEnabledBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `EnabledBaseline` from [`crate::state`]: the baseline and target it
+//! applies, the version and parameters currently applied, and its enablement status
+//! summary. Implemented alongside `UpdateEnabledBaseline`, which has nothing else to
+//! read its writes back through.
+//!
+//! `@readonly`: the only write this handler makes is `settle`'s, which materialises
+//! transitions the CLOCK already owed (an operation becoming due, a pending update
+//! applying, a torn-down enablement disappearing) and would hold at the same instant
+//! whether or not anybody called.
+//!
+//! `driftStatusSummary` and `parentIdentifier` are ABSENT: this emulator assesses no
+//! inheritance drift and models no parent/child enablement, and the model makes both
+//! members optional.
+//!
+//! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
+//! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
+//! unreachable from this handler.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +158,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEnabledBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEnabledBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEnabledBaseline"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetEnabledBaselineErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(enabled_baseline) = store
+            .resolve_enabled_baseline_arn(&input.enabled_baseline_identifier)
+            .and_then(|arn| store.enabled_baselines.get(&arn))
+        else {
+            return Err(GetEnabledBaselineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled baseline matches enabledBaselineIdentifier {}",
+                        input.enabled_baseline_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetEnabledBaselineOutput {
+            enabled_baseline_details: Some(EnabledBaselineDetails {
+                arn: enabled_baseline.arn.clone(),
+                baseline_identifier: enabled_baseline.baseline_identifier.clone(),
+                baseline_version: Some(enabled_baseline.baseline_version.clone()),
+                // No drift is assessed and no parent enablement is modelled, so both
+                // optional members are absent rather than invented.
+                drift_status_summary: None,
+                target_identifier: enabled_baseline.target_identifier.clone(),
+                parent_identifier: None,
+                status_summary: EnablementStatusSummary {
+                    status: Some(enabled_baseline.status.as_wire().to_string()),
+                    last_operation_identifier: Some(
+                        enabled_baseline.last_operation_identifier.clone(),
+                    ),
+                },
+                // "Shows the parameters that are applied when enabling this Baseline":
+                // absent when none are applied, otherwise the stored pairs in the order
+                // the call that applied them supplied.
+                parameters: (!enabled_baseline.parameters.is_empty()).then(|| {
+                    enabled_baseline
+                        .parameters
+                        .iter()
+                        .map(|(key, value)| EnabledBaselineParameterSummary {
+                            key: key.clone(),
+                            value: value.clone(),
+                        })
+                        .collect()
+                }),
+            }),
+        })
     }
 }
