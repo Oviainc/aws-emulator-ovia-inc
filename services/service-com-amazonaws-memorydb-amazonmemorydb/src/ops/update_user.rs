@@ -195,7 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than reporting a parameter problem for a resource that does not exist.
         let Some(stored) = state.users.get(&user_name) else {
             return Err(UpdateUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {user_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::User,
+                    &user_name,
+                )),
             })
             .into());
         };

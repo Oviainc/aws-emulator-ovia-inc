@@ -168,7 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not-found whatever else is wrong with it.
         let Some(acl) = state.acls.get(&acl_name) else {
             return Err(DeleteACLErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
-                message: Some(format!("ACL {acl_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::Acl,
+                    &acl_name,
+                )),
             })
             .into());
         };
@@ -231,7 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(mut acl) = state.acls.remove(&acl_name) else {
             // Unreachable: the entry was read under this same lock just above.
             return Err(DeleteACLErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
-                message: Some(format!("ACL {acl_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::Acl,
+                    &acl_name,
+                )),
             })
             .into());
         };

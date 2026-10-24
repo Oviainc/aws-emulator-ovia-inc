@@ -251,7 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(acl) = state.acls.get(&acl_name) else {
             return Err(UpdateACLErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
-                message: Some(format!("ACL {acl_name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::Acl,
+                    &acl_name,
+                )),
             })
             .into());
         };

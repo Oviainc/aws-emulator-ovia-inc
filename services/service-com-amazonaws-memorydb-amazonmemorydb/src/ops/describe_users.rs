@@ -259,7 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let name = user_name.unwrap_or_default();
             return Err(DescribeUsersErrorModeled::UserNotFoundFault(UserNotFoundFault {
-                message: Some(format!("User {name} not found.")),
+                message: Some(crate::state::not_found_message(
+                    crate::state::ResourceKind::User,
+                    &name,
+                )),
             })
             .into());
         }

@@ -319,7 +319,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.clusters.contains_key(&cluster_name) {
             return Err(UpdateClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {cluster_name} not found.")),
+                    message: Some(crate::state::not_found_message(
+                        crate::state::ResourceKind::Cluster,
+                        &cluster_name,
+                    )),
                 },
             )
             .into());
@@ -352,7 +355,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(acl_name) = requested_acl_name.as_deref() {
             if !state.acls.contains_key(acl_name) {
                 return Err(UpdateClusterErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
-                    message: Some(format!("ACL {acl_name} not found.")),
+                    message: Some(crate::state::not_found_message(
+                        crate::state::ResourceKind::Acl,
+                        acl_name,
+                    )),
                 })
                 .into());
             }
