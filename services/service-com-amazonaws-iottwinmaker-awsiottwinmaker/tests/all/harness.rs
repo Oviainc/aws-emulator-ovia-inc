@@ -347,6 +347,18 @@ impl Emulator {
             .await
     }
 
+    /// `GetPropertyValue`: POST
+    /// /workspaces/{workspaceId}/entity-properties/value, with the workspace as
+    /// the only `@httpLabel` and every other member in the body.
+    pub(crate) async fn get_property_value(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/entity-properties/value"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `ListSyncJobs`: POST /workspaces/{workspaceId}/sync-jobs-list, with the
     /// workspace as the only `@httpLabel` and the page members (`maxResults`,
     /// `nextToken`) carried in the body.
