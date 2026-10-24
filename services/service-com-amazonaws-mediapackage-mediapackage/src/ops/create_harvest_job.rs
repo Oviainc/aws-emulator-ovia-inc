@@ -28,11 +28,11 @@
 //!   so an endpoint whose startover playback is disabled retains nothing to harvest and
 //!   the submission is refused ([`crate::state::OriginEndpointRecord::startover_enabled`],
 //!   read off the stored endpoint);
-//! * the DESTINATION ROLE is the identity MediaPackage writes the harvested content as,
-//!   so the role's trust policy has to grant `mediapackage.amazonaws.com`
-//!   `sts:AssumeRole`. The role is resolved against the account's IAM records in the same
-//!   engine and read through the one shared trust-policy evaluator
-//!   ([`crate::state::harvest_role_refusal`]).
+//! * the DESTINATION ROLE is the identity MediaPackage writes the harvested content as, so
+//!   the value has to BE an IAM role ARN ([`crate::state::IAM_ROLE_ARN`]) and the role's
+//!   trust policy has to grant `mediapackage.amazonaws.com` `sts:AssumeRole`. The role is
+//!   resolved against the account's IAM records in the same engine and read through the one
+//!   shared trust-policy evaluator ([`crate::state::harvest_role_refusal`]).
 //!
 //! All three answer the modelled `UnprocessableEntityException` (422) keyed by the member
 //! the caller has to fix. Whether the harvest window lies INSIDE the endpoint's startover
@@ -237,10 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // MediaPackage writes the harvested content to the caller's bucket AS the role the
         // destination names, so a submission it could never carry out is refused here
-        // instead of producing a job id for a harvest that cannot happen. The IAM store is
-        // a different store in the same engine, and no IAM handler reads this one; its
-        // guard is taken and released BEFORE this service's, so no two orders of the same
-        // two locks exist.
+        // instead of producing a job id for a harvest that cannot happen. The role has to
+        // BE an IAM role ARN first — a value that is not one names no role to assume, which
+        // is a value in the request the caller has to fix — and then one this emulator has
+        // no reason to think the service could not assume. The IAM store is a different
+        // store in the same engine, and no IAM handler reads this one; its guard is taken
+        // and released BEFORE this service's, so no two orders of the same two locks exist.
+        crate::state::check_arn_member(
+            crate::state::HARVEST_ROLE_MEMBER,
+            &input.s3_destination.role_arn,
+            crate::state::IAM_ROLE_ARN,
+        )?;
         let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
             CreateHarvestJobErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {

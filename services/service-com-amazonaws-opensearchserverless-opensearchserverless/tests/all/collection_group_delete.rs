@@ -396,10 +396,18 @@ async fn delete_collection_group_refuses_an_unknown_id_and_a_non_empty_group() {
         .await;
         let id = text(&detail, "id");
         for collection in &collections {
+            // The collection carries its own encryption setting: a collection is only
+            // admitted when one comes from the request or from a covering encryption
+            // security policy, and this suite is about the GROUP, not about where that
+            // setting came from.
             let (status, code, body) = call(
                 &router,
                 "CreateCollection",
-                json!({ "name": collection, "collectionGroupName": group }),
+                json!({
+                    "name": collection,
+                    "collectionGroupName": group,
+                    "encryptionConfig": { "aWSOwnedKey": true },
+                }),
             )
             .await;
             assert_eq!(
@@ -453,6 +461,10 @@ async fn delete_collection_group_refuses_an_unknown_id_and_a_non_empty_group() {
                 "case DeleteCollection({collection}): expected 200, got {status} {code} with {body}"
             );
         }
+        // A deleted collection stays readable in `DELETING` until the clock makes its
+        // purge due, and it still belongs to the group until then: the group is empty
+        // once that purge has fallen due.
+        tokio::time::sleep(SETTLE_WAIT).await;
         let (status, code, body) = delete_group(&router, "us-east-1", json!({ "id": &id })).await;
         assert_eq!(
             (status, code.as_str()),

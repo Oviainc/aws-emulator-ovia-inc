@@ -76,12 +76,13 @@
 //! What a type's PROPERTIES are decides how its create call is built, which is why that
 //! half lives per type in [`super::provisioner`]: for
 //! `AWS::KinesisFirehose::DeliveryStream` the properties ARE the request's members, so the
-//! evaluated document is passed through verbatim; for `AWS::ECR::PublicRepository` they are
-//! not (`RepositoryName` / `RepositoryCatalogData.RepositoryDescription` against
-//! `repositoryName` / `catalogData.description`), so that arm maps the members the resource
-//! reference publishes one by one, and sends nothing for a property the template leaves
-//! out; and for `AWS::ECS::Cluster` they are the same members in a different CASE, with one
-//! renamed, so that arm re-cases them.
+//! evaluated document is passed through verbatim; for `AWS::ECR::PublicRepository` and the
+//! `AWS::OpenSearchServerless::*` types they are not (`RepositoryName` /
+//! `RepositoryCatalogData.RepositoryDescription` against `repositoryName` /
+//! `catalogData.description`, and `Name`/`Type`/`Policy` against `name`/`type`/`policy`), so
+//! those arms map the members the resource reference publishes one by one, and send nothing
+//! for a property the template leaves out; and for `AWS::ECS::Cluster` they are the same
+//! members in a different CASE, with one renamed, so that arm re-cases them.
 //!
 //! A type with no entry there is left DECLARED-ONLY: [`StoredResource::materialised`]
 //! stays `false` and nothing is created in any service. Such a resource still carries the
@@ -121,6 +122,17 @@
 //! attempted create that did not answer 2xx tells you is that the resource was not
 //! created. A declaration that is missing a property its resource type REQUIRES is
 //! refused the same way, naming that property.
+//!
+//! ## An identifier the owning service assigns
+//!
+//! Most types' physical resource id is a name the template asked for, which is why
+//! [`super::template::provision`] can compute it. Some are SERVER-minted instead: an
+//! OpenSearch Serverless collection's `Ref` is its `CollectionId`, which only the create
+//! reports. Such a type's create answers that identifier ([`Created`]) and it replaces the
+//! computed one, and
+//! [`identity_is_service_assigned`](super::template::identity_is_service_assigned) is what
+//! tells a re-deploy to carry the recorded identifier forward rather than read the
+//! resource as replaced.
 //!
 //! ## Identity, and the isolation these calls can and cannot carry
 //!

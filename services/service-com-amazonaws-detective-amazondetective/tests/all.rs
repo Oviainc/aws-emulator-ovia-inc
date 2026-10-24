@@ -21,6 +21,8 @@ mod datasource_package_ingest;
 mod datasource_package_reporting;
 #[path = "all/member_datasource_ingest_history.rs"]
 mod member_datasource_ingest_history;
+#[path = "all/member_removal.rs"]
+mod member_removal;
 #[path = "all/member_verification_outcome.rs"]
 mod member_verification_outcome;
 #[path = "all/not_found_and_validation_semantics.rs"]

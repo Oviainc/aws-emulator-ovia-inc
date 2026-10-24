@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveRegion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes an ADDITIONAL Region from the IAM Identity Center instance its
+//! `InstanceArn` names, from the same records `DescribeInstance` and `ListInstances`
+//! report. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The Region the request names enters `REMOVING` and its record stops existing when the
+//! clock makes the removal due (`crate::state::REGION_REMOVAL_SPAN`) — the sequence this
+//! operation documents: "This operation initiates an asynchronous workflow to clean up IAM
+//! Identity Center resources in the specified additional Region. The Region status is set
+//! to REMOVING and the Region record is deleted when the workflow completes." — so a
+//! caller that reads the instance straight after the remove observes the `REMOVING` the
+//! model's `RegionStatus` enum declares; nothing sleeps for it. A repeat of the remove is
+//! idempotent: it answers `REMOVING` again and cannot push the deletion out.
+//!
+//! The documented preconditions are refused rather than ignored:
+//!
+//! * an `InstanceArn` this account holds no instance for, and a `RegionName` the instance
+//!   is not enabled in, are the modelled `ResourceNotFoundException`;
+//! * "The request must be made from the primary Region" and "The target Region cannot be
+//!   the primary Region" are the modelled `ValidationException`;
+//! * "no other add or remove Region workflows can be in progress" is the modelled
+//!   `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +142,35 @@ impl From<RemoveRegionErrorModeled> for RemoveRegionError {
     }
 }
 
+/// The modelled refusal for a request this operation's documented preconditions reject.
+///
+/// This operation's model declares its own `ValidationException` ("The request failed
+/// because it contains a syntax error", HTTP 400), so a refusal uses THAT shape rather
+/// than the scaffold's synthetic one. `Reason` is left absent: every value the model's
+/// `ValidationExceptionReason` enum carries reports a KMS key fault
+/// (`KMS_InvalidKeyUsageException`, `KMS_InvalidStateException`, `KMS_DisabledException`),
+/// and neither of these refusals inspects a key.
+fn validation(message: impl Into<String>) -> RemoveRegionError {
+    RemoveRegionErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
+/// The modelled refusal for a resource this request names that does not exist.
+///
+/// `Reason` is left absent for the same kind of reason as above: the model's
+/// `ResourceNotFoundExceptionReason` enum reports KMS key states, not a missing instance
+/// or Region.
+fn not_found(message: impl Into<String>) -> RemoveRegionError {
+    RemoveRegionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
 /// The `RemoveRegion` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +207,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveRegion"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RemoveRegionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+        // The Region this call was MADE in, which the request carries only on its SigV4
+        // credential scope: "The request must be made from the primary Region."
+        let called_from = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // A WRITE, so it first materialises what the clock already owes: an instance whose
+        // deletion instant has passed is gone before this call looks for it, and a Region
+        // whose own removal workflow has run out is no longer one of the instance's.
+        store.on_request(&called_from, now);
+
+        // A syntactically valid ARN for an instance this account does not hold is a
+        // MISSING RESOURCE, which this operation models (unlike `DescribeInstance`, whose
+        // only not-found channel is `AccessDeniedException`).
+        let instance = store.instance_mut(&input.instance_arn).ok_or_else(|| {
+            not_found(crate::state::instance_not_found_message(&input.instance_arn))
+        })?;
+        let primary_region = instance.primary_region.clone();
+
+        // "The request must be made from the primary Region."
+        if called_from != primary_region {
+            return Err(validation(format!(
+                "RemoveRegion must be called in the primary Region of instance {} \
+                 ({primary_region}); this request was made in {called_from}",
+                input.instance_arn
+            )));
+        }
+
+        // "The target Region cannot be the primary Region" — `IsPrimaryRegion` is
+        // documented as "The primary Region cannot be removed."
+        if input.region_name == primary_region {
+            return Err(validation(format!(
+                "RegionName {} is the primary Region of instance {} and cannot be removed",
+                input.region_name, input.instance_arn
+            )));
+        }
+
+        // Only a Region the instance is ENABLED in can be removed; anything else names no
+        // resource.
+        if instance.region(&input.region_name).is_none() {
+            return Err(not_found(format!(
+                "Instance {} is not enabled in Region {}",
+                input.instance_arn, input.region_name
+            )));
+        }
+
+        // "no other add or remove Region workflows can be in progress" — any Region of
+        // this instance still `ADDING` or `REMOVING` is such a workflow. The one exception
+        // is the TARGET's own REMOVING, which this very operation started: a repeat of the
+        // call is idempotent below. A target still `ADDING` is NOT an exception — its add
+        // workflow is in progress, so the remove is refused rather than overwriting it.
+        if let Some(busy) = instance.regions.iter().find(|region| {
+            region.workflow_in_progress()
+                && !(region.region_name == input.region_name && region.removed_due.is_some())
+        }) {
+            return Err(RemoveRegionErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "An add or remove Region workflow is already in progress on instance {}: \
+                     Region {} is {}",
+                    input.instance_arn, busy.region_name, busy.status
+                )),
+            })
+            .into());
+        }
+
+        // The Region enters `REMOVING` and its record is deleted when the clock makes the
+        // removal due (`crate::state::REGION_REMOVAL_SPAN`). A repeat keeps the instant the
+        // first remove fixed, so it cannot push the deletion out.
+        let region = instance
+            .region_mut(&input.region_name)
+            .expect("the target Region was just resolved on this instance");
+        region.start_removal(now);
+        Ok(RemoveRegionOutput {
+            status: Some(region.status.clone()),
+        })
     }
 }

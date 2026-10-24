@@ -25,7 +25,7 @@ async fn claim(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
 }
 
 /// Claim one device by id, asserting the claim succeeded.
-async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
+pub async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
     let (status, body) = claim(router, json!({ "id": id })).await;
     assert_eq!(
         status, 200,
@@ -33,11 +33,11 @@ async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
     );
 }
 
-async fn describe_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub async fn describe_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/prod/inputDevices/{id}"), None).await
 }
 
-async fn start_maintenance_window(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub async fn start_maintenance_window(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -48,7 +48,7 @@ async fn start_maintenance_window(router: &MultiServiceRouter, id: &str) -> (u16
 }
 
 /// The device as `DescribeInputDevice` reports it right now.
-async fn device(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub async fn device(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     let (status, described) = describe_device(router, id).await;
     assert_eq!(
         status, 200,

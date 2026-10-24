@@ -163,6 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
+        // The moves the clock already owes, materialised before anything is read:
+        // a torn-down record past its retention is no longer reported, and neither is
+        // the `ClientToken` of the create that made it, so the replay below cannot
+        // hand back an id this service has stopped knowing.
+        state.settle_all(std::time::Instant::now());
 
         // `@idempotent` + `@idempotencyToken`: a repeat call carrying a token this
         // service has already created for replays the SAME id and creates nothing.
@@ -174,9 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A real account has a Service Quotas limit on WorkSpace Instances, and this
-        // operation models `ServiceQuotaExceededException` for reaching it. Capacity
-        // is released by DeleteWorkspaceInstance.
+        // A real account has a Service Quotas limit on RUNNING WorkSpace Instances,
+        // and this operation models `ServiceQuotaExceededException` for reaching it.
+        // An instance `DeleteWorkspaceInstance` has started tearing down is no longer
+        // running, so it no longer holds a slot even while it is still reported — and
+        // a second bound on the records held in total keeps the store from growing
+        // without bound through those (see `state::MAX_HELD_INSTANCES`). The count the
+        // error reports is what the account HOLDS, whichever bound was reached.
         if !state.has_instance_capacity() {
             return Err(
                 CreateWorkspaceInstanceErrorModeled::ServiceQuotaExceededException(
@@ -218,6 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token.clone(),
             created_at: std::time::SystemTime::now(),
             allocation_due: std::time::Instant::now() + crate::state::ALLOCATION_SPAN,
+            // Nothing has asked for this instance to be torn down, so no
+            // deallocation deadline is owed yet; `DeleteWorkspaceInstance` sets it.
+            deallocation_due: None,
         };
 
         if let Some(token) = input.client_token {

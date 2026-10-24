@@ -54,7 +54,14 @@ async fn get_router_output(emulator: &Emulator, arn: &str) -> (u16, Option<Strin
         .await
 }
 
-async fn delete_router_output(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
+/// Send one DeleteRouterOutput request.
+///
+/// `pub(crate)` because `tests/all/update_router_output.rs` drives the same delete to reach
+/// an output whose deletion is in progress, so there is one spelling of the call.
+pub(crate) async fn delete_router_output(
+    emulator: &Emulator,
+    arn: &str,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("DELETE", &format!("/v1/routerOutput/{arn}"), None)
         .await

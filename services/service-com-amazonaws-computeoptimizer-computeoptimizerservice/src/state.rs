@@ -37,23 +37,26 @@ use crate::ops::types::{
     AutoScalingGroupConfiguration, CustomizableMetricParameters, DBStorageConfiguration,
     EBSEffectiveRecommendationPreferences, EBSEstimatedMonthlySavings, EBSSavingsEstimationMode,
     EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, EffectivePreferredResource,
-    EffectiveRecommendationPreferences, EstimatedMonthlySavings, ExternalMetricsPreference,
-    IdleRecommendation, IdleRecommendationFilter, InstanceSavingsEstimationMode,
+    EffectiveRecommendationPreferences, EstimatedMonthlySavings, ExportDestination,
+    ExternalMetricsPreference, IdleRecommendation, IdleRecommendationFilter,
+    InstanceSavingsEstimationMode, JobFilter,
     LambdaEffectiveRecommendationPreferences, LambdaEstimatedMonthlySavings,
     LambdaFunctionMemoryProjectedMetric, LambdaFunctionMemoryRecommendationOption,
     LambdaFunctionRecommendation, LambdaFunctionRecommendationFilter,
     LambdaFunctionUtilizationMetric, LambdaSavingsEstimationMode,
     LambdaSavingsOpportunityAfterDiscounts, PreferredResource, PutRecommendationPreferencesInput,
     RDSDBRecommendation, RDSDBRecommendationFilter, RDSDBUtilizationMetric,
-    RecommendationPreferencesDetail, SavingsOpportunity, Scope, Tag, UtilizationMetric,
-    UtilizationPreference, VolumeConfiguration, VolumeRecommendation, VolumeRecommendationOption,
+    RecommendationExportJob, RecommendationPreferencesDetail, S3Destination, SavingsOpportunity,
+    Scope, Tag, UtilizationMetric, UtilizationPreference, VolumeConfiguration,
+    VolumeRecommendation, VolumeRecommendationOption,
     IDLE_FINDING_VALUES, IDLE_RECOMMENDATION_FILTER_NAME_VALUES,
-    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES, IDLE_VALUES,
-    LAMBDA_FUNCTION_RECOMMENDATION_FILTER_NAME_VALUES,
+    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES, IDLE_VALUES, JOB_FILTER_NAME_VALUES,
+    JOB_STATUS_VALUES, LAMBDA_FUNCTION_RECOMMENDATION_FILTER_NAME_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_VALUES, R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES,
     R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES, R_D_S_INSTANCE_FINDING_VALUES,
     R_D_S_STORAGE_FINDING_REASON_CODE_VALUES, R_D_S_STORAGE_FINDING_VALUES,
+    RESOURCE_TYPE_VALUES,
 };
 
 /// The look-back period in force when no preference sets one. From the model's own
@@ -153,6 +156,16 @@ impl Default for Enrollment {
     }
 }
 
+/// The current instant, in seconds since the Unix epoch, on the same scale as every
+/// timestamp this service stores and reports (`::aws_smithy_types::DateTime`).
+///
+/// Every clock-driven rule in this module reads the time through here — the enrollment
+/// analysis that becomes due, the export job whose status moves on — so no two of them can
+/// disagree about what "now" is or about the units they compare in.
+pub fn now_secs() -> f64 {
+    DateTime::from(::std::time::SystemTime::now()).as_secs_f64()
+}
+
 impl Enrollment {
     /// Whether the account is opted in. The operations that model
     /// `OptInRequiredException` ("The account is not opted in to Compute Optimizer")
@@ -168,7 +181,7 @@ impl Enrollment {
     /// The due instant is DERIVED from the stored `lastUpdatedTimestamp` and compared
     /// against the clock; nothing waits for it and no reader writes it.
     pub fn analysis_due(&self) -> bool {
-        let now = DateTime::from(::std::time::SystemTime::now()).as_secs_f64();
+        let now = now_secs();
         self.last_updated_timestamp
             .as_ref()
             .is_some_and(|written| now - written.as_secs_f64() >= ANALYSIS_DELAY.as_secs_f64())
@@ -3317,6 +3330,348 @@ fn observed_functions() -> Vec<ObservedFunction> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Recommendation export jobs
+//
+// Every `Export*Recommendations` operation of this service does the same thing: it QUEUES
+// one asynchronous export job against the destination bucket the request names, and answers
+// the job's id plus the object keys the export file and its metadata file will be written
+// under. `DescribeRecommendationExportJobs` is the reader of those jobs. So the job record
+// and every rule over it live here ONCE, whichever export operation created it: the keys a
+// job's destination derives, the status lifecycle the clock drives, the
+// one-job-in-progress-per-Region limit each export operation documents, the seven-day
+// window the reader reports over, and the `JobFilter` vocabulary it selects with.
+//
+// What the job does NOT hold is the exported file: the destination is a bucket in the
+// CALLER's account, which this emulator does not serve, and no operation of this API ever
+// returns the file's content. The record is the whole of what a client can observe.
+// ---------------------------------------------------------------------------
+
+/// The `JobStatus` values (`crate::ops::types::JOB_STATUS_VALUES`), named so the rules
+/// below read as the model's own vocabulary.
+pub const JOB_STATUS_QUEUED: &str = "Queued";
+/// See [`JOB_STATUS_QUEUED`].
+pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`JOB_STATUS_QUEUED`].
+pub const JOB_STATUS_COMPLETE: &str = "Complete";
+
+/// The `JobFilterName` values (`crate::ops::types::JOB_FILTER_NAME_VALUES`): "Specify
+/// `ResourceType` to return export jobs of a specific resource type ... Specify `JobStatus`
+/// to return export jobs with a specific status".
+pub const JOB_FILTER_RESOURCE_TYPE: &str = "ResourceType";
+/// See [`JOB_FILTER_RESOURCE_TYPE`].
+pub const JOB_FILTER_JOB_STATUS: &str = "JobStatus";
+
+/// The `ResourceType` an idle resource export job carries, which
+/// `ExportIdleRecommendations` exports recommendations for
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES`).
+pub const RESOURCE_TYPE_IDLE: &str = "Idle";
+
+/// How long each step of an export job's lifecycle takes: a created job stays `Queued` for
+/// this long, then runs `InProgress` for this long, then is `Complete`.
+///
+/// AWS documents no duration for either step — an export takes as long as it takes — so
+/// this is the emulator's own span. It is deliberately NON-ZERO, so a caller that describes
+/// the job straight after creating it still sees the transient `Queued` status and the
+/// one-job-in-progress limit it implies, and short enough that a caller can poll the job
+/// through to `Complete`.
+pub const EXPORT_JOB_STEP: Duration = Duration::from_millis(250);
+
+/// How long a created export job is reported for: "Describes recommendation export jobs
+/// created in the last seven days" (`DescribeRecommendationExportJobs`). An older job is
+/// neither reported nor kept.
+pub const EXPORT_JOB_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The most export jobs this store holds. Every export call allocates a record, so without
+/// this bound repeated calls could grow one emulator process without limit. A call past
+/// this count is REFUSED with the `LimitExceededException` the export operations model
+/// ([`ExportJobStore::can_hold`]).
+pub const MAX_EXPORT_JOBS: usize = 1_000;
+
+/// One recommendation export job, as `ExportIdleRecommendations` creates it and
+/// `DescribeRecommendationExportJobs` reports it.
+///
+/// Its STATUS is not stored: it is derived from the creation instant
+/// ([`Self::status_at`]), because the lifecycle is owed by the clock rather than by any
+/// call. So a reader reports the status the clock has made due without writing to the
+/// store, and two readers of one job can never disagree about where it has got to.
+#[derive(Debug, Clone)]
+pub struct ExportJob {
+    /// The `JobId` this job was minted with ([`ExportJobStore::mint_job_id`]).
+    pub job_id: String,
+    /// The Region whose endpoint created it. Compute Optimizer is regional, so both the
+    /// one-job-in-progress limit and what a reader reports are per Region.
+    pub region: String,
+    /// The `ResourceType` of the exported recommendations.
+    pub resource_type: String,
+    /// The destination bucket the request named. Compute Optimizer does not create it.
+    pub bucket: String,
+    /// The object key of the export file, and of its metadata file
+    /// ([`export_destination_keys`]).
+    pub key: String,
+    /// See [`Self::key`].
+    pub metadata_key: String,
+    /// When the job was created, in seconds since the epoch ([`now_secs`]).
+    pub created_at: f64,
+}
+
+impl ExportJob {
+    /// The job's `JobStatus` at `now`: `Queued` until the first step has elapsed,
+    /// `InProgress` until the second has, `Complete` after that. `Complete` is terminal,
+    /// so the status never moves again.
+    pub fn status_at(&self, now: f64) -> &'static str {
+        let step = EXPORT_JOB_STEP.as_secs_f64();
+        let elapsed = now - self.created_at;
+        if elapsed >= 2.0 * step {
+            JOB_STATUS_COMPLETE
+        } else if elapsed >= step {
+            JOB_STATUS_IN_PROGRESS
+        } else {
+            JOB_STATUS_QUEUED
+        }
+    }
+
+    /// When the job last changed, at `now`: the instant the status it currently reports
+    /// became due, which for a job still `Queued` is the instant it was created.
+    pub fn last_updated_at(&self, now: f64) -> f64 {
+        let step = EXPORT_JOB_STEP.as_secs_f64();
+        match self.status_at(now) {
+            JOB_STATUS_COMPLETE => self.created_at + 2.0 * step,
+            JOB_STATUS_IN_PROGRESS => self.created_at + step,
+            _ => self.created_at,
+        }
+    }
+
+    /// Whether the job is still running at `now`, i.e. has not reached a terminal status.
+    /// This is what "only one export job in progress per Amazon Web Services Region"
+    /// counts.
+    pub fn is_in_progress(&self, now: f64) -> bool {
+        self.status_at(now) != JOB_STATUS_COMPLETE
+    }
+
+    /// Whether the job was created within the last seven days, the window
+    /// `DescribeRecommendationExportJobs` reports over.
+    pub fn is_reported_at(&self, now: f64) -> bool {
+        now - self.created_at < EXPORT_JOB_RETENTION.as_secs_f64()
+    }
+
+    /// The `S3Destination` of the export: the bucket the request named and the keys the
+    /// export file and its metadata file are written under. Answered by the export
+    /// operation that created the job and reported by the job's reader, so the two cannot
+    /// name different objects.
+    pub fn s3_destination(&self) -> S3Destination {
+        S3Destination {
+            bucket: Some(self.bucket.clone()),
+            key: Some(self.key.clone()),
+            metadata_key: Some(self.metadata_key.clone()),
+        }
+    }
+
+    /// The job as `DescribeRecommendationExportJobs` reports it at `now`.
+    ///
+    /// `failureReason` is "the reason for an export job failure": this emulator's export
+    /// jobs are refused at the export call when they cannot be created at all, and none
+    /// fails afterwards, so a reported job carries no failure reason.
+    pub fn to_wire(&self, now: f64) -> RecommendationExportJob {
+        RecommendationExportJob {
+            job_id: Some(self.job_id.clone()),
+            destination: Some(ExportDestination {
+                s3: Some(self.s3_destination()),
+            }),
+            resource_type: Some(self.resource_type.clone()),
+            status: Some(self.status_at(now).to_string()),
+            creation_timestamp: Some(DateTime::from_secs_f64(self.created_at)),
+            last_updated_timestamp: Some(DateTime::from_secs_f64(self.last_updated_at(now))),
+            failure_reason: None,
+        }
+    }
+}
+
+/// The export jobs this service holds, in CREATION order, so a page boundary a reader
+/// hands out stays where it was whatever is created afterwards.
+#[derive(Debug)]
+pub struct ExportJobStore {
+    /// The jobs, oldest first.
+    jobs: Vec<ExportJob>,
+    /// How many ids this store has minted, which is what makes the next one unique.
+    minted: u64,
+    /// A per-store seed, so two stores created in one process mint disjoint id sequences.
+    seed: u128,
+}
+
+impl Default for ExportJobStore {
+    fn default() -> Self {
+        Self {
+            jobs: Vec::new(),
+            minted: 0,
+            seed: ::std::time::SystemTime::now()
+                .duration_since(::std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos()),
+        }
+    }
+}
+
+impl ExportJobStore {
+    /// Mint the next `JobId`. The model types a job id as an opaque string and the service
+    /// answers a UUID, so this hands out a UUID-shaped identifier derived from this store's
+    /// seed and the number of ids it has already minted: unique per job, and never
+    /// reachable from anything the request carried.
+    pub fn mint_job_id(&mut self) -> String {
+        self.minted = self.minted.saturating_add(1);
+        uuid_shaped(&format!("{}:{}", self.seed, self.minted))
+    }
+
+    /// Whether another job may be stored: only while the store is below
+    /// [`MAX_EXPORT_JOBS`]. Callers refuse with a modelled error rather than growing past
+    /// the bound.
+    pub fn can_hold(&self) -> bool {
+        self.jobs.len() < MAX_EXPORT_JOBS
+    }
+
+    /// Record a created job. Newest last, so [`Self::iter_in_order`] stays creation-ordered.
+    pub fn insert(&mut self, job: ExportJob) {
+        self.jobs.push(job);
+    }
+
+    /// Every stored job, oldest first.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &ExportJob> {
+        self.jobs.iter()
+    }
+
+    /// How many jobs the store holds, whether or not they are still reported.
+    pub fn len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// Whether the store holds no job at all.
+    pub fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    /// The job of `resource_type` still running in `region` at `now`, if any: what "You can
+    /// have only one ... export job in progress per Amazon Web Services Region" refuses a
+    /// second export against.
+    pub fn in_progress_in(
+        &self,
+        region: &str,
+        resource_type: &str,
+        now: f64,
+    ) -> Option<&ExportJob> {
+        self.jobs.iter().find(|job| {
+            job.region == region && job.resource_type == resource_type && job.is_in_progress(now)
+        })
+    }
+
+    /// Drop the jobs created more than seven days ago, which no reader reports any more.
+    /// Called from the export path, which is already a mutation; a reader never writes.
+    pub fn prune_expired(&mut self, now: f64) {
+        self.jobs.retain(|job| job.is_reported_at(now));
+    }
+}
+
+/// A UUID-shaped identifier for `seed`: the first 30 hex digits of its SHA-256, laid out
+/// 8-4-4-4-12 with the version and variant nibbles RFC 4122 fixes for a random UUID. The
+/// digest is what makes two seeds that differ anywhere give unrelated identifiers.
+fn uuid_shaped(seed: &str) -> String {
+    let digest = ::hex::encode(Sha256::digest(seed.as_bytes()));
+    format!(
+        "{}-{}-4{}-8{}-{}",
+        &digest[0..8],
+        &digest[8..12],
+        &digest[12..15],
+        &digest[15..18],
+        &digest[18..30]
+    )
+}
+
+/// The object keys an export job writes under: the export file and its metadata file.
+///
+/// AWS documents the destination as "the Amazon S3 bucket name and key prefix for a
+/// recommendations export job" and the two files as "a comma-separated values (CSV) file,
+/// and its metadata in a JavaScript Object Notation (JSON) file", but publishes no key
+/// layout, so this is the emulator's own: the caller's prefix, then the account the export
+/// is for, then the service, the resource type and the job id — which is what makes the two
+/// keys of one job unique and tells two jobs of one bucket apart. Shared by every export
+/// operation, so none of them lays its destination out differently.
+pub fn export_destination_keys(
+    key_prefix: Option<&str>,
+    account_id: &str,
+    resource_type: &str,
+    job_id: &str,
+) -> (String, String) {
+    let prefix = key_prefix
+        .map(|prefix| prefix.trim_matches('/'))
+        .filter(|prefix| !prefix.is_empty())
+        .map_or_else(String::new, |prefix| format!("{prefix}/"));
+    let stem = format!("{prefix}{account_id}/ComputeOptimizer/{resource_type}/{job_id}");
+    (format!("{stem}.csv"), format!("{stem}-metadata.json"))
+}
+
+/// Check a `DescribeRecommendationExportJobs` filter set against the model's own
+/// vocabulary, returning the reason it is not valid.
+///
+/// `name` is a `JobFilterName` and the values a filter carries are the value set of the
+/// member that name selects on: `ResourceType` selects on `ResourceType` and `JobStatus` on
+/// `JobStatus`. A name or a value outside those sets is refused rather than silently
+/// matching nothing. (The member's prose still names only `Ec2Instance` and
+/// `AutoScalingGroup` as resource types, which the `ResourceType` enum has since outgrown;
+/// the enum is the vocabulary.)
+pub fn job_filter_rejection(filters: &[JobFilter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                JOB_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let vocabulary: &[&str] = match name {
+            JOB_FILTER_RESOURCE_TYPE => RESOURCE_TYPE_VALUES,
+            JOB_FILTER_JOB_STATUS => JOB_STATUS_VALUES,
+            _ => {
+                return Some(format!(
+                    "The value supplied for parameter filters is not valid: {name} is not a \
+                     filter name, which must be one of [{}].",
+                    JOB_FILTER_NAME_VALUES.join(", ")
+                ))
+            }
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value of \
+                 the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Does `job` satisfy every `DescribeRecommendationExportJobs` filter at `now`?
+///
+/// A filter matches when the member its name selects on equals any of the filter's values;
+/// several filters are ANDed, and a filter carrying no values constrains nothing. An
+/// unrecognised name never reaches here — [`job_filter_rejection`] refuses the request
+/// first.
+pub fn export_job_matches_filters(job: &ExportJob, filters: &[JobFilter], now: f64) -> bool {
+    filters.iter().all(|filter| {
+        let Some(values) = filter.values.as_ref().filter(|values| !values.is_empty()) else {
+            return true;
+        };
+        let member = match filter.name.as_deref() {
+            Some(JOB_FILTER_RESOURCE_TYPE) => Some(job.resource_type.as_str()),
+            Some(JOB_FILTER_JOB_STATUS) => Some(job.status_at(now)),
+            _ => None,
+        };
+        member.is_some_and(|member| values.iter().any(|value| value == member))
+    })
+}
+
 /// Per-service state for com-amazonaws-computeoptimizer-computeoptimizerservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
@@ -3360,13 +3715,18 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// `GetIdleRecommendations` reports. See [`IdleRecommendationStore`]: no operation of
     /// this API writes one.
     pub idle_recommendations: IdleRecommendationStore,
+    /// The recommendation export jobs the account has created, which every
+    /// `Export*Recommendations` operation writes to and
+    /// `DescribeRecommendationExportJobs` reports. See [`ExportJobStore`].
+    pub export_jobs: ExportJobStore,
 }
 
 impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The store's initial value: the account is not opted in, nobody has written a
     /// preference, the EBS volume observation, the Auto Scaling group analysis and the
     /// findings catalog this emulator analysed — which a reader only sees once the account
-    /// is enrolled — and no idle resource recommendation (only an analysis records one).
+    /// is enrolled — no idle resource recommendation (only an analysis records one) and no
+    /// export job (only an export call creates one).
     fn default() -> Self {
         Self {
             enrollment: Enrollment::default(),
@@ -3382,6 +3742,7 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             auto_scaling_group_analyses: seed_auto_scaling_group_analyses(),
             analysed_resources: seed_analysed_resources(),
             idle_recommendations: IdleRecommendationStore::default(),
+            export_jobs: ExportJobStore::default(),
         }
     }
 }

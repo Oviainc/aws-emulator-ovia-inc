@@ -821,6 +821,15 @@ pub const NOT_INGESTED_FOR_REASON: &str = "The account is not an account of the 
 /// without one — the administrator included — has no member details in this graph.
 pub const NOT_A_MEMBER_REASON: &str = "The account is not a member account in the behavior graph.";
 
+/// Why the account that administers a behavior graph is reported unprocessed when a
+/// member-removal batch names it: `DeleteMembers` documents that "an administrator
+/// account cannot use DeleteMembers to remove their own account from the behavior graph.
+/// To disable a behavior graph, the administrator account uses the DeleteGraph API
+/// method."
+pub const ADMINISTRATOR_NOT_REMOVABLE_REASON: &str =
+    "The account administers this behavior graph and cannot be removed from it; use \
+     DeleteGraph to disable the behavior graph.";
+
 /// An `UnprocessedAccount` naming `account_id` and why it was not processed.
 pub fn unprocessed(account_id: &str, reason: String) -> UnprocessedAccount {
     UnprocessedAccount {

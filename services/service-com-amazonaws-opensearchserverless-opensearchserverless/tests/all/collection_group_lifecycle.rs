@@ -311,7 +311,14 @@ async fn batch_get_collection_group_counts_collections_and_reports_missing_keys(
         let (status, code, answer) = call(
             &router,
             "CreateCollection",
-            json!({ "name": collection, "collectionGroupName": group }),
+            // A collection's encryption setting has to come from somewhere — the request's
+            // `encryptionConfig` or an `encryption` policy covering its name — and this
+            // case is about the group it names, so it carries the AWS-owned key.
+            json!({
+                "name": collection,
+                "collectionGroupName": group,
+                "encryptionConfig": { "aWSOwnedKey": true },
+            }),
         )
         .await;
         assert_eq!(

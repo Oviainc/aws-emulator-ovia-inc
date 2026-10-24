@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCollection
-//! IMPLEMENTED: removes the `CollectionRecord` stored in [`crate::state`] under the
-//! requested id (and its name index entry), reporting it in the `DELETING` status, so a
-//! later `BatchGetCollection` reports it in `collectionErrorDetails` and `ListCollections`
-//! no longer lists it. Refuses a collection whose deletion protection is on, or one not
-//! yet in a state it may be deleted from.
+//! IMPLEMENTED: ACCEPTS the deletion of the `CollectionRecord` stored in [`crate::state`]
+//! under the requested id — the collection moves to `DELETING` and stays readable there
+//! until the clock makes its purge due, after which `BatchGetCollection` reports it in
+//! `collectionErrorDetails`, `ListCollections` no longer lists it and its name is free
+//! again. Refuses a collection whose deletion protection is on (`ValidationException`, a
+//! configuration refusal) and one not in a state it may be deleted from
+//! (`ConflictException`).
 //!
 //! ## Shape of an operation
 //!
@@ -177,17 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.collections.get(&input.id) else {
             return Err(DeleteCollectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Collection with ID {} is not found", input.id)),
+                    message: Some(crate::state::collection_not_found_message(&input.id)),
                 },
             )
             .into());
         };
 
         // From `DeletionProtection`'s own documentation: "When deletion protection is
-        // ENABLED, the collection cannot be deleted."
+        // ENABLED, the collection cannot be deleted." That refusal is the collection's own
+        // CONFIGURATION, not a transient state of it — nothing changes it but a request
+        // that turns the setting off — so it is the modelled `ValidationException` (400)
+        // rather than the `ConflictException` (409) a retry could clear.
         if record.deletion_protection == crate::state::DELETION_PROTECTION_ENABLED {
-            return Err(DeleteCollectionErrorModeled::ConflictException(
-                ConflictException {
+            return Err(DeleteCollectionErrorModeled::ValidationException(
+                ValidationException {
                     message: Some(format!(
                         "Collection with ID {} has deletion protection enabled and cannot be deleted",
                         input.id
@@ -199,7 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // From `ConflictException`'s own documentation: "When deleting a resource, thrown
         // when the resource is not in the ACTIVE, FAILED, or UPDATE_FAILED state" — so a
-        // collection still being created cannot be deleted yet.
+        // collection still being created, already being deleted, or mid-update cannot be
+        // deleted yet.
         if !crate::state::DELETABLE_STATUSES.contains(&record.status.as_str()) {
             return Err(DeleteCollectionErrorModeled::ConflictException(
                 ConflictException {
@@ -212,23 +218,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(mut removed) = store.remove_collection(&input.id) else {
+        // The delete is ACCEPTED here, not completed: the collection is reported in
+        // `DELETING` and stays readable in that status until the clock makes its purge
+        // due, so a caller polling the deletion observes the state it goes through
+        // instead of the resource vanishing in one step.
+        let deleted_at = crate::state::now_epoch_millis();
+        let Some(record) = store.collections.get_mut(&input.id) else {
             return Err(DeleteCollectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Collection with ID {} is not found", input.id)),
+                    message: Some(crate::state::collection_not_found_message(&input.id)),
                 },
             )
             .into());
         };
-        // The removed record is reported in `DELETING`: the delete has been accepted and
-        // the collection is gone from every later read, so this is the last status any
-        // caller sees for it.
-        removed.status = crate::state::COLLECTION_DELETING.to_string();
-        removed.pending_status = None;
-        removed.last_modified_date = crate::state::now_epoch_millis();
+        record.begin_deletion(deleted_at);
 
         Ok(DeleteCollectionOutput {
-            delete_collection_detail: Some(removed.delete_detail()),
+            delete_collection_detail: Some(record.delete_detail()),
         })
     }
 }

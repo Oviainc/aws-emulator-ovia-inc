@@ -81,6 +81,12 @@ fn graph_scoped_calls() -> Vec<GraphScopedCall> {
             body: |arn| json!({ "GraphArn": arn, "AccountIds": [account_id(0)] }),
         },
         GraphScopedCall {
+            name: "DeleteMembers",
+            method: "POST",
+            uri: |_| "/graph/members/removal".to_string(),
+            body: |arn| json!({ "GraphArn": arn, "AccountIds": [account_id(0)] }),
+        },
+        GraphScopedCall {
             name: "DeleteGraph",
             method: "POST",
             uri: |_| "/graph/removal".to_string(),

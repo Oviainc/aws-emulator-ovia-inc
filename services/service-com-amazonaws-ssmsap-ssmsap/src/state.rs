@@ -16,17 +16,25 @@
 //! only ever reaches the partition of the Region its request was signed for
 //! ([`request_region`]).
 //!
+//! A configuration check is the service's OTHER asynchronous unit of work:
+//! `StartConfigurationChecks` files one [`StoredConfigurationCheckOperation`] per
+//! requested check in [`RegionState::configuration_check_operations`], which
+//! `GetConfigurationCheckOperation` reads back by its id — in that Region alone, like
+//! every other record.
+//!
 //! The record is the stored half; the wire half (`Application`, `ApplicationSummary`,
-//! `Operation`) is PROJECTED from it by [`StoredApplication::view`] /
-//! [`StoredApplication::summary`] / [`StoredOperation::view`], so no handler assembles
-//! a response member by hand.
+//! `Operation`, `ConfigurationCheckOperation`) is PROJECTED from it by
+//! [`StoredApplication::view`] / [`StoredApplication::summary`] /
+//! [`StoredOperation::view`] / [`StoredConfigurationCheckOperation::view`], so no
+//! handler assembles a response member by hand.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Application, ApplicationCredential, ApplicationSummary, ConflictException, Filter,
-    InternalServerException, Operation, ResourceNotFoundException, ValidationException,
+    Application, ApplicationCredential, ApplicationSummary, ConfigurationCheckOperation,
+    ConflictException, Filter, InternalServerException, Operation, ResourceNotFoundException,
+    ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -68,6 +76,10 @@ pub const OPERATION_STATUS_INPROGRESS: &str = "INPROGRESS";
 
 /// `OperationStatus` for an operation that completed.
 pub const OPERATION_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// `OperationStatus` for an operation that ended without doing its work. One of the
+/// model's `OperationStatus` values (see [`crate::ops::types::OPERATION_STATUS_VALUES`]).
+pub const OPERATION_STATUS_ERROR: &str = "ERROR";
 
 /// `Operation$Type` for the operation `RegisterApplication` files.
 ///
@@ -124,9 +136,10 @@ pub const MAX_APPLICATIONS: usize = 1_000;
 /// hold something count against it.
 pub const MAX_REGIONS: usize = 64;
 
-/// How many operation records are retained per Region. Beyond this the oldest record
-/// that has already reached a terminal status is dropped first, so a caller polling a
-/// fresh operation can still resolve it.
+/// How many operation records are retained per Region, per kind of record (application
+/// operations, configuration check operations). Beyond this the oldest record that has
+/// already reached a terminal status is dropped first, so a caller polling a fresh
+/// operation can still resolve it.
 pub const MAX_RETAINED_OPERATIONS: usize = 10_000;
 
 /// The page size `ListApplications` uses when the caller names no `MaxResults`, and
@@ -271,6 +284,12 @@ pub struct StoredOperation {
 }
 
 impl StoredOperation {
+    /// How this record ranks for eviction when the store is full: see [`evict_oldest`].
+    /// The record with the smallest rank goes first, so a finished record is dropped
+    /// before any that is still running, oldest first.
+    fn eviction_rank(&self) -> (bool, SystemTime) {
+        (self.status == OPERATION_STATUS_INPROGRESS, self.start_time)
+    }
     /// Materialise the terminal status the clock already owes this operation: it was
     /// due to succeed at `success_due_at` whether or not anybody asked.
     pub fn settle(&mut self, now: SystemTime) {
@@ -304,6 +323,112 @@ impl StoredOperation {
     }
 }
 
+/// What a configuration check operation reports once the clock has brought it to its
+/// terminal status.
+///
+/// A configuration check evaluates AWS's own catalogue of SAP rules against a live SAP
+/// system. This emulator holds the service's CONTROL plane — the registered
+/// application, the operation record, its id, its status and its timestamps — but it
+/// runs no SAP system and the model carries no rule catalogue
+/// (`smithy_query(query="shape", shape="ConfigurationCheckType")` is three opaque
+/// identifiers with no prose), so there is nothing here that can evaluate a rule.
+/// Rather than synthesise results that would look computed, the run ends in the
+/// model's own failure status (`ERROR`, see
+/// [`crate::ops::types::OPERATION_STATUS_VALUES`]) with a `StatusMessage` that says
+/// why, and reports NO `RuleStatusCounts`: no rule ran, so there is nothing to count.
+pub const CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE: &str =
+    "This emulator holds no SAP system to evaluate configuration check rules against, \
+     so no rule results were produced for this check.";
+
+/// A configuration check operation: one requested check, running against one
+/// registered application. The record `GetConfigurationCheckOperation` reads.
+#[derive(Debug, Clone)]
+pub struct StoredConfigurationCheckOperation {
+    pub id: String,
+    /// The `ApplicationId` of the application the check was started against.
+    pub application_id: String,
+    /// A `ConfigurationCheckType` value (see
+    /// [`crate::ops::types::CONFIGURATION_CHECK_TYPE_VALUES`]).
+    pub check_id: String,
+    /// An `OperationStatus` value; see the `OPERATION_STATUS_*` constants.
+    pub status: String,
+    pub status_message: Option<String>,
+    pub start_time: SystemTime,
+    pub end_time: Option<SystemTime>,
+    /// When this check's terminal status falls due. See [`TRANSITION_SPAN`].
+    pub terminal_due_at: SystemTime,
+}
+
+impl StoredConfigurationCheckOperation {
+    /// How this record ranks for eviction when the store is full; see
+    /// [`StoredOperation::eviction_rank`], which the two records share the policy of.
+    fn eviction_rank(&self) -> (bool, SystemTime) {
+        (self.status == OPERATION_STATUS_INPROGRESS, self.start_time)
+    }
+    /// Materialise the terminal status the clock already owes this check: it was due to
+    /// end at `terminal_due_at` whether or not anybody asked.
+    ///
+    /// See [`CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] for why the terminal status is
+    /// the model's failure status rather than `SUCCESS`.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status != OPERATION_STATUS_INPROGRESS || now < self.terminal_due_at {
+            return;
+        }
+        self.status = OPERATION_STATUS_ERROR.to_string();
+        self.status_message = Some(CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE.to_string());
+        self.end_time = Some(self.terminal_due_at);
+    }
+
+    /// Project the stored check onto the modelled `ConfigurationCheckOperation`.
+    ///
+    /// `ConfigurationCheckName` / `ConfigurationCheckDescription` are the catalogue's
+    /// prose for the check. Neither the model nor this emulator holds that text, so
+    /// they are reported ABSENT rather than invented; `RuleStatusCounts` is absent for
+    /// the reason [`CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] states.
+    pub fn view(&self) -> ConfigurationCheckOperation {
+        ConfigurationCheckOperation {
+            id: Some(self.id.clone()),
+            application_id: Some(self.application_id.clone()),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+            configuration_check_id: Some(self.check_id.clone()),
+            configuration_check_name: None,
+            configuration_check_description: None,
+            start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            rule_status_counts: None,
+        }
+    }
+}
+
+/// The configuration checks one `StartConfigurationChecks` call runs, in the order
+/// their operations are reported.
+///
+/// `ConfigurationCheckIds` names "the list of configuration checks to perform", so a
+/// request that names some runs exactly those; one that names none runs the service's
+/// whole catalogue of checks, which is the model's `ConfigurationCheckType` enum (see
+/// [`crate::ops::types::CONFIGURATION_CHECK_TYPE_VALUES`]) — a check added to the
+/// model is therefore started here without this function changing.
+///
+/// A check named twice in one request is one check to perform, so the result holds each
+/// requested check once, keeping the position of its first mention.
+pub fn configuration_checks_to_run(requested: Option<&[String]>) -> Vec<String> {
+    let named = requested.unwrap_or(&[]);
+    if named.is_empty() {
+        return CONFIGURATION_CHECK_TYPE_VALUES
+            .iter()
+            .map(|check| (*check).to_string())
+            .collect();
+    }
+    let mut checks: Vec<String> = Vec::with_capacity(named.len());
+    for check in named {
+        if !checks.iter().any(|seen| seen == check) {
+            checks.push(check.clone());
+        }
+    }
+    checks
+}
+
 /// Everything Systems Manager for SAP holds in ONE Region: the applications registered
 /// there, the operation records filed there, and their tags.
 ///
@@ -328,6 +453,12 @@ pub struct RegionState {
     /// Every operation record filed in this Region, keyed by `OperationId`. Bounded by
     /// [`MAX_RETAINED_OPERATIONS`].
     pub operations: BTreeMap<String, StoredOperation>,
+    /// Every configuration check operation, keyed by its own `OperationId` — written by
+    /// `StartConfigurationChecks` and read by `GetConfigurationCheckOperation`. A
+    /// separate map from `operations` because the two are separate resources in the
+    /// model: one is read as an `Operation`, the other as a
+    /// `ConfigurationCheckOperation`. Bounded by [`MAX_RETAINED_OPERATIONS`] too.
+    pub configuration_check_operations: BTreeMap<String, StoredConfigurationCheckOperation>,
     /// Tags by resource ARN — written by `RegisterApplication`'s `Tags` and read by
     /// `GetApplication`/`ListApplications`, so the later tagging APIs
     /// (`TagResource`/`UntagResource`/`ListTagsForResource`) have one place to join.
@@ -348,12 +479,18 @@ impl RegionState {
         for operation in self.operations.values_mut() {
             operation.settle(now);
         }
+        for check in self.configuration_check_operations.values_mut() {
+            check.settle(now);
+        }
     }
 
     /// Whether this Region holds nothing at all — the state an unused partition is in,
     /// and the one a partition returns to when its last application is deregistered.
     pub fn is_empty(&self) -> bool {
-        self.applications.is_empty() && self.operations.is_empty() && self.tags_by_arn.is_empty()
+        self.applications.is_empty()
+            && self.operations.is_empty()
+            && self.configuration_check_operations.is_empty()
+            && self.tags_by_arn.is_empty()
     }
 
     /// Resolve the application a request names by its id, its ARN, or its AppRegistry
@@ -434,38 +571,98 @@ impl RegionState {
                 success_due_at: now + TRANSITION_SPAN,
             },
         );
-        self.evict_oldest_operations();
+        evict_oldest(&mut self.operations, StoredOperation::eviction_rank);
         id
     }
 
-    /// Drop every operation record filed against `application_id` — used when the
-    /// application is deregistered, since nothing else would ever reclaim them.
+    /// File a configuration check operation for `check_id` against `application_id` and
+    /// return the record, so the caller reports the SAME thing a later
+    /// `GetConfigurationCheckOperation` reads.
+    ///
+    /// The record starts `INPROGRESS` with its terminal status due [`TRANSITION_SPAN`]
+    /// later — a configuration check is asynchronous, so a caller acting straight after
+    /// the start call still observes it running — and
+    /// [`StoredConfigurationCheckOperation::settle`] materialises that transition once
+    /// the clock reaches it. The id is a fresh UUID, which is what the model's
+    /// `OperationId` pattern describes.
+    pub fn record_configuration_check(
+        &mut self,
+        application_id: &str,
+        check_id: &str,
+        now: SystemTime,
+    ) -> StoredConfigurationCheckOperation {
+        let record = StoredConfigurationCheckOperation {
+            id: new_operation_id(),
+            application_id: application_id.to_string(),
+            check_id: check_id.to_string(),
+            status: OPERATION_STATUS_INPROGRESS.to_string(),
+            // `StatusMessage` explains a non-success status; a check that is still
+            // running has nothing to explain.
+            status_message: None,
+            start_time: now,
+            // A check that has not finished has no end time yet.
+            end_time: None,
+            terminal_due_at: now + TRANSITION_SPAN,
+        };
+        self.configuration_check_operations
+            .insert(record.id.clone(), record.clone());
+        evict_oldest(
+            &mut self.configuration_check_operations,
+            StoredConfigurationCheckOperation::eviction_rank,
+        );
+        record
+    }
+
+    /// The configuration check operation for `check_id` that is still running against
+    /// `application_id`, if one is.
+    ///
+    /// Call [`Self::settle`] first, so a check whose terminal status the clock already
+    /// owes does not read as running.
+    pub fn configuration_check_in_progress(
+        &self,
+        application_id: &str,
+        check_id: &str,
+    ) -> Option<&StoredConfigurationCheckOperation> {
+        self.configuration_check_operations.values().find(|record| {
+            record.application_id == application_id
+                && record.check_id == check_id
+                && record.status == OPERATION_STATUS_INPROGRESS
+        })
+    }
+
+    /// Drop every operation record filed against `application_id`, configuration check
+    /// operations included — used when the application is deregistered, since nothing
+    /// else would ever reclaim them and the resource they describe no longer exists.
     pub fn forget_operations_for(&mut self, application_id: &str) {
         self.operations
             .retain(|_, record| record.resource_id != application_id);
+        self.configuration_check_operations
+            .retain(|_, record| record.application_id != application_id);
     }
+}
 
-    /// Keep [`Self::operations`] within [`MAX_RETAINED_OPERATIONS`], dropping the
-    /// oldest record that has already reached a terminal status first so a caller
-    /// polling a fresh operation can still resolve it.
-    fn evict_oldest_operations(&mut self) {
-        while self.operations.len() > MAX_RETAINED_OPERATIONS {
-            let victim = self
-                .operations
-                .values()
-                .min_by_key(|record| {
-                    (
-                        record.status == OPERATION_STATUS_INPROGRESS,
-                        record.start_time,
-                    )
-                })
-                .map(|record| record.id.clone());
-            match victim {
-                Some(id) => {
-                    self.operations.remove(&id);
-                }
-                None => break,
+/// Keep `records` within [`MAX_RETAINED_OPERATIONS`], dropping the oldest record that
+/// has already reached a terminal status first so a caller polling a fresh record can
+/// still resolve it.
+///
+/// `rank` orders the candidates for eviction: the record with the smallest rank goes
+/// first, so a rank of `(still running, start time)` evicts the oldest finished record
+/// before any running one.
+fn evict_oldest<T, F, K>(records: &mut BTreeMap<String, T>, rank: F)
+where
+    F: Fn(&T) -> K,
+    K: Ord,
+{
+    while records.len() > MAX_RETAINED_OPERATIONS {
+        let victim = records
+            .iter()
+            .min_by_key(|(_, record)| rank(record))
+            .map(|(id, _)| id.clone());
+        match victim {
+            Some(id) => {
+                records.remove(&id);
             }
+            None => break,
         }
     }
 }

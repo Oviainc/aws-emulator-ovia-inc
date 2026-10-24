@@ -181,8 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(crate::state::DEFAULT_MAX_RESULTS, |n| n as usize);
 
         let mut state = state.lock();
-        // The `ALLOCATING -> ALLOCATED` moves the clock already owes, materialised
-        // before the page is read so the listing reports the same state a `Get` would.
+        // The moves the clock already owes (`ALLOCATING -> ALLOCATED`,
+        // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record past its
+        // retention), materialised before the page is read so the listing reports the
+        // same state a `Get` would.
         state.settle_all(std::time::Instant::now());
 
         // Iteration is in id order (the store is a `BTreeMap`), which is creation

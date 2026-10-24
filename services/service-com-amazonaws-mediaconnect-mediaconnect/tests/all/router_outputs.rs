@@ -35,13 +35,14 @@ const NETWORK_INTERFACE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:a1b2c3d4e5f6";
 /// A `FlowArn` matching the modelled pattern (see `flow_lifecycle`).
 ///
-/// `pub(crate)` because `tests/all/router_output_lifecycle.rs` builds its own cases from
-/// the same fixtures, so the two suites cannot drift apart.
+/// `pub(crate)` because `tests/all/router_output_lifecycle.rs` and
+/// `tests/all/update_router_output.rs` build their own cases from the same fixtures, so the
+/// suites cannot drift apart.
 pub(crate) const FLOW_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:ro-target";
 /// A `FlowSourceArn` matching the modelled pattern
 /// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:source:[a-zA-Z0-9-]+:[a-zA-Z0-9_-]+$`.
-const FLOW_SOURCE_ARN: &str =
+pub(crate) const FLOW_SOURCE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:source:1-0000000a:ro-target-source";
 /// A `MediaLiveInputArn` matching the modelled pattern
 /// `^arn:(aws[a-zA-Z-]*):medialive:[a-z0-9-]+:[0-9]{12}:input:[a-zA-Z0-9]+$`. See
@@ -57,7 +58,7 @@ pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/router-output-
 
 /// An ARN satisfying the modelled `RouterOutputArn` pattern that no create minted, so no
 /// store holds a router output for it.
-const UNKNOWN_ARN: &str =
+pub(crate) const UNKNOWN_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerOutput:ffffffffffff";
 /// A second one, for the cases that name more than one absent output.
 const OTHER_UNKNOWN_ARN: &str =
@@ -65,8 +66,8 @@ const OTHER_UNKNOWN_ARN: &str =
 
 /// Send one CreateRouterOutput request.
 ///
-/// `pub(crate)` for the same reason as [`FLOW_ARN`]: the delete/get suite creates what it
-/// then reads through this one helper.
+/// `pub(crate)` for the same reason as [`FLOW_ARN`]: the suites that update, read and
+/// delete a router output create what they act on through this one helper.
 pub(crate) async fn create_router_output(
     emulator: &Emulator,
     body: Value,
@@ -77,7 +78,7 @@ pub(crate) async fn create_router_output(
 /// BatchGetRouterOutput binds its `Arns` member to the `arns` query parameter, one
 /// parameter per ARN (`smithy_query(query="operation",operation="BatchGetRouterOutput")`:
 /// `GET /v1/routerOutputs`, `Arns` `@httpQuery("arns")`).
-async fn batch_get_router_outputs(
+pub(crate) async fn batch_get_router_outputs(
     emulator: &Emulator,
     arns: &[&str],
 ) -> (u16, Option<String>, Value) {
@@ -151,14 +152,14 @@ pub(crate) fn assert_minted_router_output_arn(case: &str, arn: &str, id: &str, r
 /// epoch-seconds form — the framework's generated member schemas carry no
 /// `@timestampFormat`, for every service alike — so that is the form asserted here. The
 /// value is read from the clock either way, which is what these cases are about.
-fn reported_timestamp(case: &str, member: &str, value: &Value) -> f64 {
+pub(crate) fn reported_timestamp(case: &str, member: &str, value: &Value) -> f64 {
     value.as_f64().unwrap_or_else(|| {
         panic!("case {case:?}: {member} must be reported as a timestamp, got {value}")
     })
 }
 
 /// Now, in seconds since the epoch — what a reported timestamp is compared against.
-fn now_epoch_seconds() -> f64 {
+pub(crate) fn now_epoch_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs_f64())
@@ -168,7 +169,7 @@ fn now_epoch_seconds() -> f64 {
 /// The members of a `RouterOutput` that a read must report exactly as the create stored
 /// them. `state` is excluded on purpose: it is the one member the CLOCK moves (see
 /// [`the_clock_settles_a_new_router_output_into_standby`]).
-const PERSISTED_MEMBERS: [&str; 20] = [
+pub(crate) const PERSISTED_MEMBERS: [&str; 20] = [
     "name",
     "arn",
     "id",
@@ -217,7 +218,7 @@ struct CreateCase {
 /// A union's members are keyed on the wire by their MODELLED member name (`Standard`,
 /// `Rtp`, …): the framework's union schemas carry no `@jsonName`, so that is the key this
 /// emulator reads and writes for every service.
-fn standard(protocol_configuration: Value) -> Value {
+pub(crate) fn standard(protocol_configuration: Value) -> Value {
     json!({
         "Standard": {
             "networkInterfaceArn": NETWORK_INTERFACE_ARN,

@@ -18,6 +18,12 @@
 //!    this call removed it or an earlier one did, so a retried disassociate cannot
 //!    fail because the first one succeeded.
 //!
+//! An association this call really removes is also ended on the account's own Amazon EC2
+//! store ([`crate::state::ec2_resources::release_elastic_ips`]): the `eipassoc-` id names
+//! an EC2 association of an EC2 allocation, so the allocation goes back to being an
+//! unassociated Elastic IP address of the account — "disassociated … but remains
+//! allocated to your account" — and can be associated again.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -251,9 +257,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@idempotent`: the end state is what the call asks for — the VLAN no longer
         // carries this association — so a repeat of a call that already removed it is
         // not a failure. Only a call that really removed something re-stamps the record.
+        //
+        // The association the call ends is an Amazon EC2 fact as much as one of this
+        // service's: the allocation goes back to being an unassociated Elastic IP
+        // address of the account, so the pairs removed here are released on EC2's own
+        // `Address` records below.
         let before = vlan.eip_associations.len();
+        let mut released: Vec<(String, String)> = Vec::new();
         vlan.eip_associations.retain(|association| {
-            association.association_id.as_deref() != Some(input.association_id.as_str())
+            let named =
+                association.association_id.as_deref() == Some(input.association_id.as_str());
+            if named {
+                if let (Some(allocation_id), Some(association_id)) = (
+                    association.allocation_id.clone(),
+                    association.association_id.clone(),
+                ) {
+                    released.push((allocation_id, association_id));
+                }
+            }
+            !named
         });
         let removed = vlan.eip_associations.len() != before;
         if removed {
@@ -263,6 +285,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if removed {
             environment.modified_at_ms = modified_at_ms;
         }
+        // The EC2 store is written while this service's lock is held, the same order
+        // `CreateEnvironment` and `DeleteEnvironment` take the two locks in.
+        crate::state::ec2_resources::release_elastic_ips(&*self.engine, &released);
         Ok(DisassociateEipFromVlanOutput { vlan: Some(vlan) })
     }
 }

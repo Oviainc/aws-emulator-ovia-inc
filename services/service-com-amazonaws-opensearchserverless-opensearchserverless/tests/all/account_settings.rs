@@ -122,7 +122,14 @@ async fn get_account_settings_reports_the_stored_limits_and_changes_nothing() {
     let (status, code, answer) = call(
         &router,
         "CreateCollection",
-        json!({ "name": "settings-probe", "type": "SEARCH" }),
+        // A collection's encryption setting has to come from somewhere — the request's
+        // `encryptionConfig` or an `encryption` policy covering its name — and this case
+        // is about the account settings beside it, so it names the AWS-owned key.
+        json!({
+            "name": "settings-probe",
+            "type": "SEARCH",
+            "encryptionConfig": { "aWSOwnedKey": true },
+        }),
     )
     .await;
     assert_eq!(

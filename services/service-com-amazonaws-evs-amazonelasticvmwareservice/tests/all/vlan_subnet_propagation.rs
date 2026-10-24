@@ -64,8 +64,9 @@ const VLAN_MEMBERS: [&str; 10] = [
 
 /// One emulator: a router carrying Amazon EVS AND Amazon EC2 over ONE shared engine,
 /// which is the whole point — the VLAN subnets have to be visible through the service
-/// that owns subnets.
-fn emulator() -> MultiServiceRouter {
+/// that owns subnets. Shared with the sibling suites that assert the same about another
+/// EC2 resource an Amazon EVS operation changes (`eip_ec2_propagation.rs`).
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests exercise behaviour, not signing: every request below is unsigned.
@@ -98,7 +99,10 @@ fn form_value(value: &str) -> String {
 
 /// Drive one ec2Query action as a client signing for `region`: `POST /` with the
 /// parameters in the form body. Answers the HTTP status and the XML text.
-async fn call_ec2(
+///
+/// Shared with the sibling suites that have to ask Amazon EC2 what it holds for a
+/// resource Amazon EVS created or changed in the account (`eip_ec2_propagation.rs`).
+pub(crate) async fn call_ec2(
     router: &MultiServiceRouter,
     region: &str,
     action: &str,
@@ -131,7 +135,7 @@ async fn call_ec2(
 }
 
 /// The text of the first `<name>…</name>` element of an XML body.
-fn element(xml: &str, name: &str) -> Option<String> {
+pub(crate) fn element(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = xml.find(&open)? + open.len();
@@ -140,7 +144,7 @@ fn element(xml: &str, name: &str) -> Option<String> {
 }
 
 /// Every `<name>…</name>` element of an XML body, in document order.
-fn elements(xml: &str, name: &str) -> Vec<String> {
+pub(crate) fn elements(xml: &str, name: &str) -> Vec<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let mut found = Vec::new();
