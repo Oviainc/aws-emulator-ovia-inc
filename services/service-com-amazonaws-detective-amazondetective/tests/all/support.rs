@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use service_com_amazonaws_detective_amazondetective::state::ACCOUNT_ID_LEN;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -122,6 +122,33 @@ pub async fn call_in(
 /// One `POST` call in [`REGION`].
 pub async fn call(router: &MultiServiceRouter, uri: &str, body: &Value) -> (u16, Value) {
     call_in(router, REGION, uri, body).await
+}
+
+/// The tag map `ListTagsForResource` reports for `graph_arn` in `region` — the one
+/// reader every tag suite in this crate checks a write through.
+pub async fn tags_of(
+    router: &MultiServiceRouter,
+    region: &str,
+    graph_arn: &str,
+) -> Map<String, Value> {
+    let (status, body) = call_with(
+        router,
+        "GET",
+        region,
+        &format!("/tags/{graph_arn}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "ListTagsForResource({graph_arn}): expected 200, got {status} {body:?}"
+    );
+    body.get("Tags")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("ListTagsForResource({graph_arn}) carried no Tags, got {body:?}")
+        })
 }
 
 /// The modelled error shape a failed call reported.

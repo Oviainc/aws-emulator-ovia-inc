@@ -13,12 +13,16 @@
 //! (connector, VM) pair is the identity of an entitlement and a repeat call for a VM
 //! already entitled through the same connector reports the stored record.
 //!
-//! `connectorId` is persisted on the record and scopes it, but is not checked against
-//! a stored connector here: an entitlement is created through a vCenter Server
-//! connector, and whether a create must refuse a `connectorId` that names no VCENTER
-//! connector of the environment is this operation's own precondition — it belongs with
-//! this operation's issue, beside the environment lookup below, not with the connector
-//! operations that merely make the records available.
+//! `connectorId` names the connector the entitlement is created THROUGH, so it is
+//! resolved against the environment's stored connectors before anything is persisted:
+//! "Creates a Windows Server License entitlement for virtual machines in an Amazon EVS
+//! environment using the provided vCenter Server connector" (this operation's doc), and
+//! a vCenter connector is what that feature runs on ("VCENTER: Connector to a vCenter
+//! Server appliance. Required for features that depend on vCenter, such as Windows
+//! Server license-included", the `type` member of `CreateEnvironmentConnector`). An id
+//! the environment holds no live VCENTER connector for names no such connector, so it
+//! is a `ResourceNotFoundException` naming the connector the request asked for, and
+//! nothing is stored for it.
 //!
 //! ## Shape of an operation
 //!
@@ -218,6 +222,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         let environment_id = environment.environment_id.clone();
+
+        // The connector the entitlement is created THROUGH has to exist as a resource of
+        // that environment: "using the provided vCenter Server connector" (this
+        // operation's doc), and vCenter is the appliance the Windows Server
+        // license-included feature depends on ("Required for features that depend on
+        // vCenter, such as Windows Server license-included", the `type` member doc). An
+        // id the environment holds no live VCENTER connector for names no connector this
+        // entitlement could be tracked through, so it is refused before anything is
+        // persisted — the same `ResourceNotFoundException` `UpdateEnvironmentConnector`
+        // answers for a connector id, naming the connector the REQUEST asked for.
+        if crate::state::live_connector(environment, &input.connector_id)
+            .filter(|connector| connector.connector_type == crate::state::CONNECTOR_TYPE_VCENTER)
+            .is_none()
+        {
+            return Err(CreateEntitlementErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.connector_id),
+            )
+            .into());
+        }
 
         // One entitlement per DISTINCT requested virtual machine: the (connector, VM)
         // pair identifies an entitlement, so a `vmIds` list naming the same VM twice

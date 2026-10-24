@@ -21,6 +21,8 @@ mod device_lifecycle;
 mod filter_id_list_maximum;
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
+#[path = "all/link_association_lifecycle.rs"]
+mod link_association_lifecycle;
 #[path = "all/link_lifecycle.rs"]
 mod link_lifecycle;
 #[path = "all/list_tags_for_resource.rs"]
