@@ -390,7 +390,7 @@ fn password_sign_in(
             if hides_user_existence {
                 incorrect_credentials()
             } else {
-                user_not_found(username)
+                user_not_found()
             }
         })?;
         // The stored credential, actually checked — and checked FIRST: every refusal
@@ -603,10 +603,12 @@ fn client_not_found(client_id: &str) -> InitiateAuthError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> InitiateAuthError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> InitiateAuthError {
     InitiateAuthErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

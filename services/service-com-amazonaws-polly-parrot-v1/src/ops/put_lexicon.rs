@@ -5,11 +5,17 @@
 //! Stores a PLS pronunciation lexicon under its name, deriving the attributes
 //! `GetLexicon` and `ListLexicons` report from the document itself.
 //!
-//! The PLS document is parsed with a real XML reader (`quick-xml`), never scanned as
-//! text: `Alphabet` is the `<lexicon>` element's `alphabet` attribute, `LanguageCode`
-//! its `xml:lang`, and `LexemesCount` the number of `<lexeme>` elements. A store is an
-//! INSERT-OR-REPLACE keyed by name, so re-putting a name overwrites the entry and
-//! moves its `LastModified` forward rather than adding a second one.
+//! The PLS document is parsed with a real namespace-aware XML reader (`quick-xml`),
+//! never scanned as text: `Alphabet` is the `<lexicon>` element's `alphabet`
+//! attribute, `LanguageCode` its `xml:lang`, and `LexemesCount` the number of
+//! `<lexeme>` elements. A store is an INSERT-OR-REPLACE keyed by name, so re-putting a
+//! name overwrites the entry and moves its `LastModified` forward rather than adding a
+//! second one.
+//!
+//! A document element that does not DECLARE itself a PLS 1.0 lexicon — `<lexicon>` in
+//! the [`PLS_NAMESPACE`] carrying `version="`[`PLS_VERSION`]`"` and an `xml:lang` — is
+//! not a lexicon this service can store, so nothing about it is stored; that is what
+//! makes `LanguageCode` a value every stored lexicon has rather than an optional one.
 //!
 //! The error channel is the model's: a document that is not a PLS lexicon — including
 //! one declaring an `alphabet` Amazon Polly does not support — is
@@ -144,6 +150,21 @@ pub const MAX_LEXICONS: usize = 100;
 /// [`MAX_LEXICON_CHARACTERS`] along with the rest of the document.
 pub const MAX_LEXEME_CHARACTERS: usize = 100;
 
+/// The XML namespace a PLS lexicon's elements are bound to.
+///
+/// `PutLexicon` documents `Content` as a PLS document, and PLS 1.0 (the W3C
+/// Pronunciation Lexicon Specification) declares its vocabulary — `lexicon`,
+/// `lexeme`, `grapheme`, `phoneme`, `alias` — in this namespace. Every lexicon in
+/// Amazon Polly's own lexicon documentation declares it on the document element.
+pub const PLS_NAMESPACE: &str = "http://www.w3.org/2005/01/pronunciation-lexicon";
+
+/// The `version` a PLS lexicon's document element declares.
+///
+/// PLS 1.0 makes `version` a required attribute of the `lexicon` element and fixes
+/// its value at the version of the specification, so a document element declaring no
+/// version — or another one — is not a PLS 1.0 lexicon.
+pub const PLS_VERSION: &str = "1.0";
+
 /// The phonetic alphabets a PLS lexicon may declare.
 ///
 /// Quoted from this operation's `UnsupportedPlsAlphabetException` documentation in
@@ -166,8 +187,10 @@ pub struct ParsedLexicon {
     /// The `<lexicon alphabet="...">` attribute, absent when the document omits it
     /// (PLS allows a per-phoneme alphabet instead).
     pub alphabet: Option<String>,
-    /// The `<lexicon xml:lang="...">` attribute.
-    pub language_code: Option<String>,
+    /// The `<lexicon xml:lang="...">` attribute. Not optional: PLS requires the
+    /// document element to declare the lexicon's language, so a document that parses
+    /// at all has one.
+    pub language_code: String,
     /// How many `<lexeme>` elements the document declares.
     pub lexemes_count: i32,
 }
@@ -213,76 +236,144 @@ impl From<PlsRejection> for PutLexiconError {
     }
 }
 
+/// What the document element of a PLS lexicon declares about the document.
+struct DocumentElement {
+    /// The optional `alphabet` attribute.
+    alphabet: Option<String>,
+    /// The required `xml:lang` attribute.
+    language_code: String,
+}
+
+/// Read, and CHECK, the document element of a PLS lexicon.
+///
+/// A PLS lexicon's document element declares the document to be one: it is
+/// `<lexicon>` bound to [`PLS_NAMESPACE`], it carries `version` fixed at
+/// [`PLS_VERSION`], and it carries the `xml:lang` naming the language the lexicon is
+/// written for. A document element missing any of those three declarations is not a
+/// PLS lexicon at all — whatever else is in the document — so it is refused as a
+/// whole rather than stored with the corresponding attributes missing.
+///
+/// `alphabet` is the one attribute PLS leaves optional here, because a `<phoneme>`
+/// may name its own; it is read when present and checked by the caller.
+fn read_document_element(
+    element: &quick_xml::events::BytesStart<'_>,
+    in_pls_namespace: bool,
+    local_name: &str,
+) -> Result<DocumentElement, PlsRejection> {
+    // PLS names its document element `lexicon` and binds it to its own namespace;
+    // any other element, or a `lexicon` in no namespace or a foreign one, is some
+    // other XML document, which is what `InvalidLexiconException` is for.
+    if local_name != "lexicon" {
+        return Err(PlsRejection::NotALexicon(format!(
+            "the document element is <{local_name}>, not <lexicon>"
+        )));
+    }
+    if !in_pls_namespace {
+        return Err(PlsRejection::NotALexicon(
+            "the document element is not bound to the PLS namespace".to_string(),
+        ));
+    }
+
+    let mut alphabet: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut language_code: Option<String> = None;
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+        let raw = String::from_utf8_lossy(attribute.value.as_ref()).to_string();
+        let value = quick_xml::escape::unescape(&raw)
+            .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?
+            .to_string();
+        match attribute.key.as_ref() {
+            b"alphabet" => alphabet = Some(value),
+            b"version" => version = Some(value),
+            // PLS and XML define only the prefixed form, so a bare `lang=` is a
+            // different attribute and is not read as the language.
+            b"xml:lang" => language_code = Some(value),
+            _ => {}
+        }
+    }
+
+    if version.as_deref() != Some(PLS_VERSION) {
+        return Err(PlsRejection::NotALexicon(format!(
+            "the document element declares version {version:?}, not {PLS_VERSION:?}"
+        )));
+    }
+    // An `xml:lang` whose value is empty declares no language — that is what XML
+    // uses it for — so it is the absent attribute rather than a language to look up.
+    let language_code = language_code
+        .filter(|language| !language.trim().is_empty())
+        .ok_or_else(|| {
+            PlsRejection::NotALexicon(
+                "the document element declares no xml:lang, so the lexicon is for no \
+                 language"
+                    .to_string(),
+            )
+        })?;
+
+    Ok(DocumentElement {
+        alphabet,
+        language_code,
+    })
+}
+
 /// Read a PLS lexicon document.
 ///
-/// The reader is a real XML parser, so any well-formed PLS document is accepted and
-/// any malformed one is refused — the shape of the examples this emulator has seen
-/// does not enter into it. Each `<lexeme>`'s replacement elements are measured as
-/// they close, so an oversized one is refused without the document being stored.
+/// The reader is a real, NAMESPACE-AWARE XML parser, so any well-formed PLS document
+/// is accepted whatever prefix it spells its elements with, and any malformed one is
+/// refused — the shape of the examples this emulator has seen does not enter into it.
+/// The document element is checked by [`read_document_element`] before anything in
+/// the document is read. Each `<lexeme>`'s replacement elements are measured as they
+/// close, so an oversized one is refused without the document being stored.
 pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
     use quick_xml::events::Event;
+    use quick_xml::name::ResolveResult;
 
-    let mut reader = quick_xml::Reader::from_str(content);
+    let mut reader = quick_xml::NsReader::from_str(content);
     reader.config_mut().trim_text(true);
 
-    let mut root_seen = false;
+    let mut document_element: Option<DocumentElement> = None;
+    let mut lexemes_count: i32 = 0;
     let mut in_lexeme = false;
     // The text of the `<alias>`/`<phoneme>` element currently open inside a
     // `<lexeme>`, accumulated until that element closes.
     let mut replacement: Option<String> = None;
-    let mut parsed = ParsedLexicon {
-        alphabet: None,
-        language_code: None,
-        lexemes_count: 0,
-    };
 
     loop {
-        let event = reader
-            .read_event()
+        let (resolved, event) = reader
+            .read_resolved_event()
             .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+        // Taken as a value so the resolved namespace does not outlive this step of
+        // the read.
+        let in_pls_namespace =
+            matches!(resolved, ResolveResult::Bound(namespace) if namespace.0 == PLS_NAMESPACE.as_bytes());
         match event {
             Event::Eof => break,
             Event::Start(ref element) | Event::Empty(ref element) => {
                 let local_name =
                     String::from_utf8_lossy(element.local_name().as_ref()).to_string();
-                if !root_seen {
-                    // PLS 1.0 names its document element `lexicon`; anything else is
-                    // some other XML document, which is what
-                    // `InvalidLexiconException` is for.
-                    if local_name != "lexicon" {
-                        return Err(PlsRejection::NotALexicon(format!(
-                            "the document element is <{local_name}>, not <lexicon>"
-                        )));
-                    }
-                    root_seen = true;
-                    for attribute in element.attributes() {
-                        let attribute =
-                            attribute.map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
-                        let raw = String::from_utf8_lossy(attribute.value.as_ref()).to_string();
-                        let value = quick_xml::escape::unescape(&raw)
-                            .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?
-                            .to_string();
-                        match attribute.key.as_ref() {
-                            b"alphabet" => parsed.alphabet = Some(value),
-                            // PLS and XML define only the prefixed form, so a bare
-                            // `lang=` is a different attribute and is not read as the
-                            // language.
-                            b"xml:lang" => parsed.language_code = Some(value),
-                            _ => {}
-                        }
-                    }
+                if document_element.is_none() {
+                    document_element = Some(read_document_element(
+                        element,
+                        in_pls_namespace,
+                        &local_name,
+                    )?);
                     continue;
                 }
+                // PLS's vocabulary is the one bound to its namespace, so an element
+                // borrowed from another vocabulary is not a lexeme and is not
+                // counted or measured as one.
                 match local_name.as_str() {
-                    "lexeme" => {
+                    "lexeme" if in_pls_namespace => {
                         // An empty `<lexeme/>` opens nothing, so it leaves no element
                         // for a later replacement to be measured inside.
                         in_lexeme = matches!(event, Event::Start(_));
-                        parsed.lexemes_count = parsed.lexemes_count.saturating_add(1);
+                        lexemes_count = lexemes_count.saturating_add(1);
                     }
                     // A replacement is the text between the tags, so an EMPTY element
                     // carries none and needs no measuring.
-                    "alias" | "phoneme" if in_lexeme && matches!(event, Event::Start(_)) => {
+                    "alias" | "phoneme"
+                        if in_pls_namespace && in_lexeme && matches!(event, Event::Start(_)) =>
+                    {
                         replacement = Some(String::new());
                     }
                     _ => {}
@@ -292,8 +383,8 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                 let local_name =
                     String::from_utf8_lossy(element.local_name().as_ref()).to_string();
                 match local_name.as_str() {
-                    "lexeme" => in_lexeme = false,
-                    "alias" | "phoneme" => {
+                    "lexeme" if in_pls_namespace => in_lexeme = false,
+                    "alias" | "phoneme" if in_pls_namespace => {
                         if let Some(text) = replacement.take() {
                             let length = text.chars().count();
                             if length > MAX_LEXEME_CHARACTERS {
@@ -323,22 +414,24 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
         }
     }
 
-    if !root_seen {
-        return Err(PlsRejection::NotALexicon(
-            "the content carries no XML element".to_string(),
-        ));
-    }
-    if let Some(alphabet) = &parsed.alphabet {
+    let document_element = document_element.ok_or_else(|| {
+        PlsRejection::NotALexicon("the content carries no XML element".to_string())
+    })?;
+    if let Some(alphabet) = &document_element.alphabet {
         if !SUPPORTED_PLS_ALPHABETS.contains(&alphabet.as_str()) {
             return Err(PlsRejection::UnsupportedAlphabet(alphabet.clone()));
         }
     }
-    if let Some(language) = &parsed.language_code {
-        if !language_is_supported(language) {
-            return Err(PlsRejection::UnsupportedLanguage(language.clone()));
-        }
+    if !language_is_supported(&document_element.language_code) {
+        return Err(PlsRejection::UnsupportedLanguage(
+            document_element.language_code,
+        ));
     }
-    Ok(parsed)
+    Ok(ParsedLexicon {
+        alphabet: document_element.alphabet,
+        language_code: document_element.language_code,
+        lexemes_count,
+    })
 }
 
 /// Whether `language` is a language Amazon Polly supports.
@@ -463,6 +556,15 @@ mod tests {
   <lexeme><grapheme>PLS</grapheme><phoneme>ˈplɪs</phoneme></lexeme>
 </lexicon>"#;
 
+    /// A PLS document element carrying `attributes` on top of the three declarations
+    /// PLS requires of it, around `body`.
+    fn pls(attributes: &str, body: &str) -> String {
+        format!(
+            "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+             xml:lang=\"en-US\" {attributes}>{body}</lexicon>"
+        )
+    }
+
     #[test]
     fn attributes_are_read_from_the_document() {
         let parsed = parse_pls(IPA_LEXICON).expect("a valid PLS lexicon parses");
@@ -470,11 +572,171 @@ mod tests {
             parsed,
             ParsedLexicon {
                 alphabet: Some("ipa".to_string()),
-                language_code: Some("en-US".to_string()),
+                language_code: "en-US".to_string(),
                 lexemes_count: 2,
             },
             "the attributes must come from the document"
         );
+    }
+
+    /// RULE: the document element of a PLS lexicon declares the document to be one —
+    /// `<lexicon>` bound to the PLS namespace, `version` fixed at the PLS version and
+    /// an `xml:lang` for the language the lexicon is written for — and a document
+    /// element that omits any of those three declares no lexicon, whatever the rest
+    /// of the document carries.
+    #[test]
+    fn a_document_element_that_does_not_declare_a_pls_lexicon_is_rejected() {
+        const LEXEME: &str = "<lexeme><grapheme>W3C</grapheme>\
+                              <alias>World Wide Web Consortium</alias></lexeme>";
+        // case, document, whether it is a PLS lexicon
+        let rows: [(&str, String, bool); 14] = [
+            (
+                "every declaration present",
+                pls("alphabet=\"ipa\"", LEXEME),
+                true,
+            ),
+            (
+                "every declaration present, no alphabet",
+                pls("", LEXEME),
+                true,
+            ),
+            (
+                "the PLS namespace on a prefix",
+                format!(
+                    "<pls:lexicon xmlns:pls=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+                     xml:lang=\"en-US\"><pls:lexeme><pls:grapheme>W3C</pls:grapheme>\
+                     <pls:alias>W3C</pls:alias></pls:lexeme></pls:lexicon>"
+                ),
+                true,
+            ),
+            ("no declaration at all", "<lexicon/>".to_string(), false),
+            (
+                "no declaration at all, with a lexeme",
+                format!("<lexicon>{LEXEME}</lexicon>"),
+                false,
+            ),
+            (
+                "no namespace",
+                format!(
+                    "<lexicon version=\"{PLS_VERSION}\" xml:lang=\"en-US\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "a foreign namespace",
+                format!(
+                    "<lexicon xmlns=\"http://example.invalid/lexicon\" \
+                     version=\"{PLS_VERSION}\" xml:lang=\"en-US\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "no version",
+                format!(
+                    "<lexicon xmlns=\"{PLS_NAMESPACE}\" xml:lang=\"en-US\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "another version",
+                format!(
+                    "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"2.0\" \
+                     xml:lang=\"en-US\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "an empty version",
+                format!(
+                    "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"\" \
+                     xml:lang=\"en-US\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "no xml:lang",
+                format!(
+                    "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+                     alphabet=\"ipa\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "an empty xml:lang",
+                format!(
+                    "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+                     xml:lang=\"\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                // Only the prefixed form is the language attribute.
+                "a bare lang instead of xml:lang",
+                format!(
+                    "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+                     lang=\"en-US\">{LEXEME}</lexicon>"
+                ),
+                false,
+            ),
+            (
+                "the declarations on a child instead of the document element",
+                format!(
+                    "<lexicon><lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+                     xml:lang=\"en-US\"/></lexicon>"
+                ),
+                false,
+            ),
+        ];
+        for (case, document, is_a_lexicon) in rows {
+            let outcome = parse_pls(&document);
+            assert_eq!(
+                outcome.is_ok(),
+                is_a_lexicon,
+                "case {case:?}: expected a lexicon: {is_a_lexicon}, got {outcome:?}"
+            );
+            if !is_a_lexicon {
+                assert!(
+                    matches!(outcome, Err(PlsRejection::NotALexicon(_))),
+                    "case {case:?}: a document element declaring no PLS lexicon is \
+                     refused as not a lexicon, got {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Only the PLS vocabulary counts: an element borrowed from another namespace is
+    /// not a lexeme of the lexicon.
+    #[test]
+    fn only_lexemes_in_the_pls_namespace_are_counted() {
+        let document = format!(
+            "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" xml:lang=\"en-US\">\
+             <lexeme><grapheme>W3C</grapheme><alias>W3C</alias></lexeme>\
+             <other:lexeme xmlns:other=\"http://example.invalid/lexicon\"/>\
+             </lexicon>"
+        );
+        let parsed = parse_pls(&document).expect("the document is a PLS lexicon");
+        assert_eq!(
+            parsed.lexemes_count, 1,
+            "only the lexeme in the PLS namespace counts, got {parsed:?}"
+        );
+    }
+
+    /// The language a valid document declares is the one the attributes report, for
+    /// every form of language code a PLS document may carry.
+    #[test]
+    fn the_declared_language_is_what_the_document_reports() {
+        for language in ["en-US", "en", "en-GB", "arb", "cmn-CN", "ja-JP"] {
+            let document = format!(
+                "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+                 xml:lang=\"{language}\"/>"
+            );
+            let parsed = parse_pls(&document);
+            assert_eq!(
+                parsed.as_ref().map(|p| p.language_code.as_str()),
+                Ok(language),
+                "language {language:?}: expected it to be reported, got {parsed:?}"
+            );
+        }
     }
 
     #[test]
@@ -495,20 +757,22 @@ mod tests {
     #[test]
     fn alphabet_and_language_are_checked_against_the_model() {
         for alphabet in SUPPORTED_PLS_ALPHABETS {
-            let content =
-                format!(r#"<lexicon version="1.0" alphabet="{alphabet}" xml:lang="en-US"/>"#);
+            let content = pls(&format!("alphabet=\"{alphabet}\""), "");
             let parsed = parse_pls(&content);
             assert!(
                 parsed.is_ok(),
                 "alphabet {alphabet:?}: expected acceptance, got {parsed:?}"
             );
         }
-        let bogus = parse_pls(r#"<lexicon version="1.0" alphabet="x-klingon" xml:lang="en-US"/>"#);
+        let bogus = parse_pls(&pls("alphabet=\"x-klingon\"", ""));
         assert!(
             matches!(bogus, Err(PlsRejection::UnsupportedAlphabet(ref a)) if a == "x-klingon"),
             "expected UnsupportedAlphabet, got {bogus:?}"
         );
-        let bad_language = parse_pls(r#"<lexicon version="1.0" alphabet="ipa" xml:lang="xx-ZZ"/>"#);
+        let bad_language = parse_pls(&format!(
+            "<lexicon xmlns=\"{PLS_NAMESPACE}\" version=\"{PLS_VERSION}\" \
+             alphabet=\"ipa\" xml:lang=\"xx-ZZ\"/>"
+        ));
         assert!(
             matches!(bad_language, Err(PlsRejection::UnsupportedLanguage(ref l)) if l == "xx-ZZ"),
             "expected UnsupportedLanguage, got {bad_language:?}"
@@ -526,11 +790,13 @@ mod tests {
                 ("one past the quota", MAX_LEXEME_CHARACTERS + 1, true),
                 ("far past the quota", MAX_LEXEME_CHARACTERS * 3, true),
             ] {
-                let content = format!(
-                    "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"en-US\">\
-                     <lexeme><grapheme>G</grapheme>\
-                     <{element}>{}</{element}></lexeme></lexicon>",
-                    "x".repeat(length)
+                let content = pls(
+                    "alphabet=\"ipa\"",
+                    &format!(
+                        "<lexeme><grapheme>G</grapheme>\
+                         <{element}>{}</{element}></lexeme>",
+                        "x".repeat(length)
+                    ),
                 );
                 let outcome = parse_pls(&content);
                 let rejected =
@@ -543,10 +809,12 @@ mod tests {
         }
 
         // A grapheme is bounded by the lexicon size quota, not by this one.
-        let long_grapheme = format!(
-            "<lexicon version=\"1.0\" alphabet=\"ipa\" xml:lang=\"en-US\">\
-             <lexeme><grapheme>{}</grapheme><alias>short</alias></lexeme></lexicon>",
-            "g".repeat(MAX_LEXEME_CHARACTERS * 2)
+        let long_grapheme = pls(
+            "alphabet=\"ipa\"",
+            &format!(
+                "<lexeme><grapheme>{}</grapheme><alias>short</alias></lexeme>",
+                "g".repeat(MAX_LEXEME_CHARACTERS * 2)
+            ),
         );
         assert!(
             parse_pls(&long_grapheme).is_ok(),

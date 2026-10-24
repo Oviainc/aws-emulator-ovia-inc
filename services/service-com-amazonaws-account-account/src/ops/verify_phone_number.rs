@@ -196,16 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The number being verified is the one in the primary contact
-        // information: with no primary contact stored there is no such number,
-        // which is the resource this call names not being found.
-        if account.primary_phone_number().is_none() {
-            return Err(VerifyPhoneNumberErrorModeled::ResourceNotFoundException(
-                crate::state::contact_information_not_set(&account_id),
-            )
-            .into());
-        }
-
         // Nothing to evaluate the submitted passcode against: either no passcode
         // was ever sent to the number now in the primary contact information, or
         // the one sent was already submitted and consumed. Both are a conflict

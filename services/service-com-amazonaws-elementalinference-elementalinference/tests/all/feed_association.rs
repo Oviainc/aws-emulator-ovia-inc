@@ -680,9 +680,9 @@ async fn associate_refuses_an_append_past_the_output_quota() {
     );
 
     // A call that appends NOTHING grows nothing, so the quota never refuses it — not
-    // even on a feed whose own outputs are already at or past the bound, which
-    // CreateFeed can produce in one request.
-    let over: Vec<Value> = (0..MAX_OUTPUTS_PER_FEED + 5)
+    // even on a feed whose own outputs are already AT the bound, which is as far as
+    // any operation that sets a feed's output list may take it.
+    let over: Vec<Value> = (0..MAX_OUTPUTS_PER_FEED)
         .map(|index| output(&format!("own{index}"), "cropping", "ENABLED"))
         .collect();
     let over_count = over.len();
