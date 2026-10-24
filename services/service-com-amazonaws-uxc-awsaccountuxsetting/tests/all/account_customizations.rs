@@ -45,10 +45,10 @@ async fn get_before_any_update_returns_the_documented_defaults() {
 // ---------------------------------------------------------------------------
 
 /// The rule, over a table spanning the class: a settings value accepted by
-/// `UpdateAccountCustomizations` is persisted for the calling account exactly as
-/// it was supplied, returned by that call and returned again by
-/// `GetAccountCustomizations` — and re-applying the same request changes neither
-/// (`@idempotent`).
+/// `UpdateAccountCustomizations` is persisted for the calling account — a list
+/// setting canonicalized, its members ascending ([`crate::support::reported`]) —
+/// returned by that call and returned again by `GetAccountCustomizations`, and
+/// re-applying the same request changes neither (`@idempotent`).
 ///
 /// Rows differ along colour value, list size (0, 1, 3, 10), element form and
 /// ordering, which is what the rule generalises over.
@@ -230,8 +230,7 @@ async fn lists_are_accepted_at_their_modelled_bound() {
         .map(|n| catalog[n % catalog.len()].clone())
         .collect();
     let regions_at_bound: Vec<String> = (0..100).map(legal_region).collect();
-    // Read back as the sequence they were supplied in, which for neither list is
-    // sorted.
+    // Read back canonically: the supplied sequence of neither list is ascending.
     let services_expected = reported_owned(&services_at_bound);
     let regions_expected = reported_owned(&regions_at_bound);
 
@@ -251,12 +250,12 @@ async fn lists_are_accepted_at_their_modelled_bound() {
     assert_eq!(
         fetched.get("visibleServices"),
         Some(&services_expected),
-        "500 services must round-trip as supplied, got {fetched:?}"
+        "500 services must round-trip canonically, got {fetched:?}"
     );
     assert_eq!(
         fetched.get("visibleRegions"),
         Some(&regions_expected),
-        "100 Regions must round-trip as supplied, got {fetched:?}"
+        "100 Regions must round-trip canonically, got {fetched:?}"
     );
 }
 
@@ -347,7 +346,7 @@ async fn every_catalog_entry_is_accepted_as_a_visible_service() {
     let catalog = whole_catalog(&router).await;
 
     let (status, _, body) =
-        update_customizations(&router, json!({"visibleServices": catalog})).await;
+        update_customizations(&router, json!({"visibleServices": catalog.clone()})).await;
     assert_eq!(
         status, 200,
         "the whole catalog must be accepted as visibleServices, got {status} ({body})"
@@ -355,8 +354,8 @@ async fn every_catalog_entry_is_accepted_as_a_visible_service() {
     let (_, _, fetched) = get_customizations(&router).await;
     assert_eq!(
         fetched.get("visibleServices"),
-        Some(&json!(catalog)),
-        "the stored visibleServices must be the catalog verbatim, got {fetched:?}"
+        Some(&reported_owned(&catalog)),
+        "the stored visibleServices must be the whole catalog, got {fetched:?}"
     );
 
     // And one entry at a time, to pin each identifier on its own.

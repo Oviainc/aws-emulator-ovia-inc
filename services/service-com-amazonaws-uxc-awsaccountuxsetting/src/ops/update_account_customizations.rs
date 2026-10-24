@@ -8,8 +8,9 @@
 //! breaks a modelled SHAPE constraint never reaches this handler at all — this
 //! service's front door (`crate::service`) refuses it with HTTP 400
 //! `BadRequestException` — and nothing beyond those constraints is refused here.
-//! A list setting is stored and reported as the sequence the request supplied
-//! (`crate::state::AccountUxCustomization::set_visible_services`).
+//! A list setting is stored, echoed and read back in ONE canonical sequence —
+//! its members ascending — whatever sequence the request named them in
+//! (`crate::state::canonical_members`).
 //!
 //! ## Shape of an operation
 //!
@@ -211,9 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(color) = input.account_color {
                 record.account_color = Some(color);
             }
-            // A list setting is stored as the sequence the request supplied: the
-            // array a caller sent is its own document, and the service has no
-            // published rule that re-orders it.
+            // A list setting is stored CANONICALIZED (`state::canonical_members`:
+            // its members ascending), so this echo and every later
+            // `GetAccountCustomizations` report the one same sequence. The model
+            // fixes no order for either list, so the order is recorded behaviour
+            // only; the rule and its evidence live on that function.
             if let Some(services) = input.visible_services {
                 record.set_visible_services(services);
             }
