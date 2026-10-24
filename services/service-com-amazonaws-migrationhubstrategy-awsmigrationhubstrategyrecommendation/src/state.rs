@@ -27,6 +27,11 @@
 //! running on those servers — which `GetApplicationComponentDetails` reports one at a
 //! time: every member of the `ApplicationComponentDetail` it answers comes from that
 //! record, and the association counts it reports are counted off the record's own lists.
+//! `UpdateApplicationComponentConfig` writes that same record — the component's app type,
+//! inclusion status, database credentials, source code configuration and the strategy
+//! option the account prefers for it — and `GetApplicationComponentStrategies` reports
+//! that preference beside the service's own recommendation, so each read answers what the
+//! update stored.
 //!
 //! And beside those, the account's one **portfolio preferences** record
 //! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
@@ -42,7 +47,8 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail, ApplicationPreferences,
+    AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail, ApplicationComponentStrategy,
+    ApplicationPreferences,
     AssessmentTarget, AssociatedApplication, DataCollectionDetails, DatabaseConfigDetail,
     DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
@@ -505,6 +511,115 @@ pub const SORT_DESCENDING: &str = "DESC";
 /// nothing computed.
 pub const STRATEGY_RECOMMENDED: &str = "recommended";
 
+/// `SrcCodeOrDbAnalysisStatus`'s value for an application component whose source code
+/// and/or database credentials are configured and for which no analysis was asked for.
+///
+/// `UpdateApplicationComponentConfigRequest$configureOnly` is documented "If it is set to
+/// true, the source code and/or database credentials are updated. If it is set to false,
+/// the source code and/or database credentials are updated and an analysis is initiated",
+/// so a configure-only update leaves the component configured and unanalysed.
+pub const ANALYSIS_CONFIGURED: &str = "CONFIGURED";
+
+/// `SrcCodeOrDbAnalysisStatus`'s value for an application component whose analysis has
+/// been asked for and not yet scheduled.
+///
+/// It is where an update that asked for an analysis (the same documented sentence, with
+/// `configureOnly` false or absent) leaves the component, and where it STAYS: nothing in
+/// this emulator analyses source code or a database, so no analyzer picks the queued
+/// analysis up and no result, success or failure is ever reported for work nothing ran.
+pub const ANALYSIS_TO_BE_SCHEDULED: &str = "ANALYSIS_TO_BE_SCHEDULED";
+
+/// The `RecommendationSet` a stored strategy and destination amount to, or `None` when
+/// neither is held.
+///
+/// A recommendation of this emulator is a strategy and/or a destination and carries no
+/// transformation tool, because nothing here picks one. Both the server inventory and the
+/// application components hold those two members, so both report their recommendation
+/// through this one function.
+fn recommendation_of(
+    strategy: &Option<String>,
+    target_destination: &Option<String>,
+) -> Option<RecommendationSet> {
+    (strategy.is_some() || target_destination.is_some()).then(|| RecommendationSet {
+        transformation_tool: None,
+        target_destination: target_destination.clone(),
+        strategy: strategy.clone(),
+    })
+}
+
+/// The `RecommendationSet` a stored preference names.
+///
+/// `StrategyOption` and `RecommendationSet` carry the same three things under different
+/// names — a strategy, a destination and a tool — so the preference is reported as the
+/// recommendation it selects, its `toolName` becoming the `TransformationTool` the option
+/// named and nothing more (no description and no installation link: the caller named a
+/// tool, not a tool catalog entry).
+fn recommendation_of_option(option: &StrategyOption) -> RecommendationSet {
+    RecommendationSet {
+        transformation_tool: option.tool_name.clone().map(|name| TransformationTool {
+            name: Some(name),
+            description: None,
+            tranformation_tool_installation_link: None,
+        }),
+        target_destination: option.target_destination.clone(),
+        strategy: option.strategy.clone(),
+    }
+}
+
+/// One entry of the strategy list a read reports for a resource of this service.
+///
+/// `ServerStrategy` and `ApplicationComponentStrategy` declare the same three members (the
+/// server's one also counts the application components running the strategy), so the list
+/// is decided once here and each read maps it into its own shape.
+struct StrategyListing {
+    recommendation: RecommendationSet,
+    status: Option<String>,
+    is_preferred: bool,
+}
+
+/// The strategies a read reports for a resource holding the recommendation `analyzed` and
+/// the preference `preferred`: the option the account prefers first, then the service's
+/// own recommendation when it is a different one.
+///
+/// Both come from the resource's own record, so one nothing recommended and nobody chose a
+/// preference for reports NO strategy rather than a canned list. `isPreferred` is "set to
+/// true if the recommendation is set as preferred", so it is true exactly for the option an
+/// update stored (the flag that call carried when it carried one) and false for a
+/// recommendation nobody chose. A preference naming the same strategy and destination as
+/// the service's recommendation is ONE strategy, not two, and is reported once — carrying
+/// the recommended status, since it is also what the service recommends.
+fn strategy_listings(
+    analyzed: Option<RecommendationSet>,
+    preferred: Option<&StrategyOption>,
+) -> Vec<StrategyListing> {
+    let preferred_set = preferred.map(recommendation_of_option);
+    let same_strategy = |left: &RecommendationSet, right: &RecommendationSet| {
+        left.strategy == right.strategy && left.target_destination == right.target_destination
+    };
+    let also_recommended = match (&analyzed, &preferred_set) {
+        (Some(analyzed), Some(preferred)) => same_strategy(analyzed, preferred),
+        _ => false,
+    };
+    let mut listings: Vec<StrategyListing> = Vec::new();
+    if let Some(recommendation) = preferred_set {
+        listings.push(StrategyListing {
+            recommendation,
+            status: also_recommended.then(|| STRATEGY_RECOMMENDED.to_string()),
+            is_preferred: preferred
+                .and_then(|option| option.is_preferred)
+                .unwrap_or(true),
+        });
+    }
+    if let Some(recommendation) = analyzed.filter(|_| !also_recommended) {
+        listings.push(StrategyListing {
+            recommendation,
+            status: Some(STRATEGY_RECOMMENDED.to_string()),
+            is_preferred: false,
+        });
+    }
+    listings
+}
+
 /// What a data collector fetched about one server when it discovered it — the
 /// `AnalyzableServerSummary` members, held on the server they describe.
 ///
@@ -639,14 +754,7 @@ impl ServerRecord {
             network_info_list: None,
             cpu_architecture: self.cpu_architecture.clone(),
         });
-        let recommendation_set = (self.strategy.is_some() || self.target_destination.is_some())
-            .then(|| RecommendationSet {
-                // No transformation tool is recommended: nothing in this emulator picks
-                // one.
-                transformation_tool: None,
-                target_destination: self.target_destination.clone(),
-                strategy: self.strategy.clone(),
-            });
+        let recommendation_set = self.analyzed_recommendation();
         ServerDetail {
             id: Some(self.id.clone()),
             name: self.name.clone(),
@@ -702,82 +810,28 @@ impl ServerRecord {
     /// and/or a destination, and no transformation tool is part of it, because nothing in
     /// this emulator picks one.
     fn analyzed_recommendation(&self) -> Option<RecommendationSet> {
-        (self.strategy.is_some() || self.target_destination.is_some()).then(|| {
-            RecommendationSet {
-                transformation_tool: None,
-                target_destination: self.target_destination.clone(),
-                strategy: self.strategy.clone(),
-            }
-        })
+        recommendation_of(&self.strategy, &self.target_destination)
     }
 
-    /// The `RecommendationSet` the stored preference names, or `None` when no preference
-    /// is stored.
+    /// The strategies a read reports for this server — [`strategy_listings`] as
+    /// `ServerStrategy`.
     ///
-    /// `StrategyOption` and `RecommendationSet` carry the same three things under
-    /// different names — a strategy, a destination and a tool — so the preference is
-    /// reported as the recommendation it selects, its `toolName` becoming the
-    /// `TransformationTool` the option named and nothing more (no description and no
-    /// installation link: the caller named a tool, not a tool catalog entry).
-    fn preferred_recommendation(&self) -> Option<RecommendationSet> {
-        let option = self.preferred_strategy.as_ref()?;
-        Some(RecommendationSet {
-            transformation_tool: option.tool_name.clone().map(|name| TransformationTool {
-                name: Some(name),
-                description: None,
-                tranformation_tool_installation_link: None,
-            }),
-            target_destination: option.target_destination.clone(),
-            strategy: option.strategy.clone(),
-        })
-    }
-
-    /// The strategies a read reports for this server: the one the account prefers first,
-    /// then the service's own recommendation when it is a different one.
-    ///
-    /// Both come from this record, so a server nothing recommended and nobody chose a
-    /// preference for reports NO strategy rather than a canned list. `isPreferred` is
-    /// "set to true if the recommendation is set as preferred", so it is true exactly for
-    /// the option a `UpdateServerConfig` call stored (the flag that call carried when it
-    /// carried one) and false for a recommendation nobody chose. A preference naming the
-    /// same strategy and destination as the service's recommendation is ONE strategy, not
-    /// two, and is reported once — carrying the recommended status, since it is also what
-    /// the service recommends.
+    /// `numberOfApplicationComponents` is left unset: the component records this service
+    /// holds carry the servers they run on, but nothing here attributes a component to a
+    /// strategy of a server, so a count would be a number nothing computed.
     pub fn to_server_strategies(&self) -> Vec<ServerStrategy> {
-        let analyzed = self.analyzed_recommendation();
-        let preferred = self.preferred_recommendation();
-        let mut strategies: Vec<ServerStrategy> = Vec::new();
-        let same_strategy = |left: &RecommendationSet, right: &RecommendationSet| {
-            left.strategy == right.strategy && left.target_destination == right.target_destination
-        };
-        let also_recommended = match (&analyzed, &preferred) {
-            (Some(analyzed), Some(preferred)) => same_strategy(analyzed, preferred),
-            _ => false,
-        };
-        if let Some(preferred) = preferred {
-            strategies.push(ServerStrategy {
-                recommendation: Some(preferred),
-                status: also_recommended.then(|| STRATEGY_RECOMMENDED.to_string()),
-                // This emulator holds no application component, so there is no count of
-                // the ones running this strategy on the server to report.
-                number_of_application_components: None,
-                is_preferred: Some(
-                    self.preferred_strategy
-                        .as_ref()
-                        .and_then(|option| option.is_preferred)
-                        .unwrap_or(true),
-                ),
-            });
-        }
-        if let Some(analyzed) = analyzed.filter(|_| !also_recommended) {
-            strategies.push(ServerStrategy {
-                recommendation: Some(analyzed),
-                status: Some(STRATEGY_RECOMMENDED.to_string()),
-                number_of_application_components: None,
-                is_preferred: Some(false),
-            });
-        }
-        strategies
+        strategy_listings(
+            self.analyzed_recommendation(),
+            self.preferred_strategy.as_ref(),
+        )
+        .into_iter()
+        .map(|listing| ServerStrategy {
+            recommendation: Some(listing.recommendation),
+            status: listing.status,
+            number_of_application_components: None,
+            is_preferred: Some(listing.is_preferred),
+        })
+        .collect()
     }
 
     /// The `AnalyzableServerSummary` a read reports for this server, or `None` when no
@@ -894,6 +948,17 @@ pub struct ApplicationComponentRecord {
     /// more than one application group") is whether there is more than one, counted off
     /// this list.
     pub associated_applications: Vec<AssociatedApplication>,
+    /// The strategy option the account PREFERS for this component, as
+    /// `UpdateApplicationComponentConfig` stored it — member for member, so nothing here
+    /// is derived from the request that reads it. `None` until a caller sets one.
+    ///
+    /// Like the server inventory's preference ([`ServerRecord::preferred_strategy`]) it
+    /// records the CUSTOMER's choice rather than any analysis, so it is held beside the
+    /// recommendation members above instead of overwriting them:
+    /// `GetApplicationComponentStrategies` reports both, and
+    /// `ApplicationComponentStrategy$isPreferred` is the member the model gives the
+    /// distinction to.
+    pub preferred_strategy: Option<StrategyOption>,
 }
 
 impl ApplicationComponentRecord {
@@ -907,14 +972,7 @@ impl ApplicationComponentRecord {
     /// reported only when the record holds something to put in them, so a component the
     /// ingestion knew little about does not come back as a tree of empty objects.
     pub fn to_detail(&self) -> ApplicationComponentDetail {
-        let recommendation_set = (self.strategy.is_some() || self.target_destination.is_some())
-            .then(|| RecommendationSet {
-                // No transformation tool is recommended: nothing in this emulator picks
-                // one.
-                transformation_tool: None,
-                target_destination: self.target_destination.clone(),
-                strategy: self.strategy.clone(),
-            });
+        let recommendation_set = self.analyzed_recommendation();
         ApplicationComponentDetail {
             id: Some(self.id.clone()),
             name: self.name.clone(),
@@ -959,6 +1017,30 @@ impl ApplicationComponentRecord {
     /// reports, so the flag and the list cannot drift apart.
     pub fn more_application_resource(&self) -> bool {
         self.associated_applications.len() > 1
+    }
+
+    /// The `RecommendationSet` the service's own recommendation for this component amounts
+    /// to, or `None` when it holds none — the same two members [`Self::to_detail`]
+    /// reports.
+    fn analyzed_recommendation(&self) -> Option<RecommendationSet> {
+        recommendation_of(&self.strategy, &self.target_destination)
+    }
+
+    /// The strategies a read reports for this component — [`strategy_listings`] as
+    /// `ApplicationComponentStrategy`: the option the account prefers first, then the
+    /// service's own recommendation when it is a different one.
+    pub fn to_component_strategies(&self) -> Vec<ApplicationComponentStrategy> {
+        strategy_listings(
+            self.analyzed_recommendation(),
+            self.preferred_strategy.as_ref(),
+        )
+        .into_iter()
+        .map(|listing| ApplicationComponentStrategy {
+            recommendation: Some(listing.recommendation),
+            status: listing.status,
+            is_preferred: Some(listing.is_preferred),
+        })
+        .collect()
     }
 }
 

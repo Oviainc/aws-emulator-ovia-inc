@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplicationComponentConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplicationComponentConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplicationComponentConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the configuration of one application component of this account's portfolio: the
+//! members the request names are written onto that component's record
+//! ([`crate::state::ApplicationComponentRecord`]), and the reads beside this operation then
+//! report what it stored — `GetApplicationComponentDetails` the app type, the inclusion
+//! status, the database credentials and the source code configuration, and
+//! `GetApplicationComponentStrategies` the strategy option the account prefers for the
+//! component.
+//!
+//! It is an update of named members, not a replacement of the record: a member the request
+//! leaves out is left exactly as it was, however an earlier call left it. A `sourceCodeList`
+//! names the WHOLE list of source code configurations, so one that is sent replaces the
+//! stored list (an empty one leaves the component configured with no repository), and a
+//! `strategyOption` whose every strategy member is absent selects nothing and so stores
+//! nothing.
+//!
+//! `configureOnly` decides what the update does BESIDE storing the configuration: it is
+//! documented "If it is set to true, the source code and/or database credentials are
+//! updated. If it is set to false, the source code and/or database credentials are updated
+//! and an analysis is initiated", so a request that configures source code and/or database
+//! credentials leaves the component's `SrcCodeOrDbAnalysisStatus` at
+//! [`crate::state::ANALYSIS_CONFIGURED`] when it asked for configuration only and at
+//! [`crate::state::ANALYSIS_TO_BE_SCHEDULED`] when it asked for an analysis too (the member
+//! absent being the latter: the request did not ask for configuration only). A request that
+//! configures neither has nothing to analyse and leaves that status alone. Nothing in this
+//! emulator analyses source code or a database, so a queued analysis is never scheduled and
+//! no analysis result is ever reported.
+//!
+//! An `applicationComponentId` that names no component of the portfolio is refused with the
+//! modelled 404 `ResourceNotFoundException`, and a value that is not one its enumeration
+//! declares — `appType`, `inclusionStatus`, a `strategyOption` member or a source code
+//! entry's `versionControl`, none of which the boundary validator holds to its catalog —
+//! with the service's 400 `ValidationException`, before anything is written: a request this
+//! service cannot accept leaves the component's configuration exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +108,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    application_component_not_found, invalid_request_body, ANALYSIS_CONFIGURED,
+    ANALYSIS_TO_BE_SCHEDULED,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -117,6 +146,86 @@ impl From<UpdateApplicationComponentConfigErrorModeled> for UpdateApplicationCom
     fn from(modeled: UpdateApplicationComponentConfigErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// This operation's refusal of a request the model admits member by member but whose
+/// values this service does not accept, in the service's one wording for an invalid
+/// request body.
+fn refused() -> UpdateApplicationComponentConfigError {
+    UpdateApplicationComponentConfigErrorModeled::ValidationException(invalid_request_body()).into()
+}
+
+/// Refuse a value that is not one the named enumeration declares.
+///
+/// The membership test itself is the service's [`crate::state::check_enum`] (an absent
+/// member names no value, so it is accepted); this wrapper only lifts its
+/// `ValidationException` into this operation's error channel. Enum membership is checked
+/// in the handler because the boundary validator does not enforce it — the same reason
+/// `UpdateServerConfig` checks its `strategyOption` and `PutPortfolioPreferences` its
+/// `applicationMode`.
+fn check_enum(
+    value: Option<&str>,
+    declared: &[&str],
+) -> Result<(), UpdateApplicationComponentConfigError> {
+    crate::state::check_enum(value, declared).map_err(|_| refused())
+}
+
+/// The strategy option this request stores against the component, or `None` when it names
+/// none to store.
+///
+/// `isPreferred` alone selects no strategy, no destination and no tool, so an option
+/// carrying nothing else is nothing to store: this operation updates the members the
+/// request names, and that request names none.
+fn preference_of(
+    option: Option<StrategyOption>,
+) -> Result<Option<StrategyOption>, UpdateApplicationComponentConfigError> {
+    let Some(option) = option else {
+        return Ok(None);
+    };
+    check_enum(option.strategy.as_deref(), STRATEGY_VALUES)?;
+    check_enum(option.target_destination.as_deref(), TARGET_DESTINATION_VALUES)?;
+    check_enum(option.tool_name.as_deref(), TRANSFORMATION_TOOL_NAME_VALUES)?;
+    let names_a_strategy = option.strategy.is_some()
+        || option.target_destination.is_some()
+        || option.tool_name.is_some();
+    Ok(names_a_strategy.then_some(option))
+}
+
+/// One source code configuration the request named, as the component record holds it.
+///
+/// `SourceCode` and `SourceCodeRepository` carry the same four things under different
+/// names, documented word for word the same: the repository name for the source code
+/// (`location` / `repository`), its branch (`sourceVersion` / `branch`), the type of
+/// repository to use (`versionControl` / `versionControlType`) and the name of the project.
+/// So the configuration is stored member for member and the read reports it back
+/// unchanged.
+fn repository_of(source: SourceCode) -> SourceCodeRepository {
+    SourceCodeRepository {
+        repository: source.location,
+        branch: source.source_version,
+        version_control_type: source.version_control,
+        project_name: source.project_name,
+    }
+}
+
+/// The source code configurations this request stores against the component, or `None`
+/// when it names no list at all.
+///
+/// `sourceCodeList` is "The list of source code configurations to update for the
+/// application component", so a list that IS sent names the whole of it and replaces what
+/// was stored, in the order the request gave; an empty one leaves the component configured
+/// with no repository. Each entry's `versionControl` is held to the `VersionControl`
+/// catalog, one level down inside the list, before anything is stored.
+fn repositories_of(
+    list: Option<Vec<SourceCode>>,
+) -> Result<Option<Vec<SourceCodeRepository>>, UpdateApplicationComponentConfigError> {
+    let Some(list) = list else {
+        return Ok(None);
+    };
+    for source in &list {
+        check_enum(source.version_control.as_deref(), VERSION_CONTROL_VALUES)?;
+    }
+    Ok(Some(list.into_iter().map(repository_of).collect()))
 }
 
 /// The `UpdateApplicationComponentConfig` operation.
@@ -155,18 +264,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplicationComponentConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationComponentConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplicationComponentConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateApplicationComponentConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the migrationhub-strategy application component inventory is \
+                             unavailable"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Decided from the request alone, before the store is touched: a request this
+        // service cannot accept must leave the component's configuration exactly as it
+        // was.
+        check_enum(input.app_type.as_deref(), APP_TYPE_VALUES)?;
+        check_enum(input.inclusion_status.as_deref(), INCLUSION_STATUS_VALUES)?;
+        let preference = preference_of(input.strategy_option)?;
+        let repositories = repositories_of(input.source_code_list)?;
+        // What the request configures, which is what `configureOnly` chooses between
+        // configuring and configuring-then-analysing.
+        let configures_source_code = repositories.is_some();
+        let configures_database = input.secrets_manager_key.is_some();
+
+        let mut store = state.lock();
+        // The update applies to a component of THIS account's portfolio: an id naming none
+        // is reported as the missing resource it is, never silently created.
+        let Some(component) = store
+            .application_components
+            .get_mut(&input.application_component_id)
+        else {
+            return Err(
+                UpdateApplicationComponentConfigErrorModeled::ResourceNotFoundException(
+                    application_component_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // The write: each member the request named becomes the component's, member for
+        // member. A member the request left out updates nothing, so what an earlier call
+        // stored survives it.
+        if let Some(app_type) = input.app_type {
+            component.app_type = Some(app_type);
+        }
+        if let Some(inclusion_status) = input.inclusion_status {
+            component.inclusion_status = Some(inclusion_status);
+        }
+        if let Some(secret_name) = input.secrets_manager_key {
+            component.database_secret_name = Some(secret_name);
+        }
+        if let Some(repositories) = repositories {
+            component.source_code_repositories = repositories;
+        }
+        if let Some(option) = preference {
+            component.preferred_strategy = Some(option);
+        }
+
+        // `configureOnly` is about the source code and the database credentials, so a
+        // request that configures neither has nothing to analyse and leaves the
+        // component's analysis status as it was. One that configures either records
+        // whether an analysis was asked for; an absent `configureOnly` did not ask for
+        // configuration only, so it asked for one.
+        if configures_source_code || configures_database {
+            let configure_only = input.configure_only.unwrap_or(false);
+            component.analysis_status = Some(if configure_only {
+                ANALYSIS_CONFIGURED.to_string()
+            } else {
+                ANALYSIS_TO_BE_SCHEDULED.to_string()
+            });
+        }
+
+        // `UpdateApplicationComponentConfigResponse` models no members: the update is the
+        // whole of the answer.
+        Ok(UpdateApplicationComponentConfigOutput {})
     }
 }
