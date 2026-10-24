@@ -850,7 +850,7 @@ async fn tag_operations_apply_to_every_resource_the_service_holds() {
             let case = format!("{case}/{operation}");
             let (status, response) = emulator.call(operation, body).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {case:?}: expected the modeled not-found refusal, got {status} \
                  {response:?}"
             );

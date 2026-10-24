@@ -158,10 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 GetConfigurationCheckOperationErrorModeled::ValidationException(
-                    crate::state::validation(format!(
-                        "No configuration check operation with ID {} exists in this account and Region",
-                        input.operation_id
-                    )),
+                    crate::state::validation(
+                        crate::state::no_configuration_check_operation_message(&input.operation_id),
+                    ),
                 )
                 .into(),
             );

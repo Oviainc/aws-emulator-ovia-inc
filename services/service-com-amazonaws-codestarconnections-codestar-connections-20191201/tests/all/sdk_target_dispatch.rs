@@ -274,7 +274,9 @@ async fn one_store_lies_behind_every_prefix_form() {
 
 /// RULE: a modelled refusal is the handler's, behind every prefix form — a tag operation
 /// whose `ResourceArn` names no resource this service holds is the modelled
-/// `ResourceNotFoundException` (404) and never a claim that the operation does not exist.
+/// `ResourceNotFoundException`, at the status the live service answers an absent resource
+/// with (`state::RESOURCE_NOT_FOUND_STATUS`), and never a claim that the operation does
+/// not exist.
 ///
 /// The rows are well-shaped `AmazonResourceName`s (modeled `len 1..1011`, pattern
 /// `^arn:aws(-[\w]+)*:.+:.+:[0-9]{12}:.+$`) that resolve to nothing: a connection id no
@@ -319,13 +321,17 @@ async fn an_unknown_resource_arn_is_refused_as_absent_behind_every_prefix_form()
             .await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {form:?}/{case:?}: expected the modelled absence for {arn:?}, got \
                  {status} {body}"
             );
-            assert!(
-                error_message(&body).contains(arn.as_str()),
-                "case {form:?}/{case:?}: the refusal must name the ARN supplied, got {body}"
+            assert_eq!(
+                error_message(&body),
+                // The literal a client reads, written out here rather than read back
+                // out of the constant the handler writes.
+                "No connection exists with the ARN",
+                "case {form:?}/{case:?}: the refusal must be the service's absent-resource \
+                 wording, got {body}"
             );
 
             // The same ARN is just as absent for the other two tag operations.
@@ -338,7 +344,7 @@ async fn an_unknown_resource_arn_is_refused_as_absent_behind_every_prefix_form()
             .await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {form:?}/{case:?}: ListTagsForResource must refuse {arn:?} as absent, \
                  got {status} {body}"
             );
@@ -351,7 +357,7 @@ async fn an_unknown_resource_arn_is_refused_as_absent_behind_every_prefix_form()
             .await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
+                (400, "ResourceNotFoundException"),
                 "case {form:?}/{case:?}: UntagResource must refuse {arn:?} as absent, got \
                  {status} {body}"
             );

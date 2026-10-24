@@ -84,6 +84,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // This service's signing name is its own, so the claim rule is the framework's
+        // default plus ONE disjunct for the dotted target below — deliberately NOT
+        // `service_common::claims_request`, which is the rule for a SHARED signing name:
+        // that one opens with `routes_to` (the resolved routing key must equal the
+        // signing name) and only then consults the target, so it cannot claim the very
+        // requests this seam exists for — an unsigned, un-hosted call whose resolved key
+        // is the namespace label `com`. Its path conjunct is likewise for separating
+        // peers that share a name, and this endpoint has no peers to be separated from.
+        //
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.

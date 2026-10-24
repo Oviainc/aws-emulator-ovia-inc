@@ -192,6 +192,20 @@ pub fn deployment_target_not_found(deployment_id: &str, target_id: &str) -> Stri
     )
 }
 
+/// `InstanceDoesNotExistException` (HTTP 400): the instance id the request asked
+/// for and the deployment whose group holds no such instance, which is what the
+/// shape's own sentence says ("The specified instance does not exist in the
+/// deployment group"). The instance-shaped refusal that answers exactly what
+/// [`deployment_target_not_found`] answers for the target-shaped readers of the
+/// same records, so the two cannot disagree about an instance neither can look
+/// up; the id is bounded by [`echoed`].
+pub fn deployment_instance_not_found(deployment_id: &str, instance_id: &str) -> String {
+    format!(
+        "The instance {} does not exist in the deployment group of the deployment {deployment_id}",
+        echoed(instance_id)
+    )
+}
+
 /// `InvalidDeploymentTargetIdException` (HTTP 400): the refusal every operation
 /// taking a `targetId` answers a value outside the FORM a target of that compute
 /// platform is reported under with, so the single-target reader and the batch
@@ -2436,6 +2450,34 @@ pub fn deployment_target_view(
         }
     }
     view
+}
+
+/// One instance target of `deployment` as the modelled `InstanceSummary`.
+///
+/// The instance-shaped view of the very record [`deployment_target_view`]
+/// projects — the model says so twice over ("InstanceSummary is deprecated, use
+/// DeploymentTarget instead", "InstanceStatus is deprecated, use TargetStatus
+/// instead") — so both views are computed from the SAME stored deployment and
+/// the same derivations: the status its progress gives the target
+/// ([`target_status`]), the instant that status last changed
+/// ([`target_last_updated_at_ms`]), and the lifecycle event results reported
+/// against the deployment ([`target_lifecycle_events`]). The environment the
+/// instance belongs to is the `TargetLabel` the snapshot resolved, whose members
+/// `InstanceType` repeats (`smithy_query(query="shape",shape="InstanceType")`:
+/// Blue | Green), so an instance of an in-place deployment — which has one
+/// environment — carries none.
+pub fn instance_summary(
+    deployment: &Deployment,
+    target: &DeploymentTargetSnapshot,
+) -> crate::ops::types::InstanceSummary {
+    crate::ops::types::InstanceSummary {
+        deployment_id: Some(deployment.deployment_id.clone()),
+        instance_id: target.target_id.clone(),
+        status: Some(target_status(deployment).to_string()),
+        last_updated_at: Some(timestamp(target_last_updated_at_ms(deployment))),
+        lifecycle_events: target_lifecycle_events(deployment),
+        instance_type: target.instance_label.clone(),
+    }
 }
 
 /// The `targetArn` of an instance target: the ARN of the instance itself.
