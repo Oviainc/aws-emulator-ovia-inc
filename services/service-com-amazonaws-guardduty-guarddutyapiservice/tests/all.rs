@@ -21,6 +21,8 @@ mod custom_detection_rules;
 mod detector_data_sources_projection;
 #[path = "all/detector_lifecycle.rs"]
 mod detector_lifecycle;
+#[path = "all/filter_lifecycle.rs"]
+mod filter_lifecycle;
 #[path = "all/filter_listing.rs"]
 mod filter_listing;
 #[path = "all/findings_archive_state.rs"]

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSatellites
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSatellites`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSatellites::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,23 +129,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SATELLITES_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the satellites this account is on-boarded to, a page at a time.
+    ///
+    /// `@readonly`: the answer is computed from [`crate::state::ComAmazonawsGroundstationGroundstationState::satellites`]
+    /// and nothing is written, so a listing changes nothing a later caller sees. A
+    /// satellite is not created through this API — AWS onboards one to the account
+    /// outside it — so the store holds exactly the onboardings
+    /// [`crate::state::SATELLITES_ENV`] describes, and an account with none lists none.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSatellites` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSatellitesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSatellites"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "satellites";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSatellitesErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // A page boundary is only stable over a stable order, so the listing is ordered
+        // by the NORAD catalogue number that identifies the spacecraft (and by
+        // `satelliteId` beside it, so the order is total whatever the store holds) rather
+        // than by the map's own iteration order.
+        let guard = state.lock();
+        let mut onboarded: Vec<&crate::state::Satellite> = guard.satellites.values().collect();
+        onboarded.sort_by(|left, right| {
+            (left.norad_satellite_id, &left.satellite_id)
+                .cmp(&(right.norad_satellite_id, &right.satellite_id))
+        });
+        let items: Vec<SatelliteListItem> = onboarded
+            .into_iter()
+            .map(|satellite| SatelliteListItem {
+                satellite_id: Some(satellite.satellite_id.clone()),
+                satellite_arn: Some(satellite.satellite_arn.clone()),
+                norad_satellite_id: satellite.norad_satellite_id,
+                ground_stations: Some(satellite.ground_stations.clone()),
+                current_ephemeris: satellite.current_ephemeris.clone(),
+            })
+            .collect();
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(LISTING, token).ok_or_else(|| {
+                ListSatellitesErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(
+                        "nextToken was not issued by a previous ListSatellites call".to_string(),
+                    ),
+                    parameter_name: Some("nextToken".to_string()),
+                })
+            })?,
+        };
+        let (page, next_token) = crate::state::paginate(LISTING, &items, input.max_results, offset);
+
+        Ok(ListSatellitesOutput {
+            next_token,
+            satellites: Some(page),
+        })
     }
 }
