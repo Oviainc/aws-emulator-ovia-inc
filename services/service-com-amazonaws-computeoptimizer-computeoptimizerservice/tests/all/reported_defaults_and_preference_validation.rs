@@ -283,10 +283,11 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
 
     // (case, accepted, the member the row sets, the request)
     let rows: Vec<(&str, bool, &str, Value)> = vec![
-        // `enhancedInfrastructureMetrics` documents NO resource-type restriction, so it is
-        // settable for every `ResourceType` the enum admits — see
-        // `enhanced_metrics_is_settable_for_every_resource_type` in
-        // `tests/all/unrestricted_preference_resource_types.rs` for the whole enum.
+        // `enhancedInfrastructureMetrics` is an instance-feature preference: the service
+        // supports it for the EC2 instance and Auto Scaling group types and refuses it for
+        // every other `ResourceType` — see
+        // `every_preference_member_is_settable_exactly_where_its_resource_types_allow` in
+        // `tests/all/preference_resource_type_support.rs` for the whole enum.
         (
             "enhanced metrics on Ec2Instance",
             true,
@@ -305,33 +306,54 @@ async fn put_refuses_a_preference_the_resource_type_does_not_support_and_stores_
         ),
         (
             "enhanced metrics on RdsDBInstance",
-            true,
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "RdsDBInstance", "enhancedInfrastructureMetrics": "Inactive"}),
         ),
         (
             "enhanced metrics on EcsService",
-            true,
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "EcsService", "enhancedInfrastructureMetrics": "Active"}),
         ),
         (
             "enhanced metrics on EbsVolume",
-            true,
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "EbsVolume", "enhancedInfrastructureMetrics": "Inactive"}),
         ),
         (
             "enhanced metrics on LambdaFunction",
-            true,
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "LambdaFunction", "enhancedInfrastructureMetrics": "Active"}),
         ),
         (
             "enhanced metrics on Idle",
-            true,
+            false,
             "enhancedInfrastructureMetrics",
             json!({"resourceType": "Idle", "enhancedInfrastructureMetrics": "Active"}),
+        ),
+        // `inferredWorkloadTypes` is the other instance-feature preference, restricted the
+        // same way.
+        (
+            "inferred workload types on Ec2Instance",
+            true,
+            "inferredWorkloadTypes",
+            json!({"resourceType": "Ec2Instance", "inferredWorkloadTypes": "Inactive"}),
+        ),
+        (
+            "inferred workload types on NotApplicable",
+            false,
+            "inferredWorkloadTypes",
+            json!({"resourceType": "NotApplicable", "inferredWorkloadTypes": "Active"}),
+        ),
+        // `savingsEstimationMode` is restricted to no resource type at all.
+        (
+            "savings estimation mode on License",
+            true,
+            "savingsEstimationMode",
+            json!({"resourceType": "License", "savingsEstimationMode": "AfterDiscounts"}),
         ),
         // `externalMetricsPreference` "can only be set for the Ec2Instance resource type".
         (
