@@ -18,8 +18,9 @@ use std::time::Duration;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ConflictException, DependencyConfig, Goal, GroupingAttributeDefinition, GroupingConfiguration,
-    Interval, MetricDataQuery, MetricSource, MonitoredRequestCountMetricDataQueries,
+    ConflictException, DependencyConfig, ExclusionWindow, Goal, GroupingAttributeDefinition,
+    GroupingConfiguration, Interval, MetricDataQuery, MetricSource,
+    MonitoredRequestCountMetricDataQueries,
     RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
     RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
     ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
@@ -165,6 +166,19 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// list makes walks the store only when the clock has actually made a lapse or a scope
     /// drop due.
     instrumentation_due_at: Option<DateTime>,
+    /// The exclusion windows configured on each SLO, keyed by the same SLO NAME `slos` is
+    /// keyed by, so the two maps name one resource and a window set cannot outlive the SLO
+    /// it belongs to (see [`Self::remove`]).
+    ///
+    /// The windows of one SLO are an ORDERED SET identified by configuration: a removal
+    /// names a window by its configuration (`RemoveExclusionWindows`: "The window
+    /// configuration must match an existing exclusion window"), so two windows with the same
+    /// configuration would be one window named twice. The order is the order the windows
+    /// were added in, which is what makes a `ListServiceLevelObjectiveExclusionWindows` page
+    /// cursor a stable boundary. Bounded at [`MAX_EXCLUSION_WINDOWS_PER_SLO`] per SLO by the
+    /// only writer, and the entry is dropped once an SLO holds no windows — holding none and
+    /// holding an empty set are the same state, exactly as for `tags`.
+    pub exclusion_windows: BTreeMap<String, Vec<ExclusionWindow>>,
     /// This account's grouping configuration, or `None` while none is configured.
     ///
     /// At most ONE configuration exists: `PutGroupingConfiguration` "creates or updates the
@@ -194,6 +208,9 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         let removed = self.slos.remove(slo_name_of(id));
         if let Some(slo) = removed.as_ref() {
             self.tags.remove(&slo.arn);
+            // The window set belongs to the SLO, so it goes with it: a later SLO created
+            // under the same name is a NEW resource and starts with no exclusion windows.
+            self.exclusion_windows.remove(&slo.name);
         }
         removed
     }
@@ -1026,6 +1043,194 @@ pub fn same_dependency(left: Option<&DependencyConfig>, right: &DependencyConfig
         left.dependency_operation_name == right.dependency_operation_name
             && left.dependency_key_attributes == right.dependency_key_attributes
     })
+}
+
+// =============================================================================
+// The exclusion windows configured on an SLO
+// =============================================================================
+
+/// The most exclusion windows one SLO holds.
+///
+/// The API states the limit per SLO rather than per request:
+/// `BatchUpdateExclusionWindows.AddExclusionWindows` documents "You can add up to 10
+/// exclusion windows per SLO", and the modelled `ExclusionWindows` list caps both that
+/// member and the `ListServiceLevelObjectiveExclusionWindows` output at 10 entries \u2014 so a
+/// set beyond this size could not be reported back at all.
+pub const MAX_EXCLUSION_WINDOWS_PER_SLO: usize = 10;
+
+/// The most per-SLO failures one `BatchUpdateExclusionWindows` response reports: the modelled
+/// maximum of `BatchUpdateExclusionWindowsErrors` (`len ..10`), while `SloIds` admits up to
+/// 50 ids.
+///
+/// Which SLOs a request WAS applied to is reported in full by the response's `SloIds`, so an
+/// id missing from that list was not updated whether or not the capped `Errors` list also
+/// names it.
+pub const MAX_EXCLUSION_WINDOW_ERRORS: usize = 10;
+
+/// The largest page `ListServiceLevelObjectiveExclusionWindows` returns when the caller
+/// names no `MaxResults`.
+///
+/// The member's doc sentence says "the default of 50 is used", but its modelled
+/// `@range` is `1..10` and the `ExclusionWindows` list it fills holds at most 10 entries, so
+/// 50 is not a page this operation can ever return: the effective default is the largest page
+/// the model admits, which is also the whole window set of one SLO
+/// ([`MAX_EXCLUSION_WINDOWS_PER_SLO`]).
+pub const DEFAULT_EXCLUSION_WINDOW_PAGE: i32 = MAX_EXCLUSION_WINDOWS_PER_SLO as i32;
+
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceLevelObjectiveExclusionWindows`.
+pub const EXCLUSION_WINDOWS_TOKEN_TAG: &str = "exclusion-windows/1/";
+
+/// Why one SLO named by a `BatchUpdateExclusionWindows` request was not updated.
+///
+/// The failure is per SLO because the request is: one set of windows is applied to each id
+/// in `SloIds` independently, and the response reports the ids it was applied to beside an
+/// `Errors` entry for each one it was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionWindowFailure {
+    /// The id names no stored SLO.
+    NoSuchSlo,
+    /// A window in `RemoveExclusionWindows` matches no exclusion window this SLO holds.
+    UnmatchedRemoval,
+    /// The additions would take this SLO past [`MAX_EXCLUSION_WINDOWS_PER_SLO`] windows.
+    TooManyWindows,
+}
+
+impl ExclusionWindowFailure {
+    /// The `ErrorCode` this failure reports.
+    ///
+    /// `ExclusionWindowErrorCode` is an unconstrained string in the model
+    /// (`smithy_query(shape="ExclusionWindowErrorCode")` \u2014 a `string` with no enum), so the
+    /// code reported is the NAME of the modelled exception a single-SLO call would have been
+    /// refused with, which is the same token a client already branches on when it reads an
+    /// error envelope — and the exception a request whose every id failed is answered with,
+    /// so the two paths cannot disagree about one failure.
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::NoSuchSlo => "ResourceNotFoundException",
+            Self::UnmatchedRemoval | Self::TooManyWindows => "ValidationException",
+        }
+    }
+
+    /// The `ErrorMessage` this failure reports for the SLO `id` named, in `region`.
+    ///
+    /// A not-found failure is worded by [`slo_not_found`] and a constraint failure by
+    /// [`validation_envelope`] over [`constraint_clause`], so a per-item error reads exactly
+    /// like the exception the same failure earns on its own, and neither echoes the window
+    /// configuration the request carried.
+    pub fn error_message(self, region: &str, id: &str) -> String {
+        match self {
+            Self::NoSuchSlo => slo_not_found(region, id).message,
+            Self::UnmatchedRemoval => validation_envelope(&[constraint_clause(
+                "removeExclusionWindows",
+                "Each window configuration must match an existing exclusion window of the SLO",
+            )]),
+            Self::TooManyWindows => validation_envelope(&[constraint_clause(
+                "addExclusionWindows",
+                &format!(
+                    "Member must not take the SLO past {MAX_EXCLUSION_WINDOWS_PER_SLO} \
+                     exclusion windows"
+                ),
+            )]),
+        }
+    }
+}
+
+impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// The exclusion windows configured on the SLO an `Id` names, in the order they were
+    /// added. Empty for a stored SLO that holds none, and for an id that names no SLO \u2014 a
+    /// caller tells the two apart from [`Self::resolve`], which is what the reads refuse an
+    /// unknown id by.
+    pub fn exclusion_windows_of(&self, id: &str) -> &[ExclusionWindow] {
+        self.exclusion_windows
+            .get(slo_name_of(id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Remove `remove` from the window set of the SLO an `Id` names and then add `add` to it,
+    /// or answer the single [`ExclusionWindowFailure`] that left the SLO untouched.
+    ///
+    /// Removals are applied BEFORE additions, so one call can replace a window: the
+    /// configuration being removed frees its slot before the additions are counted against
+    /// [`MAX_EXCLUSION_WINDOWS_PER_SLO`].
+    ///
+    /// A window is named by its configuration, which is the identity a removal uses, so the
+    /// set holds each configuration once: adding a configuration the SLO already holds
+    /// changes nothing (and consumes no slot), and removing one it does not hold is the
+    /// failure [`ExclusionWindowFailure::UnmatchedRemoval`] rather than a silent no-op, since
+    /// `RemoveExclusionWindows` requires that "the window configuration must match an
+    /// existing exclusion window".
+    ///
+    /// The whole update is applied to a COPY of the set and stored only once every window has
+    /// been applied, so an SLO that earns a failure is left exactly as it was.
+    pub fn update_exclusion_windows(
+        &mut self,
+        id: &str,
+        add: &[ExclusionWindow],
+        remove: &[ExclusionWindow],
+    ) -> Result<(), ExclusionWindowFailure> {
+        let name = slo_name_of(id);
+        if !self.slos.contains_key(name) {
+            return Err(ExclusionWindowFailure::NoSuchSlo);
+        }
+
+        let mut windows = self.exclusion_windows.get(name).cloned().unwrap_or_default();
+        for window in remove {
+            let Some(at) = windows
+                .iter()
+                .position(|stored| same_exclusion_window(stored, window))
+            else {
+                return Err(ExclusionWindowFailure::UnmatchedRemoval);
+            };
+            windows.remove(at);
+        }
+        for window in add {
+            if windows
+                .iter()
+                .any(|stored| same_exclusion_window(stored, window))
+            {
+                continue;
+            }
+            if windows.len() >= MAX_EXCLUSION_WINDOWS_PER_SLO {
+                return Err(ExclusionWindowFailure::TooManyWindows);
+            }
+            windows.push(window.clone());
+        }
+
+        if windows.is_empty() {
+            self.exclusion_windows.remove(name);
+        } else {
+            self.exclusion_windows.insert(name.to_string(), windows);
+        }
+        Ok(())
+    }
+}
+
+/// Whether two exclusion windows are the same window: the configuration a removal names one
+/// by, member for member.
+///
+/// Every member counts, because every member is part of what the window excludes: its length
+/// (`Window`), when it starts (`StartTime`), how it repeats (`RecurrenceRule`) and why
+/// (`Reason`). An omitted optional member is part of the configuration too \u2014 it matches an
+/// omission, not an arbitrary value \u2014 so the window a caller added is named by exactly the
+/// configuration they sent, and the set a `ListServiceLevelObjectiveExclusionWindows` reports
+/// is the set a `RemoveExclusionWindows` can address. `Window` and `RecurrenceRule` carry no
+/// `PartialEq`, so those members are compared out, as [`same_dependency`] is; `StartTime` uses
+/// `DateTime`'s own, which compares the seconds and the sub-second fields \u2014 exactly "the same
+/// instant at the resolution a `Timestamp` carries", and never the float seconds, where two
+/// different instants could round together.
+pub fn same_exclusion_window(left: &ExclusionWindow, right: &ExclusionWindow) -> bool {
+    left.window.duration_unit == right.window.duration_unit
+        && left.window.duration == right.window.duration
+        && left.start_time == right.start_time
+        && left
+            .recurrence_rule
+            .as_ref()
+            .map(|rule| rule.expression.as_str())
+            == right
+                .recurrence_rule
+                .as_ref()
+                .map(|rule| rule.expression.as_str())
+        && left.reason == right.reason
 }
 
 // =============================================================================

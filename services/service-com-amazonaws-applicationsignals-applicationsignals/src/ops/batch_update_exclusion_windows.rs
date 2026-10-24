@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateExclusionWindows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateExclusionWindows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateExclusionWindows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the exclusion-window set of each persisted service level objective `SloIds` names.
 //!
 //! ## Shape of an operation
 //!
@@ -142,23 +134,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::BATCH_UPDATE_EXCLUSION_WINDOWS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Apply the request's removals and then its additions to the exclusion-window set of
+    /// every SLO `SloIds` names, and answer the ids it was applied to beside one `Errors`
+    /// entry per id it was not.
+    ///
+    /// Each id is applied INDEPENDENTLY, which is what the per-item `Errors` list is for: one
+    /// id that names no SLO does not discard the updates to the other 49 a request may carry.
+    /// An id that earns a failure leaves its SLO exactly as it was
+    /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::update_exclusion_windows`]),
+    /// and a repeated id names one SLO, so it is applied once and reported once.
+    ///
+    /// A request whose EVERY id failed is answered with the modelled exception that id's
+    /// failure earns on its own, rather than with an empty success: the output's `SloIds` is
+    /// `@required` with a modelled minimum of 1 entry, so there is no such thing as a
+    /// successful response that updated nothing. Nothing is stored on that path either, since
+    /// no id was applied. The failure reported is the FIRST in `SloIds` order — the request
+    /// states the ids in an order and the first thing wrong with it is what a single-item
+    /// caller would have been refused for — and every other failure of that request is a
+    /// failure of the same call, so none is hidden by the choice.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateExclusionWindows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateExclusionWindowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateExclusionWindows"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchUpdateExclusionWindowsErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::region_of(ctx.parts());
+        // Both lists are optional: a request carrying neither adds and removes nothing, so it
+        // reports which of the ids it names are SLOs this service holds.
+        let add = input.add_exclusion_windows.as_deref().unwrap_or_default();
+        let remove = input.remove_exclusion_windows.as_deref().unwrap_or_default();
+
+        let mut applied: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, crate::state::ExclusionWindowFailure)> = Vec::new();
+        let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+
+        let mut store = state.lock();
+        for id in &input.slo_ids {
+            // Either id form the modelled `ServiceLevelObjectiveId` admits resolves to one
+            // record, so a request naming the same SLO by name AND by ARN names it once.
+            if !seen.insert(crate::state::slo_name_of(id).to_string()) {
+                continue;
+            }
+            match store.update_exclusion_windows(id, add, remove) {
+                // The id is reported back as the CALLER spelled it: `SloIds` is "the list of
+                // SLO IDs that were successfully processed", which are the ids of the request.
+                Ok(()) => applied.push(id.clone()),
+                Err(failure) => failures.push((id.clone(), failure)),
+            }
+        }
+        drop(store);
+
+        if let (true, Some((id, failure))) = (applied.is_empty(), failures.first()) {
+            return Err(match failure {
+                crate::state::ExclusionWindowFailure::NoSuchSlo => {
+                    BatchUpdateExclusionWindowsErrorModeled::ResourceNotFoundException(
+                        crate::state::slo_not_found(&region, id),
+                    )
+                    .into()
+                }
+                failure => BatchUpdateExclusionWindowsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(failure.error_message(&region, id)),
+                    },
+                )
+                .into(),
+            });
+        }
+
+        let mut errors: Vec<BatchUpdateExclusionWindowsError2> = failures
+            .iter()
+            .map(|(id, failure)| BatchUpdateExclusionWindowsError2 {
+                slo_id: id.clone(),
+                error_code: failure.error_code().to_string(),
+                error_message: failure.error_message(&region, id),
+            })
+            .collect();
+        errors.truncate(crate::state::MAX_EXCLUSION_WINDOW_ERRORS);
+
+        Ok(BatchUpdateExclusionWindowsOutput {
+            slo_ids: applied,
+            errors,
+        })
     }
 }
