@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBudgetAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBudgetAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBudgetAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new budget action on the budget it names, under the UUID `ActionId` this
+//! operation mints for it, and leaves it in `ActionStatus$STANDBY` — armed, waiting for
+//! its threshold. `Action$ActionType` determines which member of `Definition` describes
+//! the work, so a mismatch is an `InvalidParameterException`
+//! ([`crate::state::validate_action_definition`]); a budget this account does not hold
+//! is a `NotFoundException`.
+//!
+//! Nothing here applies the action's `Definition` to IAM, Organizations or Systems
+//! Manager: that work belongs to other services and no request in this emulator runs
+//! it. This operation owns the budget control plane's own record of the action, which
+//! is what `DescribeBudgetAction` reads back and what `ExecuteBudgetAction` drives.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +191,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBudgetAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBudgetActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBudgetAction"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBudgetActionErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // "This field also determines the format for definition" — the one rule tying
+        // `ActionType` to `Definition`, which no constraint trait can express.
+        crate::state::validate_action_definition(&input.action_type, &input.definition).map_err(
+            |message| {
+                CreateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            },
+        )?;
+
+        let mut store = state.lock();
+        // An action is a resource OF the budget it names (`Action$BudgetName`), so the
+        // budget has to exist before the action can hang off it.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                CreateBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to create budget action: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+        // The store is bounded: without a ceiling a caller could grow this process
+        // without limit by creating actions on one budget.
+        if stored.actions.len() >= crate::state::MAX_ACTIONS_PER_BUDGET {
+            return Err(CreateBudgetActionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Unable to create budget action: {} - a budget can hold at most {} \
+                         actions.",
+                        input.budget_name,
+                        crate::state::MAX_ACTIONS_PER_BUDGET
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A system-generated universally unique identifier (UUID) for the action"
+        // (`Action$ActionId`) — minted here, never taken from the request.
+        let action_id = ::uuid::Uuid::new_v4().to_string();
+        let action = Action {
+            action_id: action_id.clone(),
+            budget_name: input.budget_name.clone(),
+            notification_type: input.notification_type,
+            action_type: input.action_type,
+            action_threshold: input.action_threshold,
+            definition: input.definition,
+            execution_role_arn: input.execution_role_arn,
+            approval_model: input.approval_model,
+            // The one member of an action the SERVICE owns rather than the caller. A
+            // created action is armed and waiting for its threshold, which is
+            // `STANDBY`; the statuses past it are reached by `ExecuteBudgetAction`,
+            // since no spend in this emulator ever crosses an action threshold.
+            status: crate::state::ACTION_STATUS_STANDBY.to_string(),
+            subscribers: input.subscribers,
+        };
+        stored.actions.push(crate::state::StoredAction::new(
+            action,
+            input.resource_tags.unwrap_or_default(),
+        ));
+
+        Ok(CreateBudgetActionOutput {
+            account_id: input.account_id,
+            budget_name: input.budget_name,
+            action_id,
+        })
     }
 }

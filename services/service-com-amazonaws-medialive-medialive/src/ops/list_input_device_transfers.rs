@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInputDeviceTransfers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInputDeviceTransfers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInputDeviceTransfers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the transfers pending on this account's input devices, in the
+//! direction the request's `TransferType` asks for — the transfers
+//! `TransferInputDevice` recorded, walked in device-id order and cut into pages.
+//! Reporting only: nothing here writes anything a later caller would not have
+//! seen anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInputDeviceTransfers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInputDeviceTransfersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInputDeviceTransfers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        // The direction is REQUIRED and modelled as a `__string` rather than as
+        // the `InputDeviceTransferType` enum, so the service is what refuses a
+        // spelling outside that enum — including the empty one a request that
+        // omits the query parameter leaves behind. The refusal names the value
+        // and the accepted set, so it says what the caller must change.
+        let transfer_type = input.transfer_type.as_str();
+        if !crate::state::input_device_transfer_type::ALL.contains(&transfer_type) {
+            return Err(ListInputDeviceTransfersErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "{transfer_type} is not an input device transfer type: \
+                         TransferType is one of {}",
+                        crate::state::input_device_transfer_type::ALL.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing
+        // and is a bad request. It is clamped to a finite ceiling, and an absent
+        // one uses that ceiling, so no single request can ask the service to
+        // project an unbounded number of transfers in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(ListInputDeviceTransfersErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!("maxResults must be at least 1, got {max_results}")),
+                    },
+                )
+                .into());
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due — a maintenance window whose span has passed among
+        // them — which were owed whether or not this listing ran.
+        state.settle(now);
+        let state = &*state;
+
+        // `NextToken` is the device id the next page starts at, and the devices
+        // sort by that id in the `BTreeMap`, so resuming is a range scan from
+        // it. A token naming a device whose transfer has ended since the
+        // previous page simply resumes at the next device still transferring
+        // instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        // Every transfer is reported through the store's ONE projection of a
+        // pending transfer, which is also what applies the direction filter: a
+        // device with no transfer pending in that direction yields nothing.
+        let mut transferring = state
+            .input_devices
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .filter_map(|(id, _)| {
+                state
+                    .input_device_transfer_summary(id, transfer_type)
+                    .map(|summary| (id, summary))
+            });
+
+        let input_device_transfers: Vec<TransferringInputDeviceSummary> = transferring
+            .by_ref()
+            .take(page_size)
+            .map(|(_, summary)| summary)
+            .collect();
+        // Absent on the last page: a token is handed out only when a transfer is
+        // left over after this one.
+        let next_token = transferring.next().map(|(id, _)| id.clone());
+
+        Ok(ListInputDeviceTransfersOutput {
+            input_device_transfers: Some(input_device_transfers),
+            next_token,
+        })
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there are no transfers to list. A modelled server error, never a fresh
+/// engine (which would answer from an empty private store).
+fn unavailable() -> ListInputDeviceTransfersError {
+    ListInputDeviceTransfersErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

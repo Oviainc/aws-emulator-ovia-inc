@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! Returns exactly the tags stored on the resource the ARN names — for this service a
-//! search job, whose tags are whatever `StartSearchJob` was given plus whatever
-//! `TagResource` added. An ARN no resource of this account matches is a
-//! `ResourceNotFoundException` (404).
+//! Returns exactly the tags stored on the resource the ARN names — any resource this
+//! service mints and holds (a search job or an export job), whose tags are whatever the
+//! operation that minted it was given plus whatever `TagResource` added. An ARN no
+//! resource of this account matches is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -64,7 +64,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::SEARCH_JOB_RESOURCE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,9 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
+        // Resolved against every taggable record this store holds, not only the search
+        // jobs: `ResourceArn` is documented as "the resource", and both of this
+        // service's resources are its own and both carry a tag set.
         let tags = state
-            .job_by_arn(&input.resource_arn)
-            .map(|job| job.tags.clone())
+            .tags_by_arn(&input.resource_arn)
+            .cloned()
             .ok_or_else(|| {
                 ListTagsForResourceError::from(
                     ListTagsForResourceErrorModeled::ResourceNotFoundException(
@@ -163,7 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 input.resource_arn
                             ),
                             resource_id: input.resource_arn.clone(),
-                            resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                            // The type the submitted ARN claims; the lookup spans more
+                            // than one, so the refusal cannot name a fixed one.
+                            resource_type: crate::state::arn_resource_type(
+                                &input.resource_arn,
+                            ),
                         },
                     ),
                 )

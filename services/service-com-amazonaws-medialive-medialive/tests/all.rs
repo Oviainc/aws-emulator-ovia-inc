@@ -62,6 +62,9 @@ mod input_deletion;
 #[path = "all/input_device_maintenance_window.rs"]
 mod input_device_maintenance_window;
 
+#[path = "all/input_device_transfers.rs"]
+mod input_device_transfers;
+
 #[path = "all/input_endpoint_release.rs"]
 mod input_endpoint_release;
 

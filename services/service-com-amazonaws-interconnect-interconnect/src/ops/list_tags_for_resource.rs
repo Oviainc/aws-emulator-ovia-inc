@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,9 +67,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#ListTagsForResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#ListTagsForResource",
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectServerException",
+    ]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -127,23 +128,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_TAGS_FOR_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// "List all current tags on the specified resource. Currently this supports
+    /// Connection resources."
+    ///
+    /// `@readonly`: the answer is the tag set the resource the `arn` names CURRENTLY
+    /// holds — exactly what `CreateConnection$tags`, `TagResource` and
+    /// `UntagResource` last left in the store, with no key the store does not hold
+    /// and none of the ones it does left out. Listing tags never changes a tag set,
+    /// so two calls with no tag write in between answer the same, and an `arn` that
+    /// names no resource of this service is a 404 rather than an empty listing: "no
+    /// tags" and "no resource" are different answers.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect connection store is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "Currently this supports Connection resources", which is also what
+        // `AmazonResourceName`'s pattern allows: the ARN carries the `ConnectionId`
+        // of the connection whose tags these are. An ARN the boundary validator let
+        // through that still does not parse as one is refused as invalid INPUT,
+        // never with a 501.
+        if crate::state::connection_id_from_arn(&input.arn).is_none() {
+            return Err(
+                ListTagsForResourceErrorModeled::InterconnectValidationException(
+                    InterconnectValidationException {
+                        message: crate::state::not_a_connection_arn_message(&input.arn),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Reporting only: the one write here settles transitions the clock had
+        // already made due (`deleting` -> `deleted`, `updating` -> the state the
+        // connection came from), which were owed at this instant whether or not
+        // anybody asked. No tag is added, removed or rewritten on a read, so a later
+        // caller sees exactly what this one saw.
+        let found = {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::Instant::now());
+            store
+                .connection_by_arn(&input.arn)
+                .map(|stored| stored.connection.tags.clone())
+        };
+
+        let Some(tags) = found else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::connection_not_retrievable_message(&input.arn)),
+                },
+            )
+            .into());
+        };
+
+        // A resource carrying no tags is stored as `None` (how a connection created
+        // without tags is held, and what `UntagResource` leaves once the last key
+        // goes). The listing of it is the EMPTY tag set, not an absent member: the
+        // resource exists and currently has nothing on it.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.unwrap_or_default()),
+        })
     }
 }

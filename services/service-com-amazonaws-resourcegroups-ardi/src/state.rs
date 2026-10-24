@@ -4,17 +4,18 @@
 //!
 //! Every resource group this emulator holds lives in ONE map, [`ComAmazonawsResourcegroupsArdiState::groups`],
 //! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `ListGroups`, `GroupResources`,
-//! `ListGroupResources`, `UpdateGroup` and `DeleteGroup` all read and write the same
-//! records. The map is a
+//! `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup` and `DeleteGroup` all read
+//! and write the same records. The map is a
 //! [`BTreeMap`] keyed by group name: the key order is the listing order, which is
 //! what makes `ListGroups` paging deterministic and resumable from an opaque
 //! token even after a group in the middle of the listing is deleted.
 
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use crate::ops::types::{
-    Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier, ListGroupResourcesItem,
-    ResourceIdentifier, ResourceQuery, ResourceStatus,
+    Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier, GroupingStatusesItem,
+    ListGroupResourcesItem, ResourceIdentifier, ResourceQuery, ResourceStatus,
 };
 
 /// Per-service state for com-amazonaws-resourcegroups-ardi. A handler reaches it through [`service_state`].
@@ -114,6 +115,10 @@ pub struct GroupRecord {
     /// Static members added by `GroupResources`, kept sorted by ARN: the sort is
     /// the listing order `ListGroupResources` pages through.
     pub members: Vec<MemberRecord>,
+    /// The last grouping or ungrouping action recorded against each resource of
+    /// this group, keyed by resource ARN — what `ListGroupingStatuses` reports.
+    /// Ordered by ARN, so that listing and its continuation token are stable.
+    pub grouping_statuses: BTreeMap<String, GroupingStatusRecord>,
 }
 
 impl GroupRecord {
@@ -180,6 +185,17 @@ impl GroupRecord {
     /// by ARN. Adding an ARN that is already a member changes nothing, so
     /// repeating a `GroupResources` call does not duplicate a membership.
     pub fn add_member(&mut self, resource_arn: &str) {
+        // A membership recorded here is the outcome of a GROUP action that
+        // succeeded, so the same call records the grouping status
+        // `ListGroupingStatuses` reports. It is recorded for an ARN that is
+        // already a member too: that call is the resource's LAST grouping
+        // action, and it is the one `GroupResources` reports in `Succeeded`.
+        self.record_grouping_status(
+            resource_arn,
+            GROUPING_ACTION_GROUP,
+            GROUPING_STATUS_SUCCESS,
+            SystemTime::now(),
+        );
         let at = self
             .members
             .partition_point(|m| m.resource_arn.as_str() < resource_arn);
@@ -203,6 +219,99 @@ impl GroupRecord {
             },
         );
     }
+
+    /// Record that the last grouping action on `resource_arn` in this group was
+    /// `action` (a modelled `GroupingType`) and ended in `status` (a modelled
+    /// `GroupingStatus`), at `at`.
+    ///
+    /// The ONE place a grouping status is written, so every producer of grouping
+    /// or ungrouping actions records them the same way and `ListGroupingStatuses`
+    /// reads one record per resource. Recording a resource again REPLACES its
+    /// entry: the operation reports each resource's last action, not a history.
+    /// This slice records only the successful GROUP actions
+    /// [`GroupRecord::add_member`] performs, so the map holds one entry per
+    /// member and is bounded by [`MAX_MEMBERS_PER_GROUP`].
+    pub fn record_grouping_status(
+        &mut self,
+        resource_arn: &str,
+        action: &str,
+        status: &str,
+        at: SystemTime,
+    ) {
+        self.grouping_statuses.insert(
+            resource_arn.to_string(),
+            GroupingStatusRecord {
+                action: action.to_string(),
+                status: status.to_string(),
+                updated_at: at,
+            },
+        );
+    }
+}
+
+/// The modelled `GroupingType` value for adding a resource to a group — the
+/// action `GroupResources` performs.
+pub const GROUPING_ACTION_GROUP: &str = "GROUP";
+
+/// The modelled `GroupingType` value for removing a resource from a group.
+pub const GROUPING_ACTION_UNGROUP: &str = "UNGROUP";
+
+/// Every value the modelled `GroupingStatus` enum declares, which is also the
+/// domain of the `status` filter `ListGroupingStatuses` accepts.
+///
+/// Source: `smithy_query(query="shape",shape="GroupingStatus")`.
+pub const GROUPING_STATUS_VALUES: [&str; 4] = ["SUCCESS", "FAILED", "IN_PROGRESS", "SKIPPED"];
+
+/// The modelled `GroupingStatus` of an action that completed: the only outcome
+/// this emulator records, because a grouping request it accepts is applied
+/// synchronously and in full, and one it cannot apply is refused before any
+/// state changes.
+pub const GROUPING_STATUS_SUCCESS: &str = GROUPING_STATUS_VALUES[0];
+
+/// The last grouping or ungrouping action recorded against one resource of one
+/// group.
+#[derive(Debug, Clone)]
+pub struct GroupingStatusRecord {
+    /// A modelled `GroupingType` value: [`GROUPING_ACTION_GROUP`] or
+    /// [`GROUPING_ACTION_UNGROUP`].
+    pub action: String,
+    /// A modelled `GroupingStatus` value, one of [`GROUPING_STATUS_VALUES`].
+    pub status: String,
+    /// When the action this record reports was performed.
+    pub updated_at: SystemTime,
+}
+
+impl GroupingStatusRecord {
+    /// The modelled `GroupingStatusesItem` for this record, as
+    /// `ListGroupingStatuses` reports it for `resource_arn`.
+    ///
+    /// `ErrorCode` and `ErrorMessage` report why an action FAILED; a recorded
+    /// action that did not fail carries neither.
+    pub fn to_item(&self, resource_arn: &str) -> GroupingStatusesItem {
+        GroupingStatusesItem {
+            resource_arn: Some(resource_arn.to_string()),
+            action: Some(self.action.clone()),
+            status: Some(self.status.clone()),
+            error_code: None,
+            error_message: None,
+            updated_at: Some(to_date_time(self.updated_at)),
+        }
+    }
+}
+
+/// `at` as the modelled `timestamp` a response carries. A time before the epoch
+/// cannot be reported by this service — nothing it stores predates the process —
+/// so one reads as the epoch rather than panicking.
+pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let since_epoch = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    // A whole-second count past `i64::MAX` is 292 billion years away; saturating
+    // keeps the conversion total without a panic path.
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+        since_epoch.subsec_nanos(),
+    )
 }
 
 /// The resource query a group was created with.

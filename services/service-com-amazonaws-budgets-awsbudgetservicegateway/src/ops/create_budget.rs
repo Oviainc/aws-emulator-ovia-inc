@@ -266,6 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::StoredBudget {
                 budget,
                 notifications,
+                actions: Vec::new(),
                 tags: input.resource_tags.unwrap_or_default(),
             },
         );

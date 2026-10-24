@@ -166,9 +166,13 @@ pub const CATALOG_LATEST_VERSION: &str = "1.0";
 /// Setup default configuration type, which that member's tables do not itemise; it
 /// is published too because configuration definitions name it.
 ///
-/// This is the DISCOVERY catalog, not an allow-list: `Type` is modelled as a
-/// patterned string with no enum, so `CreateConfigurationManager` accepts any value
-/// matching that pattern and this list does not narrow it.
+/// This list is both the DISCOVERY catalog `ListQuickSetupTypes` publishes and the
+/// set of configuration types a configuration definition may name: Quick Setup
+/// deploys a service-owned template per type, so a type the service does not offer
+/// resolves to no template and cannot be deployed. `Type` is modelled as a patterned
+/// string rather than an enum only because the set is versioned out of band, so the
+/// membership check lives in [`quick_setup_type_rejection`] instead of at the
+/// modelled boundary.
 pub const QUICK_SETUP_TYPE_CATALOG: &[QuickSetupTypeEntry] = &[
     // Conformance Packs
     QuickSetupTypeEntry { type_: "AWSQuickSetupType-CFGCPacks", latest_version: CATALOG_LATEST_VERSION },
@@ -195,6 +199,34 @@ pub const QUICK_SETUP_TYPE_CATALOG: &[QuickSetupTypeEntry] = &[
     // Resource Scheduler
     QuickSetupTypeEntry { type_: "AWSQuickSetupType-Scheduler", latest_version: CATALOG_LATEST_VERSION },
 ];
+
+/// Why the value of a configuration-type member is unacceptable, or `None` when this
+/// service offers that Quick Setup configuration type.
+///
+/// A configuration definition's `Type` selects the service-owned template Quick Setup
+/// deploys, so the set of acceptable values is exactly the catalog the service
+/// publishes ([`QUICK_SETUP_TYPE_CATALOG`], what `ListQuickSetupTypes` answers): a
+/// pattern-valid string the catalog does not carry names no template, so it is
+/// refused at validation rather than minting a manager that could never deploy.
+/// Membership is exact — a type name differing only in case is not a published type.
+///
+/// The one place the rule lives, so every member that names a configuration type
+/// refuses the same values. The message names the member, the requirement and the
+/// value, the way this service's other refusals do; the echoed value is bounded for
+/// the reason [`MAX_ECHOED_VALUE`] gives.
+pub fn quick_setup_type_rejection(member: &str, value: &str) -> Option<String> {
+    if QUICK_SETUP_TYPE_CATALOG
+        .iter()
+        .any(|entry| entry.type_ == value)
+    {
+        return None;
+    }
+    Some(format!(
+        "{member} must name a Quick Setup configuration type this service offers \
+         (one of the types ListQuickSetupTypes publishes), got '{}'",
+        echoed_value(value)
+    ))
+}
 
 /// The settings Quick Setup holds for ONE account and region: what the last
 /// successful `UpdateServiceSettings` wrote there.
@@ -557,7 +589,7 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
 ///
 /// The message names the member, the requirement and the value, the way the boundary
 /// validator's own refusals do. The echoed value is bounded for the reason
-/// [`MAX_ECHOED_ARN`] gives.
+/// [`MAX_ECHOED_VALUE`] gives.
 pub fn iam_role_arn_rejection(member: &str, value: &str) -> Option<String> {
     let fields: Vec<&str> = value.split(':').collect();
     let well_formed = match fields.as_slice() {
@@ -573,7 +605,7 @@ pub fn iam_role_arn_rejection(member: &str, value: &str) -> Option<String> {
         format!(
             "{member} must be the ARN of an IAM role \
              (arn:<partition>:iam::<account>:role/<name>), got '{}'",
-            echoed_arn(value)
+            echoed_value(value)
         )
     })
 }
@@ -583,15 +615,15 @@ pub fn iam_role_arn_rejection(member: &str, value: &str) -> Option<String> {
 /// The value is caller-controlled, so an unelided echo would amplify one request into
 /// an arbitrarily long response. The same bound the framework's own constraint walk
 /// applies.
-const MAX_ECHOED_ARN: usize = 256;
+const MAX_ECHOED_VALUE: usize = 256;
 
 /// `value` as it may appear in a refusal message: itself when short, otherwise a
 /// character-boundary-safe prefix plus the elision the framework's renderer appends.
-fn echoed_arn(value: &str) -> String {
-    if value.len() <= MAX_ECHOED_ARN {
+fn echoed_value(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
         return value.to_string();
     }
-    let mut end = MAX_ECHOED_ARN;
+    let mut end = MAX_ECHOED_VALUE;
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
