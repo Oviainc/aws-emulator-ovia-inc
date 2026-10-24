@@ -3,7 +3,9 @@
 //! @op UntagResource
 //! Implemented: removes the named tag keys from the resource named by `ResourceArn` in
 //! [`crate::state`] — the one tag set `ListTagsForResource` and that resource's own
-//! Get/Describe report.
+//! Get/Describe report. A key in the reserved namespace
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key a
+//! caller may remove, so such a request is refused whole and removes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +164,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The reserved key namespace is Amazon Web Services' own: a caller may not remove
+        // a key in it any more than it may create one. Judged WHOLE and before the store is
+        // touched, so one reserved key refuses the whole request and every other key the
+        // request named stays where it was.
+        if let Some(why) =
+            crate::state::reserved_tag_keys_refusal(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException { message: Some(why) },
+            )
+            .into());
+        }
 
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());

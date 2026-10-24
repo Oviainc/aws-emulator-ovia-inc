@@ -32,10 +32,14 @@ const MAX_TAGS: usize = 50;
 
 /// The only `AccessorType` the model declares (smithy_query: shape AccessorType =
 /// BILLING_TOKEN).
-const BILLING_TOKEN: &str = "BILLING_TOKEN";
+pub(crate) const BILLING_TOKEN: &str = "BILLING_TOKEN";
 
 /// `count` distinct tags, `key-<i>` -> `value-<i>`.
-fn tags(count: usize) -> Value {
+///
+/// This helper and the ones below it are `pub(crate)` so the sibling suite that pins the
+/// reserved tag-key namespace drives the tagging surface through this one harness rather
+/// than a second copy of it.
+pub(crate) fn tags(count: usize) -> Value {
     Value::Object(
         (0..count)
             .map(|i| (format!("key-{i}"), json!(format!("value-{i}"))))
@@ -44,14 +48,14 @@ fn tags(count: usize) -> Value {
 }
 
 /// The same `count` tags as a map, to compare a listing against.
-fn expected_tags(count: usize) -> BTreeMap<String, String> {
+pub(crate) fn expected_tags(count: usize) -> BTreeMap<String, String> {
     (0..count)
         .map(|i| (format!("key-{i}"), format!("value-{i}")))
         .collect()
 }
 
 /// A JSON tag map as a sorted map, so two answers compare regardless of member order.
-fn tag_map(value: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(value: &Value) -> BTreeMap<String, String> {
     value
         .as_object()
         .map(|map| {
@@ -69,23 +73,27 @@ fn tag_map(value: &Value) -> BTreeMap<String, String> {
 
 /// The ARN of one of this service's resources, as the create that minted it stored it:
 /// `arn:aws:managedblockchain:<region>:<account>:<type>/<id>`.
-fn arn(resource_type: &str, id: &str) -> String {
+pub(crate) fn arn(resource_type: &str, id: &str) -> String {
     format!("arn:aws:managedblockchain:{REGION}:{ACCOUNT}:{resource_type}/{id}")
 }
 
 /// A `ResourceArn` as a non-greedy `@httpLabel` carries it: every reserved character
 /// percent-encoded, which is how an SDK sends one.
-fn label(resource_arn: &str) -> String {
+pub(crate) fn label(resource_arn: &str) -> String {
     resource_arn.replace(':', "%3A").replace('/', "%2F")
 }
 
 /// `ListTagsForResource` (`GET /tags/{ResourceArn}`).
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Answer {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Answer {
     call(router, "GET", &format!("/tags/{}", label(resource_arn)), None).await
 }
 
 /// `TagResource` (`POST /tags/{ResourceArn}`).
-async fn tag_resource(router: &MultiServiceRouter, resource_arn: &str, tags: Value) -> Answer {
+pub(crate) async fn tag_resource(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tags: Value,
+) -> Answer {
     call(
         router,
         "POST",
@@ -96,7 +104,7 @@ async fn tag_resource(router: &MultiServiceRouter, resource_arn: &str, tags: Val
 }
 
 /// `UntagResource` (`DELETE /tags/{ResourceArn}?tagKeys=…`, one query value per key).
-async fn untag_resource(
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     keys: &[String],
@@ -114,16 +122,19 @@ async fn untag_resource(
 /// One taggable resource of this service: how a case names it, the ARN that identifies
 /// it, and the route (plus body member) its own read answers its `Tags` on.
 #[derive(Debug)]
-struct Resource {
-    case: &'static str,
-    resource_arn: String,
-    read_path: String,
-    shape: &'static str,
+pub(crate) struct Resource {
+    pub(crate) case: &'static str,
+    pub(crate) resource_arn: String,
+    pub(crate) read_path: String,
+    pub(crate) shape: &'static str,
 }
 
 /// The `Tags` the resource's OWN read reports, so a listing can be checked against the
 /// record every other reader projects.
-async fn tags_of_read(router: &MultiServiceRouter, resource: &Resource) -> BTreeMap<String, String> {
+pub(crate) async fn tags_of_read(
+    router: &MultiServiceRouter,
+    resource: &Resource,
+) -> BTreeMap<String, String> {
     let answer = call(router, "GET", &resource.read_path, None).await;
     assert_eq!(
         answer.status, 200,
@@ -138,7 +149,10 @@ async fn tags_of_read(router: &MultiServiceRouter, resource: &Resource) -> BTree
 /// The network's first member comes from `CreateNetwork`'s `MemberConfiguration`, which
 /// carries its own `Tags`; the node and the proposal are created on that network once it
 /// has settled to `AVAILABLE`.
-async fn taggable_resources(router: &MultiServiceRouter, create_tags: &Value) -> Vec<Resource> {
+pub(crate) async fn taggable_resources(
+    router: &MultiServiceRouter,
+    create_tags: &Value,
+) -> Vec<Resource> {
     let answer = call(
         router,
         "POST",
