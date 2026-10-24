@@ -4,26 +4,35 @@
 //! `GetResourcePolicy` and `DeleteResourcePolicy` — driven over HTTP through the real
 //! router (the harness lives in `crate::global_network_lifecycle`).
 //!
-//! The rule under test: the resource policy of a resource is a per-ARN store.
+//! The first rule under test: a resource policy is attached only to a resource that may
+//! CARRY one, which is a resource of ANOTHER service — the Direct Connect gateway
+//! `CreateDirectConnectGatewayAttachment` joins to a core network, whose ARN the model
+//! types as `DirectConnectGatewayArn` (`smithy_query shape=DirectConnectGatewayArn`). A
+//! `PutResourcePolicy` naming any other resource — every resource Network Manager itself
+//! owns included, a core network among them — is refused with `ValidationException`
+//! (HTTP 400) naming `ResourceArn` and stores nothing, while `GetResourcePolicy` keeps
+//! reporting no policy for it and `DeleteResourcePolicy` stays a no-op.
+//!
+//! The second rule: for the resources that may carry one, the policy is a per-ARN store.
 //! `PutResourcePolicy` stores, under the ARN its `ResourceArn` names, the document it
 //! accepted — verbatim, replacing whatever that ARN held; `GetResourcePolicy` answers
 //! exactly that stored document and no `PolicyDocument` member at all while the ARN holds
 //! none; `DeleteResourcePolicy` removes it, and both reads and deletes of one ARN leave
 //! every other ARN alone. A document outside the IAM JSON policy grammar (it must parse as
 //! JSON, be an object, carry at least one statement, and every statement must name an
-//! `Effect` of `Allow` or `Deny`) and a string that is not an ARN of this service are
-//! refused with `ValidationException` (HTTP 400) and store nothing. The store's own
-//! bounds are pinned too: a document is accepted at the documented size bound and refused
-//! one character past it, and a policy for one ARN more than the account quota allows is
-//! refused with `ServiceQuotaExceededException` (HTTP 402) while a replacement for an ARN
-//! already held is not.
+//! `Effect` of `Allow` or `Deny`) and a string that names no resource these operations
+//! address at all are refused with `ValidationException` (HTTP 400) and store nothing. The
+//! store's own bounds are pinned too: a document is accepted at the documented size bound
+//! and refused one character past it, and a policy for one ARN more than the account quota
+//! allows is refused with `ServiceQuotaExceededException` (HTTP 402) while a replacement
+//! for an ARN already held is not.
 //!
-//! The tables below span that class: documents differing in how `Statement` is written
+//! The tables below span those classes: documents differing in how `Statement` is written
 //! (one object, a list, several statements), in which elements the statements carry, in
-//! whitespace, in alphabet and in size; and ARNs differing in which resource kind they
-//! name, including a well-formed ARN naming a resource this store does not hold — none of
-//! the three operations models a `ResourceNotFoundException`, so the policy store is keyed
-//! by ARN alone.
+//! whitespace, in alphabet and in size; attachable ARNs differing in partition, in owning
+//! account and in gateway id; refused ARNs differing in which resource kind of this
+//! service they name, whether that resource is stored, and which part of the attachable
+//! ARN form they break.
 //!
 //! Nothing here reaches into `crate::state`: a policy is only ever read back through
 //! `GetResourcePolicy`.
@@ -100,8 +109,42 @@ async fn delete_policy_ok(emulator: &Emulator, case: &str, arn: &str) {
     );
 }
 
-/// Create a core network (in its own global network) and answer its ARN — the resource a
-/// Cloud WAN resource policy is normally attached to.
+/// Assert `arn` was refused by `PutResourcePolicy` with a `ValidationException` naming
+/// `ResourceArn`, and answer the body so a caller can look at the rest of it.
+async fn assert_put_refused(emulator: &Emulator, case: &str, arn: &str, document: &str) -> Value {
+    let (status, body) = put_policy(emulator, arn, document).await;
+    assert_eq!(
+        status, 400,
+        "case {case}: PutResourcePolicy expected 400, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case {case}: expected ValidationException, got {body}"
+    );
+    assert_eq!(
+        body["Fields"][0]["Name"].as_str(),
+        Some("ResourceArn"),
+        "case {case}: expected the Fields entry to name ResourceArn, got {body}"
+    );
+    body
+}
+
+/// A Direct Connect gateway ARN: the form the model types as `DirectConnectGatewayArn`,
+/// `arn:<partition>:directconnect::<account>:dx-gateway/<id>` with an EMPTY region segment
+/// (`smithy_query shape=DirectConnectGatewayArn`).
+fn gateway_arn(partition: &str, account: &str, id: &str) -> String {
+    format!("arn:{partition}:directconnect::{account}:dx-gateway/{id}")
+}
+
+/// The `index`th distinct gateway id in the 8-4-4-4-12 lowercase-hex form that same
+/// pattern spells out.
+fn gateway_id(index: usize) -> String {
+    format!("{index:08x}-1a2b-3c4d-5e6f-{index:012x}")
+}
+
+/// Create a core network (in its own global network) and answer its ARN — a resource this
+/// service owns, so one that cannot carry a resource policy.
 async fn create_core_network_arn(emulator: &Emulator) -> String {
     let network = emulator.create_global_network("owns a core network").await;
     let (status, created) = emulator
@@ -117,23 +160,38 @@ async fn create_core_network_arn(emulator: &Emulator) -> String {
         .to_string()
 }
 
-/// The ARNs the policy table runs over: one per resource kind this store holds, plus a
-/// well-formed ARN of this service naming nothing stored.
-async fn policy_arns(emulator: &Emulator) -> Vec<(&'static str, String)> {
-    let core_network = create_core_network_arn(emulator).await;
-    let network = emulator.create_global_network("carries a policy").await;
-    let site = emulator.create_site(&network, "carries a policy").await;
+/// The ARNs the policy table runs over: resources that may carry a policy, differing in
+/// partition, in which account owns the gateway (the point of a resource policy is that
+/// the resource is another account's) and in gateway id.
+fn policy_arns() -> Vec<(&'static str, String)> {
     vec![
-        ("a core network's ARN", core_network),
-        ("a global network's ARN", expected_arn("global-network", &network)),
-        ("a site's ARN", expected_arn("site", &site)),
-        // No resource-policy operation models a not-found failure, so an ARN of this
-        // service that names no stored resource still carries a policy of its own.
         (
-            "an ARN naming no stored resource",
-            expected_arn("core-network", "core-network-0000000000000beef"),
+            "a gateway of this account",
+            gateway_arn("aws", engine::emulator_account_id(), &gateway_id(1)),
+        ),
+        (
+            "a gateway of another account",
+            gateway_arn("aws", "222222222222", &gateway_id(2)),
+        ),
+        (
+            "a gateway in another partition",
+            gateway_arn("aws-cn", "333333333333", &gateway_id(3)),
+        ),
+        // The modelled pattern writes the account segment `[^:]{0,63}`, so it may be empty.
+        (
+            "a gateway ARN carrying no account",
+            gateway_arn("aws", "", &gateway_id(4)),
         ),
     ]
+}
+
+/// One policy-attachable ARN, for the tests that need a single subject.
+fn one_policy_arn() -> String {
+    policy_arns()
+        .into_iter()
+        .next()
+        .expect("the ARN table is not empty")
+        .1
 }
 
 /// A JSON policy document rendered as the string the member carries, so a test can assert
@@ -150,7 +208,7 @@ fn many_statements(statements: usize) -> String {
                 "Sid": format!("statement{index}"),
                 "Effect": if index % 2 == 0 { "Allow" } else { "Deny" },
                 "Principal": { "AWS": format!("arn:aws:iam::{:012}:root", index) },
-                "Action": "networkmanager:CreateVpcAttachment",
+                "Action": "networkmanager:CreateDirectConnectGatewayAttachment",
                 "Resource": "*",
             })
         })
@@ -166,14 +224,14 @@ fn many_statements(statements: usize) -> String {
 fn accepted_documents() -> Vec<(&'static str, String)> {
     vec![
         (
-            "a single statement granting attachment acceptance",
+            "a single statement granting attachment creation",
             compact(&json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Sid": "AllowAttachments",
                     "Effect": "Allow",
                     "Principal": { "AWS": "arn:aws:iam::222222222222:root" },
-                    "Action": "networkmanager:CreateVpcAttachment",
+                    "Action": "networkmanager:CreateDirectConnectGatewayAttachment",
                     "Resource": "*",
                 }],
             })),
@@ -200,7 +258,7 @@ fn accepted_documents() -> Vec<(&'static str, String)> {
                         "Sid": "AllowOne",
                         "Effect": "Allow",
                         "Principal": { "AWS": ["arn:aws:iam::222222222222:root"] },
-                        "Action": ["networkmanager:CreateVpcAttachment"],
+                        "Action": ["networkmanager:CreateDirectConnectGatewayAttachment"],
                         "Resource": "*",
                     },
                     {
@@ -242,13 +300,22 @@ fn accepted_documents() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The first document of the table, for the tests that need just one.
+fn one_document() -> String {
+    accepted_documents()
+        .into_iter()
+        .next()
+        .expect("the document table is not empty")
+        .1
+}
+
 #[tokio::test]
 async fn a_put_policy_is_reported_back_verbatim_for_every_arn_and_document_form() {
     // The cross product of the two tables: every document form against every ARN form,
     // each document in its own store so what is reported can only come from its own put.
     for (document_case, document) in accepted_documents() {
         let emulator = Emulator::new();
-        for (arn_case, arn) in policy_arns(&emulator).await {
+        for (arn_case, arn) in policy_arns() {
             let case = format!("{document_case} on {arn_case}");
 
             assert_no_policy(&emulator, &case, &arn).await;
@@ -261,7 +328,7 @@ async fn a_put_policy_is_reported_back_verbatim_for_every_arn_and_document_form(
 #[tokio::test]
 async fn every_arn_reports_only_its_own_policy_and_a_delete_removes_only_that_one() {
     let emulator = Emulator::new();
-    let arns = policy_arns(&emulator).await;
+    let arns = policy_arns();
     let documents = accepted_documents();
 
     // Every ARN carries a different document at the same time.
@@ -302,7 +369,7 @@ async fn every_arn_reports_only_its_own_policy_and_a_delete_removes_only_that_on
 #[tokio::test]
 async fn putting_again_replaces_the_document_the_arn_reports() {
     let emulator = Emulator::new();
-    let arn = create_core_network_arn(&emulator).await;
+    let arn = one_policy_arn();
 
     // Every document form in turn, so a replacement is exercised from and to each of them.
     let mut previous: Option<String> = None;
@@ -330,11 +397,8 @@ async fn putting_again_replaces_the_document_the_arn_reports() {
 #[tokio::test]
 async fn reading_a_policy_changes_nothing_a_later_caller_sees() {
     let emulator = Emulator::new();
-    let arns = policy_arns(&emulator).await;
-    let (_, document) = accepted_documents()
-        .into_iter()
-        .next()
-        .expect("the document table is not empty");
+    let arns = policy_arns();
+    let document = one_document();
 
     for (case, arn) in &arns {
         // Reading an ARN that holds no policy may not create one, and may not stop a
@@ -359,6 +423,84 @@ async fn reading_a_policy_changes_nothing_a_later_caller_sees() {
         // A put after a delete is stored again.
         put_policy_ok(&emulator, &format!("{case} re-put"), arn, &document).await;
         assert_policy_is(&emulator, &format!("{case} re-put"), arn, &document).await;
+    }
+}
+
+#[tokio::test]
+async fn a_resource_that_cannot_carry_a_policy_is_refused_and_keeps_reporting_none() {
+    let emulator = Emulator::new();
+    let document = one_document();
+
+    // Resources of THIS service, which carry no resource policy: the kinds it mints, both
+    // as stored resources and as well-formed ARNs naming nothing (none of the three
+    // operations models a not-found failure, so storage is not what decides this).
+    let core_network = create_core_network_arn(&emulator).await;
+    let global_network = emulator.create_global_network("carries no policy").await;
+    let site = emulator.create_site(&global_network, "carries no policy").await;
+    let refused: Vec<(String, String)> = vec![
+        ("a stored core network".to_string(), core_network),
+        (
+            "a stored global network".to_string(),
+            expected_arn("global-network", &global_network),
+        ),
+        ("a stored site".to_string(), expected_arn("site", &site)),
+        (
+            "a device ARN naming nothing stored".to_string(),
+            expected_arn("device", "device-0000000000000beef"),
+        ),
+        (
+            "a link ARN naming nothing stored".to_string(),
+            expected_arn("link", "link-0000000000000beef"),
+        ),
+        (
+            "an attachment ARN naming nothing stored".to_string(),
+            expected_arn("attachment", "attachment-0000000000000beef"),
+        ),
+        (
+            "a core network ARN naming nothing stored".to_string(),
+            expected_arn("core-network", "core-network-0000000000000beef"),
+        ),
+    ];
+
+    // The refusal wording is the service's own constant, so it must not vary by resource.
+    let mut refusal_message: Option<String> = None;
+    for (case, arn) in &refused {
+        // The put is refused, and the reporting sibling still answers no policy: the
+        // refusal stored nothing.
+        let body = assert_put_refused(&emulator, case, arn, &document).await;
+        assert_eq!(
+            body["Reason"].as_str(),
+            Some("FieldValidationFailed"),
+            "case {case}: expected Reason FieldValidationFailed, got {body}"
+        );
+        // The wording carries no per-request detail: the offending member travels in
+        // `Fields`, so the message is the same whichever resource was named.
+        let message = body["Message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: expected a Message in {body}"))
+            .to_string();
+        assert!(
+            !message.contains(arn.as_str()),
+            "case {case}: expected the message to carry no per-request detail, got {message:?}"
+        );
+        match &refusal_message {
+            Some(first) => assert_eq!(
+                &message, first,
+                "case {case}: expected every refusal to carry the same message {first:?}, got {message:?}"
+            ),
+            None => refusal_message = Some(message),
+        }
+        assert_no_policy(&emulator, case, arn).await;
+
+        // Deleting the policy of a resource that holds none is a no-op, not a failure.
+        delete_policy_ok(&emulator, case, arn).await;
+        assert_no_policy(&emulator, &format!("{case} after delete"), arn).await;
+
+        // Refusing one resource does not stop a policy-attachable one from being stored.
+        let attachable = one_policy_arn();
+        put_policy_ok(&emulator, case, &attachable, &document).await;
+        assert_policy_is(&emulator, case, &attachable, &document).await;
+        delete_policy_ok(&emulator, case, &attachable).await;
     }
 }
 
@@ -456,13 +598,10 @@ fn refused_documents() -> Vec<BadDocument> {
 #[tokio::test]
 async fn a_document_outside_the_policy_grammar_is_refused_and_stores_nothing() {
     let emulator = Emulator::new();
-    let arn = create_core_network_arn(&emulator).await;
+    let arn = one_policy_arn();
 
     // The ARN already carries a policy, so a refusal must leave that one in place.
-    let (_, held) = accepted_documents()
-        .into_iter()
-        .next()
-        .expect("the document table is not empty");
+    let held = one_document();
     put_policy_ok(&emulator, "the held policy", &arn, &held).await;
 
     for row in refused_documents() {
@@ -496,19 +635,20 @@ async fn a_document_outside_the_policy_grammar_is_refused_and_stores_nothing() {
 }
 
 #[tokio::test]
-async fn a_string_that_is_not_an_arn_of_this_service_is_refused_by_all_three_operations() {
+async fn a_string_that_names_no_resource_is_refused_by_all_three_operations() {
     let emulator = Emulator::new();
-    let (_, document) = accepted_documents()
-        .into_iter()
-        .next()
-        .expect("the document table is not empty");
+    let document = one_document();
 
-    // Rows differ along which part of the ARN form is missing or wrong.
+    // Rows differ along which part of an ARN form is missing or wrong — of this service's
+    // ARNs, and of the attachable gateway ARN the model types.
     let bad_arns: Vec<(&str, String)> = vec![
         ("an empty-looking plain name", "not-an-arn".to_string()),
         (
-            "an ARN of another service",
-            format!("arn:aws:ec2:us-west-2:{}:vpc/vpc-1234", engine::emulator_account_id()),
+            "an ARN of a service neither this one nor the gateway's",
+            format!(
+                "arn:aws:ec2:us-west-2:{}:vpc/vpc-1234",
+                engine::emulator_account_id()
+            ),
         ),
         (
             "an ARN with no resource segment",
@@ -531,6 +671,26 @@ async fn a_string_that_is_not_an_arn_of_this_service_is_refused_by_all_three_ope
         (
             "an ARN with no account",
             "arn:aws:networkmanager:::core-network/core-network-0000000000000beef".to_string(),
+        ),
+        (
+            "a gateway ARN whose id is not a gateway id",
+            gateway_arn("aws", "222222222222", "not-a-gateway-id"),
+        ),
+        (
+            "a gateway ARN whose id carries upper-case hex",
+            gateway_arn("aws", "222222222222", &gateway_id(5).to_uppercase()),
+        ),
+        (
+            "a gateway ARN whose id is one group short",
+            gateway_arn("aws", "222222222222", "00000006-1a2b-3c4d-5e6f"),
+        ),
+        (
+            "a gateway ARN carrying a region",
+            "arn:aws:directconnect:us-west-2:222222222222:dx-gateway/00000007-1a2b-3c4d-5e6f-000000000007".to_string(),
+        ),
+        (
+            "a gateway ARN with no partition",
+            gateway_arn("", "222222222222", &gateway_id(8)),
         ),
     ];
 
@@ -585,7 +745,7 @@ fn document_of_chars(total: usize) -> String {
 #[tokio::test]
 async fn a_document_is_accepted_at_the_size_bound_and_refused_past_it() {
     let emulator = Emulator::new();
-    let arn = create_core_network_arn(&emulator).await;
+    let arn = one_policy_arn();
 
     // Each published bound, and one past it.
     let rows: Vec<(String, usize, bool)> = vec![
@@ -634,13 +794,10 @@ async fn a_document_is_accepted_at_the_size_bound_and_refused_past_it() {
 #[tokio::test]
 async fn the_policy_quota_refuses_one_more_arn_and_stores_nothing() {
     let emulator = Emulator::new();
-    let (_, document) = accepted_documents()
-        .into_iter()
-        .next()
-        .expect("the document table is not empty");
+    let document = one_document();
 
-    // Well-formed ARNs of this service, each naming a different resource.
-    let arn_of = |index: usize| expected_arn("core-network", &format!("core-network-{index:017x}"));
+    // Policy-attachable ARNs, each naming a different gateway.
+    let arn_of = |index: usize| gateway_arn("aws", "222222222222", &gateway_id(index));
 
     for index in 0..MAX_RESOURCE_POLICIES {
         put_policy_ok(&emulator, &format!("policy {index}"), &arn_of(index), &document).await;

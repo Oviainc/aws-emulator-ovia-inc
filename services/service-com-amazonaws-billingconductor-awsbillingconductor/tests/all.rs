@@ -23,6 +23,8 @@ mod billing_group_core_loop;
 mod billing_transfer_preference;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]
 mod custom_line_item_and_create_name_refusals;
+#[path = "all/delete_custom_line_item.rs"]
+mod delete_custom_line_item;
 #[path = "all/disassociate_accounts.rs"]
 mod disassociate_accounts;
 #[path = "all/list_custom_line_items.rs"]

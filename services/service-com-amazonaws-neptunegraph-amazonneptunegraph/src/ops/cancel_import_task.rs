@@ -163,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CancelImportTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,13 +172,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An import task lives in exactly one Region, so the Region this request was
+        // signed for is part of the lookup: a task of another Region is not found here.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
         // The lookup settles the transition the clock already made due first, so a
         // task whose load has already stopped is judged on the status it stopped in
         // rather than on the status it was accepted with.
-        let Some(task) = store.settled_import_task_mut(&input.task_identifier, now) else {
+        let Some(task) = store.settled_import_task_mut(&input.task_identifier, &region, now)
+        else {
             return Err(CancelImportTaskErrorModeled::ResourceNotFoundException(
                 crate::state::import_task_not_found(&input.task_identifier),
             )
@@ -225,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // completes rather than when the cancelled load would have finished. A graph
         // whose own transition has already come due, or that was deleted meanwhile, is
         // left alone.
-        if let Some(graph) = store.settled_graph_mut(&graph_id, now) {
+        if let Some(graph) = store.settled_graph_mut(&graph_id, &region, now) {
             if graph.status == crate::state::GraphStatus::Importing {
                 graph.begin_transition(
                     crate::state::GraphStatus::Importing,

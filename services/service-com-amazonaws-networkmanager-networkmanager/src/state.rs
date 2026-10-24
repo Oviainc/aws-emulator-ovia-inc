@@ -1655,8 +1655,9 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// models a `ResourceNotFoundException` (`smithy_query query="operation"
     /// operation="GetResourcePolicy,PutResourcePolicy,DeleteResourcePolicy"`), unlike every
     /// other reader of a resource in this service, so the policy store does not assert
-    /// that the ARN names a resource this account holds — only that it is an ARN of this
-    /// service ([`parse_resource_arn`]). The store is bounded instead by its own quota:
+    /// that the ARN names a resource this account holds — only that it names a resource
+    /// type a policy may be attached to ([`parse_policy_attachable_arn`]), which is a
+    /// resource of ANOTHER service. The store is bounded instead by its own quota:
     /// at most [`MAX_RESOURCE_POLICIES`] ARNs hold a policy, each document at most
     /// [`MAX_RESOURCE_POLICY_CHARS`] characters, so no caller can grow it without end.
     pub resource_policies: BTreeMap<String, String>,
@@ -2323,6 +2324,165 @@ pub fn malformed_resource_arn(member: &str) -> ValidationException {
         fields: Some(vec![ValidationExceptionField {
             name: member.to_string(),
             message: "must read arn:<partition>:networkmanager::<account>:<type>/<id>".to_string(),
+        }]),
+    }
+}
+
+/// The ARN namespace and resource type of the resource a resource policy of this service
+/// is attached to: a Direct Connect gateway.
+///
+/// A resource policy is attached to a resource that can CARRY one, and no resource Network
+/// Manager itself owns can: a recording of `PutResourcePolicy` against a core network — the
+/// central resource of this service — is refused for every well-formed policy document.
+/// The model agrees that the subject of these three operations is not a resource of this
+/// service: `TagResource` and `ListTagsForResource` carry the very same `ResourceArn`
+/// member and model `ResourceNotFoundException` (HTTP 404) for an ARN naming nothing,
+/// while `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` model no
+/// not-found failure at all (`smithy_query query="operation"
+/// operation="PutResourcePolicy,TagResource"`), so they never resolve the ARN against this
+/// service's resources.
+///
+/// The one resource of ANOTHER service this API surface joins to a core network — across
+/// accounts, so it needs a grant from its own owner — is the Direct Connect gateway
+/// `CreateDirectConnectGatewayAttachment` takes, and its ARN is the one cross-service ARN
+/// the model types: `DirectConnectGatewayArn` carries
+/// `pattern ^arn:[^:]{1,63}:directconnect::[^:]{0,63}:dx-gateway\/[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$`
+/// (`smithy_query shape=DirectConnectGatewayArn`). That form is what
+/// [`parse_direct_connect_gateway_arn`] accepts, and an ARN of any other resource type is
+/// refused by `PutResourcePolicy` with [`resource_not_policy_attachable`].
+const DIRECT_CONNECT_NAMESPACE: &str = "directconnect";
+/// See [`DIRECT_CONNECT_NAMESPACE`].
+pub const DIRECT_CONNECT_GATEWAY_KIND: &str = "dx-gateway";
+
+/// Whether `id` reads as a Direct Connect gateway id: the five lowercase-hex groups of
+/// 8-4-4-4-12 digits the modelled `DirectConnectGatewayArn` pattern spells out (see
+/// [`DIRECT_CONNECT_NAMESPACE`]).
+fn is_direct_connect_gateway_id(id: &str) -> bool {
+    /// The widths of the groups, in order, from that pattern.
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let mut groups = id.split('-');
+    for width in GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        let lowercase_hex = group
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if group.len() != width || !lowercase_hex {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// Split a Direct Connect gateway ARN into its kind and id, or `None` when the string is
+/// not one in the form the model types (see [`DIRECT_CONNECT_NAMESPACE`]).
+///
+/// The region segment must be EMPTY and the account segment may be, exactly as that
+/// pattern has them; which account owns the gateway is not judged here, since the point of
+/// a resource policy is that the gateway belongs to another account.
+pub fn parse_direct_connect_gateway_arn(arn: &str) -> Option<ArnParts<'_>> {
+    /// The widest partition and account the modelled pattern admits.
+    const MAX_SEGMENT: usize = 63;
+
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let partition = fields.next()?;
+    if partition.is_empty() || partition.len() > MAX_SEGMENT {
+        return None;
+    }
+    if fields.next()? != DIRECT_CONNECT_NAMESPACE {
+        return None;
+    }
+    if !fields.next()?.is_empty() {
+        return None;
+    }
+    if fields.next()?.len() > MAX_SEGMENT {
+        return None;
+    }
+    let (kind, id) = fields.next()?.split_once('/')?;
+    if kind != DIRECT_CONNECT_GATEWAY_KIND || !is_direct_connect_gateway_id(id) {
+        return None;
+    }
+    Some(ArnParts { kind, id })
+}
+
+/// The resource an ARN names when that resource may CARRY a resource policy, or `None`
+/// when it may not — see [`DIRECT_CONNECT_NAMESPACE`] for which resource types may.
+///
+/// `PutResourcePolicy` attaches a policy only to such a resource; every other ARN, this
+/// service's own resources included, is refused with [`resource_not_policy_attachable`].
+/// This is the ONE place that class is decided, so a second attachable resource type —
+/// should one be recorded as carrying a policy — is added here as another arm and reaches
+/// all three operations at once.
+pub fn parse_policy_attachable_arn(arn: &str) -> Option<ArnParts<'_>> {
+    parse_direct_connect_gateway_arn(arn)
+}
+
+/// The resource an ARN names when the resource-policy operations ADDRESS it at all: one of
+/// this service's own resources (which carries no policy, so it is reported as holding
+/// none) or a policy-attachable resource of another service.
+///
+/// `GetResourcePolicy` and `DeleteResourcePolicy` answer for either — a resource that
+/// cannot carry a policy simply holds none — so only a string that names neither is
+/// refused, with [`malformed_policy_resource_arn`].
+pub fn parse_policy_resource_arn(arn: &str) -> Option<ArnParts<'_>> {
+    parse_resource_arn(arn).or_else(|| parse_policy_attachable_arn(arn))
+}
+
+/// The modelled `ValidationException` (HTTP 400) the resource-policy operations answer when
+/// the string in `member` names no resource they address at all (see
+/// [`parse_policy_resource_arn`]).
+///
+/// Like [`malformed_resource_arn`], but naming BOTH forms these three operations read: an
+/// ARN of this service, and the policy-attachable form of another service's resource — a
+/// caller whose gateway ARN is slightly wrong is told the form it missed rather than the
+/// one it was not reaching for.
+pub fn malformed_policy_resource_arn(member: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{member} is not an ARN of a resource a resource policy is read or written for"),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "must read arn:<partition>:{ARN_NAMESPACE}::<account>:<type>/<id>, or arn:<partition>:{DIRECT_CONNECT_NAMESPACE}::<account>:{DIRECT_CONNECT_GATEWAY_KIND}/<id> for a resource that can carry a policy"
+            ),
+        }]),
+    }
+}
+
+/// The message a refusal of a resource that cannot carry a resource policy carries.
+///
+/// A fixed, request-INDEPENDENT constant, like [`RESOURCE_NOT_FOUND_MESSAGE`] and for the
+/// same reason: a recording of `PutResourcePolicy` against a resource of this service
+/// answers the identical string for every well-formed policy document put at it — the
+/// document's principal, its actions and whether the resource already holds a policy of
+/// its own change nothing — so the wording carries no per-request detail. The offending
+/// member travels in `Fields` instead, where [`resource_not_policy_attachable`] names it.
+///
+/// What this refusal PINS is the HTTP 400, the `ValidationException` code and the
+/// `FieldValidationFailed` reason; the wording is this service's own text, so changing it
+/// is not a behaviour change.
+pub const INVALID_RESOURCE_POLICY_MESSAGE: &str = "Invalid policy.";
+
+/// The modelled `ValidationException` (HTTP 400) `PutResourcePolicy` answers when the ARN
+/// in `member` names a well-formed resource that cannot carry a resource policy — this
+/// service's own resources among them (see [`DIRECT_CONNECT_NAMESPACE`]).
+///
+/// A FIELD failure on the member that carried the ARN, like [`malformed_resource_arn`]:
+/// nothing is stored, so the resource keeps reporting no policy afterwards.
+pub fn resource_not_policy_attachable(member: &str) -> ValidationException {
+    ValidationException {
+        message: INVALID_RESOURCE_POLICY_MESSAGE.to_string(),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "must read arn:<partition>:{DIRECT_CONNECT_NAMESPACE}::<account>:{DIRECT_CONNECT_GATEWAY_KIND}/<id>"
+            ),
         }]),
     }
 }

@@ -933,13 +933,15 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .filter(|(_, item)| item.billing_group_arn == group_arn)
             .map(|(arn, _)| arn.clone())
             .collect();
+        // Through the SAME removal `DeleteCustomLineItem` performs, so an item taken
+        // by its billing group leaves exactly as little behind as one deleted
+        // directly.
         for arn in &orphaned {
-            self.custom_line_items.remove(arn);
+            self.remove_custom_line_item(arn);
         }
         for item in self.custom_line_items.values_mut() {
-            item.associated_resources.retain(|association| {
-                association.arn != group_arn && !orphaned.contains(&association.arn)
-            });
+            item.associated_resources
+                .retain(|association| association.arn != group_arn);
         }
 
         let released: Vec<String> = self
@@ -953,8 +955,31 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             self.note_unassociated_account(&account_id);
         }
 
-        self.idempotency_tokens
-            .retain(|_, arn| arn != group_arn && !orphaned.contains(arn));
+        // The tokens that named one of the deleted ITEMS went with each of them
+        // ([`Self::remove_custom_line_item`]), so what is left to reclaim here is the
+        // group's own.
+        self.idempotency_tokens.retain(|_, arn| arn != group_arn);
+        let remaining = &self.idempotency_tokens;
+        self.idempotency_order
+            .retain(|key| remaining.contains_key(key));
+
+        Some(removed)
+    }
+
+    /// Delete a custom line item and everything that only existed because of it: the
+    /// associations other percentage custom line items held TO it (an association
+    /// names a resource that exists, and its own associations go with the record) and
+    /// the idempotency entries that named it, so a `ClientToken` cannot replay into
+    /// the ARN of an item that no longer exists. `None` when no such item is stored.
+    pub fn remove_custom_line_item(&mut self, item_arn: &str) -> Option<CustomLineItemRecord> {
+        let removed = self.custom_line_items.remove(item_arn)?;
+
+        for item in self.custom_line_items.values_mut() {
+            item.associated_resources
+                .retain(|association| association.arn != item_arn);
+        }
+
+        self.idempotency_tokens.retain(|_, arn| arn != item_arn);
         let remaining = &self.idempotency_tokens;
         self.idempotency_order
             .retain(|key| remaining.contains_key(key));

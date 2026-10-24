@@ -301,13 +301,9 @@ fn absent_arn(resource_type: &str, id: &str) -> String {
 }
 
 /// A policy document of `statements` statements, inside `ResourcePolicyJson`'s
-/// `@length(min: 1, max: 10240)`.
+/// `@length(min: 1, max: 10240)`. Every statement states its effect, its action and the
+/// principal it is granted to, which is what makes the document a RESOURCE-based policy.
 fn policy_document(statements: usize) -> String {
-    if statements == 0 {
-        // A JSON document with no statements at all: the smallest `PutResourcePolicy`
-        // accepts, and a document a resource only ever carries because it was ATTACHED.
-        return "{}".to_string();
-    }
     json!({
         "Version": "2012-10-17",
         "Statement": (0..statements)
@@ -368,8 +364,8 @@ async fn a_policy_read_reports_only_what_was_attached() {
                 fresh.message()
             );
 
-            // The rows' documents: none, one, two and many statements.
-            for statements in [0usize, 1, 2, 24] {
+            // The rows' documents: one, two, three and many statements.
+            for statements in [1usize, 2, 3, 24] {
                 let document = policy_document(statements);
                 let put = put_resource_policy(&router, arn, &document).await;
                 assert_eq!(

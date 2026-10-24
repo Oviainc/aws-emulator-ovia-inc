@@ -235,7 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .get(alias)
                             .cloned()
                             .ok_or_else(|| {
-                                not_found(format!("The time series {alias} could not be found."))
+                                not_found(crate::state::not_found_message(
+                                    crate::state::RESOURCE_TIME_SERIES,
+                                    alias,
+                                ))
                             })?,
                     ),
                 }
@@ -253,8 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request that identifies no series is still invalid first: the scope only
         // narrows where a well-formed lookup is answered from.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            return Err(not_found(format!(
-                "The workspace {workspace} could not be found."
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                workspace,
             )));
         }
 
@@ -283,13 +287,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both ids are modelled `CustomID`, so either can arrive as the raw UUID or as
         // `externalId:<externalId>`; both forms name the one stored property.
-        let asset_id = store
-            .resolve_asset_id(&asset_label)
-            .ok_or_else(|| not_found(format!("The asset {asset_label} could not be found.")))?;
-        let asset = store
-            .assets
-            .get(&asset_id)
-            .ok_or_else(|| not_found(format!("The asset {asset_label} could not be found.")))?;
+        let asset_id = store.resolve_asset_id(&asset_label).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &asset_label,
+            ))
+        })?;
+        let asset = store.assets.get(&asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &asset_label,
+            ))
+        })?;
         let property = asset.property(&property_label).ok_or_else(|| {
             not_found(format!(
                 "The asset {asset_label} has no property {property_label}."

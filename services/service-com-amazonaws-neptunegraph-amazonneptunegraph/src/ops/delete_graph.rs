@@ -174,10 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A graph lives in exactly one Region, so the Region this request was signed
+        // for is part of the lookup: a graph of another Region is not deletable through
+        // this endpoint.
         let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
-        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
@@ -244,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             let id = store.next_snapshot_id();
-            let name = store.free_final_snapshot_name(&graph_name, &id);
+            let name = store.free_final_snapshot_name(&graph_name, &id, &region);
             Some(crate::state::Snapshot {
                 arn: ::engine::emulator_arn(
                     crate::state::ARN_NAMESPACE,
@@ -253,6 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 id,
                 name,
+                // The final snapshot lives in the Region of the graph it was taken of,
+                // which is the Region this request was signed for.
+                region: region.clone(),
                 source_graph_id: graph_id.clone(),
                 // Not restorable when the call returns; the clock owes the move to
                 // AVAILABLE a fixed span later, exactly as for an explicitly named
@@ -272,10 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The deletion is ACCEPTED, not finished: the graph reports DELETING and stays
-        // observable — listed, readable, and holding its name — until the deletion the
-        // clock owes falls due (`crate::state::DELETION_SPAN`), after which the next
-        // read finds it gone. No handler sleeps for it.
-        let Some(deleting) = store.settled_graph_mut(&graph_id, now) else {
+        // observable — listed, readable, and holding its name in its own Region — until
+        // the deletion the clock owes falls due (`crate::state::DELETION_SPAN`), after
+        // which the next read finds it gone. No handler sleeps for it.
+        let Some(deleting) = store.settled_graph_mut(&graph_id, &region, now) else {
             // Unreachable: the lookup above resolved under the same lock.
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),

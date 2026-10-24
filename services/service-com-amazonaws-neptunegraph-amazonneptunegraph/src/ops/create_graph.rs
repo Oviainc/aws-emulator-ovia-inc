@@ -239,10 +239,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would see.
         store.reap_deleted_graphs(now);
 
-        // `graphName` is unique: a second graph by the same name conflicts with the
-        // stored one — including one that is still DELETING, which holds its name
-        // until the deletion finishes.
-        if let Some(existing) = store.graph_names.get(&input.graph_name) {
+        // `graphName` is unique per account PER REGION — this is a regional control
+        // plane, so a second graph by the same name conflicts only with a stored graph
+        // of the SAME Region (including one that is still DELETING, which holds its
+        // name until the deletion finishes), and the same name in another Region is
+        // another graph.
+        if let Some(existing) = store.graph_id_named(&input.graph_name, &region) {
             return Err(CreateGraphErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "a graph named '{}' already exists with id {existing}",
@@ -273,13 +275,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let id = store.next_graph_id();        let graph = crate::state::Graph {
+        let id = store.next_graph_id();
+        let graph = crate::state::Graph {
             arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
                 &region,
                 &format!("graph/{id}"),
             ),
             endpoint: format!("{id}.{region}.{}.amazonaws.com", crate::state::ARN_NAMESPACE),
+            // The Region this graph exists in: it names the ARN and the endpoint above,
+            // and it is the predicate every later lookup and listing applies, so the
+            // graph is visible only through the Region it was created in.
+            region,
             id,
             name: input.graph_name,
             // The graph is not usable when the call returns; the clock owes the move to

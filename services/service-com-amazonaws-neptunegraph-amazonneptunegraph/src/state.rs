@@ -166,6 +166,13 @@ pub struct Graph {
     pub id: String,
     pub name: String,
     pub arn: String,
+    /// The Region the request that created this graph was signed for.
+    ///
+    /// neptune-graph is a REGIONAL control plane: a graph exists in exactly one
+    /// Region, so this is the lookup and listing predicate every operation applies
+    /// beside the identifier (see [`Self::is_in`]) — not merely the Region that names
+    /// the record's ARN and endpoint.
+    pub region: String,
     pub status: GraphStatus,
     pub status_reason: Option<String>,
     pub create_time: SystemTime,
@@ -193,6 +200,12 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Whether this record belongs to `region`: the predicate that makes a resource
+    /// of a regional control plane invisible outside the Region that holds it.
+    pub fn is_in(&self, region: &str) -> bool {
+        self.region == region
+    }
+
     /// Materialise the transition the clock has already made due.
     ///
     /// This is the one write a reporting operation (`GetGraph`, `ListGraphs`) is
@@ -267,6 +280,10 @@ pub struct Snapshot {
     pub id: String,
     pub name: String,
     pub arn: String,
+    /// The Region the request that created this snapshot was signed for — the Region
+    /// of the graph it was taken from, and the only Region it is visible in. The same
+    /// predicate [`Graph::region`] carries, for the same reason.
+    pub region: String,
     /// The graph the snapshot was taken from. Kept as the graph's id (not a
     /// borrow), so deleting that graph leaves the snapshot's provenance intact.
     pub source_graph_id: String,
@@ -282,6 +299,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Whether this record belongs to `region`: the same predicate [`Graph::is_in`]
+    /// applies to a graph.
+    pub fn is_in(&self, region: &str) -> bool {
+        self.region == region
+    }
+
     /// Materialise the transition the clock has already made due.
     ///
     /// The same one write a reporting operation may make as [`Graph::settle`]: the
@@ -369,6 +392,10 @@ pub struct ImportTaskTransition {
 #[derive(Debug, Clone)]
 pub struct ImportTask {
     pub id: String,
+    /// The Region the request that started this task was signed for — the same
+    /// predicate [`Graph::region`] carries, for the same reason: this is a regional
+    /// control plane, so a task of one Region is not visible from another.
+    pub region: String,
     /// The graph the data is imported INTO, kept as the graph's id (not a borrow), so
     /// deleting that graph leaves the task's provenance intact.
     pub graph_id: String,
@@ -391,6 +418,12 @@ pub struct ImportTask {
 }
 
 impl ImportTask {
+    /// Whether this record belongs to `region`: the same predicate [`Graph::is_in`]
+    /// applies to a graph.
+    pub fn is_in(&self, region: &str) -> bool {
+        self.region == region
+    }
+
     /// Materialise the transition the clock has already made due.
     ///
     /// The same one write a reporting operation may make as [`Graph::settle`]: the
@@ -490,6 +523,10 @@ pub struct ExportTask {
     /// the same hyphenated resource segment convention as the other resources this
     /// service mints (`graph/`, `graph-snapshot/`).
     pub arn: String,
+    /// The Region the request that started this task was signed for — the same
+    /// predicate [`Graph::region`] carries, for the same reason: this is a regional
+    /// control plane, so a task of one Region is not visible from another.
+    pub region: String,
     /// The graph the export reads, kept as that graph's id (not a borrow) so deleting
     /// the graph leaves the task's provenance intact.
     pub source_graph_id: String,
@@ -512,6 +549,12 @@ pub struct ExportTask {
 }
 
 impl ExportTask {
+    /// Whether this record belongs to `region`: the same predicate [`Graph::is_in`]
+    /// applies to a graph.
+    pub fn is_in(&self, region: &str) -> bool {
+        self.region == region
+    }
+
     /// Materialise the transition the clock has already made due.
     ///
     /// The same one write a reporting operation may make as [`Graph::settle`]: the task
@@ -841,20 +884,22 @@ impl PrivateGraphEndpoint {
 }
 
 /// Per-service state for com-amazonaws-neptunegraph-amazonneptunegraph. A handler reaches it through [`service_state`].
+///
+/// One store serves every Region, and every record carries the Region it belongs to
+/// ([`Graph::region`], [`Snapshot::region`]), so each lookup, listing and
+/// name-uniqueness check below takes the Region of the current request beside the
+/// identifier: this is a regional control plane, and a resource of one Region is not
+/// visible from another.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// Every stored graph, keyed by its minted `g-xxxxxxxxxx` id. A `BTreeMap` so
-    /// `ListGraphs` has one stable total order to page over.
+    /// `ListGraphs` has one stable total order to page over. Ids are minted unique
+    /// across the whole store, so the key needs no Region in it — the Region is the
+    /// predicate a lookup applies to the record it finds.
     pub graphs: BTreeMap<String, Graph>,
-    /// `graphName` -> graph id: the uniqueness index behind `CreateGraph`'s
-    /// `ConflictException`.
-    pub graph_names: HashMap<String, String>,
     /// Every stored snapshot, keyed by its minted `gs-xxxxxxxxxx` id. A `BTreeMap`
     /// so `ListGraphSnapshots` has one stable total order to page over.
     pub snapshots: BTreeMap<String, Snapshot>,
-    /// `snapshotName` -> snapshot id: the uniqueness index behind
-    /// `CreateGraphSnapshot`'s `ConflictException`.
-    pub snapshot_names: HashMap<String, String>,
     /// Every stored import task, keyed by its minted `t-xxxxxxxxxx` id. A `BTreeMap`
     /// so `ListImportTasks` has one stable total order to page over.
     pub import_tasks: BTreeMap<String, ImportTask>,
@@ -864,7 +909,9 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// within the graph that admitted it: the query namespace is per graph, and the
     /// same id on another graph names nothing. A query is admitted by the operation
     /// that runs it and leaves this map when it terminates, so the map holds exactly
-    /// the queries `GetQuery`, `ListQueries` and `CancelQuery` can still name.
+    /// the queries `GetQuery`, `ListQueries` and `CancelQuery` can still name. The
+    /// graph the queries hang off is itself resolved per Region, so a query is reached
+    /// only from the Region that holds its graph.
     pub queries: BTreeMap<String, BTreeMap<String, Query>>,
     /// Every stored export task, keyed by its minted `t-xxxxxxxxxx` id. A `BTreeMap`
     /// so `ListExportTasks` has one stable total order to page over.
@@ -937,9 +984,8 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.import_tasks.contains_key(id) || self.export_tasks.contains_key(id)
     }
 
-    /// Store a new graph and index its name.
+    /// Store a new graph.
     pub fn insert_graph(&mut self, graph: Graph) {
-        self.graph_names.insert(graph.name.clone(), graph.id.clone());
         self.graphs.insert(graph.id.clone(), graph);
     }
 
@@ -966,42 +1012,55 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.export_tasks.insert(task.id.clone(), task);
     }
 
-    /// Apply the terminal transition the clock has made due, then borrow one export
-    /// task.
-    pub fn settled_export_task(&mut self, id: &str, now: Instant) -> Option<&ExportTask> {
+    /// Apply the terminal transition the clock has made due, then borrow the export
+    /// task `id` names IN `region` — `None` when this Region holds no such task.
+    pub fn settled_export_task(
+        &mut self,
+        id: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<&ExportTask> {
         let task = self.export_tasks.get_mut(id)?;
+        if !task.is_in(region) {
+            return None;
+        }
         task.settle(now);
         Some(task)
     }
 
-    /// A free `snapshotName` for the FINAL snapshot of the graph named `graph_name`,
-    /// satisfying the modelled `SnapshotName` constraints (`@length(1..63)`, pattern
-    /// `^(?!gs-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`).
+    /// A free `snapshotName` for the FINAL snapshot of the graph named `graph_name`
+    /// IN `region`, satisfying the modelled `SnapshotName` constraints
+    /// (`@length(1..63)`, pattern `^(?!gs-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`).
     ///
     /// The request that asks for a final snapshot carries no name, so the service names
     /// it: after the graph it is taken of, which is how a caller finds it again. A name
-    /// that would break the modelled length, or that the account already holds, falls
-    /// back to the snapshot's own freshly minted id, which no stored snapshot shares.
-    pub fn free_final_snapshot_name(&self, graph_name: &str, snapshot_id: &str) -> String {
+    /// that would break the modelled length, or that the account already holds IN THAT
+    /// REGION, falls back to the snapshot's own freshly minted id, which no stored
+    /// snapshot shares. Names are per Region, so a name another Region holds is free
+    /// here.
+    pub fn free_final_snapshot_name(
+        &self,
+        graph_name: &str,
+        snapshot_id: &str,
+        region: &str,
+    ) -> String {
         let after_the_graph = format!("{graph_name}{FINAL_SNAPSHOT_SUFFIX}");
         if after_the_graph.len() <= MAX_RESOURCE_NAME_CHARS
-            && !self.snapshot_names.contains_key(&after_the_graph)
+            && self.snapshot_id_named(&after_the_graph, region).is_none()
         {
             return after_the_graph;
         }
         let mut from_the_id = format!("final-snapshot-{snapshot_id}");
         let mut attempt = 1u32;
-        while self.snapshot_names.contains_key(&from_the_id) {
+        while self.snapshot_id_named(&from_the_id, region).is_some() {
             attempt += 1;
             from_the_id = format!("final-snapshot-{snapshot_id}-{attempt}");
         }
         from_the_id
     }
 
-    /// Store a new snapshot and index its name.
+    /// Store a new snapshot.
     pub fn insert_snapshot(&mut self, snapshot: Snapshot) {
-        self.snapshot_names
-            .insert(snapshot.name.clone(), snapshot.id.clone());
         self.snapshots.insert(snapshot.id.clone(), snapshot);
     }
 
@@ -1011,21 +1070,39 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.import_tasks.insert(task.id.clone(), task);
     }
 
-    /// Drop a graph, its name index entry, every query that was running on it and
-    /// every private endpoint that reached it.
+    /// Drop the graph `id` names IN `region`, leaving another Region's graph of the
+    /// same id (and any graph of the same NAME in another Region) in place.
     ///
-    /// A query exists only while the graph it runs on does, so a deleted graph takes
-    /// its in-flight queries with it rather than leaving entries a later `GetQuery` on
-    /// a re-minted id could find. A private graph endpoint is the same: it is the
-    /// private route INTO one graph, addressed as an endpoint of that graph, so it
-    /// cannot outlive it. An import task is NOT dropped with its graph: it is read by
-    /// its own id and keeps the provenance of the load it describes.
-    pub fn remove_graph(&mut self, id: &str) -> Option<Graph> {
+    /// Every query that was running on it goes too, and every private endpoint that
+    /// reached it: a query exists only while the graph it runs on does, so a deleted
+    /// graph takes its in-flight queries with it rather than leaving entries a later
+    /// `GetQuery` on a re-minted id could find. A private graph endpoint is the same:
+    /// it is the private route INTO one graph, addressed as an endpoint of that graph,
+    /// so it cannot outlive it. An import task is NOT dropped with its graph: it is
+    /// read by its own id and keeps the provenance of the load it describes.
+    pub fn remove_graph(&mut self, id: &str, region: &str) -> Option<Graph> {
+        if !self.graphs.get(id).is_some_and(|graph| graph.is_in(region)) {
+            return None;
+        }
         let graph = self.graphs.remove(id)?;
-        self.graph_names.remove(&graph.name);
         self.queries.remove(id);
         self.private_endpoints.remove(id);
         Some(graph)
+    }
+
+    /// The id of the graph named `name` in `region`, or `None` when that Region holds
+    /// no graph by that name: the uniqueness check behind `CreateGraph`'s
+    /// `ConflictException`.
+    ///
+    /// Graph names are unique per account PER REGION, so the same name in two Regions
+    /// is two graphs. The record itself carries its Region and its name, so this one
+    /// scan over a bounded map ([`MAX_GRAPHS`]) is the whole index — a second map
+    /// keyed by name could disagree with it.
+    pub fn graph_id_named(&self, name: &str, region: &str) -> Option<&str> {
+        self.graphs
+            .values()
+            .find(|graph| graph.is_in(region) && graph.name == name)
+            .map(|graph| graph.id.as_str())
     }
 
     /// Mint a VPC endpoint id no endpoint in this store holds, matching the modelled
@@ -1168,7 +1245,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// `query_id` names ON the graph `graph_id` names.
     ///
     /// The lookup is scoped to the graph because a query is addressed as a query of one
-    /// graph: the same id against another graph names nothing.
+    /// graph: the same id against another graph names nothing. The graph itself is
+    /// resolved per Region by the caller ([`Self::settled_graph`]), which is what keeps
+    /// a query of one Region's graph unreachable from another.
     pub fn live_query(&mut self, graph_id: &str, query_id: &str, now: Instant) -> Option<&Query> {
         self.reap_terminated_queries(now);
         self.queries.get(graph_id)?.get(query_id)
@@ -1186,39 +1265,57 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.queries.get_mut(graph_id)?.get_mut(query_id)
     }
 
+    /// The id of the snapshot named `name` in `region`, or `None` when that Region
+    /// holds no snapshot by that name. Snapshot names are unique per account per
+    /// Region, exactly as graph names are ([`Self::graph_id_named`]).
+    pub fn snapshot_id_named(&self, name: &str, region: &str) -> Option<&str> {
+        self.snapshots
+            .values()
+            .find(|snapshot| snapshot.is_in(region) && snapshot.name == name)
+            .map(|snapshot| snapshot.id.as_str())
+    }
+
     /// Drop every graph whose accepted deletion the clock has made due, along with
     /// everything [`Self::remove_graph`] reclaims with a graph.
     ///
     /// The same one write a reporting operation may make as [`Graph::settle`]: each of
     /// those graphs was gone at its `deletes_at` instant whether or not anybody called,
     /// so reclaiming it on read is bookkeeping rather than a state change caused by the
-    /// read.
+    /// read. Each graph is reclaimed in its OWN Region — the Region the record carries
+    /// — so this is the one lookup that is not scoped to the caller's Region: the clock
+    /// owes it in every Region at once.
     pub fn reap_deleted_graphs(&mut self, now: Instant) {
-        let due: Vec<String> = self
+        let due: Vec<(String, String)> = self
             .graphs
             .iter()
             .filter(|(_, graph)| graph.deletion_complete(now))
-            .map(|(id, _)| id.clone())
+            .map(|(id, graph)| (id.clone(), graph.region.clone()))
             .collect();
-        for id in due {
-            self.remove_graph(&id);
+        for (id, region) in due {
+            self.remove_graph(&id, &region);
         }
     }
 
-    /// Apply every provisioning transition the clock has made due, then borrow one
-    /// graph.
-    pub fn settled_graph(&mut self, id: &str, now: Instant) -> Option<&Graph> {
-        self.reap_deleted_graphs(now);
-        let graph = self.graphs.get_mut(id)?;
-        graph.settle(now);
-        Some(graph)
+    /// Apply every provisioning transition the clock has made due, then borrow the
+    /// graph `id` names IN `region` — `None` when this Region holds no such graph,
+    /// whatever another Region holds.
+    pub fn settled_graph(&mut self, id: &str, region: &str, now: Instant) -> Option<&Graph> {
+        self.settled_graph_mut(id, region, now).map(|graph| &*graph)
     }
 
-    /// Apply every provisioning transition the clock has made due, then borrow one
-    /// graph mutably.
-    pub fn settled_graph_mut(&mut self, id: &str, now: Instant) -> Option<&mut Graph> {
+    /// Apply every provisioning transition the clock has made due, then borrow the
+    /// graph `id` names in `region` mutably.
+    pub fn settled_graph_mut(
+        &mut self,
+        id: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<&mut Graph> {
         self.reap_deleted_graphs(now);
         let graph = self.graphs.get_mut(id)?;
+        if !graph.is_in(region) {
+            return None;
+        }
         graph.settle(now);
         Some(graph)
     }
@@ -1241,36 +1338,69 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.materialise_private_endpoints(now);
     }
 
-    /// Apply the snapshot transition the clock has made due, then borrow one
-    /// snapshot.
-    pub fn settled_snapshot(&mut self, id: &str, now: Instant) -> Option<&Snapshot> {
+    /// The graphs `region` holds, in graph-id order, resuming after `after_id` when a
+    /// pagination token named a position: the one listing `ListGraphs` pages over.
+    pub fn graphs_in<'store>(
+        &'store self,
+        region: &'store str,
+        after_id: Option<&str>,
+    ) -> impl Iterator<Item = &'store Graph> {
+        let lower = match after_id {
+            Some(id) => ::std::ops::Bound::Excluded(id.to_string()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.graphs
+            .range((lower, ::std::ops::Bound::Unbounded))
+            .map(|(_, graph)| graph)
+            .filter(move |graph| graph.is_in(region))
+    }
+
+    /// Apply the snapshot transition the clock has made due, then borrow the snapshot
+    /// `id` names IN `region` — `None` when this Region holds no such snapshot.
+    pub fn settled_snapshot(&mut self, id: &str, region: &str, now: Instant) -> Option<&Snapshot> {
         let snapshot = self.snapshots.get_mut(id)?;
+        if !snapshot.is_in(region) {
+            return None;
+        }
         snapshot.settle(now);
         Some(snapshot)
     }
 
-    /// Apply the import-task transition the clock has made due, then borrow one task.
-    pub fn settled_import_task(&mut self, id: &str, now: Instant) -> Option<&ImportTask> {
+    /// Apply the import-task transition the clock has made due, then borrow the task
+    /// `id` names IN `region` — `None` when this Region holds no such task.
+    pub fn settled_import_task(
+        &mut self,
+        id: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<&ImportTask> {
+        self.settled_import_task_mut(id, region, now).map(|t| &*t)
+    }
+
+    /// [`Self::settled_import_task`], mutably.
+    pub fn settled_import_task_mut(
+        &mut self,
+        id: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<&mut ImportTask> {
         let task = self.import_tasks.get_mut(id)?;
+        if !task.is_in(region) {
+            return None;
+        }
         task.settle(now);
         Some(task)
     }
 
-    /// Apply the import-task transition the clock has made due, then borrow one task
-    /// mutably.
-    pub fn settled_import_task_mut(&mut self, id: &str, now: Instant) -> Option<&mut ImportTask> {
-        let task = self.import_tasks.get_mut(id)?;
-        task.settle(now);
-        Some(task)
-    }
-
-    /// The tag map of the resource `arn` names, or `None` when this store holds no
-    /// resource by that ARN.
+    /// The tag map of the resource `arn` names IN `region`, or `None` when this
+    /// Region holds no resource by that ARN.
     ///
     /// The lookup is on the ARN the service MINTED for the resource, so a request
     /// naming the right resource id in the wrong region, account or partition names
     /// no resource here — an ARN identifies one resource in one region of one
-    /// account.
+    /// account. `region` is the Region the REQUEST was signed for, which the regional
+    /// endpoint makes part of the lookup as well: a resource of another Region is not
+    /// reachable through this one even by its own full ARN.
     ///
     /// Tags live on the resource record itself, which is what makes a tag supplied at
     /// create time and one written later by `TagResource` the same bytes, read back by
@@ -1280,46 +1410,58 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// they live on the graph that call creates). A private graph endpoint never joins
     /// this lookup either: the model gives it neither an ARN nor a `tags` member, so the
     /// tagging surface has nothing to address it by.
-    pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+    pub fn tags_of(&self, arn: &str, region: &str) -> Option<&BTreeMap<String, String>> {
         self.graphs
             .values()
-            .find(|graph| graph.arn == arn)
+            .find(|graph| graph.is_in(region) && graph.arn == arn)
             .map(|graph| &graph.tags)
             .or_else(|| {
                 self.snapshots
                     .values()
-                    .find(|snapshot| snapshot.arn == arn)
+                    .find(|snapshot| snapshot.is_in(region) && snapshot.arn == arn)
                     .map(|snapshot| &snapshot.tags)
             })
             .or_else(|| {
                 self.export_tasks
                     .values()
-                    .find(|task| task.arn == arn)
+                    .find(|task| task.is_in(region) && task.arn == arn)
                     .map(|task| &task.tags)
             })
     }
 
     /// [`Self::tags_of`], mutably: the one place `TagResource`/`UntagResource` write.
-    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+    pub fn tags_of_mut(
+        &mut self,
+        arn: &str,
+        region: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
         // Two disjoint maps and one `&mut self`, so which map holds the ARN is
         // decided by an immutable scan before either is borrowed mutably.
-        if self.graphs.values().any(|graph| graph.arn == arn) {
+        if self
+            .graphs
+            .values()
+            .any(|graph| graph.is_in(region) && graph.arn == arn)
+        {
             return self
                 .graphs
                 .values_mut()
-                .find(|graph| graph.arn == arn)
+                .find(|graph| graph.is_in(region) && graph.arn == arn)
                 .map(|graph| &mut graph.tags);
         }
-        if self.snapshots.values().any(|snapshot| snapshot.arn == arn) {
+        if self
+            .snapshots
+            .values()
+            .any(|snapshot| snapshot.is_in(region) && snapshot.arn == arn)
+        {
             return self
                 .snapshots
                 .values_mut()
-                .find(|snapshot| snapshot.arn == arn)
+                .find(|snapshot| snapshot.is_in(region) && snapshot.arn == arn)
                 .map(|snapshot| &mut snapshot.tags);
         }
         self.export_tasks
             .values_mut()
-            .find(|task| task.arn == arn)
+            .find(|task| task.is_in(region) && task.arn == arn)
             .map(|task| &mut task.tags)
     }
 }
@@ -2305,6 +2447,7 @@ mod tests {
             id: "t-0123456789".to_string(),
             arn: "arn:aws:neptune-graph:us-east-1:000000000000:export-task/t-0123456789"
                 .to_string(),
+            region: "us-east-1".to_string(),
             source_graph_id: "g-0000000000".to_string(),
             role_arn: "arn:aws:iam::000000000000:role/NeptuneExportRole".to_string(),
             format: "CSV".to_string(),
@@ -2591,7 +2734,7 @@ mod tests {
         let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
         let id = "g-0123456789";
         let arn = ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("graph/{id}"));
-        let mut graph = sample_graph(id, &arn);
+        let mut graph = sample_graph(id, &arn, "us-east-1");
         graph.tags.insert("env".to_string(), "prod".to_string());
         state.insert_graph(graph);
 
@@ -2621,12 +2764,12 @@ mod tests {
             ("not an ARN of this service", "arn:aws:s3:::bucket".to_string(), false),
         ];
         for (case, candidate, resolves) in cases {
-            let actual = state.tags_of(&candidate).is_some();
+            let actual = state.tags_of(&candidate, "us-east-1").is_some();
             assert_eq!(
                 actual, resolves,
                 "case {case:?} ({candidate:?}): expected resolves={resolves}, got {actual}"
             );
-            let actual_mut = state.tags_of_mut(&candidate).is_some();
+            let actual_mut = state.tags_of_mut(&candidate, "us-east-1").is_some();
             assert_eq!(
                 actual_mut, resolves,
                 "case {case:?} ({candidate:?}) mutably: expected resolves={resolves}, \
@@ -2635,12 +2778,130 @@ mod tests {
         }
     }
 
+    /// Every lookup and listing is scoped to the Region of the current request: a
+    /// record of one Region answers only there, and the same NAME in two Regions is
+    /// two records.
+    #[test]
+    fn every_lookup_is_scoped_to_the_region_of_the_request() {
+        let now = Instant::now();
+        // One graph per Region, all sharing the name `shared`, plus a second graph in
+        // one of them so a Region can hold more than one.
+        let placements: &[(&str, &str, &str)] = &[
+            ("g-0000000001", "us-east-1", "shared"),
+            ("g-0000000002", "eu-west-1", "shared"),
+            ("g-0000000003", "ap-southeast-2", "shared"),
+            ("g-0000000004", "eu-west-1", "other"),
+        ];
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        for (id, region, name) in placements {
+            let arn = ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("graph/{id}"));
+            let mut graph = sample_graph(id, &arn, region);
+            graph.name = (*name).to_string();
+            state.insert_graph(graph);
+            state.insert_snapshot(Snapshot {
+                id: format!("gs{}", id.trim_start_matches('g')),
+                name: (*name).to_string(),
+                arn: ::engine::emulator_arn(
+                    ARN_NAMESPACE,
+                    region,
+                    &format!("graph-snapshot/gs{}", id.trim_start_matches('g')),
+                ),
+                region: (*region).to_string(),
+                source_graph_id: (*id).to_string(),
+                status: SnapshotStatus::Available,
+                snapshot_create_time: SystemTime::UNIX_EPOCH,
+                kms_key_identifier: None,
+                tags: BTreeMap::new(),
+                settles_at: None,
+            });
+        }
+
+        for (id, region, name) in placements {
+            let snapshot_id = format!("gs{}", id.trim_start_matches('g'));
+            // The id resolves in its own Region ...
+            assert!(
+                state.settled_graph(id, region, now).is_some(),
+                "case {id:?} in {region:?}: expected the graph to resolve in its own Region"
+            );
+            assert!(
+                state.settled_snapshot(&snapshot_id, region, now).is_some(),
+                "case {snapshot_id:?} in {region:?}: expected the snapshot to resolve in \
+                 its own Region"
+            );
+            // ... and in no other.
+            for (_, other_region, _) in placements.iter().filter(|(_, r, _)| r != region) {
+                let graph = state.settled_graph(id, other_region, now);
+                assert!(
+                    graph.is_none(),
+                    "case {id:?} from {other_region:?}: expected no graph, got {:?}",
+                    graph.map(|graph| graph.id.clone())
+                );
+                let snapshot = state.settled_snapshot(&snapshot_id, other_region, now);
+                assert!(
+                    snapshot.is_none(),
+                    "case {snapshot_id:?} from {other_region:?}: expected no snapshot, \
+                     got {:?}",
+                    snapshot.map(|snapshot| snapshot.id.clone())
+                );
+            }
+            // The name index is per Region: `shared` names a DIFFERENT graph in each.
+            let named = state.graph_id_named(name, region);
+            assert_eq!(
+                named,
+                Some(*id),
+                "case name {name:?} in {region:?}: expected {id:?}, got {named:?}"
+            );
+            let named_snapshot = state.snapshot_id_named(name, region);
+            assert_eq!(
+                named_snapshot,
+                Some(snapshot_id.as_str()),
+                "case snapshot name {name:?} in {region:?}: expected {snapshot_id:?}, \
+                 got {named_snapshot:?}"
+            );
+        }
+
+        // A listing reports the Region's own graphs, in id order, and nothing else.
+        for (region, expected) in [
+            ("us-east-1", vec!["g-0000000001"]),
+            ("eu-west-1", vec!["g-0000000002", "g-0000000004"]),
+            ("ap-southeast-2", vec!["g-0000000003"]),
+            ("sa-east-1", Vec::new()),
+        ] {
+            let actual: Vec<&str> = state
+                .graphs_in(region, None)
+                .map(|graph| graph.id.as_str())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "case listing {region:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // A delete reaches only the Region it was signed for.
+        assert!(
+            state.remove_graph("g-0000000002", "us-east-1").is_none(),
+            "case deleting an eu-west-1 graph from us-east-1: expected no removal"
+        );
+        assert!(
+            state.remove_graph("g-0000000002", "eu-west-1").is_some(),
+            "case deleting an eu-west-1 graph from eu-west-1: expected the removal"
+        );
+        let named = state.graph_id_named("shared", "us-east-1");
+        assert_eq!(
+            named,
+            Some("g-0000000001"),
+            "case after deleting eu-west-1's 'shared': expected us-east-1's graph to \
+             keep its name, got {named:?}"
+        );
+    }
+
     /// A stored graph with the members every test here needs and nothing else set.
-    fn sample_graph(id: &str, arn: &str) -> Graph {
+    fn sample_graph(id: &str, arn: &str, region: &str) -> Graph {
         Graph {
             id: id.to_string(),
             name: format!("name-for-{id}"),
             arn: arn.to_string(),
+            region: region.to_string(),
             status: GraphStatus::Available,
             status_reason: None,
             create_time: SystemTime::UNIX_EPOCH,
@@ -2678,7 +2939,7 @@ mod tests {
             ("stopping", GraphStatus::Stopping, GraphStatus::Stopped),
             ("starting", GraphStatus::Starting, GraphStatus::Available),
         ] {
-            let mut graph = sample_graph("g-0123456789", "arn");
+            let mut graph = sample_graph("g-0123456789", "arn", "us-east-1");
             graph.begin_transition(transient, settled, now);
 
             graph.settle(now);
@@ -2715,53 +2976,63 @@ mod tests {
             ("stopped", GraphStatus::Stopped),
         ] {
             let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
-            let mut graph = sample_graph("g-0123456789", "arn");
+            let mut graph = sample_graph("g-0123456789", "arn", "us-east-1");
             graph.status = resting;
             let name = graph.name.clone();
             state.insert_graph(graph);
 
             state
-                .settled_graph_mut("g-0123456789", now)
+                .settled_graph_mut("g-0123456789", "us-east-1", now)
                 .expect("the stored graph resolves")
                 .begin_deletion(now);
 
-            let in_flight = state.settled_graph("g-0123456789", now);
+            let in_flight = state.settled_graph("g-0123456789", "us-east-1", now);
             assert_eq!(
                 in_flight.map(|graph| graph.status),
                 Some(GraphStatus::Deleting),
                 "case {case:?} not-yet-due: expected a graph reporting DELETING, got {:?}",
                 in_flight.map(|graph| graph.status)
             );
-            assert!(
-                state.graph_names.contains_key(&name),
-                "case {case:?} not-yet-due: the name must stay reserved, got {:?}",
-                state.graph_names
+            let reserved = state.graph_id_named(&name, "us-east-1");
+            assert_eq!(
+                reserved,
+                Some("g-0123456789"),
+                "case {case:?} not-yet-due: the name must stay reserved, got {reserved:?}"
             );
 
             let settled = state
-                .settled_graph("g-0123456789", now + DELETION_SPAN)
+                .settled_graph("g-0123456789", "us-east-1", now + DELETION_SPAN)
                 .cloned();
             assert!(
                 settled.is_none(),
                 "case {case:?} due: the record must be gone, got {settled:?}"
             );
+            let freed = state.graph_id_named(&name, "us-east-1");
             assert!(
-                !state.graph_names.contains_key(&name),
-                "case {case:?} due: the name must be free again, got {:?}",
-                state.graph_names
+                freed.is_none(),
+                "case {case:?} due: the name must be free again, got {freed:?}"
             );
         }
     }
 
     /// The name a final snapshot takes: after the graph where that fits and is free,
     /// otherwise after the snapshot's own id — and always a name the modelled
-    /// `SnapshotName` constraints accept.
+    /// `SnapshotName` constraints accept. The names it has to avoid are the ones its
+    /// OWN Region holds, so a row is checked against a snapshot of another Region too.
     #[test]
     fn a_final_snapshots_name_satisfies_the_modelled_name_constraints() {
         let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
-        state
-            .snapshot_names
-            .insert("taken-graph-final-snapshot".to_string(), "gs-0000000000".to_string());
+        state.insert_snapshot(sample_snapshot(
+            "gs-0000000000",
+            "taken-graph-final-snapshot",
+            "us-east-1",
+        ));
+        // The same name in ANOTHER Region is not in the way: names are per Region.
+        state.insert_snapshot(sample_snapshot(
+            "gs-0000000001",
+            "elsewhere-graph-final-snapshot",
+            "eu-west-1",
+        ));
         let longest_graph_name = "a".repeat(MAX_RESOURCE_NAME_CHARS);
 
         // (case, the graph's name, whether the name may be built from the graph's own)
@@ -2774,13 +3045,18 @@ mod tests {
                 false,
             ),
             (
+                "a name held only by a snapshot of another Region",
+                "elsewhere-graph",
+                true,
+            ),
+            (
                 "a graph name that leaves no room for the suffix",
                 longest_graph_name.as_str(),
                 false,
             ),
         ];
         for (case, graph_name, after_the_graph) in cases {
-            let minted = state.free_final_snapshot_name(graph_name, "gs-1234567890");
+            let minted = state.free_final_snapshot_name(graph_name, "gs-1234567890", "us-east-1");
             assert_eq!(
                 minted == format!("{graph_name}{FINAL_SNAPSHOT_SUFFIX}"),
                 *after_the_graph,
@@ -2795,10 +3071,28 @@ mod tests {
                 resource_name_is_well_formed(&minted, "gs-"),
                 "case {case:?}: expected a name the modelled pattern accepts, got {minted:?}"
             );
+            let clash = state.snapshot_id_named(&minted, "us-east-1");
             assert!(
-                !state.snapshot_names.contains_key(&minted),
-                "case {case:?}: expected a name no stored snapshot holds, got {minted:?}"
+                clash.is_none(),
+                "case {case:?}: expected a name no stored snapshot of this Region holds, \
+                 got {minted:?} ({clash:?})"
             );
+        }
+    }
+
+    /// A stored snapshot with the members these tests need and nothing else set.
+    fn sample_snapshot(id: &str, name: &str, region: &str) -> Snapshot {
+        Snapshot {
+            id: id.to_string(),
+            name: name.to_string(),
+            arn: ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("graph-snapshot/{id}")),
+            region: region.to_string(),
+            source_graph_id: "g-0123456789".to_string(),
+            status: SnapshotStatus::Available,
+            snapshot_create_time: SystemTime::UNIX_EPOCH,
+            kms_key_identifier: None,
+            tags: BTreeMap::new(),
+            settles_at: None,
         }
     }
 
@@ -2892,7 +3186,7 @@ mod tests {
         let graph_id = "g-0123456789";
         let graph_arn =
             ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("graph/{graph_id}"));
-        state.insert_graph(sample_graph(graph_id, &graph_arn));
+        state.insert_graph(sample_graph(graph_id, &graph_arn, "us-east-1"));
 
         let snapshot_id = "gs-0123456789";
         let snapshot_arn = ::engine::emulator_arn(
@@ -2904,6 +3198,7 @@ mod tests {
             id: snapshot_id.to_string(),
             name: "my-snapshot".to_string(),
             arn: snapshot_arn.clone(),
+            region: "us-east-1".to_string(),
             source_graph_id: graph_id.to_string(),
             status: SnapshotStatus::Available,
             snapshot_create_time: SystemTime::UNIX_EPOCH,
@@ -2932,13 +3227,15 @@ mod tests {
             ),
         ];
         for (case, candidate, expected) in cases {
-            let actual = state.tags_of(&candidate).map(BTreeMap::len);
+            let actual = state.tags_of(&candidate, "us-east-1").map(BTreeMap::len);
             assert_eq!(
                 actual, expected,
                 "case {case:?} ({candidate:?}): expected {expected:?} tag entries, \
                  got {actual:?}"
             );
-            let actual_mut = state.tags_of_mut(&candidate).map(|tags| tags.len());
+            let actual_mut = state
+                .tags_of_mut(&candidate, "us-east-1")
+                .map(|tags| tags.len());
             assert_eq!(
                 actual_mut, expected,
                 "case {case:?} ({candidate:?}) mutably: expected {expected:?} tag \
@@ -2956,6 +3253,7 @@ mod tests {
             id: "gs-0123456789".to_string(),
             name: "example".to_string(),
             arn: "arn".to_string(),
+            region: "us-east-1".to_string(),
             source_graph_id: "g-0123456789".to_string(),
             status: SnapshotStatus::Creating,
             snapshot_create_time: SystemTime::UNIX_EPOCH,
@@ -3137,6 +3435,7 @@ mod tests {
     fn sample_import_task(id: &str, graph_id: &str) -> ImportTask {
         ImportTask {
             id: id.to_string(),
+            region: "us-east-1".to_string(),
             graph_id: graph_id.to_string(),
             source: "s3://example-bucket/data/".to_string(),
             format: None,
@@ -3159,6 +3458,7 @@ mod tests {
         ExportTask {
             id: id.to_string(),
             arn: ::engine::emulator_arn(ARN_NAMESPACE, "us-east-1", &format!("export-task/{id}")),
+            region: "us-east-1".to_string(),
             source_graph_id: graph_id.to_string(),
             role_arn: "arn:aws:iam::000000000000:role/example".to_string(),
             format: "CSV".to_string(),

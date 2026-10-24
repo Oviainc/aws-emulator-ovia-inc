@@ -27,8 +27,8 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
-    call, create_monitor, create_probe, error_code, get_monitor, name_of_length, probes_of, router,
-    source_arn, string_at,
+    call, create_monitor, create_probe, error_code, error_message, get_monitor, name_of_length,
+    probe_json, probes_of, router, string_at,
 };
 
 /// The clause AWS states a `@pattern` requirement with, and the one the
@@ -91,14 +91,7 @@ struct PatternCase {
     expression: &'static str,
 }
 
-/// The `message` member of an error response, or `"<none>"`.
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("<none>")
-        .to_string()
-}
-
+/// The `aggregationPeriod` a response reports.
 fn period_of(body: &Value) -> Option<i64> {
     body.get("aggregationPeriod").and_then(Value::as_i64)
 }
@@ -121,14 +114,6 @@ async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (
         None,
     )
     .await
-}
-
-/// A probe body whose `sourceArn` names a subnet of this account.
-fn probe_json(destination: &str, protocol: &str, extra: &str) -> String {
-    format!(
-        r#"{{"sourceArn":"{}","destination":"{destination}","protocol":"{protocol}"{extra}}}"#,
-        source_arn()
-    )
 }
 
 /// A `@pattern` refusal states the expression the model declares WITHOUT the

@@ -53,8 +53,27 @@ impl Emulator {
     /// Dispatch `POST <path>` with `body` as the restJson1 payload, signed (in
     /// scope only) for `region`. Returns the status and the parsed body.
     pub(crate) async fn call_in(&self, region: &str, path: &str, body: &Value) -> (u16, Value) {
+        self.request_in(region, "POST", path, Some(body)).await
+    }
+
+    /// Dispatch `<method> <path>`, signed (in scope only) for `region`, with
+    /// `body` as the restJson1 payload when the operation takes one and no body
+    /// at all when it does not. The operations whose members are bound to the URI
+    /// are reached this way, since the model gives them their own method and path.
+    /// Returns the status and the parsed body.
+    pub(crate) async fn request_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
+        let payload = match body {
+            Some(value) => serde_json::to_vec(value).expect("serializable body"),
+            None => Vec::new(),
+        };
         let request = http::Request::builder()
-            .method("POST")
+            .method(method)
             .uri(path)
             .header(
                 "authorization",
@@ -65,7 +84,7 @@ impl Emulator {
                 ),
             )
             .header("content-type", "application/json")
-            .body(bytes::Bytes::from(serde_json::to_vec(body).expect("serializable body")))
+            .body(bytes::Bytes::from(payload))
             .expect("valid request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
@@ -74,7 +93,7 @@ impl Emulator {
         } else {
             serde_json::from_slice(response.body()).unwrap_or_else(|e| {
                 panic!(
-                    "POST {path} answered {status} with a body that is not JSON ({e}): {:?}",
+                    "{method} {path} answered {status} with a body that is not JSON ({e}): {:?}",
                     String::from_utf8_lossy(response.body()),
                 )
             })

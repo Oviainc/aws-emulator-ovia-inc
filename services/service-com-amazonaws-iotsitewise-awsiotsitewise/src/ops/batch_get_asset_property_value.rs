@@ -311,7 +311,7 @@ fn resolve_entry(
             let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
                 (
                     ERROR_NOT_FOUND,
-                    format!("The asset {asset_label} could not be found."),
+                    crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
                 )
             })?;
             let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
@@ -334,7 +334,7 @@ fn resolve_entry(
         (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
             (
                 ERROR_NOT_FOUND,
-                format!("The property alias {alias} could not be found."),
+                crate::state::not_found_message(crate::state::RESOURCE_TIME_SERIES, alias),
             )
         })?,
         _ => {

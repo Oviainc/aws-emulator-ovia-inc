@@ -225,7 +225,10 @@ fn merge_node_logs(
     }
 }
 
-/// Merge `NodeFabricLogPublishingConfiguration`'s two log streams independently.
+/// Merge `NodeFabricLogPublishingConfiguration`'s two log streams independently; each
+/// stream goes through the one `LogConfigurations` merge this service has
+/// ([`crate::state::merge_log_configurations`]), which every log-publishing tree bottoms
+/// out in.
 fn merge_fabric_logs(
     stored: Option<NodeFabricLogPublishingConfiguration>,
     requested: Option<NodeFabricLogPublishingConfiguration>,
@@ -235,36 +238,10 @@ fn merge_fabric_logs(
     };
     let stored = stored.unwrap_or_default();
     Some(NodeFabricLogPublishingConfiguration {
-        chaincode_logs: merge_log_configurations(stored.chaincode_logs, requested.chaincode_logs),
-        peer_logs: merge_log_configurations(stored.peer_logs, requested.peer_logs),
-    })
-}
-
-/// Merge one log stream's `LogConfigurations`; its only member is the CloudWatch one.
-fn merge_log_configurations(
-    stored: Option<LogConfigurations>,
-    requested: Option<LogConfigurations>,
-) -> Option<LogConfigurations> {
-    let Some(requested) = requested else {
-        return stored;
-    };
-    let stored = stored.unwrap_or_default();
-    Some(LogConfigurations {
-        cloudwatch: merge_log_configuration(stored.cloudwatch, requested.cloudwatch),
-    })
-}
-
-/// Merge one `LogConfiguration`: a named `Enabled` wins, an omitted one keeps the stored
-/// setting.
-fn merge_log_configuration(
-    stored: Option<LogConfiguration>,
-    requested: Option<LogConfiguration>,
-) -> Option<LogConfiguration> {
-    let Some(requested) = requested else {
-        return stored;
-    };
-    let stored = stored.unwrap_or_default();
-    Some(LogConfiguration {
-        enabled: requested.enabled.or(stored.enabled),
+        chaincode_logs: crate::state::merge_log_configurations(
+            stored.chaincode_logs,
+            requested.chaincode_logs,
+        ),
+        peer_logs: crate::state::merge_log_configurations(stored.peer_logs, requested.peer_logs),
     })
 }

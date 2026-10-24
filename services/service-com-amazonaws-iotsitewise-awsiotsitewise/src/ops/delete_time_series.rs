@@ -202,8 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // created by `CreateWorkspace`, which is still a scaffold stub here, so no
         // workspace exists for a request to name.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            return Err(not_found(format!(
-                "The workspace {workspace} could not be found."
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                workspace,
             )));
         }
 
@@ -224,7 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the shared resolver every alias-addressed operation uses.
             (Some(alias), None, None) => {
                 store.resolve_alias_series(alias).ok_or_else(|| {
-                    not_found(format!("The time series {alias} could not be found."))
+                    not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_TIME_SERIES,
+                        alias,
+                    ))
                 })?
             }
             (None, Some(asset_label), Some(property_label)) => {

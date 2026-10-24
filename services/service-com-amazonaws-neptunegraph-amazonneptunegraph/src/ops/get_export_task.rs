@@ -159,7 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetExportTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -169,9 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An export task lives in exactly one Region, so the Region this request was
+        // signed for is part of the lookup: a task of another Region is not found here.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
-        let Some(task) = store.settled_export_task(&input.task_identifier, now) else {
+        let Some(task) = store.settled_export_task(&input.task_identifier, &region, now) else {
             return Err(GetExportTaskErrorModeled::ResourceNotFoundException(
                 crate::state::export_task_not_found(&input.task_identifier),
             )

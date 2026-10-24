@@ -149,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetGraphSnapshotErrorModeled::InternalServerException(
                 InternalServerException {
@@ -159,12 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A snapshot lives in exactly one Region, so the Region this request was
+        // signed for is part of the lookup: a snapshot of another Region is not found
+        // here.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         // Reporting only (`@readonly`): the sole write is materialising the CREATING ->
         // AVAILABLE transition the clock already made due, which was owed at this
         // instant whether or not anybody read the snapshot.
-        let Some(snapshot) = store.settled_snapshot(&input.snapshot_identifier, now) else {
+        let Some(snapshot) = store.settled_snapshot(&input.snapshot_identifier, &region, now)
+        else {
             return Err(GetGraphSnapshotErrorModeled::ResourceNotFoundException(
                 crate::state::snapshot_not_found(&input.snapshot_identifier),
             )

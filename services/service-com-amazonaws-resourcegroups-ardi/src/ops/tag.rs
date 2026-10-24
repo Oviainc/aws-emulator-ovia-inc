@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Tag
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Tag`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Tag::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds tags to the resource group its `Arn` addresses: the pairs the request
+//! carries are MERGED into the group's stored tag map, so a key the request names
+//! is set or overwritten and a key it does not name keeps the value it had. The
+//! response reports the stored ARN and the pairs now stored for the keys the
+//! request named, both read back out of the record — so a later `GetTags` answers
+//! the same values.
+//!
+//! A request whose ARN addresses no stored group is `NotFoundException` (404), and
+//! one naming a tag key a caller may not write is `BadRequestException` (400),
+//! which stores none of the batch.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Tag` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Tag"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read for the audit record
+        // this operation emits.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // The key rules every tagging path of this service decides in one place.
+        // Judged before the group is resolved and before anything is written, so a
+        // batch holding one pair this service refuses stores none of its pairs.
+        crate::state::check_tags(
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .map_err(bad_request)?;
+        let not_found = || {
+            TagError::from(TagErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+            }))
+        };
+        let mut store = state.lock();
+        // `Arn` is a group ARN (the modelled `GroupArnV2`), so it resolves only
+        // against a group's own STORED ARN: an ARN for another region or account
+        // addresses no group here.
+        let name = store.lookup(&input.arn).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // The merge, and the store's own ceiling on how many tags one group holds,
+        // live on the record: an empty batch is a no-op success, and the pairs that
+        // come back are the ones now STORED for the keys the request named.
+        let added = record
+            .merge_tags(
+                input
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
+            .map_err(bad_request)?;
+        let arn = record.group_arn.clone();
+        // Everything below is owned, so the store lock is released before the
+        // record is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and
+        // the outcome. Metadata only — the tag keys and values a caller sent are
+        // never recorded, only how many pairs were written — and request-derived
+        // values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?crate::state::request_region(ctx.parts()),
+            group = ?name,
+            tags = added.len(),
+            outcome = "tagged",
+            "resource group tagged",
+        );
+        Ok(TagOutput {
+            arn: Some(arn),
+            tags: Some(added),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> TagError {
+    TagErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

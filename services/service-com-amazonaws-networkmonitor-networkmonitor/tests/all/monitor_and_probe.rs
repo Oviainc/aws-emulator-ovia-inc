@@ -161,6 +161,29 @@ pub(crate) fn probes_of(body: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The `message` member of an error response, or `"<none>"`.
+///
+/// Shared, because what a refusal SAYS is asserted by more than one suite
+/// (`authored_refusal_messages`, `validation_message_wording`,
+/// `monitor_lifecycle_and_front_door`) and one reading of the member keeps them
+/// from drifting.
+pub(crate) fn error_message(body: &Value) -> String {
+    body.get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<none>")
+        .to_string()
+}
+
+/// One probe body whose `sourceArn` names a subnet of this account: the members
+/// `ProbeInput` and `CreateMonitorProbeInput` both require, plus whatever
+/// `extra` adds (`,"destinationPort":443`, `,"packetSize":56`, …).
+pub(crate) fn probe_json(destination: &str, protocol: &str, extra: &str) -> String {
+    format!(
+        r#"{{"sourceArn":"{}","destination":"{destination}","protocol":"{protocol}"{extra}}}"#,
+        source_arn()
+    )
+}
+
 /// Whether `id` satisfies the model's `ProbeId` pattern,
 /// `^probe-[a-z0-9A-Z-]{21,64}$`.
 pub(crate) fn is_modelled_probe_id(id: &str) -> bool {

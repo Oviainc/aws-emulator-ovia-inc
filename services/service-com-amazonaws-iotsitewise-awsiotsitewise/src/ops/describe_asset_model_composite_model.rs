@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn model_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
     DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The asset model {label} could not be found."),
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET_MODEL, label),
         },
     )
     .into()
@@ -295,7 +295,10 @@ fn model_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
 fn composite_not_found(label: &str) -> DescribeAssetModelCompositeModelError {
     DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The composite model {label} could not be found."),
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET_MODEL_COMPOSITE_MODEL,
+                label,
+            ),
         },
     )
     .into()

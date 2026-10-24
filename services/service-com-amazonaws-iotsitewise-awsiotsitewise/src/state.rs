@@ -762,10 +762,7 @@ impl TripleRefusal {
     pub fn message(&self) -> String {
         match self {
             Self::AssetNotFound(label) => not_found_message(RESOURCE_ASSET, label),
-            // A hierarchy is not a top-level resource, and AWS words its absence
-            // as a hierarchy that "doesn't exist"; the identifier is still the
-            // one the request supplied.
-            Self::HierarchyNotFound(label) => format!("A hierarchy with ID {label} doesn't exist"),
+            Self::HierarchyNotFound(label) => hierarchy_not_found_message(label),
         }
     }
 }
@@ -2223,12 +2220,27 @@ pub const RESOURCE_DATASET: &str = "Dataset";
 /// operations that address one cannot each invent a kind of their own.
 pub const RESOURCE_ASSET_MODEL_COMPOSITE_MODEL: &str = "Asset Model Composite Model";
 
+/// The resource kind those errors name for a gateway.
+///
+/// AWS's own wording was observed for the asset and asset-model paths; for this
+/// kind and the three below, the label is the service's resource name under that
+/// same one form, so every handler addressing one states the absence identically.
+pub const RESOURCE_GATEWAY: &str = "Gateway";
+
+/// The resource kind those errors name for a data stream, which every operation
+/// that addresses one addresses by its `alias`.
+pub const RESOURCE_TIME_SERIES: &str = "Time Series";
+
+/// The resource kind those errors name for a workspace.
+pub const RESOURCE_WORKSPACE: &str = "Workspace";
+
 /// The resource kind those errors name for an IoT SiteWise Monitor portal.
 pub const RESOURCE_PORTAL: &str = "Portal";
 
 /// The message a not-found refusal carries: the resource kind, then the
-/// identifier the REQUEST supplied (a raw id or an `externalId:` label, exactly
-/// as sent).
+/// identifier the REQUEST supplied, echoed exactly as sent — whatever form that
+/// identifier took for the resource in question (a raw id, an `externalId:`
+/// label, a stream alias, a workspace name).
 ///
 /// One rule for every not-found path in this service, so no handler invents its
 /// own template: AWS states the absence as `<Resource> with ID <id> not found`,
@@ -2239,10 +2251,28 @@ pub fn not_found_message(resource: &str, requested: &str) -> String {
 }
 
 /// The message a uniqueness refusal carries: AWS names the DIMENSION of the
-/// request that collided (`externalId`, `ID`), not an identifier the rejected
-/// request would have minted.
+/// request that collided (`externalId`, `ID`, `name`), not an identifier the
+/// rejected request would have minted.
 pub fn already_using_message(resource: &str, dimension: &str) -> String {
     format!("Another {resource} is already using the same {dimension}")
+}
+
+/// The message an absent HIERARCHY carries. A hierarchy is not a top-level
+/// resource but a grouping an asset model declares, and AWS words its absence as
+/// a hierarchy that "doesn't exist"; the identifier is still the one the request
+/// supplied, echoed exactly as sent.
+///
+/// One place, so the operations that address a hierarchy — the two association
+/// operations and the listing over one — cannot word the same absence three ways.
+pub fn hierarchy_not_found_message(requested: &str) -> String {
+    format!("A hierarchy with ID {requested} doesn't exist")
+}
+
+/// The message a not-found refusal carries where the request addressed the
+/// resource by its ARN rather than by an id: the dimension the request named is
+/// the ARN, so that is what the refusal states.
+pub fn not_found_arn_message(requested_arn: &str) -> String {
+    format!("Resource with ARN {requested_arn} not found")
 }
 
 /// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s,
