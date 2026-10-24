@@ -24,9 +24,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AccountInsightHealth, CloudFormationCollection, CloudFormationHealth, InsightHealth,
-    InsightTimeRange, MonitoredResourceIdentifier, PredictionTimeRange, ProactiveInsight,
-    ProactiveInsightSummary, ReactiveInsight, ReactiveInsightSummary, ResourceCollection,
+    InsightTimeRange, ListInsightsStatusFilter, MonitoredResourceIdentifier, PredictionTimeRange,
+    ProactiveInsight, ProactiveInsightSummary, ProactiveOrganizationInsightSummary, ReactiveInsight,
+    ReactiveInsightSummary, ReactiveOrganizationInsightSummary, ResourceCollection,
     ServiceCollection, ServiceHealth, ServiceInsightHealth, TagCollection, TagHealth,
+    ValidationException, ValidationExceptionField, INSIGHT_TYPE_VALUES,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -388,6 +390,18 @@ impl InsightRecord {
         self.insight_type == Self::PROACTIVE
     }
 
+    /// Whether this record is reported as a REACTIVE insight — the OTHER of
+    /// `INSIGHT_TYPE_VALUES`'s two values, which [`Self::is_proactive`] tests for.
+    ///
+    /// A listing partitions its page with both predicates, so every insight whose
+    /// `insight_type` the model admits lands on exactly one of the response's two lists.
+    /// A value outside the enum is not one this store holds — `InsightType` is modelled
+    /// as an enum, and only DevOps Guru's own analysis writes the map — and it is
+    /// reported as neither type rather than as REACTIVE by default.
+    pub fn is_reactive(&self) -> bool {
+        self.insight_type == INSIGHT_TYPE_REACTIVE
+    }
+
     /// This record as the modelled `ProactiveInsight`, the DETAIL shape
     /// `DescribeInsight` reports. Built from the SAME record as
     /// [`InsightRecord::to_proactive_summary`], so a listed insight and the one a
@@ -451,6 +465,54 @@ impl InsightRecord {
         }
     }
 
+    /// This record as the modelled `ProactiveOrganizationInsightSummary`: the same
+    /// insight [`Self::to_proactive_summary`] renders for the account-scoped listing,
+    /// stamped with the member account that holds it and the organizational unit that
+    /// account belongs to — the two members an organization-wide listing adds. Built
+    /// from the SAME record, so the account-scoped and the organization-scoped listing
+    /// of one store cannot disagree about an insight.
+    ///
+    /// The organization summary shapes model no `AssociatedResourceArns` and no
+    /// `SsmOpsItemId`, so neither is rendered here.
+    pub fn to_proactive_organization_summary(
+        &self,
+        account_id: &str,
+        organizational_unit_id: Option<&str>,
+    ) -> ProactiveOrganizationInsightSummary {
+        ProactiveOrganizationInsightSummary {
+            id: Some(self.id.clone()),
+            account_id: Some(account_id.to_string()),
+            organizational_unit_id: organizational_unit_id.map(ToString::to_string),
+            name: Some(self.name.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            insight_time_range: Some(self.insight_time_range()),
+            prediction_time_range: self.prediction_time_range(),
+            resource_collection: self.wire_resource_collection(),
+            service_collection: self.wire_service_collection(),
+        }
+    }
+
+    /// This record as the modelled `ReactiveOrganizationInsightSummary`, which carries
+    /// no `PredictionTimeRange`: only a proactive insight predicts a window.
+    pub fn to_reactive_organization_summary(
+        &self,
+        account_id: &str,
+        organizational_unit_id: Option<&str>,
+    ) -> ReactiveOrganizationInsightSummary {
+        ReactiveOrganizationInsightSummary {
+            id: Some(self.id.clone()),
+            account_id: Some(account_id.to_string()),
+            organizational_unit_id: organizational_unit_id.map(ToString::to_string),
+            name: Some(self.name.clone()),
+            severity: Some(self.severity.clone()),
+            status: Some(self.status.clone()),
+            insight_time_range: Some(self.insight_time_range()),
+            resource_collection: self.wire_resource_collection(),
+            service_collection: self.wire_service_collection(),
+        }
+    }
+
     fn insight_time_range(&self) -> InsightTimeRange {
         InsightTimeRange {
             start_time: timestamp(self.start_time_millis),
@@ -500,6 +562,263 @@ impl InsightRecord {
         (!self.associated_resource_arns.is_empty())
             .then(|| self.associated_resource_arns.clone())
     }
+}
+
+// ---------------------------------------------------------------------------
+// What an insight listing selects
+//
+// `ListInsights` and `ListOrganizationInsights` take the SAME
+// `ListInsightsStatusFilter` and select over the same `insights` map — one
+// account-scoped, one organization-wide — so the selector, the time ranges it
+// compares against and the refusal of a malformed filter live here once. Two
+// listings of one store then cannot disagree about which insights a filter names.
+// ---------------------------------------------------------------------------
+
+/// Why a submitted insight filter is refused, stated WITHOUT naming an operation's
+/// error enum: the shared selector cannot construct one, so it reports the refusal and
+/// each handler lifts it into its own modelled `ValidationException` through
+/// [`FilterRejection::validation_exception`].
+#[derive(Debug, Clone)]
+pub struct FilterRejection {
+    /// What is wrong with the request, as the exception's `Message`.
+    pub message: String,
+    /// One of `VALIDATION_EXCEPTION_REASON_VALUES`.
+    pub reason: &'static str,
+    /// The request member at fault, as `ValidationExceptionField.Name`.
+    pub field: String,
+    /// What that member must satisfy, as `ValidationExceptionField.Message`.
+    pub field_message: String,
+}
+
+impl FilterRejection {
+    /// The refusal of a `NextToken` that names no page of `collection`.
+    ///
+    /// Every paginated read of this store answers a stale or foreign cursor the same
+    /// way: a token is bound to the selection it was issued for, so one issued for
+    /// another selection, by another operation, or into a collection that has since
+    /// shrunk names no page at all. `scoped_by` names the request members the cursor is
+    /// bound to.
+    pub fn stale_cursor(operation: &str, collection: &str, scoped_by: &str) -> Self {
+        Self {
+            message: format!("NextToken does not name a page of {collection}"),
+            reason: "FIELD_VALIDATION_FAILED",
+            field: "NextToken".to_string(),
+            field_message: format!(
+                "must be a token returned by an earlier {operation} for the same {scoped_by}"
+            ),
+        }
+    }
+
+    /// This refusal as the modelled `ValidationException` every insight listing
+    /// declares (HTTP 400).
+    pub fn validation_exception(&self) -> ValidationException {
+        ValidationException {
+            message: self.message.clone(),
+            reason: Some(self.reason.to_string()),
+            fields: Some(vec![ValidationExceptionField {
+                name: self.field.clone(),
+                message: self.field_message.clone(),
+            }]),
+        }
+    }
+}
+
+/// A closed interval of instants, in milliseconds since the epoch. An absent bound is
+/// unbounded on that side, which is what `StartTimeRange` and `EndTimeRange` model:
+/// both of their members are optional.
+#[derive(Debug, Clone, Copy)]
+pub struct MillisRange {
+    from: Option<i64>,
+    to: Option<i64>,
+}
+
+impl MillisRange {
+    /// Whether `at` lies in this interval.
+    pub fn holds(&self, at: i64) -> bool {
+        self.from.is_none_or(|from| at >= from) && self.to.is_none_or(|to| at <= to)
+    }
+
+    /// The interval as a page-scope fragment, so a cursor into one window does not
+    /// resolve against another.
+    fn page_scope(&self) -> String {
+        let bound = |at: Option<i64>| at.map_or_else(|| "-".to_string(), |at| at.to_string());
+        format!("{}/{}", bound(self.from), bound(self.to))
+    }
+}
+
+/// The ONE status filter a request names, resolved to what it selects.
+///
+/// `ListInsightsStatusFilter` carries three optional members and `StatusFilter`'s
+/// documentation says "You can specify one status filter", so exactly one of them is a
+/// well-formed request. The model cannot express that, so [`InsightStatusSelector::of`]
+/// enforces it.
+#[derive(Debug, Clone, Copy)]
+pub enum InsightStatusSelector {
+    /// `Ongoing`: the insights of this type whose behaviour has not ended.
+    Ongoing { insight_type: &'static str },
+    /// `Closed`: the insights of this type whose behaviour ended inside the range.
+    Closed {
+        insight_type: &'static str,
+        ended: MillisRange,
+    },
+    /// `Any`: the insights of this type, whatever their status, whose behaviour started
+    /// inside the range.
+    Any {
+        insight_type: &'static str,
+        started: MillisRange,
+    },
+}
+
+impl InsightStatusSelector {
+    /// The selector `filter` names, or the [`FilterRejection`] that refuses it.
+    pub fn of(filter: &ListInsightsStatusFilter) -> Result<Self, FilterRejection> {
+        let named: Vec<&str> = [
+            filter.ongoing.is_some().then_some("Ongoing"),
+            filter.closed.is_some().then_some("Closed"),
+            filter.any.is_some().then_some("Any"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if named.len() != 1 {
+            let named = if named.is_empty() {
+                "none".to_string()
+            } else {
+                named.join(" + ")
+            };
+            return Err(FilterRejection {
+                message: format!(
+                    "StatusFilter must specify exactly one of Ongoing, Closed or Any, got {named}"
+                ),
+                reason: "INVALID_PARAMETER_COMBINATION",
+                field: "StatusFilter".to_string(),
+                field_message: "exactly one of Ongoing, Closed or Any must be specified"
+                    .to_string(),
+            });
+        }
+
+        if let Some(ongoing) = filter.ongoing.as_ref() {
+            return Ok(Self::Ongoing {
+                insight_type: insight_type_of(&ongoing.r#type, "StatusFilter.Ongoing.Type")?,
+            });
+        }
+        if let Some(closed) = filter.closed.as_ref() {
+            return Ok(Self::Closed {
+                insight_type: insight_type_of(&closed.r#type, "StatusFilter.Closed.Type")?,
+                ended: millis_range(
+                    closed.end_time_range.from_time.as_ref(),
+                    closed.end_time_range.to_time.as_ref(),
+                    "StatusFilter.Closed.EndTimeRange",
+                )?,
+            });
+        }
+        let any = filter
+            .any
+            .as_ref()
+            .expect("exactly one selector is named, and it is neither Ongoing nor Closed");
+        Ok(Self::Any {
+            insight_type: insight_type_of(&any.r#type, "StatusFilter.Any.Type")?,
+            started: millis_range(
+                any.start_time_range.from_time.as_ref(),
+                any.start_time_range.to_time.as_ref(),
+                "StatusFilter.Any.StartTimeRange",
+            )?,
+        })
+    }
+
+    /// Whether this selector selects `insight`.
+    pub fn matches(&self, insight: &InsightRecord) -> bool {
+        match self {
+            Self::Ongoing { insight_type } => {
+                insight.insight_type == *insight_type && insight.status == INSIGHT_STATUS_ONGOING
+            }
+            Self::Closed {
+                insight_type,
+                ended,
+            } => {
+                insight.insight_type == *insight_type
+                    && insight.status == INSIGHT_STATUS_CLOSED
+                    // A closed insight's behaviour ended at `EndTime`; one that records
+                    // no end instant lies in no end-time range.
+                    && insight.end_time_millis.is_some_and(|at| ended.holds(at))
+            }
+            Self::Any {
+                insight_type,
+                started,
+            } => insight.insight_type == *insight_type && started.holds(insight.start_time_millis),
+        }
+    }
+
+    /// The scope a page token over this selection is bound to: a cursor into one
+    /// selection must not seek into another's. A caller prefixes its operation, so a
+    /// cursor of the account-scoped listing does not resolve against the
+    /// organization-wide one either.
+    pub fn page_scope(&self) -> String {
+        match self {
+            Self::Ongoing { insight_type } => {
+                format!("{INSIGHT_STATUS_ONGOING}/{insight_type}")
+            }
+            Self::Closed {
+                insight_type,
+                ended,
+            } => format!(
+                "{INSIGHT_STATUS_CLOSED}/{insight_type}/ended/{}",
+                ended.page_scope()
+            ),
+            Self::Any {
+                insight_type,
+                started,
+            } => format!("ANY/{insight_type}/started/{}", started.page_scope()),
+        }
+    }
+}
+
+/// `value` as one of `InsightType`'s values, or the rejection naming `member`.
+///
+/// The model declares the member as an enum, so the boundary validator refuses anything
+/// else before a handler runs; this keeps such a value a 400 rather than a silently
+/// empty answer if it ever reaches here.
+fn insight_type_of(value: &str, member: &str) -> Result<&'static str, FilterRejection> {
+    match value {
+        InsightRecord::PROACTIVE => Ok(InsightRecord::PROACTIVE),
+        INSIGHT_TYPE_REACTIVE => Ok(INSIGHT_TYPE_REACTIVE),
+        other => {
+            let allowed = INSIGHT_TYPE_VALUES.join(" | ");
+            Err(FilterRejection {
+                message: format!("{member} must be one of {allowed}, got '{other}'"),
+                reason: "FIELD_VALIDATION_FAILED",
+                field: member.to_string(),
+                field_message: format!("must be one of {allowed}"),
+            })
+        }
+    }
+}
+
+/// A submitted time range in the milliseconds the store keeps, or the rejection naming
+/// `member` when a bound is not a representable instant.
+///
+/// A range whose `FromTime` is after its `ToTime` is NOT refused: it holds no instant,
+/// so it selects nothing, which is what an empty interval means. The model states no
+/// ordering rule for either range, so refusing it would be this emulator's invention.
+fn millis_range(
+    from: Option<&::aws_smithy_types::DateTime>,
+    to: Option<&::aws_smithy_types::DateTime>,
+    member: &str,
+) -> Result<MillisRange, FilterRejection> {
+    let bound = |at: Option<&::aws_smithy_types::DateTime>, side: &str| match at {
+        None => Ok(None),
+        Some(at) => millis_of(at).map(Some).ok_or_else(|| FilterRejection {
+            message: format!("{member}.{side} is not an instant this service can represent"),
+            reason: "FIELD_VALIDATION_FAILED",
+            field: format!("{member}.{side}"),
+            field_message: "must be an instant representable in milliseconds since the epoch"
+                .to_string(),
+        }),
+    };
+    Ok(MillisRange {
+        from: bound(from, "FromTime")?,
+        to: bound(to, "ToTime")?,
+    })
 }
 
 /// The account an insight read resolves against: the `AccountId` the request

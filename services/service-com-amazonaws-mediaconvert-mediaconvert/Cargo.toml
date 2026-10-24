@@ -26,6 +26,20 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for S3, driven over the in-process callback
+# (`OperationContext::callback`): `CreateJob` probes each of a job's
+# `Settings.Inputs[].FileInput` S3 locations with `HeadObject` before the job is
+# accepted, so a job that fails because an input cannot be opened is classified
+# from what S3 actually answered. Only the generated client is needed — the
+# emulator supplies the transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    # `BehaviorVersion::latest()` in `state.rs` is gated behind this feature, and the
+    # Tokio runtime is what the callback transport is driven on — spelled out here, as
+    # the sibling crates that build the same in-process client do, so a
+    # `cargo build -p` of this crate alone resolves them too.
+    "behavior-version-latest",
+    "rt-tokio",
+] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
