@@ -25,8 +25,9 @@
 //! [`PROVISIONING_SPAN`]).
 
 use crate::ops::types::{
-    AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterNode,
-    ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup,
+    AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterIamRole,
+    ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
+    ClusterSubnetGroup,
     ClusterVersion, CreateUsageLimitOutput, MaintenanceTrack, NetworkInterface, Parameter,
     PendingModifiedValues, Qev2IdcApplication, Snapshot, Subnet, SupportedOperation,
     SupportedPlatform, UpdateTarget, VpcEndpoint, VpcSecurityGroupMembership,
@@ -935,10 +936,28 @@ pub const MAX_RECORDS_MIN: i32 = 20;
 /// The documented maximum of the `MaxRecords` window. See [`MAX_RECORDS_DEFAULT`].
 pub const MAX_RECORDS_MAX: i32 = 100;
 
+/// `ClusterIamRole$ApplyStatus` once the association is established: "the role is
+/// available for use by the cluster".
+///
+/// Source: `smithy_query(query="doc", shape="ClusterIamRole",
+/// member="ApplyStatus")`, which publishes exactly three statuses — this one,
+/// [`IAM_ROLE_APPLY_STATUS_ADDING`] and [`IAM_ROLE_APPLY_STATUS_REMOVING`].
+pub const IAM_ROLE_APPLY_STATUS_IN_SYNC: &str = "in-sync";
+/// `ClusterIamRole$ApplyStatus` while the role "is in the process of being
+/// associated with the cluster". See [`IAM_ROLE_APPLY_STATUS_IN_SYNC`].
+pub const IAM_ROLE_APPLY_STATUS_ADDING: &str = "adding";
+/// `ClusterIamRole$ApplyStatus` while the role "is in the process of being
+/// disassociated" from the cluster. See [`IAM_ROLE_APPLY_STATUS_IN_SYNC`].
+pub const IAM_ROLE_APPLY_STATUS_REMOVING: &str = "removing";
+
 /// `ClusterStatus` while the cluster is being provisioned.
 pub const STATUS_CREATING: &str = "creating";
 /// `ClusterStatus` / snapshot `Status` once provisioning is done.
 pub const STATUS_AVAILABLE: &str = "available";
+/// `ClusterStatus` while the service is applying a change to a cluster that was
+/// already provisioned: the cluster is only intermittently available for queries
+/// until the change is applied (see [`availability_status`]).
+pub const STATUS_MODIFYING: &str = "modifying";
 /// `ClusterStatus` a `DeleteCluster` response reports.
 pub const STATUS_DELETING: &str = "deleting";
 
@@ -1338,7 +1357,10 @@ pub struct StoredCluster {
     /// NEVER placed on [`StoredCluster::cluster`] — the `Cluster` shape models
     /// no password member, so it can never reach the wire.
     pub master_user_password: Option<String>,
-    /// When the `creating` -> `available` transition falls due.
+    /// When the clock-owed changes the last call against this cluster started
+    /// fall due: the `creating` -> `available` transition, the admin password a
+    /// create or a modify asked for, and the `adding` / `removing` IAM role
+    /// associations a `ModifyClusterIamRoles` reported as in progress.
     pub available_at: Instant,
 }
 
@@ -1519,9 +1541,15 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         // next week whether or not anybody called.
         let wall = ::aws_smithy_types::DateTime::from(SystemTime::now());
         for stored in &mut self.clusters {
-            if stored.cluster.cluster_status.as_deref() == Some(STATUS_CREATING)
-                && now >= stored.available_at
-            {
+            // A cluster the service is still working on — bringing it up, or
+            // applying a change to it — is available again once that work's span
+            // has passed, whether or not anybody called.
+            let in_progress = stored
+                .cluster
+                .cluster_status
+                .as_deref()
+                .is_some_and(|status| status == STATUS_CREATING || status == STATUS_MODIFYING);
+            if in_progress && now >= stored.available_at {
                 stored.cluster.cluster_status = Some(STATUS_AVAILABLE.to_string());
                 stored.cluster.cluster_availability_status =
                     Some(availability_status(STATUS_AVAILABLE).to_string());
@@ -1538,6 +1566,21 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             if now >= stored.available_at {
                 if let Some(pending) = stored.cluster.pending_modified_values.as_mut() {
                     pending.master_user_password = None;
+                }
+                // An IAM role association reported as in progress completes once
+                // that call's span has passed: a role being added becomes
+                // available for use by the cluster and a role being removed
+                // leaves the list. Both were due at this instant whether or not
+                // anybody called.
+                if let Some(roles) = stored.cluster.iam_roles.as_mut() {
+                    roles.retain(|role| {
+                        role.apply_status.as_deref() != Some(IAM_ROLE_APPLY_STATUS_REMOVING)
+                    });
+                    for role in roles.iter_mut() {
+                        if role.apply_status.as_deref() == Some(IAM_ROLE_APPLY_STATUS_ADDING) {
+                            role.apply_status = Some(IAM_ROLE_APPLY_STATUS_IN_SYNC.to_string());
+                        }
+                    }
                 }
             }
             // The next maintenance window start is derived from the cluster's
@@ -2120,7 +2163,7 @@ pub fn availability_status(cluster_status: &str) -> &'static str {
         return "Available";
     }
     match cluster_status {
-        STATUS_CREATING | "modifying" | "resizing" | "cancelling-resize" | "rebooting"
+        STATUS_CREATING | STATUS_MODIFYING | "resizing" | "cancelling-resize" | "rebooting"
         | "renaming" | "rotating-keys" | "updating-hsm" | "final-snapshot" => "Modifying",
         "hardware-failure" => "Failed",
         other if other.starts_with("incompatible-") => "Failed",
@@ -3048,6 +3091,66 @@ pub fn populate_derived_members(
     cluster.pending_modified_values.get_or_insert_default();
     if let Some(window) = cluster.preferred_maintenance_window.as_deref() {
         cluster.next_maintenance_window_start_time = next_maintenance_window_start(window, now);
+    }
+}
+
+/// The IAM role associations a cluster reports for `arns`, each at `apply_status`.
+///
+/// One rule for every path that puts roles on a cluster (`CreateCluster`,
+/// `RestoreFromClusterSnapshot`, `ModifyClusterIamRoles`), so the create path and
+/// the modify path cannot report an association differently. The ARNs are stored
+/// exactly as the request carried them: an IAM role is a resource of another
+/// service, so this service does not resolve one.
+pub fn cluster_iam_roles<I>(arns: I, apply_status: &str) -> Vec<ClusterIamRole>
+where
+    I: IntoIterator<Item = String>,
+{
+    arns.into_iter()
+        .map(|arn| ClusterIamRole {
+            iam_role_arn: Some(arn),
+            apply_status: Some(apply_status.to_string()),
+        })
+        .collect()
+}
+
+/// Associate `add` and disassociate `remove` on a cluster's IAM role list.
+///
+/// The list is a SET keyed by role ARN, in association order: associating an ARN
+/// the cluster already carries leaves one entry, and disassociating an ARN it
+/// does not carry changes nothing. Disassociations are applied first, so an ARN
+/// named by both lists ends up associated.
+///
+/// Neither change is complete when this returns: a new association starts at
+/// [`IAM_ROLE_APPLY_STATUS_ADDING`] and a disassociation at
+/// [`IAM_ROLE_APPLY_STATUS_REMOVING`], and
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`] completes
+/// both once the cluster's span has passed.
+pub fn apply_iam_role_changes(roles: &mut Vec<ClusterIamRole>, add: &[String], remove: &[String]) {
+    let position = |roles: &[ClusterIamRole], arn: &str| {
+        roles
+            .iter()
+            .position(|role| role.iam_role_arn.as_deref() == Some(arn))
+    };
+    for arn in remove {
+        if let Some(index) = position(roles, arn) {
+            roles[index].apply_status = Some(IAM_ROLE_APPLY_STATUS_REMOVING.to_string());
+        }
+    }
+    for arn in add {
+        match position(roles, arn) {
+            // Already associated: re-associating it is not a second entry, and
+            // an association already in use stays in use. One this same call
+            // asked to disassociate goes back to being established.
+            Some(index) => {
+                if roles[index].apply_status.as_deref() != Some(IAM_ROLE_APPLY_STATUS_IN_SYNC) {
+                    roles[index].apply_status = Some(IAM_ROLE_APPLY_STATUS_ADDING.to_string());
+                }
+            }
+            None => roles.extend(cluster_iam_roles(
+                [arn.clone()],
+                IAM_ROLE_APPLY_STATUS_ADDING,
+            )),
+        }
     }
 }
 

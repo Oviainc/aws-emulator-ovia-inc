@@ -668,18 +668,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(input.tags.clone().unwrap_or_default()),
             kms_key_id: input.kms_key_id.clone(),
             enhanced_vpc_routing: Some(input.enhanced_vpc_routing.unwrap_or(false)),
-            iam_roles: Some(
-                input
-                    .iam_roles
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|arn| ClusterIamRole {
-                        iam_role_arn: Some(arn),
-                        apply_status: Some("in-sync".to_string()),
-                    })
-                    .collect(),
-            ),
+            iam_roles: Some(st::cluster_iam_roles(
+                input.iam_roles.clone().unwrap_or_default(),
+                st::IAM_ROLE_APPLY_STATUS_IN_SYNC,
+            )),
             maintenance_track_name: Some(
                 input
                     .maintenance_track_name

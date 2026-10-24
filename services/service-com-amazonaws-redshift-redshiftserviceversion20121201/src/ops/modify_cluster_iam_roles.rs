@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyClusterIamRoles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyClusterIamRoles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyClusterIamRoles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the roles `AddIamRoles` names with the named cluster and
+//! disassociates the ones `RemoveIamRoles` names, then reports the cluster back.
+//! The cluster's role list is a SET keyed by role ARN, and each association
+//! carries the `ApplyStatus` the model publishes: a new one is `adding` and a
+//! disassociated one is `removing` until the cluster's span has passed, after
+//! which the first is `in-sync` and the second is gone. The cluster itself
+//! reports the change in progress (`modifying`) for that same span.
+//!
+//! The default role is one OF the roles the cluster carries, so disassociating
+//! the role set as default leaves the cluster with no default.
+//!
+//! An IAM role is a resource of another service, so this service does not resolve
+//! one: the ARN the request carries is stored as it came.
 //!
 //! ## Shape of an operation
 //!
@@ -90,11 +95,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyClusterIamRolesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyClusterIamRoles")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyClusterIamRoles",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyClusterIamRolesErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,20 +155,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyClusterIamRoles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyClusterIamRolesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyClusterIamRoles"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyClusterIamRolesErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let started = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The roles are associated WITH a cluster, so the cluster has to be
+        // there, and it has to be in the state that admits a configuration
+        // change.
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(ModifyClusterIamRolesErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                },
+            )
+            .into());
+        };
+        let cluster_status = store.clusters[position]
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(
+                ModifyClusterIamRolesErrorModeled::InvalidClusterStateFault(
+                    InvalidClusterStateFault {
+                        message: Some(format!(
+                            "Cluster {} is in state {cluster_status}; it must be {} to modify its IAM roles.",
+                            input.cluster_identifier,
+                            st::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = &mut store.clusters[position];
+        let add = input.add_iam_roles.clone().unwrap_or_default();
+        let remove = input.remove_iam_roles.clone().unwrap_or_default();
+        let roles = stored.cluster.iam_roles.get_or_insert_default();
+        st::apply_iam_role_changes(roles, &add, &remove);
+
+        // The default role is one OF the roles the cluster carries, so a call
+        // that disassociates the role currently set as default leaves the
+        // cluster with no default.
+        if stored
+            .cluster
+            .default_iam_role_arn
+            .as_deref()
+            .is_some_and(|arn| remove.iter().any(|removed| removed == arn))
+        {
+            stored.cluster.default_iam_role_arn = None;
+        }
+
+        // "The ARN for the IAM role that was set as default for the cluster when
+        // the cluster was last modified": the member records the caller's choice,
+        // and an empty ARN names no role, so it clears the choice instead.
+        if let Some(default_role) = input.default_iam_role_arn.clone() {
+            stored.cluster.default_iam_role_arn =
+                (!default_role.is_empty()).then_some(default_role);
+        }
+
+        // A call that asked for a change leaves the service applying it: the
+        // associations sit in a transient `ApplyStatus` and the cluster is only
+        // intermittently available for queries until the change is applied, so
+        // it reports the work in progress until that falls due a span from this
+        // call. A call that named no change leaves the cluster as it stands.
+        if !add.is_empty() || !remove.is_empty() || input.default_iam_role_arn.is_some() {
+            stored.cluster.cluster_status = Some(st::STATUS_MODIFYING.to_string());
+            stored.available_at = started + st::PROVISIONING_SPAN;
+        }
+
+        // Re-derive every member this service computes from the cluster's own
+        // configuration, through the same rule the create and the modify paths
+        // use, so this response reports the member set a later read does.
+        let cluster_type = stored.cluster_type.clone();
+        st::populate_derived_members(
+            &mut stored.cluster,
+            &cluster_type,
+            ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        );
+
+        Ok(ModifyClusterIamRolesOutput {
+            cluster: Some(stored.cluster.clone()),
+        })
     }
 }

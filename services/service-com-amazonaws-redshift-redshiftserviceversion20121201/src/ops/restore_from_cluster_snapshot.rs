@@ -878,13 +878,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or(false),
             ),
             iam_roles: Some(match input.iam_roles.clone() {
-                Some(roles) => roles
-                    .into_iter()
-                    .map(|arn| ClusterIamRole {
-                        iam_role_arn: Some(arn),
-                        apply_status: Some("in-sync".to_string()),
-                    })
-                    .collect(),
+                Some(roles) => st::cluster_iam_roles(roles, st::IAM_ROLE_APPLY_STATUS_IN_SYNC),
                 None => source
                     .and_then(|cluster| cluster.iam_roles.clone())
                     .unwrap_or_default(),
