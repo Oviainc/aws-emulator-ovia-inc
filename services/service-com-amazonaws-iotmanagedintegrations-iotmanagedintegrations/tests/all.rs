@@ -39,6 +39,8 @@ mod not_found_messages;
 mod notification_configuration_lifecycle;
 #[path = "all/ota_task_configuration_lifecycle.rs"]
 mod ota_task_configuration_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/runtime_log_configuration_cycle.rs"]
 mod runtime_log_configuration_cycle;
 #[path = "all/state_roundtrip.rs"]
