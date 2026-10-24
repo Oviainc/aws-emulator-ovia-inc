@@ -69,6 +69,8 @@ mod relational_database_blueprints;
 mod relational_database_bundles;
 #[path = "all/relational_database_lifecycle.rs"]
 mod relational_database_lifecycle;
+#[path = "all/relational_database_parameters.rs"]
+mod relational_database_parameters;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]
