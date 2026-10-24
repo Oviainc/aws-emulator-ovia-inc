@@ -153,10 +153,10 @@ pub const HARVEST_JOB_KIND: &str = "harvestJob";
 /// below names the children blocking a delete.
 pub const ORIGIN_ENDPOINT_SHAPE: &str = "OriginEndpoint";
 
-/// How a MediaPackage error names an IngestEndpoint in `errors` — the shape name,
-/// lowerCamel, the way every other resource type is keyed here
-/// (`com.amazonaws.mediapackage#IngestEndpoint`).
-pub const INGEST_ENDPOINT_KIND: &str = "ingestEndpoint";
+/// How MediaPackage NAMES an ingest endpoint inside the refusal of a lookup scoped to its
+/// channel — the resource in prose, as the recorded channel-scoped `NotFoundException`
+/// words it (trace `mediapackage.rotate-ingest-endpoint-credentials-invalid-endpoint-id-rejected`).
+pub const INGEST_ENDPOINT_LABEL: &str = "Ingest Endpoint";
 
 /// `NotFoundException` (404) for a resource the request addressed BY ID that this service
 /// does not hold: keyed by the resource type, because what is missing is the resource and
@@ -180,13 +180,42 @@ pub fn harvest_job_not_found(id: &str) -> ServiceError {
     resource_not_found(HARVEST_JOB_KIND, id)
 }
 
-/// [`resource_not_found`] for an IngestEndpoint.
+/// `NotFoundException` (404) for a CHILD resource the request addressed INSIDE its
+/// parent's path, when the parent resolved but holds no such child.
 ///
-/// 404 and not a 422 reference refusal: the id travels as an `@httpLabel`, so the request
-/// ADDRESSES that ingest endpoint rather than referring to it from a body member — the
-/// same reason a channel or an origin endpoint the service does not hold is a 404.
-pub fn ingest_endpoint_not_found(id: &str) -> ServiceError {
-    resource_not_found(INGEST_ENDPOINT_KIND, id)
+/// 404 and not a 422 reference refusal for the same reason [`resource_not_found`] is: both
+/// ids travel as `@httpLabel`s, so the request ADDRESSES the child rather than referring
+/// to it from a body member.
+///
+/// Keyed by the PARENT, and reporting BOTH ids: the lookup was scoped to that parent, so
+/// what the service can say is that this parent does not hold a child by that id — a
+/// caller or an operator reading the refusal needs the scope as much as the id, because
+/// the same child id may well exist under another parent. `child` names the child resource
+/// as the refusal words it (e.g. [`INGEST_ENDPOINT_LABEL`]).
+///
+/// The sentence ends after the child id with a trailing space, which is what MediaPackage
+/// itself emits for this refusal (recorded 2026-09-20, us-west-2), so error-mapping code
+/// keyed on the service's own form matches here too.
+pub fn child_not_found(
+    parent_kind: &str,
+    parent_id: &str,
+    child: &str,
+    child_id: &str,
+) -> ServiceError {
+    ServiceError::not_found(
+        parent_kind,
+        format!("with id={parent_id} does not have {child} with guid = {child_id} "),
+    )
+}
+
+/// [`child_not_found`] for an IngestEndpoint addressed under its channel.
+pub fn ingest_endpoint_not_found(channel_id: &str, ingest_endpoint_id: &str) -> ServiceError {
+    child_not_found(
+        CHANNEL_KIND,
+        channel_id,
+        INGEST_ENDPOINT_LABEL,
+        ingest_endpoint_id,
+    )
 }
 
 /// `UnprocessableEntityException` (422) for a create whose id is already in use: the
@@ -285,6 +314,39 @@ pub fn invalid_page_token() -> ServiceError {
         "nextToken",
         "is not a pagination token this service issued",
     )
+}
+
+/// `UnprocessableEntityException` (422) for two request members the service treats as
+/// MUTUALLY EXCLUSIVE, both of which the request specified.
+///
+/// Keyed by `member` — the one the refusal is reported against, named as the wire names it
+/// — and stating the other by its MODELLED member name, which is how MediaPackage words
+/// this refusal. The service refuses the combination outright instead of applying both
+/// rules together, so a request can never be served by a reading of two contradictory
+/// arguments the caller did not intend.
+pub fn mutually_exclusive_members(member: &str, other_member: &str) -> ServiceError {
+    member_invalid(
+        member,
+        format!("cannot be specified at the same time as {other_member}"),
+    )
+}
+
+/// The query parameter `ListHarvestJobs` binds `IncludeChannelId` to, and that member's
+/// modelled name — the two halves of the refusal above
+/// (`smithy_query(query="operation",operation="ListHarvestJobs")`:
+/// `IncludeChannelId` is `@httpQuery("includeChannelId")`).
+pub const INCLUDE_CHANNEL_ID_MEMBER: &str = "IncludeChannelId";
+
+/// The query parameter `ListHarvestJobs` binds `IncludeStatus` to
+/// (`@httpQuery("includeStatus")`).
+pub const INCLUDE_STATUS_QUERY: &str = "includeStatus";
+
+/// The refusal `ListHarvestJobs` answers a request carrying BOTH of its filters with:
+/// `IncludeChannelId` and `IncludeStatus` select harvest jobs by different properties and
+/// MediaPackage does not combine them, so specifying both is refused rather than
+/// intersected (recorded 2026-09-20, us-west-2).
+pub fn harvest_job_filters_mutually_exclusive() -> ServiceError {
+    mutually_exclusive_members(INCLUDE_STATUS_QUERY, INCLUDE_CHANNEL_ID_MEMBER)
 }
 
 /// The requirement an out-of-bound page size failed, worded as the service words it.
@@ -477,12 +539,17 @@ pub fn bound_origin_endpoint_members(
 // so the floor is not a modelled constraint the framework's own walk could refuse: it is
 // the service's rule, enforced here for EVERY such member rather than for the one a
 // client happened to get wrong.
+//
+// A member for which the service publishes a minimum of its OWN is bounded by that
+// minimum instead of by the shared floor, so the accepted domain of each member is the
+// one MediaPackage accepts: `StartoverWindowSeconds` is the one such member
+// ([`bound_startover_window`], minimum [`MIN_ENABLED_STARTOVER_WINDOW_SECONDS`]).
 // ---------------------------------------------------------------------------
 
-/// The smallest value a duration-in-seconds member may carry. Zero is a real value for
-/// each of them — `StartoverWindowSeconds` 0 is startover playback disabled, and
-/// `TimeDelaySeconds` 0 no delay, which is what [`apply_origin_endpoint_defaults`] fills
-/// an absent one with — so the floor is zero and not one.
+/// The smallest value a duration-in-seconds member with no published minimum of its own
+/// may carry. Zero is a real value for each of them — `TimeDelaySeconds` 0 is no delay,
+/// which is what [`apply_origin_endpoint_defaults`] fills an absent one with — so the
+/// floor is zero and not one.
 pub const MIN_DURATION_SECONDS: i32 = 0;
 
 /// The refusal a negative duration-in-seconds member answers with: the floor it broke,
@@ -494,6 +561,40 @@ fn duration_refusal(member: &str) -> ServiceError {
     )
 }
 
+/// The wire name of the startover-window member, which its refusal is keyed by
+/// (`StartoverWindowSeconds` is `@jsonName("startoverWindowSeconds")` —
+/// `smithy_query(query="operation",operation="CreateOriginEndpoint")`).
+pub const STARTOVER_WINDOW_MEMBER: &str = "startoverWindowSeconds";
+
+/// Refuse a `StartoverWindowSeconds` MediaPackage will not store.
+///
+/// The member is the "maximum duration (seconds) of content to retain for startover
+/// playback", and unlike the other durations above it has a published minimum of its own:
+/// an ENABLED startover window must be at least
+/// [`MIN_ENABLED_STARTOVER_WINDOW_SECONDS`] seconds, so the whole span 1..299 — which the
+/// shared floor would admit — is refused with `UnprocessableEntityException` (422) stating
+/// that minimum (recorded 2026-09-20, us-west-2, for a negative value).
+///
+/// [`DEFAULT_STARTOVER_WINDOW_SECONDS`] (zero) is the one smaller value accepted, because
+/// it is not a window at all: the model documents an unspecified member as DISABLING
+/// startover playback, and that is the value this service fills in and renders back for an
+/// absent one — so a caller round-tripping an endpoint it read must be able to send it
+/// again. Every other value below the minimum is refused, whatever its sign, with the one
+/// requirement sentence built from the member and that minimum.
+pub fn bound_startover_window(seconds: Option<i32>) -> Result<(), ServiceError> {
+    let accepted = seconds.is_none_or(|seconds| {
+        seconds == DEFAULT_STARTOVER_WINDOW_SECONDS
+            || seconds >= MIN_ENABLED_STARTOVER_WINDOW_SECONDS
+    });
+    if accepted {
+        return Ok(());
+    }
+    Err(member_invalid(
+        STARTOVER_WINDOW_MEMBER,
+        format!("must be greater than or equal to {MIN_ENABLED_STARTOVER_WINDOW_SECONDS}"),
+    ))
+}
+
 /// Refuse a negative value in any duration-in-seconds member of an OriginEndpoint create
 /// or update request, keyed by the member path the wire names.
 ///
@@ -502,6 +603,9 @@ fn duration_refusal(member: &str) -> ServiceError {
 /// are judged in a fixed order (the request's own member order, outermost first), so one
 /// request is always refused by the same member — and a member's PATH is built only when
 /// that member is the one being refused, so an accepted request allocates nothing.
+///
+/// `StartoverWindowSeconds` is judged by [`bound_startover_window`] instead of by the
+/// shared floor: it is the one member of the set whose own minimum the service publishes.
 pub fn bound_origin_endpoint_durations(
     startover_window_seconds: Option<i32>,
     time_delay_seconds: Option<i32>,
@@ -520,10 +624,8 @@ pub fn bound_origin_endpoint_durations(
         Ok(())
     }
 
-    judge(&[
-        ("startoverWindowSeconds", startover_window_seconds),
-        ("timeDelaySeconds", time_delay_seconds),
-    ])?;
+    bound_startover_window(startover_window_seconds)?;
+    judge(&[("timeDelaySeconds", time_delay_seconds)])?;
     if let Some(package) = hls_package {
         judge(&[
             (
@@ -665,15 +767,23 @@ pub const DEFAULT_ORIGINATION: &str = "ALLOW";
 /// playback will be disabled for the OriginEndpoint" — a window of zero seconds.
 pub const DEFAULT_STARTOVER_WINDOW_SECONDS: i32 = 0;
 
-/// The smallest `StartoverWindowSeconds` with startover playback ENABLED.
+/// The smallest `StartoverWindowSeconds` with startover playback ENABLED, and so the
+/// smallest value a request may carry for it beyond the "disabled" zero.
 ///
-/// The member is the "maximum duration (seconds) of content to retain for startover
-/// playback", and the model documents that an unspecified one DISABLES startover playback
-/// for the endpoint ([`DEFAULT_STARTOVER_WINDOW_SECONDS`], zero) — so a window of zero
-/// seconds retains no content and one second is the smallest that retains any. This is the
-/// bound [`OriginEndpointRecord::startover_enabled`] reads, and nothing else decides what
-/// "startover enabled" means for this service.
-pub const MIN_ENABLED_STARTOVER_WINDOW_SECONDS: i32 = 1;
+/// Five minutes. The member is the "maximum duration (seconds) of content to retain for
+/// startover playback" and the model declares no `@range` on it
+/// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#CreateOriginEndpointRequest",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`
+/// reports the plain `__integer`), so the bound is the service's own: a recorded
+/// `CreateOriginEndpoint` refuses an out-of-range window with
+/// `UnprocessableEntityException` stating "startoverWindowSeconds must be greater than or
+/// equal to 300" (trace `mediapackage.origin-endpoint-startover-window-negative-rejected`,
+/// measured 2026-09-20 in us-west-2).
+///
+/// This is both the bound [`bound_startover_window`] refuses below and the bound
+/// [`OriginEndpointRecord::startover_enabled`] reads, so no stored endpoint can carry a
+/// window the service would not have accepted, and nothing else decides what "startover
+/// enabled" means for this service.
+pub const MIN_ENABLED_STARTOVER_WINDOW_SECONDS: i32 = 300;
 
 /// `TimeDelaySeconds`' default. The model documents "If not specified, there will be no
 /// time delay in effect for the OriginEndpoint" — a delay of zero seconds.

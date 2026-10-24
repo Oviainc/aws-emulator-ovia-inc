@@ -51,8 +51,10 @@ struct Row {
 
 /// Rows spanning what the rule generalises over: whether the member is sent at all, a
 /// window that retains nothing, the smallest window that retains anything, and windows of
-/// a minute, an hour, a day, the fortnight the console offers and the largest the member's
-/// `__integer` can carry — each on a different packaging configuration.
+/// ten minutes, an hour, a day, the fortnight the console offers and the largest the
+/// member's `__integer` can carry — each on a different packaging configuration. Every
+/// window below is one the service accepts (`tests/all/startover_window_bound.rs` owns the
+/// values it refuses), so what each row tests is the harvest rule and not the bound.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -80,8 +82,8 @@ fn rows() -> Vec<Row> {
             harvestable: true,
         },
         Row {
-            case: "a one-minute window",
-            startover: Some(60),
+            case: "a ten-minute window",
+            startover: Some(600),
             package: "mssPackage",
             harvestable: true,
         },

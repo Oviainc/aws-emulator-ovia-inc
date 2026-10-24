@@ -231,7 +231,7 @@ fn cases() -> Vec<(&'static str, Value)> {
         (
             "dash, partly supplied",
             json!({
-                "startoverWindowSeconds": 60,
+                "startoverWindowSeconds": 600,
                 "dashPackage": {
                     "profile": "HBBTV_1_5",
                     "periodTriggers": ["ADS"],

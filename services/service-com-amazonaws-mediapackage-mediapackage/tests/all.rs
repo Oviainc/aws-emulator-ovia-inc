@@ -27,6 +27,8 @@ mod harvest_startover;
 mod ingest_credentials;
 #[path = "all/mutation_persistence.rs"]
 mod mutation_persistence;
+#[path = "all/mutually_exclusive_list_filters.rs"]
+mod mutually_exclusive_list_filters;
 #[path = "all/origin_endpoint_defaults.rs"]
 mod origin_endpoint_defaults;
 #[path = "all/origin_endpoint_durations.rs"]
@@ -37,5 +39,7 @@ mod resource_tags;
 mod rotate_channel_credentials;
 #[path = "all/rotate_ingest_endpoint_credentials.rs"]
 mod rotate_ingest_endpoint_credentials;
+#[path = "all/startover_window_bound.rs"]
+mod startover_window_bound;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
