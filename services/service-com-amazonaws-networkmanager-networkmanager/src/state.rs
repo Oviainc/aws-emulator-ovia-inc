@@ -126,6 +126,15 @@ pub const CORE_NETWORK_POLICY_KIND: &str = "core-network-policy";
 /// `attachment` entry of [`NETWORK_RESOURCE_TYPES`], so one name serves the id prefix,
 /// the ARN resource type and the network-resource inventory.
 pub const ATTACHMENT_KIND: &str = "attachment";
+/// The resource kind a refusal names when the resource addressed is one PREFIX LIST
+/// ASSOCIATION of a core network.
+///
+/// Like [`LINK_ASSOCIATION_KIND`] this is not an ARN resource type and no id is minted for
+/// it: the modelled `PrefixListAssociation` is the core network / prefix list pair plus the
+/// alias, with no id, ARN or state of its own (`smithy_query shape=PrefixListAssociation`),
+/// so the pair travels in a refusal's `ResourceId` ([`prefix_list_association_key`]) and
+/// this kind in its `ResourceType`.
+pub const PREFIX_LIST_ASSOCIATION_KIND: &str = "prefix-list-association";
 /// See [`GLOBAL_NETWORK_KIND`]. A ROUTE ANALYSIS is a job of its global network rather
 /// than a resource with an ARN — the modelled `RouteAnalysis` carries only a
 /// `RouteAnalysisId` (`smithy_query shape=RouteAnalysis`) — so this name serves the id
@@ -191,6 +200,10 @@ pub const LIMIT_CORE_NETWORKS_PER_GLOBAL_NETWORK: &str = "core-networks-per-glob
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
 /// [`MAX_CONNECTIONS_PER_GLOBAL_NETWORK`] bounds.
 pub const LIMIT_CONNECTIONS_PER_GLOBAL_NETWORK: &str = "connections-per-global-network";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
+/// [`MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK`] bounds.
+pub const LIMIT_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK: &str =
+    "prefix-list-associations-per-core-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
 pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
 
@@ -247,6 +260,9 @@ pub const FIELD_ADD_SUBNET_ARNS: &str = "addSubnetArns";
 pub const FIELD_REMOVE_SUBNET_ARNS: &str = "removeSubnetArns";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_VPN_CONNECTION_ARN: &str = "vpnConnectionArn";
+/// See [`FIELD_CORE_NETWORK_ID`]: the member carrying the ARN of the managed prefix list a
+/// core network's prefix-list association names.
+pub const FIELD_PREFIX_LIST_ARN: &str = "prefixListArn";
 /// See [`FIELD_CORE_NETWORK_ID`]: the member carrying the several edge locations a Direct
 /// Connect gateway attachment spans.
 pub const FIELD_EDGE_LOCATIONS: &str = "edgeLocations";
@@ -548,6 +564,16 @@ pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
 /// [`VALIDATION_REASON_OTHER`] — the request is invalid against stored state, no single
 /// member is at fault — and stores nothing.
 pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
+
+/// How many managed prefix lists one core network may be associated with here.
+///
+/// CHOSEN, like [`MAX_ATTACHMENTS_PER_CORE_NETWORK`]: Cloud WAN publishes no number for it
+/// and the model carries none, so this bound exists only so that repeated creates cannot
+/// grow the store without end. `CreateCoreNetworkPrefixListAssociation` DOES model a
+/// `ServiceQuotaExceededException` (`smithy_query query="operation"
+/// operation="CreateCoreNetworkPrefixListAssociation"`), so reaching it is answered with
+/// that modelled error (HTTP 402) and stores nothing.
+pub const MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK: usize = 100;
 
 /// How many Connect peers one Connect attachment may hold here, and how many inside CIDR
 /// blocks one Connect peer may peer over.
@@ -1252,6 +1278,48 @@ impl CoreNetworkRecord {
             tags: Some(self.tags.clone()),
         }
     }
+}
+
+/// A stored association between a core network and a managed prefix list: the tie
+/// `CreateCoreNetworkPrefixListAssociation` makes "for routing control" (`smithy_query
+/// query="doc" shape="CreateCoreNetworkPrefixListAssociation"`).
+///
+/// Like [`LinkAssociationRecord`] this is NOT a resource of its own: the modelled
+/// `PrefixListAssociation` is the core network id, the prefix list ARN and the alias
+/// (`smithy_query shape=PrefixListAssociation`), with no id, ARN or state member, so the
+/// core network / prefix list pair is its identity and the store keys it by
+/// [`prefix_list_association_key`]. Carrying no state member, it has nothing that is a
+/// function of the clock and no transition is owed on it.
+#[derive(Debug, Clone)]
+pub struct PrefixListAssociationRecord {
+    /// The core network the association was made on: the one whose prefix-list
+    /// associations list it and whose delete removes it.
+    pub core_network_id: String,
+    /// The ARN of the associated prefix list, exactly as accepted. A managed prefix list is
+    /// an Amazon VPC resource, so this service mints nothing for it and stores no record of
+    /// the list itself — [`parse_prefix_list_arn`] judges only the form of the ARN.
+    pub prefix_list_arn: String,
+    /// The alias the create carried: "An optional alias for the prefix list association"
+    /// (`smithy_query query="doc" shape="CreateCoreNetworkPrefixListAssociationRequest"
+    /// member="PrefixListAlias"`). A required member whose modelled length starts at zero,
+    /// so an empty alias is one a caller may ask for and is stored as asked.
+    pub prefix_list_alias: String,
+    /// The `@idempotencyToken` the create carried, when it carried a non-empty one, so a
+    /// retry of the same request answers this association instead of storing a second one.
+    pub client_token: Option<String>,
+}
+
+/// The key the association store holds a core network / prefix list pair under: the core
+/// network id, then the ARN of the prefix list, so the map orders associations by core
+/// network and then by prefix list and a pagination token can name an offset into it.
+///
+/// A core network id is `core-network-<17 hex>`
+/// ([`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`], which the modelled
+/// `CoreNetworkId` pattern constrains) and carries no `/`, so no two pairs can produce the
+/// same key. The same string identifies the association in a not-found refusal, where no
+/// single resource id would.
+pub fn prefix_list_association_key(core_network_id: &str, prefix_list_arn: &str) -> String {
+    format!("{core_network_id}/{prefix_list_arn}")
 }
 
 /// How many subnet ARNs one VPC attachment may hold.
@@ -2511,6 +2579,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network-resource inventory and the core-network delete refusal all count
     /// attachments without caring which kind each is.
     pub attachments: BTreeMap<String, AttachmentRecord>,
+    /// Prefix list associations by [`prefix_list_association_key`], each tying one stored
+    /// core network to one managed prefix list of Amazon VPC. A `BTreeMap`, so listing
+    /// order is stable and a pagination token can name a key offset into it.
+    ///
+    /// Bounded per core network by [`MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK`],
+    /// and only ever holding a pair once, so no caller can grow it without end.
+    pub prefix_list_associations: BTreeMap<String, PrefixListAssociationRecord>,
     /// Connect peers by `ConnectPeerId`, each carrying the Connect attachment it is carried
     /// over and that attachment's core network and edge location. A `BTreeMap`, so listing
     /// order is stable and a pagination token can name a key offset into it.
@@ -2700,6 +2775,15 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         self.attachments
             .values()
             .filter(|attachment| attachment.core_network_id == core_network_id)
+            .count()
+    }
+
+    /// How many managed prefix lists `core_network_id` is associated with, for the
+    /// per-core-network quota.
+    pub fn prefix_list_association_count_of(&self, core_network_id: &str) -> usize {
+        self.prefix_list_associations
+            .values()
+            .filter(|association| association.core_network_id == core_network_id)
             .count()
     }
 
@@ -3386,6 +3470,146 @@ pub fn malformed_resource_arn(member: &str) -> ValidationException {
     }
 }
 
+/// Whether every character of `text` is a lowercase hex digit — the alphabet every id the
+/// cross-service ARN patterns of this model spell out is drawn from (`[0-9a-f]` in
+/// `DirectConnectGatewayArn`'s and `VpcArn`'s patterns).
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// What the Region segment of a cross-service ARN may carry, which is the one thing the
+/// modelled patterns of the two forms below disagree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArnRegion {
+    /// The segment must be EMPTY, as `DirectConnectGatewayArn`'s pattern has it
+    /// (`:directconnect::`).
+    Absent,
+    /// The segment may carry any Region, or none, as the EC2 patterns have it
+    /// (`:ec2:[^:]{0,63}:`).
+    Any,
+}
+
+/// Split the ARN of a resource of ANOTHER service into its kind and id, or `None` when the
+/// string is not one in the form asked for.
+///
+/// Every cross-service ARN this model types spells one skeleton —
+/// `arn:<partition>:<namespace>:<region>:<account>:<kind>/<id>`, with the partition 1 to 63
+/// characters and the Region and account at most 63
+/// (`^arn:[^:]{1,63}:directconnect::[^:]{0,63}:dx-gateway\/…$`, `smithy_query
+/// shape=DirectConnectGatewayArn`; `^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/…$`,
+/// `smithy_query shape=VpcArn`) — so ONE walk serves every such form and two of them cannot
+/// drift apart. `region` is what that form's pattern says about the Region segment, `kind`
+/// the resource type it names and `is_id` the shape of the id inside it.
+///
+/// Which account, partition or Region the ARN carries is not judged beyond those widths,
+/// exactly as [`parse_resource_arn`] does not judge them for an ARN of this service: the
+/// resource belongs to another service, so whether it EXISTS cannot be known here.
+fn parse_foreign_arn<'a>(
+    arn: &'a str,
+    namespace: &str,
+    region: ArnRegion,
+    kind: &str,
+    is_id: fn(&str) -> bool,
+) -> Option<ArnParts<'a>> {
+    /// The widest partition, Region and account those patterns admit.
+    const MAX_SEGMENT: usize = 63;
+
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let partition = fields.next()?;
+    if partition.is_empty() || partition.len() > MAX_SEGMENT {
+        return None;
+    }
+    if fields.next()? != namespace {
+        return None;
+    }
+    let found_region = fields.next()?;
+    if found_region.len() > MAX_SEGMENT || (region == ArnRegion::Absent && !found_region.is_empty())
+    {
+        return None;
+    }
+    if fields.next()?.len() > MAX_SEGMENT {
+        return None;
+    }
+    let (found_kind, id) = fields.next()?.split_once('/')?;
+    if found_kind != kind || !is_id(id) {
+        return None;
+    }
+    Some(ArnParts {
+        kind: found_kind,
+        id,
+    })
+}
+
+/// The ARN namespace of the managed prefix list a core network's prefix-list association
+/// names: an Amazon VPC (EC2) resource, not one of this service.
+const EC2_NAMESPACE: &str = "ec2";
+/// The ARN resource type of a managed prefix list, and the prefix of its id — the `pl-` of
+/// `prefix-list/pl-0123456789abcdef1`.
+pub const PREFIX_LIST_KIND: &str = "prefix-list";
+/// See [`PREFIX_LIST_KIND`].
+const PREFIX_LIST_ID_PREFIX: &str = "pl-";
+
+/// Whether `id` reads as a managed prefix list id: the `pl-` prefix plus the 8 to 17
+/// lowercase hex digits every EC2 resource id the model DOES type carries (`vpc-[0-9a-f]{8,17}`
+/// in `VpcArn`'s pattern, see [`parse_prefix_list_arn`]).
+fn is_prefix_list_id(id: &str) -> bool {
+    /// The width an EC2 resource id's hex suffix may have, from that pattern.
+    const WIDTHS: ::std::ops::RangeInclusive<usize> = 8..=17;
+
+    match id.strip_prefix(PREFIX_LIST_ID_PREFIX) {
+        Some(digits) => WIDTHS.contains(&digits.len()) && is_lowercase_hex(digits),
+        None => false,
+    }
+}
+
+/// Split a managed prefix list ARN into its kind and id, or `None` when the string is not
+/// one at all — the caller refuses that as a `ValidationException` on the ARN member
+/// ([`malformed_prefix_list_arn`]).
+///
+/// `PrefixListArn` is the one cross-service ARN this model leaves free-form (len 0..500,
+/// pattern `^[\s\S]*$`: `smithy_query shape=PrefixListArn`), so the form is judged here
+/// rather than by the pre-handler constraint walk. Every EC2 ARN the model DOES type spells
+/// the skeleton [`parse_foreign_arn`] walks — `VpcArn` carries
+/// `^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$` (`smithy_query
+/// shape=VpcArn`) — and a prefix list ARN is that skeleton with the `prefix-list` resource
+/// type and a `pl-` id ([`is_prefix_list_id`]).
+///
+/// Whether the prefix list EXISTS is not judged: it belongs to Amazon VPC, which this
+/// service holds no record of, so a well-formed ARN is stored as the association's subject.
+pub fn parse_prefix_list_arn(arn: &str) -> Option<ArnParts<'_>> {
+    parse_foreign_arn(
+        arn,
+        EC2_NAMESPACE,
+        ArnRegion::Any,
+        PREFIX_LIST_KIND,
+        is_prefix_list_id,
+    )
+}
+
+/// The modelled `ValidationException` (HTTP 400) a prefix-list association operation
+/// answers when the string in its member `member` is not a managed prefix list ARN at all
+/// (see [`parse_prefix_list_arn`]).
+///
+/// Like [`malformed_resource_arn`]: a string that names no prefix list is a FIELD failure
+/// on the member that carried it, a different answer from a well-formed ARN that names no
+/// association this core network holds.
+pub fn malformed_prefix_list_arn(member: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{member} is not a managed prefix list ARN"),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "must read arn:<partition>:{EC2_NAMESPACE}:<region>:<account>:{PREFIX_LIST_KIND}/{PREFIX_LIST_ID_PREFIX}<8 to 17 hex digits>"
+            ),
+        }]),
+    }
+}
+
 /// The ARN namespace and resource type of the resource a resource policy of this service
 /// is attached to: a Direct Connect gateway.
 ///
@@ -3424,10 +3648,7 @@ fn is_direct_connect_gateway_id(id: &str) -> bool {
         let Some(group) = groups.next() else {
             return false;
         };
-        let lowercase_hex = group
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
-        if group.len() != width || !lowercase_hex {
+        if group.len() != width || !is_lowercase_hex(group) {
             return false;
         }
     }
@@ -3441,31 +3662,13 @@ fn is_direct_connect_gateway_id(id: &str) -> bool {
 /// pattern has them; which account owns the gateway is not judged here, since the point of
 /// a resource policy is that the gateway belongs to another account.
 pub fn parse_direct_connect_gateway_arn(arn: &str) -> Option<ArnParts<'_>> {
-    /// The widest partition and account the modelled pattern admits.
-    const MAX_SEGMENT: usize = 63;
-
-    let mut fields = arn.splitn(6, ':');
-    if fields.next()? != "arn" {
-        return None;
-    }
-    let partition = fields.next()?;
-    if partition.is_empty() || partition.len() > MAX_SEGMENT {
-        return None;
-    }
-    if fields.next()? != DIRECT_CONNECT_NAMESPACE {
-        return None;
-    }
-    if !fields.next()?.is_empty() {
-        return None;
-    }
-    if fields.next()?.len() > MAX_SEGMENT {
-        return None;
-    }
-    let (kind, id) = fields.next()?.split_once('/')?;
-    if kind != DIRECT_CONNECT_GATEWAY_KIND || !is_direct_connect_gateway_id(id) {
-        return None;
-    }
-    Some(ArnParts { kind, id })
+    parse_foreign_arn(
+        arn,
+        DIRECT_CONNECT_NAMESPACE,
+        ArnRegion::Absent,
+        DIRECT_CONNECT_GATEWAY_KIND,
+        is_direct_connect_gateway_id,
+    )
 }
 
 /// The resource an ARN names when that resource may CARRY a resource policy, or `None`

@@ -175,6 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // A prefix list association is not a resource of its own: it is a tie held BY this
+        // core network (`state::PrefixListAssociationRecord`), addressed only through it, so
+        // the ties go with the record the same way its policy versions do, rather than
+        // outliving the core network they were made on.
+        store
+            .prefix_list_associations
+            .retain(|_, association| association.core_network_id != input.core_network_id);
+
         Ok(DeleteCoreNetworkOutput {
             core_network: Some(removed.to_shape_with_state(crate::state::STATE_DELETING)),
         })
