@@ -2,7 +2,9 @@
 
 //! @op ListObjectVersions
 //! Reports metadata about every version of the objects in a bucket: the current version
-//! of each key and the noncurrent versions the store kept behind it, newest first.
+//! of each key and the noncurrent versions the store kept behind it, newest first, with
+//! each DELETE MARKER reported in the response's own `DeleteMarker` container (it holds no
+//! bytes, so it carries neither a size nor an entity tag).
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -319,6 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let delimiter = input.delimiter.clone().unwrap_or_default();
 
         let mut versions: Vec<ObjectVersion> = Vec::new();
+        let mut delete_markers: Vec<DeleteMarkerEntry> = Vec::new();
         let mut common_prefixes: Vec<String> = Vec::new();
         // The last entry this page reported, as `(key, version id)` — `None` for a
         // rolled-up common prefix, which has no version of its own — and whether anything
@@ -376,7 +379,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     {
                         continue;
                     }
-                    if versions.len() + common_prefixes.len() >= page_limit {
+                    if versions.len() + delete_markers.len() + common_prefixes.len()
+                        >= page_limit
+                    {
                         truncated = true;
                         break 'keys;
                     }
@@ -405,30 +410,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                         continue;
                     }
-                    // One slot per entry, shared by Versions and CommonPrefixes. Out of
-                    // slots means there is more to report: this page is truncated, and the
-                    // markers below name the last entry it DID report, which is where the
-                    // next one resumes from.
-                    if versions.len() + common_prefixes.len() >= page_limit {
+                    // One slot per entry, shared by Versions, DeleteMarkers and
+                    // CommonPrefixes — `MaxKeys` "sets the maximum number of keys returned
+                    // in the response" over all three, because a delete marker is an entry
+                    // of the listing like any other. Out of slots means there is more to
+                    // report: this page is truncated, and the markers below name the last
+                    // entry it DID report, which is where the next one resumes from.
+                    if versions.len() + delete_markers.len() + common_prefixes.len()
+                        >= page_limit
+                    {
                         truncated = true;
                         break 'keys;
                     }
                     last_entry = Some((key.to_string(), Some(version_id_of(held).to_string())));
+                    // "Specifies whether the object is (true) or is not (false) the latest
+                    // version of an object": the version the store hands back first IS the
+                    // key's current version, whether it is an object or a delete marker.
+                    let is_latest = Some(position == 0);
+                    // A delete marker holds no bytes, so it is reported in its own
+                    // container, which carries neither a size nor an entity tag.
+                    let Some(object) = held.as_object() else {
+                        delete_markers.push(DeleteMarkerEntry {
+                            key: Some(key.to_string()),
+                            version_id: Some(version_id_of(held).to_string()),
+                            is_latest,
+                            last_modified: Some(::aws_smithy_types::DateTime::from(
+                                held.last_modified(),
+                            )),
+                            // `Owner` needs an object owner this emulator does not record.
+                            owner: None,
+                        });
+                        continue;
+                    };
                     versions.push(ObjectVersion {
                         key: Some(key.to_string()),
                         // "Version ID of an object" — the `null` version carries no id of
                         // its own, and that is the id a request names it by.
                         version_id: Some(version_id_of(held).to_string()),
-                        // "Specifies whether the object is (true) or is not (false) the
-                        // latest version of an object": the current version is the one the
-                        // store hands back first, and a key whose current version was
-                        // deleted has none at all.
-                        is_latest: Some(position == 0 && bucket.object(key).is_some()),
-                        e_tag: Some(held.etag.clone()),
-                        size: Some(i64::try_from(held.body.len()).unwrap_or(i64::MAX)),
-                        storage_class: Some(held.storage_class.clone()),
+                        is_latest,
+                        e_tag: Some(object.etag.clone()),
+                        size: Some(i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
+                        storage_class: Some(object.storage_class.clone()),
                         last_modified: Some(::aws_smithy_types::DateTime::from(
-                            held.last_modified,
+                            object.last_modified,
                         )),
                         // `Owner` needs an object owner this emulator does not record and
                         // `RestoreStatus` an archive tier it does not model; the checksum
@@ -493,10 +517,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect()
             }),
-            // A delete records no delete marker (see `DeleteObject`: its 204 carries
-            // neither the marker's version id nor the flag that would report it), so there
-            // is none to list rather than an invented one.
-            delete_markers: None,
+            // Every delete marker the page reported, in the same key-then-version order
+            // the versions are in: "Container for an object that is a delete marker"
+            // (`ListObjectVersionsOutput$DeleteMarkers`), reported exactly when a delete
+            // that named no version laid one.
+            delete_markers: (!delete_markers.is_empty()).then(|| {
+                delete_markers
+                    .into_iter()
+                    .map(|mut marker| {
+                        marker.key = marker.key.map(&encode);
+                        marker
+                    })
+                    .collect()
+            }),
             // `EncodingType` is "included in the response" exactly when the request asked
             // for one, which is when the elements above are encoded; `RequestCharged`
             // reports a Requester Pays charge this emulator does not model.
@@ -510,9 +543,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// [`crate::state::NULL_VERSION_ID`] for a version written while the bucket was not
 /// versioning-enabled ("Objects stored in your bucket before you set the versioning state
 /// have a version ID of null").
-fn version_id_of(version: &crate::state::Object) -> &str {
+fn version_id_of(version: &crate::state::StoredVersion) -> &str {
     version
-        .version_id
-        .as_deref()
+        .version_id()
         .unwrap_or(crate::state::NULL_VERSION_ID)
 }

@@ -10,8 +10,12 @@
 //! A bucket whose versioning status is `Enabled` holds more than one version of a key:
 //! the CURRENT one, which every reader that names no `versionId` answers with, and the
 //! noncurrent ones a later write or a delete displaced, each addressable by the version id
-//! the store minted for it ([`mint_version_id`]). Every stored version counts against the
-//! same ceilings a current object does.
+//! the store minted for it ([`mint_version_id`]). A delete that names no version adds a
+//! version of its own — a [`DeleteMarker`], which "becomes the current version of the
+//! object" and takes nothing away — so a key's versions are one chain of
+//! [`StoredVersion`]s, newest first. Every stored version counts against the same ceilings
+//! a current object does, and every one of them has to be deleted before the bucket can
+//! be ([`Bucket::holds_no_versions`]).
 //!
 //! A bucket also holds the multipart uploads it has IN PROGRESS ([`MultipartUpload`]),
 //! each addressable by the upload id the store minted for it ([`mint_upload_id`]) until a
@@ -138,6 +142,15 @@ pub const NULL_VERSION_ID: &str = "null";
 /// bucket receive a unique version ID" (`PutBucketVersioning`'s documentation).
 pub const VERSIONING_ENABLED_STATUS: &str = "Enabled";
 
+/// The `BucketVersioningStatus` value of a bucket whose versioning was turned off again.
+///
+/// "Suspended—Disables versioning for the objects in the bucket. All objects added to the
+/// bucket receive the version ID null" (`PutBucketVersioning`'s documentation). A
+/// suspended bucket KEEPS every version it already holds — suspension is a state of the
+/// bucket, not of its versions — which is what makes it different from a bucket that was
+/// never versioned at all.
+pub const VERSIONING_SUSPENDED_STATUS: &str = "Suspended";
+
 /// The most user-defined metadata one stored object may carry, in UTF-8 bytes summed
 /// over every `x-amz-meta-` key and value.
 ///
@@ -173,6 +186,35 @@ pub enum ObjectWrite {
     /// Recording the object would take the whole store past
     /// [`MAX_OBJECT_BYTES_TOTAL`] retained bytes; nothing was written.
     TotalByteBudgetReached { would_hold: usize },
+}
+
+/// What a `DeleteObject` that named NO `versionId` did
+/// ([`ComAmazonawsS3Amazons3State::remove_object`]), so the caller answers each outcome
+/// without re-deriving it from the bucket's versioning state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectDeletion {
+    /// The bucket holds no versioning state, and the `null` version at that key was
+    /// removed; everything it retained is released.
+    Removed,
+    /// The bucket holds no versioning state and held nothing at that key, so nothing was
+    /// written — "if there isn't a null version, Amazon S3 does not remove anything"
+    /// (`DeleteObject`'s documentation).
+    NothingThere,
+    /// The bucket carries a versioning state, so a DELETE MARKER is now the key's current
+    /// version, under `version_id` (`None` for the `null` marker of a suspended bucket).
+    /// Every version behind it is still stored. `displaced_object` is whether the key had
+    /// a current object for the marker to hide, which is what `DeleteObject`'s
+    /// `x-amz-delete-marker` reports.
+    MarkerLaid {
+        version_id: Option<String>,
+        displaced_object: bool,
+    },
+    /// The bucket is at [`MAX_OBJECTS_PER_BUCKET`] stored versions, so the delete marker
+    /// this delete would lay was refused rather than recorded; nothing was written.
+    VersionCountReached,
+    /// This emulator is at [`MAX_OBJECTS_TOTAL`] stored versions across every bucket, so
+    /// the delete marker was refused rather than recorded; nothing was written.
+    TotalVersionCountReached,
 }
 
 /// What [`ComAmazonawsS3Amazons3State::replace_object_tags`] did, so the caller answers
@@ -913,8 +955,14 @@ pub const UNRESOLVABLE_GRANT_BY_EMAIL_CODE: &str = "UnresolvableGrantByEmailAddr
 /// The code S3 answers a request the resource does not allow at all: "MethodNotAllowed -
 /// The specified method is not allowed against this resource", HTTP 405 (same list) — what
 /// an Email Grantee ACL gets in the Regions where S3 has discontinued it
-/// ([`EMAIL_GRANTEE_DISCONTINUED_REGIONS`]).
+/// ([`EMAIL_GRANTEE_DISCONTINUED_REGIONS`]), and what a read that names a version which is
+/// a DELETE MARKER gets ("If the specified version is a delete marker, the response
+/// returns a 405 Method Not Allowed error" — `GetObject`'s own documentation, whose
+/// options `HeadObject` shares).
 pub const METHOD_NOT_ALLOWED_CODE: &str = "MethodNotAllowed";
+/// See [`METHOD_NOT_ALLOWED_CODE`] — the message of that same list entry.
+pub const METHOD_NOT_ALLOWED_MESSAGE: &str =
+    "The specified method is not allowed against this resource.";
 /// The HTTP status [`METHOD_NOT_ALLOWED_CODE`] is rendered with: 405, from the same list
 /// and from `PutBucketAcl`'s own documentation ("the request will receive an HTTP 405
 /// (Method Not Allowed) error").
@@ -2134,13 +2182,28 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the accessor pair below is the only way in or out.
     cors: Option<Vec<BucketCorsRule>>,
-    /// The objects the bucket holds, by key, as `PutObject` last recorded each.
+    /// Every VERSION the bucket holds of every key, NEWEST FIRST within each key.
     ///
-    /// The CURRENT version of each key, and so the whole of a bucket that was never
-    /// versioning-enabled. Private for the same reason as `tags`, and sorted by key
-    /// because that is the order S3 lists objects in ("returns some or all of the objects
-    /// in a bucket … in lexicographical order").
-    objects: BTreeMap<String, Object>,
+    /// Entry 0 of a key's chain is its CURRENT version — what a reader that names no
+    /// `versionId` answers with — and the rest are the noncurrent ones a later write or a
+    /// delete displaced, each addressable by its own [`Object::version_id`]. A chain holds
+    /// a [`StoredVersion::DeleteMarker`] wherever a delete that named no version was made
+    /// on a bucket carrying a versioning state: "If bucket versioning is enabled, the
+    /// operation inserts a delete marker, which becomes the current version of the object"
+    /// (`DeleteObject`'s documentation), so the version it displaced is still stored behind
+    /// it. A bucket that was never versioning-enabled holds exactly one entry per key, the
+    /// `null` version, and no markers at all.
+    ///
+    /// A `BTreeMap`, so iterating it IS the ascending UTF-8 byte order S3 lists keys in
+    /// (`String`'s `Ord` compares bytes) and a listing needs no sort step. A key is present
+    /// only while its chain is non-empty, so "the bucket holds no version of this key" and
+    /// "the bucket has no such key" are the same state.
+    ///
+    /// Private for the same reason as `tags`: a version is recorded only through
+    /// [`ComAmazonawsS3Amazons3State::put_object`] / [`Self::remove_object`] /
+    /// [`Self::remove_version`], which are the only places that see every ceiling and the
+    /// store's version sequence.
+    versions: BTreeMap<String, Vec<StoredVersion>>,
     /// The emulated service that provisioned this bucket on the account's behalf, or
     /// `None` for a bucket a client created over S3's own API
     /// ([`ComAmazonawsS3Amazons3State::create_bucket`]).
@@ -2158,20 +2221,6 @@ pub struct Bucket {
     /// Private, like `tags`, and written only where the bucket comes into being: a stored
     /// bucket never changes hands.
     provisioned_by: Option<String>,
-    /// The NONCURRENT versions of each key, newest first.
-    ///
-    /// A version lands here only when it stops being the current one on a bucket whose
-    /// versioning status is `Enabled`: "when you enable versioning for a bucket, if Amazon
-    /// S3 receives multiple write requests for the same object simultaneously, it stores
-    /// all of the objects" (`PutObject`'s documentation), and a delete on such a bucket
-    /// "inserts a delete marker" rather than removing what was there
-    /// (`DeleteObject`'s). Each entry keeps its own [`Object::version_id`], which is what
-    /// makes it addressable after it is no longer current.
-    ///
-    /// Private, and written only through [`Self::put_object`] / [`Self::remove_object`],
-    /// so a version cannot be recorded without passing the ceilings every stored version
-    /// counts against.
-    noncurrent_versions: BTreeMap<String, Vec<Object>>,
     /// The multipart uploads the bucket has in progress, by upload id.
     ///
     /// An upload lands here when `CreateMultipartUpload` initiates it and leaves only
@@ -2182,7 +2231,7 @@ pub struct Bucket {
     /// sorted, because `ListMultipartUploads` reports uploads in key order and an id is
     /// what distinguishes two uploads of one key.
     ///
-    /// Private, like `objects`, and written only through
+    /// Private, like `versions`, and written only through
     /// [`ComAmazonawsS3Amazons3State::create_multipart_upload`], which is the only place
     /// that sees the ceilings an in-progress upload counts against.
     multipart_uploads: BTreeMap<String, MultipartUpload>,
@@ -2447,57 +2496,67 @@ impl Bucket {
         self.cors = Some(rules);
     }
 
-    /// The object stored at `key`, or `None` when the bucket holds no such key.
+    /// The object stored at `key`, or `None` when the bucket holds no current object
+    /// there.
     ///
     /// The CURRENT version: what a read that names no `versionId` answers with, and the
-    /// only version a bucket that was never versioning-enabled has.
+    /// only version a bucket that was never versioning-enabled has. `None` when the key's
+    /// current version is a DELETE MARKER — "if the current version of the object is a
+    /// delete marker, Amazon S3 behaves as if the object was deleted"
+    /// (`GetObject`/`DeleteObject`) — and also when the bucket holds no such key at all:
+    /// the two are the same thing to every reader of a current object.
     pub fn object(&self, key: &str) -> Option<&Object> {
-        self.objects.get(key)
+        self.current_version(key)?.as_object()
     }
 
-    /// The version of `key` that `version_id` names — current or noncurrent — or `None`
-    /// when the bucket holds no such version.
+    /// The key's CURRENT version, object or delete marker, or `None` when the bucket holds
+    /// no version of it.
+    ///
+    /// Entry 0 of the chain: "the delete marker … becomes the current version of the
+    /// object", and a write makes what it stores current.
+    pub fn current_version(&self, key: &str) -> Option<&StoredVersion> {
+        self.versions.get(key)?.first()
+    }
+
+    /// The version of `key` that `version_id` names — current or noncurrent, object or
+    /// delete marker — or `None` when the bucket holds no such version.
     ///
     /// [`NULL_VERSION_ID`] names the version a write made while the bucket was not
     /// versioning-enabled, which is stored with no minted id of its own.
-    pub fn object_version(&self, key: &str, version_id: &str) -> Option<&Object> {
-        let named = |held: &&Object| match held.version_id.as_deref() {
-            Some(id) => id == version_id,
-            None => version_id == NULL_VERSION_ID,
-        };
-        self.objects
-            .get(key)
-            .filter(named)
-            .or_else(|| self.noncurrent_versions.get(key)?.iter().find(named))
+    pub fn stored_version(&self, key: &str, version_id: &str) -> Option<&StoredVersion> {
+        self.versions
+            .get(key)?
+            .iter()
+            .find(|held| held.named_by(version_id))
     }
 
-    /// Every version of `key` the bucket holds, newest first: the current one (when the
-    /// key has one) followed by its noncurrent versions.
+    /// The OBJECT version of `key` that `version_id` names, or `None` when the bucket
+    /// holds no such version or that version is a delete marker (which holds no bytes to
+    /// answer a read with — see [`Self::stored_version`] for the version itself).
+    pub fn object_version(&self, key: &str, version_id: &str) -> Option<&Object> {
+        self.stored_version(key, version_id)?.as_object()
+    }
+
+    /// Every version of `key` the bucket holds, NEWEST FIRST: the current one followed by
+    /// the noncurrent ones, delete markers among them.
     ///
     /// The read seam for anything that reports a key's versions rather than its current
-    /// object, so no caller reaches into either map.
-    pub fn object_versions(&self, key: &str) -> Vec<&Object> {
-        self.objects
-            .get(key)
-            .into_iter()
-            .chain(
-                self.noncurrent_versions
-                    .get(key)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            )
-            .collect()
+    /// object, so no caller reaches into the chain itself.
+    pub fn object_versions(&self, key: &str) -> &[StoredVersion] {
+        self.versions.get(key).map_or(&[], Vec::as_slice)
     }
 
-    /// Every object the bucket holds, keyed by object key.
+    /// Every CURRENT OBJECT the bucket holds, as `(key, object)` in ascending key order.
     ///
-    /// A `BTreeMap`, so iterating it IS the ascending UTF-8 byte order S3 lists keys in
-    /// (`String`'s `Ord` compares bytes) and a listing needs no sort step. Read-only:
-    /// an object is recorded only through
-    /// [`ComAmazonawsS3Amazons3State::put_object`], which is the only place that sees
-    /// every ceiling.
-    pub fn objects(&self) -> &BTreeMap<String, Object> {
-        &self.objects
+    /// The read seam for a listing over current objects (`ListObjectsV2`): ascending UTF-8
+    /// byte order, because that is the order S3 lists keys in ("returns some or all of the
+    /// objects in a bucket … in lexicographical order"), and a key whose current version
+    /// is a delete marker is NOT here — a delete marker is what makes a key stop appearing
+    /// in such a listing while its versions are still stored.
+    pub fn objects(&self) -> impl Iterator<Item = (&str, &Object)> + '_ {
+        self.versions
+            .iter()
+            .filter_map(|(key, chain)| Some((key.as_str(), chain.first()?.as_object()?)))
     }
 
     /// The in-progress multipart upload `upload_id` names, or `None` when the bucket has
@@ -2518,30 +2577,103 @@ impl Bucket {
         &self.multipart_uploads
     }
 
-    /// Remove the object at `key`, reporting whether the bucket held one.
+    /// Delete `key` the way a `DeleteObject` that named NO `versionId` does, reporting
+    /// what that did ([`ObjectDeletion`]).
     ///
-    /// A current version that is [`Self::keeps_superseded`] is kept as a noncurrent version
-    /// instead of being destroyed: "If bucket versioning is enabled, the operation inserts
-    /// a delete marker, which becomes the current version of the object. To permanently
-    /// delete an object in a versioned bucket, you must include the object's versionId in
-    /// the request" (`DeleteObject`'s documentation) — so the version a delete displaces
-    /// is still addressable by its id afterwards, and its bytes are still retained.
-    /// Removing the `null` version of a bucket that is not versioning-enabled releases
-    /// everything that object retained.
+    /// Which of the three things it does turns on the bucket's versioning state, and
+    /// `PutBucketVersioning` / `DeleteObject` document each:
+    ///
+    /// * versioning status `Enabled` — "the operation inserts a delete marker, which
+    ///   becomes the current version of the object. To permanently delete an object in a
+    ///   versioned bucket, you must include the object's versionId in the request": the
+    ///   marker is PREPENDED to the key's chain under the id `minted`, nothing stored is
+    ///   taken away, and every version behind it stays addressable by its own id.
+    /// * versioning status `Suspended` — "All objects added to the bucket receive the
+    ///   version ID null", and a delete "removes the null version (if there is one) and
+    ///   inserts a delete marker with version ID null": the `null` version goes, whether it
+    ///   is an object or an older null marker, and a null marker becomes current. Every
+    ///   version minted while versioning was enabled stays.
+    /// * no versioning state at all — such a bucket has no version history to keep, so the
+    ///   `null` version is removed in place and everything it retained is released.
+    ///
+    /// `minted` is the version id the delete marker of an `Enabled` bucket is stored under,
+    /// which only [`ComAmazonawsS3Amazons3State::remove_object`] can mint (it holds the
+    /// store's version sequence); it is ignored on any other bucket, whose marker is the
+    /// `null` one.
     ///
     /// PRIVATE, so a delete goes through
     /// [`ComAmazonawsS3Amazons3State::remove_object`] and cannot name a bucket that does
-    /// not exist.
-    fn remove_object(&mut self, key: &str) -> bool {
-        let keeps = self.keeps_superseded(key);
-        let Some(removed) = self.objects.remove(key) else {
+    /// not exist. NOTHING is written when the answer is a ceiling: a delete marker is a
+    /// stored version like any other, so it is refused rather than recorded once the bucket
+    /// is at [`MAX_OBJECTS_PER_BUCKET`] stored versions.
+    fn remove_object(&mut self, key: &str, minted: Option<String>) -> ObjectDeletion {
+        let held_object = self.object(key).is_some();
+
+        // A bucket with no versioning state keeps no history: the delete takes the `null`
+        // version away, and with it the last entry of the key's chain.
+        if self.versioning.is_none() {
+            return if self.remove_null_version(key) {
+                ObjectDeletion::Removed
+            } else {
+                ObjectDeletion::NothingThere
+            };
+        }
+
+        // An `Enabled` bucket's marker is a version of its own ("All objects added to the
+        // bucket receive a unique version ID"); a suspended bucket's is the `null` one,
+        // which is why it displaces whatever null version the key held.
+        let version_id = if self.versioning_enabled() { minted } else { None };
+        let displaces_null = version_id.is_none() && self.null_version_position(key).is_some();
+        // The marker is a stored version like any other, so it is refused rather than
+        // recorded once the bucket is full — unless it takes the place of the null version
+        // it displaces, which leaves the count where it was.
+        if !displaces_null && self.stored_versions() >= MAX_OBJECTS_PER_BUCKET {
+            return ObjectDeletion::VersionCountReached;
+        }
+        if displaces_null {
+            self.remove_null_version(key);
+        }
+        self.versions
+            .entry(key.to_string())
+            .or_default()
+            .insert(
+                0,
+                StoredVersion::DeleteMarker(DeleteMarker {
+                    version_id: version_id.clone(),
+                    last_modified: SystemTime::now(),
+                }),
+            );
+        ObjectDeletion::MarkerLaid {
+            version_id,
+            displaced_object: held_object,
+        }
+    }
+
+    /// Where in `key`'s chain the `null` version is — the one entry that carries no minted
+    /// id, object or delete marker — or `None` when the bucket holds none.
+    ///
+    /// At most one such entry can exist: only a write or a delete made while the bucket was
+    /// not versioning-enabled stores one, and each of those displaces the one before it
+    /// ("All objects added to the bucket receive the version ID null").
+    fn null_version_position(&self, key: &str) -> Option<usize> {
+        self.versions
+            .get(key)?
+            .iter()
+            .position(|held| held.version_id().is_none())
+    }
+
+    /// Remove the `null` version of `key`, reporting whether the bucket held one. See
+    /// [`Self::null_version_position`].
+    fn remove_null_version(&mut self, key: &str) -> bool {
+        let Some(position) = self.null_version_position(key) else {
             return false;
         };
-        if keeps {
-            self.noncurrent_versions
-                .entry(key.to_string())
-                .or_default()
-                .insert(0, removed);
+        let Some(chain) = self.versions.get_mut(key) else {
+            return false;
+        };
+        chain.remove(position);
+        if chain.is_empty() {
+            self.versions.remove(key);
         }
         true
     }
@@ -2554,7 +2686,7 @@ impl Bucket {
     /// sees the byte budgets a subresource write also has to stay inside, so a handler
     /// reaching an object this way directly would bypass them.
     fn object_mut(&mut self, key: &str) -> Option<&mut Object> {
-        self.objects.get_mut(key)
+        self.versions.get_mut(key)?.first_mut()?.as_object_mut()
     }
 
     /// Store `object` at `key` as the key's current version, reporting what that did.
@@ -2600,20 +2732,22 @@ impl Bucket {
         // inside the budgets like every other string kept beside the payload.
         object.version_id = minted;
         let retaining = self.keeps_superseded(key);
-        let held = self.objects.contains_key(key);
-        if (retaining || !held) && self.stored_versions() >= MAX_OBJECTS_PER_BUCKET {
+        let held = self.object(key).is_some();
+        // The write adds an entry unless it replaces the key's current version in place,
+        // which it does only when that version is not retained and there is one.
+        let adds_version = retaining || self.current_version(key).is_none();
+        if adds_version && self.stored_versions() >= MAX_OBJECTS_PER_BUCKET {
             return ObjectWrite::ObjectCountReached;
         }
         let would_hold = self.retained_bytes_after_write(key, retaining) + object.retained_bytes();
         if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
             return ObjectWrite::ByteBudgetReached { would_hold };
         }
-        let superseded = self.objects.insert(key.to_string(), object);
-        if let (true, Some(superseded)) = (retaining, superseded) {
-            self.noncurrent_versions
-                .entry(key.to_string())
-                .or_default()
-                .insert(0, superseded);
+        let chain = self.versions.entry(key.to_string()).or_default();
+        if adds_version {
+            chain.insert(0, StoredVersion::Object(Box::new(object)));
+        } else {
+            chain[0] = StoredVersion::Object(Box::new(object));
         }
         if held {
             ObjectWrite::Replaced
@@ -2624,19 +2758,13 @@ impl Bucket {
 
     /// Every key the bucket holds at least one version of, in ascending UTF-8 byte order
     /// — the keys with a current object, plus the keys whose only versions left are
-    /// noncurrent ones.
+    /// noncurrent ones or delete markers.
     ///
     /// The read seam for a listing over VERSIONS (`ListObjectVersions`), the way
     /// [`Self::objects`] is the seam for a listing over current objects. Ascending order,
     /// because that is the order S3 lists keys in.
     pub fn version_keys(&self) -> Vec<&str> {
-        let mut keys: ::std::collections::BTreeSet<&str> = self
-            .objects
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.extend(self.noncurrent_versions.keys().map(String::as_str));
-        keys.into_iter().collect()
+        self.versions.keys().map(String::as_str).collect()
     }
 
     /// Remove the version of `key` that `version_id` names, reporting whether the bucket
@@ -2653,33 +2781,18 @@ impl Bucket {
     /// [`ComAmazonawsS3Amazons3State::remove_object_version`] and cannot name a bucket
     /// that does not exist.
     fn remove_version(&mut self, key: &str, version_id: &str) -> bool {
-        let names = |held: &Object| match held.version_id.as_deref() {
-            Some(id) => id == version_id,
-            None => version_id == NULL_VERSION_ID,
+        let Some(chain) = self.versions.get_mut(key) else {
+            return false;
         };
-        let removed_current = self.objects.get(key).is_some_and(names);
-        if removed_current {
-            self.objects.remove(key);
-            if let Some(remaining) = self.noncurrent_versions.get_mut(key) {
-                if !remaining.is_empty() {
-                    self.objects.insert(key.to_string(), remaining.remove(0));
-                }
-            }
-        } else {
-            let Some(remaining) = self.noncurrent_versions.get_mut(key) else {
-                return false;
-            };
-            let Some(position) = remaining.iter().position(names) else {
-                return false;
-            };
-            remaining.remove(position);
-        }
-        if self
-            .noncurrent_versions
-            .get(key)
-            .is_some_and(Vec::is_empty)
-        {
-            self.noncurrent_versions.remove(key);
+        let Some(position) = chain.iter().position(|held| held.named_by(version_id)) else {
+            return false;
+        };
+        // Removing entry 0 promotes the version behind it to current, because the chain is
+        // newest first: that is what makes a versioned bucket's delete reversible — the
+        // version before it becomes what a read without a `versionId` answers with.
+        chain.remove(position);
+        if chain.is_empty() {
+            self.versions.remove(key);
         }
         true
     }
@@ -2702,50 +2815,161 @@ impl Bucket {
     fn keeps_superseded(&self, key: &str) -> bool {
         self.versioning_enabled()
             || self
-                .objects
-                .get(key)
-                .is_some_and(|held| held.version_id.is_some())
+                .current_version(key)
+                .is_some_and(|held| held.version_id().is_some())
     }
 
-    /// How many object versions this bucket stores: the current object at each key plus
-    /// every noncurrent version it keeps.
+    /// Whether the bucket holds NOTHING at all: no version of any key — no current object,
+    /// no noncurrent version retained behind one, and no delete marker.
+    ///
+    /// This is the emptiness `DeleteBucket` is over — "All objects (including all object
+    /// versions and delete markers) in the bucket must be deleted before the bucket itself
+    /// can be deleted" (that operation's own documentation) — so it spans the bucket's
+    /// whole version history rather than its current view. [`Self::objects`] alone would
+    /// report a versioning-enabled bucket whose every key has been deleted as empty, while
+    /// each of those deletes laid a delete marker over a version that is still stored and
+    /// still addressable by its id: both of them have to be deleted first.
+    pub fn holds_no_versions(&self) -> bool {
+        self.stored_versions() == 0
+    }
+
+    /// How many versions this bucket stores, over every key: each key's current version
+    /// plus every noncurrent one it keeps, delete markers included.
     ///
     /// What [`MAX_OBJECTS_PER_BUCKET`] counts, because a retained noncurrent version holds
     /// this process's memory exactly as a current one does.
-    fn stored_versions(&self) -> usize {
-        self.objects.len()
-            + self
-                .noncurrent_versions
-                .values()
-                .map(Vec::len)
-                .sum::<usize>()
+    pub fn stored_versions(&self) -> usize {
+        self.versions.values().map(Vec::len).sum()
     }
 
     /// How many bytes this bucket's objects retain — payloads AND every string kept
     /// beside them, over every version it stores, so no part of a stored object escapes
     /// the budgets.
     fn retained_bytes(&self) -> usize {
-        self.objects
+        self.versions
             .values()
-            .chain(self.noncurrent_versions.values().flatten())
-            .map(Object::retained_bytes)
+            .flatten()
+            .map(StoredVersion::retained_bytes)
             .sum()
     }
 
     /// How many bytes this bucket would still retain with a write at `key` applied, not
     /// counting the incoming object itself.
     ///
-    /// Everything it holds now, less the current object at `key` when that object is
-    /// replaced in place — which is every write except one that mints a version id, since
-    /// such a write keeps what it supersedes.
+    /// Everything it holds now, less the key's current version when that version is
+    /// replaced in place — which is every write except one that keeps what it supersedes.
     fn retained_bytes_after_write(&self, key: &str, retaining_current: bool) -> usize {
         let released = if retaining_current {
             0
         } else {
-            self.objects.get(key).map_or(0, Object::retained_bytes)
+            self.current_version(key)
+                .map_or(0, StoredVersion::retained_bytes)
         };
         self.retained_bytes().saturating_sub(released)
     }
+}
+
+/// One stored VERSION of a key: the object a write recorded, or the delete marker a
+/// delete that named no version laid over it.
+///
+/// A separate type rather than a flag on [`Object`], so a reader that wants an object's
+/// bytes cannot be handed a marker by mistake: a marker holds no bytes, no metadata and no
+/// entity tag, and `ListObjectVersions` reports it in its own `DeleteMarker` container.
+#[derive(Debug, Clone)]
+pub enum StoredVersion {
+    /// A version that holds bytes — what a read answers with. BOXED: an [`Object`] is
+    /// two orders of magnitude larger than a marker, and a chain of them would otherwise
+    /// carry that size for every delete marker too.
+    Object(Box<Object>),
+    /// A delete marker: "If bucket versioning is enabled, the operation inserts a delete
+    /// marker, which becomes the current version of the object" (`DeleteObject`'s
+    /// documentation). While it is a key's current version every read that names no
+    /// `versionId` behaves as if the object were deleted, and the versions behind it stay
+    /// addressable by their own ids.
+    DeleteMarker(DeleteMarker),
+}
+
+impl StoredVersion {
+    /// The id this version is addressed by, or `None` for the `null` version — one stored
+    /// while the bucket's versioning status was not `Enabled`, which a request names by
+    /// [`NULL_VERSION_ID`].
+    pub fn version_id(&self) -> Option<&str> {
+        match self {
+            Self::Object(object) => object.version_id.as_deref(),
+            Self::DeleteMarker(marker) => marker.version_id.as_deref(),
+        }
+    }
+
+    /// Whether `version_id` — as a request writes it — names this version.
+    pub fn named_by(&self, version_id: &str) -> bool {
+        match self.version_id() {
+            Some(id) => id == version_id,
+            None => version_id == NULL_VERSION_ID,
+        }
+    }
+
+    /// The object this version holds, or `None` when it is a delete marker.
+    pub fn as_object(&self) -> Option<&Object> {
+        match self {
+            Self::Object(object) => Some(object.as_ref()),
+            Self::DeleteMarker(_) => None,
+        }
+    }
+
+    /// The object this version holds, for writing one of its subresources, or `None` when
+    /// it is a delete marker.
+    fn as_object_mut(&mut self) -> Option<&mut Object> {
+        match self {
+            Self::Object(object) => Some(object.as_mut()),
+            Self::DeleteMarker(_) => None,
+        }
+    }
+
+    /// The delete marker this version is, or `None` when it holds an object.
+    pub fn as_delete_marker(&self) -> Option<&DeleteMarker> {
+        match self {
+            Self::Object(_) => None,
+            Self::DeleteMarker(marker) => Some(marker),
+        }
+    }
+
+    /// When this version came into being: the write that stored the object, or the delete
+    /// that laid the marker.
+    pub fn last_modified(&self) -> SystemTime {
+        match self {
+            Self::Object(object) => object.last_modified,
+            Self::DeleteMarker(marker) => marker.last_modified,
+        }
+    }
+
+    /// How many bytes this version retains, which the per-bucket and service-wide budgets
+    /// count. A marker retains only the id it is addressed by.
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Object(object) => object.retained_bytes(),
+            Self::DeleteMarker(marker) => marker.version_id.as_ref().map_or(0, String::len),
+        }
+    }
+}
+
+/// One delete marker: "a placeholder (marker) for a versioned object that was named in a
+/// simple DELETE request… it has a key name and version ID like any other object"
+/// (Amazon S3 User Guide, "Working with delete markers"), and nothing else — it holds no
+/// bytes, so `ListObjectVersions`' `DeleteMarkerEntry` reports neither a size nor an
+/// entity tag for it.
+#[derive(Debug, Clone)]
+pub struct DeleteMarker {
+    /// The version id the marker is addressed by, or `None` for the `null` marker a
+    /// versioning-SUSPENDED bucket's delete lays ("All objects added to the bucket receive
+    /// the version ID null").
+    ///
+    /// Minted by [`ComAmazonawsS3Amazons3State::remove_object`], the one place that sees
+    /// both the bucket's versioning state and the store's version sequence, so no handler
+    /// constructs one.
+    pub version_id: Option<String>,
+    /// When the delete that laid the marker was made, which is what a listing reports as
+    /// its `LastModified`.
+    pub last_modified: SystemTime,
 }
 
 /// One object this emulator holds, as a single `PutObject` recorded it.
@@ -3537,16 +3761,47 @@ impl ComAmazonawsS3Amazons3State {
         BucketCreation::Created
     }
 
-    /// Remove the object at `key` from the bucket named `bucket`, reporting whether an
-    /// object was there — or `None` when this emulator holds no such bucket, so a delete
-    /// can tell "no such bucket" from "no such key".
+    /// Delete `key` in the bucket named `bucket` the way a `DeleteObject` that named no
+    /// `versionId` does, reporting what that did — or `None` when this emulator holds no
+    /// such bucket, so a delete can tell "no such bucket" from "nothing at that key".
     ///
-    /// Everything the removed object retained is released with it, which is what lets a
-    /// later write back into the byte budgets [`Self::put_object`] checks.
-    pub fn remove_object(&mut self, bucket: &str, key: &str) -> Option<bool> {
+    /// What it does turns on the bucket's versioning state, which [`Bucket::remove_object`]
+    /// documents case by case. This is where the DELETE MARKER's version id is minted,
+    /// because this is the only place that sees both that state and the store's version
+    /// sequence: a delete on a bucket whose status is `Enabled` mints a fresh id for the
+    /// marker it lays, exactly as a write mints one for the version it stores.
+    ///
+    /// A marker is a stored version, so it is bounded like one: this refuses to lay it
+    /// once the whole store holds [`MAX_OBJECTS_TOTAL`] versions, and the per-bucket
+    /// ceiling is checked inside. Nothing is written when the answer is a ceiling.
+    pub fn remove_object(&mut self, bucket: &str, key: &str) -> Option<ObjectDeletion> {
+        let held = self.buckets.get(bucket)?;
+        let versioned = held.versioning_enabled();
+        // Only a delete that lays a marker the store does not already hold a slot for adds
+        // an entry: a bucket with no versioning state takes one away, and a `null` marker
+        // displaces the `null` version it covers. Just that case is bounded here, and only
+        // that case pays for the pass over every bucket.
+        let adds_version = held.versioning.is_some()
+            && (versioned || held.null_version_position(key).is_none());
+        if adds_version {
+            let held_versions: usize = self
+                .buckets
+                .values()
+                .map(Bucket::stored_versions)
+                .sum::<usize>();
+            if held_versions >= MAX_OBJECTS_TOTAL {
+                return Some(ObjectDeletion::TotalVersionCountReached);
+            }
+        }
+        // Minted before the ceilings below are measured, the way a write's id is; a
+        // refusal leaves it unused, which costs nothing but the sequence number.
+        let minted = versioned.then(|| {
+            self.minted_versions = self.minted_versions.saturating_add(1);
+            mint_version_id(bucket, key, self.minted_versions)
+        });
         self.buckets
             .get_mut(bucket)
-            .map(|held| held.remove_object(key))
+            .map(|held| held.remove_object(key, minted))
     }
 
     /// Remove the version of `key` that `version_id` names from the bucket named
@@ -3601,6 +3856,21 @@ pub const NO_SUCH_VERSION_CODE: &str = "NoSuchVersion";
 /// See [`NO_SUCH_VERSION_CODE`].
 pub const NO_SUCH_VERSION_MESSAGE: &str =
     "The specified version does not exist.";
+/// The code S3 answers a `DeleteBucket` of a bucket that still holds something, with HTTP
+/// 409 Conflict: "All objects (including all object versions and delete markers) in the
+/// bucket must be deleted before the bucket itself can be deleted" (`DeleteBucket`'s own
+/// documentation). Not a shape in this model, so it goes out through the unmodelled
+/// channel.
+pub const BUCKET_NOT_EMPTY_CODE: &str = "BucketNotEmpty";
+/// See [`BUCKET_NOT_EMPTY_CODE`] — the wording for a bucket that has no versioning state,
+/// whose only contents are the current object at each key.
+pub const BUCKET_NOT_EMPTY_MESSAGE: &str = "The bucket you tried to delete is not empty";
+/// See [`BUCKET_NOT_EMPTY_CODE`] — the wording for a bucket that HAS a versioning state,
+/// where what is left to delete is the stored versions rather than a current object. The
+/// code and the 409 are the requirement; this sentence is the recorded example of how S3
+/// says "versions" to a versioned bucket's caller.
+pub const BUCKET_NOT_EMPTY_VERSIONED_MESSAGE: &str =
+    "The bucket you tried to delete is not empty. You must delete all versions in the bucket.";
 /// The code S3 answers a write whose `Content-MD5` is not the digest of the bytes it
 /// carried: "The Content-MD5 or checksum value that you specified did not match what the
 /// server received."
@@ -4068,8 +4338,7 @@ mod tests {
             .bucket("one")
             .expect("bucket one exists")
             .objects()
-            .keys()
-            .map(String::as_str)
+            .map(|(key, _)| key)
             .collect();
         assert_eq!(
             listed,
@@ -4098,12 +4367,12 @@ mod tests {
 
         assert_eq!(
             store.remove_object("one", "doomed"),
-            Some(true),
-            "removing a stored key reports that an object was there"
+            Some(ObjectDeletion::Removed),
+            "removing a stored key on a bucket with no versioning state takes it away"
         );
         assert_eq!(
             store.remove_object("one", "doomed"),
-            Some(false),
+            Some(ObjectDeletion::NothingThere),
             "removing it again reports that nothing was there"
         );
         assert_eq!(
@@ -4142,7 +4411,7 @@ mod tests {
         );
         assert_eq!(
             store.remove_object("one", "large"),
-            Some(true),
+            Some(ObjectDeletion::Removed),
             "the large object was stored"
         );
         assert_eq!(
@@ -4215,7 +4484,7 @@ mod tests {
         );
         let ids: Vec<Option<&str>> = versions
             .iter()
-            .map(|held| held.version_id.as_deref())
+            .map(StoredVersion::version_id)
             .collect();
         assert_eq!(
             ids.iter().filter(|id| id.is_some()).count(),
@@ -4248,13 +4517,20 @@ mod tests {
             "an id no version carries addresses nothing"
         );
 
-        // Only a delete that NAMES a version releases it; the current one it displaces
-        // stays addressable.
+        // Only a delete that NAMES a version releases it; a delete that names none lays a
+        // delete marker over the key and keeps every version behind it.
         let displaced = ids[0].expect("the newest version carries an id").to_string();
-        assert_eq!(
-            store.remove_object("one", "key"),
-            Some(true),
-            "the key held a current object"
+        let laid = store.remove_object("one", "key");
+        let Some(ObjectDeletion::MarkerLaid {
+            version_id: Some(marker_id),
+            displaced_object,
+        }) = laid
+        else {
+            panic!("a delete on a versioning-enabled bucket lays a delete marker, got {laid:?}");
+        };
+        assert!(
+            displaced_object,
+            "the marker hid a current object, got {displaced_object}"
         );
         let bucket = store.bucket("one").expect("bucket one exists");
         assert!(
@@ -4262,8 +4538,40 @@ mod tests {
             "the delete took the key out of the current view"
         );
         assert!(
+            bucket
+                .current_version("key")
+                .is_some_and(|held| held.as_delete_marker().is_some()),
+            "the delete marker is the key's current version"
+        );
+        assert_eq!(
+            bucket.object_versions("key").len(),
+            4,
+            "the marker is stored beside the three versions it hides, got {}",
+            bucket.object_versions("key").len()
+        );
+        assert!(
             bucket.object_version("key", &displaced).is_some(),
             "the displaced version is still addressable by its id"
+        );
+        assert!(
+            bucket.object_version("key", &marker_id).is_none(),
+            "the marker holds no object to read by its id"
+        );
+        assert!(
+            bucket
+                .stored_version("key", &marker_id)
+                .is_some_and(|held| held.as_delete_marker().is_some()),
+            "the marker is addressable by the id it was minted with"
+        );
+        assert_eq!(
+            store.remove_object_version("one", "key", &marker_id),
+            Some(true),
+            "naming the marker's id removes the marker"
+        );
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert!(
+            bucket.object("key").is_some(),
+            "removing the marker makes the version it hid current again"
         );
         let held_before = bucket.retained_bytes();
         assert_eq!(

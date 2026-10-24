@@ -390,12 +390,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — "a HEAD request has the same options as a GET operation on an object"): with
         // one the read is of that stored version, with none it is of the key's current
         // version.
-        let object = store.bucket(&input.bucket).and_then(|bucket| {
+        let held = store.bucket(&input.bucket).and_then(|bucket| {
             match input.version_id.as_deref() {
-                None => bucket.object(&input.key),
-                Some(version_id) => bucket.object_version(&input.key, version_id),
+                None => bucket.current_version(&input.key),
+                Some(version_id) => bucket.stored_version(&input.key, version_id),
             }
         });
+        // "If the specified version is a delete marker, the response returns a 405 Method
+        // Not Allowed error" (`GetObject`, whose options this HEAD shares): a marker holds
+        // nothing for a HEAD to report, and a read that names NO version is answered as if
+        // the object were deleted — `NoSuchKey`, through the `None` below, because
+        // `Bucket::object` reports no current object behind a marker.
+        if input.version_id.is_some() && held.is_some_and(|held| held.as_delete_marker().is_some())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                405,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        let object = held.and_then(crate::state::StoredVersion::as_object);
         // A missing bucket and a missing key are both a 404 on a HEAD, which carries no
         // body to tell them apart by an error document. The modelled `NotFound` cannot
         // say it: the shape carries no `@httpError`, so the framework would render the

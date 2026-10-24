@@ -385,9 +385,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 match (&resume_at, &input.start_after) {
                     // The token's key is the first one this page owes, inclusive.
-                    (Some(from), _) if key < from => continue,
+                    (Some(from), _) if key < from.as_str() => continue,
                     // "Amazon S3 starts listing AFTER this specified key".
-                    (None, Some(start_after)) if key <= start_after => continue,
+                    (None, Some(start_after)) if key <= start_after.as_str() => continue,
                     _ => {}
                 }
 
@@ -421,7 +421,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match rolled_up {
                     Some(rolled_up) => common_prefixes.push(rolled_up),
                     None => contents.push(Object {
-                        key: Some(key.clone()),
+                        key: Some(key.to_string()),
                         // The instant the store recorded for the write, rendered the way
                         // `GetObject` and `HeadObject` render it.
                         last_modified: Some(::aws_smithy_types::DateTime::from(

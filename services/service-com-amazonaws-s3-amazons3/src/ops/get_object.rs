@@ -396,15 +396,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let object = match input.version_id.as_deref() {
             None => bucket.object(&input.key),
             Some(version_id) => {
-                let found = bucket.object_version(&input.key, version_id);
-                if found.is_none() {
+                let Some(held) = bucket.stored_version(&input.key, version_id) else {
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::NO_SUCH_VERSION_CODE,
                         404,
                         crate::state::NO_SUCH_VERSION_MESSAGE,
                     ));
+                };
+                // "If the specified version is a delete marker, the response returns a 405
+                // Method Not Allowed error" (`GetObject`'s documentation): a delete marker
+                // holds no bytes, so a read of it is not something this method can do —
+                // and `MethodNotAllowed` is not a shape in this model either.
+                if held.as_delete_marker().is_some() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::METHOD_NOT_ALLOWED_CODE,
+                        405,
+                        crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+                    ));
                 }
-                found
+                held.as_object()
             }
         };
         let Some(object) = object else {
