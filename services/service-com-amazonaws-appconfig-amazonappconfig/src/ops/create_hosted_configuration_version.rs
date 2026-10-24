@@ -264,20 +264,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // helper extension before storing it, and refuses a document the extension
         // rejects. Storing one anyway would leave a version a deployment could serve
         // that AppConfig would have refused at write time.
-        if profile.profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE
-            && !crate::state::feature_flags::is_valid_feature_flags_content(&input.content)
-        {
-            return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(
-                        crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE
-                            .to_string(),
-                    ),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        //
+        // The helper does not only check the document, it REWRITES it: what AppConfig
+        // stores — and serves to a configuration consumer afterwards — is the document
+        // with `_createdAt`/`_updatedAt` stamped on every entry of `flags` and of
+        // `values`. So the bytes kept below are the helper's output for such a profile,
+        // and the caller's bytes unchanged for every other profile Type.
+        let mut content = input.content;
+        if profile.profile_type == crate::state::FEATURE_FLAGS_PROFILE_TYPE {
+            if !crate::state::feature_flags::is_valid_feature_flags_content(&content) {
+                return Err(CreateHostedConfigurationVersionErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(
+                            crate::state::feature_flags::INVALID_FEATURE_FLAGS_CONTENT_MESSAGE
+                                .to_string(),
+                        ),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into());
+            }
+            // The latest version this profile already holds: the stamps record when each
+            // entry first appeared in the profile and when it last changed, so the
+            // instants a previous version recorded are carried over rather than reset by
+            // a write that did not touch that entry.
+            let previous = profile
+                .hosted_versions
+                .values()
+                .next_back()
+                .map(|version| version.content.as_slice());
+            let Some(stamped) = crate::state::feature_flags::stamped_feature_flags_content(
+                &content,
+                previous,
+                std::time::SystemTime::now(),
+            ) else {
+                return Err(CreateHostedConfigurationVersionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The feature-flag document could not be stamped with its flag \
+                             metadata"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            content = stamped;
         }
 
         // `LatestVersionNumber` is the model's optimistic lock: "an optional locking
@@ -319,7 +352,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if !store.reserve_hosted_configuration_bytes(content_length) {
+        // The STORED bytes are what the emulator's heap holds and what
+        // `DeleteHostedConfigurationVersion` releases, so the reservation counts the
+        // helper's output rather than the request's; the per-request bound above is
+        // about the content the caller submitted.
+        let stored_length = content.len();
+        if !store.reserve_hosted_configuration_bytes(stored_length) {
             return Err(
                 CreateHostedConfigurationVersionErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -365,9 +403,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version = crate::state::HostedConfigurationVersion {
             version_number,
             description: input.description,
-            // The exact bytes the caller wrote, so a later read returns the
-            // configuration byte for byte.
-            content: input.content,
+            // The bytes AppConfig stores: the caller's, byte for byte, unless the
+            // profile's Type put them through the feature-flags helper above.
+            content,
             content_type: input.content_type,
             version_label: input.version_label,
         };

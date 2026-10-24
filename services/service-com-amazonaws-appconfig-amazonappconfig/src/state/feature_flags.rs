@@ -15,6 +15,14 @@
 //! document this module accepts is one whose structure the guide allows, not one that
 //! has been round-tripped through AppConfig. The JSON itself is parsed by `serde_json`,
 //! not by anything hand-written here.
+//!
+//! The helper does not only check the document: it REWRITES it before AppConfig stores
+//! it, stamping every entry of `flags` and of `values` with the `_createdAt`/`_updatedAt`
+//! instants the Type reference lists on a flag definition and on a flag's values — which
+//! is why a version read back from a feature-flags profile carries metadata the caller
+//! never wrote. [`stamped_feature_flags_content`] is that rewrite.
+
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -154,6 +162,124 @@ fn is_valid_flag_value(value: &Value) -> bool {
         return false;
     };
     value.get("enabled").is_none_or(Value::is_boolean)
+}
+
+// =============================================================================
+// The helper's rewrite: `_createdAt` / `_updatedAt` on every stamped entry
+// =============================================================================
+
+/// The metadata key naming when an entry first appeared in the profile.
+pub const CREATED_AT_KEY: &str = "_createdAt";
+
+/// The metadata key naming when an entry's content last changed.
+pub const UPDATED_AT_KEY: &str = "_updatedAt";
+
+/// The document's maps whose every entry the helper stamps: one entry per flag in
+/// `flags` (the flag's definition) and one per flag in `values` (that flag's values).
+/// Nothing else in the document is stamped — `version` is a scalar, and an attribute
+/// lives inside a flag definition rather than as an entry of a stamped map.
+pub const STAMPED_MAPS: &[&str] = &["flags", "values"];
+
+/// `content` as the feature-flags helper would store it: the same document with
+/// `_createdAt` and `_updatedAt` on every entry of each map in [`STAMPED_MAPS`].
+///
+/// `previous` is the content of the profile's latest existing hosted version, when it has
+/// one, because the two instants are properties of the ENTRY's history in the profile and
+/// not of this call:
+///
+/// * `_createdAt` is when the entry's key first appeared — carried over from `previous`
+///   when that version already held the key, otherwise `now`.
+/// * `_updatedAt` is when the entry's content last changed — `now` when the entry's body
+///   differs from the one `previous` held (or the key is new), otherwise the instant
+///   carried over from `previous`.
+///
+/// Metadata the CALLER supplied is dropped first: the stamps are the helper's, so a
+/// request cannot dictate them, and a document re-submitted unchanged keeps the instants
+/// the profile already recorded rather than whatever a client echoed back.
+///
+/// `None` when `content` is not a JSON object or the instant is not representable, which
+/// is the caller's signal to refuse rather than store an unstamped document;
+/// [`is_valid_feature_flags_content`] has already rejected the former by the time this
+/// runs on a real request.
+pub fn stamped_feature_flags_content(
+    content: &[u8],
+    previous: Option<&[u8]>,
+    now: SystemTime,
+) -> Option<Vec<u8>> {
+    let mut document = serde_json::from_slice::<Value>(content).ok()?;
+    let previous = previous.and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+    let now = format_instant(now)?;
+    let document_object = document.as_object_mut()?;
+
+    for map_name in STAMPED_MAPS {
+        let Some(entries) = document_object
+            .get_mut(*map_name)
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for (key, entry) in entries.iter_mut() {
+            let Some(entry) = entry.as_object_mut() else {
+                continue;
+            };
+            // What the previous version recorded for this same key, if anything.
+            let prior = previous
+                .as_ref()
+                .and_then(|document| document.get(*map_name))
+                .and_then(|map| map.get(key.as_str()))
+                .and_then(Value::as_object)
+                .cloned();
+
+            entry.remove(CREATED_AT_KEY);
+            entry.remove(UPDATED_AT_KEY);
+
+            let prior_created = prior
+                .as_ref()
+                .and_then(|prior| prior.get(CREATED_AT_KEY))
+                .and_then(Value::as_str);
+            let prior_updated = prior
+                .as_ref()
+                .and_then(|prior| prior.get(UPDATED_AT_KEY))
+                .and_then(Value::as_str);
+            // The previous body, compared with the metadata keys stripped from both
+            // sides, so carrying the stamps forward is not itself read as a change.
+            let unchanged = prior.as_ref().is_some_and(|prior| {
+                let mut body = prior.clone();
+                body.remove(CREATED_AT_KEY);
+                body.remove(UPDATED_AT_KEY);
+                body == *entry
+            });
+
+            let created = prior_created.unwrap_or(now.as_str()).to_string();
+            let updated = if unchanged {
+                prior_updated.unwrap_or(now.as_str()).to_string()
+            } else {
+                now.clone()
+            };
+            entry.insert(CREATED_AT_KEY.to_string(), Value::from(created));
+            entry.insert(UPDATED_AT_KEY.to_string(), Value::from(updated));
+        }
+    }
+
+    serde_json::to_vec(&document).ok()
+}
+
+/// `at` as the instant the stamps carry: an RFC 3339 UTC instant with a fixed
+/// MILLISECOND fraction, the resolution AppConfig's feature-flags helper writes these
+/// stamps at (the recorded documents carry three fractional digits, e.g.
+/// `2026-09-07T05:48:55.763Z`).
+///
+/// The calendar part comes from the same `aws-smithy-types` date type the wire serializer
+/// uses rather than from a second date implementation here; only the fraction is written
+/// out to a fixed width, because that type trims a trailing zero and a stamp's width must
+/// not depend on the value of its milliseconds.
+fn format_instant(at: SystemTime) -> Option<String> {
+    let millis = i64::try_from(at.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis()).ok()?;
+    let whole = ::aws_smithy_types::DateTime::from_secs(millis.div_euclid(1_000))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    let civil = whole.strip_suffix('Z')?;
+    Some(format!("{civil}.{:03}Z", millis.rem_euclid(1_000)))
 }
 
 /// Whether `key` matches the schema's flag/attribute key pattern,
