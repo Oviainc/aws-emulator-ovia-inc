@@ -220,6 +220,18 @@ pub(crate) fn instant(case: &str, body: &Value, member: &str) -> f64 {
     }
 }
 
+/// Whether `member` carries nothing: absent, null, or an empty collection — the one
+/// reading every suite asserts "the request named none of this, so the record carries
+/// nothing for it" through, so two of them cannot drift.
+pub(crate) fn carries_nothing(body: &Value, member: &str) -> bool {
+    body.get(member).is_none_or(|value| match value {
+        Value::Null => true,
+        Value::Object(map) => map.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    })
+}
+
 /// A minted id is ten lowercase alphanumerics.
 pub(crate) fn assert_minted_id(case: &str, member: &str, id: &str) {
     assert_eq!(
