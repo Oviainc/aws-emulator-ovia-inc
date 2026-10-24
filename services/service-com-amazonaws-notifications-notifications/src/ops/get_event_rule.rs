@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEventRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEventRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEventRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored EventRule the arn names, member for member, after
+//! materialising the status transitions the clock had already made due. A 404
+//! when the store holds no rule under that arn.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEventRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEventRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEventRule"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetEventRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Reporting only: this materialises the transitions the clock already
+        // owed at this instant, so a Get cannot report a Region as `CREATING`
+        // after its settling fell due.
+        store.settle_due_event_rules(::std::time::SystemTime::now());
+
+        // The arn is the only key: an arn no EventRule is stored under does not
+        // exist, whatever its shape.
+        let record = store.event_rules.get(&input.arn).ok_or_else(|| {
+            GetEventRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no EventRule exists with arn {}", input.arn),
+                resource_id: input.arn.clone(),
+            })
+        })?;
+
+        Ok(GetEventRuleOutput {
+            arn: record.arn.clone(),
+            notification_configuration_arn: record.notification_configuration_arn.clone(),
+            creation_time: record.creation_time,
+            source: record.source.clone(),
+            event_type: record.event_type.clone(),
+            event_pattern: record.reported_event_pattern(),
+            regions: record.regions.clone(),
+            managed_rules: record.managed_rules(),
+            status_summary_by_region: record.status_summary_by_region(),
+        })
     }
 }

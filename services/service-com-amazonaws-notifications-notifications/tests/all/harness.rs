@@ -89,3 +89,69 @@ pub(crate) fn encode_path_label(value: &str) -> String {
 pub(crate) fn error_code(response: &Value) -> String {
     response["__type"].as_str().unwrap_or_default().to_string()
 }
+
+/// Whether `value` matches the `NotificationConfigurationArn` pattern the model
+/// declares,
+/// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}$`,
+/// checked by hand so these suites need no regex dependency.
+pub(crate) fn is_configuration_arn(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("arn:") else {
+        return false;
+    };
+    let Some((partition, rest)) = rest.split_once(':') else {
+        return false;
+    };
+    if !(3..=10).contains(&partition.len())
+        || !partition
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'-')
+    {
+        return false;
+    }
+    let Some(rest) = rest.strip_prefix("notifications::") else {
+        return false;
+    };
+    let Some((account, resource)) = rest.split_once(':') else {
+        return false;
+    };
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some(id) = resource.strip_prefix("configuration/") else {
+        return false;
+    };
+    is_arn_id(id)
+}
+
+/// Whether `value` matches the `EventRuleArn` pattern the model declares,
+/// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}/rule/[a-z0-9]{27}$`
+/// — a configuration arn with a `/rule/<id>` segment appended.
+pub(crate) fn is_event_rule_arn(value: &str) -> bool {
+    let Some((configuration, id)) = value.rsplit_once("/rule/") else {
+        return false;
+    };
+    is_configuration_arn(configuration) && is_arn_id(id)
+}
+
+/// Whether `id` is an arn id segment as this service's arn patterns declare it:
+/// `[a-z0-9]{27}`.
+fn is_arn_id(id: &str) -> bool {
+    id.len() == 27 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether a rendered timestamp is a real instant: epoch seconds past 2020, or
+/// an RFC 3339 string in this century. This framework renders a timestamp member
+/// in either encoding depending on the schema, so both are accepted — but a zero
+/// or a placeholder is not.
+pub(crate) fn is_an_instant(value: &Value) -> bool {
+    match value {
+        Value::Number(_) => value.as_f64().is_some_and(|secs| secs > 1_600_000_000.0),
+        Value::String(rendered) => {
+            rendered.len() >= 20
+                && rendered.starts_with("20")
+                && rendered[..4].bytes().all(|b| b.is_ascii_digit())
+                && rendered.contains('T')
+        }
+        _ => false,
+    }
+}
