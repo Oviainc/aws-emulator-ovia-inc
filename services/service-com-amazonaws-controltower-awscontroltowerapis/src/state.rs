@@ -30,6 +30,9 @@
 //!   `EnableBaseline` is REFUSED past that cap rather than growing the store (see
 //!   [`record_enablement`]), because an enablement is a resource a caller must tear down
 //!   rather than a history record a newer one may evict;
+//! * `enabled_controls` holds at most [`MAX_ENABLED_CONTROLS`] control enablements — one
+//!   per control/target pair `EnableControl` is called for — and `EnableControl` is
+//!   REFUSED past that cap for the same reason as `EnableBaseline`;
 //! * `tags` is keyed by the ARNs of the two stores above, and an entry is dropped with
 //!   the resource it tags, so it is bounded by them.
 //!
@@ -47,14 +50,16 @@ pub const ARN_NAMESPACE: &str = "controltower";
 /// read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long an asynchronous operation — a landing zone one or a baseline one — stays
-/// `IN_PROGRESS` before the clock owes it a terminal status.
+/// How long an asynchronous operation stays non-terminal before the clock owes it a
+/// terminal status — a landing zone or baseline operation its `IN_PROGRESS`, a control
+/// enablement its `UNDER_CHANGE`.
 ///
-/// `CreateLandingZone`/`DeleteLandingZone` "start an asynchronous operation" (model
-/// docs), so a caller must be able to observe `IN_PROGRESS` and a `PROCESSING` landing
-/// zone. AWS takes tens of minutes, which no emulator can usefully reproduce and which
-/// AWS does not document as a contract, so this span is CHOSEN — kept short enough that
-/// a test can wait for it and long enough that the call that starts the operation always
+/// `CreateLandingZone`/`DeleteLandingZone` "start an asynchronous operation" and
+/// `EnableControl` leaves the control `UNDER_CHANGE` ("the EnabledControl configuration
+/// is changing", model docs), so a caller must be able to observe the transient status.
+/// AWS takes tens of minutes, which no emulator can usefully reproduce and which AWS
+/// does not document as a contract, so this span is CHOSEN — kept short enough that a
+/// test can wait for it and long enough that the call that starts the operation always
 /// returns before it elapses.
 pub const OPERATION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
@@ -67,6 +72,40 @@ pub const OPERATION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// is CHOSEN: large enough that no lifecycle an emulator client drives reaches it, small
 /// enough to bound the store.
 pub const MAX_LANDING_ZONE_OPERATIONS: usize = 1024;
+
+/// The most enabled controls this account's store holds.
+///
+/// `EnableControl` is the one call a caller can repeat to grow the enabled-control map
+/// (each distinct control/target pair is a new entry), so the map is bounded and the
+/// call past the bound is refused with the modelled `ServiceQuotaExceededException`
+/// (HTTP 402) rather than growing the store. AWS publishes per-OU control quotas but
+/// not one number for an account, so this value is CHOSEN: far above any lifecycle an
+/// emulator client drives, small enough to bound the store and the per-request scan
+/// `ListEnabledControls` runs under the state lock.
+pub const MAX_ENABLED_CONTROLS: usize = 1024;
+
+/// The most `EnabledControlParameter`s one `EnableControl` request may carry.
+///
+/// `EnabledControlParameters` carries no `@length` trait, so the front door imposes no
+/// count on it and the only other ceiling is the server's request-body limit — which
+/// admits hundreds of thousands of entries. The count a caller chooses is therefore
+/// bounded HERE, before any per-parameter work runs, and refused with the modelled
+/// `ValidationException`. The value is CHOSEN: an AWS Control Tower control is
+/// configured by a handful of parameters, so this is far above any real configuration
+/// and small enough that the duplicate-key pass and the stored record are bounded.
+pub const MAX_ENABLED_CONTROL_PARAMETERS: usize = 200;
+
+/// The most bytes one `EnableControl` request's `parameters` may weigh, keys and
+/// documents together.
+///
+/// A parameter count alone does not bound the store: an `EnabledControlParameter$value`
+/// is an unconstrained `Document`, so one parameter can carry a whole body. The weight
+/// is measured with [`document_weight_within`], which stops as soon as this cap is
+/// exceeded, and a request above it is refused with the modelled `ValidationException`.
+/// CHOSEN for the same reason as the count: orders of magnitude above any real control
+/// configuration, and small enough that [`MAX_ENABLED_CONTROLS`] records bound the
+/// store's size in bytes as well as in entries.
+pub const MAX_ENABLED_CONTROL_PARAMETER_BYTES: usize = 64 * 1024;
 
 /// The most baseline operation records the log retains.
 ///
@@ -186,6 +225,68 @@ impl LandingZoneDriftStatus {
             Self::InSync => "IN_SYNC",
         }
     }
+}
+
+/// `DriftStatus`: whether an enabled control still matches the configuration Control
+/// Tower deployed.
+///
+/// Wire values from the model's `DriftStatus` enum, reported through
+/// `DriftStatusSummary$driftStatus` and the two `EnabledControlDriftTypes` members
+/// (`DRIFTED` | `IN_SYNC` | `NOT_CHECKING` | `UNKNOWN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftStatus {
+    Drifted,
+    InSync,
+    NotChecking,
+    Unknown,
+}
+
+impl DriftStatus {
+    /// The value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Drifted => "DRIFTED",
+            Self::InSync => "IN_SYNC",
+            Self::NotChecking => "NOT_CHECKING",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// A persisted enabled control: one control applied to one target.
+///
+/// Everything `ListEnabledControls` and `GetEnabledControl` report about a control is
+/// read from here, so the two agree by construction. `parameters` keeps the caller's
+/// `EnabledControlParameter` documents in the order they were supplied, and
+/// `target_regions` the regions the control was deployed into at enablement time.
+#[derive(Debug, Clone)]
+pub struct EnabledControl {
+    pub arn: String,
+    pub control_identifier: String,
+    pub target_identifier: String,
+    /// `EnabledControlSummary$parentIdentifier` — "the ARN of the parent enabled control
+    /// from which this control inherits its configuration, if applicable". A control
+    /// `EnableControl` applied directly to its target inherits from nothing, and this
+    /// service stores no organizational hierarchy to derive inheritance from, so it is
+    /// `None` for every control this emulator enables.
+    pub parent_identifier: Option<String>,
+    /// `EnabledControlParameter`s as supplied, in order.
+    pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
+    /// The regions this control was deployed into: the landing zone's governed regions
+    /// when one is deployed, else the region the enabling request was signed for.
+    pub target_regions: Vec<String>,
+    pub status: EnablementStatus,
+    /// `EnablementStatusSummary$lastOperationIdentifier`: the identifier of the most
+    /// recent control operation against this control.
+    pub last_operation_identifier: String,
+    pub drift_status: DriftStatus,
+    /// `EnabledControlDriftTypes$inheritance`.
+    pub inheritance_drift_status: DriftStatus,
+    /// `EnabledControlDriftTypes$resource`.
+    pub resource_drift_status: DriftStatus,
+    /// The instant the clock owes this control its terminal enablement status. Stored,
+    /// never slept on: a reader materialises the transition once it is due.
+    pub due_at: SystemTime,
 }
 
 /// A persisted landing zone. Everything `GetLandingZone` reports is read from here.
@@ -342,6 +443,11 @@ pub struct ComAmazonawsControltowerAwscontroltowerapisState {
     /// The operation log, keyed by `operationIdentifier`. Append-only up to
     /// [`MAX_LANDING_ZONE_OPERATIONS`] records; see the module header on retention.
     pub landing_zone_operations: HashMap<String, LandingZoneOperation>,
+    /// Enabled controls keyed by their own ARN — the single home for this service's
+    /// control enablements, written by `EnableControl` and read by
+    /// `ListEnabledControls`/`GetEnabledControl`. Holds at most
+    /// [`MAX_ENABLED_CONTROLS`] entries.
+    pub enabled_controls: HashMap<String, EnabledControl>,
     /// Enabled baselines keyed by the `EnabledBaseline` ARN this service minted for them.
     pub enabled_baselines: HashMap<String, EnabledBaseline>,
     /// The baseline operation log, keyed by `operationIdentifier`. Append-only up to
@@ -384,6 +490,25 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             } else {
                 LandingZoneStatus::Active
             };
+        }
+
+        for control in self.enabled_controls.values_mut() {
+            if control.status == EnablementStatus::UnderChange && now >= control.due_at {
+                control.status = EnablementStatus::Succeeded;
+                // Drift is only assessable once the configuration is deployed: while the
+                // control is `UNDER_CHANGE` the service "is not able to check the drift
+                // status" (`UNKNOWN`), and the deployment that completes here is of the
+                // configuration the service expects, so nothing has diverged from it yet.
+                if control.drift_status == DriftStatus::Unknown {
+                    control.drift_status = DriftStatus::InSync;
+                }
+                if control.inheritance_drift_status == DriftStatus::Unknown {
+                    control.inheritance_drift_status = DriftStatus::InSync;
+                }
+                if control.resource_drift_status == DriftStatus::Unknown {
+                    control.resource_drift_status = DriftStatus::InSync;
+                }
+            }
         }
 
         for operation in self.baseline_operations.values_mut() {
@@ -451,6 +576,55 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// [`settle`]: Self::settle
     pub fn has_operation_in_flight(&self, arn: &str) -> bool {
         any_operation_in_flight(&self.landing_zone_operations, arn)
+    }
+
+    /// The control already enabled for `control_identifier` on `target_identifier`, or
+    /// `None` when that pair is not enabled.
+    ///
+    /// A control is enabled at most once per target, so this is what `EnableControl`
+    /// reads to refuse a repeat. The ARN tie-break keeps the answer independent of the
+    /// map's iteration order should a pair ever appear twice.
+    pub fn enabled_control_on_target(
+        &self,
+        control_identifier: &str,
+        target_identifier: &str,
+    ) -> Option<&EnabledControl> {
+        self.enabled_controls
+            .values()
+            .filter(|control| {
+                control.control_identifier == control_identifier
+                    && control.target_identifier == target_identifier
+            })
+            .min_by(|a, b| a.arn.cmp(&b.arn))
+    }
+
+    /// The regions the deployed landing zone governs, read out of its `Manifest`
+    /// document's `governedRegions` list.
+    ///
+    /// Empty when no landing zone is deployed or its manifest carries no such list: a
+    /// control enablement then falls back to the region its request was signed for. The
+    /// account holds at most one landing zone; the ARN order makes the choice total
+    /// anyway, so the answer never depends on the map's iteration order.
+    pub fn governed_regions(&self) -> Vec<String> {
+        use ::aws_smithy_types::Document;
+
+        let Some(landing_zone) = self.landing_zones.values().min_by(|a, b| a.arn.cmp(&b.arn))
+        else {
+            return Vec::new();
+        };
+        let Document::Object(members) = &landing_zone.manifest else {
+            return Vec::new();
+        };
+        let Some(Document::Array(regions)) = members.get("governedRegions") else {
+            return Vec::new();
+        };
+        regions
+            .iter()
+            .filter_map(|region| match region {
+                Document::String(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The identifier of the earliest-started operation still `IN_PROGRESS` against ANY
@@ -827,6 +1001,73 @@ pub fn landing_zone_arn(region: &str, landing_zone_id: &str) -> String {
         region,
         &format!("landingzone/{landing_zone_id}"),
     )
+}
+
+/// A fresh enabled-control resource id, used as the ARN's resource segment.
+///
+/// The same 36-character lowercase-hex UUID form as an `OperationIdentifier`, which
+/// keeps the minted ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
+pub fn new_enabled_control_id() -> String {
+    new_operation_identifier()
+}
+
+/// `arn:aws:controltower:<region>:<account>:enabledcontrol/<id>`.
+///
+/// Built through `engine::emulator_arn`, so the account segment is the emulator's
+/// canonical account id rather than a literal.
+pub fn enabled_control_arn(region: &str, enabled_control_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("enabledcontrol/{enabled_control_id}"),
+    )
+}
+
+/// The approximate size in bytes of `document`, or `None` as soon as it exceeds `cap`.
+///
+/// Walks the document with an EXPLICIT stack rather than by recursion, so a deeply
+/// nested value cannot overflow the thread's stack, and stops at the first node that
+/// takes the running total past `cap`. A container wider than the budget left is refused
+/// BEFORE its children are pushed, so both the walk and the stack it uses cost at most
+/// `cap` whatever the caller sent. A scalar counts as its machine width and a string,
+/// key or structural node as the bytes it holds — an approximation, which is all a bound
+/// needs.
+pub fn document_weight_within(document: &::aws_smithy_types::Document, cap: usize) -> Option<usize> {
+    use ::aws_smithy_types::Document;
+
+    /// What a scalar or a container node itself costs, before its contents.
+    const NODE_WEIGHT: usize = 8;
+
+    let mut total = 0usize;
+    let mut pending: Vec<&Document> = vec![document];
+    while let Some(node) = pending.pop() {
+        let weight = match node {
+            Document::Null | Document::Bool(_) | Document::Number(_) => NODE_WEIGHT,
+            Document::String(value) => value.len(),
+            Document::Array(items) => {
+                // More children than the whole remaining budget cannot be summarised
+                // within it, so the width is refused before the stack grows by it.
+                if items.len() > cap.saturating_sub(pending.len()) {
+                    return None;
+                }
+                pending.extend(items.iter());
+                NODE_WEIGHT
+            }
+            Document::Object(members) => {
+                if members.len() > cap.saturating_sub(pending.len()) {
+                    return None;
+                }
+                let keys = members.keys().map(String::len).sum::<usize>();
+                pending.extend(members.values());
+                NODE_WEIGHT.saturating_add(keys)
+            }
+        };
+        total = total.saturating_add(weight);
+        if total > cap {
+            return None;
+        }
+    }
+    Some(total)
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists one control enablement — a control applied to a target — in
+//! [`crate::state`], and starts the asynchronous operation that deploys it: the stored
+//! control is `UNDER_CHANGE` until [`crate::state::OPERATION_SETTLE_AFTER`] has elapsed,
+//! which is what `ListEnabledControls` and `GetEnabledControl` report back.
+//!
+//! Implemented: this operation no longer answers HTTP 501. It is the writer those two
+//! reporting operations read, so it is implemented with them rather than left a stub
+//! that would leave the enabled-control list permanently empty.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +169,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableControl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(EnableControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `EnabledControlParameters` carries no modelled length, so the count and the
+        // weight of what a caller sends are bounded HERE, before any per-parameter work
+        // runs: both caps are refused with this operation's own `ValidationException`,
+        // naming the member and the bound.
+        let supplied = input.parameters.unwrap_or_default();
+        if supplied.len() > crate::state::MAX_ENABLED_CONTROL_PARAMETERS {
+            return Err(EnableControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "parameters carries {} entries, more than the {} a control may be \
+                         configured with",
+                        supplied.len(),
+                        crate::state::MAX_ENABLED_CONTROL_PARAMETERS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // One pass over a set of the keys already seen, so detecting a repeat costs
+        // O(n log n) in the entry count rather than O(n^2). The model declares no
+        // uniqueness constraint on `EnabledControlParameters`, so this refusal is CHOSEN:
+        // a parameter is addressed by its `key`, so a request carrying one key twice does
+        // not describe one configuration.
+        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        let mut weight = 0usize;
+        for parameter in &supplied {
+            if !seen.insert(parameter.key.as_str()) {
+                return Err(EnableControlErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "parameters carries key {} more than once; each control \
+                             parameter key may be given at most once",
+                            parameter.key
+                        ),
+                    },
+                )
+                .into());
+            }
+            // The budget left for this value, so the whole list is measured once and the
+            // walk stops at the first node that takes it past the cap.
+            let budget = crate::state::MAX_ENABLED_CONTROL_PARAMETER_BYTES
+                .saturating_sub(weight.saturating_add(parameter.key.len()));
+            let Some(value_weight) = crate::state::document_weight_within(&parameter.value, budget)
+            else {
+                return Err(EnableControlErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "parameters weighs more than the {} bytes a control \
+                             configuration may hold",
+                            crate::state::MAX_ENABLED_CONTROL_PARAMETER_BYTES
+                        ),
+                    },
+                )
+                .into());
+            };
+            weight = weight
+                .saturating_add(parameter.key.len())
+                .saturating_add(value_weight);
+        }
+
+        let parameters: Vec<(String, ::aws_smithy_types::Document)> = supplied
+            .into_iter()
+            .map(|parameter| (parameter.key, parameter.value))
+            .collect();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // A control is enabled at most once per target. A repeat while the first
+        // enablement is still deploying would race it, which is the inconsistent state
+        // `ConflictException` reports; once it is deployed the request asks for something
+        // that already exists.
+        if let Some(existing) =
+            store.enabled_control_on_target(&input.control_identifier, &input.target_identifier)
+        {
+            let existing_arn = existing.arn.clone();
+            if existing.status == crate::state::EnablementStatus::UnderChange {
+                return Err(EnableControlErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "enabled control {existing_arn} is still being deployed on \
+                             target {}; enabling control {} again now would leave it in an \
+                             inconsistent state",
+                            input.target_identifier, input.control_identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+            return Err(EnableControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "control {} is already enabled on target {} as {existing_arn}",
+                        input.control_identifier, input.target_identifier
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store's bound, surfaced as the quota error this operation models rather
+        // than by growing the store without limit.
+        if store.enabled_controls.len() >= crate::state::MAX_ENABLED_CONTROLS {
+            return Err(EnableControlErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds {} enabled controls, the most AWS \
+                         Control Tower emulates",
+                        crate::state::MAX_ENABLED_CONTROLS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn =
+            crate::state::enabled_control_arn(&region, &crate::state::new_enabled_control_id());
+        let operation_identifier = crate::state::new_operation_identifier();
+
+        // A control is deployed into the regions the landing zone governs; with no
+        // landing zone deployed, the only region this request names is the one it was
+        // signed for.
+        let mut target_regions = store.governed_regions();
+        if target_regions.is_empty() {
+            target_regions.push(region);
+        }
+
+        store.enabled_controls.insert(
+            arn.clone(),
+            crate::state::EnabledControl {
+                arn: arn.clone(),
+                control_identifier: input.control_identifier,
+                target_identifier: input.target_identifier,
+                // This control was applied directly to its target, so it inherits its
+                // configuration from no other enabled control.
+                parent_identifier: None,
+                parameters,
+                target_regions,
+                status: crate::state::EnablementStatus::UnderChange,
+                last_operation_identifier: operation_identifier.clone(),
+                // Drift is not assessable until the configuration is deployed; `settle`
+                // moves these to `IN_SYNC` once the enablement is due.
+                drift_status: crate::state::DriftStatus::Unknown,
+                inheritance_drift_status: crate::state::DriftStatus::Unknown,
+                resource_drift_status: crate::state::DriftStatus::Unknown,
+                due_at: now + crate::state::OPERATION_SETTLE_AFTER,
+            },
+        );
+
+        if let Some(tags) = input.tags {
+            store.tags.insert(arn.clone(), tags.into_iter().collect());
+        }
+
+        Ok(EnableControlOutput {
+            operation_identifier,
+            arn: Some(arn),
+        })
     }
 }
