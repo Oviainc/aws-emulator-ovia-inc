@@ -81,6 +81,8 @@ mod modeled_constraint_refusals;
 mod negative_class_rejections;
 #[path = "all/object_malware_scan.rs"]
 mod object_malware_scan;
+#[path = "all/organization_configuration.rs"]
+mod organization_configuration;
 #[path = "all/publishing_destination_lifecycle.rs"]
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]
