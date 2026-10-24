@@ -259,6 +259,7 @@ async fn accept_invitation_accepts_a_pending_invitation_and_the_read_reports_it(
             let detector_id = enabled_detector(&router).await;
             seed_invitation(
                 &engine,
+                REGION,
                 &detector_id,
                 administrator_id,
                 invitation_id,
@@ -390,8 +391,15 @@ async fn administrator_account(
 
 /// Put one pending invitation in the detector's inbox, through this service's own
 /// state module — the store the handlers read.
-fn seed_invitation(
+///
+/// `region` is the Region the detector's create was signed for, because a detector is
+/// a REGIONAL resource and the store resolves it under that Region. Shared with the
+/// `administrator_disassociation` suite, which needs the same seam for the same
+/// reason: no request this single-account emulator can answer delivers an invitation
+/// to its own inbox.
+pub(crate) fn seed_invitation(
     engine: &engine::InMemoryEngine,
+    region: &str,
     detector_id: &str,
     administrator_id: &str,
     invitation_id: &str,
@@ -400,7 +408,7 @@ fn seed_invitation(
     let state = service_state(engine).expect("this service's state");
     let mut state = state.lock();
     let detector = state
-        .detector_in_mut(REGION, detector_id)
+        .detector_in_mut(region, detector_id)
         .expect("the detector the create minted");
     detector.received_invitations.insert(
         administrator_id.to_string(),
