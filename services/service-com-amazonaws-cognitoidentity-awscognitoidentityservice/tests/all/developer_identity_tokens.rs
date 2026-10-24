@@ -62,7 +62,9 @@ type MintingCase<'a> = (&'a str, &'a str, Vec<Login<'a>>, Option<i64>);
 type InvalidLoginsCase<'a> = (&'a str, Option<&'a str>, Vec<Login<'a>>);
 
 /// Create a pool, optionally with a `DeveloperProviderName`, and return its minted id.
-async fn pool_with_developer_provider(
+/// `pub(crate)` so a sibling suite in this test target drives the same flow rather than a
+/// second copy of this helper.
+pub(crate) async fn pool_with_developer_provider(
     emulator: &Emulator,
     name: &str,
     developer_provider: Option<&str>,
@@ -83,8 +85,9 @@ async fn pool_with_developer_provider(
 
 /// The `GetOpenIdTokenForDeveloperIdentity` request for one case: `IdentityId` and
 /// `TokenDuration` are sent only when the row carries them, so a row with `None`
-/// exercises the member's absence.
-fn token_request(
+/// exercises the member's absence. `pub(crate)` for the same reason as
+/// [`pool_with_developer_provider`].
+pub(crate) fn token_request(
     pool_id: &str,
     logins: &[Login<'_>],
     identity_id: Option<&str>,

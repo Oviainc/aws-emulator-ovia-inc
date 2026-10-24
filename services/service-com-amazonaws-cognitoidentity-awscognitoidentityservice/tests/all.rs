@@ -17,6 +17,8 @@ mod developer_identity_tokens;
 mod identity_pool_flow;
 #[path = "all/identity_pool_roles.rs"]
 mod identity_pool_roles;
+#[path = "all/lookup_developer_identity.rs"]
+mod lookup_developer_identity;
 #[path = "all/principal_tag_attribute_map.rs"]
 mod principal_tag_attribute_map;
 #[path = "all/resource_tags.rs"]
