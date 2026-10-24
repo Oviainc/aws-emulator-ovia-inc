@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVpcAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVpcAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVpcAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -150,18 +140,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVpcAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVpcAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVpcAttachment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateVpcAttachmentErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The update acts on an EXISTING attachment addressed by its path. One id space
+        // holds every attachment kind and this operation changes VPC attachments, so an id
+        // naming an attachment of another kind names no VPC attachment — the same
+        // not-found answer `GetVpcAttachment` gives it.
+        let not_found = || {
+            UpdateVpcAttachmentErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::ATTACHMENT_KIND,
+                    &input.attachment_id,
+                ),
+            )
+        };
+        // The record is taken by value and written back only once every rule below holds,
+        // so a refused update leaves the stored attachment exactly as it was.
+        let Some(mut record) = store.attachments.get(&input.attachment_id).cloned() else {
+            return Err(not_found().into());
+        };
+        let crate::state::AttachmentDetail::Vpc {
+            subnet_arns: held_subnets,
+            options: held_options,
+        } = record.detail.clone()
+        else {
+            return Err(not_found().into());
+        };
+
+        // An attachment accepts a change only once it is settled: one whose own creation or
+        // previous change is still in flight, or which is still waiting for the acceptance
+        // its core network policy asked for, would be left inconsistent by a second change
+        // — which is what the modelled `ConflictException` (409) reports ("Updating or
+        // deleting the resource can cause an inconsistent state"). Unlike a dependency
+        // refusal this one clears by itself when the transition the clock owes falls due,
+        // so 409 — which an SDK retry loop retries — is the answer, not a terminal 400.
+        let held_state = record.state_at(now);
+        if held_state != crate::state::STATE_AVAILABLE {
+            return Err(UpdateVpcAttachmentErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "attachment {} is {held_state} and cannot be updated until it is {}",
+                        record.id,
+                        crate::state::STATE_AVAILABLE
+                    ),
+                    resource_id: record.id.clone(),
+                    resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // How long the subnet list may become: its bound, or the length a create left it at
+        // if that is longer, so an update can never GROW it past the bound but one of an
+        // attachment already beyond it is not frozen.
+        let limit = crate::state::MAX_SUBNETS_PER_VPC_ATTACHMENT.max(held_subnets.len());
+
+        // Each list is judged by `crate::state::check_subnet_list`, the one function the
+        // create judges its own `SubnetArns` by: its LENGTH first, before anything walks it
+        // — `SubnetArnList` carries no modelled `@length`, so a caller chooses how long it
+        // is — then every entry a subnet of the VPC's Region, which is this attachment's
+        // edge location, and no entry twice. Either list may be absent or empty, which asks
+        // for no change to the subnets.
+        let added = input.add_subnet_arns.unwrap_or_default();
+        let removed = input.remove_subnet_arns.unwrap_or_default();
+        crate::state::check_subnet_list(
+            crate::state::FIELD_ADD_SUBNET_ARNS,
+            &record.edge_location,
+            &added,
+            limit,
+        )
+        .map_err(UpdateVpcAttachmentErrorModeled::ValidationException)?;
+        crate::state::check_subnet_list(
+            crate::state::FIELD_REMOVE_SUBNET_ARNS,
+            &record.edge_location,
+            &removed,
+            limit,
+        )
+        .map_err(UpdateVpcAttachmentErrorModeled::ValidationException)?;
+
+        // Both lists are now at most `limit` long, and every membership test below goes
+        // through a set built ONCE, so the whole walk costs O(n log n) rather than a scan
+        // per entry — the store lock is held for all of it.
+        let removing: ::std::collections::BTreeSet<&str> =
+            removed.iter().map(String::as_str).collect();
+        let attached: ::std::collections::BTreeSet<&str> =
+            held_subnets.iter().map(String::as_str).collect();
+
+        // A subnet is attached or it is not, so one request cannot both attach and detach
+        // it: that asks for two states at once rather than for a change.
+        if let Some(both) = added
+            .iter()
+            .find(|subnet| removing.contains(subnet.as_str()))
+        {
+            return Err(UpdateVpcAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_ADD_SUBNET_ARNS,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!("subnet {both} is both added and removed"),
+                ),
+            )
+            .into());
+        }
+        // Adding a subnet the attachment already holds, or removing one it does not, names
+        // a subnet that is not in the state the request assumes it is in.
+        if let Some(held) = added
+            .iter()
+            .find(|subnet| attached.contains(subnet.as_str()))
+        {
+            return Err(UpdateVpcAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_ADD_SUBNET_ARNS,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "subnet {held} is already attached to attachment {}",
+                        record.id
+                    ),
+                ),
+            )
+            .into());
+        }
+        if let Some(absent) = removed
+            .iter()
+            .find(|subnet| !attached.contains(subnet.as_str()))
+        {
+            return Err(UpdateVpcAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_REMOVE_SUBNET_ARNS,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!("subnet {absent} is not attached to attachment {}", record.id),
+                ),
+            )
+            .into());
+        }
+
+        // The resulting list: the kept subnets in the order they were attached, then the
+        // additions in the order the request named them.
+        let mut subnet_arns: Vec<String> = held_subnets
+            .iter()
+            .filter(|subnet| !removing.contains(subnet.as_str()))
+            .cloned()
+            .collect();
+        subnet_arns.extend(added.iter().cloned());
+        // An attachment reaches its VPC THROUGH its subnets, so a request that would take
+        // the last one away is refused rather than leaving an attachment that attaches
+        // nothing — the rule the create enforces on its own list.
+        if subnet_arns.is_empty() {
+            return Err(UpdateVpcAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_REMOVE_SUBNET_ARNS,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    "a VPC attachment must keep at least one subnet".to_string(),
+                ),
+            )
+            .into());
+        }
+        // Only the LENGTH of the composed list can still fail: its entries are the stored
+        // ones and the added ones, each already judged above. Growing it is what
+        // `AddSubnetArns` asks for, so that is the member the bound is reported against.
+        crate::state::check_subnet_count(
+            crate::state::FIELD_ADD_SUBNET_ARNS,
+            subnet_arns.len(),
+            limit,
+        )
+        .map_err(UpdateVpcAttachmentErrorModeled::ValidationException)?;
+
+        // `Options` names the options the attachment is to have, so a request carrying it
+        // REPLACES all four flags — every member of `VpcOptions` carries a modelled
+        // `@default` of `false` (`smithy_query shape=VpcOptions`), so one the request
+        // leaves out is off rather than left alone — and a request carrying none leaves the
+        // stored options as they are.
+        let options = input.options.or_else(|| held_options.clone());
+
+        // A request that asks for the state the attachment is already in changes nothing:
+        // it does not move the attachment to `UPDATING`, does not advance `UpdatedAt` and
+        // writes nothing, because there is no change for the service to apply.
+        if subnet_arns == held_subnets
+            && crate::state::same_vpc_options(options.as_ref(), held_options.as_ref())
+        {
+            return Ok(UpdateVpcAttachmentOutput {
+                vpc_attachment: record.to_vpc_attachment(now),
+            });
+        }
+
+        // The change is accepted: the attachment is `UPDATING` until the transition the
+        // clock owes falls due, and `UpdatedAt` is the instant the change was accepted
+        // (`AttachmentRecord::changed_at`).
+        record.detail = crate::state::AttachmentDetail::Vpc {
+            subnet_arns,
+            options,
+        };
+        record.changed_at = Some(now);
+        record.available_at = Some(now + crate::state::SETTLE_DELAY);
+        let vpc_attachment = record.to_vpc_attachment(now);
+        store.attachments.insert(record.id.clone(), record);
+
+        Ok(UpdateVpcAttachmentOutput { vpc_attachment })
     }
 }

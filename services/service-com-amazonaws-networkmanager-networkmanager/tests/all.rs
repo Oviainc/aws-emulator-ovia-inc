@@ -59,3 +59,5 @@ mod state_roundtrip;
 mod unknown_parent_reference;
 #[path = "all/update_site.rs"]
 mod update_site;
+#[path = "all/vpc_attachment_lifecycle.rs"]
+mod vpc_attachment_lifecycle;
