@@ -18,10 +18,10 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, InternalServerException,
+    AutoParticipantRecordingConfiguration, IngestConfiguration, InternalServerException,
     ParticipantRecordingHlsConfiguration, ParticipantThumbnailConfiguration, ParticipantToken,
-    ResourceNotFoundException, ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary,
-    ValidationException,
+    RedundantIngestCredential, ResourceNotFoundException, ServiceQuotaExceededException, Stage,
+    StageEndpoints, StageSummary, ValidationException,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -261,18 +261,20 @@ pub const NO_ACTIVE_SESSION_ID: &str = "";
 /// results to return. Default: 50."
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 50;
 
-/// Total size a participant token's `attributes` map may reach.
+/// Total size an `attributes` map may reach, on every shape of this service that
+/// carries one.
 ///
-/// The model documents it on `CreateParticipantTokenRequest$attributes` and
-/// `ParticipantTokenConfiguration$attributes`: "The maximum length of this field is
-/// 1 KB total." It is a documented limit the model carries no constraint trait for,
-/// so the handler enforces it and answers `ValidationException`.
+/// The model documents it on `CreateParticipantTokenRequest$attributes`,
+/// `ParticipantTokenConfiguration$attributes` and
+/// `CreateIngestConfigurationRequest$attributes` — each "The maximum length of this
+/// field is 1 KB total." It is a documented limit the model carries no constraint trait
+/// for, so the handler enforces it and answers `ValidationException`.
 ///
 /// The measure is the one [`attributes_size`] computes: the sum of the key and value
 /// bytes the caller sent, with no allowance for the JSON punctuation around them. The
 /// model states the limit without stating how it is counted, so the counted thing is
 /// the caller's own data.
-pub const MAX_TOKEN_ATTRIBUTES_BYTES: usize = 1024;
+pub const MAX_ATTRIBUTES_BYTES: usize = 1024;
 
 /// Region an ARN names when the request carries no usable SigV4 credential scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -291,7 +293,7 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 // The product is therefore finite: at most `MAX_STAGES` stages, each with at most
 // `MAX_PARTICIPANT_TOKENS_PER_STAGE` token records, each record holding members the
 // model already bounds (`userId` 0..128, `capabilities` 0..2, and `attributes`
-// capped at [`MAX_TOKEN_ATTRIBUTES_BYTES`]).
+// capped at [`MAX_ATTRIBUTES_BYTES`]).
 // ---------------------------------------------------------------------------
 
 /// Stages this emulator keeps for one engine. Not an AWS quota — this emulator's
@@ -301,6 +303,56 @@ pub const MAX_STAGES: usize = 1_000;
 /// Participant-token records this emulator keeps per stage. Not an AWS quota — this
 /// emulator's own resource guard on the store `CreateParticipantToken` grows.
 pub const MAX_PARTICIPANT_TOKENS_PER_STAGE: usize = 1_000;
+
+/// Ingest configurations this emulator keeps for one engine. Not an AWS quota — this
+/// emulator's own resource guard on the one store `CreateIngestConfiguration` grows,
+/// set the same way [`MAX_STAGES`] is and answered with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_INGEST_CONFIGURATIONS: usize = 1_000;
+
+// ---------------------------------------------------------------------------
+// What an ingest configuration reports beyond what the creating request said
+//
+// `CreateIngestConfiguration` takes the protocol, the stage and the publisher's
+// identity; the three members an `IngestConfiguration` reports that no request
+// supplies — its state, its stage when the request named none, and its redundant
+// credentials — are fixed here, each from the model's own doc for that member.
+// ---------------------------------------------------------------------------
+
+/// State of an ingest configuration nobody is publishing to.
+///
+/// The model documents `IngestConfiguration$state`: "It is `ACTIVE` if a publisher
+/// currently is publishing to the stage associated with the ingest configuration."
+/// Nothing publishes to an emulated stage — no operation of this service starts a
+/// broadcast — so every configuration this service holds reports this value. It is not
+/// a transition the clock owes either: what makes a configuration `ACTIVE` is a
+/// publisher connecting, not time passing, so it does not become `ACTIVE` on its own.
+pub const NO_PUBLISHER_INGEST_CONFIGURATION_STATE: &str = "INACTIVE";
+
+/// `stageArn` of an ingest configuration associated with no stage.
+///
+/// `IngestConfiguration$stageArn` is `@required` while
+/// `CreateIngestConfigurationRequest$stageArn` is optional, and the
+/// `IngestConfigurationStageArn` both target admits the empty string (its pattern's
+/// first alternative, `^$`). Reporting the member as empty is the one reading under
+/// which both hold: a caller that reads `stageArn` off a configuration always finds it
+/// and compares it against a stage ARN, exactly as [`NO_ACTIVE_SESSION_ID`] works for a
+/// stage's session.
+pub const NO_ASSOCIATED_STAGE_ARN: &str = "";
+
+/// Credentials an ingest configuration carries BESIDE its own `streamKey` when
+/// `redundantIngest` is enabled.
+///
+/// `IngestConfiguration$redundantIngestCredentials` is "a list of redundant ingest
+/// credentials, present only when `redundantIngest` is set to `true`", and the Redundant
+/// Ingest section of *IVS RTMP Publishing* it points at describes redundant ingest as
+/// publishing one source over a second, backup path. The configuration's own
+/// `streamKey`/`participantId` are the primary path, so one further credential is what a
+/// backup path takes. The model states no count, so the COUNT is this reading of that
+/// doc; what the model does state is applied exactly — the member is absent unless
+/// redundant ingest is on, and each entry carries its own participant id and its own
+/// ingest key.
+pub const REDUNDANT_INGEST_CREDENTIALS: usize = 1;
 
 /// Marks a `ListStages` page token as this service's, so a token from elsewhere is
 /// refused rather than silently read as a position.
@@ -398,6 +450,92 @@ impl ParticipantTokenRecord {
     }
 }
 
+/// One ingest credential this service minted: the participant a publisher appears as in
+/// the stage, and the ingest key it publishes with.
+///
+/// Reported both as an `IngestConfiguration`'s own `participantId`/`streamKey` and as one
+/// entry of its `redundantIngestCredentials`, which the model gives the same two members.
+#[derive(Debug, Clone)]
+pub struct IngestCredential {
+    pub participant_id: String,
+    pub stream_key: String,
+}
+
+impl IngestCredential {
+    /// The modelled `RedundantIngestCredential` this credential reports.
+    pub fn to_redundant_ingest_credential(&self) -> RedundantIngestCredential {
+        RedundantIngestCredential {
+            participant_id: Some(self.participant_id.clone()),
+            stream_key: Some(self.stream_key.clone()),
+        }
+    }
+}
+
+/// One ingest configuration, as `CreateIngestConfiguration` persisted it and
+/// `GetIngestConfiguration` reports it.
+#[derive(Debug, Clone)]
+pub struct IngestConfigurationRecord {
+    /// The ingest-configuration ARN, and the single key every lookup uses.
+    pub arn: String,
+    pub name: Option<String>,
+    /// `RTMP` or `RTMPS`: the protocol the creating request chose, which the model
+    /// makes `@required` on both the request and the reported configuration.
+    pub ingest_protocol: String,
+    /// The primary ingest key, minted once at creation ([`mint_stream_key`]) and
+    /// reported unchanged on every read, so a publisher that cached it keeps working.
+    pub stream_key: String,
+    /// The stage this configuration is associated with, or [`NO_ASSOCIATED_STAGE_ARN`]
+    /// when the creating request named none.
+    pub stage_arn: String,
+    /// The participant this configuration's publisher appears as in the stage.
+    pub participant_id: String,
+    /// [`NO_PUBLISHER_INGEST_CONFIGURATION_STATE`] while nobody is publishing to it.
+    pub state: String,
+    pub user_id: Option<String>,
+    pub redundant_ingest: bool,
+    /// The backup credentials redundant ingest takes, minted at creation beside the
+    /// primary one. Empty unless [`Self::redundant_ingest`] is set; see
+    /// [`REDUNDANT_INGEST_CREDENTIALS`].
+    pub redundant_ingest_credentials: Vec<IngestCredential>,
+    pub attributes: HashMap<String, String>,
+    pub tags: HashMap<String, String>,
+    /// Creation order, and the stable key a page over these records resumes from — the
+    /// same role it plays on a [`StageRecord`].
+    pub sequence: u64,
+}
+
+impl IngestConfigurationRecord {
+    /// The modelled `IngestConfiguration` this record reports.
+    pub fn to_ingest_configuration(&self) -> IngestConfiguration {
+        IngestConfiguration {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            ingest_protocol: self.ingest_protocol.clone(),
+            stream_key: self.stream_key.clone(),
+            stage_arn: self.stage_arn.clone(),
+            participant_id: self.participant_id.clone(),
+            state: self.state.clone(),
+            user_id: self.user_id.clone(),
+            redundant_ingest: self.redundant_ingest,
+            // "present only when `redundantIngest` is set to `true`", as the member's
+            // own doc states it: see [`REDUNDANT_INGEST_CREDENTIALS`].
+            redundant_ingest_credentials: self.redundant_ingest.then(|| {
+                self.redundant_ingest_credentials
+                    .iter()
+                    .map(IngestCredential::to_redundant_ingest_credential)
+                    .collect()
+            }),
+            // Reported only when the configuration carries attributes, the same way a
+            // participant token's are: the member is optional, and an absent member is
+            // how the model says "none".
+            attributes: (!self.attributes.is_empty()).then(|| self.attributes.clone()),
+            // Always reported, empty map included: `tags` is how a caller reads the tags
+            // back, exactly as on a stage.
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime. A handler reaches it through [`service_state`].
 ///
 /// ONE store per engine, not one per region: the minted ARN names the region the
@@ -413,6 +551,8 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     /// The tokens issued against a stage, keyed by that stage's ARN. Removed with
     /// the stage.
     pub participant_tokens: HashMap<String, Vec<ParticipantTokenRecord>>,
+    /// Every live ingest configuration, keyed by its ARN.
+    pub ingest_configurations: HashMap<String, IngestConfigurationRecord>,
     /// Monotonic counter behind every id this service mints, so two stages created
     /// in the same instant still get distinct ids and a distinct page position.
     next_id: u64,
@@ -454,13 +594,19 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// model-derived; only the BODY is this service's rendering (see
 /// [`crate::scaffolded::Scaffolded::stated`]).
 pub fn store_unavailable<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
-    let message = STORE_UNAVAILABLE_MESSAGE.to_string();
+    internal_server(variant, STORE_UNAVAILABLE_MESSAGE)
+}
+
+/// The modelled 500 `variant` names, stating `message`. The one construction behind
+/// every `InternalServerException` this service answers, so two of them cannot be
+/// assembled two ways.
+fn internal_server<E>(variant: fn(InternalServerException) -> E, message: &str) -> Scaffolded<E> {
     Scaffolded::stated(
         variant(InternalServerException {
-            exception_message: Some(message.clone()),
+            exception_message: Some(message.to_string()),
             ..Default::default()
         }),
-        message,
+        message.to_string(),
     )
 }
 
@@ -473,19 +619,23 @@ pub const STORE_UNAVAILABLE_MESSAGE: &str =
 /// no secret for a participant token, so no token is issued rather than one this service
 /// made up itself.
 pub fn token_minting_failed<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
-    let message = TOKEN_MINTING_FAILED_MESSAGE.to_string();
-    Scaffolded::stated(
-        variant(InternalServerException {
-            exception_message: Some(message.clone()),
-            ..Default::default()
-        }),
-        message,
-    )
+    internal_server(variant, TOKEN_MINTING_FAILED_MESSAGE)
 }
 
 /// The text [`token_minting_failed`] states.
 pub const TOKEN_MINTING_FAILED_MESSAGE: &str =
     "the participant token could not be minted, so no token was issued";
+
+/// The modelled 500 a handler answers when the emulator's credential store minted no
+/// secret for an ingest key, so no ingest configuration is created rather than one
+/// carrying a stream key this service made up itself.
+pub fn stream_key_minting_failed<E>(variant: fn(InternalServerException) -> E) -> Scaffolded<E> {
+    internal_server(variant, STREAM_KEY_MINTING_FAILED_MESSAGE)
+}
+
+/// The text [`stream_key_minting_failed`] states.
+pub const STREAM_KEY_MINTING_FAILED_MESSAGE: &str =
+    "the ingest stream key could not be minted, so no ingest configuration was created";
 
 /// Characters in a minted stage id. The model's `StageArn` pattern allows
 /// `[a-zA-Z0-9-]+` after `stage/`, and caps the whole ARN at 128 characters.
@@ -494,6 +644,11 @@ pub const STAGE_ID_LEN: usize = 12;
 /// Characters in a minted participant id. The model's `ParticipantTokenId` allows
 /// `[a-zA-Z0-9-_]{0,64}`.
 pub const PARTICIPANT_ID_LEN: usize = 12;
+
+/// Characters in a minted ingest-configuration id. The model's
+/// `IngestConfigurationArn` pattern allows `[a-zA-Z0-9-]+` after
+/// `ingest-configuration/`, and caps the whole ARN at 128 characters.
+pub const INGEST_CONFIGURATION_ID_LEN: usize = 12;
 
 /// A fresh id for a resource this service mints: `len` lowercase-hex characters, which
 /// stays inside the `[a-zA-Z0-9-]` / `[a-zA-Z0-9-_]` id charsets the model's `StageArn`
@@ -519,6 +674,17 @@ pub fn mint_id(sequence: u64, len: usize) -> String {
 /// requires: `arn:aws:ivs:<region>:<account>:stage/<id>`.
 pub fn stage_arn(region: &str, stage_id: &str) -> String {
     ::engine::emulator_arn("ivs", region, &format!("stage/{stage_id}"))
+}
+
+/// The ingest-configuration ARN for `ingest_configuration_id`, in the form the model's
+/// `IngestConfigurationArn` pattern requires:
+/// `arn:aws:ivs:<region>:<account>:ingest-configuration/<id>`.
+pub fn ingest_configuration_arn(region: &str, ingest_configuration_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ivs",
+        region,
+        &format!("ingest-configuration/{ingest_configuration_id}"),
+    )
 }
 
 /// When a token issued now for `duration_minutes` expires.
@@ -619,7 +785,7 @@ pub fn issue_token_record(
     })
 }
 
-/// Total size of an `attributes` map, against [`MAX_TOKEN_ATTRIBUTES_BYTES`]: the sum of
+/// Total size of an `attributes` map, against [`MAX_ATTRIBUTES_BYTES`]: the sum of
 /// the key and value bytes the caller sent.
 pub fn attributes_size(attributes: &HashMap<String, String>) -> usize {
     attributes
@@ -653,6 +819,66 @@ pub fn mint_participant_token(credentials: &::emulator_server::CredentialStore) 
     // The participant token is not a credential of this emulator; see above.
     let _ = credentials.delete(&minted.id);
     token
+}
+
+/// One ingest credential: a fresh participant id, and the ingest key minted for it.
+///
+/// The ONE place an ingest credential is built, so the primary credential an ingest
+/// configuration carries and each of its redundant ones are minted alike (the model
+/// gives both the same two members, `participantId` and `streamKey`).
+///
+/// The participant id comes off the store's monotonic counter, so it is distinct from
+/// every other id this store mints — including the participant ids of the stage's
+/// tokens — by construction rather than by probability.
+///
+/// `None` only when the credential store minted no secret, which the caller answers
+/// with [`stream_key_minting_failed`] rather than by reporting a key it made up.
+pub fn mint_ingest_credential(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    credentials: &::emulator_server::CredentialStore,
+    region: &str,
+) -> Option<IngestCredential> {
+    let participant_id = mint_id(state.next_sequence(), PARTICIPANT_ID_LEN);
+    let stream_key = mint_stream_key(credentials, region, &participant_id)?;
+    Some(IngestCredential {
+        participant_id,
+        stream_key,
+    })
+}
+
+/// The ingest key a publisher broadcasts with, for the participant `participant_id` of
+/// a configuration created in `region`.
+///
+/// The FORM is the model's: `StreamKey`'s `@pattern`
+/// `^rt_[0-9]+_[a-z0-9-]+_[a-zA-Z0-9-]+_.+$` reads as
+/// `rt_<account>_<region>_<participant id>_<secret>`, so the account this emulator
+/// presents, the region the creating request was signed for and the participant the key
+/// publishes as are its first three fields, and the secret is the last.
+///
+/// The secret is a credential handed to the caller, and nothing in a service may
+/// construct a secret itself, so it is minted by the one component of this emulator that
+/// generates secrets — the credential store — and then removed from it again, exactly as
+/// [`mint_participant_token`] does: an ingest key authenticates a broadcast to a stage,
+/// not a request to the emulator's API, so the emulator keeps no credential it would
+/// accept as SigV4 and nothing accumulates per call.
+///
+/// `None` when the store minted no secret; see [`mint_ingest_credential`].
+pub fn mint_stream_key(
+    credentials: &::emulator_server::CredentialStore,
+    region: &str,
+    participant_id: &str,
+) -> Option<String> {
+    let minted = credentials.create(&::emulator_server::aws_credentials::AWS_ACCESS_KEY);
+    let secret = minted
+        .secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY)
+        .map(str::to_string);
+    // The ingest key is not a credential of this emulator; see above.
+    let _ = credentials.delete(&minted.id);
+    Some(format!(
+        "rt_{}_{region}_{participant_id}_{}",
+        ::engine::emulator_account_id(),
+        secret?,
+    ))
 }
 
 /// The opaque `nextToken` a `ListStages` page ends with: the creation sequence the
@@ -1029,17 +1255,22 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// The tags attached to the resource `arn` names, or `None` when this store holds no
 /// such resource.
 ///
-/// A stage is the one resource type this store can hold: `CreateStage` is the only
-/// create this service implements, so every other resource type in its ARN shapes names
-/// nothing, and a well-formed ARN naming one is answered exactly as an ARN naming a
-/// deleted stage is — not found. Each such create is its own gap issue, and when one
-/// lands its record joins the match below.
+/// A stage and an ingest configuration are the resource types this store can hold:
+/// `CreateStage` and `CreateIngestConfiguration` are the creates this service
+/// implements, so every other resource type in its ARN shapes names nothing, and a
+/// well-formed ARN naming one is answered exactly as an ARN naming a deleted stage is —
+/// not found. Each such create is its own gap issue, and when one lands its record joins
+/// the match below.
 pub fn resource_tags(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
 ) -> Option<HashMap<String, String>> {
     match arn_resource_type(arn)? {
         "stage" => state.stages.get(arn).map(|stage| stage.tags.clone()),
+        "ingest-configuration" => state
+            .ingest_configurations
+            .get(arn)
+            .map(|configuration| configuration.tags.clone()),
         _ => None,
     }
 }
@@ -1052,6 +1283,10 @@ pub fn resource_tags_mut<'a>(
 ) -> Option<&'a mut HashMap<String, String>> {
     match arn_resource_type(arn)? {
         "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
+        "ingest-configuration" => state
+            .ingest_configurations
+            .get_mut(arn)
+            .map(|configuration| &mut configuration.tags),
         _ => None,
     }
 }

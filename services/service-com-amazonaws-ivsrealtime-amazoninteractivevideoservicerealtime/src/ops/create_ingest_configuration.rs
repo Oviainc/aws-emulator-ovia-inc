@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIngestConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIngestConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIngestConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +100,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource an ingest-configuration quota refusal names, as
+/// `crate::state::quota_exceeded_message` states it.
+const INGEST_CONFIGURATION_QUOTA_RESOURCE: &str = "ingest-configuration";
+
+/// The `IngestProtocol` value that may be used only with insecure ingest enabled.
+///
+/// The model documents the pairing on both members:
+/// `CreateIngestConfigurationRequest$ingestProtocol` ("If this is set to RTMP,
+/// insecureIngest must be set to true") and `$insecureIngest` ("This must be set to
+/// `true`, if `ingestProtocol` is set to `RTMP`"). It is a documented requirement the
+/// model carries no trait for — neither member constrains the other — so the handler
+/// enforces it and answers the modelled `ValidationException`.
+const CLEARTEXT_INGEST_PROTOCOL: &str = "RTMP";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -120,10 +125,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `CreateIngestConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#CreateIngestConfiguration")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#CreateIngestConfiguration",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateIngestConfigurationErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `CreateIngestConfiguration` does not list it, and it is the only
+    // honest answer if the shared engine cannot hand back this service's store, or if the
+    // credential store mints no secret for the ingest key.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -180,18 +193,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIngestConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIngestConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIngestConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                CreateIngestConfigurationErrorModeled::InternalServerException,
+            )
+        })?;
+
+        let attributes = input.attributes.unwrap_or_default();
+        // The 1 KB `attributes` limit is documented, not modeled, so it is refused here —
+        // before anything is minted or persisted, so a refused request leaves no
+        // configuration behind. The same limit, measured the same way, as the one
+        // `CreateParticipantToken` and `CreateStage` enforce on a token's attributes.
+        let size = crate::state::attributes_size(&attributes);
+        if size > crate::state::MAX_ATTRIBUTES_BYTES {
+            return Err(crate::state::validation_failed(
+                CreateIngestConfigurationErrorModeled::ValidationException,
+                // Worded in the construction this service states every constraint refusal
+                // with (`crate::state::violation_clause`): the operation, the member and
+                // the bound it violated, with what the request actually sent.
+                format!(
+                    "{}.attributes is required to have a maximum size of {} bytes, found {size}",
+                    Self::NAME,
+                    crate::state::MAX_ATTRIBUTES_BYTES,
+                ),
+            ));
+        }
+
+        // The documented pairing of the two members (see [`CLEARTEXT_INGEST_PROTOCOL`]):
+        // cleartext ingest is refused unless the request also allows insecure ingest.
+        if input.ingest_protocol == CLEARTEXT_INGEST_PROTOCOL && !input.insecure_ingest {
+            return Err(crate::state::validation_failed(
+                CreateIngestConfigurationErrorModeled::ValidationException,
+                format!(
+                    "{}.insecureIngest is required to be true when ingestProtocol is \
+                     {CLEARTEXT_INGEST_PROTOCOL}, found {}",
+                    Self::NAME,
+                    input.insecure_ingest,
+                ),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The store grows only here, and a record is reclaimed only by an explicit
+        // `DeleteIngestConfiguration`, so the bound is checked before anything is minted
+        // or persisted.
+        if store.ingest_configurations.len() >= crate::state::MAX_INGEST_CONFIGURATIONS {
+            return Err(crate::state::quota_exceeded(
+                CreateIngestConfigurationErrorModeled::ServiceQuotaExceededException,
+                INGEST_CONFIGURATION_QUOTA_RESOURCE,
+                crate::state::MAX_INGEST_CONFIGURATIONS,
+            ));
+        }
+
+        // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
+        // digest already names a live configuration, so one ARN never denotes two of
+        // them — the uniqueness rule `CreateStage` applies to a minted stage ARN.
+        let sequence = store.next_sequence();
+        let mut arn = crate::state::ingest_configuration_arn(
+            &region,
+            &crate::state::mint_id(sequence, crate::state::INGEST_CONFIGURATION_ID_LEN),
+        );
+        while store.ingest_configurations.contains_key(&arn) {
+            let retry = store.next_sequence();
+            arn = crate::state::ingest_configuration_arn(
+                &region,
+                &crate::state::mint_id(retry, crate::state::INGEST_CONFIGURATION_ID_LEN),
+            );
+        }
+
+        // The configuration's own participant id and ingest key, and — only when the
+        // request asked for redundant ingest — the backup credentials beside them. Each
+        // is minted the single way `crate::state` mints an ingest credential, so the
+        // primary and every redundant one carry a key of the same modelled form and a
+        // participant id distinct from every other this store issued.
+        let primary = crate::state::mint_ingest_credential(&mut store, ctx.credential_store(), &region)
+            .ok_or_else(|| {
+                crate::state::stream_key_minting_failed(
+                    CreateIngestConfigurationErrorModeled::InternalServerException,
+                )
+            })?;
+        let mut redundant_ingest_credentials = Vec::new();
+        if input.redundant_ingest {
+            for _ in 0..crate::state::REDUNDANT_INGEST_CREDENTIALS {
+                let credential =
+                    crate::state::mint_ingest_credential(&mut store, ctx.credential_store(), &region)
+                        .ok_or_else(|| {
+                            crate::state::stream_key_minting_failed(
+                                CreateIngestConfigurationErrorModeled::InternalServerException,
+                            )
+                        })?;
+                redundant_ingest_credentials.push(credential);
+            }
+        }
+
+        let record = crate::state::IngestConfigurationRecord {
+            arn: arn.clone(),
+            name: input.name,
+            ingest_protocol: input.ingest_protocol,
+            stream_key: primary.stream_key,
+            // The stage the request named, or the empty ARN the model's own reading of
+            // "no stage" is: `crate::state::NO_ASSOCIATED_STAGE_ARN`. The association is
+            // recorded as the request gave it — `UpdateIngestConfiguration` is what moves
+            // a configuration to another stage — and this operation models no
+            // `ResourceNotFoundException`, so a stage ARN this store does not hold is
+            // persisted rather than refused with an error the model does not declare.
+            stage_arn: input
+                .stage_arn
+                .unwrap_or_else(|| crate::state::NO_ASSOCIATED_STAGE_ARN.to_string()),
+            participant_id: primary.participant_id,
+            // Nobody is publishing to a configuration that has just been created.
+            state: crate::state::NO_PUBLISHER_INGEST_CONFIGURATION_STATE.to_string(),
+            user_id: input.user_id,
+            redundant_ingest: input.redundant_ingest,
+            redundant_ingest_credentials,
+            attributes,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+        };
+
+        // `insecureIngest` is not persisted: no shape in this model reports it (the
+        // modelled `IngestConfiguration` has no such member), so the only thing the
+        // request's value decides is whether the cleartext protocol is admitted, which
+        // is settled above.
+        let ingest_configuration = record.to_ingest_configuration();
+        store.ingest_configurations.insert(arn, record);
+
+        Ok(CreateIngestConfigurationOutput {
+            ingest_configuration: Some(ingest_configuration),
+            ..Default::default()
+        })
     }
 }

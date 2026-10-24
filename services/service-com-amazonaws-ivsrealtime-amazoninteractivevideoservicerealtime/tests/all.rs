@@ -15,6 +15,8 @@
 mod empty_response_framing;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/ingest_configurations.rs"]
+mod ingest_configurations;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/stages.rs"]
