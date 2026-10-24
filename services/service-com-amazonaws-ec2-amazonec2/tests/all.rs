@@ -47,6 +47,8 @@ mod allowed_images_settings;
 mod application_status;
 #[path = "all/associate_address.rs"]
 mod associate_address;
+#[path = "all/authorize_security_group_egress.rs"]
+mod authorize_security_group_egress;
 #[path = "all/availability_zones.rs"]
 mod availability_zones;
 #[path = "all/byoip_cidr_lifecycle.rs"]

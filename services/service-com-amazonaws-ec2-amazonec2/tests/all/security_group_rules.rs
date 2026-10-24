@@ -1049,6 +1049,7 @@ async fn a_group_holds_at_most_the_published_rules_per_direction() {
                 &group_id,
                 false,
                 &ipv4_permission("tcp", Some((443, 443)), &grants),
+                &[],
                 true,
                 REGION,
             );
@@ -1134,7 +1135,7 @@ async fn a_permission_that_does_not_fit_stores_nothing() {
             let store = engine.state::<Ec2State>();
             let mut guard = store.lock();
             let permission = ipv4_permission("tcp", Some((9000, 9000)), &grants);
-            guard.insert_security_group_rules(&group_id, false, &permission, true, REGION)
+            guard.insert_security_group_rules(&group_id, false, &permission, &[], true, REGION)
         };
         assert!(
             minted.is_empty(),
@@ -1223,7 +1224,7 @@ async fn a_rule_a_request_named_is_charged_and_the_delete_gives_it_back() {
         let minted = {
             let store = engine.state::<Ec2State>();
             let mut guard = store.lock();
-            guard.insert_security_group_rules(&group_id, false, &permission, true, REGION)
+            guard.insert_security_group_rules(&group_id, false, &permission, &[], true, REGION)
         };
         assert!(
             !minted.is_empty(),
@@ -1372,7 +1373,7 @@ async fn a_request_naming_no_page_size_gets_at_most_the_documented_maximum() {
                 .map(|cidr| (cidr.as_str(), None))
                 .collect();
             let permission = ipv4_permission("tcp", Some((443, 443)), &grants);
-            guard.insert_security_group_rules(&group_id, false, &permission, false, REGION);
+            guard.insert_security_group_rules(&group_id, false, &permission, &[], false, REGION);
         }
         guard.security_group_rules.len()
     };
