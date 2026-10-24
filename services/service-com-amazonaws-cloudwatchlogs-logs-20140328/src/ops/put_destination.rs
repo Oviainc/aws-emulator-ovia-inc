@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates — or, under a `destinationName` the account already holds, UPDATES — one logical
+//! destination in this account's state from the `targetArn` and `roleArn` the request names,
+//! and reports the stored record. The destination's `arn` is derived from the request's
+//! Region and its own name, its `creationTime` is stamped when it is created, and its
+//! `accessPolicy` is left to `PutDestinationPolicy`: "By default, PutDestination does not set
+//! any access policy with the destination."
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The ARN of the logical object this call creates names the Region the request was
+        // signed for, so it is read off the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: &str| {
+            PutDestinationError::from(PutDestinationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            ))
+        };
+
+        // Both ARNs this operation takes are parsed as ARNs — `targetArn` "The ARN of an
+        // Amazon Kinesis stream to which to deliver matching log events" and `roleArn` "The
+        // ARN of an IAM role that grants CloudWatch Logs permissions to call the Amazon
+        // Kinesis PutRecord operation on the destination stream" — so a value that is not an
+        // ARN at all is refused. The refusal names neither member: the two are parsed
+        // together and reported as one failure
+        // (`crate::state::DESTINATION_ARN_PARSE_FAILED`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDestination"))
+        // Nothing narrower is asserted about either ARN: `Destination$targetArn` documents
+        // the target as a physical resource "(for example, a Kinesis stream)" — an example
+        // rather than a closed set — and whether the role exists and grants those
+        // permissions is IAM's answer, not this service's.
+        if [input.target_arn.as_str(), input.role_arn.as_str()]
+            .iter()
+            .any(|value| crate::state::arn_service_and_resource(value).is_none())
+        {
+            return Err(invalid(crate::state::DESTINATION_ARN_PARSE_FAILED));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDestinationError::from(PutDestinationErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // A put naming a destination the account already holds UPDATES that destination, so
+        // only a put that would ADD one can reach the account's destination quota
+        // (`crate::state::MAX_DESTINATIONS`). This operation models no
+        // `LimitExceededException`, so the refusal is the `InvalidParameterException` it
+        // declares for a parameter it will not accept, naming the ceiling.
+        if !store.destinations.contains_key(&input.destination_name)
+            && store.destinations.len() >= crate::state::MAX_DESTINATIONS
+        {
+            return Err(PutDestinationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "an account can have up to {} destinations",
+                        crate::state::MAX_DESTINATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Creates or updates a destination": a put under a name the account already holds
+        // rewrites that destination's target and role in place, so everything that is not a
+        // parameter of this request survives the update — the ARN it is known by, the instant
+        // it was created, the access policy `PutDestinationPolicy` attached to it, and the
+        // tag set assigned to the resource. A put under a name the account does not hold
+        // creates the destination, stamped with the current wall clock.
+        let destination = store
+            .destinations
+            .entry(input.destination_name.clone())
+            .or_insert_with(|| {
+                crate::state::DestinationRecord::new(
+                    &region,
+                    &input.destination_name,
+                    &input.target_arn,
+                    &input.role_arn,
+                    crate::state::now_ms(),
+                )
+            });
+        destination.target_arn = input.target_arn.clone();
+        destination.role_arn = input.role_arn.clone();
+
+        // `tags` is "An optional list of key-value pairs to associate with the resource", so
+        // a put that names tags assigns exactly those, and a put that names none leaves the
+        // destination's tags as they were: they are the RESOURCE's tag set, the one every
+        // tagging operation reads and writes, not one of the destination's own parameters.
+        if let Some(tags) = input.tags.as_ref() {
+            destination.tags = tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+
+        Ok(PutDestinationOutput {
+            // "The destination" — reported from the stored record, so what this call reports
+            // is what `DescribeDestinations` reports afterwards.
+            destination: Some(destination.reported()),
+        })
     }
 }
