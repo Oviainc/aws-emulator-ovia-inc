@@ -19,10 +19,25 @@ pub struct RemovePermissionInput {
     pub revision_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#RemovePermissionResponse")]
+/// `RemovePermissionResponse`. Its schema and codec come from
+/// [`profiler_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// for the same reason as `GetPolicyResponse`: both members are `@required` in the model
+/// yet neither is in the body of the 200 that answers a removal which took the policy's
+/// LAST statement — that leaves the group with no resource-based policy, so there is no
+/// document and no revision to report. See `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct RemovePermissionOutput {
-    pub policy: String,
-    pub revision_id: String,
+    pub policy: Option<String>,
+    pub revision_id: Option<String>,
 }
+
+profiler_schema_and_codec!(
+    RemovePermissionOutput,
+    REMOVE_PERMISSION_OUTPUT_SCHEMA,
+    "com.amazonaws.codeguruprofiler#RemovePermissionResponse",
+    "com.amazonaws.codeguruprofiler",
+    "RemovePermissionResponse",
+    (M_POLICY, policy, "policy", 0, opt, string),
+    (M_REVISION_ID, revision_id, "revisionId", 1, opt, string),
+);
 

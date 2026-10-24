@@ -1004,8 +1004,9 @@ pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
     ///
     /// Private, together with [`Self::idempotency_order`], because the two are one
     /// bounded store: every read and write goes through [`Self::replay_idempotent`],
-    /// [`Self::remember_idempotent`] and [`Self::forget_node_token`], which keep the
-    /// count at or under [`MAX_IDEMPOTENCY_RECORDS`] and keep the two in step.
+    /// [`Self::remember_idempotent`], [`Self::forget_node_token`] and
+    /// [`Self::forget_dangling_tokens`], which keep the count at or under
+    /// [`MAX_IDEMPOTENCY_RECORDS`] and keep the two in step.
     idempotency: BTreeMap<String, CreatedIds>,
     /// The keys of `idempotency` in insertion order, oldest first: the eviction order
     /// when the ledger is at its ceiling.
@@ -1207,6 +1208,57 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
             self.idempotency.remove(&key);
             self.idempotency_order.retain(|queued| queued != &key);
         }
+    }
+
+    /// Forget every idempotency record that names NOTHING this store still holds.
+    ///
+    /// The ledger must not outlive the resources it describes — the same reason
+    /// [`Self::forget_node_token`] runs when a node is deleted — so once every id a create
+    /// minted has been deleted, its token is forgotten and replaying it creates afresh,
+    /// which is the same answer the real service gives once a token has aged out.
+    ///
+    /// A record that still names ONE live resource is KEPT: a create that minted several
+    /// ids (`CreateNetwork` mints a network and its first member) must keep replaying its
+    /// original result while any of them stands, rather than creating a second resource.
+    pub fn forget_dangling_tokens(&mut self) {
+        let stale: Vec<String> = self
+            .idempotency
+            .iter()
+            .filter(|(_, created)| !self.holds_any(created))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            self.idempotency.remove(&key);
+            self.idempotency_order.retain(|queued| queued != &key);
+        }
+    }
+
+    /// Whether any resource `created` names is still stored.
+    fn holds_any(&self, created: &CreatedIds) -> bool {
+        let network_held = created
+            .network_id
+            .as_deref()
+            .is_some_and(|id| self.networks.contains_key(id));
+        let member_held = created.member_id.as_deref().is_some_and(|id| {
+            self.networks
+                .values()
+                .any(|network| network.members.contains_key(id))
+        });
+        let node_held = created.node_id.as_deref().is_some_and(|id| {
+            self.networks
+                .values()
+                .any(|network| network.nodes.contains_key(id))
+        });
+        let proposal_held = created.proposal_id.as_deref().is_some_and(|id| {
+            self.networks
+                .values()
+                .any(|network| network.proposals.contains_key(id))
+        });
+        let accessor_held = created
+            .accessor_id
+            .as_deref()
+            .is_some_and(|id| self.accessors.contains_key(id));
+        network_held || member_held || node_held || proposal_held || accessor_held
     }
 
     /// Mint a fresh resource id: `prefix`, a hyphen, then [`ID_BODY_LEN`] characters of

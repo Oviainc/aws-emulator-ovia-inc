@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCapacityTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCapacityTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a capacity task on the Outpost the `OutpostIdentifier` names,
+//! persists everything the caller requested, and answers it from what was persisted;
+//! `GetCapacityTask` reads the same record back. The task starts in the non-terminal
+//! `REQUESTED` status and runs to `COMPLETED` on the clock
+//! ([`crate::state::capacity_task_progression`]), and a second task is refused with the
+//! modelled `ConflictException` while one is still active on the same Outpost or order,
+//! or when the store has reached the emulator's entry ceiling
+//! ([`crate::state::MAX_RESOURCES`]): a completed task is never released, so the store
+//! this operation grows needs a bound.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCapacityTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One input class answers the scaffold's 501 and nothing else does: a DRY RUN. Its
+//! result is a verdict on the Outpost's available instance capacity, and this emulator
+//! models no installed capacity to weigh a request against (`ListAssets`,
+//! `GetOutpostInstanceTypes` and `GetOutpostSupportedInstanceTypes` are still stubs), so
+//! it cannot judge one — and a dry run must change nothing, so it cannot answer with a
+//! persisted task either. A 501 says "nobody has written this yet", which is exactly
+//! true of the capacity model a dry run needs.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +201,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCapacityTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCapacityTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCapacityTask"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartCapacityTaskErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // A dry run reports whether the requested pools are above or below the
+        // Outpost's AVAILABLE instance capacity, and changes nothing. This emulator
+        // models no installed capacity to weigh them against, so it can neither
+        // judge the request nor answer it with a persisted task: see this module's
+        // header for why that is the scaffold's 501 rather than a made-up verdict.
+        if input.dry_run {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartCapacityTask with DryRun set",
+            ));
+        }
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                StartCapacityTaskErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?;
+
+        let mut store = state.lock();
+        // Materialise what the clock already owed before judging whether another
+        // task may start: a task that has run to a terminal status holds nothing up.
+        store.settle_capacity_tasks();
+        // A capacity task runs ON an Outpost, so an Outpost the store does not hold
+        // cannot take one: the not-found error this operation models, worded as the
+        // identifier echo of the value AS SUPPLIED.
+        if !store.outposts.contains_key(&outpost_id) {
+            return Err(StartCapacityTaskErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &input.outpost_identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+        // "You can have one active capacity task for each order and each Outpost":
+        // a second one is the conflict this operation models, naming the resource
+        // the conflict is about in `ResourceId` / `ResourceType`.
+        let order_id = crate::state::non_empty(input.order_id);
+        let conflict = store
+            .active_capacity_task_on_outpost(&outpost_id)
+            .map(|active| {
+                (
+                    crate::state::RESOURCE_TYPE_OUTPOST,
+                    outpost_id.clone(),
+                    active.capacity_task_id.clone(),
+                )
+            })
+            .or_else(|| {
+                let order_id = order_id.clone()?;
+                let active = store.active_capacity_task_on_order(&order_id)?;
+                Some((
+                    crate::state::RESOURCE_TYPE_ORDER,
+                    order_id,
+                    active.capacity_task_id.clone(),
+                ))
+            });
+        if let Some((resource_type, resource_id, active)) = conflict {
+            return Err(StartCapacityTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::capacity_task_conflict(
+                        resource_type,
+                        &resource_id,
+                        &active,
+                    )),
+                    resource_id: Some(resource_id),
+                    resource_type: Some(resource_type.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // See `MAX_RESOURCES`: a completed task is never released (`GetCapacityTask`
+        // must still answer it), so the store this insert grows needs a maximum
+        // entry count. The one-active-task rule above is a rate limit, not a bound —
+        // a task completes on the clock and then holds nothing up — so past the cap
+        // the request is refused rather than stored. `StartCapacityTask` models no
+        // quota error, so the refusal is the `ConflictException` it does model,
+        // worded by `store_full` so a caller can tell it from the active-task one.
+        if store.capacity_tasks.len() >= crate::state::MAX_RESOURCES {
+            return Err(StartCapacityTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::store_full("capacity tasks")),
+                    resource_id: Some(outpost_id),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_OUTPOST.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let (capacity_task_id, sequence) = store.mint_id("cap");
+        let now = std::time::SystemTime::now();
+        let task = crate::state::CapacityTaskRecord {
+            sequence,
+            capacity_task_id: capacity_task_id.clone(),
+            outpost_id,
+            order_id,
+            // `AssetIdInput` (`^\d{10}$`) is one of the forms the output's
+            // `AssetId` (`^(\w+)$`) accepts, so the asset the caller named is
+            // reported back as the task's own.
+            asset_id: crate::state::non_empty(input.asset_id),
+            requested_instance_pools: input.instance_pools,
+            instances_to_exclude: input.instances_to_exclude,
+            // False here: a dry run never reaches this far.
+            dry_run: input.dry_run,
+            task_action_on_blocking_instances: crate::state::non_empty(
+                input.task_action_on_blocking_instances,
+            ),
+            // A just-started task is awaiting its next step, so it reports the
+            // non-terminal status until the progression the clock owes falls due;
+            // every read materialises it through `settle_capacity_tasks`.
+            status: crate::state::CAPACITY_TASK_REQUESTED.to_string(),
+            // Nothing in this slice fails a task. See `CAPACITY_TASK_FAILED`.
+            failed: None,
+            created_at: now,
+            last_modified_at: now,
+            completed_at: None,
+            pending: crate::state::capacity_task_progression(now),
+        };
+        store.capacity_tasks.insert(capacity_task_id, task.clone());
+
+        Ok(crate::capacity_task_projection!(
+            StartCapacityTaskOutput,
+            &task
+        ))
     }
 }

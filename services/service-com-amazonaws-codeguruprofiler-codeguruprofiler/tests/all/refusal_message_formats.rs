@@ -549,7 +549,9 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
     // model's own `ActionGroup` enum names as the agent APIs — is NOT here: a recorded
     // `ConfigureAgent` refusal states an account-qualified sentence of its own
     // ("Profiling group for <accountId>/<name> does not exist!"), which
-    // `refusal_message_rules.rs` pins over both of them.
+    // `refusal_message_rules.rs` pins over both of them. `GetPolicy` is not here for the
+    // same reason — a recorded refusal states the LOOKUP it performed, naming the account
+    // it was scoped to — and is pinned on its own below.
     let names = ["never-created", "Absent_1", "a-b-c"];
     for name in names {
         let cases: Vec<(&str, &str, String, &str, Vec<u8>)> = vec![            (
@@ -587,13 +589,6 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
                 "ListFindingsReports",
                 "GET",
                 format!("/internal/profilingGroups/{name}/findingsReports?{window}"),
-                "application/json",
-                Vec::new(),
-            ),
-            (
-                "GetPolicy",
-                "GET",
-                format!("/profilingGroups/{name}/policy"),
                 "application/json",
                 Vec::new(),
             ),
@@ -645,6 +640,48 @@ async fn every_other_group_scoped_operation_states_its_own_not_found_text() {
                 answer.error_message()
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn get_policy_states_the_group_lookup_that_found_nothing() {
+    let harness = Harness::new();
+
+    // `GetPolicy` answers 404 for ONE case — the profiling group itself does not exist —
+    // and that refusal states the lookup it performed: the account the lookup was scoped
+    // to and the name it looked for. (A group that exists and holds no policy is not a
+    // refusal at all; `policy_surface.rs` pins that empty 200.)
+    for name in ["never-created", "Absent_1", "a-b-c", "x", &"g".repeat(255)] {
+        let answer = harness
+            .send(
+                "GET",
+                &format!("/profilingGroups/{name}/policy"),
+                "application/json",
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 404,
+            "case {name:?}: expected HTTP 404, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {name:?}: expected ResourceNotFoundException, got {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        let expected = format!(
+            "No profiling group with accountId: {}; name: {name} was found.",
+            account_id()
+        );
+        assert_eq!(
+            answer.error_message(),
+            expected,
+            "case {name:?}: expected {expected:?}, got {:?}",
+            answer.error_message()
+        );
     }
 }
 
