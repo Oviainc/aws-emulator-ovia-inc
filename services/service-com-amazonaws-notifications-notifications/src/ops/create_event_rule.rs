@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an EventRule arn under the NotificationConfiguration the request names,
+//! persists the rule with every Region it asked for in the transitional
+//! `CREATING` status the model documents, and answers
+//! `{arn, notificationConfigurationArn, statusSummaryByRegion}` read back out of
+//! that record. The clock, not a read, settles those Regions to `ACTIVE`.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventRule"))
+        let _ = ctx;
+
+        // Refuse an over-long `regions` list BEFORE anything is allocated,
+        // locked or looked up: the modelled `Regions` declares `@length(1..)`
+        // with no ceiling, so this is the only thing standing between a
+        // caller-chosen list length and the size of the stored rule, of its
+        // per-Region status map and of every response that reports them. The
+        // message names the member and the bound it exceeded, which is what the
+        // modelled `ValidationException` carries in its `fieldList`.
+        if input.regions.len() > crate::state::MAX_REGIONS_PER_EVENT_RULE {
+            return Err(CreateEventRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "regions must name at most {} Regions, got {}",
+                        crate::state::MAX_REGIONS_PER_EVENT_RULE,
+                        input.regions.len()
+                    ),
+                    reason: Some("fieldValidationFailed".to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "regions".to_string(),
+                        message: format!(
+                            "the list names more than the {} Regions an EventRule covers",
+                            crate::state::MAX_REGIONS_PER_EVENT_RULE
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // The store is the only place an EventRule exists; without it there is
+        // nothing to create in, which is a server fault, not a client error.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEventRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the notifications store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // Materialise the transitions the clock already owed at this instant, so
+        // the idempotent repeat below reports a rule's settled status rather than
+        // the one it was minted with.
+        store.settle_due_event_rules(::std::time::SystemTime::now());
+
+        // An EventRule is "associated with a specified NotificationConfiguration":
+        // the arn must name one this account holds, or there is nothing to
+        // associate the rule with.
+        if !store
+            .configurations
+            .contains_key(&input.notification_configuration_arn)
+        {
+            return Err(CreateEventRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no NotificationConfiguration exists with arn {}",
+                        input.notification_configuration_arn
+                    ),
+                    resource_id: input.notification_configuration_arn.clone(),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotent`: a repeat of a request already served reports the rule it
+        // made, rather than minting a second rule with a second arn.
+        let existing = store
+            .matching_event_rule(
+                &input.notification_configuration_arn,
+                &input.source,
+                &input.event_type,
+                input.event_pattern.as_deref(),
+                &input.regions,
+            )
+            .map(|rule| rule.arn.clone());
+
+        let arn = match existing {
+            Some(arn) => arn,
+            None => {
+                // The store is bounded: past its ceiling a create is refused with
+                // the error the model declares for a quota, not served by growing
+                // the store further.
+                if !store.has_event_rule_capacity(&input.notification_configuration_arn) {
+                    return Err(CreateEventRuleErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "this NotificationConfiguration already holds the maximum of {} EventRules",
+                                crate::state::MAX_EVENT_RULES_PER_CONFIGURATION
+                            ),
+                            resource_type: "EventRule".to_string(),
+                            resource_id: Some(input.notification_configuration_arn.clone()),
+                            service_code: Some("notifications".to_string()),
+                            quota_code: None,
+                        },
+                    )
+                    .into());
+                }
+
+                // `source`, `eventType`, `eventPattern` and every Region already
+                // satisfy their modelled constraints: the boundary validator
+                // refused the request before this handler ran otherwise. The one
+                // bound the model does not declare — how MANY Regions the list
+                // names — was refused above.
+                store.insert_event_rule(
+                    &input.notification_configuration_arn,
+                    input.source.clone(),
+                    input.event_type.clone(),
+                    input.event_pattern.clone(),
+                    &input.regions,
+                    ::std::time::SystemTime::now(),
+                )
+            }
+        };
+
+        // Read the response back out of the stored record rather than echoing the
+        // values just written, so this response can only report what a later Get
+        // does.
+        let stored = store.event_rules.get(&arn).ok_or_else(|| {
+            CreateEventRuleErrorModeled::InternalServerException(InternalServerException {
+                message: "the created EventRule could not be read back".to_string(),
+            })
+        })?;
+        Ok(CreateEventRuleOutput {
+            arn: stored.arn.clone(),
+            notification_configuration_arn: stored.notification_configuration_arn.clone(),
+            status_summary_by_region: stored.status_summary_by_region(),
+        })
     }
 }

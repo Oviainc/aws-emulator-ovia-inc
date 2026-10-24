@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootRelationalDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootRelationalDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Restarts a stored managed relational database's engine in place: the record —
+//! the master endpoint a client connects to above all — is left exactly as it is,
+//! the database reports `rebooting` until the clock brings its engine back up,
+//! the restart is what loads the parameter values that were waiting for one, and
+//! the call is recorded in the operation log.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootRelationalDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +162,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootRelationalDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootRelationalDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootRelationalDatabase"))
+        // A database is addressed by name alone — nothing about the request
+        // metadata takes part.
+        let _ = ctx;
+
+        // `relationalDatabaseName` is modelled `@required` and carries the
+        // modelled `ResourceName` pattern, so the centralized walk refused
+        // anything outside it before this body ran. What is left is what the
+        // model cannot express: the database must exist, and it must have a
+        // running engine to restart.
+        let name = input.relational_database_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // ONE borrow of the stored record: the state check, the location the
+            // log entry is placed at and the restart itself all come from it.
+            let database = store
+                .relational_database_mut(&name)
+                .ok_or_else(|| not_found(&name))?;
+
+            // There has to be a running engine to restart: a database that is
+            // still being provisioned has none, and one that is already
+            // restarting is in the middle of the restart this call would start.
+            // Amazon RDS refuses the same reboot — a DB instance can be rebooted
+            // only in the `available` state ("Rebooting a DB instance", Amazon
+            // RDS User Guide) — and Lightsail's modelled counterpart for a call
+            // its resource's state does not allow is
+            // `OperationFailureException`.
+            if database.state != crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE {
+                return Err(operation_failure(format!(
+                    "The relational database {name} is {}: a database can be rebooted \
+                     only while it is {}.",
+                    database.state,
+                    crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE,
+                )));
+            }
+            let location = database.location.clone();
+
+            // The restart itself. Nothing else on the record is rewritten — the
+            // restart happens inside the database — so the ARN, the hardware,
+            // the credentials, the windows and the master endpoint a client
+            // connects to all stay as they are; the database reports
+            // `rebooting` until the clock brings its engine back up, and the
+            // parameter values that were waiting for a restart are loaded then.
+            database.begin_reboot(now);
+            let settles_at_ms = database.due.map(|due| due.at_ms);
+
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one acts on exactly one database,
+            // so it answers exactly one entry, located where that database is.
+            // The restart is not finished when the call returns, so the entry is
+            // answered non-terminal and the clock owes it its `Succeeded`
+            // status.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_REBOOT_RELATIONAL_DATABASE,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                &name,
+                &location,
+                settles_at_ms,
+            );
+            Ok(RebootRelationalDatabaseOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> RebootRelationalDatabaseError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// Lightsail's refusal of a well-formed request the database's state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// database and the state it is in.
+fn operation_failure(message: String) -> RebootRelationalDatabaseError {
+    RebootRelationalDatabaseErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> RebootRelationalDatabaseError {
+    RebootRelationalDatabaseErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
