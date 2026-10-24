@@ -19,6 +19,8 @@ mod get_keyspace;
 mod keyspace_table_lifecycle;
 #[path = "all/list_keyspaces.rs"]
 mod list_keyspaces;
+#[path = "all/list_types.rs"]
+mod list_types;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/service_managed_catalog.rs"]
