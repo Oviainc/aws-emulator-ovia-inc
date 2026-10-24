@@ -19,7 +19,7 @@
 //! instead of deleted from.
 //!
 //! `ReturnConsumedCapacity=INDEXES` reports the capacity the delete consumed on the
-//! table AND on each secondary index the removed item reached, and
+//! table AND on each secondary index whose stored entry it removes, and
 //! `ReturnItemCollectionMetrics=SIZE` reports the item collection the delete touched —
 //! both computed from the stored table by [`crate::state::Table::write_capacity`] and
 //! [`crate::state::Table::item_collection_metrics`], so a delete that removed no item

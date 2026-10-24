@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetRegexPatternSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF RegexPatternSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         // A read: it writes nothing, so what a later caller sees is unchanged.
@@ -158,10 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetRegexPatternSetErrorModeled::WAFNonexistentItemException(
                     WAFNonexistentItemException {
-                        message: Some(format!(
-                            "RegexPatternSet {} does not exist",
-                            input.regex_pattern_set_id
-                        )),
+                        // This exception type's own fixed sentence: it says nothing about
+                        // the id that was asked for.
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
                     },
                 )
             })?;

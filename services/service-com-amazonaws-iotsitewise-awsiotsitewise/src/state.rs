@@ -10,7 +10,8 @@
 //! tagging operations and the creates share one tag set per resource. A data
 //! stream no asset property owns lives in its own map
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociated_time_series`]),
-//! which is what `DisassociateTimeSeriesFromAssetProperty` leaves behind. Every
+//! which is what `DisassociateTimeSeriesFromAssetProperty` leaves behind and what
+//! alias-addressed ingestion creates. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -143,10 +144,16 @@ pub const MAX_ASSETS: usize = 10_000;
 /// The model's own ceiling: `TagMap` carries `@length(min: 1, max: 50)` wherever
 /// it is used — `TagResource.tags`, `CreateAsset.tags`, `CreateAssetModel.tags`
 /// and `ListTagsForResource.tags` — so no single call may carry more than this
-/// many tags and no listing may report more. A `TagResource` call that would
-/// leave a resource above it is refused with the modelled `TooManyTagsException`
-/// (HTTP 400), whose own documentation is "You've reached the quota for the
-/// number of tags allowed for a resource".
+/// many tags and no listing may report more.
+///
+/// The two refusals this bound drives are DIFFERENT failures and carry different
+/// modelled errors. A single call carrying more than this many tags violates
+/// `TagMap`'s own `@length`, which the boundary validator refuses before a handler
+/// runs. A well-formed call whose tags would carry the TARGET RESOURCE's
+/// accumulated count past the ceiling is a quota refusal, so it answers the
+/// modelled `LimitExceededException` (HTTP 410) — "You've reached the quota for a
+/// resource" — which is the error IoT SiteWise declares for every accumulated-count
+/// ceiling in this service.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The `TagKey` bounds: `TagMap`'s key targets `TagKey`, which the model
@@ -190,17 +197,27 @@ pub const GATEWAY_VERSION_V3: &str = "3";
 /// own bound; AWS publishes a retention period rather than a sample count.
 pub const MAX_SAMPLES_PER_SERIES: usize = 1_000;
 
+/// How many child assets one `(asset, hierarchy)` holds.
+///
+/// `AssociateAssets` is the only thing that adds one and it declares the modelled
+/// `LimitExceededException` (HTTP 410) for exactly this case — "this can occur if
+/// you're trying to associate more than the allowed number of child assets" — so
+/// that is how this store refuses past the cap. The emulator's own bound, not a
+/// published AWS default (AWS publishes the quota as adjustable), set high enough
+/// that no ordinary hierarchy meets it.
+pub const MAX_CHILDREN_PER_HIERARCHY: usize = 500;
+
 /// How many DISASSOCIATED time series this store keeps.
 ///
-/// `DisassociateTimeSeriesFromAssetProperty` keeps the data stream it detaches
-/// (see [`DisassociatedTimeSeriesRecord`]) and `DeleteTimeSeries` — the operation
-/// that forgets one — is still a scaffold stub, so repeatedly binding and
-/// detaching aliases would otherwise grow this map without limit. Like a series'
-/// samples ([`MAX_SAMPLES_PER_SERIES`]) and unlike a resource an operation can
-/// delete, an eviction policy IS available here: past this many series the least
-/// recently updated one goes, since `DisassociateTimeSeriesFromAssetProperty`
-/// declares no limit error to refuse with. The emulator's own bound, not a
-/// published AWS quota, and high enough that no ordinary workflow meets it.
+/// Two operations put one here: `DisassociateTimeSeriesFromAssetProperty` keeps
+/// the data stream it detaches (see [`DisassociatedTimeSeriesRecord`]), and
+/// `BatchPutAssetPropertyValue` creates one for a `propertyAlias` no asset
+/// property carries. The alias is the caller's to choose, so the collection needs
+/// a bound of its own: the ingest path REFUSES past this many series with the
+/// `LimitExceededException` entry error code (the operation declares it), and the
+/// detach path — which declares no limit error to refuse with — drops the least
+/// recently updated series instead. The emulator's own bound, not a published AWS
+/// quota, and high enough that no ordinary workflow meets it.
 pub const MAX_DISASSOCIATED_TIME_SERIES: usize = 1_000;
 
 /// A time series (data stream) that no asset property owns.
@@ -215,7 +232,8 @@ pub const MAX_DISASSOCIATED_TIME_SERIES: usize = 1_000;
 /// specify the alias of the time series"). So detaching a series from its asset
 /// property leaves THIS record behind: the stream keeps the identity, alias, data
 /// type and creation date it had while associated, and its last-update instant
-/// moves to the call that detached it.
+/// moves to the call that detached it. Alias-addressed ingestion creates one the
+/// same way, with the data type of the value that created it.
 #[derive(Debug, Clone)]
 pub struct DisassociatedTimeSeriesRecord {
     /// The alias that identifies the stream, and the only way to address it once
@@ -574,6 +592,23 @@ pub struct HierarchyTriple {
     pub child_asset_id: String,
 }
 
+/// How far a hierarchy association recorded by `AssociateAssets` has got: the
+/// state a SECOND call naming the same triple is judged against.
+///
+/// The two are different answers to the caller, so they are different values here:
+/// a still-settling association is a transient conflict between two operations on
+/// one resource (the modelled `ConflictingOperationException`, HTTP 409, "retry"),
+/// while a settled one is a terminal statement about the request (the modelled
+/// `InvalidRequestException`, HTTP 400, "stop").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociationState {
+    /// The association was recorded and the transition that call owes has not
+    /// fallen due yet.
+    InProgress,
+    /// The association is recorded and settled.
+    Established,
+}
+
 /// Why an association triple does not name anything the store can act on.
 ///
 /// Described structurally rather than as one error type, because the two
@@ -637,19 +672,33 @@ pub struct GatewayRecord {
 /// [`GatewayPlatform`]'s documentation refuses, since one gateway specifies exactly
 /// one platform type.
 pub fn gateway_device_key(platform: &GatewayPlatform) -> Option<String> {
+    gateway_device_dimension(platform).map(|(member, value)| format!("{member}:{value}"))
+}
+
+/// The same device, as the REQUEST MEMBER that names it and that member's value:
+/// `greengrass.groupArn`, `greengrassV2.coreDeviceThingName` or
+/// `siemensIE.iotCoreThingName`.
+///
+/// A refusal about a device has to name the dimension the caller actually supplied
+/// — a thing name, a group ARN — rather than an identifier of the gateway it
+/// collided with, so the member and its value are kept together here and
+/// [`gateway_device_key`] is derived from them.
+pub fn gateway_device_dimension(platform: &GatewayPlatform) -> Option<(&'static str, String)> {
     if let Some(greengrass) = platform.greengrass.as_ref() {
-        return Some(format!("greengrass:{}", greengrass.group_arn));
+        return Some(("greengrass.groupArn", greengrass.group_arn.clone()));
     }
     if let Some(greengrass_v2) = platform.greengrass_v2.as_ref() {
-        return Some(format!(
-            "greengrassV2:{}",
-            greengrass_v2.core_device_thing_name
+        return Some((
+            "greengrassV2.coreDeviceThingName",
+            greengrass_v2.core_device_thing_name.clone(),
         ));
     }
-    platform
-        .siemens_ie
-        .as_ref()
-        .map(|siemens| format!("siemensIE:{}", siemens.iot_core_thing_name))
+    platform.siemens_ie.as_ref().map(|siemens| {
+        (
+            "siemensIE.iotCoreThingName",
+            siemens.iot_core_thing_name.clone(),
+        )
+    })
 }
 
 /// How many platform types `platform` names. Exactly one is valid; see
@@ -664,6 +713,14 @@ pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
     .filter(|named| *named)
     .count()
 }
+
+/// The `ListTimeSeriesType` value of a series associated with an asset property.
+pub const TIME_SERIES_TYPE_ASSOCIATED: &str = "ASSOCIATED";
+
+/// The `ListTimeSeriesType` value of a series associated with no asset property,
+/// as the member's own documentation states it: "DISASSOCIATED \u2013 The time series
+/// isn't associated with any asset property."
+pub const TIME_SERIES_TYPE_DISASSOCIATED: &str = "DISASSOCIATED";
 
 /// A stored record the tagging operations reach by ARN: it knows the ARN it was
 /// minted with and owns the one tag set every operation that touches its tags
@@ -741,6 +798,16 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// hierarchy. `ListAssets`'s `TOP_LEVEL` filter reads it to tell a root asset
     /// from one that is some other asset's child.
     pub asset_hierarchy_children: HashMap<(String, String), Vec<String>>,
+    /// `(assetId, hierarchyId, childAssetId)` -> the instant the association
+    /// recorded for that triple finishes settling.
+    ///
+    /// The association set above says WHICH associations exist; this says how far
+    /// the one that created an entry has got, which is what tells a second call on
+    /// the same triple whether it collides with an operation still in flight or
+    /// with an association already established (see [`AssociationState`]). Written
+    /// and pruned beside the set itself by [`Self::associate_child`] and
+    /// [`Self::disassociate_child`], so the two cannot drift.
+    pub asset_hierarchy_settles_at: HashMap<(String, String, String), SystemTime>,
     /// `assetId` -> `propertyId` -> the property's time series, kept sorted
     /// ascending by timestamp so the latest value is the last element.
     ///
@@ -964,9 +1031,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// [`MAX_DISASSOCIATED_TIME_SERIES`] by dropping the least recently updated
     /// series.
     ///
-    /// The eviction exists only because nothing in this emulator forgets a
-    /// disassociated stream yet; it goes away when `DeleteTimeSeries` — the
-    /// operation AWS gives a caller for that — is implemented.
+    /// `DeleteTimeSeries` is what a caller uses to forget one, so the eviction is
+    /// the bound on the path that has no limit error to refuse with — detaching a
+    /// stream from its property, which
+    /// `DisassociateTimeSeriesFromAssetProperty` declares none for. The ingest
+    /// path, whose operation DOES declare one, refuses past the cap instead and so
+    /// never reaches the eviction.
     fn keep_disassociated_time_series(&mut self, record: DisassociatedTimeSeriesRecord) {
         self.disassociated_time_series
             .insert(record.alias.clone(), record);
@@ -1092,6 +1162,68 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         self.property_values.get(asset_id)?.get(property_id)?.last()
     }
 
+    /// Create the DISASSOCIATED time series an alias no asset property carries
+    /// addresses, answering `false` when a stream already answers to that alias.
+    ///
+    /// This is what makes alias-addressed ingestion work: IoT SiteWise accepts a
+    /// `propertyAlias` entry before any asset property carries that alias and
+    /// implicitly creates the data stream it names, which `DescribeTimeSeries` and
+    /// `ListTimeSeries` then report and `AssociateTimeSeriesToAssetProperty` binds.
+    /// `data_type` is the type of the value that created it — the stream has no
+    /// asset property to take one from — and a later value of another type does not
+    /// change it.
+    ///
+    /// The caller checks [`MAX_DISASSOCIATED_TIME_SERIES`] first and refuses past
+    /// it; the insert itself goes through the same bounded keeper the detach path
+    /// uses, so the collection cannot grow past the cap either way.
+    pub fn create_disassociated_time_series(
+        &mut self,
+        alias: &str,
+        data_type: &str,
+        now: SystemTime,
+    ) -> bool {
+        if self.resolve_alias_series(alias).is_some() {
+            return false;
+        }
+        self.keep_disassociated_time_series(DisassociatedTimeSeriesRecord {
+            alias: alias.to_string(),
+            time_series_id: new_id(),
+            data_type: data_type.to_string(),
+            data_type_spec: None,
+            creation_date: now,
+            last_update_date: now,
+            values: Vec::new(),
+        });
+        true
+    }
+
+    /// Forget the disassociated stream `alias` names, answering the record that was
+    /// removed.
+    ///
+    /// What `DeleteTimeSeries` does to a stream no asset property owns: the stream
+    /// goes, samples and all, and the alias names nothing afterwards.
+    pub fn forget_disassociated_time_series(
+        &mut self,
+        alias: &str,
+    ) -> Option<DisassociatedTimeSeriesRecord> {
+        self.disassociated_time_series.remove(alias)
+    }
+
+    /// Forget the series an asset property owns: its alias binding and its stored
+    /// samples, leaving the property itself in place.
+    ///
+    /// What `DeleteTimeSeries` does to an ASSOCIATED stream — "If you delete a time
+    /// series that's associated with an asset property, the asset property still
+    /// exists, but the time series will no longer be associated with this asset
+    /// property" — so a series removed by its alias and the same series removed by
+    /// its `(assetId, propertyId)` pair leave the store in one state.
+    pub fn forget_property_series(&mut self, asset_id: &str, property_id: &str) {
+        self.set_property_alias(asset_id, property_id, None);
+        if let Some(properties) = self.property_values.get_mut(asset_id) {
+            properties.remove(property_id);
+        }
+    }
+
     /// The tag set of the resource `arn` names, for reading.
     ///
     /// Resolved through [`parse_resource_arn`] and then by exact ARN equality, so
@@ -1122,7 +1254,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     }
 
     /// Forget an asset and everything keyed off it: its external-id entry, its
-    /// property series and its property aliases.
+    /// property series, its property aliases and its hierarchy associations.
     pub fn forget_asset(&mut self, asset_id: &str) -> Option<AssetRecord> {
         let record = self.assets.remove(asset_id)?;
         if let Some(external) = record.external_id.as_deref() {
@@ -1136,6 +1268,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         for children in self.asset_hierarchy_children.values_mut() {
             children.retain(|child| child != asset_id);
         }
+        self.asset_hierarchy_children
+            .retain(|_, children| !children.is_empty());
+        self.asset_hierarchy_settles_at
+            .retain(|(asset, _, child), _| asset != asset_id && child != asset_id);
         Some(record)
     }
 
@@ -1258,7 +1394,13 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             }
             for hierarchy_id in dropped_hierarchies {
                 self.asset_hierarchy_children
-                    .remove(&(asset_id.clone(), hierarchy_id));
+                    .remove(&(asset_id.clone(), hierarchy_id.clone()));
+                // The settle clock of an association is keyed by the same triple,
+                // so it goes with the association it belongs to.
+                self.asset_hierarchy_settles_at
+                    .retain(|(asset, hierarchy, _), _| {
+                        asset != &asset_id || hierarchy != &hierarchy_id
+                    });
             }
         }
     }
@@ -1270,6 +1412,17 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Whether any child asset is associated under ANY hierarchy of `asset_id`.
+    ///
+    /// The dependency an asset carries as a PARENT: what makes it a resource other
+    /// resources still point at, which is what the operations that remove an asset
+    /// have to refuse on.
+    pub fn has_hierarchy_children(&self, asset_id: &str) -> bool {
+        self.asset_hierarchy_children
+            .iter()
+            .any(|((asset, _), children)| asset == asset_id && !children.is_empty())
+    }
+
     /// The association `child_asset_id` is a child through, as
     /// `(parentAssetId, hierarchyId)`, or `None` when the asset is nobody's child.
     ///
@@ -1278,13 +1431,78 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// parent: the asset hierarchies form a TREE, so an asset appears as a child at
     /// most once in [`Self::asset_hierarchy_children`]. It lives here, beside the
     /// index it reads, because it is the one step every upward walk of that tree
-    /// takes — `AssociateAssets`'s cycle check, `ListAssets`'s `TOP_LEVEL` filter
-    /// and `ListAssetRelationships`'s `PATH_TO_ROOT` traversal all take it.
+    /// takes — `AssociateAssets`'s cycle check, `ListAssets`'s `TOP_LEVEL` filter,
+    /// `ListAssetRelationships`'s `PATH_TO_ROOT` traversal and `DeleteAsset`'s
+    /// refusal to remove a still-associated asset all take it.
     pub fn hierarchy_parent(&self, child_asset_id: &str) -> Option<(&str, &str)> {
         self.asset_hierarchy_children
             .iter()
             .find(|(_, children)| children.iter().any(|child| child == child_asset_id))
             .map(|((parent, hierarchy), _)| (parent.as_str(), hierarchy.as_str()))
+    }
+
+    /// Record `child_id` as a child of `asset_id` under `hierarchy_id`, after the
+    /// children already associated there, and start the transition that call owes:
+    /// the association reports [`AssociationState::InProgress`] until
+    /// [`ACTIVATION_DELAY`] after `now` and [`AssociationState::Established`] from
+    /// then on. The due instant is STORED, never slept on.
+    ///
+    /// The list stays a set: a child already associated under that hierarchy is not
+    /// added twice. `AssociateAssets` refuses such a request before reaching here,
+    /// so this keeps the stored invariant for any caller whose own rule allows it.
+    pub fn associate_child(
+        &mut self,
+        asset_id: &str,
+        hierarchy_id: &str,
+        child_id: &str,
+        now: SystemTime,
+    ) {
+        let children = self
+            .asset_hierarchy_children
+            .entry((asset_id.to_string(), hierarchy_id.to_string()))
+            .or_default();
+        if !children.iter().any(|child| child == child_id) {
+            children.push(child_id.to_string());
+        }
+        self.asset_hierarchy_settles_at.insert(
+            (
+                asset_id.to_string(),
+                hierarchy_id.to_string(),
+                child_id.to_string(),
+            ),
+            now + ACTIVATION_DELAY,
+        );
+    }
+
+    /// How far the association of `(asset_id, hierarchy_id, child_id)` has got as
+    /// of `now`, or `None` when that triple is not associated.
+    ///
+    /// Derived from the stored due instant, so a read never has to write: an
+    /// association whose due instant has passed is `Established`, and one recorded
+    /// by a call that has not settled yet is `InProgress`.
+    pub fn association_state(
+        &self,
+        asset_id: &str,
+        hierarchy_id: &str,
+        child_id: &str,
+        now: SystemTime,
+    ) -> Option<AssociationState> {
+        let associated = self
+            .hierarchy_children(asset_id, hierarchy_id)
+            .iter()
+            .any(|child| child == child_id);
+        if !associated {
+            return None;
+        }
+        let settles_at = self.asset_hierarchy_settles_at.get(&(
+            asset_id.to_string(),
+            hierarchy_id.to_string(),
+            child_id.to_string(),
+        ));
+        match settles_at {
+            Some(due) if now < *due => Some(AssociationState::InProgress),
+            _ => Some(AssociationState::Established),
+        }
     }
 
     /// Resolve a `(parent, hierarchyId, childAssetId)` triple of `CustomID` labels
@@ -1367,6 +1585,11 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         if children.is_empty() {
             self.asset_hierarchy_children.remove(&key);
         }
+        self.asset_hierarchy_settles_at.remove(&(
+            asset_id.to_string(),
+            hierarchy_id.to_string(),
+            child_id.to_string(),
+        ));
         true
     }
 }

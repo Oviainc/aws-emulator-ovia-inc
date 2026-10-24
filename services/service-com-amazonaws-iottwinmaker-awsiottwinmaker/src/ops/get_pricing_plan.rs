@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPricingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPricingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPricingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's pricing plan. A REPORTING operation (`@readonly` in the
+//! model): it reads the stored plan and the stored entities and writes nothing —
+//! the plan changes only when `UpdatePricingPlan` changes it, never because
+//! somebody read it.
+//!
+//! ## What it reports
+//!
+//! * `currentPricingPlan` — the plan in force. An account that has never changed
+//!   its plan is on the service default (`BASIC`, `updateReason=DEFAULT`), which
+//!   the store carries from the moment it exists
+//!   ([`crate::state::PricingPlanRecord::default_plan`]), so this read never has
+//!   to mint one and repeated reads report the same instants.
+//! * `pendingPricingPlan` — the accepted-but-not-yet-in-force plan, reported only
+//!   while the store holds one and omitted otherwise.
+//! * `billableEntityCount`, on each reported plan — DERIVED from the entities the
+//!   service currently holds
+//!   ([`crate::state::ComAmazonawsIottwinmakerAwsiottwinmakerState::billable_entity_count`]),
+//!   so creating or deleting an entity moves it without anything having to
+//!   maintain a counter.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +149,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPricingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPricingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPricingPlan"))
+        // Every call is recorded, successful or refused, as the other readers of
+        // this service's state do: the real service logs control-plane access.
+        ::tracing::info!(operation = "GetPricingPlan", "serving a request");
+        // `GetPricingPlanRequest` has no members, and the plan is account-wide:
+        // there is nothing in the request or its metadata to read.
+        let _ = (&input, ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPricingPlanErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // One count for both reported plans: `billableEntityCount` describes the
+        // ACCOUNT, not the plan, so the pending plan is reported with the same
+        // number as the current one.
+        let billable_entity_count = state.billable_entity_count();
+        Ok(GetPricingPlanOutput {
+            current_pricing_plan: state.pricing_plan.as_pricing_plan(billable_entity_count),
+            pending_pricing_plan: state
+                .pending_pricing_plan
+                .as_ref()
+                .map(|pending| pending.as_pricing_plan(billable_entity_count)),
+        })
     }
 }

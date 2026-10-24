@@ -178,6 +178,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        // A destructive call cannot go through while another resource still depends on
+        // the one it removes, and an asset in a hierarchy is depended on from BOTH
+        // sides: as a parent whose children would be left pointing at a hierarchy
+        // whose parent is gone, and as a child the parent's hierarchy still lists.
+        // The operation's own documentation states the rule for the second direction
+        // — "You can't delete an asset that's associated to another asset. For more
+        // information, see DisassociateAssets" — and the first is the same dependency
+        // seen from the other end. Either way this is a TERMINAL request error — the
+        // caller has to disassociate first, and no retry of this call can succeed — so
+        // it is `InvalidRequestException` (400), not the retryable
+        // `ConflictingOperationException` (409); the same rule, and the same mapping,
+        // as `DeleteAssetModel`'s refusal for a model that still has assets. The
+        // precondition is evaluated BEFORE anything is removed, so a refused delete
+        // leaves the asset exactly as it was.
+        if store.has_hierarchy_children(&id) {
+            return Err(DeleteAssetError::Modeled(
+                DeleteAssetErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "The asset {id} has child assets associated with its hierarchies. \
+                         Disassociate them before deleting it."
+                    ),
+                }),
+            ));
+        }
+        if let Some((parent, hierarchy)) = store.hierarchy_parent(&id) {
+            return Err(DeleteAssetError::Modeled(
+                DeleteAssetErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "The asset {id} is associated with the asset {parent} through the \
+                         hierarchy {hierarchy}. Disassociate it before deleting it."
+                    ),
+                }),
+            ));
+        }
+
         // The asset and everything keyed off it (its property series, its aliases, its
         // hierarchy associations) go away, so no later read can still see it.
         store.forget_asset(&id);

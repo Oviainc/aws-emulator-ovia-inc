@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     payload: CreateClusterOutput {
                         cluster: Some(view),
                     },
-                    cluster_count: guard.cluster_count(),
+                    cluster_count: guard.cluster_count_for(&name),
                     member: &CLUSTER_COUNT_MEMBER,
                 });
             }
@@ -316,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attachments_update_due_at: None,
         };
         let view = guard.cluster_mutation_view(&record, true);
-        guard.clusters.insert(name, record);
+        guard.clusters.insert(name.clone(), record);
 
         // `clusterCount` is read AFTER the create landed, so it counts the cluster this
         // call just added.
@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             payload: CreateClusterOutput {
                 cluster: Some(view),
             },
-            cluster_count: guard.cluster_count(),
+            cluster_count: guard.cluster_count_for(&name),
             member: &CLUSTER_COUNT_MEMBER,
         })
     }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCapacityProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCapacityProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCapacityProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ListCapacityProviders` "Returns a list of capacity providers in your account", so it
+//! reports the capacity-provider records this service's store holds — one page of them,
+//! in the stable order the store keeps them in (by provider name), optionally filtered
+//! to one `CapacityProviderState`, and a `NextMarker` only when more remain. It writes
+//! nothing of its own: the only change it applies is the one the clock already made due
+//! (a `Pending` provider whose activation is owed becomes `Active`), through
+//! [`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::materialize_all`].
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +145,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCapacityProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCapacityProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCapacityProviders"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCapacityProvidersErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `MaxItems` is modelled `MaxFiftyListItems`, `@range(min: 1, max: 50)`, so the
+        // boundary validator has already refused anything outside it; this handler
+        // enforces the same floor itself rather than letting a page size of zero reach
+        // the pagination arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(
+                ListCapacityProvidersErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "1 validation error detected: Value '{requested}' at 'maxItems' \
+                             failed to satisfy constraint: Member must have value greater \
+                             than or equal to 1"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_CAPACITY_PROVIDERS_PER_PAGE)
+            .clamp(1, MAX_CAPACITY_PROVIDERS_PER_PAGE);
+
+        let mut store = state.lock();
+        // A provider whose activation the clock has already made due is `Active`, and
+        // that is as true reported in a listing as read one at a time. Nothing else is
+        // written here.
+        store.materialize_all(::std::time::SystemTime::now());
+
+        // "Filter capacity providers by their current state": a request naming a state
+        // reports only the providers in it, and one naming none reports them all. The
+        // value is modelled as the `CapacityProviderState` enum, so the boundary
+        // validator has already refused anything that is not one of its values.
+        let wanted_state = input.state.as_deref();
+        let entries: Vec<_> = store
+            .capacity_providers
+            .iter()
+            .filter(|(_, record)| wanted_state.is_none_or(|wanted| record.state == wanted))
+            .collect();
+
+        // The marker is the name of the last provider the previous page reported, so the
+        // next page starts at the first provider ordered after it and no provider is ever
+        // reported twice. The store is keyed by name, so that order is the iteration
+        // order above.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|(name, _)| name.as_str() > marker)
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListCapacityProvidersOutput {
+            // Every member reported comes out of the stored record; see
+            // [`crate::state::CapacityProviderRecord::reported`].
+            capacity_providers: page.iter().map(|(_, record)| record.reported()).collect(),
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the name of the last provider THIS
+            // page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|(name, _)| (*name).clone()),
+        })
     }
 }
+
+/// The most capacity providers one page reports: the model caps `MaxItems` at 50
+/// (`MaxFiftyListItems`, `@range(min: 1, max: 50)`) and the answered
+/// `CapacityProvidersList` at `@length(min: 0, max: 50)`, so 50 is both the page size a
+/// caller that names no `MaxItems` gets and the ceiling on the one who does.
+const MAX_CAPACITY_PROVIDERS_PER_PAGE: usize = 50;

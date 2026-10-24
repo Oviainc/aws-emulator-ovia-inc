@@ -19,6 +19,11 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::state::service_state;
 // The crate's shared test harness lives in the `asset_lifecycle` suite; this file
 // reaches those helpers rather than growing a second copy of them.
 use crate::asset_lifecycle::{call, error_code, router_with_engine, REGION};
+// Comfortably past `state::ACTIVATION_DELAY`, so the transition an accepted
+// association owes has fallen due by the time the next call lands. The ONE copy of
+// that span lives in `hierarchies_etags_and_refusals`, so the two suites cannot
+// drift from each other or from `state::ACTIVATION_DELAY`.
+use crate::hierarchies_etags_and_refusals::PAST_ACTIVATION;
 
 /// A UUID in the modelled `ID` form that names no stored resource.
 const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
@@ -361,14 +366,18 @@ async fn a_child_is_associated_to_one_parent_hierarchy_at_a_time() {
     assert_eq!(status, 200, "first association: got {status} {body}");
 
     // Rows: the three ways a second association collides with the first — the same
-    // edge again, another hierarchy of the same parent, and another parent.
+    // edge again, another hierarchy of the same parent, and another parent. The
+    // repeat of the SAME edge lands while the association the first call recorded is
+    // still settling, which is a transient collision between two operations on one
+    // resource (409 `ConflictingOperationException`); the other two are terminal
+    // statements about the request (400 `InvalidRequestException`).
     let cases: Vec<(&str, String, String, u16, &str)> = vec![
         (
-            "the same hierarchy again",
+            "the same hierarchy again, while the association is still settling",
             farm.clone(),
             turbines.clone(),
             409,
-            "ResourceAlreadyExistsException",
+            "ConflictingOperationException",
         ),
         (
             "another hierarchy of the same parent",
@@ -398,19 +407,34 @@ async fn a_child_is_associated_to_one_parent_hierarchy_at_a_time() {
         );
     }
 
-    // The conflict on the already-recorded edge names the child asset it is about.
+    // The in-flight conflict names the resource the two operations collide on: the
+    // parent asset the association is being recorded under.
     let (_, body) = associate(&router, &farm, &turbines, &turbine).await;
     assert_eq!(
-        body["resourceId"], turbine,
-        "the conflict must name the child asset, got {body}"
+        body["resourceId"], farm,
+        "the conflict must name the parent asset, got {body}"
     );
     assert_eq!(
         body["resourceArn"],
         format!(
-            "arn:aws:iotsitewise:{REGION}:{}:asset/{turbine}",
+            "arn:aws:iotsitewise:{REGION}:{}:asset/{farm}",
             engine::EMULATOR_ACCOUNT_ID
         ),
-        "the conflict must carry the child asset's ARN, got {body}"
+        "the conflict must carry the parent asset's ARN, got {body}"
+    );
+
+    // Once the association has settled the same repeat is a TERMINAL request error:
+    // the association is established, so no retry of the call can succeed.
+    tokio::time::sleep(PAST_ACTIVATION).await;
+    let (status, body) = associate(&router, &farm, &turbines, &turbine).await;
+    assert_eq!(
+        status, 400,
+        "a repeat of an established association: got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidRequestException",
+        "a repeat of an established association: unexpected error code in {body}"
     );
 
     // The first association survives every refusal above.

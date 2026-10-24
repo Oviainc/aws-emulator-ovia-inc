@@ -26,6 +26,9 @@ mod execute_query;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/pricing_plan.rs"]
+mod pricing_plan;
+
 #[path = "all/reported_members.rs"]
 mod reported_members;
 
@@ -37,3 +40,6 @@ mod state_roundtrip;
 
 #[path = "all/workspace_entity_lifecycle.rs"]
 mod workspace_entity_lifecycle;
+
+#[path = "all/workspace_listing.rs"]
+mod workspace_listing;

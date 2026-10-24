@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .attributes
                 .as_ref()
                 .map_or(0, crate::state::attributes_size);
-            if size > crate::state::MAX_TOKEN_ATTRIBUTES_BYTES {
+            if size > crate::state::MAX_ATTRIBUTES_BYTES {
                 return Err(crate::state::validation_failed(
                     CreateStageErrorModeled::ValidationException,
                     // Worded in the construction this service states every constraint
@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          have a maximum size of {} bytes, found {size}",
                         Self::NAME,
                         index + 1,
-                        crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
+                        crate::state::MAX_ATTRIBUTES_BYTES,
                     ),
                 ));
             }

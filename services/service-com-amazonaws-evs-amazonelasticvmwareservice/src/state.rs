@@ -18,7 +18,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AccountSetting, Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
-    EnvironmentSummary, Host, LicenseInfo, ResourceNotFoundException,
+    EnvironmentSummary, Host, LicenseInfo, NetworkInterface, ResourceNotFoundException,
     ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan, VmEntitlement,
 };
 
@@ -615,6 +615,15 @@ pub struct StoredHost {
     pub created_at_ms: i64,
     /// Epoch milliseconds the host was last modified at.
     pub modified_at_ms: i64,
+    /// The EC2 bare metal instance this host RUNS ON, and the elastic network interfaces
+    /// attached to it, as the account's own Amazon EC2 store holds them
+    /// ([`ec2_resources::launch_host_instance`]).
+    ///
+    /// `None` only when no instance was launched at all — an EC2 store this emulator
+    /// cannot reach, or one at a ceiling of its own — in which case the host reports
+    /// neither `ec2InstanceId` nor `networkInterfaces` rather than naming resources that
+    /// do not exist.
+    pub ec2: Option<ec2_resources::HostEc2Resources>,
     /// The state change the clock owes this host, if any.
     pub pending: Option<PendingStatus>,
 }
@@ -627,6 +636,7 @@ impl StoredHost {
         ip_address: String,
         esx_version: Option<String>,
         created_at_ms: i64,
+        ec2: Option<ec2_resources::HostEc2Resources>,
         pending: PendingStatus,
     ) -> Self {
         Self {
@@ -640,6 +650,7 @@ impl StoredHost {
             state: HOST_CREATING.to_string(),
             created_at_ms,
             modified_at_ms: created_at_ms,
+            ec2,
             pending: Some(pending),
         }
     }
@@ -658,11 +669,11 @@ impl StoredHost {
 
     /// This host as the modelled `Host` shape.
     ///
-    /// Two members are deliberately absent, because nothing in this emulator produces a
-    /// value for them: `ec2InstanceId` and `networkInterfaces` name the EC2 instance and
-    /// the elastic network interfaces Amazon EVS launches for the host, and this service
-    /// launches none — reporting an instance id no EC2 store holds would name a
-    /// resource that does not exist.
+    /// `ec2InstanceId` and `networkInterfaces` are reported from the EC2 resources the
+    /// host's creation launched ([`Self::ec2`]) — the instance id the account's own
+    /// Amazon EC2 store minted, and the ENIs attached to it — so a caller can look the
+    /// host's instance up in EC2 with the id reported here. Both are absent together
+    /// when no instance was launched at all, never one without the other.
     pub fn to_wire(&self) -> Host {
         Host {
             host_name: Some(self.host_name.clone()),
@@ -675,8 +686,15 @@ impl StoredHost {
             modified_at: Some(timestamp(self.modified_at_ms)),
             host_state: Some(self.state.clone()),
             state_details: None,
-            ec2_instance_id: None,
-            network_interfaces: None,
+            ec2_instance_id: self.ec2.as_ref().map(|ec2| ec2.instance_id.clone()),
+            network_interfaces: self.ec2.as_ref().map(|ec2| {
+                ec2.network_interface_ids
+                    .iter()
+                    .map(|network_interface_id| NetworkInterface {
+                        network_interface_id: Some(network_interface_id.clone()),
+                    })
+                    .collect()
+            }),
         }
     }
 }
@@ -928,6 +946,17 @@ impl StoredEnvironment {
             .min()
     }
 
+    /// The VLAN that carries ESX host management traffic, the one every host of this
+    /// environment is addressed and attached on: its subnet is where a host's management
+    /// address comes from ([`Self::next_host_ip`]) and where the host's ENIs live
+    /// ("Amazon EVS provisions two identically configured ENIs in the VMkernel
+    /// management subnet during host creation", `NetworkInterface` doc).
+    pub fn vmk_management_vlan(&self) -> Option<&StoredVlan> {
+        self.vlans
+            .iter()
+            .find(|vlan| vlan.function_name == VMK_MANAGEMENT_FUNCTION)
+    }
+
     /// The management IP address the next host of this environment takes: the lowest
     /// usable address of the `vmkManagement` VLAN subnet that no host of this
     /// environment already holds.
@@ -939,10 +968,7 @@ impl StoredEnvironment {
     /// environment can hold: `None` means the subnet is full and a further host cannot
     /// be addressed.
     pub fn next_host_ip(&self) -> Option<String> {
-        let vmk = self
-            .vlans
-            .iter()
-            .find(|vlan| vlan.function_name == VMK_MANAGEMENT_FUNCTION)?;
+        let vmk = self.vmk_management_vlan()?;
         let taken: Vec<&str> = self
             .hosts
             .values()

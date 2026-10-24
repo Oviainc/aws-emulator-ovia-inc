@@ -23,6 +23,8 @@ mod emulator;
 mod global_secondary_indexes;
 #[path = "all/index_capacity_and_item_collections.rs"]
 mod index_capacity_and_item_collections;
+#[path = "all/index_write_capacity_changes.rs"]
+mod index_write_capacity_changes;
 #[path = "all/item_write_expressions.rs"]
 mod item_write_expressions;
 #[path = "all/item_write_vocabularies.rs"]

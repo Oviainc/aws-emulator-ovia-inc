@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the members the request names onto the filter `CreateFilter`
+//! saved, leaves the ones it does not name as they were, and advances that filter's
+//! `UpdatedAt` and `Version`, so a later `GetFilter` reports exactly that. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The rule the model cannot express: a `FindingCriteria.Criterion` key must
+        // NAME a finding attribute. The model types the criterion as a map keyed by a
+        // plain string, so the boundary validator accepts any key at all, and a filter
+        // whose criterion names no attribute would select nothing. The catalogue is
+        // the one `ListFindings`/`GetFindings` evaluate against and `CreateFilter`
+        // already refuses an unknown key by, so an update cannot smuggle into a saved
+        // filter a criterion a create would have refused.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFilter"))
+        // Validated before the store is touched, so a refused update changes nothing.
+        crate::state::validate_finding_criteria(input.finding_criteria.as_ref()).map_err(
+            |path| {
+                bad_request(format!(
+                    "findingCriteria.criterion: '{path}' is not a finding attribute this service can filter on. Supported attributes are {}.",
+                    crate::state::FINDING_ATTRIBUTES.join(", ")
+                ))
+            },
+        )?;
+
+        // The modelled constraints — `Rank` range 1..100, `Description` len 0..512,
+        // `Action` within `FilterAction` — are refused BEFORE this handler runs, as
+        // `BadRequestException`/400 (see `crate::service`'s refusal seam), so reaching
+        // here means every value this request carries is inside its constraint.
+        let mut state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST the way every detector-scoped operation
+            // classifies it: a value that cannot be a detector id is a parameter
+            // failure, a well-formed one this account does not hold an ownership
+            // failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+        // Updating is not creating: a name the detector does not hold is refused
+        // rather than saved as a new filter. Checked before the clock is read, so a
+        // refused update moves no timestamp and no version.
+        if !detector.filters.contains_key(&input.filter_name) {
+            // `FilterName` is a plain `String` URI label here
+            // (`smithy_query(operation="UpdateFilter")`), so it carries no modelled
+            // constraint and a malformed name reaches this handler: classified from
+            // the REQUEST the same way a detector id is.
+            return Err(bad_request(crate::state::filter_name_rejection(
+                &input.filter_name,
+            )));
+        }
+
+        let now = state.tick_millis();
+        let Some(filter) = state
+            .detector_in_mut(&region, &input.detector_id)
+            .and_then(|detector| detector.filters.get_mut(&input.filter_name))
+        else {
+            // Both were resolved just above under the same lock, so this is
+            // unreachable; it is a modelled server fault rather than a panic.
+            return Err(UpdateFilterErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // Every member but `DetectorId` and `FilterName` is optional on this request
+        // (`smithy_query(operation="UpdateFilter")`), and an absent optional member
+        // names no new value: the stored one stands. Reading absence as "clear it"
+        // would make changing one member alone impossible, since this request carries
+        // no way to re-state the filter's name-keyed identity plus every other value.
+        if let Some(description) = input.description.as_ref() {
+            filter.description = Some(description.clone());
+        }
+        if let Some(action) = input.action.as_ref() {
+            filter.action = Some(action.clone());
+        }
+        if let Some(rank) = input.rank {
+            filter.rank = Some(rank);
+        }
+        if let Some(criteria) = input.finding_criteria.as_ref() {
+            // Stored as sent, the way `CreateFilter` stores it: a saved criterion is
+            // reported back verbatim rather than narrowed to the subset the finding
+            // matcher can evaluate.
+            filter.finding_criteria = criteria.clone();
+        }
+
+        // "The version of the filter. Every time the filter is updated, the version
+        // increments by 1", and `UpdatedAt` is "the timestamp when the filter was last
+        // updated" (`smithy_query(operation="GetFilter")`) — so a successful update is
+        // what moves both, and `CreatedAt` never moves again.
+        filter.version = filter.version.saturating_add(1);
+        filter.updated_at_millis = now;
+
+        Ok(UpdateFilterOutput {
+            name: filter.name.clone(),
+        })
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> UpdateFilterError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

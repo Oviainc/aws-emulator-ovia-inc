@@ -7,7 +7,7 @@
 //!
 //! 1. a write's `ConsumedCapacity` FANS OUT: with `ReturnConsumedCapacity=INDEXES` the
 //!    response carries the units consumed on the table and one entry per secondary index
-//!    the written (or removed) item reaches, and the aggregate `CapacityUnits` is their
+//!    the write CHANGES the stored entry of, and the aggregate `CapacityUnits` is their
 //!    sum; with `TOTAL` only that aggregate; with `NONE` (or no member) nothing;
 //! 2. `ReturnItemCollectionMetrics=SIZE` reports the item collection the write landed
 //!    in — its `ItemCollectionKey` is the item's partition key attribute alone and its
@@ -312,6 +312,17 @@ fn key_of(item: &Value) -> Value {
     json!({"pk": item["pk"].clone(), "sk": item["sk"].clone()})
 }
 
+/// The same item at a DIFFERENT sort key, and of the same size: a sibling of the row's
+/// item, so a write of it costs what a write of the row's item costs.
+fn sibling_key(item: &Value) -> Value {
+    let mut sibling = item.clone();
+    let sort = item["sk"]["S"]
+        .as_str()
+        .expect("every capacity row keys its item with a string sort key");
+    sibling["sk"] = json!({"S": format!("t{}", &sort[1..])});
+    sibling
+}
+
 #[tokio::test]
 async fn a_write_reports_the_capacity_it_consumed_on_every_index_it_affects() {
     let router = emulator();
@@ -338,13 +349,18 @@ async fn a_write_reports_the_capacity_it_consumed_on_every_index_it_affects() {
         );
         assert_breakdown(&format!("put {}", row.case), &put["ConsumedCapacity"], &row);
 
-        // TOTAL: "only the aggregate ConsumedCapacity for the operation".
+        // TOTAL: "only the aggregate ConsumedCapacity for the operation". The item goes
+        // to a SIBLING key, so this write creates index entries of its own and fans out
+        // exactly as the row predicts — a second write of the identical item at the same
+        // key would change no index entry, which is what
+        // `a_write_that_replaces_an_item_is_charged_by_the_documented_replacement_rules`
+        // pins.
         let total = ok(
             &router,
             "PutItem",
             json!({
                 "TableName": FAN_OUT,
-                "Item": row.item.clone(),
+                "Item": sibling_key(&row.item),
                 "ReturnConsumedCapacity": "TOTAL",
             }),
         )
@@ -751,14 +767,16 @@ async fn a_write_that_replaces_an_item_is_charged_by_the_documented_replacement_
     // Each row is a (before, after) pair at ONE key, and the breakdown the Developer
     // Guide's write-capacity rules predict for the replacement:
     //
-    // * the table is charged on "the larger of the two" item sizes;
-    // * an index whose key value is unchanged takes one write, on the larger of the two
-    //   projections;
+    // * the table is charged on "the larger of the two" item sizes, whether or not the
+    //   item it stores differs from the one that stood there;
+    // * an index whose key value is unchanged but whose PROJECTED attributes changed
+    //   takes one write, on the larger of the two projections;
     // * an index whose key value CHANGED takes two — "one to delete the previous item
     //   from the index and another write to put the new item into the index";
     // * an index the new version no longer reaches still takes the one write that
     //   deletes its old projection;
-    // * an index neither version reaches is not charged at all.
+    // * an index neither version reaches is not charged at all, and neither is one whose
+    //   stored entry the write leaves exactly as it stood.
     let big = "p".repeat(2000);
     let large_item = json!({
         "pk": {"S": "coll-r"}, "sk": {"S": "s1"},
@@ -780,79 +798,123 @@ async fn a_write_that_replaces_an_item_is_charged_by_the_documented_replacement_
         "lsiAll": {"S": "a1"},
         "gsiPk": {"S": "g1"}, "payload": {"S": "small"},
     });
-    // A number respelt is the same key, so the index entry is updated, not moved.
+    // A number respelt is the same key AND the same value, so no index entry changes.
     let small_respelt_number_key = json!({
         "pk": {"S": "coll-r"}, "sk": {"S": "s1"},
         "lsiAll": {"S": "a1"}, "lsiKeys": {"N": "1e0"},
         "gsiPk": {"S": "g1"}, "payload": {"S": "small"},
     });
+    // An attribute only the `ALL` local index stores: it is neither index key nor a
+    // `NonKeyAttributes` entry of the global index.
+    let small_plus_untracked = json!({
+        "pk": {"S": "coll-r"}, "sk": {"S": "s1"},
+        "lsiAll": {"S": "a1"}, "lsiKeys": {"N": "1"},
+        "gsiPk": {"S": "g1"}, "payload": {"S": "small"}, "note": {"S": "n"},
+    });
+    // The attribute the global index `INCLUDE`s, changed and the same length, so only
+    // WHICH indexes are charged can differ, not how much.
+    let small_other_payload = json!({
+        "pk": {"S": "coll-r"}, "sk": {"S": "s1"},
+        "lsiAll": {"S": "a1"}, "lsiKeys": {"N": "1"},
+        "gsiPk": {"S": "g1"}, "payload": {"S": "other"},
+    });
 
-    let rows: Vec<(&str, Value, CapacityCase)> = vec![
+    let rows: Vec<(&str, Value, Value, CapacityCase)> = vec![
         (
             "shrinking replacement is charged on the larger item",
+            large_item.clone(),
             small_same_keys.clone(),
             CapacityCase {
                 case: "shrink",
                 item: small_same_keys.clone(),
                 table: 2.0,
-                local: vec![("lsiAll", 2.0), ("lsiKeys", 1.0)],
+                local: vec![("lsiAll", 2.0)],
                 global: vec![("gsi1", 2.0)],
             },
         ),
         (
             "a changed local index key costs a delete and a write",
+            small_same_keys.clone(),
             small_moved_local_key.clone(),
             CapacityCase {
                 case: "moved local key",
                 item: small_moved_local_key.clone(),
                 table: 1.0,
-                local: vec![("lsiAll", 2.0), ("lsiKeys", 1.0)],
-                global: vec![("gsi1", 1.0)],
+                local: vec![("lsiAll", 2.0)],
+                global: vec![],
             },
         ),
         (
             "dropping an index key costs the delete of its old projection",
+            small_same_keys.clone(),
             small_without_local_key.clone(),
             CapacityCase {
                 case: "dropped local key",
                 item: small_without_local_key.clone(),
                 table: 1.0,
                 local: vec![("lsiAll", 1.0), ("lsiKeys", 1.0)],
-                global: vec![("gsi1", 1.0)],
+                global: vec![],
             },
         ),
         (
-            "an index key respelt to the same number is not a move",
+            "an index key respelt to the same number changes no index entry",
+            small_same_keys.clone(),
             small_respelt_number_key.clone(),
             CapacityCase {
                 case: "respelt number key",
                 item: small_respelt_number_key.clone(),
                 table: 1.0,
-                local: vec![("lsiAll", 1.0), ("lsiKeys", 1.0)],
+                local: vec![],
+                global: vec![],
+            },
+        ),
+        (
+            "re-writing the identical item changes no index entry",
+            small_same_keys.clone(),
+            small_same_keys.clone(),
+            CapacityCase {
+                case: "identical replacement",
+                item: small_same_keys.clone(),
+                table: 1.0,
+                local: vec![],
+                global: vec![],
+            },
+        ),
+        (
+            "an attribute only one projection stores charges only that index",
+            small_same_keys.clone(),
+            small_plus_untracked.clone(),
+            CapacityCase {
+                case: "untracked attribute added",
+                item: small_plus_untracked.clone(),
+                table: 1.0,
+                local: vec![("lsiAll", 1.0)],
+                global: vec![],
+            },
+        ),
+        (
+            "a changed INCLUDEd attribute charges the index that includes it",
+            small_same_keys.clone(),
+            small_other_payload.clone(),
+            CapacityCase {
+                case: "included attribute changed",
+                item: small_other_payload.clone(),
+                table: 1.0,
+                local: vec![("lsiAll", 1.0)],
                 global: vec![("gsi1", 1.0)],
             },
         ),
     ];
 
-    for (case, after, expected) in rows {
-        // Seed the key with the large item, then replace it; the seeding write's own
-        // capacity is not what this row is about.
+    for (case, before, after, expected) in rows {
+        // Seed the key with this row's "before" version; the seeding write's own
+        // capacity is not what the row is about.
         ok(
             &router,
             "PutItem",
-            json!({"TableName": FAN_OUT, "Item": large_item.clone()}),
+            json!({"TableName": FAN_OUT, "Item": before}),
         )
         .await;
-        if case.contains("respelt") || case.contains("dropping") || case.contains("changed") {
-            // These rows move or drop an index key, so the "before" version must be the
-            // small item that holds the original keys.
-            ok(
-                &router,
-                "PutItem",
-                json!({"TableName": FAN_OUT, "Item": small_same_keys.clone()}),
-            )
-            .await;
-        }
         let replaced = ok(
             &router,
             "PutItem",

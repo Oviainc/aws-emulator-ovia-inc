@@ -423,7 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .availability_zone
                 .clone()
                 .filter(|zone| !zone.is_empty())
-                .unwrap_or_else(|| format!("{region}a")),
+                .unwrap_or_else(|| crate::state::default_availability_zone(&region)),
             // A new flow is not running: it stands by until StartFlow. AWS returns it in
             // this steady status, so no transition is owed here.
             status: crate::state::STATUS_STANDBY.to_string(),

@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAggregateResourceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAggregateResourceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAggregateResourceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CURRENT configuration item ONE aggregate resource identifier names, out
+//! of the discovered-resource inventory this service's store holds
+//! (`discovered_resources` in
+//! [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState`]), for the source
+//! account and Region the named configuration aggregator aggregates. The lookup is the
+//! one `BatchGetAggregateResourceConfig` runs per identifier
+//! ([`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState::aggregated_resource`]),
+//! so a single read and a batch read cannot disagree about what an identifier names;
+//! where this aggregator holds no current configuration item for the identifier, a
+//! single read has no item to answer with and refuses with the modelled
+//! `ResourceNotDiscoveredException` instead of the batch path's
+//! `UnprocessedResourceIdentifiers` entry.
+//!
+//! Unlike the batch path, the item carries the resource's TAGS: dropping them is
+//! documented for `BatchGetAggregateResourceConfig` ("The API does not return tags and
+//! relationships"), not for this operation, whose output is the full
+//! `ConfigurationItem`.
+//!
+//! It is a REPORT: it writes nothing, so the inventory a later caller sees is the one
+//! this call saw.
+//!
+//! `OversizedConfigurationItemException` ("The configuration item size is outside the
+//! allowable range") is not raised here: `PutResourceConfig` is the only operation that
+//! records a configuration item into this store and it already refuses a configuration
+//! past [`crate::ops::put_resource_config::MAX_RESOURCE_CONFIGURATION_BYTES`] ("The
+//! configuration JSON must not exceed 64 KB"), so no configuration item this store
+//! holds is outside the allowable range.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +174,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAggregateResourceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAggregateResourceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAggregateResourceConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // This store stands for ONE account in ONE Region, so the Config data it holds
+        // is this account's, in the Region the request is signed for: an identifier
+        // naming any other source names data this store does not hold.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                GetAggregateResourceConfigErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(crate::state::no_such_configuration_aggregator_message(
+                            &input.configuration_aggregator_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let identifier = &input.resource_identifier;
+        // No current configuration item for this identifier — its source or its
+        // resource type is outside the aggregator's scope, the inventory holds nothing
+        // of the resource, or the resource was deleted — leaves this read nothing to
+        // answer with, which is the resource the modelled error calls "either unknown
+        // or has not been discovered".
+        let Some(entry) = store.aggregated_resource(aggregator, identifier, account_id, &region)
+        else {
+            return Err(
+                GetAggregateResourceConfigErrorModeled::ResourceNotDiscoveredException(
+                    ResourceNotDiscoveredException {
+                        message: Some(crate::state::resource_not_discovered_message(identifier)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetAggregateResourceConfigOutput {
+            configuration_item: Some(entry.to_configuration_item(
+                &identifier.source_region,
+                store.recording_frequency_of(&entry.resource_type),
+            )),
+        })
     }
 }

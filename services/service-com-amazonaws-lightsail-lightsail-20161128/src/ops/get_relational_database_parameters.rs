@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the runtime parameters of ONE stored managed database: the parameter
+//! set of the engine that database's blueprint names
+//! ([`crate::state::relational_database_parameter_specs`]), each entry carrying
+//! the name, allowed range, data type, apply type, apply method and
+//! modifiability that engine publishes for it, and the value the database runs
+//! it at — absent where the service's parameter group leaves the parameter at
+//! the engine's own default, a fixed value where the group pins one, and a
+//! number computed from the memory of the database's own bundle where the group
+//! sizes the parameter by memory.
+//!
+//! The set is paged by `pageToken`, which names a parameter
+//! ([`crate::state::relational_database_parameter_page`]) and is refused with
+//! the modelled `InvalidInputException` when it names none; a database name the
+//! account does not hold is refused with the service's `DoesNotExist` envelope.
+//! Reporting it is a READ: nothing a later caller can see changes.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +179,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseParameters"))
+        // Reporting only: the answer is the engine's parameter set, sized by the
+        // stored database's own hardware, and nothing about the request changes
+        // either. A database is addressed by name alone, so `ctx`'s request
+        // metadata takes no part in it.
+        let _ = ctx;
+
+        // `relationalDatabaseName` is a modelled `@required` member carrying the
+        // `ResourceName` pattern, so the centralized walk already refused an
+        // absent or malformed name. A well-formed name that names nothing is the
+        // service's `DoesNotExist` rejection, never an empty 200.
+        let name = input.relational_database_name;
+        let page_token = input.page_token.as_deref();
+
+        // The database's blueprint picks WHICH parameter set it has, and its
+        // bundle's RAM is what the memory-sized values in that set come to — so
+        // both are read out of the one stored record, under the one lock.
+        let (specs, ram_size_in_gb) = crate::state::with_state(&*self.engine, |store| {
+            store
+                .relational_database(&name)
+                .map(|database| {
+                    (
+                        crate::state::relational_database_parameter_specs(database.blueprint.engine),
+                        database.bundle.ram_size_in_gb,
+                    )
+                })
+                .ok_or_else(|| not_found(&name))
+        })
+        .ok_or_else(unavailable)??;
+
+        let page = crate::state::relational_database_parameter_page(
+            specs,
+            ram_size_in_gb,
+            page_token,
+            crate::state::RELATIONAL_DATABASE_PARAMETER_PAGE_SIZE,
+        )
+        .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), specs))?;
+
+        Ok(GetRelationalDatabaseParametersOutput {
+            // A page always reports a list, empty or not: the caller asked what
+            // the engine offers, and an absent member would say nothing.
+            parameters: Some(page.parameters),
+            next_page_token: page.next_page_token,
+        })
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> GetRelationalDatabaseParametersError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// `pageToken` names no parameter of this database's parameter set, so there is
+/// no page to answer: the modelled `InvalidInputException`, documented as "user
+/// input does not conform to the validation rules of an input field".
+fn invalid_page_token(
+    token: &str,
+    specs: &[crate::state::RelationalDatabaseParameterSpec],
+) -> GetRelationalDatabaseParametersError {
+    GetRelationalDatabaseParametersErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "pageToken {token:?} does not name a parameter of this database; a page token is the parameter name a previous page reported as nextPageToken, one of: {}",
+            crate::state::relational_database_parameter_names(specs)
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetRelationalDatabaseParametersError {
+    GetRelationalDatabaseParametersErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -21,8 +21,12 @@ mod error_message_members;
 mod member_accounts;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
+#[path = "all/protection_status.rs"]
+mod protection_status;
 #[path = "all/protocols_list_lifecycle.rs"]
 mod protocols_list_lifecycle;
+#[path = "all/protocols_lists_enumeration.rs"]
+mod protocols_lists_enumeration;
 #[path = "all/resource_set_deletion.rs"]
 mod resource_set_deletion;
 #[path = "all/state_roundtrip.rs"]

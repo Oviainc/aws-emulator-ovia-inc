@@ -21,6 +21,8 @@ mod channel_lifecycle;
 mod channel_listing;
 #[path = "all/channel_updates.rs"]
 mod channel_updates;
+#[path = "all/dashboard_deletion.rs"]
+mod dashboard_deletion;
 #[path = "all/dashboard_enumeration.rs"]
 mod dashboard_enumeration;
 #[path = "all/dashboard_lifecycle.rs"]

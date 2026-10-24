@@ -9,13 +9,14 @@
 //! # The clock, not the reader, moves a status
 //!
 //! AWS HealthImaging answers `CreateDatastore` with `CREATING` and `DeleteDatastore`
-//! with `DELETING`, and `StartDICOMImportJob` with `SUBMITTED` — three non-terminal
-//! statuses the service itself advances afterwards. This crate stores the instant each
+//! with `DELETING`, `StartDICOMImportJob` with `SUBMITTED`, and `CopyImageSet` with a
+//! `LOCKED` source and destination — non-terminal statuses the service itself advances
+//! afterwards. This crate stores the instant each
 //! transition falls DUE and materialises it in [`ComAmazonawsMedicalimagingAhigatewayserviceState::advance_clock`],
 //! which every handler calls first. Nothing sleeps, and a reporting operation
-//! (`GetDatastore`, `ListDatastores`, `GetDICOMImportJob`) only ever writes a change the
-//! clock already owed at that instant — so a read never moves a status that was not
-//! already due.
+//! (`GetDatastore`, `ListDatastores`, `GetDICOMImportJob`, `GetImageSet`) only ever
+//! writes a change the clock already owed at that instant — so a read never moves a
+//! status that was not already due.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -43,6 +44,18 @@ pub const IMPORT_JOB_IN_PROGRESS_DELAY: Duration = Duration::from_millis(300);
 /// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`].
 pub const IMPORT_JOB_COMPLETION_DELAY: Duration = Duration::from_millis(600);
 
+/// How long after `CopyImageSet` the copy completes: the source image set leaves
+/// `COPYING_WITH_READ_ONLY_ACCESS` and the destination leaves `COPYING`, both returning
+/// to `ACTIVE`. A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`] —
+/// AWS publishes no duration for a copy, and a caller reading either image set straight
+/// after the call still observes the `LOCKED` copy in flight.
+pub const IMAGE_SET_COPY_DELAY: Duration = Duration::from_millis(400);
+
+/// The external version identifier an image set's FIRST version carries. AWS numbers
+/// image set versions from 1 (`ImageSetExternalVersionId` is `^\d+$`), and each later
+/// version is one past the one it supersedes.
+pub const FIRST_IMAGE_SET_VERSION_ID: u32 = 1;
+
 /// The smallest page `ListDatastores` will serve — the model's `maxResults` minimum
 /// (`smithy_query(query="operation",operation="ListDatastores")` reports range 1..50).
 pub const MIN_LIST_PAGE_SIZE: usize = 1;
@@ -66,6 +79,20 @@ pub const MAX_DATASTORES: usize = 128;
 /// [`MAX_DATASTORES`], applied per data store so the product of the two is bounded too.
 /// Past the cap `StartDICOMImportJob` is refused with `ServiceQuotaExceededException`.
 pub const MAX_IMPORT_JOBS_PER_DATASTORE: usize = 128;
+
+/// How many image sets one data store will hold at once — the same memory bound as
+/// [`MAX_IMPORT_JOBS_PER_DATASTORE`], applied per data store. Past the cap an operation
+/// that would mint another image set (`CopyImageSet` without a destination image set)
+/// is refused with `ServiceQuotaExceededException`.
+pub const MAX_IMAGE_SETS_PER_DATASTORE: usize = 128;
+
+/// How many versions one image set will hold at once.
+///
+/// A memory bound, not an AWS quota: every copy into an existing image set keeps the
+/// version it superseded, so without a cap a caller could grow one image set's version
+/// list without limit. Past the cap the call is refused with the operation's own
+/// `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_IMAGE_SET_VERSIONS: usize = 128;
 
 /// How many `@idempotencyToken` entries the ledger keeps.
 ///
@@ -122,6 +149,37 @@ pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Datastore resource is not found."
 /// absent import job is not recorded, so this spelling is chosen by analogy. What is
 /// NOT chosen is the shape: no identifier the caller supplied appears in it.
 pub const IMPORT_JOB_NOT_FOUND_MESSAGE: &str = "ImportJob resource is not found.";
+
+/// The text this service answers a request naming an image set a data store does not
+/// hold with — the resource KIND, by the same rule as [`DATASTORE_NOT_FOUND_MESSAGE`],
+/// with no identifier from the request in it.
+pub const IMAGE_SET_NOT_FOUND_MESSAGE: &str = "ImageSet resource is not found.";
+
+/// The text this service answers a request naming a VERSION of an image set it holds no
+/// such version of with. Stated by kind, like [`IMAGE_SET_NOT_FOUND_MESSAGE`].
+pub const IMAGE_SET_VERSION_NOT_FOUND_MESSAGE: &str =
+    "ImageSet version resource is not found.";
+
+/// The text this service refuses a copy whose caller named a version that is no longer
+/// the image set's latest with. A `latestVersionId` is an optimistic-concurrency check:
+/// a stale one means the caller's view of the image set is out of date, which is what
+/// `ConflictException` (HTTP 409) reports. Constant, echoing neither version.
+pub const IMAGE_SET_VERSION_CONFLICT_MESSAGE: &str =
+    "The latest image set version identifier provided does not match the image set's latest version.";
+
+/// The text this service refuses a copy of (or into) an image set that is not `ACTIVE`
+/// with — one still `LOCKED` by a copy in flight, or already `DELETED`. Constant, and
+/// stated by rule rather than by which image set it was.
+pub const IMAGE_SET_NOT_ACTIVE_MESSAGE: &str =
+    "The image set is not in the ACTIVE state, so it cannot take part in a copy.";
+
+/// The storage tier every image set this emulator holds reports.
+///
+/// `StorageTier`'s other value, `ARCHIVE_INSTANT_ACCESS`, is reached by archiving, and
+/// this service's model binds no operation that archives an image set
+/// (`smithy_query(query="list_operations")`) — so an image set here never leaves the
+/// tier a new one is created in.
+pub const DEFAULT_STORAGE_TIER: &str = "FREQUENT_ACCESS";
 
 /// The text this service refuses a `nextToken` it did not issue with — fixed, and
 /// independent of the token supplied, so the refusal reveals nothing about how a real
@@ -184,12 +242,21 @@ pub fn constraint_clause(violation: &Violation) -> String {
 /// * `datastoreName` and `jobName` carry a caller-chosen NAME: free text a caller
 ///   composed, which in a clinical service can carry patient detail.
 /// * `kmsKeyArn` names an encryption key, which is credential-adjacent.
+/// * `copiableAttributes` carries a caller-composed JSON document naming the SOP
+///   instances a copy takes, which the model marks `@sensitive`
+///   (`smithy_query(query="shape",shape="MetadataCopies")`) — the model itself saying
+///   the value must not be reproduced.
 ///
 /// A member that names another AWS resource (`lambdaAuthorizerArn`, `dataAccessRoleArn`)
 /// is in neither class and keeps its echoed value — which is what the recorded corpus
 /// shows: the clauses about the data store's name and its KMS key carry no value where
 /// the one about the authorizer's function ARN carries it.
-const VALUE_WITHHOLDING_MEMBERS: &[&str] = &["datastorename", "jobname", "kmskeyarn"];
+const VALUE_WITHHOLDING_MEMBERS: &[&str] = &[
+    "datastorename",
+    "jobname",
+    "kmskeyarn",
+    "copiableattributes",
+];
 
 /// The DICOM attribute members, in the same lowercased spelling. The model marks every
 /// one of them `@sensitive`
@@ -258,6 +325,26 @@ pub fn validation_envelope(violations: &[Violation]) -> Option<String> {
 /// [`validation_envelope`], so the envelope text is spelled in one place.
 pub fn one_validation_error(violation: &Violation) -> String {
     validation_envelope(::std::slice::from_ref(violation)).unwrap_or_default()
+}
+
+/// The `ValidationException` message for a requirement no [`ViolationKind`] states —
+/// one a HANDLER checks itself, such as a member the model documents as holding a JSON
+/// document, or two members that cannot hold together. Worded through the same envelope
+/// and the same `<subject> failed to satisfy constraint: <requirement>` clause as every
+/// refusal the boundary validator states, so the two read alike.
+///
+/// `value` is the rejected value, and is echoed under exactly the rule the boundary
+/// refusals follow: withheld for a member [`withholds_value`] covers, and withheld when
+/// the caller passes `None` because the requirement is about the member's presence or
+/// its relation to another member rather than about what it held.
+pub fn handler_requirement_error(path: &str, value: Option<&str>, requirement: &str) -> String {
+    let clause = match value {
+        Some(shown) if !withholds_value(path) => {
+            format!("Value '{shown}' at '{path}'{CONSTRAINT_SEPARATOR}{requirement}")
+        }
+        _ => format!("{path}{CONSTRAINT_SEPARATOR}{requirement}"),
+    };
+    format!("1 validation error detected: {clause}")
 }
 
 /// The `@pattern` of `com.amazonaws.medicalimaging#Arn`
@@ -401,23 +488,259 @@ impl ImportJob {
     }
 }
 
-/// One persisted image set. Import jobs populate this map in the image-set slice;
-/// the bootstrap slice only needs the data store to own it.
+/// `ImageSetState`, exactly the values the model declares
+/// (`smithy_query(query="shape",shape="ImageSetState")`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSetState {
+    Active,
+    Locked,
+    Deleted,
+}
+
+impl ImageSetState {
+    /// The wire form of this state.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Locked => "LOCKED",
+            Self::Deleted => "DELETED",
+        }
+    }
+
+    /// Parse a wire state, or `None` when the string names no modelled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "ACTIVE" => Some(Self::Active),
+            "LOCKED" => Some(Self::Locked),
+            "DELETED" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+/// `ImageSetWorkflowStatus`, exactly the values the model declares
+/// (`smithy_query(query="shape",shape="ImageSetWorkflowStatus")`) — what last happened
+/// to an image set, as against [`ImageSetState`], which is whether it can be read and
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSetWorkflowStatus {
+    Created,
+    Copied,
+    Copying,
+    CopyingWithReadOnlyAccess,
+    CopyFailed,
+    Updating,
+    UpdatingForStudyConsistency,
+    Updated,
+    UpdateFailed,
+    Deleting,
+    Deleted,
+    Importing,
+    Imported,
+    ImportFailed,
+}
+
+impl ImageSetWorkflowStatus {
+    /// The wire form of this status.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Created => "CREATED",
+            Self::Copied => "COPIED",
+            Self::Copying => "COPYING",
+            Self::CopyingWithReadOnlyAccess => "COPYING_WITH_READ_ONLY_ACCESS",
+            Self::CopyFailed => "COPY_FAILED",
+            Self::Updating => "UPDATING",
+            Self::UpdatingForStudyConsistency => "UPDATING_FOR_STUDY_CONSISTENCY",
+            Self::Updated => "UPDATED",
+            Self::UpdateFailed => "UPDATE_FAILED",
+            Self::Deleting => "DELETING",
+            Self::Deleted => "DELETED",
+            Self::Importing => "IMPORTING",
+            Self::Imported => "IMPORTED",
+            Self::ImportFailed => "IMPORT_FAILED",
+        }
+    }
+
+    /// Parse a wire status, or `None` when the string names no modelled value.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "CREATED" => Some(Self::Created),
+            "COPIED" => Some(Self::Copied),
+            "COPYING" => Some(Self::Copying),
+            "COPYING_WITH_READ_ONLY_ACCESS" => Some(Self::CopyingWithReadOnlyAccess),
+            "COPY_FAILED" => Some(Self::CopyFailed),
+            "UPDATING" => Some(Self::Updating),
+            "UPDATING_FOR_STUDY_CONSISTENCY" => Some(Self::UpdatingForStudyConsistency),
+            "UPDATED" => Some(Self::Updated),
+            "UPDATE_FAILED" => Some(Self::UpdateFailed),
+            "DELETING" => Some(Self::Deleting),
+            "DELETED" => Some(Self::Deleted),
+            "IMPORTING" => Some(Self::Importing),
+            "IMPORTED" => Some(Self::Imported),
+            "IMPORT_FAILED" => Some(Self::ImportFailed),
+            _ => None,
+        }
+    }
+}
+
+/// One VERSION of an image set — what `GetImageSet`, `ListImageSetVersions` and the
+/// copy properties report.
+///
+/// State and workflow status live HERE and nowhere else: an image set's current state
+/// is its latest version's, so the two can never disagree.
+#[derive(Debug, Clone)]
+pub struct ImageSetVersion {
+    /// The external version identifier, `1` for an image set's first version. The wire
+    /// form is `ImageSetExternalVersionId` (`^\d+$`), rendered by
+    /// [`ImageSetVersion::wire_version_id`].
+    pub version_id: u32,
+    pub image_set_state: ImageSetState,
+    pub workflow_status: ImageSetWorkflowStatus,
+    /// When this version last changed. Set from the instant the change fell DUE, never
+    /// from `now`, so it does not move between reads.
+    pub updated_at: SystemTime,
+    /// `Overrides.forced`: whether the `force` flag was used when creating this
+    /// version, which is exactly what the model says the member reports.
+    pub forced: bool,
+    /// `message` — the error message an image set action failed with, absent otherwise.
+    pub message: Option<String>,
+}
+
+impl ImageSetVersion {
+    /// The version identifier as `ImageSetExternalVersionId` spells it (`^\d+$`).
+    pub fn wire_version_id(&self) -> String {
+        self.version_id.to_string()
+    }
+}
+
+/// A change to an image set the CLOCK owes — the copy a `CopyImageSet` call started,
+/// which lands on the latest version once [`IMAGE_SET_COPY_DELAY`] has passed.
+#[derive(Debug, Clone)]
+pub struct PendingImageSetTransition {
+    pub due_at: SystemTime,
+    pub image_set_state: ImageSetState,
+    pub workflow_status: ImageSetWorkflowStatus,
+}
+
+/// One persisted image set, with every version of it the data store holds.
 #[derive(Debug, Clone)]
 pub struct ImageSet {
     /// The tags `TagResource` / `ListTagsForResource` keep for this image set, which
     /// an ARN reaches through its optional `/imageset/<id>` suffix (see
-    /// [`ARN_PATTERN`]). Empty until the image-set slice mints image sets.
+    /// [`ARN_PATTERN`]).
     pub tags: HashMap<String, String>,
     pub image_set_id: String,
     pub image_set_arn: String,
-    pub versions: Vec<String>,
-    pub image_set_state: String,
-    pub image_set_workflow_status: String,
+    /// The newest version. Held apart from [`ImageSet::earlier_versions`] so that
+    /// "an image set has at least one version" is a TYPE invariant: no reader has to
+    /// handle an empty version list, and no handler can create an image set without
+    /// one.
+    pub latest_version: ImageSetVersion,
+    /// Every superseded version, oldest first.
+    pub earlier_versions: Vec<ImageSetVersion>,
+    /// Whether this image set is in the primary DICOM hierarchy (`isPrimary`).
     pub is_primary: bool,
     pub created_at: SystemTime,
-    pub updated_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
+    /// What the clock owes the latest version, if anything.
+    pub pending: Option<PendingImageSetTransition>,
+}
+
+impl ImageSet {
+    /// A freshly minted image set at version [`FIRST_IMAGE_SET_VERSION_ID`], in the
+    /// state and workflow status its creator puts it in.
+    ///
+    /// The ONE place an image set record is built, so every creator — the copy's
+    /// destination today, a DICOM import later — agrees on the invariants.
+    pub fn new(
+        image_set_id: String,
+        image_set_arn: String,
+        image_set_state: ImageSetState,
+        workflow_status: ImageSetWorkflowStatus,
+        is_primary: bool,
+        forced: bool,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            tags: HashMap::new(),
+            image_set_id,
+            image_set_arn,
+            latest_version: ImageSetVersion {
+                version_id: FIRST_IMAGE_SET_VERSION_ID,
+                image_set_state,
+                workflow_status,
+                updated_at: now,
+                forced,
+                message: None,
+            },
+            earlier_versions: Vec::new(),
+            is_primary,
+            created_at: now,
+            deleted_at: None,
+            pending: None,
+        }
+    }
+
+    /// Every version this image set holds, oldest first — the order
+    /// `ListImageSetVersions` reports them in.
+    pub fn versions(&self) -> impl Iterator<Item = &ImageSetVersion> {
+        self.earlier_versions
+            .iter()
+            .chain(::std::iter::once(&self.latest_version))
+    }
+
+    /// The version `wire_version_id` (`^\d+$`) names, or `None` when this image set
+    /// holds no such version.
+    pub fn version(&self, wire_version_id: &str) -> Option<&ImageSetVersion> {
+        self.versions()
+            .find(|version| version.wire_version_id() == wire_version_id)
+    }
+
+    /// The latest version identifier, as the wire spells it.
+    pub fn latest_version_id(&self) -> String {
+        self.latest_version.wire_version_id()
+    }
+
+    /// Supersede the latest version with a new one, numbered one past it, and answer
+    /// the new version's identifier. The old latest becomes the newest earlier version,
+    /// so a reader naming it still gets what it reported before.
+    pub fn push_version(
+        &mut self,
+        image_set_state: ImageSetState,
+        workflow_status: ImageSetWorkflowStatus,
+        forced: bool,
+        now: SystemTime,
+    ) -> u32 {
+        let version_id = self.latest_version.version_id.saturating_add(1);
+        let superseded = ::std::mem::replace(
+            &mut self.latest_version,
+            ImageSetVersion {
+                version_id,
+                image_set_state,
+                workflow_status,
+                updated_at: now,
+                forced,
+                message: None,
+            },
+        );
+        self.earlier_versions.push(superseded);
+        version_id
+    }
+
+    /// Materialise the transition the clock owed this image set by `now`.
+    fn advance_to(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        if now < pending.due_at {
+            return;
+        }
+        self.latest_version.image_set_state = pending.image_set_state;
+        self.latest_version.workflow_status = pending.workflow_status;
+        // The due instant, not `now`: `updatedAt` must not move between reads.
+        self.latest_version.updated_at = pending.due_at;
+        self.pending = None;
+    }
 }
 
 /// One persisted data store, with the import jobs and image sets it owns.
@@ -480,6 +803,9 @@ impl Datastore {
         }
         for job in self.import_jobs.values_mut() {
             job.advance_to(now);
+        }
+        for image_set in self.image_sets.values_mut() {
+            image_set.advance_to(now);
         }
         true
     }
@@ -620,6 +946,13 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// `arn:aws:medical-imaging:<region>:<account>:datastore/<datastoreId>`.
 pub fn datastore_arn(region: &str, datastore_id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("datastore/{datastore_id}"))
+}
+
+/// The ARN of one image set inside a data store: that data store's OWN ARN with the
+/// `/imageset/<imageSetId>` suffix [`ARN_PATTERN`] admits — which is what makes the
+/// tagging operations reach the image set through [`ResourceArn`].
+pub fn image_set_arn(datastore_arn: &str, image_set_id: &str) -> String {
+    format!("{datastore_arn}/imageset/{image_set_id}")
 }
 
 /// What a `resourceArn` label names: a data store, or ONE image set inside it —

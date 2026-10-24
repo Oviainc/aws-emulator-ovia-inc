@@ -8,6 +8,10 @@
 //! `DeleteFHIRDatastore` all read and write the SAME record, so a create is
 //! observable through every one of them.
 //!
+//! `RestoreFHIRDatastore` mints one too, from the record a backup-enabled data
+//! store already holds here, so the restored data store is observable through
+//! exactly the same operations.
+//!
 //! The data transformation profile is the second: `CreateDataTransformationProfile`
 //! mints one in DRAFT here and `GetDataTransformationProfile` reads the SAME
 //! record back, version by version.
@@ -64,6 +68,19 @@ pub const DATASTORE_NOT_FOUND_MESSAGE: &str = "Could not find specified datastor
 /// is one fixed text for "the data store cannot be written to right now".
 pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "Specified datastore is not active.";
 
+/// The sentence this service refuses a point-in-time restore with when the
+/// source data store exists but holds no enabled backup to restore from.
+///
+/// Fixed, like the two texts above: it names neither the requested
+/// `DatastoreId` nor the restore point, so a refusal never quotes the request
+/// back at the caller.
+pub const DATASTORE_BACKUP_NOT_ENABLED_MESSAGE: &str =
+    "Specified datastore does not have backup enabled.";
+
+/// Seconds in a day, for turning a modelled `BackupRetentionPeriodInDays`
+/// (range 1..30) into the span it names.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+
 /// The sentence this service's `ResourceNotFoundException` carries when the
 /// request names a data transformation profile no record holds.
 ///
@@ -89,7 +106,9 @@ pub const PROFILE_VERSION_NOT_FOUND_MESSAGE: &str =
 /// — the only quota-shaped refusal that operation declares.
 pub const MAX_DATASTORES: usize = 100;
 
-/// The most `ClientToken` entries kept for `CreateFHIRDatastore` idempotency.
+/// The most `ClientToken` entries kept for data-store idempotency, across both
+/// operations that mint a data store (`CreateFHIRDatastore` and
+/// `RestoreFHIRDatastore`).
 ///
 /// At most one token is recorded per stored data store and a token is dropped
 /// with the record it minted, so this cap is never the binding one in practice;
@@ -357,9 +376,14 @@ impl Datastore {
             profile_configuration: self.profile_configuration.clone(),
             // Only the configuration half of the backup status is known here,
             // plus the instant that configuration became enabled. The
-            // restore-point and scheduled-deletion instants describe backups
-            // that have run, and nothing in this slice runs one, so they stay
-            // unset rather than being invented.
+            // restore-point instants would each have to be derived from the
+            // clock on every read — `RestoreFHIRDatastore` holds a requested
+            // restore point against the window
+            // [`Datastore::restore_window`] derives at the instant it runs —
+            // and the scheduled-deletion instant describes retained backup
+            // data of a deleted data store, which nothing in this slice keeps,
+            // so all three stay unset rather than being invented here and
+            // making two identical reads of one data store differ.
             backup_status_info: self
                 .backup_configuration
                 .clone()
@@ -400,6 +424,105 @@ impl Datastore {
         };
     }
 
+    /// The window a point-in-time restore of this data store may name, or `None`
+    /// when it holds no enabled backup and so cannot be restored at all.
+    ///
+    /// Continuous backup is a CONTINUOUS window rather than a set of snapshots,
+    /// so it runs from the instant backup became enabled on this data store —
+    /// nothing before that was ever backed up — no earlier than the retention
+    /// period the configuration names (`BackupConfiguration.RetentionPeriodInDays`,
+    /// "the number of days backup data is retained"), up to `now`, the latest
+    /// instant a continuous backup covers.
+    ///
+    /// Derived on every call rather than stored: the latest restorable point
+    /// advances with the clock, so there is nothing here to keep up to date and
+    /// reading it writes nothing.
+    pub fn restore_window(&self, now: SystemTime) -> Option<RestoreWindow> {
+        let enabled_at = self.backup_enabled_at?;
+        let retention_floor = self
+            .backup_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.retention_period_in_days)
+            .filter(|days| *days > 0)
+            .and_then(|days| {
+                now.checked_sub(Duration::from_secs(
+                    u64::from(days.unsigned_abs()).saturating_mul(SECONDS_PER_DAY),
+                ))
+            })
+            .map(::aws_smithy_types::DateTime::from);
+        // Whichever bound is LATER is the earliest restorable point: backup
+        // covers nothing before it was enabled, and nothing older than the
+        // retention period is retained.
+        let earliest = match retention_floor {
+            Some(floor) if epoch_nanos(&floor) > epoch_nanos(&enabled_at) => floor,
+            _ => enabled_at,
+        };
+        let at = ::aws_smithy_types::DateTime::from(now);
+        // A window never ends before it starts, whatever the clock did between
+        // the instant backup was enabled and this one.
+        let latest = if epoch_nanos(&earliest) > epoch_nanos(&at) {
+            earliest
+        } else {
+            at
+        };
+        Some(RestoreWindow { earliest, latest })
+    }
+
+    /// This data store's FHIR resources as they stood at `at`, with the bytes
+    /// they hold together.
+    ///
+    /// A point-in-time restore reproduces the data store as of one instant, so a
+    /// resource whose last write came AFTER that instant was not in the data
+    /// store in that form then and is not in the restored one. Nothing is
+    /// reconstructed: a resource is copied exactly as this service holds it, or
+    /// not at all.
+    ///
+    /// KNOWN LIMITATION, and the reason this is a `<=` filter rather than a
+    /// version walk: [`FhirResource`] holds ONE version — the FHIR update
+    /// interaction rewrites it in place and keeps no history — so a resource
+    /// created before `at` and updated after it has no version this service can
+    /// answer for `at`. It is left out rather than copied at the version it
+    /// reached later, because that content did not exist at `at` and a restore
+    /// must not invent it. Whoever gives [`FhirResource`] a version history
+    /// (charging the retained bytes the way the create and update paths already
+    /// charge [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`]) should make this pick
+    /// the newest version at or before `at` instead, which is exactly what the
+    /// real point-in-time restore does.
+    pub fn fhir_resources_as_of(
+        &self,
+        at: &::aws_smithy_types::DateTime,
+    ) -> (BTreeMap<(String, String), FhirResource>, usize) {
+        let cutoff = epoch_nanos(at);
+        let resources: BTreeMap<(String, String), FhirResource> = self
+            .fhir_resources
+            .iter()
+            .filter(|(_, resource)| epoch_nanos(&resource.last_updated) <= cutoff)
+            .map(|(key, resource)| (key.clone(), resource.clone()))
+            .collect();
+        let bytes = resources
+            .values()
+            .fold(0usize, |total, resource| total.saturating_add(resource.bytes));
+        (resources, bytes)
+    }
+
+    /// The tags a restore of this data store inherits: its own tags when its
+    /// backup configuration includes them, and none otherwise.
+    ///
+    /// `BackupConfiguration.BackupTagsEnabled` "specifies whether tags are
+    /// included in backups", so a backup taken with it unset carries no tags for
+    /// a restore to reproduce.
+    pub fn backed_up_tags(&self) -> BTreeMap<String, String> {
+        let included = self
+            .backup_configuration
+            .as_ref()
+            .is_some_and(|configuration| configuration.backup_tags_enabled);
+        if included {
+            self.tags.clone()
+        } else {
+            BTreeMap::new()
+        }
+    }
+
     /// The stored tags as the modelled `TagList`, ordered by key.
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
@@ -418,6 +541,19 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
             value: value.clone(),
         })
         .collect()
+}
+
+/// The window a point-in-time restore may name on a backup-enabled data store:
+/// from the instant backup became enabled (no earlier than the retention period
+/// the configuration names) up to now, which is the range
+/// `RestoreFHIRDatastore` holds a requested `RestorePointTime` against. The
+/// modelled `DatastoreBackupStatus.EarliestRestorePoint` / `LatestRestorePoint`
+/// describe the same two instants; [`Datastore::properties`] says why it does
+/// not report them.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreWindow {
+    pub earliest: ::aws_smithy_types::DateTime,
+    pub latest: ::aws_smithy_types::DateTime,
 }
 
 /// What one `CreateFHIRDatastore` `ClientToken` recorded: the data store it
@@ -585,8 +721,13 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// [`MAX_DATASTORES`]; a `DELETED` record is reaped after
     /// [`DELETED_RETENTION`].
     pub datastores: BTreeMap<String, Datastore>,
-    /// `CreateFHIRDatastore` idempotency: `ClientToken` -> what the first call
-    /// with that token minted. Bounded by [`MAX_CLIENT_TOKENS`]; write it through
+    /// Data-store idempotency: `ClientToken` -> what the first call with that
+    /// token minted. ONE map for both operations that mint a data store
+    /// (`CreateFHIRDatastore` and `RestoreFHIRDatastore`), so one caller's token
+    /// names one data store whichever of them minted it; each records a
+    /// fingerprint of its own request, so a token reused with a different
+    /// request — including the other operation's — is refused rather than
+    /// answered with the earlier data store. Bounded by [`MAX_CLIENT_TOKENS`]; write it through
     /// [`Self::record_client_token`], never directly.
     pub client_tokens: BTreeMap<String, ClientTokenRecord>,
     /// The order [`Self::client_tokens`] was written in, so the cap evicts the

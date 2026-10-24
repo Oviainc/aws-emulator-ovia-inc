@@ -34,6 +34,13 @@ mod interpolated_property_values;
 #[path = "all/asset_relationships.rs"]
 mod asset_relationships;
 
+// Same reasoning once more: this suite's alphabetical place is inside the sorted
+// list, which is where every concurrent iotsitewise change lands a declaration of
+// its own, so it is declared up here with the other suites kept out of that
+// stretch. Fold it into the list once the churn settles.
+#[path = "all/simultaneous_writes.rs"]
+mod simultaneous_writes;
+
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]
@@ -44,6 +51,11 @@ mod asset_model_composite_model;
 mod asset_model_composite_model_delete;
 #[path = "all/asset_model_properties.rs"]
 mod asset_model_properties;
+// Declared only because the build requires every file under `tests/all/` to be:
+// the suite was folded into `update_asset_model.rs` and this module now carries
+// no test. See the file's own note.
+#[path = "all/asset_model_update.rs"]
+mod asset_model_update;
 #[path = "all/asset_property_update.rs"]
 mod asset_property_update;
 #[path = "all/associated_assets.rs"]
@@ -54,6 +66,8 @@ mod batch_get_latest_values;
 mod batch_put_timestamp_and_quality;
 #[path = "all/describe_asset_property.rs"]
 mod describe_asset_property;
+#[path = "all/execute_query.rs"]
+mod execute_query;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/hierarchies_etags_and_refusals.rs"]
@@ -72,6 +86,8 @@ mod support;
 mod time_series;
 #[path = "all/time_series_disassociation.rs"]
 mod time_series_disassociation;
+#[path = "all/time_series_ingestion.rs"]
+mod time_series_ingestion;
 #[path = "all/update_asset.rs"]
 mod update_asset;
 #[path = "all/update_asset_model.rs"]

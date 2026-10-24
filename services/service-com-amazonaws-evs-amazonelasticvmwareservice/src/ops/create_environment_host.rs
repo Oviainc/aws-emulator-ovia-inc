@@ -7,6 +7,18 @@
 //! `CREATING` (the clock owes it `CREATED`). `ListEnvironmentHosts` reports what this
 //! operation stored.
 //!
+//! An Amazon EVS host IS an EC2 bare metal instance — "An ESX host that runs on an
+//! Amazon EC2 bare metal instance" (`Host` doc) — so this operation also LAUNCHES that
+//! instance into the account's own Amazon EC2 store, from the `keyName` and
+//! `instanceType` the request gave, in the environment's `vmkManagement` VLAN subnet and
+//! on its management address, and attaches the two ENIs Amazon EVS gives a host
+//! (`NetworkInterface` doc). The host reports that instance's id as `ec2InstanceId` and
+//! those interfaces as `networkInterfaces`, so a caller can look the host's instance up
+//! with EC2's own `DescribeInstances`. The launch happens after every precondition below
+//! has passed, so a refused request launches nothing; an EC2 store this emulator cannot
+//! reach leaves both members absent rather than naming resources that do not exist
+//! ([`crate::state::ec2_resources::launch_host_instance`]).
+//!
 //! The rules it enforces, each from the documentation quoted under "Modeled contract"
 //! below. This operation's error contract is `ThrottlingException` and
 //! `ValidationException` ONLY — it declares no `ResourceNotFoundException` — so a
@@ -299,11 +311,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is the move to CREATED the clock owes it.
         let pending = crate::state::PendingStatus::starting_now(crate::state::HOST_CREATED);
         let due_at = pending.due_at;
+        // "An ESX host that runs on an Amazon EC2 bare metal instance" (`Host` doc): the
+        // instance IS the host, so it is launched into the account's own Amazon EC2
+        // store here, from the key pair and instance type the request gave, in the
+        // environment's own `vmkManagement` VLAN subnet. It is launched only now, after
+        // every precondition above has passed, so a refused request launches nothing.
+        //
+        // No `vmkManagement` VLAN means no subnet to attach the host's interfaces to, so
+        // nothing is launched and the host reports neither member — rather than an
+        // instance in a subnet named by the empty string. Unreachable while the host's
+        // own management address comes out of that VLAN, which is the check above.
+        let ec2 = environment.vmk_management_vlan().and_then(|vlan| {
+            crate::state::ec2_resources::launch_host_instance(
+                &*self.engine,
+                crate::state::ec2_resources::HostLaunch {
+                    region: &region,
+                    instance_type: &input.host.instance_type,
+                    key_name: &input.host.key_name,
+                    management_ip: &ip_address,
+                    management_subnet_id: &vlan.subnet_id,
+                    service_access_subnet_id: &environment.service_access_subnet_id,
+                },
+            )
+        });
         let host = crate::state::StoredHost::creating(
             &input.host,
             ip_address,
             input.esx_version,
             created_at_ms,
+            ec2,
             pending,
         );
         // The name is unique across environments, checked above, so the slot is vacant.

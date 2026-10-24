@@ -210,7 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation cannot create a service-linked configuration recorder:
         // `PutServiceLinkedConfigurationRecorder` does. A request that names a service
-        // principal or a connector is asking for one.
+        // principal or a connector is asking for one, and the model states the sentence
+        // this refusal carries
+        // ([`crate::state::PUT_RECORDER_IS_NOT_SERVICE_LINKED`]).
         if requested.service_principal.is_some() || requested.connector_arn.is_some() {
             return Err(
                 PutConfigurationRecorderErrorModeled::UnmodifiableEntityException(

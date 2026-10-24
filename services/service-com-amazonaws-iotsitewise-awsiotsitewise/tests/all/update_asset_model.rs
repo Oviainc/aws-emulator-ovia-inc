@@ -798,6 +798,83 @@ async fn update_asset_model_evaluates_its_conditional_headers_before_writing() {
 }
 
 #[tokio::test]
+async fn the_conditional_headers_target_a_version_that_may_not_exist_yet() {
+    let router = router();
+
+    // The rows the settled matrix above cannot carry: a model whose owed
+    // CREATING -> ACTIVE transition has NOT fallen due has no ACTIVE version at
+    // all, so a header targeting that version is judged against nothing. The
+    // same two headers against the same model are the two outcomes: `If-Match`
+    // matches no tag (412), while `If-None-Match` asks that the version not
+    // exist, which is exactly the state (202).
+    //
+    // (case, headers, expected status)
+    let rows: Vec<ConditionalRow<'_>> = vec![
+        (
+            "If-Match on ACTIVE before the model has settled",
+            vec![("if-match", "$ETAG"), ("match-for-version-type", "ACTIVE")],
+            412,
+        ),
+        (
+            "If-None-Match on ACTIVE before the model has settled",
+            vec![("if-none-match", "*"), ("match-for-version-type", "ACTIVE")],
+            202,
+        ),
+    ];
+
+    for (case, headers, expected) in &rows {
+        // A model created and left alone: the transition it owes is still due,
+        // so this read reports the LATEST version's tag and no ACTIVE version
+        // exists behind it.
+        let model_id = create_model(&router, case, base_properties()).await;
+        let tag = describe_e_tag(&router, &model_id).await;
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| {
+                (*name, if *value == "$ETAG" { tag.as_str() } else { *value })
+            })
+            .collect();
+
+        let (status, answered) = update_model(
+            &router,
+            &model_id,
+            json!({"assetModelName": "Conditioned", "assetModelProperties": base_properties()}),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            status, *expected,
+            "case {case:?}: expected {expected}, got {status} {answered}"
+        );
+
+        let after = describe_model(&router, &model_id).await;
+        if *expected == 412 {
+            assert_eq!(
+                error_code(&answered),
+                "PreconditionFailedException",
+                "case {case:?}: unexpected error code in {answered}"
+            );
+            assert_eq!(
+                after["assetModelName"].as_str(),
+                Some(*case),
+                "case {case:?}: a refused update must leave the name alone, got {after}"
+            );
+            assert_eq!(
+                describe_e_tag(&router, &model_id).await,
+                tag,
+                "case {case:?}: a refused update must leave the ETag alone"
+            );
+        } else {
+            assert_eq!(
+                after["assetModelName"].as_str(),
+                Some("Conditioned"),
+                "case {case:?}: the accepted update must have landed, got {after}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn every_asset_of_the_model_inherits_the_updated_definition() {
     let (router, engine) = router_with_engine();
     let model_id = create_model(&router, "Boiler", base_properties()).await;

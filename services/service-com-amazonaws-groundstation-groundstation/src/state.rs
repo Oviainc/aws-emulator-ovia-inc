@@ -4,8 +4,9 @@
 //!
 //! Every resource this service hands out lives here: configs keyed by their
 //! `(configType, configId)` pair (the two labels `GET /config/{configType}/{configId}`
-//! carries), mission profiles and contacts keyed by their uuid, plus one ARN index so a
-//! `trackingConfigArn` / `missionProfileArn` reference resolves without scanning a map.
+//! carries), mission profiles, contacts and AWS Ground Station Agents keyed by their
+//! uuid, plus one ARN index so a `trackingConfigArn` / `missionProfileArn` reference
+//! resolves without scanning a map.
 //!
 //! The helpers beside the struct are the pieces every handler of this service needs —
 //! the request's region, the union-member-to-`ConfigCapabilityType` mapping, the
@@ -27,7 +28,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    ConfigTypeData, ContactVersion, Eirp, EndpointDetails, Frequency, FrequencyBandwidth,
+    AgentDetails, AggregateStatus, ComponentStatusData, ConfigTypeData, ContactVersion,
+    DiscoveryData, Eirp, EndpointDetails, EphemerisMetaData, Frequency, FrequencyBandwidth,
     InvalidParameterException, KmsKey, SpectrumConfig, TrackingOverrides,
 };
 
@@ -771,6 +773,8 @@ pub enum ResourceRef {
     Contact { contact_id: String },
     /// A dataflow endpoint group, by `dataflowEndpointGroupId`.
     DataflowEndpointGroup { dataflow_endpoint_group_id: String },
+    /// An AWS Ground Station Agent, by `agentId`.
+    Agent { agent_id: String },
 }
 
 /// A config as `CreateConfig` stored it.
@@ -1141,6 +1145,11 @@ pub const REASON_NO_REGISTERED_AGENT: &str = "NO_REGISTERED_AGENT";
 /// The `AgentStatus` an AWS Ground Station Agent endpoint carries while no agent has
 /// registered itself for that endpoint (`smithy_query(query="shape",
 /// shape="AgentStatus")` — `SUCCESS`, `FAILED`, `ACTIVE`, `INACTIVE`).
+///
+/// It is also the aggregate status a freshly registered [`Agent`] carries: the status of
+/// an agent is what the agent itself reports through `UpdateAgentStatus`, so until it has
+/// reported one the service holds it inactive rather than claiming a status nothing
+/// observed.
 pub const AGENT_INACTIVE: &str = "INACTIVE";
 
 /// A dataflow endpoint group as `CreateDataflowEndpointGroup` stored it.
@@ -1161,6 +1170,110 @@ pub struct DataflowEndpointGroup {
     pub endpoints_settle_at: Option<SystemTime>,
 }
 
+/// An AWS Ground Station Agent as `RegisterAgent` registered it, with the status its
+/// last `UpdateAgentStatus` report carried.
+///
+/// The model makes `Agent` a resource of this service with the lifecycle
+/// `RegisterAgent` (create), `GetAgentConfiguration` (read) and `UpdateAgentStatus`
+/// (update), identified by `agentId` and ARN-addressed as `agent/{agentId}`
+/// (`smithy_query(query="shape", shape="Agent")`), so one record per agent carries
+/// everything those three operations read and write.
+#[derive(Debug, Clone)]
+pub struct Agent {
+    pub agent_id: String,
+    pub agent_arn: String,
+    /// What the agent said about itself when it registered: its version, the EC2
+    /// instance it runs on and the versions of its components.
+    pub agent_details: AgentDetails,
+    /// The addresses and capability ARNs the agent registered with — "data for
+    /// associating an agent with the capabilities it is managing".
+    pub discovery_data: DiscoveryData,
+    pub tags: HashMap<String, String>,
+    /// The aggregate status the agent last reported, [`AGENT_INACTIVE`] until it has
+    /// reported one.
+    pub aggregate_status: AggregateStatus,
+    /// The per-component statuses the agent last reported: the whole list of the latest
+    /// report, since each report carries the agent's components as they stand.
+    pub component_statuses: Vec<ComponentStatusData>,
+    /// The agent task the last report was about; `None` before the first report.
+    pub task_id: Option<String>,
+    /// The tasking document `GetAgentConfiguration` hands the agent.
+    ///
+    /// `None` until the service has tasked the agent: the document describes the
+    /// contact the agent is to carry, and no operation this model declares produces one
+    /// (`smithy_query(query="digest")` carries no operation that tasks an agent), so an
+    /// agent that nothing has tasked is reported with no document rather than with an
+    /// invented one.
+    pub tasking_document: Option<String>,
+    /// When the agent registered.
+    pub registered: DateTime,
+    /// When the agent last reported its status, equal to [`Agent::registered`] until it
+    /// has reported once.
+    pub last_updated: DateTime,
+}
+
+/// What this service answers when an `{agentId}` label names no registered agent.
+///
+/// Shared by the two operations that address an agent by that label —
+/// `GetAgentConfiguration` and `UpdateAgentStatus` — so a read and an update of an
+/// agent that is not there answer one text.
+pub fn agent_not_found_message(agent_id: &str) -> String {
+    format!("No agent found with id {agent_id}")
+}
+
+/// A satellite this account is on-boarded to, as [`SATELLITES_ENV`] described it.
+///
+/// Nothing in THIS API creates one: the model declares no operation that onboards a
+/// satellite — `ListSatellites` and `GetSatellite` only report them
+/// (`smithy_query(query="digest")`) — because AWS onboards a spacecraft to an account
+/// outside the API, once its licensing and configuration have been reviewed. So a
+/// satellite record is minted when this service's store is created, from the operator
+/// setting, and the API reports it.
+#[derive(Debug, Clone)]
+pub struct Satellite {
+    /// The `Uuid` this onboarding is addressed by, minted by [`new_uuid`] when the store
+    /// is created and stable for the life of that store.
+    pub satellite_id: String,
+    /// This satellite's ARN. Its REGION segment is empty: the modelled `satelliteArn`
+    /// pattern makes the region optional
+    /// (`^arn:aws:groundstation:([-a-z0-9]{1,50})?:[0-9]{12}:satellite/…`,
+    /// `smithy_query(query="shape", shape="satelliteArn")`) where every other ARN of this
+    /// service requires one, because an on-boarded satellite belongs to the account
+    /// rather than to one region.
+    pub satellite_arn: String,
+    /// The spacecraft's NORAD catalogue number ([`NORAD_SATELLITE_ID_RANGE`]).
+    pub norad_satellite_id: i32,
+    /// The ground stations this satellite is on-boarded to, each a `GroundStationName`.
+    pub ground_stations: Vec<String>,
+    /// The ephemeris currently used to compute this satellite's trajectory, once one is
+    /// known for it. An onboarding carries none until an ephemeris is stored.
+    pub current_ephemeris: Option<EphemerisMetaData>,
+}
+
+/// The range a `noradSatelliteID` may hold: `smithy_query(query="shape",
+/// shape="noradSatelliteID")` — 0..339999, inclusive of both bounds.
+pub const NORAD_SATELLITE_ID_RANGE: ::std::ops::RangeInclusive<i32> = 0..=339_999;
+
+/// Whether `value` is inside [`NORAD_SATELLITE_ID_RANGE`], so the bound is stated once
+/// and read the same way everywhere.
+pub fn is_norad_satellite_id(value: i32) -> bool {
+    NORAD_SATELLITE_ID_RANGE.contains(&value)
+}
+
+/// Most ground stations one satellite can be on-boarded to: the modelled maximum length
+/// of `GroundStationIdList` (`smithy_query(query="shape", shape="GroundStationIdList")` —
+/// len 0..500), which is what `GetSatellite`/`ListSatellites` report.
+pub const MAX_GROUND_STATIONS_PER_SATELLITE: usize = 500;
+
+/// Whether `name` is spellable as a `GroundStationName`: length 4..97 over the character
+/// set `[ a-zA-Z0-9-._:=]` (`smithy_query(query="shape", shape="GroundStationName")`).
+pub fn is_ground_station_name(name: &str) -> bool {
+    (4..=97).contains(&name.len())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.' | b'_' | b':' | b'=')
+        })
+}
+
 /// Per-service state for com-amazonaws-groundstation-groundstation. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsGroundstationGroundstationState {
@@ -1172,6 +1285,8 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     pub contacts: HashMap<String, Contact>,
     /// Dataflow endpoint groups, keyed by `dataflowEndpointGroupId`.
     pub dataflow_endpoint_groups: HashMap<String, DataflowEndpointGroup>,
+    /// Registered AWS Ground Station Agents, keyed by `agentId`.
+    pub agents: HashMap<String, Agent>,
     /// Every ARN this service minted, and what it points at.
     pub arn_index: HashMap<String, ResourceRef>,
     /// The uplink frequency bands, in MHz, this account has been approved to transmit
@@ -1202,6 +1317,18 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     /// on-demand pricing, exactly as a new AWS account does, and `GetMinuteUsage` answers
     /// `isReservedMinutesCustomer: false` with a zero allocation until a plan lands here.
     pub reserved_minutes: ReservedMinutesPlan,
+    /// The satellites this account is on-boarded to, keyed by `satelliteId` — what
+    /// `ListSatellites` reports.
+    ///
+    /// EMPTY unless [`SATELLITES_ENV`] onboards one, and that is this account's real
+    /// onboarding rather than a gap in the emulator: AWS onboards a spacecraft to an
+    /// account outside this API (after reviewing its licensing and configuration), and
+    /// the model carries no operation that onboards one and no response member that
+    /// reports one other than the two satellite readers themselves
+    /// (`smithy_query(query="digest")`). So an account starts on-boarded to no satellite,
+    /// exactly as a new AWS account does, and `ListSatellites` answers an empty list until
+    /// an onboarding lands here.
+    pub satellites: HashMap<String, Satellite>,
 }
 
 /// The reserved-minutes pricing plan an account holds: which calendar months it covers
@@ -1307,6 +1434,69 @@ pub fn parse_approved_uplink_bands(setting: &str) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The environment variable an operator uses to onboard a satellite to THIS emulated
+/// account, since the API models no operation that onboards one: a comma-separated list of
+/// entries, each either a bare NORAD catalogue number (`25994`) or
+/// `<norad>=<ground station>+<ground station>…` naming the ground stations the satellite is
+/// on-boarded to (`25994=Ohio 1+Oregon 1`). Read once when this service's store is created.
+/// Unset means no satellite, which is what a new AWS account is on-boarded to.
+pub const SATELLITES_ENV: &str = "GROUNDSTATION_SATELLITES";
+
+/// The satellites `setting` onboards, keyed by the `satelliteId` each is minted with.
+///
+/// `,` separates entries and `+` separates one entry's ground stations because neither is
+/// spellable in a `GroundStationName`, so no name can be split in two; the first `=` of an
+/// entry separates the NORAD number from the names, which may contain further `=`.
+///
+/// An entry whose NORAD number is not an integer inside [`NORAD_SATELLITE_ID_RANGE`] is
+/// skipped, as is one repeating a NORAD number already on-boarded (one spacecraft is one
+/// satellite) and any ground station not spellable as a `GroundStationName`, so a typo
+/// onboards nothing instead of something unintended. The list is bounded by
+/// [`MAX_RECORDS_PER_STORE`] and each satellite's ground stations by
+/// [`MAX_GROUND_STATIONS_PER_SATELLITE`].
+pub fn parse_satellites(setting: &str) -> HashMap<String, Satellite> {
+    let mut satellites: HashMap<String, Satellite> = HashMap::new();
+    let mut onboarded: Vec<i32> = Vec::new();
+    for entry in setting.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() || satellites.len() >= MAX_RECORDS_PER_STORE {
+            continue;
+        }
+        let (norad, names) = match entry.split_once('=') {
+            None => (entry, ""),
+            Some((norad, names)) => (norad.trim(), names),
+        };
+        let Ok(norad_satellite_id) = norad.parse::<i32>() else {
+            continue;
+        };
+        if !is_norad_satellite_id(norad_satellite_id) || onboarded.contains(&norad_satellite_id) {
+            continue;
+        }
+        let ground_stations: Vec<String> = names
+            .split('+')
+            .map(str::trim)
+            .filter(|name| is_ground_station_name(name))
+            .map(str::to_string)
+            .take(MAX_GROUND_STATIONS_PER_SATELLITE)
+            .collect();
+        let satellite_id = new_uuid();
+        let satellite_arn =
+            ::engine::emulator_arn(ARN_SERVICE, "", &format!("satellite/{satellite_id}"));
+        onboarded.push(norad_satellite_id);
+        satellites.insert(
+            satellite_id.clone(),
+            Satellite {
+                satellite_id,
+                satellite_arn,
+                norad_satellite_id,
+                ground_stations,
+                current_ephemeris: None,
+            },
+        );
+    }
+    satellites
+}
+
 /// The value `variable` holds, parsed by `parse`, or nothing when it is not set.
 fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
     ::std::env::var(variable)
@@ -1316,20 +1506,22 @@ fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
 
 impl Default for ComAmazonawsGroundstationGroundstationState {
     /// An account with no resources, the uplink approval [`APPROVED_UPLINK_BANDS_ENV`]
-    /// grants it and the reserved minutes [`RESERVED_MINUTES_ENV`] commits (neither,
-    /// unless they are set).
+    /// grants it, the reserved minutes [`RESERVED_MINUTES_ENV`] commits and the satellites
+    /// [`SATELLITES_ENV`] onboards (none of them, unless they are set).
     fn default() -> Self {
         Self {
             configs: HashMap::new(),
             mission_profiles: HashMap::new(),
             contacts: HashMap::new(),
             dataflow_endpoint_groups: HashMap::new(),
+            agents: HashMap::new(),
             arn_index: HashMap::new(),
             approved_uplink_bands_mhz: from_env(
                 APPROVED_UPLINK_BANDS_ENV,
                 parse_approved_uplink_bands,
             ),
             reserved_minutes: from_env(RESERVED_MINUTES_ENV, parse_reserved_minutes),
+            satellites: from_env(SATELLITES_ENV, parse_satellites),
         }
     }
 }

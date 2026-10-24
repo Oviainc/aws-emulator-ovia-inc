@@ -22,7 +22,8 @@
 //! The lineage groups the account's lineage entities belong to are kept the same way,
 //! keyed by `(Region, LineageGroupName)` because a lineage group is a REGIONAL resource —
 //! with no `Create*` of their own, because SageMaker models none: see
-//! [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`].
+//! [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`]. `DescribeLineageGroup`
+//! reports one of them and `ListLineageGroups` is a pure read over the Region's.
 //!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
@@ -215,7 +216,8 @@ pub const DEFAULT_PRESIGNED_URL_SESSION_SECONDS: i32 = 1800;
 /// each entity in it; this emulator models no other lineage group, so every artifact
 /// reports this one. It is also the group the lineage-entity creates materialise through
 /// [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`], so that
-/// `DescribeLineageGroup` reports the group those entities are in.
+/// `DescribeLineageGroup` reports the group those entities are in and
+/// `ListLineageGroups` lists it.
 pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
 
 /// See [`MODEL_QUOTA`]. `DeleteHyperParameterTuningJob` is still a stub, so no call
@@ -434,10 +436,11 @@ pub const fn pipeline_definition_bounds() -> (usize, usize) {
 /// The most records each of this service's paginated listings returns in one page,
 /// including when `MaxResults` is absent or larger.
 ///
-/// `MaxResults` is modelled `range 1..100` on these operations, so this is the service's
-/// own server-side ceiling: one call can never serialise the whole store, and a caller
-/// that wants the rest follows `NextToken`. Matches the ceiling the other paginated
-/// services in this workspace apply.
+/// `MaxResults` is modelled `range 1..100` on these operations — `ListModels` documents
+/// no default and `ListLineageGroups` documents 10 — so this is the service's own
+/// server-side ceiling on top of whichever default applies: one call can never serialise
+/// the whole store, and a caller that wants the rest follows `NextToken`. Matches the
+/// ceiling the other paginated services in this workspace apply.
 pub const MAX_PAGE_SIZE: i32 = 50;
 
 /// `SortBy`'s documented default on this service's listings ("Sorts the list of results.
@@ -3088,10 +3091,17 @@ pub fn app_arn(region: &str, key: &AppKey) -> String {
     )
 }
 
+/// The ARN of one named lineage group, as `LineageGroupArn` carries it. The single owner
+/// of the `lineage-group` ARN resource kind, so a listing and a describe cannot drift
+/// apart.
+pub fn named_lineage_group_arn(region: &str, name: &str) -> String {
+    resource_arn(region, "lineage-group", name)
+}
+
 /// The ARN of the Region's default lineage group (see [`DEFAULT_LINEAGE_GROUP`]), as
-/// `LineageGroupArn` carries it.
+/// `LineageGroupArn` carries it for an entity that belongs to no other group.
 pub fn lineage_group_arn(region: &str) -> String {
-    resource_arn(region, "lineage-group", DEFAULT_LINEAGE_GROUP)
+    named_lineage_group_arn(region, DEFAULT_LINEAGE_GROUP)
 }
 
 /// Mint the opaque id an ARN carries for a resource whose ARN does NOT contain the
@@ -4526,6 +4536,23 @@ impl ComAmazonawsSagemakerSagemakerState {
             .get(&(region.to_string(), name.to_string()))
     }
 
+    /// Every lineage group `region` holds, in `LineageGroupName` order.
+    ///
+    /// The Region is half the key (see [`Self::lineage_group`]), so a listing reports only
+    /// the groups the caller's Region holds: a group an entity materialised elsewhere is
+    /// not this caller's, exactly as the describe does not report it. One accessor for it,
+    /// so `ListLineageGroups` and `DescribeLineageGroup` cannot disagree about which
+    /// groups a Region has.
+    pub fn lineage_groups_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a LineageGroup> + 'a {
+        self.lineage_groups
+            .iter()
+            .filter(move |((group_region, _), _)| group_region.as_str() == region)
+            .map(|(_, group)| group)
+    }
+
     /// Materialise the lineage group `name` in `region` unless the store already holds
     /// it, and answer the ARN of the group this call CREATED.
     ///
@@ -4578,7 +4605,7 @@ impl ComAmazonawsSagemakerSagemakerState {
                 None
             }
             ::std::collections::btree_map::Entry::Vacant(slot) => {
-                let arn = resource_arn(region, "lineage-group", name);
+                let arn = named_lineage_group_arn(region, name);
                 slot.insert(LineageGroup {
                     name: name.to_string(),
                     arn: arn.clone(),

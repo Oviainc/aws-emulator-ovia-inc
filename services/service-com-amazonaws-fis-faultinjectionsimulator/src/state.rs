@@ -32,12 +32,19 @@
 //! -> `stopped`): the instant it falls due is stored on the record and materialised by
 //! [`ExperimentRecord::settle`], so no handler ever sleeps and a read never invents a
 //! status the clock did not already owe. An experiment that is STARTED therefore runs:
-//! it is observable in `running` for as long as the longest path through its actions'
-//! durations takes on the emulator's run clock ([`run_plan`], [`RUN_CLOCK_SCALE`]) and
-//! then reaches the terminal status its actions earned — `failed` with an
+//! it is observable in `running` for as long as the longest path through the actions it
+//! CARRIES OUT takes on the emulator's run clock ([`run_plan`], [`RUN_CLOCK_SCALE`]) and
+//! then reaches the terminal status those actions earned — `failed` with an
 //! insufficient-privileges reason when the account's IAM store shows the experiment's
 //! execution role may not perform an action's own API calls
 //! ([`action_permissions`]), and `completed` otherwise.
+//!
+//! WHICH actions a run carries out is what the experiment options decide ([`RunActions`],
+//! [`plan_run`]): `actionsMode: skip-all` carries out none of them, and
+//! `emptyTargetResolutionMode` says what an empty target resolution does — `skip` skips
+//! the actions that name such a target, `fail` (the default) ends the run `failed` on the
+//! resolution. An action the run does not carry out spends none of its `duration`, earns
+//! no failure attributed to it, and reports the modelled `skipped` status.
 //!
 //! Two things that run means here, and does NOT:
 //!
@@ -48,8 +55,9 @@
 //!   an instance stopping) happens in THAT service's responses, and this emulator does not
 //!   produce it. Nothing here reports such an effect as having happened: no injected fault
 //!   is announced, and the per-action `state`/`startTime`/`endTime` an experiment could
-//!   carry are left unset rather than filled in for work nothing performed
-//!   (see `experiment_action`).
+//!   carry are left unset rather than filled in for work nothing performed — the one
+//!   exception being the action the run SKIPS, whose `state` is the decision the options
+//!   made and not a claim about work (see `experiment_action` and [`ActionSkip`]).
 //! * the time members `startTime` and `endTime` bound the run on the COMPRESSED clock
 //!   ([`RUN_CLOCK_SCALE`]), so the span between them is shorter than the duration the
 //!   actions name — which is reported back verbatim, exactly as the template stored it.
@@ -61,7 +69,7 @@
 //! and the role FIS assumes in it, so the two have to agree: the role has to belong to
 //! that account ([`target_account_role_arn_refusal`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -69,7 +77,7 @@ use crate::ops::types::{
     CreateExperimentTemplateExperimentOptionsInput, CreateExperimentTemplateInput,
     CreateExperimentTemplateLogConfigurationInput,
     CreateExperimentTemplateReportConfigurationInput, CreateExperimentTemplateStopConditionInput,
-    CreateExperimentTemplateTargetInput, Experiment, ExperimentAction,
+    CreateExperimentTemplateTargetInput, Experiment, ExperimentAction, ExperimentActionState,
     ExperimentCloudWatchLogsLogConfiguration, ExperimentLogConfiguration, ExperimentOptions,
     ExperimentReportConfiguration, ExperimentReportConfigurationCloudWatchDashboard,
     ExperimentReportConfigurationDataSources, ExperimentReportConfigurationOutputs,
@@ -295,9 +303,30 @@ pub const DEFAULT_ACCOUNT_TARGETING: &str = "single-account";
 /// (`EmptyTargetResolutionMode` is modelled `fail | skip`).
 pub const DEFAULT_EMPTY_TARGET_RESOLUTION_MODE: &str = "fail";
 
+/// The `emptyTargetResolutionMode` that SKIPS the action instead of failing the
+/// experiment: FIS documents the two values as "fail — the experiment fails if a target
+/// resolves to zero resources" (the default,
+/// [`DEFAULT_EMPTY_TARGET_RESOLUTION_MODE`]) and "skip — the experiment skips the action
+/// if a target resolves to zero resources". [`run_actions`] is where they are read.
+pub const EMPTY_TARGET_RESOLUTION_MODE_SKIP: &str = "skip";
+
 /// The value FIS applies to `actionsMode` when `StartExperiment` names none: the
 /// experiment runs all of its actions (`ActionsMode` is modelled `run-all | skip-all`).
 pub const DEFAULT_ACTIONS_MODE: &str = "run-all";
+
+/// The `actionsMode` that carries out NONE of the experiment's actions.
+///
+/// FIS documents `skip-all` as skipping all of the actions, which is how a caller checks
+/// an experiment's TARGET RESOLUTION without performing the actions: the experiment is
+/// started and resolves its targets, and nothing is carried out. See [`run_actions`].
+pub const ACTIONS_MODE_SKIP_ALL: &str = "skip-all";
+
+/// `ExperimentActionStatus`'s value for an action the run did not carry out \u2014 one of the
+/// modelled `ExperimentActionStatus` values
+/// (`pending | initiating | running | completed | cancelled | stopping | stopped | failed |
+/// skipped`), and the only one this emulator reports: it states the DECISION the
+/// experiment options made about the action rather than any progress of work.
+pub const EXPERIMENT_ACTION_STATUS_SKIPPED: &str = "skipped";
 
 /// The `selectionMode` that keeps every identified resource, which FIS documents as the
 /// default: "ALL - Run the action on all identified targets. This is the default."
@@ -508,6 +537,26 @@ impl ExperimentFailure {
         }
     }
 
+    /// The failure of a run whose TARGET RESOLUTION came back empty, under the
+    /// `emptyTargetResolutionMode` that fails the experiment for it
+    /// ([`DEFAULT_EMPTY_TARGET_RESOLUTION_MODE`], which FIS documents as "the experiment
+    /// fails if a target resolves to zero resources").
+    ///
+    /// The target's own name comes from the template, and the location is the section of
+    /// the template that failed — the TARGET rather than an action, because the resolution
+    /// is what came back empty and no action had run when it did.
+    pub fn empty_target_resolution(target_name: &str) -> Self {
+        Self {
+            reason: clipped_reason(format!(
+                "Target {target_name} resolved to no resources and \
+                 experimentOptions.emptyTargetResolutionMode is \
+                 {DEFAULT_EMPTY_TARGET_RESOLUTION_MODE}"
+            )),
+            code: EMPTY_TARGET_RESOLUTION_CODE.to_string(),
+            location: format!("targets.{target_name}"),
+        }
+    }
+
     /// The `ExperimentError` a failed experiment reports beside its reason.
     ///
     /// `accountId` is "the Amazon Web Services Account ID where the experiment failure
@@ -531,8 +580,22 @@ impl ExperimentFailure {
 /// prose.
 pub const INSUFFICIENT_PRIVILEGES_CODE: &str = "insufficientPrivileges";
 
+/// The `ExperimentError$code` of a run that ended because one of the experiment's targets
+/// resolved to no resources while its `emptyTargetResolutionMode` was the one that fails
+/// for it.
+///
+/// Like [`INSUFFICIENT_PRIVILEGES_CODE`] this is the emulator's own token rather than a
+/// reproduction of AWS's, which publishes no catalog of `ExperimentErrorCode` values: what
+/// the contract requires is a code within the member's modelled `@length(0..128)` /
+/// `^[\S]+$` that tells this failure apart from any other.
+pub const EMPTY_TARGET_RESOLUTION_CODE: &str = "emptyTargetResolution";
+
 /// `reason` within `ExperimentStatusReason`'s modelled ceiling, cut at a character
 /// boundary so a clipped reason is still valid UTF-8.
+///
+/// `ExperimentActionStatusReason` ("the reason for the state" of one ACTION) is modelled
+/// with the same `@length(min: 0, max: 512)`, so the reason of a skipped action
+/// ([`ActionSkip::reason`]) is clipped here too.
 fn clipped_reason(reason: String) -> String {
     if reason.chars().count() <= EXPERIMENT_STATUS_REASON_CEILING {
         return reason;
@@ -541,6 +604,70 @@ fn clipped_reason(reason: String) -> String {
         .chars()
         .take(EXPERIMENT_STATUS_REASON_CEILING)
         .collect()
+}
+
+/// Why a started experiment does NOT carry out one of the template's actions.
+///
+/// Both values are an experiment OPTION's doing, which is the only thing that skips an
+/// action here: the emulator never decides on its own that an action was not performed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionSkip {
+    /// The experiment was started with `actionsMode: skip-all`, which carries out no
+    /// action at all ([`ACTIONS_MODE_SKIP_ALL`]).
+    AllActions,
+    /// The target of this name, which the action refers to, resolved to no resources while
+    /// the experiment's `emptyTargetResolutionMode` was
+    /// [`EMPTY_TARGET_RESOLUTION_MODE_SKIP`].
+    EmptyTarget(String),
+}
+
+impl ActionSkip {
+    /// The `ExperimentActionState` a skipped action reports: the modelled `skipped` status
+    /// and, in `reason`, the option that skipped it.
+    ///
+    /// FIS documents no WORDING for `ExperimentActionState$reason` ("the reason for the
+    /// state"), so the text is an explanatory string of this emulator's own — like
+    /// [`STOPPED_BY_REQUEST`] — while the status is the value the model names for an action
+    /// that was skipped.
+    pub fn to_state(&self) -> ExperimentActionState {
+        ExperimentActionState {
+            status: Some(EXPERIMENT_ACTION_STATUS_SKIPPED.to_string()),
+            reason: Some(clipped_reason(match self {
+                Self::AllActions => format!(
+                    "Action skipped: the experiment was started with \
+                     experimentOptions.actionsMode {ACTIONS_MODE_SKIP_ALL}"
+                ),
+                Self::EmptyTarget(target) => format!(
+                    "Action skipped: target {target} resolved to no resources and \
+                     experimentOptions.emptyTargetResolutionMode is \
+                     {EMPTY_TARGET_RESOLUTION_MODE_SKIP}"
+                ),
+            })),
+        }
+    }
+}
+
+/// What the experiment options make of a template's actions when an experiment is started
+/// from it: which actions the run CARRIES OUT, which it skips and why, and the failure the
+/// target resolution earned before any action ran.
+///
+/// This is the one place the two options that select the run are read, and every
+/// consequence of them follows from it: only an action the run carries out spends its
+/// `duration` ([`run_plan`]) or is decided against the execution role's permissions
+/// ([`action_permissions::permission_failure`]), because an action nothing carries out can
+/// neither take time nor earn a failure attributed to it.
+#[derive(Debug, Clone, Default)]
+pub struct RunActions {
+    /// The actions the run carries out, by the name the template gave them.
+    pub carried_out: HashMap<String, ExperimentTemplateAction>,
+    /// The actions the run does not carry out, and why — the `state` each of them reports.
+    ///
+    /// Ordered by name, so the skipped actions of one start are reported in one order
+    /// rather than in whichever one a `HashMap` yielded.
+    pub skipped: BTreeMap<String, ActionSkip>,
+    /// The failure an empty target resolution earns under the `emptyTargetResolutionMode`
+    /// that fails for it, or `None` when the resolution gave that mode nothing to fail on.
+    pub empty_target_failure: Option<ExperimentFailure>,
 }
 
 /// One target account configuration of an experiment template, exactly as
@@ -839,8 +966,9 @@ pub struct ExperimentRecord {
     /// When the transition this experiment owes the clock falls due, or `None` when it
     /// owes none. [`ExperimentRecord::settle`] is what spends it.
     pub transition_due: Option<SystemTime>,
-    /// How long this experiment is `running` for — the longest path through its action
-    /// graph on the emulator's run clock, as [`run_plan`] computes it.
+    /// How long this experiment is `running` for — the longest path through the actions it
+    /// CARRIES OUT on the emulator's run clock, as [`run_plan`] computes it over the plan
+    /// [`RunActions`] made of the template.
     pub run_span: Duration,
     /// The terminal status the run earns once [`run_span`](Self::run_span) elapses.
     pub outcome: ExperimentOutcome,
@@ -849,10 +977,15 @@ pub struct ExperimentRecord {
 impl ExperimentRecord {
     /// The record `StartExperiment` persists for `template`.
     ///
+    /// `actions_mode` is the `actionsMode` the start chose, which with the template's
+    /// `emptyTargetResolutionMode` decides WHICH of the template's actions this run carries
+    /// out ([`run_actions`]).
+    ///
     /// `failure` is what the start already knows about the run: the one failure the
     /// account's IAM store SHOWS the experiment's execution role cannot get past (see
     /// [`action_permissions::permission_failure`]), or `None` when it shows none. It is
-    /// resolved by the caller, which is where the IAM store is reachable, and decides the
+    /// resolved by the caller, which is where the IAM store is reachable, over the actions
+    /// this run CARRIES OUT ([`plan_run`] is how the caller selects them), and decides the
     /// terminal status the run earns — see [`run_plan`].
     pub fn from_template(
         id: String,
@@ -863,14 +996,28 @@ impl ExperimentRecord {
         now: SystemTime,
         failure: Option<ExperimentFailure>,
     ) -> Self {
-        let (run_span, outcome) = run_plan(&template.actions, failure);
-        let targets: HashMap<String, ExperimentTarget> = template
-            .targets
-            .iter()
-            .map(|(name, target)| (name.clone(), experiment_target(target)))
-            .collect();
+        let targets = experiment_targets(&template.targets);
         // Resolution happens ONCE, here, where the experiment is started.
         let resolved_targets = resolve_targets(&targets);
+        // What the experiment options make of that resolution and of the template's
+        // actions. The same plan the caller decided the role's permissions over, computed
+        // from the same template and mode — see [`plan_run`].
+        let plan = run_actions(
+            &template.actions,
+            actions_mode,
+            template
+                .experiment_options
+                .empty_target_resolution_mode
+                .as_deref(),
+            &empty_target_names(&targets, &resolved_targets),
+        );
+        // An empty resolution is decided BEFORE any action runs, so it is the failure such
+        // a run ends in; `failure` is what the start showed about the actions it carries
+        // out, and under `skip-all` there are none for it to be about.
+        let (run_span, outcome) = run_plan(
+            &plan.carried_out,
+            plan.empty_target_failure.clone().or(failure),
+        );
         Self {
             id,
             arn,
@@ -885,7 +1032,12 @@ impl ExperimentRecord {
             actions: template
                 .actions
                 .iter()
-                .map(|(name, action)| (name.clone(), experiment_action(action)))
+                .map(|(name, action)| {
+                    (
+                        name.clone(),
+                        experiment_action(action, plan.skipped.get(name)),
+                    )
+                })
                 .collect(),
             stop_conditions: template
                 .stop_conditions
@@ -1885,7 +2037,144 @@ pub fn actions_quota_refusal(
     })
 }
 
-/// How long an experiment's actions take once it is `running`, and what the run ends as.
+/// What the experiment options make of a started experiment's actions — see [`RunActions`].
+///
+/// `actions_mode` is the `actionsMode` `StartExperiment` resolved
+/// ([`resolve_actions_mode`]), `empty_target_resolution_mode` is the template's option as
+/// stored (absent meaning [`DEFAULT_EMPTY_TARGET_RESOLUTION_MODE`]), and `empty_targets`
+/// names the targets that RESOLVED to no resources ([`empty_target_names`]).
+///
+/// The rules, both of which FIS states for its experiment options:
+///
+/// * `skip-all` carries out NO action, so none of them is in `carried_out` — which is how
+///   a caller checks the target resolution without performing the actions;
+/// * an empty resolution is decided before any action runs, so under the mode that fails
+///   for it the run ends `failed` on that resolution WHATEVER the actions mode is (a
+///   `skip-all` start is exactly the one that has to be able to see it), while under
+///   `skip` each action that refers to such a target is skipped and the rest of the
+///   experiment runs.
+///
+/// PURE: nothing here reads the clock, the store or the request — the plan is a function of
+/// the template and the mode, so the caller that decides the execution role's permissions
+/// over `carried_out` and [`ExperimentRecord::from_template`] agree on it.
+///
+/// The work is linear in the template: one pass over the actions, each looking at the
+/// targets it names, both bounded ([`MAX_ACTIONS_PER_TEMPLATE`]).
+pub fn run_actions(
+    actions: &HashMap<String, ExperimentTemplateAction>,
+    actions_mode: &str,
+    empty_target_resolution_mode: Option<&str>,
+    empty_targets: &BTreeSet<String>,
+) -> RunActions {
+    let empty_mode = empty_target_resolution_mode.unwrap_or(DEFAULT_EMPTY_TARGET_RESOLUTION_MODE);
+    // The FIRST empty target in name order is the one the failure names, so an experiment
+    // started twice from one template fails on the same target both times. The create
+    // refused any value the modelled `fail | skip` pair does not admit, so "not skip" is
+    // the documented default, `fail`.
+    let empty_target_failure = (empty_mode != EMPTY_TARGET_RESOLUTION_MODE_SKIP)
+        .then(|| {
+            empty_targets
+                .first()
+                .map(|name| ExperimentFailure::empty_target_resolution(name))
+        })
+        .flatten();
+    let mut carried_out: HashMap<String, ExperimentTemplateAction> =
+        HashMap::with_capacity(actions.len());
+    let mut skipped: BTreeMap<String, ActionSkip> = BTreeMap::new();
+    for (name, action) in actions {
+        if actions_mode == ACTIONS_MODE_SKIP_ALL {
+            skipped.insert(name.clone(), ActionSkip::AllActions);
+            continue;
+        }
+        // Under `skip` the action an empty target would have been acted on by is the one
+        // that is skipped; the targets an action names are its `targets` map's values.
+        let empty_target = (empty_mode == EMPTY_TARGET_RESOLUTION_MODE_SKIP)
+            .then(|| action_empty_target(action, empty_targets))
+            .flatten();
+        match empty_target {
+            Some(target) => {
+                skipped.insert(name.clone(), ActionSkip::EmptyTarget(target));
+            }
+            None => {
+                carried_out.insert(name.clone(), action.clone());
+            }
+        }
+    }
+    RunActions {
+        carried_out,
+        skipped,
+        empty_target_failure,
+    }
+}
+
+/// The plan [`run_actions`] makes for a run `StartExperiment` is about to persist for
+/// `template` under `actions_mode`.
+///
+/// What the start itself needs it for is `carried_out`: the actions the execution role's
+/// permissions are decided over, which it has to know BEFORE the record exists. It is the
+/// same plan [`ExperimentRecord::from_template`] then computes for the record, because both
+/// are this pure function of the same template and the same mode.
+pub fn plan_run(template: &ExperimentTemplateRecord, actions_mode: &str) -> RunActions {
+    let targets = experiment_targets(&template.targets);
+    let resolved = resolve_targets(&targets);
+    run_actions(
+        &template.actions,
+        actions_mode,
+        template
+            .experiment_options
+            .empty_target_resolution_mode
+            .as_deref(),
+        &empty_target_names(&targets, &resolved),
+    )
+}
+
+/// The target `action` refers to that resolved to no resources, taken in the order of the
+/// action's own target KEYS so one action always reports the same one.
+fn action_empty_target(
+    action: &ExperimentTemplateAction,
+    empty_targets: &BTreeSet<String>,
+) -> Option<String> {
+    let named: BTreeMap<&str, &str> = action
+        .targets
+        .iter()
+        .flatten()
+        .map(|(key, name)| (key.as_str(), name.as_str()))
+        .collect();
+    named
+        .values()
+        .find(|name| empty_targets.contains(**name))
+        .map(|name| (*name).to_string())
+}
+
+/// The names of the targets that RESOLVED to no resources — the condition
+/// `emptyTargetResolutionMode` decides on.
+///
+/// Read off the resolution itself rather than recomputed, so what
+/// `ListExperimentResolvedTargets` reports for an experiment and what its run made of an
+/// empty target are the SAME fact: a target no entry of the resolution names resolved to
+/// nothing (a target identified by `resourceTags`, whose resources belong to services this
+/// emulator does not hold, is the case that reaches here — see [`resolve_targets`]).
+pub fn empty_target_names(
+    targets: &HashMap<String, ExperimentTarget>,
+    resolved: &[ResolvedTarget],
+) -> BTreeSet<String> {
+    let named: HashSet<&str> = resolved
+        .iter()
+        .filter_map(|entry| entry.target_name.as_deref())
+        .collect();
+    targets
+        .keys()
+        .filter(|name| !named.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// How long the actions an experiment CARRIES OUT take once it is `running`, and what the
+/// run ends as.
+///
+/// `actions` is the actions the run carries out — [`RunActions::carried_out`], which is
+/// every action of the template unless an experiment option skipped one. An action the run
+/// does not carry out is not among them and so spends none of its duration.
 ///
 /// FIS starts an action as soon as every action its `startAfter` names has finished, so a
 /// run lasts as long as the longest path through that graph ([`critical_path`]), which is
@@ -1895,10 +2184,11 @@ pub fn actions_quota_refusal(
 ///
 /// `failure` is what the start showed about the run before it began — the account's IAM
 /// store showing the experiment's execution role is not allowed to perform an action's own
-/// API calls. Such an action never starts, so that run claims no duration at all: it is
-/// one transition span long and ends `failed`, carrying the failure, which is the status
-/// and the attribution FIS reports for it. With nothing shown against it the run ends
-/// `completed`.
+/// API calls, or a target of the experiment having resolved to no resources under the
+/// `emptyTargetResolutionMode` that fails for it. Neither run gets going, so it claims no
+/// duration at all: it is one transition span long and ends `failed`, carrying the failure,
+/// which is the status and the attribution FIS reports for it. With nothing shown against
+/// it the run ends `completed`.
 ///
 /// The span is never zero: a caller polling after `StartExperiment` observes `initiating`
 /// and then `running`, exactly as it would against the real service.
@@ -2341,6 +2631,17 @@ fn template_report_data_sources(
     }
 }
 
+/// The experiment's copy of the template's targets, which is also what the resolution and
+/// the empty-target rule are taken over ([`resolve_targets`], [`empty_target_names`]).
+fn experiment_targets(
+    targets: &HashMap<String, ExperimentTemplateTarget>,
+) -> HashMap<String, ExperimentTarget> {
+    targets
+        .iter()
+        .map(|(name, target)| (name.clone(), experiment_target(target)))
+        .collect()
+}
+
 fn experiment_target(target: &ExperimentTemplateTarget) -> ExperimentTarget {
     ExperimentTarget {
         resource_type: target.resource_type.clone(),
@@ -2360,22 +2661,31 @@ fn experiment_target(target: &ExperimentTemplateTarget) -> ExperimentTarget {
     }
 }
 
-/// The experiment's copy of one of the template's actions.
+/// The experiment's copy of one of the template's actions, with the `state` the run's plan
+/// gives it: `skip` is `Some` exactly for an action the run does NOT carry out.
 ///
-/// `state`, `startTime` and `endTime` are left unset on purpose: they report the progress
-/// of ONE action, and what this emulator models is the progress of the EXPERIMENT (its
-/// `ExperimentState` and the run span its actions' durations add up to), not the effect
-/// each action has on another service — so no per-action status is claimed for work this
-/// emulator did not carry out. Reporting them is the business of whatever models those
-/// effects.
-fn experiment_action(action: &ExperimentTemplateAction) -> ExperimentAction {
+/// `startTime` and `endTime` are left unset on purpose, and so is `state` for an action the
+/// run carries out: they report the progress of ONE action, and what this emulator models
+/// is the progress of the EXPERIMENT (its `ExperimentState` and the run span the actions it
+/// carries out add up to), not the effect each action has on another service — so no
+/// per-action status is claimed for work this emulator did not carry out. Reporting them is
+/// the business of whatever models those effects.
+///
+/// A SKIPPED action is the one action whose state is known without any work having been
+/// done: the experiment options decided it would not be carried out, which is what the
+/// modelled `skipped` status says ([`ActionSkip::to_state`]). Its `startTime` and `endTime`
+/// stay unset, because it never ran.
+fn experiment_action(
+    action: &ExperimentTemplateAction,
+    skip: Option<&ActionSkip>,
+) -> ExperimentAction {
     ExperimentAction {
         action_id: action.action_id.clone(),
         description: action.description.clone(),
         parameters: action.parameters.clone(),
         targets: action.targets.clone(),
         start_after: action.start_after.clone(),
-        state: None,
+        state: skip.map(ActionSkip::to_state),
         start_time: None,
         end_time: None,
     }

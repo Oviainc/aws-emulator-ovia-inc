@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPublicKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPublicKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPublicKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the public keys this account holds, one page at a time: the page is cut at
+//! `MaxItems` (bounded by this emulator's own ceiling), the order is the stored total
+//! order over ids, and `Marker` names the public key the previous page ended at, so
+//! walking the pages enumerates every key exactly once.
+//!
+//! A reporting operation: it reads the stored records and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +69,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +140,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPublicKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPublicKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPublicKeys"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the maximum number of public keys you want in the response body" — a
+        // page holds at least one item, so a non-positive size names no page at all. The
+        // size served is bounded above by this emulator's own page ceiling, so one request
+        // cannot serve the whole store in a single response. A value the parameter cannot
+        // take is refused with the one sentence this service states the constraint in,
+        // whether it is out of range here or unreadable as an integer at the request
+        // boundary (see `crate::service::envelope`).
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListPublicKeysErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+        // "To get the next page of results, set the Marker to the value of the NextMarker
+        // from the current page's response (which is also the ID of the last public key on
+        // that page)": the marker is a resume point this service handed out — a public key
+        // id — so a value outside that shape was never one.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_public_key_id(marker) {
+                return Err(ListPublicKeysErrorModeled::InvalidArgument(
+                    crate::state::invalid_public_key_marker(),
+                )
+                .into());
+            }
+        }
+
+        let store = state.lock();
+
+        let mut items: Vec<PublicKeySummary> = Vec::new();
+        let mut is_truncated = false;
+        // `Marker` names where the previous page ENDED, so this page starts after it —
+        // "the results include public keys in the list that occur after the marker" — and
+        // walking the pages enumerates every key exactly once. The store is ordered by id,
+        // so the resume point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        for (_, stored) in store.public_keys.range::<str, _>((start, Bound::Unbounded)) {
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            items.push(stored.to_summary());
+        }
+
+        Ok(ListPublicKeysOutput {
+            public_key_list: Some(PublicKeyList {
+                // "If there are more elements to be listed, this element is present and
+                // contains the value that you can use for the Marker request parameter to
+                // continue listing your public keys where you left off" — the id the page
+                // ended at, and nothing at all on a page that ends the collection.
+                // `PublicKeyList` models no `Marker` echo and no `IsTruncated`, so the
+                // presence of this element is the whole of what says more remain.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.id.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of public keys you want in the response."
+                max_items,
+                // "The number of public keys in the list": the length of `Items`.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // "A list of public keys." A page that lists nothing carries no `Items`
+                // element at all, rather than an empty one — the same form every other
+                // CloudFront listing here takes for an account using none of the resource.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

@@ -2,8 +2,9 @@
 
 //! @op BatchPutAssetPropertyValue
 //! IMPLEMENTED: this operation appends property values to the per-(asset, property)
-//! time series in the shared engine store (`crate::state`); this is the ONLY file to
-//! touch for it.
+//! time series in the shared engine store (`crate::state`), and to the DISASSOCIATED
+//! time series an entry's `propertyAlias` owns — creating that series when the alias
+//! names none yet; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -240,7 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // asset and property id of the property it is associated with, or by
             // its alias — and read that stream's data type from the SAME lookup, so
             // an identifier that names no stored stream can never fall through to
-            // an unchecked write.
+            // an unchecked write. An alias NO stream answers to yet resolves to the
+            // disassociated stream this write creates, with the data type of the
+            // value creating it.
             let (stream, data_type) = match resolve_entry(&store, entry) {
                 Ok(resolved) => resolved,
                 Err((code, message)) => {
@@ -266,6 +269,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
+            // The store holds a bounded number of disassociated streams, and an
+            // entry naming an alias none of them answers to is what would create
+            // another: past the cap the entry is refused with the quota code rather
+            // than growing the store, so no sequence of calls can grow it without
+            // limit. An entry that writes to a stream (or a property) that already
+            // exists is unaffected — nothing new is created for it.
+            let creates = match &stream {
+                crate::state::SeriesKey::Disassociated(alias) => {
+                    store.resolve_alias_series(alias).is_none()
+                }
+                crate::state::SeriesKey::Property(..) => false,
+            };
+            if creates
+                && store.disassociated_time_series.len()
+                    >= crate::state::MAX_DISASSOCIATED_TIME_SERIES
+            {
+                error_entries.push(error_entry(
+                    entry,
+                    "LimitExceededException",
+                    format!(
+                        "This emulator holds at most {} time series that no asset property \
+                         owns.",
+                        crate::state::MAX_DISASSOCIATED_TIME_SERIES
+                    ),
+                ));
+                continue;
+            }
+
             if !refused.is_empty() {
                 error_entries.push(BatchPutAssetPropertyErrorEntry {
                     entry_id: entry.entry_id.clone(),
@@ -276,6 +307,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // are dropped along with the bad ones.
                 if !partial {
                     continue;
+                }
+            }
+
+            // Alias-addressed ingestion: the stream the alias names is CREATED by
+            // the first write that reaches it and carries that value's data type,
+            // which is what makes it readable through
+            // `DescribeTimeSeries`/`ListTimeSeries` and bindable through
+            // `AssociateTimeSeriesToAssetProperty`. Created only once every value of
+            // the entry has been judged, so a refused entry leaves no stream behind.
+            if creates && !accepted.is_empty() {
+                if let crate::state::SeriesKey::Disassociated(alias) = &stream {
+                    // The alias resolved to nothing under this same held lock, so
+                    // the create cannot find a stream already answering to it;
+                    // asserted rather than ignored, so a future caller that reaches
+                    // this path with the alias already taken is caught instead of
+                    // silently keeping the older stream's data type.
+                    let created =
+                        store.create_disassociated_time_series(alias, &data_type, now);
+                    debug_assert!(
+                        created,
+                        "an alias that resolved to no stream must be free to create"
+                    );
                 }
             }
 
@@ -381,7 +434,7 @@ fn group_errors(
     errors
 }
 
-/// Resolve one entry to `(assetId, propertyId, dataType)`, failing with the
+/// Resolve one entry to the series its values land on, failing with the
 /// `BatchPutAssetPropertyValueErrorCode` the entry should report.
 ///
 /// The asset label goes through [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::resolve_asset_id`],
@@ -393,6 +446,15 @@ fn group_errors(
 ///
 /// The property record is fetched ONCE here, whichever form named it, so both the
 /// existence check and the data type come from the same stored property.
+///
+/// A `propertyAlias` entry is resolved in three steps, in this order: the alias an
+/// asset property is associated with names that property; an alias a disassociated
+/// stream answers to names that stream, with the data type it was created with; and
+/// an alias NOTHING answers to yet names the stream the caller's write creates,
+/// whose data type is the one its first value carries. That last step is what lets a
+/// client ingest by alias before any asset exists — IoT SiteWise creates a
+/// disassociated time series for it — so an unknown alias is not a not-found
+/// refusal.
 fn resolve_entry(
     store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
     entry: &PutAssetPropertyValueEntry,
@@ -413,13 +475,17 @@ fn resolve_entry(
         }
         // An alias names ONE data stream, whether an asset property is associated
         // with it or not, so ingest addressed by the alias of a disassociated stream
-        // lands in that stream rather than being refused as absent.
-        (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
-            (
-                "ResourceNotFoundException",
-                format!("The property alias {alias} could not be found."),
-            )
-        })?,
+        // lands in that stream rather than being refused as absent — and an alias no
+        // stream answers to at all names the stream this write creates.
+        (None, None, Some(alias)) => match store.resolve_alias_series(alias) {
+            Some(stream) => stream,
+            None => {
+                return Ok((
+                    crate::state::SeriesKey::Disassociated(alias.to_string()),
+                    data_type_of(entry)?,
+                ))
+            }
+        },
         _ => {
             return Err((
                 "InvalidRequestException",
@@ -465,6 +531,47 @@ fn resolve_entry(
         })?;
     let data_type = property.data_type.clone();
     Ok((stream, data_type))
+}
+
+/// The `PropertyDataType` a brand-new alias-addressed stream takes: the type of
+/// the first value the entry carries, which is the only thing that says what the
+/// stream holds — it has no asset property to take a type from.
+///
+/// A `nullValue` names no type, so an entry whose first value is one establishes
+/// nothing and is refused: the stream would have no `dataType` to report, and
+/// `DescribeTimeSeries` models it as required.
+fn data_type_of(entry: &PutAssetPropertyValueEntry) -> Result<String, (&'static str, String)> {
+    let first = entry.property_values.first().ok_or_else(|| {
+        (
+            "InvalidRequestException",
+            "An entry addressing a new propertyAlias must carry at least one value."
+                .to_string(),
+        )
+    })?;
+    let variant = &first.value;
+    // The `PropertyDataType` each `Variant` member stands for. Source:
+    // `smithy_query(query="shape", shape="PropertyDataType")` — STRING | INTEGER |
+    // DOUBLE | BOOLEAN | STRUCT | VIDEO | ANNOTATION | JSON — paired with the
+    // `Variant` members the model declares, of which only these four carry a
+    // scalar reading.
+    let data_type = if variant.string_value.is_some() {
+        "STRING"
+    } else if variant.integer_value.is_some() {
+        "INTEGER"
+    } else if variant.double_value.is_some() {
+        "DOUBLE"
+    } else if variant.boolean_value.is_some() {
+        "BOOLEAN"
+    } else {
+        return Err((
+            "InvalidRequestException",
+            "The first value of an entry addressing a new propertyAlias must set one of \
+             stringValue, integerValue, doubleValue or booleanValue, which is what gives \
+             the new time series its data type."
+                .to_string(),
+        ));
+    };
+    Ok(data_type.to_string())
 }
 
 /// The reason to refuse `value`, or `None` when it is acceptable.

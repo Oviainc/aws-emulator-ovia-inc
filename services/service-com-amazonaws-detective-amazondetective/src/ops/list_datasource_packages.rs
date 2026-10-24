@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasourcePackages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasourcePackages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasourcePackages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the data source packages one behavior graph holds, with each one's
+//! ingest state and the instant it entered it, paginated in a stable order.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +111,34 @@ impl From<ListDatasourcePackagesErrorModeled> for ListDatasourcePackagesError {
     }
 }
 
+/// The data source package a `NextToken` names, or the modelled `ValidationException`
+/// when the token is not one this operation issued.
+///
+/// The token's own text is never echoed back: it is opaque to a caller, and a caller
+/// that invents one is told only that it is not a token from here. A token this
+/// operation issued always names a value of the modelled `DatasourcePackage` enum
+/// (`smithy_query(query="shape",shape="DatasourcePackage")`), which is what the store
+/// keys these records by.
+fn next_package(token: &str) -> Result<String, ListDatasourcePackagesError> {
+    crate::state::decode_page_token(token)
+        .filter(|package| DATASOURCE_PACKAGE_VALUES.contains(&package.as_str()))
+        .ok_or_else(|| {
+            ListDatasourcePackagesErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "NextToken is not a pagination token issued by ListDatasourcePackages"
+                        .to_string(),
+                ),
+                error_code: Some("INVALID_REQUEST_BODY".to_string()),
+                error_code_reason: Some(
+                    "NextToken must be a token a previous ListDatasourcePackages response \
+                     returned"
+                        .to_string(),
+                ),
+            })
+            .into()
+        })
+}
+
 /// The `ListDatasourcePackages` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +175,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasourcePackages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasourcePackagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasourcePackages"))
+        let _ = ctx;
+        // "Lists data source packages in the behavior graph": a report, so this handler
+        // only reads. `GraphArn`'s pattern, `MaxResults`' 1..200 range and `NextToken`'s
+        // 1..1024 length are modelled constraints the centralized walk refuses anything
+        // outside of before this runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDatasourcePackagesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        // The page size is the server's own decision, clamped whatever the request
+        // asked for, so no allocation below is sized by input.
+        let page_size = crate::state::page_size(input.max_results);
+        let start = input.next_token.as_deref().map(next_package).transpose()?;
+
+        // A pure report: this operation reads the packages the graph stores and writes
+        // nothing, so the next caller sees exactly what this one did.
+        let store = state.lock();
+        let graph = store.graph(&input.graph_arn).ok_or_else(|| {
+            ListDatasourcePackagesErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(),
+            )
+        })?;
+
+        // The packages are keyed by package name, so the walk has one stable total
+        // order and a token can name the package the next page starts at.
+        let remaining = match &start {
+            Some(package) => graph.datasource_packages.range(package.clone()..),
+            None => graph.datasource_packages.range::<String, _>(..),
+        };
+
+        // Reserve no more than the graph can actually yield.
+        let mut datasource_packages = ::std::collections::HashMap::with_capacity(
+            page_size.min(graph.datasource_packages.len()),
+        );
+        let mut next_token = None;
+        for (package, ingest) in remaining {
+            // The first package that does not fit becomes the next page's start, and
+            // only then is a `NextToken` emitted: the last page carries none.
+            if datasource_packages.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(package));
+                break;
+            }
+            datasource_packages.insert(package.clone(), ingest.detail());
+        }
+
+        Ok(ListDatasourcePackagesOutput {
+            datasource_packages: Some(datasource_packages),
+            next_token,
+        })
     }
 }

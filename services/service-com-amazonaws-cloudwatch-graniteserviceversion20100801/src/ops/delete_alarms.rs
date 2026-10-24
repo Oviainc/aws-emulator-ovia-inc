@@ -177,14 +177,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let now = crate::state::now_secs();
         let mut store = state.lock();
 
-        // The composite-alarm constraints this operation documents (at most one composite
-        // alarm per call, no batched log alarms, and no deleting a composite alarm another
-        // alarm's `AlarmRule` depends on) all concern alarms only `PutCompositeAlarm` and
-        // `PutLogAlarm` can create, and both are still scaffolded — so the store holds
-        // nothing those rules can apply to and `ResourceConflict` has nothing to report yet.
-        //
+        // "You can delete up to 100 alarms in one operation. However, this total can include
+        // no more than one composite alarm." — checked before anything is removed, so a
+        // refused request leaves the store exactly as it was.
+        let mut composites: Vec<&String> = input
+            .alarm_names
+            .iter()
+            .filter(|name| store.composite_alarms.contains_key(name.as_str()))
+            .collect();
+        composites.sort_unstable();
+        composites.dedup();
+        if composites.len() > 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AlarmNames names {} composite alarms, and one call can delete no more than \
+                 one",
+                composites.len()
+            )));
+        }
+        // "you can't delete any composite alarm that is part of [a cycle] because there is
+        // always still a composite alarm that depends on that alarm that you want to delete"
+        // — generally: a composite alarm another composite alarm's `AlarmRule` references
+        // cannot be deleted while that reference stands. Only one composite alarm can be
+        // deleted per call, so a parent is never deleted by the same call.
+        if let Some(name) = composites.first() {
+            let parents = store.composite_alarm_parents(name.as_str());
+            if !parents.is_empty() {
+                return Err(DeleteAlarmsErrorModeled::ResourceConflict(ResourceConflict {
+                    message: Some(format!(
+                        "composite alarm {name} is referenced by the AlarmRule of {}",
+                        parents.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
         // "If you specify any incorrect alarm names, the alarms you specify with correct
         // names are still deleted." (DeleteAlarms documentation) — so the names that do
         // exist are removed, and the call still reports the ones that did not with the
@@ -195,10 +225,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documentation), so only the 14-day retention window ever removes it.
         let mut missing: Vec<&str> = Vec::new();
         for name in &input.alarm_names {
-            if store.alarms.remove(name).is_none() {
+            let removed = store.alarms.remove(name).is_some()
+                || store.composite_alarms.remove(name).is_some();
+            if !removed {
                 missing.push(name.as_str());
             }
         }
+        // A deleted alarm is an input every composite alarm whose rule references it loses,
+        // so the alarms downstream of this call are evaluated before it returns.
+        store.evaluate_composite_alarms(now);
         missing.sort_unstable();
         missing.dedup();
         if !missing.is_empty() {

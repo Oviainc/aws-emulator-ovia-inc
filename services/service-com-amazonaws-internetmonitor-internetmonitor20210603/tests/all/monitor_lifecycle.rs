@@ -1353,9 +1353,9 @@ async fn the_operations_outside_this_slice_still_answer_501() {
             })),
         ),
         (
-            "ListInternetEvents",
+            "GetInternetEvent",
             "GET",
-            "/v20210603/InternetEvents".to_string(),
+            "/v20210603/InternetEvents/some-event-id".to_string(),
             None,
         ),
     ];

@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this handler are refused the same way, so a malformed request is answered as
         // malformed whether or not its target exists.
         let size = crate::state::attributes_size(&attributes);
-        if size > crate::state::MAX_TOKEN_ATTRIBUTES_BYTES {
+        if size > crate::state::MAX_ATTRIBUTES_BYTES {
             return Err(crate::state::validation_failed(
                 CreateParticipantTokenErrorModeled::ValidationException,
                 // Worded in the construction this service states every constraint refusal
@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 format!(
                     "{}.attributes is required to have a maximum size of {} bytes, found {size}",
                     Self::NAME,
-                    crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
+                    crate::state::MAX_ATTRIBUTES_BYTES,
                 ),
             ));
         }

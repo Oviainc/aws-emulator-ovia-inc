@@ -10,7 +10,11 @@
 //! too: one [`SdiSourceRecord`] per created source, its own id counter and its
 //! own token map. So do signal maps: one [`SignalMapRecord`] per created signal
 //! map, carrying the media-resource graph discovery found by walking the
-//! channels this store already holds.
+//! channels this store already holds, and the latest monitor deployment
+//! `StartMonitorDeployment` started for it ([`MonitorDeploymentRecord`]) beside
+//! the latest one that succeeded, which is how both the signal map's
+//! `MonitorDeployment` and its summary's `MonitorDeploymentStatus` are reported
+//! out of state.
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
@@ -137,9 +141,10 @@ pub(crate) use alarm_template_groups::alarm_template_group_output;
 pub mod alarm_templates;
 
 pub use alarm_templates::{
-    AlarmTemplateRefusal, CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate,
-    MAX_ALARM_PERIOD_SECONDS, MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN,
-    MIN_ALARM_DATAPOINTS, MIN_ALARM_PERIOD_SECONDS,
+    AlarmTemplateRefusal, AlarmTemplateUpdateRefusal, CloudWatchAlarmTemplateChanges,
+    CloudWatchAlarmTemplateRecord, NewCloudWatchAlarmTemplate, MAX_ALARM_PERIOD_SECONDS,
+    MAX_ALARM_TEMPLATES, MAX_ALARM_TEMPLATE_TOKENS, MAX_METRIC_NAME_LEN, MIN_ALARM_DATAPOINTS,
+    MIN_ALARM_PERIOD_SECONDS,
 };
 
 pub(crate) use alarm_templates::alarm_template_output;
@@ -224,19 +229,30 @@ pub mod signal_map_status {
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 }
 
-/// The `SignalMapMonitorDeploymentStatus` value this slice uses, spelled exactly
-/// as the model declares it (`smithy_query(query="shape",
+/// The `SignalMapMonitorDeploymentStatus` values this slice uses, spelled
+/// exactly as the model declares them (`smithy_query(query="shape",
 /// shape="SignalMapMonitorDeploymentStatus")`: NOT_DEPLOYED |
 /// DRY_RUN_DEPLOYMENT_COMPLETE | DRY_RUN_DEPLOYMENT_FAILED |
 /// DRY_RUN_DEPLOYMENT_IN_PROGRESS | DEPLOYMENT_COMPLETE | DEPLOYMENT_FAILED |
 /// DEPLOYMENT_IN_PROGRESS | DELETE_COMPLETE | DELETE_FAILED |
 /// DELETE_IN_PROGRESS).
 ///
-/// Only `NOT_DEPLOYED` is reachable here: a monitor deployment is started by
-/// `StartMonitorDeployment`, which is still a scaffold, so no signal map this
-/// store holds has ever had one.
+/// `NOT_DEPLOYED` is where every signal map starts; `StartMonitorDeployment`
+/// moves it into the IN_PROGRESS status of the kind of deployment the request
+/// asked for — the dry-run one when `DryRun` is set, the real one otherwise —
+/// and the clock settles that into the matching COMPLETE status
+/// ([`MonitorDeploymentRecord`]).
+///
+/// The `*_FAILED` statuses are deliberately absent: nothing in this emulator
+/// makes a deployment fail, so no code may report one as failed. So are the
+/// `DELETE_*` ones, which belong to `StartDeleteMonitorDeployment` — still a
+/// scaffold, and its own issue.
 pub mod signal_map_monitor_deployment_status {
     pub const NOT_DEPLOYED: &str = "NOT_DEPLOYED";
+    pub const DEPLOYMENT_IN_PROGRESS: &str = "DEPLOYMENT_IN_PROGRESS";
+    pub const DEPLOYMENT_COMPLETE: &str = "DEPLOYMENT_COMPLETE";
+    pub const DRY_RUN_DEPLOYMENT_IN_PROGRESS: &str = "DRY_RUN_DEPLOYMENT_IN_PROGRESS";
+    pub const DRY_RUN_DEPLOYMENT_COMPLETE: &str = "DRY_RUN_DEPLOYMENT_COMPLETE";
 }
 
 /// The `InputSecurityGroupState` enum values, spelled exactly as the model
@@ -388,7 +404,9 @@ const INGEST_IP_POOL_LEN: u32 = 1 << 17;
 
 /// How long a resource stays in a transient state before the clock makes the next
 /// one due: a channel's `CREATING`, `STARTING`, `STOPPING`, `RECOVERING` and
-/// `DELETING`, and a signal map's `CREATE_IN_PROGRESS` discovery.
+/// `DELETING`, a signal map's `CREATE_IN_PROGRESS` discovery, and a signal map's
+/// monitor deployment, which `StartMonitorDeployment` starts in an IN_PROGRESS
+/// status.
 ///
 /// CHOSEN, not documented by AWS: the real service takes minutes, and no doc
 /// sentence pins a number, so this is the emulator's own span. It is deliberately
@@ -2131,6 +2149,18 @@ impl ComAmazonawsMedialiveMedialiveState {
             .map(|map| map.id.as_str())
     }
 
+    /// The signal map `identifier` names, for a MUTATION of it — resolved by id
+    /// or by current name, exactly as [`Self::signal_map_id_for_identifier`]
+    /// resolves it for a read, so the two cannot disagree about which signal map
+    /// an identifier names.
+    pub fn signal_map_for_identifier_mut(
+        &mut self,
+        identifier: &str,
+    ) -> Option<&mut SignalMapRecord> {
+        let id = self.signal_map_id_for_identifier(identifier)?.to_string();
+        self.signal_maps.get_mut(&id)
+    }
+
     /// The input whose ARN is exactly `arn`, if this store holds one — the same
     /// global-identity reading of an ARN as [`Self::channel_by_arn`].
     fn input_by_arn(&self, arn: &str) -> Option<&InputRecord> {
@@ -2339,12 +2369,20 @@ impl ComAmazonawsMedialiveMedialiveState {
             last_discovered_at: map.last_discovered_at.map(timestamp),
             media_resource_map: discovered.then(|| map.media_resource_map.clone()),
             modified_at: Some(timestamp(map.modified_at)),
-            // No monitor has ever been deployed for a signal map in this
-            // emulator (`StartMonitorDeployment` is scaffolded), so there is
-            // neither a deployment to report nor a pending change to one.
+            // The monitor side of the signal map, out of the record: the latest
+            // deployment `StartMonitorDeployment` started and the latest one
+            // that succeeded, both ABSENT while there is none.
+            //
+            // `MonitorChangesPendingDeployment` is "if true, there are pending
+            // monitor changes for this signal map that can be deployed": no
+            // operation in this emulator changes a signal map's monitor, so
+            // there is never a pending change to deploy.
             monitor_changes_pending_deployment: Some(false),
-            monitor_deployment: None,
-            last_successful_monitor_deployment: None,
+            monitor_deployment: map
+                .monitor_deployment
+                .as_ref()
+                .map(MonitorDeploymentRecord::described),
+            last_successful_monitor_deployment: map.last_successful_monitor_deployment.clone(),
             name: Some(map.name.clone()),
             status: Some(map.status.clone()),
             tags: Some(map.tags.clone()),
@@ -2365,11 +2403,11 @@ impl ComAmazonawsMedialiveMedialiveState {
             description: map.description.clone(),
             id: map.id.clone(),
             modified_at: Some(timestamp(map.modified_at)),
-            // No monitor has ever been deployed for a signal map in this
-            // emulator (`StartMonitorDeployment` is still a scaffold), which is
-            // what `NOT_DEPLOYED` reports.
-            monitor_deployment_status: signal_map_monitor_deployment_status::NOT_DEPLOYED
-                .to_string(),
+            // The status of the signal map's latest monitor deployment, read off
+            // the same record `signal_map_description` reports
+            // `MonitorDeployment` from, so the summary and the full description
+            // cannot disagree about it.
+            monitor_deployment_status: map.monitor_deployment_status().to_string(),
             name: map.name.clone(),
             status: map.status.clone(),
             tags: Some(map.tags.clone()),
@@ -2613,8 +2651,64 @@ enum TaggedResource {
     EventBridgeRuleTemplateGroup(String),
 }
 
+/// One monitor deployment of one signal map, as `StartMonitorDeployment`
+/// started it.
+///
+/// A deployment is ASYNCHRONOUS — the operation answers 202 and the caller polls
+/// the signal map's `MonitorDeployment$Status` — so the record carries the status
+/// it is in now and the instant the clock makes its outcome due. The instant is
+/// STORED and never slept on.
+#[derive(Debug, Clone)]
+pub struct MonitorDeploymentRecord {
+    /// Whether the request asked for a dry run, which is what decides both the
+    /// pair of statuses this deployment moves through and whether completing it
+    /// leaves a successful deployment behind.
+    dry_run: bool,
+    /// The `SignalMapMonitorDeploymentStatus` this deployment is in.
+    status: String,
+    /// `MonitorDeployment$DetailsUri`, built once when the deployment started
+    /// ([`monitor_deployment_details_uri`]) so every later read reports the same
+    /// URI.
+    details_uri: String,
+    /// The instant this deployment's outcome becomes due.
+    due: SystemTime,
+}
+
+impl MonitorDeploymentRecord {
+    /// Whether this deployment is still running, in either of the two
+    /// IN_PROGRESS statuses a deployment can be running in.
+    fn in_progress(&self) -> bool {
+        self.status == signal_map_monitor_deployment_status::DEPLOYMENT_IN_PROGRESS
+            || self.status == signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_IN_PROGRESS
+    }
+
+    /// The status this deployment completes in: a dry run reports the dry-run
+    /// outcome, a real deployment the deployed one.
+    fn complete_status(&self) -> &'static str {
+        if self.dry_run {
+            signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_COMPLETE
+        } else {
+            signal_map_monitor_deployment_status::DEPLOYMENT_COMPLETE
+        }
+    }
+
+    /// This deployment as the modelled `MonitorDeployment`, "the latest monitor
+    /// deployment of a signal map".
+    fn described(&self) -> MonitorDeployment {
+        MonitorDeployment {
+            details_uri: Some(self.details_uri.clone()),
+            // ABSENT while nothing failed: `MonitorDeployment$ErrorMessage` is
+            // the "error message associated with a FAILED monitor deployment",
+            // and no deployment fails in this emulator.
+            error_message: None,
+            status: self.status.clone(),
+        }
+    }
+}
+
 /// One created signal map, as `CreateSignalMap` stored it plus the graph its
-/// discovery found and the lifecycle state of that discovery.
+/// discovery found, the lifecycle state of that discovery and the monitor
+/// deployments `StartMonitorDeployment` has run for it.
 #[derive(Debug, Clone)]
 pub struct SignalMapRecord {
     pub id: String,
@@ -2643,19 +2737,132 @@ pub struct SignalMapRecord {
     /// `CREATE_COMPLETE`. Stored, never slept on.
     discovery_due: SystemTime,
     last_discovered_at: Option<SystemTime>,
+    /// The latest monitor deployment `StartMonitorDeployment` started for this
+    /// signal map, or `None` while none ever was — which is the `NOT_DEPLOYED`
+    /// status [`Self::monitor_deployment_status`] reports.
+    monitor_deployment: Option<MonitorDeploymentRecord>,
+    /// The latest monitor deployment that COMPLETED, which only a real
+    /// (non-dry-run) deployment leaves behind: a dry run deploys nothing, so it
+    /// is not a successful monitor deployment OF the signal map.
+    last_successful_monitor_deployment: Option<SuccessfulMonitorDeployment>,
 }
 
 impl SignalMapRecord {
-    /// Materialise the discovery the clock has already made due. Owed at
-    /// `discovery_due` whether or not anybody called, so applying it in a
-    /// reporting operation changes nothing a later caller would have seen.
+    /// Materialise what the clock has already made due: the discovery, owed at
+    /// `discovery_due`, and the outcome of a monitor deployment, owed at its own
+    /// `due`. Both were owed at those instants whether or not anybody called, so
+    /// applying them in a reporting operation changes nothing a later caller
+    /// would have seen.
     fn settle(&mut self, now: SystemTime) {
         if self.status == signal_map_status::CREATE_IN_PROGRESS && now >= self.discovery_due {
             self.status = signal_map_status::CREATE_COMPLETE.to_string();
             self.last_discovered_at = Some(self.discovery_due);
             self.modified_at = self.discovery_due;
         }
+        // Completed on THIS call: the due instant to stamp as the signal map's
+        // `ModifiedAt`, and the successful deployment to record when the
+        // deployment was a real one. Read out of the deployment before the
+        // signal map's own fields are written, so the record is borrowed once.
+        let settled = self.monitor_deployment.as_mut().and_then(|deployment| {
+            if !deployment.in_progress() || now < deployment.due {
+                return None;
+            }
+            deployment.status = deployment.complete_status().to_string();
+            let successful = (!deployment.dry_run).then(|| SuccessfulMonitorDeployment {
+                details_uri: deployment.details_uri.clone(),
+                status: deployment.status.clone(),
+            });
+            Some((deployment.due, successful))
+        });
+        if let Some((due, successful)) = settled {
+            self.modified_at = due;
+            if let Some(successful) = successful {
+                self.last_successful_monitor_deployment = Some(successful);
+            }
+        }
     }
+
+    /// The `SignalMapStatus` this signal map is in.
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
+    /// Whether this signal map has a monitor to deploy at all: deploying "the
+    /// latest monitor of the specified signal map" needs the media resource map
+    /// its discovery found, so a signal map whose discovery has not completed
+    /// has nothing to deploy yet.
+    pub fn discovery_complete(&self) -> bool {
+        self.status == signal_map_status::CREATE_COMPLETE
+    }
+
+    /// Whether a monitor deployment of this signal map is already running, so a
+    /// second one cannot be started on top of it.
+    pub fn monitor_deployment_in_progress(&self) -> bool {
+        self.monitor_deployment
+            .as_ref()
+            .is_some_and(MonitorDeploymentRecord::in_progress)
+    }
+
+    /// The status of this signal map's latest monitor deployment, as
+    /// `SignalMapSummary$MonitorDeploymentStatus` reports it: `NOT_DEPLOYED`
+    /// while no deployment was ever started for it.
+    pub fn monitor_deployment_status(&self) -> &str {
+        self.monitor_deployment.as_ref().map_or(
+            signal_map_monitor_deployment_status::NOT_DEPLOYED,
+            |deployment| deployment.status.as_str(),
+        )
+    }
+
+    /// Start a monitor deployment of this signal map, replacing the latest one:
+    /// `StartMonitorDeployment` "initiates a deployment to deploy the LATEST
+    /// monitor", so a signal map whose monitor was deployed before is deployed
+    /// again rather than refused.
+    ///
+    /// The deployment starts in the IN_PROGRESS status of the kind the request
+    /// asked for and comes due [`TRANSIENT_STATE_SPAN`] later, so a caller that
+    /// polls straight after the call still observes it running. A deployment
+    /// that has already completed is left in place until this one completes:
+    /// `LastSuccessfulMonitorDeployment` is the latest SUCCESSFUL deployment,
+    /// which a redeployment does not undo.
+    pub fn begin_monitor_deployment(&mut self, dry_run: bool, now: SystemTime) {
+        let status = if dry_run {
+            signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_IN_PROGRESS
+        } else {
+            signal_map_monitor_deployment_status::DEPLOYMENT_IN_PROGRESS
+        };
+        self.monitor_deployment = Some(MonitorDeploymentRecord {
+            dry_run,
+            status: status.to_string(),
+            details_uri: monitor_deployment_details_uri(&self.arn, &self.id),
+            due: now + TRANSIENT_STATE_SPAN,
+        });
+        self.modified_at = now;
+    }
+}
+
+/// The URI one signal map's monitor deployment reports as its `DetailsUri`: the
+/// MediaLive console's page for that signal map, in the region the signal map's
+/// own ARN names.
+///
+/// CHOSEN, not documented by AWS: `MonitorDeployment$DetailsUri` is only "URI
+/// associated with a signal map's monitor deployment" and no AWS document gives
+/// that URI a form, so this emulator serves one deterministic form of its own.
+/// It is derived from STORED state — the signal map's ARN and its id — so every
+/// read of a deployment reports the same URI, and it is never built out of the
+/// request in flight.
+fn monitor_deployment_details_uri(arn: &str, id: &str) -> String {
+    let region = arn_region(arn);
+    format!(
+        "https://{region}.console.aws.amazon.com/medialive/home\
+         ?region={region}#!/signal-maps/{id}/monitor"
+    )
+}
+
+/// The region segment of an ARN
+/// (`arn:<partition>:<service>:<region>:<account-id>:<resource>`), empty for a
+/// global service's ARNs, which carry no region.
+fn arn_region(arn: &str) -> &str {
+    arn.split(':').nth(3).unwrap_or_default()
 }
 
 /// The description of one signal map, as `CreateSignalMap` and `GetSignalMap`
@@ -2753,6 +2960,10 @@ pub fn new_signal_map(
         status: signal_map_status::CREATE_IN_PROGRESS.to_string(),
         discovery_due: now + TRANSIENT_STATE_SPAN,
         last_discovered_at: None,
+        // No monitor has been deployed for a signal map nobody has deployed one
+        // for: `StartMonitorDeployment` is what starts the first one.
+        monitor_deployment: None,
+        last_successful_monitor_deployment: None,
     }
 }
 

@@ -225,6 +225,10 @@ impl PreviousValues {
 // `crate::state::merged_parameters`, which `CreateChangeSet` resolves the same member
 // with.
 
+// The resources a template declares are created, kept or deleted in the services that own
+// them by the shared `crate::state::provisioning::reconcile`, which `CreateStack` and
+// `ExecuteChangeSet` deploy through as well.
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the

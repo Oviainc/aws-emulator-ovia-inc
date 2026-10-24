@@ -208,9 +208,11 @@ async fn create_refuses_a_change_token_it_cannot_use() {
             label,
         )
         .await;
-        assert!(
-            body.to_string().contains(token),
-            "case {label}: the refusal must name the change token it refused: {body}"
+        assert_eq!(
+            body["message"].as_str(),
+            Some("The input token is no longer current."),
+            "case {label}: the refusal carries this exception type's fixed sentence, which \
+             says nothing about the token it refused: {body}"
         );
     }
 }
@@ -247,9 +249,11 @@ async fn an_unknown_geo_match_set_id_is_a_modelled_not_found() {
             label,
         )
         .await;
-        assert!(
-            body.to_string().contains(id),
-            "case {label}: the refusal must name the id it did not find: {body}"
+        assert_eq!(
+            body["message"].as_str(),
+            Some("The referenced item does not exist."),
+            "case {label}: the refusal carries this exception type's fixed sentence, which \
+             says nothing about the id it did not find: {body}"
         );
     }
 

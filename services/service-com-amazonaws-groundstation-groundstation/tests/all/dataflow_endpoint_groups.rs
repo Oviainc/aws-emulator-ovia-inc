@@ -35,7 +35,7 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::scheduling_loop::{harness, send, Reply, ABSENT_UUID, REGION};
+use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, REGION};
 
 /// Longer than this service's chosen `creating` -> `created` endpoint settle span, so a
 /// read taken after it observes the move the service owed.
@@ -264,20 +264,6 @@ fn expected_arn(id: &str) -> String {
         "arn:aws:groundstation:{REGION}:{}:dataflow-endpoint-group/{id}",
         engine::emulator_account_id()
     )
-}
-
-/// Whether `id` is spelled the way the modelled `Uuid` requires
-/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`).
-fn is_uuid(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && [8, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| group.len() == *len)
-        && groups
-            .iter()
-            .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
 }
 
 #[tokio::test]

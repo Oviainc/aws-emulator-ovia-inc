@@ -131,8 +131,20 @@ pub const MAX_ENTITIES_PER_WORKSPACE: usize = 1000;
 /// See [`MAX_WORKSPACES`].
 pub const MAX_COMPONENT_TYPES_PER_WORKSPACE: usize = 1000;
 
+/// The `PricingMode` an account that has never changed its pricing plan is on,
+/// and the `UpdateReason` such a plan carries.
+///
+/// `BASIC` is the first value of the model's `PricingMode` enum
+/// (`ops::types::PRICING_MODE_VALUES`) and the pay-as-you-go mode the service
+/// bills an untouched account in; `DEFAULT` is the `UpdateReason` value that
+/// names exactly that — a plan nobody has updated
+/// (`ops::types::UPDATE_REASON_VALUES`).
+pub const PRICING_MODE_BASIC: &str = "BASIC";
+/// See [`PRICING_MODE_BASIC`].
+pub const UPDATE_REASON_DEFAULT: &str = "DEFAULT";
+
 /// Per-service state for com-amazonaws-iottwinmaker-awsiottwinmaker. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
     /// Workspaces by `workspaceId`.
     pub workspaces: BTreeMap<String, Workspace>,
@@ -140,6 +152,107 @@ pub struct ComAmazonawsIottwinmakerAwsiottwinmakerState {
     /// id *or* an ARN (`GetWorkspace`, and the tagging operations in a later
     /// slice) resolves one without scanning every workspace.
     pub arn_index: BTreeMap<String, ResourceRef>,
+    /// The pricing plan this account is billed under for the current billing
+    /// cycle — the one `GetPricingPlan` reports as `currentPricingPlan`.
+    ///
+    /// Account-wide, not per workspace: the pricing operations carry no
+    /// workspace in their input, so there is ONE plan per account and region,
+    /// held here beside the workspaces rather than on each of them. Present
+    /// rather than optional, because an account always HAS a plan: until
+    /// something changes it, that plan is the service default
+    /// ([`PricingPlanRecord::default_plan`]), effective from the instant this
+    /// store came into being — so a read never has to mint one, and two reads
+    /// of an unchanged plan report the same instants.
+    pub pricing_plan: PricingPlanRecord,
+    /// The plan change that is accepted but not yet in force — what
+    /// `GetPricingPlan` reports as `pendingPricingPlan` — and `None` while
+    /// nothing is pending, which is what an account whose plan nobody has
+    /// changed looks like. Written by `UpdatePricingPlan`.
+    pub pending_pricing_plan: Option<PricingPlanRecord>,
+}
+
+impl Default for ComAmazonawsIottwinmakerAwsiottwinmakerState {
+    fn default() -> Self {
+        Self {
+            workspaces: BTreeMap::new(),
+            arn_index: BTreeMap::new(),
+            // The account's plan dates from the moment the account's store
+            // exists, so the default plan's instants are captured here, ONCE,
+            // rather than by whichever call happens to read it first.
+            pricing_plan: PricingPlanRecord::default_plan(SystemTime::now()),
+            pending_pricing_plan: None,
+        }
+    }
+}
+
+/// One stored pricing plan: the mode and bundles it was set to, and when.
+///
+/// `billableEntityCount` is NOT a field here. It is the account's current
+/// billable entity count, which the stored entities already say
+/// ([`ComAmazonawsIottwinmakerAwsiottwinmakerState::billable_entity_count`]) —
+/// keeping a copy beside the plan would let an entity created or deleted after
+/// the plan was set leave it stale, the same reason `hasChildEntities` is
+/// derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PricingPlanRecord {
+    /// A `PricingMode` value (`ops::types::PRICING_MODE_VALUES`).
+    pub pricing_mode: String,
+    /// An `UpdateReason` value (`ops::types::UPDATE_REASON_VALUES`): why this
+    /// plan replaced the one before it.
+    pub update_reason: String,
+    /// The bundles this plan was set with, empty when it names none — a plan
+    /// without bundles reports no `bundleInformation` at all, since
+    /// `BundleInformation::bundleNames` is `@required` and `@length(1..10)`, so
+    /// an empty list is not a value the shape admits.
+    pub bundle_names: Vec<String>,
+    /// The `PricingTier` the bundles place the account in
+    /// (`ops::types::PRICING_TIER_VALUES`), absent when the plan carries no
+    /// tier.
+    pub pricing_tier: Option<String>,
+    /// When this plan takes (or took) effect.
+    pub effective_date_time: SystemTime,
+    /// When this plan was set.
+    pub update_date_time: SystemTime,
+}
+
+impl PricingPlanRecord {
+    /// The plan an account that has never changed its pricing plan is on:
+    /// [`PRICING_MODE_BASIC`] with no bundles, set and effective at `at` and
+    /// carrying the [`UPDATE_REASON_DEFAULT`] reason.
+    pub fn default_plan(at: SystemTime) -> Self {
+        Self {
+            pricing_mode: PRICING_MODE_BASIC.to_string(),
+            update_reason: UPDATE_REASON_DEFAULT.to_string(),
+            bundle_names: Vec::new(),
+            pricing_tier: None,
+            effective_date_time: at,
+            update_date_time: at,
+        }
+    }
+
+    /// This record as the modelled `PricingPlan`, reported with the account's
+    /// current `billable_entity_count`.
+    ///
+    /// Shared by every reader of a stored plan, so the current and the pending
+    /// plan — and `GetPricingPlan` and `UpdatePricingPlan` — report one plan the
+    /// same way.
+    pub fn as_pricing_plan(&self, billable_entity_count: i64) -> crate::ops::types::PricingPlan {
+        crate::ops::types::PricingPlan {
+            billable_entity_count: Some(billable_entity_count),
+            // Omitted while the plan names no bundle: `bundleNames` is required
+            // inside `BundleInformation`, so there is no empty form of it.
+            bundle_information: (!self.bundle_names.is_empty()).then(|| {
+                crate::ops::types::BundleInformation {
+                    bundle_names: self.bundle_names.clone(),
+                    pricing_tier: self.pricing_tier.clone(),
+                }
+            }),
+            effective_date_time: timestamp(self.effective_date_time),
+            pricing_mode: self.pricing_mode.clone(),
+            update_date_time: timestamp(self.update_date_time),
+            update_reason: self.update_reason.clone(),
+        }
+    }
 }
 
 /// What an ARN in [`ComAmazonawsIottwinmakerAwsiottwinmakerState::arn_index`] points at.
@@ -608,6 +721,25 @@ impl PropertyGroupRecord {
 }
 
 impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
+    /// The account's billable entity count: how many entities this service
+    /// currently holds, across every workspace.
+    ///
+    /// IoT TwinMaker bills the entities an account keeps in its workspaces, so
+    /// the count a pricing plan is reported with is a count of the stored
+    /// entities — derived on every read, never a counter something bumps, so a
+    /// create or a delete cannot leave it stale and reading the plan does not
+    /// change it. Saturating rather than panicking on the (unreachable, given
+    /// [`MAX_WORKSPACES`] × [`MAX_ENTITIES_PER_WORKSPACE`]) overflow of the
+    /// modelled `Long`.
+    pub fn billable_entity_count(&self) -> i64 {
+        let count: usize = self
+            .workspaces
+            .values()
+            .map(|workspace| workspace.entities.len())
+            .sum();
+        i64::try_from(count).unwrap_or(i64::MAX)
+    }
+
     /// Resolve an `IdOrArn` input to a stored `workspaceId`.
     ///
     /// `GetWorkspace`'s label accepts the workspace id or its ARN (its
@@ -783,6 +915,49 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
         since_epoch.subsec_nanos(),
     )
+}
+
+/// The opaque `nextToken` every paginated operation of this service mints.
+///
+/// One shape, shared by all of them so a token means the same thing wherever it
+/// is read: hex (so the token is opaque to a caller and safe in a JSON body)
+/// over an `envelope` naming the LISTING it belongs to, the resume `key` it
+/// resumes at, and the `scope` the listing was taken in — the parent resource
+/// whose page it is, which makes a token minted for another resource, by another
+/// listing, or by hand recognisably not this listing's.
+///
+/// The parts are separated by newlines, which the ids, ARNs and tag keys this
+/// service's listings resume at all exclude; the LAST scope part keeps any
+/// newline it carries (see [`decode_page_token`]), so a scope part that is free
+/// text — a query statement — goes last.
+pub fn encode_page_token(envelope: &str, scope: &[&str], key: &str) -> String {
+    let mut body = format!("{envelope}{key}");
+    for part in scope {
+        body.push('\n');
+        body.push_str(part);
+    }
+    ::hex::encode(body)
+}
+
+/// The resume key inside a `nextToken` [`encode_page_token`] minted for this
+/// `envelope` and `scope`, or `None` when the token is not one of them.
+///
+/// The key is split off first and each scope part is compared in turn, so a
+/// token whose envelope, arity or scope disagrees is rejected rather than
+/// resumed; the final part absorbs the remainder, so the last scope part may
+/// itself contain newlines. A token carrying an EMPTY key is rejected too: a
+/// listing never mints one, since a page is only resumed at a row that exists.
+pub fn decode_page_token(envelope: &str, scope: &[&str], token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let body = decoded.strip_prefix(envelope)?;
+    let mut parts = body.splitn(scope.len() + 1, '\n');
+    let key = parts.next()?;
+    for expected in scope {
+        if parts.next()? != *expected {
+            return None;
+        }
+    }
+    (!key.is_empty()).then(|| key.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

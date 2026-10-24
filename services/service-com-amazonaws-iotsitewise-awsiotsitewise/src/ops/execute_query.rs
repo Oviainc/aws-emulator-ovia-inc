@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation parses the request's SQL query statement with a real
+//! SQL parser and runs it over the shared engine store (`crate::state`), answering
+//! the rows the store holds; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +156,1702 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        // The statement is SQL, so it goes through a real SQL parser (the `sqlparser`
+        // crate) rather than being matched on as text: a statement the parser cannot
+        // read is a syntax error, which is the request being invalid.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteQuery"))
+        // How big a TREE the statement may build is bounded here, before the parser
+        // sees it, by three measures taken off the statement's TOKENS — the same
+        // lexer the parser itself runs, so no string, delimited identifier or
+        // comment can desynchronise the measures from what the parse will see
+        // ([`parse_nesting`]): how deeply it nests, how many keywords that nest
+        // without a bracket it carries, and how many operators it chains. The third
+        // is what bounds the shape neither of the others sees — a left-associative
+        // chain (`1+1+1+…`) needs no bracket and no keyword, and the parser builds it
+        // iteratively, so nothing in the parse refuses it while the TREE it produces
+        // is as deep as the chain is long. Past any of the three the statement is
+        // refused with a modelled error and no tree is built at all, so neither the
+        // parse, nor the move into the task below, nor the drop of the tree can walk
+        // deeper than this service allows. The parser is given the nesting limit too,
+        // as a second line of defence.
+        let dialect = ::sqlparser::dialect::GenericDialect {};
+        let nesting = parse_nesting(&dialect, &input.query_statement)?;
+        if nesting.nesting > MAX_PARSE_DEPTH {
+            return Err(invalid_request(format!(
+                "The query statement nests {} expressions, which is more than the \
+                 {MAX_PARSE_DEPTH} levels this service parses.",
+                nesting.nesting
+            )));
+        }
+        if nesting.prefix_forms > MAX_PREFIX_FORMS {
+            return Err(invalid_request(format!(
+                "The query statement carries {} of the keywords that nest without a \
+                 bracket, which is more than the {MAX_PREFIX_FORMS} this service parses.",
+                nesting.prefix_forms
+            )));
+        }
+        if nesting.operators > MAX_OPERATORS {
+            return Err(invalid_request(format!(
+                "The query statement chains {} operators, which is more than the \
+                 {MAX_OPERATORS} this service parses.",
+                nesting.operators
+            )));
+        }
+        let mut statements = {
+            let mut parser = ::sqlparser::parser::Parser::new(&dialect)
+                .with_recursion_limit(MAX_PARSE_DEPTH)
+                .try_with_sql(&input.query_statement)
+                .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?;
+            // The parser itself is dropped here, before anything is awaited: it
+            // borrows the dialect and is not `Send`, and the parsed statements are
+            // all the rest of this handler needs.
+            parser
+                .parse_statements()
+                .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?
+        };
+        if statements.len() != 1 {
+            return Err(invalid_request(format!(
+                "A query statement carries exactly one statement, but this one carries {}.",
+                statements.len()
+            )));
+        }
+        // A query READS asset data; nothing else is a statement this operation runs,
+        // so anything that is not a query is an invalid query statement. Taken by
+        // VALUE, so the tree moves into the blocking task below instead of being
+        // cloned into it.
+        let ::sqlparser::ast::Statement::Query(query) = statements.remove(0) else {
+            return Err(invalid_request(
+                "A query statement must be a SELECT query.".to_string(),
+            ));
+        };
+        let owned = *query;
+
+        // Every step of the run is charged against ONE budget: a wall-clock deadline,
+        // a row-work step budget and an expression-depth ceiling.
+        let budget = Budget::new();
+        let view = view_of(plan(&owned)?)?;
+        // The store is held only while the view's rows are read off it. Filtering,
+        // ordering and projecting the caller's statement then run WITHOUT the shared
+        // state lock, so no query can hold it for the length of its own
+        // interpretation.
+        let (columns, rows) = {
+            let store = state.lock();
+            materialise(&store, &view.view, &budget)?
+        };
+        // The interpretation itself is CPU-bound and synchronous, so it runs on a
+        // blocking worker under a wall-clock timeout rather than on the async
+        // runtime's: a request that spends its whole budget cannot pin a runtime
+        // worker, and this call has somewhere to land when it is cancelled or the
+        // server is shutting down. The statement MOVES into the task, and `plan` runs
+        // again there because the borrow it answers cannot cross that move; it is a
+        // total check over an already-admitted statement, so it cannot refuse what
+        // the call above accepted.
+        let result = ::tokio::time::timeout(
+            MAX_QUERY_TIME,
+            ::tokio::task::spawn_blocking(move || {
+                let select = plan(&owned)?;
+                run_select(select, &owned, columns, rows, &view, &budget)
+            }),
+        )
+        .await
+        .map_err(|_| {
+            query_timeout(format!(
+                "The query ran for longer than {} seconds without finishing.",
+                MAX_QUERY_TIME.as_secs()
+            ))
+        })?
+        .map_err(|_| {
+            ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the query could not be run".to_string(),
+                },
+            ))
+        })??;
+
+        // Paging over the computed result: `nextToken` is the index of the first row
+        // of the next page, hex-encoded (the member carries no pattern, and hex keeps
+        // it to the same alphabet every other token this service issues uses).
+        let start = match input.next_token.as_deref() {
+            Some(token) => decode_token(token)?,
+            None => 0,
+        };
+        if start > result.rows.len() {
+            return Err(invalid_request(
+                "The nextToken is not a token this operation issued.".to_string(),
+            ));
+        }
+        let max_results = input
+            .max_results
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(1, MAX_ROWS_PER_PAGE) as usize;
+        let end = start.saturating_add(max_results).min(result.rows.len());
+        let next_token = (end < result.rows.len()).then(|| ::hex::encode(end.to_string()));
+
+        Ok(ExecuteQueryOutput {
+            columns: Some(
+                result
+                    .columns
+                    .iter()
+                    .map(|(name, scalar_type)| ColumnInfo {
+                        name: Some(name.clone()),
+                        r#type: Some(ColumnType {
+                            scalar_type: Some((*scalar_type).to_string()),
+                        }),
+                    })
+                    .collect(),
+            ),
+            rows: Some(
+                result.rows[start..end]
+                    .iter()
+                    .map(|row| Row {
+                        data: row.iter().map(Cell::datum).collect(),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// How many rows one page carries when the caller gives no `maxResults`, and the
+/// ceiling on how many it may ask for.
+///
+/// The emulator's own bound, not a published AWS default: `maxResults` is modelled
+/// with a minimum of 1 and no maximum, so a response needs a cap of its own for one
+/// call not to be able to serialise an unbounded result set. Everything past a page
+/// is reachable through `nextToken`.
+const DEFAULT_MAX_RESULTS: i32 = 250;
+/// See [`DEFAULT_MAX_RESULTS`].
+const MAX_ROWS_PER_PAGE: i32 = 1_000;
+
+/// How many source rows' worth of WORK one query may do — the step budget this
+/// query engine runs under, so no statement can walk the store without bound. Every
+/// row read off the store, every row a predicate is evaluated against, every row a
+/// sort pass compares and every row the projection rebuilds is charged against it,
+/// and a statement that needs more is answered with the modelled
+/// `QueryTimeoutException`, which is what IoT SiteWise declares for a query that
+/// does not finish.
+///
+/// The emulator's own bound, like the duration beside it: a page of results is
+/// bounded by `maxResults`, so this caps the work BEHIND one page.
+const MAX_SCANNED_ROWS: usize = 20_000;
+
+/// How long one query may run for. The wall-clock half of the budget, so a
+/// statement whose cost is per row rather than per row COUNT (a long `LIKE`
+/// pattern, a sort over the scan) still ends in the modelled
+/// `QueryTimeoutException` rather than running on. The emulator's own bound.
+const MAX_QUERY_TIME: ::std::time::Duration = ::std::time::Duration::from_secs(2);
+
+/// How deep a caller-supplied statement may NEST, as the parser is told and as the
+/// evaluator counts it.
+///
+/// Both halves are needed and they are deliberately different: the parser's limit
+/// stops a deeply nested statement from being built at all, and the evaluator's own
+/// ceiling (lower, so it is the one a statement meets first) stops a walk of an AST
+/// this service did not parse itself from recursing without bound. Past either, the
+/// statement is refused with a modelled error rather than consuming the stack.
+const MAX_PARSE_DEPTH: usize = 100;
+/// See [`MAX_PARSE_DEPTH`]. Higher than the parse bound because the walk this
+/// counts is over an AST whose chains (`a AND b AND c …`) are as deep as they are
+/// long, where the parse's own recursion is not: a predicate that is wide rather
+/// than nested still runs.
+const MAX_EXPRESSION_DEPTH: usize = 200;
+
+/// How many keywords that nest WITHOUT a bracket ([`PREFIX_FORMS`]) one statement
+/// may carry in total.
+///
+/// The nesting measure beside it counts a run of them in front of one expression;
+/// this bounds the form that nests through them without a run — `CASE WHEN … THEN
+/// CASE WHEN …`, which costs at least one such keyword per level — so neither shape
+/// can drive the parse deeper than the parse is bounded to. Set above
+/// [`MAX_PARSE_DEPTH`] because a statement that is WIDE in these keywords rather
+/// than deep (a hundred separate `NOT`s joined by `AND`) nests no further than one.
+const MAX_PREFIX_FORMS: usize = 150;
+
+/// How deeply parsing `statement` can recurse and how big a tree it can build, as
+/// three measures taken off its TOKENS: the deepest NESTING it reaches, how many
+/// prefix forms it carries in total, and how many OPERATORS it chains.
+///
+/// The tokens come from the crate's own lexer
+/// (`sqlparser::tokenizer::Tokenizer`), run with the same dialect the parse uses,
+/// so the measures cannot disagree with the parse about what is structure and what
+/// is not: a quoted string, a delimited identifier (whatever the dialect delimits
+/// one with) and a comment are each ONE token (or whitespace) here, exactly as the
+/// parser sees them, rather than something this file has to re-lex and could
+/// desynchronise from. The statement is tokenised twice — once here, once inside
+/// the parser — which is bounded work: `queryStatement` is modelled `@length
+/// 1..10000`.
+///
+/// Measuring BEFORE the parse is the point: it bounds the work the parser will do,
+/// and the size of the tree it hands back, so the depth a caller can drive this
+/// service to — the parse, the move of the tree into the blocking task, its drop
+/// and the evaluator's walk — is this service's bound and not an internal of the
+/// crate that parses it.
+///
+/// `nesting` is the deepest the parse can descend at one point: open brackets that
+/// are still open, plus the run of prefix forms ([`PREFIX_FORMS`]) immediately in
+/// front of the expression being parsed — a chain of them (`NOT NOT NOT …`) descends
+/// once per link. A statement that is WIDE rather than deep — a hundred separately
+/// bracketed predicates joined by `AND` — closes each bracket before opening the
+/// next, so it does not count as nested and is not refused.
+///
+/// `prefix_forms` is the TOTAL number of those keywords, which bounds the nesting a
+/// form that needs no bracket to nest (`CASE WHEN … THEN CASE WHEN …`) can reach,
+/// since each level costs at least one of them.
+///
+/// `operators` is the total number of operators, which bounds the depth of the one
+/// shape the other two cannot see: a left-associative chain, which the parser builds
+/// iteratively into a tree as deep as the chain is long (see [`MAX_OPERATORS`]).
+/// Every token that is not a word, a literal, a bracket, a separator or whitespace
+/// counts as one — so `+`, `<=`, `||` and `::` alike — beside the word forms
+/// ([`OPERATOR_WORDS`]). Counting a separator-like token as an operator would only
+/// refuse sooner, never later, so the bound cannot be slipped past by a token this
+/// list does not name.
+///
+/// A statement the LEXER cannot read is a syntax error, and is refused as one.
+fn parse_nesting(
+    dialect: &dyn ::sqlparser::dialect::Dialect,
+    statement: &str,
+) -> Result<Nesting, ExecuteQueryError> {
+    use ::sqlparser::tokenizer::{Token, Tokenizer};
+    let tokens = Tokenizer::new(dialect, statement)
+        .tokenize()
+        .map_err(|error| invalid_request(format!("Invalid query statement: {error}")))?;
+    let mut measured = Nesting {
+        nesting: 0,
+        prefix_forms: 0,
+        operators: 0,
+    };
+    let mut depth = 0usize;
+    // How many prefix forms stand, unbroken, in front of the expression being
+    // parsed. Whitespace and comments do not break the run; anything else does.
+    let mut run = 0usize;
+    for token in tokens {
+        match token {
+            Token::Whitespace(_) | Token::EOF => continue,
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => {
+                depth = depth.saturating_sub(1);
+                run = 0;
+            }
+            Token::Word(word) => {
+                // A DELIMITED identifier is never a keyword, whatever it spells.
+                let bare = word.quote_style.is_none();
+                let upper = word.value.to_ascii_uppercase();
+                if bare && PREFIX_FORMS.contains(&upper.as_str()) {
+                    run += 1;
+                    measured.prefix_forms += 1;
+                } else {
+                    run = 0;
+                }
+                if bare && OPERATOR_WORDS.contains(&upper.as_str()) {
+                    measured.operators += 1;
+                }
+            }
+            Token::Number(..)
+            | Token::Char(_)
+            | Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::Comma
+            | Token::SemiColon
+            | Token::Period => run = 0,
+            _ => {
+                run = 0;
+                measured.operators += 1;
+            }
+        }
+        measured.nesting = measured.nesting.max(depth + run);
+    }
+    Ok(measured)
+}
+
+/// What [`parse_nesting`] measures of a statement.
+#[derive(Debug)]
+struct Nesting {
+    nesting: usize,
+    prefix_forms: usize,
+    operators: usize,
+}
+
+/// The keywords that can open a sub-expression the parse descends into WITHOUT an
+/// opening bracket of their own. The bracketed forms (`CAST(`, `IN (`, a function
+/// call) need none of their own counting: their bracket is what [`parse_nesting`]
+/// counts.
+const PREFIX_FORMS: [&str; 3] = ["NOT", "CASE", "WHEN"];
+
+/// The operators spelled as words rather than punctuation. Counted by
+/// [`parse_nesting`] beside the punctuation ones, so a chain of either shape is
+/// bounded by [`MAX_OPERATORS`].
+const OPERATOR_WORDS: [&str; 6] = ["AND", "OR", "IN", "LIKE", "BETWEEN", "IS"];
+
+/// How many items one statement's projection may carry, and how many keys its
+/// `ORDER BY` may name.
+///
+/// Both lists are the caller's to write and both multiply the work the engine does
+/// per row — one pass over the rows per `ORDER BY` key, one rebuilt cell per
+/// projection item per row — so each needs a ceiling of its own beside the row-work
+/// budget. The emulator's own bounds, set far above any statement over views this
+/// narrow (the widest view has nine columns).
+const MAX_PROJECTION_ITEMS: usize = 64;
+/// See [`MAX_PROJECTION_ITEMS`].
+const MAX_ORDER_BY_KEYS: usize = 8;
+
+/// How many COLUMNS a result row may carry, once `*` has been expanded.
+///
+/// [`MAX_PROJECTION_ITEMS`] bounds the items a statement WRITES, which is not the
+/// same count: a wildcard item stands for every column of the view, so a statement
+/// of n wildcard items rebuilds n × (view width) cells per row. The expanded width
+/// is what decides how many times one cell is copied, so it carries its own
+/// ceiling. Set at the item ceiling, comfortably above every view's own width (the
+/// widest has nine columns), so `SELECT *` and a handful of wildcards still run.
+const MAX_PROJECTED_COLUMNS: usize = 64;
+
+/// How many values one `IN` list may carry.
+///
+/// `IN` costs a single operator token and opens no nesting level, so neither
+/// [`MAX_OPERATORS`] nor the nesting measure bounds the list's length — while every
+/// element of it is evaluated against every surviving row, which makes the list a
+/// per-row multiplier the way the projection and the `ORDER BY` are. This
+/// emulator's own bound, set far above any list a statement over views this narrow
+/// would write.
+const MAX_IN_LIST_ITEMS: usize = 64;
+
+/// How many operators one statement may chain.
+///
+/// A left-associative chain of the same operator (`a AND b AND c …`, `1+1+1+…`)
+/// needs neither a bracket nor a prefix keyword, and the parser builds it
+/// ITERATIVELY — so neither the nesting measure nor the parser's recursion limit
+/// sees it, while the TREE it produces is as deep as the chain is long, and every
+/// later walk of that tree (the move into the blocking task, the drop, the
+/// evaluator) is as deep again. Counting the operators off the statement before it
+/// is parsed is what bounds that depth: set above [`MAX_EXPRESSION_DEPTH`], so the
+/// evaluator's own ceiling is what a merely long predicate meets, and far below any
+/// depth a tree walk could not take.
+const MAX_OPERATORS: usize = 300;
+
+/// How many compared CHARACTERS count as one unit of the work budget.
+///
+/// The row COUNT alone does not bound the work a statement can cause. A stored
+/// `stringValue` carries no modelled length bound, so matching one cell against a
+/// `LIKE` pattern, ordering by one, materialising one or projecting one costs work
+/// proportional to that cell's LENGTH rather than to the number of rows — and a
+/// bound charged once per row, counting a row as one unit whatever its cells hold,
+/// cannot see that work at all. Character work is therefore charged here too, in
+/// units of this many characters, against the SAME ceiling
+/// ([`MAX_SCANNED_ROWS`]) and the same deadline ([`MAX_QUERY_TIME`]) the row count
+/// is charged against, and charged INSIDE the per-row loops that do it — a
+/// `spawn_blocking` task cannot be aborted, so the wall-clock timeout wrapped
+/// around the interpretation abandons the join handle rather than the work, and an
+/// in-loop charge is the only thing that makes the deadline real.
+///
+/// The size is this emulator's own: a unit is a few thousand characters of
+/// comparison, far more than any identifier, name, alias or rendered value these
+/// views hold, so an ordinary statement over ordinary rows spends roughly one unit
+/// per row and only cells orders of magnitude larger reach the ceiling.
+const CHARS_PER_WORK_UNIT: usize = 4_096;
+
+/// How many characters of one cell enter a sort key.
+///
+/// A sort's comparator cannot read the deadline or charge the budget, so one
+/// comparison has to cost a BOUNDED amount however long the cells are: the key
+/// keeps this much of the cell's text, which orders every pair of values whose text
+/// differs within it and leaves two longer values agreeing on this whole prefix to
+/// the stability of the sort. This emulator's own bound, set far above every
+/// identifier, name, alias and rendered value these views hold.
+const MAX_SORT_KEY_CHARS: usize = 4_096;
+
+/// The budget one query runs under: a deadline, a scanned-row count and the
+/// expression depth its walk has reached.
+///
+/// Every loop and every recursion in this engine charges against it, so the work
+/// one statement can cause is bounded in three independent ways and each overrun
+/// ends the query with a MODELLED error.
+///
+/// The count is held in a [`::std::cell::Cell`] so that charging needs only a
+/// SHARED borrow: the predicate walk (`evaluate`/`value_of`/[`like`]) is reached
+/// through shared borrows, and it is exactly the length-proportional work in there
+/// that has to be charged.
+#[derive(Debug)]
+struct Budget {
+    deadline: ::std::time::Instant,
+    scanned: ::std::cell::Cell<usize>,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            deadline: ::std::time::Instant::now() + MAX_QUERY_TIME,
+            scanned: ::std::cell::Cell::new(0),
+        }
+    }
+
+    /// Charge `rows` rows of work, failing once either the step budget or the
+    /// deadline is spent.
+    fn charge(&self, rows: usize) -> Result<(), ExecuteQueryError> {
+        let scanned = self.scanned.get().saturating_add(rows);
+        self.scanned.set(scanned);
+        if scanned > MAX_SCANNED_ROWS {
+            return Err(query_timeout(format!(
+                "The query scanned more than {MAX_SCANNED_ROWS} rows without finishing."
+            )));
+        }
+        if ::std::time::Instant::now() > self.deadline {
+            return Err(query_timeout(format!(
+                "The query ran for longer than {} seconds without finishing.",
+                MAX_QUERY_TIME.as_secs()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Charge work proportional to `chars` COMPARED CHARACTERS, in units of
+    /// [`CHARS_PER_WORK_UNIT`].
+    ///
+    /// The deadline is read whatever the amount rounds to, so a caller that charges
+    /// a sub-unit amount inside a loop still observes it: this is the call that
+    /// makes a bound reachable from inside the per-row work.
+    fn charge_chars(&self, chars: usize) -> Result<(), ExecuteQueryError> {
+        self.charge(chars.div_ceil(CHARS_PER_WORK_UNIT))
+    }
+
+    /// Refuse a walk that has nested past [`MAX_EXPRESSION_DEPTH`].
+    fn depth(&self, depth: usize) -> Result<(), ExecuteQueryError> {
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(invalid_request(format!(
+                "The query statement nests expressions more than {MAX_EXPRESSION_DEPTH} \
+                 levels deep."
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One value in a result row, in the type the column reports.
+///
+/// Kept as a value rather than as text so a comparison in a `WHERE` clause is made
+/// between values of the column's own type — a number against a number, a timestamp
+/// against a timestamp — and the rendering to the wire's `scalarValue` string happens
+/// once, at the end.
+#[derive(Debug, Clone, PartialEq)]
+enum Cell {
+    Null,
+    Str(String),
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+    /// Nanoseconds since the Unix epoch, the resolution IoT SiteWise timestamps
+    /// carry (`TimeInNanos`).
+    Timestamp(i128),
+}
+
+impl Cell {
+    /// This value as the modelled `Datum` the wire carries: a `scalarValue` string,
+    /// or `nullValue` for an absent one.
+    fn datum(&self) -> Datum {
+        let scalar = match self {
+            Self::Null => {
+                return Datum {
+                    scalar_value: None,
+                    array_value: None,
+                    row_value: None,
+                    null_value: Some(true),
+                }
+            }
+            Self::Str(value) => value.clone(),
+            Self::Int(value) => value.to_string(),
+            Self::Double(value) => value.to_string(),
+            Self::Bool(value) => value.to_string(),
+            Self::Timestamp(nanos) => nanos.to_string(),
+        };
+        Datum {
+            scalar_value: Some(scalar),
+            array_value: None,
+            row_value: None,
+            null_value: None,
+        }
+    }
+
+    /// How much comparing, copying or rendering this value costs, in BYTES.
+    ///
+    /// Bytes rather than characters, because the byte length is what a `String`
+    /// knows without walking itself and is never smaller than the character count,
+    /// so a charge taken on it is never an under-charge (the unit
+    /// [`CHARS_PER_WORK_UNIT`] is a few thousand of either). A string costs its own
+    /// length — the one cost in this engine the model does not bound, since
+    /// `stringValue` carries no `@length` — and every other variant is a
+    /// fixed-size scalar, so it costs one.
+    fn chars(&self) -> usize {
+        match self {
+            Self::Str(value) => value.len(),
+            _ => 1,
+        }
+    }
+
+    /// This value as text, for a comparison against a string literal.
+    fn as_text(&self) -> Option<String> {
+        match self {
+            Self::Null => None,
+            Self::Str(value) => Some(value.clone()),
+            Self::Int(value) => Some(value.to_string()),
+            Self::Double(value) => Some(value.to_string()),
+            Self::Bool(value) => Some(value.to_string()),
+            Self::Timestamp(nanos) => Some(nanos.to_string()),
+        }
+    }
+
+    /// This value as a number, for a comparison against a numeric literal.
+    fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Int(value) => Some(*value as f64),
+            Self::Double(value) => Some(*value),
+            Self::Timestamp(nanos) => Some(*nanos as f64),
+            Self::Str(value) => value.parse().ok(),
+            Self::Bool(_) | Self::Null => None,
+        }
+    }
+
+    /// The order between two values, or `None` when either is null or the two
+    /// cannot be compared — in which case a comparison in a `WHERE` clause is
+    /// neither true nor false and the row does not match, the way SQL's three-valued
+    /// logic treats UNKNOWN.
+    ///
+    /// `numeric` says whether the COLUMN the comparison is about is a numeric one
+    /// (`INT`, `DOUBLE`, `TIMESTAMP`), which is what decides how the two are
+    /// compared: a numeric column compares by number, and every other column
+    /// compares as text, so a `STRING` column holding digits is not quietly compared
+    /// as the number it looks like. The same rule the sort uses ([`SortKey`]), so
+    /// filtering and ordering cannot disagree about one column's type.
+    fn compare(&self, other: &Self, numeric: bool) -> Option<::std::cmp::Ordering> {
+        if matches!(self, Self::Null) || matches!(other, Self::Null) {
+            return None;
+        }
+        if let (Self::Bool(left), Self::Bool(right)) = (self, other) {
+            return Some(left.cmp(right));
+        }
+        if numeric {
+            return self.as_number()?.partial_cmp(&other.as_number()?);
+        }
+        self.as_text()?.partial_cmp(&other.as_text()?)
+    }
+}
+
+/// One column of a view: the name a statement selects it by and the `ScalarType`
+/// the result reports for it.
+#[derive(Debug, Clone, Copy)]
+struct Column {
+    name: &'static str,
+    /// A `ScalarType` value. Source: `smithy_query(query="shape",
+    /// shape="ScalarType")` — BOOLEAN | INT | DOUBLE | TIMESTAMP | STRING.
+    scalar_type: &'static str,
+}
+
+/// A computed result set: the columns the statement projects — each the name the
+/// result reports it under and its `ScalarType` — and its rows.
+#[derive(Debug)]
+struct ResultSet {
+    columns: Vec<(String, &'static str)>,
+    rows: Vec<Vec<Cell>>,
+}
+
+/// The `asset` view: one row per stored asset.
+///
+/// The view catalog below — which views exist and what their columns are called —
+/// is the one the IoT SiteWise User Guide's query-language reference documents
+/// ("Query your asset data"); the Smithy model carries none, since `queryStatement`
+/// is an opaque string. A statement naming a view or a column that is not here is
+/// refused rather than answered from a guess.
+const ASSET_VIEW: &[Column] = &[
+    Column { name: "asset_id", scalar_type: "STRING" },
+    Column { name: "asset_name", scalar_type: "STRING" },
+    Column { name: "asset_description", scalar_type: "STRING" },
+    Column { name: "asset_model_id", scalar_type: "STRING" },
+    Column { name: "asset_external_id", scalar_type: "STRING" },
+];
+
+/// The `asset_property` view: one row per property of every stored asset.
+const ASSET_PROPERTY_VIEW: &[Column] = &[
+    Column { name: "asset_id", scalar_type: "STRING" },
+    Column { name: "property_id", scalar_type: "STRING" },
+    Column { name: "property_name", scalar_type: "STRING" },
+    Column { name: "property_alias", scalar_type: "STRING" },
+    Column { name: "property_external_id", scalar_type: "STRING" },
+    Column { name: "asset_composite_model_id", scalar_type: "STRING" },
+    Column { name: "data_type", scalar_type: "STRING" },
+];
+
+/// The `raw_time_series` view: one row per stored sample, and the shape
+/// `latest_value_time_series` carries too.
+const TIME_SERIES_VIEW: &[Column] = &[
+    Column { name: "asset_id", scalar_type: "STRING" },
+    Column { name: "property_id", scalar_type: "STRING" },
+    Column { name: "property_alias", scalar_type: "STRING" },
+    Column { name: "event_timestamp", scalar_type: "TIMESTAMP" },
+    Column { name: "quality", scalar_type: "STRING" },
+    Column { name: "boolean_value", scalar_type: "BOOLEAN" },
+    Column { name: "int_value", scalar_type: "INT" },
+    Column { name: "double_value", scalar_type: "DOUBLE" },
+    Column { name: "string_value", scalar_type: "STRING" },
+];
+
+/// Check the clauses this engine runs and answer the statement's `SELECT`.
+///
+/// Everything that depends only on the STATEMENT is decided here, before the store
+/// is touched, so a statement this engine does not plan never takes the shared
+/// state lock at all.
+///
+/// Both the query and its select are DESTRUCTURED field by field rather than read
+/// member by member: a clause this engine does not run has to be answered — with
+/// the 501 that says so, or with a modelled refusal — and never dropped, since
+/// dropping a clause the caller wrote answers a different question with 200. The
+/// destructuring is what keeps that true: a field the parser gains later fails the
+/// build here instead of being ignored by accident.
+fn plan(
+    query: &::sqlparser::ast::Query,
+) -> Result<&::sqlparser::ast::Select, ExecuteQueryError> {
+    use ::sqlparser::ast::{GroupByExpr, SetExpr};
+
+    let ::sqlparser::ast::Query {
+        with,
+        body,
+        // Read where they are used: `run_select` orders by the one and pages by the
+        // other.
+        order_by: _,
+        limit_clause: _,
+        fetch,
+        locks,
+        for_clause,
+        settings,
+        format_clause,
+        pipe_operators,
+    } = query;
+    if with.is_some() {
+        return Err(unsupported("a WITH clause"));
+    }
+    if fetch.is_some() {
+        return Err(unsupported("a FETCH clause"));
+    }
+    if !locks.is_empty() {
+        return Err(unsupported("a locking clause"));
+    }
+    if for_clause.is_some() {
+        return Err(unsupported("a FOR clause"));
+    }
+    if settings.is_some() {
+        return Err(unsupported("a SETTINGS clause"));
+    }
+    if format_clause.is_some() {
+        return Err(unsupported("a FORMAT clause"));
+    }
+    if !pipe_operators.is_empty() {
+        return Err(unsupported("a pipe operator"));
+    }
+
+    let SetExpr::Select(select) = body.as_ref() else {
+        return Err(unsupported(
+            "a query body that is not a single SELECT (a set operation, VALUES or a subquery)",
+        ));
+    };
+    let ::sqlparser::ast::Select {
+        select_token: _,
+        distinct,
+        top,
+        top_before_distinct: _,
+        projection,
+        exclude,
+        into,
+        // Read by `view_of`.
+        from: _,
+        prewhere,
+        // Read by `run_select`.
+        selection: _,
+        group_by,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        having,
+        named_window,
+        qualify,
+        window_before_qualify: _,
+        value_table_mode,
+        connect_by,
+        lateral_views,
+        flavor: _,
+    } = select.as_ref();
+    if distinct.is_some() {
+        return Err(unsupported("SELECT DISTINCT"));
+    }
+    if top.is_some() {
+        return Err(unsupported("SELECT TOP"));
+    }
+    if exclude.is_some() {
+        return Err(unsupported("an EXCLUDE clause"));
+    }
+    if into.is_some() {
+        return Err(unsupported("SELECT INTO"));
+    }
+    if prewhere.is_some() {
+        return Err(unsupported("a PREWHERE clause"));
+    }
+    if !cluster_by.is_empty() {
+        return Err(unsupported("a CLUSTER BY clause"));
+    }
+    if !distribute_by.is_empty() {
+        return Err(unsupported("a DISTRIBUTE BY clause"));
+    }
+    if !sort_by.is_empty() {
+        return Err(unsupported("a SORT BY clause"));
+    }
+    if having.is_some() {
+        return Err(unsupported("a HAVING clause"));
+    }
+    if !named_window.is_empty() {
+        return Err(unsupported("a WINDOW clause"));
+    }
+    if qualify.is_some() {
+        return Err(unsupported("a QUALIFY clause"));
+    }
+    if value_table_mode.is_some() {
+        return Err(unsupported("a value-table SELECT"));
+    }
+    if connect_by.is_some() {
+        return Err(unsupported("a CONNECT BY clause"));
+    }
+    if !lateral_views.is_empty() {
+        return Err(unsupported("a LATERAL VIEW clause"));
+    }
+    match group_by {
+        GroupByExpr::Expressions(expressions, modifiers)
+            if expressions.is_empty() && modifiers.is_empty() => {}
+        _ => return Err(unsupported("a GROUP BY clause")),
+    }
+    // A SELECT projects at least one column. The generic dialect accepts an empty
+    // projection list (`SELECT FROM asset`), which no SQL dialect's grammar admits,
+    // so the statement is refused here rather than answered with empty rows.
+    if projection.is_empty() {
+        return Err(invalid_request(
+            "A SELECT must project at least one column.".to_string(),
+        ));
+    }
+    if projection.len() > MAX_PROJECTION_ITEMS {
+        return Err(invalid_request(format!(
+            "A SELECT projects at most {MAX_PROJECTION_ITEMS} items, but this one projects {}.",
+            projection.len()
+        )));
+    }
+    Ok(select)
+}
+
+/// The one view the statement reads, lower-cased.
+///
+/// Exactly one, with no joins: every view this service exposes is readable on its
+/// own, and a join across two of them is a plan this engine does not run.
+fn view_of(select: &::sqlparser::ast::Select) -> Result<Qualified, ExecuteQueryError> {
+    use ::sqlparser::ast::TableFactor;
+    let [table] = select.from.as_slice() else {
+        return Err(unsupported(
+            "a FROM clause that does not name exactly one view",
+        ));
+    };
+    if !table.joins.is_empty() {
+        return Err(unsupported("a JOIN"));
+    }
+    let TableFactor::Table { name, alias, .. } = &table.relation else {
+        return Err(unsupported(
+            "a FROM clause whose relation is not a plain view name",
+        ));
+    };
+    Ok(Qualified {
+        view: name.to_string().to_ascii_lowercase(),
+        alias: alias
+            .as_ref()
+            .map(|alias| alias.name.value.to_ascii_lowercase()),
+    })
+}
+
+/// The view a statement reads and the alias it may qualify its columns with.
+#[derive(Debug)]
+struct Qualified {
+    view: String,
+    alias: Option<String>,
+}
+
+impl Qualified {
+    /// Whether `qualifier` names this view: its own name, or the alias the `FROM`
+    /// clause gave it. A qualifier that names neither belongs to no relation the
+    /// statement reads.
+    fn admits(&self, qualifier: &str) -> bool {
+        let qualifier = qualifier.to_ascii_lowercase();
+        qualifier == self.view || self.alias.as_deref() == Some(qualifier.as_str())
+    }
+}
+
+/// Run the statement's `WHERE`, `ORDER BY`, `LIMIT`/`OFFSET` and projection over
+/// `rows`, which were read off the store beforehand.
+fn run_select(
+    select: &::sqlparser::ast::Select,
+    query: &::sqlparser::ast::Query,
+    columns: &'static [Column],
+    rows: Vec<Vec<Cell>>,
+    from: &Qualified,
+    budget: &Budget,
+) -> Result<ResultSet, ExecuteQueryError> {
+    // WHERE, then ORDER BY, then the projection: the order SQL evaluates them in,
+    // so a statement may order or filter by a column it does not select.
+    let mut kept: Vec<Vec<Cell>> = Vec::new();
+    for row in rows {
+        // Each row costs a step whether the predicate keeps it or not, so the budget
+        // bounds the predicate work and not just the rows answered.
+        budget.charge(1)?;
+        let matched = match select.selection.as_ref() {
+            // Only a predicate that answers TRUE keeps a row: SQL's UNKNOWN keeps
+            // none, and a statement with no predicate keeps them all.
+            Some(predicate) => {
+                evaluate(predicate, columns, &row, from, budget, 0)? == Some(true)
+            }
+            None => true,
+        };
+        if matched {
+            kept.push(row);
+        }
+    }
+
+    order_rows(query, columns, from, &mut kept, budget)?;
+    let (offset, limit) = limits(query)?;
+    let kept = kept
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+
+    project(select, columns, from, kept, budget)
+}
+
+/// Every row of one view, as the cells of its columns.
+///
+/// This is where the result comes from: each row is read off the stored resources,
+/// so a query answers what the store holds and nothing else. Every row read is
+/// charged against the budget, so the read is bounded however much the store holds.
+fn materialise(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    view: &str,
+    budget: &Budget,
+) -> Result<(&'static [Column], Vec<Vec<Cell>>), ExecuteQueryError> {
+    let text = |value: Option<&str>| match value {
+        Some(value) => Cell::Str(value.to_string()),
+        None => Cell::Null,
+    };
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let columns: &'static [Column] = match view {
+        "asset" => {
+            for asset in store.assets.values() {
+                let row = vec![
+                    Cell::Str(asset.id.clone()),
+                    Cell::Str(asset.name.clone()),
+                    text(asset.description.as_deref()),
+                    Cell::Str(asset.asset_model_id.clone()),
+                    text(asset.external_id.as_deref()),
+                ];
+                charge_row(budget, &row)?;
+                rows.push(row);
+            }
+            ASSET_VIEW
+        }
+        "asset_property" => {
+            for asset in store.assets.values() {
+                for property in &asset.properties {
+                    let row = vec![
+                        Cell::Str(asset.id.clone()),
+                        Cell::Str(property.id.clone()),
+                        Cell::Str(property.name.clone()),
+                        text(property.alias.as_deref()),
+                        text(property.external_id.as_deref()),
+                        // A composite model's properties are not materialised on an
+                        // asset by this emulator, so every row here is a property of
+                        // the asset itself.
+                        Cell::Null,
+                        Cell::Str(property.data_type.clone()),
+                    ];
+                    charge_row(budget, &row)?;
+                    rows.push(row);
+                }
+            }
+            ASSET_PROPERTY_VIEW
+        }
+        "raw_time_series" | "latest_value_time_series" => {
+            let latest_only = view == "latest_value_time_series";
+            for asset in store.assets.values() {
+                for property in &asset.properties {
+                    let series = store
+                        .property_values
+                        .get(&asset.id)
+                        .and_then(|properties| properties.get(&property.id));
+                    let samples: Vec<&AssetPropertyValue> = match (series, latest_only) {
+                        (Some(series), true) => series.last().into_iter().collect(),
+                        (Some(series), false) => series.iter().collect(),
+                        (None, _) => Vec::new(),
+                    };
+                    for sample in samples {
+                        let row = time_series_row(
+                            Cell::Str(asset.id.clone()),
+                            Cell::Str(property.id.clone()),
+                            text(property.alias.as_deref()),
+                            sample,
+                        );
+                        charge_row(budget, &row)?;
+                        rows.push(row);
+                    }
+                }
+            }
+            // A DISASSOCIATED series has no asset property to hang off, and its
+            // samples are data this service holds just as much as a property's are.
+            for series in store.disassociated_time_series.values() {
+                let samples: Vec<&AssetPropertyValue> = if latest_only {
+                    series.values.last().into_iter().collect()
+                } else {
+                    series.values.iter().collect()
+                };
+                for sample in samples {
+                    let row = time_series_row(
+                        Cell::Null,
+                        Cell::Null,
+                        Cell::Str(series.alias.clone()),
+                        sample,
+                    );
+                    charge_row(budget, &row)?;
+                    rows.push(row);
+                }
+            }
+            TIME_SERIES_VIEW
+        }
+        // A view the IoT SiteWise query catalog DOES document but this engine does
+        // not compute is not a statement about the caller's query: the view exists,
+        // so saying it does not would be false. It is answered with the 501 this
+        // emulator reserves for a construct it has not written, like every other
+        // clause it does not run.
+        "precomputed_aggregates" => {
+            return Err(unsupported("the precomputed_aggregates view"))
+        }
+        _ => {
+            return Err(invalid_request(format!(
+                "The view {view} does not exist. The views this service exposes are \
+                 asset, asset_property, raw_time_series and latest_value_time_series."
+            )))
+        }
+    };
+    if rows.len() > MAX_SCANNED_ROWS {
+        return Err(query_timeout(format!(
+            "The query scanned more than {MAX_SCANNED_ROWS} rows without finishing."
+        )));
+    }
+    Ok((columns, rows))
+}
+
+/// Charge one materialised row against the budget: one row of work, PLUS the
+/// characters its cells hold.
+///
+/// A row is read off the store by cloning its cells, and every later pass over it
+/// (a `LIKE`, a sort key, a projection, the rendering to `scalarValue`) is
+/// proportional to those same characters. Charging them where the row enters the
+/// engine is what makes one enormous cell cost what it costs — a row counted as a
+/// single unit whatever it holds would leave that work unbounded.
+fn charge_row(budget: &Budget, row: &[Cell]) -> Result<(), ExecuteQueryError> {
+    budget.charge(1)?;
+    budget.charge_chars(row.iter().map(Cell::chars).sum())
+}
+
+/// One `raw_time_series` / `latest_value_time_series` row: the sample's timestamp,
+/// quality and the one `Variant` member it carries, with the other value columns
+/// null — exactly as the stored TQV holds it.
+fn time_series_row(
+    asset_id: Cell,
+    property_id: Cell,
+    alias: Cell,
+    sample: &AssetPropertyValue,
+) -> Vec<Cell> {
+    let nanos = i128::from(sample.timestamp.time_in_seconds) * 1_000_000_000
+        + i128::from(sample.timestamp.offset_in_nanos.unwrap_or(0));
+    vec![
+        asset_id,
+        property_id,
+        alias,
+        Cell::Timestamp(nanos),
+        Cell::Str(crate::state::quality_of(sample).to_string()),
+        sample.value.boolean_value.map_or(Cell::Null, Cell::Bool),
+        sample
+            .value
+            .integer_value
+            .map_or(Cell::Null, |value| Cell::Int(i64::from(value))),
+        sample.value.double_value.map_or(Cell::Null, Cell::Double),
+        sample
+            .value
+            .string_value
+            .clone()
+            .map_or(Cell::Null, Cell::Str),
+    ]
+}
+
+/// Which column of `columns` an identifier names, by its own name or by
+/// `<view>.<column>` / `<alias>.<column>`.
+///
+/// A qualifier that names neither the view the statement reads nor the alias it
+/// gave it belongs to no relation of this statement, so it names no column —
+/// rather than silently resolving against the only view there is.
+fn column_at(columns: &[Column], parts: &[String], from: &Qualified) -> Option<usize> {
+    let (qualifier, name) = match parts {
+        [name] => (None, name),
+        [.., qualifier, name] => (Some(qualifier), name),
+        [] => return None,
+    };
+    if let Some(qualifier) = qualifier {
+        if !from.admits(qualifier) {
+            return None;
+        }
+    }
+    let name = name.to_ascii_lowercase();
+    columns.iter().position(|column| column.name == name)
+}
+
+/// The identifier `expr` names, as its dot-separated parts, or `None` when the
+/// expression is not an identifier.
+fn identifier_parts(expr: &::sqlparser::ast::Expr) -> Option<Vec<String>> {
+    use ::sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => Some(vec![ident.value.clone()]),
+        Expr::CompoundIdentifier(parts) => {
+            Some(parts.iter().map(|ident| ident.value.clone()).collect())
+        }
+        _ => None,
+    }
+}
+
+/// The value `expr` stands for in `row`: a column of the row, or a literal.
+fn value_of(
+    expr: &::sqlparser::ast::Expr,
+    columns: &[Column],
+    row: &[Cell],
+    from: &Qualified,
+    budget: &Budget,
+    depth: usize,
+) -> Result<Cell, ExecuteQueryError> {
+    use ::sqlparser::ast::{Expr, Value};
+    budget.depth(depth)?;
+    // One step per recursion, as in `evaluate`: the walk charges as it walks.
+    budget.charge(1)?;
+    if let Some(parts) = identifier_parts(expr) {
+        let at = column_at(columns, &parts, from).ok_or_else(|| {
+            invalid_request(format!("The column {} does not exist.", parts.join(".")))
+        })?;
+        // Reading a column COPIES its cell, which costs the cell's length — charged
+        // before the copy is made.
+        budget.charge_chars(row[at].chars())?;
+        return Ok(row[at].clone());
+    }
+    match expr {
+        Expr::Nested(inner) => value_of(inner, columns, row, from, budget, depth + 1),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                budget.charge_chars(text.len())?;
+                Ok(Cell::Str(text.clone()))
+            }
+            Value::Number(number, _) => number
+                .parse::<i64>()
+                .map(Cell::Int)
+                .or_else(|_| number.parse::<f64>().map(Cell::Double))
+                .map_err(|_| invalid_request(format!("The literal {number} is not a number."))),
+            Value::Boolean(value) => Ok(Cell::Bool(*value)),
+            Value::Null => Ok(Cell::Null),
+            other => Err(unsupported(&format!("the literal {other}"))),
+        },
+        other => Err(unsupported(&format!("the expression {other}"))),
+    }
+}
+
+/// Whether `row` satisfies a `WHERE` predicate.
+///
+/// SQL's three-valued logic: the answer is `Some(true)`, `Some(false)` or `None`
+/// for UNKNOWN, and ONLY `Some(true)` keeps a row. UNKNOWN is what a comparison
+/// with a null operand answers, and it PROPAGATES: negating it leaves it unknown,
+/// so `NOT (col = 'x')`, `col NOT LIKE 'x'` and `col NOT IN (…)` keep no row whose
+/// column is null, exactly as SQL excludes them. `AND` is false as soon as either
+/// side is false, `OR` is true as soon as either side is true, and either is
+/// unknown otherwise.
+///
+/// `depth` is how far this walk has nested; every recursive step charges it against
+/// the budget, so a statement cannot drive the walk past
+/// [`MAX_EXPRESSION_DEPTH`] however deeply it nests.
+fn evaluate(
+    predicate: &::sqlparser::ast::Expr,
+    columns: &[Column],
+    row: &[Cell],
+    from: &Qualified,
+    budget: &Budget,
+    depth: usize,
+) -> Result<Option<bool>, ExecuteQueryError> {
+    use ::sqlparser::ast::{BinaryOperator, Expr};
+    use ::std::cmp::Ordering;
+    budget.depth(depth)?;
+    // One step per recursion of the walk, so the work ONE row's predicate costs is
+    // charged as the walk does it and the deadline is read between its steps — a
+    // charge taken once per row cannot see inside the walk at all.
+    budget.charge(1)?;
+    let value = |expr| value_of(expr, columns, row, from, budget, depth + 1);
+    match predicate {
+        Expr::Nested(inner) => evaluate(inner, columns, row, from, budget, depth + 1),
+        // `IS [NOT] NULL` is the one form that ANSWERS a null rather than
+        // propagating it: it is never unknown.
+        Expr::IsNull(inner) => Ok(Some(value(inner)? == Cell::Null)),
+        Expr::IsNotNull(inner) => Ok(Some(value(inner)? != Cell::Null)),
+        Expr::UnaryOp {
+            op: ::sqlparser::ast::UnaryOperator::Not,
+            expr,
+        } => Ok(evaluate(expr, columns, row, from, budget, depth + 1)?.map(|known| !known)),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            // Every element of the list is evaluated against every surviving row, so
+            // the list is a per-row multiplier and carries a ceiling of its own.
+            if list.len() > MAX_IN_LIST_ITEMS {
+                return Err(invalid_request(format!(
+                    "An IN list carries at most {MAX_IN_LIST_ITEMS} values, but this one \
+                     carries {}.",
+                    list.len()
+                )));
+            }
+            // The column the list is about decides how its values compare, exactly
+            // as it does for a comparison operator.
+            let numeric = numeric_comparison(&[expr], columns, from);
+            let left = value(expr)?;
+            if left == Cell::Null {
+                return Ok(None);
+            }
+            let mut found = false;
+            let mut unknown = false;
+            for candidate in list {
+                let candidate = value(candidate)?;
+                // One step per element, plus the characters comparing it costs:
+                // `compare` renders both sides as text for a non-numeric column,
+                // and a stored cell's length is the one input the model does not
+                // bound.
+                budget.charge(1)?;
+                budget.charge_chars(left.chars().saturating_add(candidate.chars()))?;
+                match left.compare(&candidate, numeric) {
+                    Some(Ordering::Equal) => found = true,
+                    // A candidate that cannot be compared — a null in the list —
+                    // leaves "not in this list" unknown, though a match elsewhere
+                    // in it still answers true.
+                    None => unknown = true,
+                    Some(_) => {}
+                }
+            }
+            Ok(match (found, unknown) {
+                (true, _) => Some(!*negated),
+                (false, true) => None,
+                (false, false) => Some(*negated),
+            })
+        }
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            any,
+        } => {
+            // `LIKE ANY (…)` compares the value against a LIST of patterns, which is
+            // a different predicate and not one this engine runs.
+            if *any {
+                return Err(unsupported("a LIKE ANY predicate"));
+            }
+            let left = value(expr)?;
+            let pattern = value(pattern)?;
+            match (left.as_text(), pattern.as_text()) {
+                // The ESCAPE character the statement names, which makes the `%` or
+                // `_` after it a literal — honoured rather than dropped, since a
+                // dropped escape answers a different predicate. The parser keeps it
+                // as a literal, so it renders quoted and the quotes come off here.
+                (Some(left), Some(pattern)) => {
+                    let escape = escape_char.as_ref().and_then(|escape| {
+                        escape.to_string().trim_matches('\'').chars().next()
+                    });
+                    Ok(Some(like(&left, &pattern, escape, budget)? != *negated))
+                }
+                // A null value or a null pattern: unknown, whether negated or not.
+                _ => Ok(None),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let left = evaluate(left, columns, row, from, budget, depth + 1)?;
+                let right = evaluate(right, columns, row, from, budget, depth + 1)?;
+                Ok(match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+            }
+            BinaryOperator::Or => {
+                let left = evaluate(left, columns, row, from, budget, depth + 1)?;
+                let right = evaluate(right, columns, row, from, budget, depth + 1)?;
+                Ok(match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+            }
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq => {
+                let numeric = numeric_comparison(&[left, right], columns, from);
+                let left = value(left)?;
+                let right = value(right)?;
+                // Charged before the comparison, which renders both sides as text
+                // for a non-numeric column.
+                budget.charge_chars(left.chars().saturating_add(right.chars()))?;
+                let Some(order) = left.compare(&right, numeric) else {
+                    // A comparison with a null operand is UNKNOWN.
+                    return Ok(None);
+                };
+                Ok(Some(match op {
+                    BinaryOperator::Eq => order == Ordering::Equal,
+                    BinaryOperator::NotEq => order != Ordering::Equal,
+                    BinaryOperator::Lt => order == Ordering::Less,
+                    BinaryOperator::LtEq => order != Ordering::Greater,
+                    BinaryOperator::Gt => order == Ordering::Greater,
+                    _ => order != Ordering::Less,
+                }))
+            }
+            other => Err(unsupported(&format!("the operator {other}"))),
+        },
+        other => Err(unsupported(&format!("the predicate {other}"))),
+    }
+}
+
+/// Whether a comparison between `operands` is a NUMERIC one: it is when a column
+/// the comparison names is one the view declares numeric (`INT`, `DOUBLE`,
+/// `TIMESTAMP`).
+///
+/// The column's declared type decides, not the shape of the values, so `WHERE
+/// asset_name = '010'` compares two strings (and does not match a stored `10`)
+/// while `WHERE int_value = '10'` compares two numbers. A comparison naming no
+/// column at all — two literals — compares as text unless both sides are numbers,
+/// which is what the caller wrote them as.
+fn numeric_comparison(
+    operands: &[&::sqlparser::ast::Expr],
+    columns: &[Column],
+    from: &Qualified,
+) -> bool {
+    let mut named_a_column = false;
+    for operand in operands {
+        if let Some(parts) = identifier_parts(operand) {
+            if let Some(at) = column_at(columns, &parts, from) {
+                named_a_column = true;
+                if matches!(columns[at].scalar_type, "INT" | "DOUBLE" | "TIMESTAMP") {
+                    return true;
+                }
+            }
+        }
+    }
+    if named_a_column {
+        return false;
+    }
+    // No column: a literal-only comparison, which is numeric when the literals are.
+    operands.iter().all(|operand| {
+        matches!(
+            operand,
+            ::sqlparser::ast::Expr::Value(value)
+                if matches!(value.value, ::sqlparser::ast::Value::Number(..))
+        )
+    })
+}
+
+/// SQL `LIKE`: `%` stands for any run of characters and `_` for exactly one, and
+/// `escape` — the statement's `ESCAPE` character, when it named one — makes the
+/// symbol after it a literal.
+///
+/// Matched with a backtracking walk over the pattern rather than by building a
+/// regular expression, so the pattern cannot be made to cost more than the product
+/// of the two lengths. That product is the cost this engine CHARGES: the pattern
+/// side is bounded by the model (`queryStatement` is `@length 1..10000`) but the
+/// value side is a stored cell with no modelled length bound, so the walk charges
+/// the value's length against the budget once per pattern symbol — inside the loop,
+/// where the deadline can still be noticed — and the two allocations proportional
+/// to the value are charged before they are made. A `LIKE` whose product outruns
+/// the budget therefore ends as the modelled `QueryTimeoutException` after a
+/// bounded amount of work instead of running to completion on a blocking-pool
+/// thread.
+fn like(
+    value: &str,
+    pattern: &str,
+    escape: Option<char>,
+    budget: &Budget,
+) -> Result<bool, ExecuteQueryError> {
+    // Charged on the BYTE lengths, which are known without walking either string
+    // and are never smaller than the character counts the walk below uses.
+    budget.charge_chars(value.len().saturating_add(pattern.len()))?;
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    // `matched[at]` is whether the first `at` characters of `value` match the
+    // pattern prefix walked so far.
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+    let mut escaped = false;
+    for symbol in pattern {
+        // One symbol costs one pass over the value, so the product of the two
+        // lengths is charged a pass at a time and the deadline is read on every
+        // one of them.
+        budget.charge_chars(value.len().saturating_add(1))?;
+        let mut next = vec![false; value.len() + 1];
+        let literal_only = escaped;
+        escaped = false;
+        if !literal_only && escape == Some(symbol) {
+            // The escape itself matches nothing: it says the NEXT symbol is a
+            // literal.
+            escaped = true;
+            continue;
+        }
+        match symbol {
+            '%' if !literal_only => {
+                let mut seen = false;
+                for at in 0..=value.len() {
+                    seen = seen || matched[at];
+                    next[at] = seen;
+                }
+            }
+            '_' if !literal_only => {
+                next[1..=value.len()].copy_from_slice(&matched[..value.len()]);
+            }
+            literal => {
+                for at in 1..=value.len() {
+                    next[at] = matched[at - 1] && value[at - 1] == literal;
+                }
+            }
+        }
+        matched = next;
+    }
+    Ok(matched[value.len()])
+}
+
+/// Sort `rows` by the statement's `ORDER BY`, if it has one.
+///
+/// One pass over the rows per key, each charged against the budget, and at most
+/// [`MAX_ORDER_BY_KEYS`] keys — so the sort cannot be made to cost more than the
+/// budget allows and cannot run past the deadline unnoticed. The comparisons
+/// themselves are charged BEFORE `sort_by` runs, in characters: a comparator
+/// cannot read the deadline, so the only place the `n log n` key-character work can
+/// be bounded is here, and [`MAX_SORT_KEY_CHARS`] is what bounds one comparison.
+fn order_rows(
+    query: &::sqlparser::ast::Query,
+    columns: &[Column],
+    from: &Qualified,
+    rows: &mut Vec<Vec<Cell>>,
+    budget: &Budget,
+) -> Result<(), ExecuteQueryError> {
+    use ::sqlparser::ast::OrderByKind;
+    let Some(order_by) = query.order_by.as_ref() else {
+        return Ok(());
+    };
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return Err(unsupported("ORDER BY ALL"));
+    };
+    if expressions.len() > MAX_ORDER_BY_KEYS {
+        return Err(invalid_request(format!(
+            "An ORDER BY names at most {MAX_ORDER_BY_KEYS} keys, but this one names {}.",
+            expressions.len()
+        )));
+    }
+    // Applied from the last key to the first, which a stable sort turns into
+    // ordering by the first key with the later ones breaking its ties.
+    for expression in expressions.iter().rev() {
+        let parts = identifier_parts(&expression.expr)
+            .ok_or_else(|| unsupported("an ORDER BY key that is not a column"))?;
+        let at = column_at(columns, &parts, from).ok_or_else(|| {
+            invalid_request(format!("The column {} does not exist.", parts.join(".")))
+        })?;
+        let descending = expression.options.asc == Some(false);
+        // One pass costs one unit of work per row it orders.
+        budget.charge(rows.len())?;
+        // The key is computed ONCE per row and is a TOTAL order (see [`SortKey`]):
+        // the comparison a `WHERE` clause makes is SQL's, where two values can be
+        // incomparable, and a sort cannot be driven by that — a comparator that is
+        // not a total order is what makes a sort's own behaviour undefined.
+        let numeric = matches!(columns[at].scalar_type, "INT" | "DOUBLE" | "TIMESTAMP");
+        // A sort makes about `n * log2(n)` comparisons and each costs up to its
+        // key's length, so that product is charged here — BEFORE the keys are built
+        // and before `sort_by` runs, whose comparator can neither charge the budget
+        // nor read the deadline. The per-key amount is what [`SortKey`] keeps, so
+        // the charge is the work that will actually be done; `+ 1` covers building
+        // the keys themselves.
+        let key_chars: usize = rows
+            .iter()
+            .map(|row| row[at].chars().min(MAX_SORT_KEY_CHARS))
+            .sum();
+        let comparisons = usize::BITS as usize - rows.len().leading_zeros() as usize;
+        budget.charge_chars(key_chars.saturating_mul(comparisons.saturating_add(1)))?;
+        let mut keyed: Vec<(SortKey, Vec<Cell>)> = ::std::mem::take(rows)
+            .into_iter()
+            .map(|row| (SortKey::of(&row[at], numeric), row))
+            .collect();
+        keyed.sort_by(|(left, _), (right, _)| {
+            let order = left.cmp(right);
+            if descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+        *rows = keyed.into_iter().map(|(_, row)| row).collect();
+    }
+    Ok(())
+}
+
+/// The sort key of one cell: a TOTAL order, so a sort over it is well defined
+/// whatever the rows hold.
+///
+/// Three rules, in this order: a null sorts before every value; a column the view
+/// declares NUMERIC (`INT`, `DOUBLE`, `TIMESTAMP`) sorts by number, through
+/// `f64::total_cmp`, which orders every float including `NaN`; and every other
+/// column sorts by text, so a `STRING` column holding digits orders as text and not
+/// as the number it looks like.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SortKey {
+    Null,
+    Number(NumberKey),
+    Text(String),
+}
+
+impl SortKey {
+    fn of(cell: &Cell, numeric: bool) -> Self {
+        if cell == &Cell::Null {
+            return Self::Null;
+        }
+        if numeric {
+            if let Some(number) = cell.as_number() {
+                return Self::Number(NumberKey(number));
+            }
+        }
+        // Truncated to [`MAX_SORT_KEY_CHARS`], so ONE comparison costs a bounded
+        // amount however long the stored cell is — the comparator is the one place
+        // in this engine that cannot charge the budget.
+        Self::Text(
+            cell.as_text()
+                .unwrap_or_default()
+                .chars()
+                .take(MAX_SORT_KEY_CHARS)
+                .collect(),
+        )
+    }
+}
+
+/// A number ordered by `f64::total_cmp`: a total order over every `f64`, `NaN`
+/// included, which `PartialOrd` on `f64` is not.
+#[derive(Debug)]
+struct NumberKey(f64);
+
+impl PartialEq for NumberKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == ::std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for NumberKey {}
+
+impl PartialOrd for NumberKey {
+    fn partial_cmp(&self, other: &Self) -> Option<::std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NumberKey {
+    fn cmp(&self, other: &Self) -> ::std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// The statement's `OFFSET` and `LIMIT`, as row counts.
+fn limits(
+    query: &::sqlparser::ast::Query,
+) -> Result<(usize, Option<usize>), ExecuteQueryError> {
+    use ::sqlparser::ast::{Expr, LimitClause, Value};
+    let Some(clause) = query.limit_clause.as_ref() else {
+        return Ok((0, None));
+    };
+    let (limit, offset) = match clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if !limit_by.is_empty() {
+                return Err(unsupported("LIMIT BY"));
+            }
+            (limit.as_ref(), offset.as_ref().map(|offset| &offset.value))
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
+    };
+    // A LIMIT or OFFSET is a non-negative whole NUMBER — "LIMIT -1", "LIMIT 1.5" and
+    // an expression naming a column are all the clause being wrong rather than
+    // something this engine has not written, so each is the terminal request error.
+    let count = |expr: Option<&Expr>| match expr {
+        None => Ok(None),
+        Some(Expr::Value(value)) => match &value.value {
+            Value::Number(number, _) => number.parse::<usize>().map(Some).map_err(|_| {
+                invalid_request(format!(
+                    "A LIMIT or OFFSET must be a non-negative whole number, not {number}."
+                ))
+            }),
+            other => Err(invalid_request(format!(
+                "A LIMIT or OFFSET must be a non-negative whole number, not {other}."
+            ))),
+        },
+        Some(other) => Err(invalid_request(format!(
+            "A LIMIT or OFFSET must be a non-negative whole number, not {other}."
+        ))),
+    };
+    Ok((count(offset)?.unwrap_or(0), count(limit)?))
+}
+
+/// Apply the statement's projection: the columns it selects, in the order it
+/// selects them, with `*` standing for every column of the view.
+fn project(
+    select: &::sqlparser::ast::Select,
+    columns: &'static [Column],
+    from: &Qualified,
+    rows: Vec<Vec<Cell>>,
+    budget: &Budget,
+) -> Result<ResultSet, ExecuteQueryError> {
+    use ::sqlparser::ast::SelectItem;
+    let mut projected: Vec<(String, &'static str)> = Vec::new();
+    // Which source column each projected column reads, so the rows are rebuilt
+    // without re-resolving a name per row.
+    let mut picks: Vec<usize> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for (at, column) in columns.iter().enumerate() {
+                    projected.push((column.name.to_string(), column.scalar_type));
+                    picks.push(at);
+                }
+            }
+            SelectItem::QualifiedWildcard(qualifier, _) => {
+                // `<qualifier>.*` stands for every column OF THAT RELATION, so a
+                // qualifier naming none of the statement's relations names no
+                // columns — the same refusal a qualified single column gets, rather
+                // than the whole view under a name the statement never read.
+                let qualifier = qualifier.to_string();
+                // The qualifier renders with the `.*` that makes it a wildcard; the
+                // relation is what comes before it.
+                let named = qualifier
+                    .trim_end_matches('*')
+                    .trim_end_matches('.')
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|qualifier| from.admits(qualifier));
+                if !named {
+                    return Err(invalid_request(format!(
+                        "The relation {qualifier} is not one this statement reads."
+                    )));
+                }
+                for (at, column) in columns.iter().enumerate() {
+                    projected.push((column.name.to_string(), column.scalar_type));
+                    picks.push(at);
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let parts = identifier_parts(expr).ok_or_else(|| {
+                    unsupported("a selected expression that is not a column")
+                })?;
+                let at = column_at(columns, &parts, from).ok_or_else(|| {
+                    invalid_request(format!("The column {} does not exist.", parts.join(".")))
+                })?;
+                // An alias names the column in the result; without one it keeps the
+                // view's own column name.
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    _ => columns[at].name.to_string(),
+                };
+                projected.push((name, columns[at].scalar_type));
+                picks.push(at);
+            }
+        }
+    }
+    // Rebuilding a row costs one unit of work per cell it carries, so a projection
+    // that asks for every column of every row is charged for all of them — and a
+    // statement that asks for more than the budget allows ends in the modelled
+    // timeout instead of being materialised. The CHARACTERS the row's cells hold are
+    // charged BEFORE the copies are made, because copying a cell and rendering it to
+    // the wire's `scalarValue` both cost its length and not one unit, and an
+    // allocation already made cannot be refused.
+    if picks.len() > MAX_PROJECTED_COLUMNS {
+        return Err(invalid_request(format!(
+            "A result row carries at most {MAX_PROJECTED_COLUMNS} columns, but this \
+             statement's projection expands to {}.",
+            picks.len()
+        )));
+    }
+    let mut projected_rows: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        budget.charge(picks.len())?;
+        budget.charge_chars(picks.iter().map(|at| row[*at].chars()).sum())?;
+        projected_rows.push(picks.iter().map(|at| row[*at].clone()).collect());
+    }
+    Ok(ResultSet {
+        columns: projected,
+        rows: projected_rows,
+    })
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ExecuteQueryError {
+    ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 400 `QueryTimeoutException`: the statement asked for more work than this
+/// query engine's budget allows, so it did not finish.
+fn query_timeout(message: String) -> ExecuteQueryError {
+    ExecuteQueryError::Modeled(ExecuteQueryErrorModeled::QueryTimeoutException(
+        QueryTimeoutException {
+            message: Some(message),
+        },
+    ))
+}
+
+/// HTTP 501 `NotImplemented` for a construct this query engine does not run.
+///
+/// Deliberately NOT a modelled refusal: the statement is valid SQL and a real
+/// service would answer it, so reporting it as an invalid request would be a false
+/// statement about the caller's query. 501 says what is true — this construct is
+/// not written yet — and is the answer the emulator reserves for exactly that.
+fn unsupported(construct: &str) -> ExecuteQueryError {
+    ExecuteQueryError::NotImplemented(crate::scaffolded::NotImplemented {
+        message: format!(
+            "operation ExecuteQuery does not implement {construct} in this emulator"
+        ),
+    })
+}
+
+/// Decode a `nextToken` back into the row offset it resumes from.
+fn decode_token(token: &str) -> Result<usize, ExecuteQueryError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| {
+            invalid_request("The nextToken is not a token this operation issued.".to_string())
+        })
 }

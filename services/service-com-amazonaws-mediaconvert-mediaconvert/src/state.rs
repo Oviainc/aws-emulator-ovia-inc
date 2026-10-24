@@ -41,7 +41,9 @@
 //!   [`JOB_ENGINE_VERSION_COUNT`] records, and no request path adds, removes or rewrites
 //!   one — so what `ListVersions` reports is stable across reads.
 //! * `ListJobs` orders the jobs, over at most `MAX_JOBS` records, and returns at most
-//!   one page of twenty, through [`page_of_jobs`]. `StartJobsQuery` walks the same record
+//!   one page of twenty, through [`page_of_jobs`]. `SearchJobs` goes through the same
+//!   function, over the same bounded record set, with the input-file test
+//!   ([`JobRecord::matches_input_file`]) narrowing it further. `StartJobsQuery` walks the same record
 //!   set ONCE, when the query is started, evaluating at most [`MAX_JOBS_QUERY_TERMS`]
 //!   filter terms per record, and stores only the one page of ids it selected; no later
 //!   call re-runs that match, so no request's cost grows with the number of stored
@@ -1006,7 +1008,7 @@ impl JobRecord {
             JOBS_QUERY_FILTER_KEY_STATUS => self.status == value,
             // "Your input file URL, or PARTIAL input file name" — so a containment test
             // over the inputs' `FileInput`, not an equality one.
-            JOBS_QUERY_FILTER_KEY_FILE_INPUT => self.input_files().any(|file| file.contains(value)),
+            JOBS_QUERY_FILTER_KEY_FILE_INPUT => self.matches_input_file(value),
             JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_REQUESTED => {
                 self.job_engine_version_requested.as_deref() == Some(value)
             }
@@ -1021,6 +1023,17 @@ impl JobRecord {
             // validator has already refused it.
             _ => false,
         }
+    }
+
+    /// Whether any input of this job names a file whose `FileInput` CONTAINS `needle`.
+    ///
+    /// Both jobs readers that filter on an input file take this one test — the jobs
+    /// query's `fileInput` filter key ("Your input file URL, or partial input file name")
+    /// and `SearchJobs`'s `InputFile` ("Provide your input file URL or your partial input
+    /// file name") — so a whole URL and any part of one both match, and the two cannot
+    /// drift apart.
+    pub fn matches_input_file(&self, needle: &str) -> bool {
+        self.input_files().any(|file| file.contains(needle))
     }
 
     /// The `FileInput` of every input of this job's settings.

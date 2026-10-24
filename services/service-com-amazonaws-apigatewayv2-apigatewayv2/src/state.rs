@@ -12,7 +12,7 @@
 //! field, and `to_wire` projects it onto the modelled shape the handlers serialize.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types as wire;
 
@@ -281,6 +281,37 @@ pub const DEFAULT_WEBSOCKET_TIMEOUT_MILLIS: i32 = 29_000;
 /// what does not fit is reported through `NextToken`.
 pub const MAX_PAGE_SIZE: usize = 100;
 
+/// The most VPC links one account may hold, after which CreateVpcLink is refused.
+///
+/// API Gateway's published quota for the HTTP/WebSocket (ApiGatewayV2) API is 10 VPC
+/// links per account per Region, so this is the faithful bound AND what stops a loop of
+/// CreateVpcLink calls growing this store without end — every call mints a new link, so
+/// nothing else bounds it.
+pub const MAX_VPC_LINKS: usize = 10;
+
+/// The `VpcLinkStatus` a VPC link carries while the service is still provisioning it,
+/// from `VPC_LINK_STATUS_VALUES` (`AVAILABLE | DELETING | FAILED | INACTIVE |
+/// PENDING`).
+pub const VPC_LINK_STATUS_PENDING: &str = "PENDING";
+
+/// The `VpcLinkStatus` of a VPC link that finished provisioning, from
+/// `VPC_LINK_STATUS_VALUES`.
+pub const VPC_LINK_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The only `VpcLinkVersion` this API models (`VPC_LINK_VERSION_VALUES`: `V2`), so it is
+/// the version every link this service mints reports.
+pub const VPC_LINK_VERSION_V2: &str = "V2";
+
+/// How long a created VPC link stays [`VPC_LINK_STATUS_PENDING`] before it reports
+/// [`VPC_LINK_STATUS_AVAILABLE`]: API Gateway attaches the link's network interfaces to
+/// the subnets it was given, which is not done when the create call answers.
+///
+/// API Gateway documents no duration for it ("it can take up to 10 minutes" is
+/// guidance, not a contract), so this span is the emulator's own, chosen short enough
+/// not to slow a caller down and long enough that a caller reading straight after
+/// `CreateVpcLink` still observes [`VPC_LINK_STATUS_PENDING`].
+pub const VPC_LINK_CREATE_SPAN: Duration = Duration::from_millis(500);
+
 /// Per-service state for com-amazonaws-apigatewayv2-apigatewayv2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
@@ -291,6 +322,14 @@ pub struct ComAmazonawsApigatewayv2Apigatewayv2State {
     /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_api_id`]; see
     /// [`ID_MULTIPLIER`] for how an id is derived from it.
     pub api_id_seed: u64,
+    /// Every persisted VPC link, keyed by `VpcLinkId`. A VPC link is an
+    /// account-and-Region resource rather than a child of an api — an integration only
+    /// REFERENCES one through its `ConnectionId` — so it is stored beside [`Self::apis`]
+    /// and not inside one. `BTreeMap` for the same stable key order [`Self::apis`] has.
+    pub vpc_links: BTreeMap<String, VpcLink>,
+    /// Drives [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_vpc_link_id`]; see
+    /// [`ID_MULTIPLIER`] for how an id is derived from it.
+    pub vpc_link_id_seed: u64,
     /// Every persisted custom domain name, keyed by its `DomainName` — the name IS the
     /// resource's identifier on the wire (`GET|PATCH|DELETE /v2/domainnames/{DomainName}`),
     /// so there is no second id to key on. `BTreeMap` for the same stable key order the
@@ -306,6 +345,12 @@ impl ComAmazonawsApigatewayv2Apigatewayv2State {
     pub fn mint_api_id(&mut self) -> String {
         self.api_id_seed = self.api_id_seed.wrapping_add(1);
         mint_id(self.api_id_seed)
+    }
+
+    /// Mint a fresh `VpcLinkId`: ten lowercase alphanumerics, never one already minted.
+    pub fn mint_vpc_link_id(&mut self) -> String {
+        self.vpc_link_id_seed = self.vpc_link_id_seed.wrapping_add(1);
+        mint_id(self.vpc_link_id_seed)
     }
 
     /// Mint the id of the regional host a custom domain name is served on: ten
@@ -1205,6 +1250,78 @@ impl Deployment {
     }
 }
 
+/// A persisted `VpcLink` resource, owned by the account and Region rather than by an
+/// api.
+#[derive(Debug, Clone)]
+pub struct VpcLink {
+    pub vpc_link_id: String,
+    pub name: String,
+    /// The security groups the request named, in the order it named them; empty for a
+    /// request that named none. Required on the modelled `VpcLink` shape, so the record
+    /// always carries the list even when it is empty.
+    pub security_group_ids: Vec<String>,
+    /// The subnets the request named, in the order it named them. Required on the
+    /// modelled `VpcLink` shape and never empty: a link with no subnet has nowhere to
+    /// attach an interface (see [`validate_subnet_ids`]).
+    pub subnet_ids: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub created_date: SystemTime,
+    /// When this link finishes provisioning, after which it reports
+    /// [`VPC_LINK_STATUS_AVAILABLE`]; before it, [`VPC_LINK_STATUS_PENDING`]. See
+    /// [`VpcLink::status`] and [`VPC_LINK_CREATE_SPAN`].
+    pub available_at: Instant,
+}
+
+impl VpcLink {
+    /// The `VpcLinkStatus` this link reports now.
+    ///
+    /// A created link is still being provisioned when the create call answers, so it is
+    /// reported [`VPC_LINK_STATUS_PENDING`] until [`VPC_LINK_CREATE_SPAN`] has passed
+    /// and [`VPC_LINK_STATUS_AVAILABLE`] after it. The transition is one the CLOCK owes,
+    /// materialised from the stored due instant rather than by sleeping or by being
+    /// read, so every reader agrees on it and a read changes nothing.
+    pub fn status(&self) -> &'static str {
+        if Instant::now() < self.available_at {
+            VPC_LINK_STATUS_PENDING
+        } else {
+            VPC_LINK_STATUS_AVAILABLE
+        }
+    }
+
+    /// The `VpcLinkStatusMessage` this link reports now: "a message summarizing the
+    /// cause of the status of the VPC link" (`VpcLink$VpcLinkStatusMessage`).
+    ///
+    /// AWS documents no wording for it, so the sentence itself is the emulator's own and
+    /// is NOT a contract; what IS one is that it summarises the status
+    /// [`VpcLink::status`] reports at the same instant.
+    pub fn status_message(&self) -> String {
+        match self.status() {
+            VPC_LINK_STATUS_PENDING => {
+                "The VPC link is being provisioned and is not ready to be used by an \
+                 integration yet."
+                    .to_string()
+            }
+            // VPC_LINK_STATUS_AVAILABLE: the only other status a stored record reaches.
+            _ => "The VPC link is available for use by an integration.".to_string(),
+        }
+    }
+
+    /// Project the record onto the modelled `VpcLink` shape.
+    pub fn to_wire(&self) -> wire::VpcLink {
+        wire::VpcLink {
+            created_date: Some(to_timestamp(self.created_date)),
+            name: self.name.clone(),
+            security_group_ids: self.security_group_ids.clone(),
+            subnet_ids: self.subnet_ids.clone(),
+            tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            vpc_link_id: self.vpc_link_id.clone(),
+            vpc_link_status: Some(self.status().to_string()),
+            vpc_link_status_message: Some(self.status_message()),
+            vpc_link_version: Some(VPC_LINK_VERSION_V2.to_string()),
+        }
+    }
+}
+
 /// A persisted custom `DomainName` resource.
 ///
 /// Keyed in the store by [`DomainName::domain_name`], which is the identifier every
@@ -1287,6 +1404,72 @@ impl DomainName {
             tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         }
     }
+}
+
+/// The prefix of an Amazon VPC subnet id, the resource type `SubnetIdList`'s members
+/// name ("A list of subnet IDs to include in the VPC link", `VpcLink$SubnetIds`).
+pub const SUBNET_ID_PREFIX: &str = "subnet-";
+
+/// The prefix of an Amazon EC2 security group id, the resource type
+/// `SecurityGroupIdList`'s members name ("A list of security group IDs for the VPC
+/// link", `VpcLink$SecurityGroupIds`).
+pub const SECURITY_GROUP_ID_PREFIX: &str = "sg-";
+
+/// How many hexadecimal characters an EC2 resource id carries after its prefix.
+///
+/// From the Amazon EC2 "Resource IDs" documentation: an id is the resource type's prefix
+/// followed by 8 characters in the original form, or 17 in the longer form AWS moved to;
+/// both forms remain valid, so both lengths are accepted.
+pub const EC2_ID_HEX_LENGTHS: &[usize] = &[8, 17];
+
+/// Whether `value` is an EC2 resource id of the type `prefix` names: the prefix followed
+/// by one of [`EC2_ID_HEX_LENGTHS`] lowercase hexadecimal characters.
+pub fn is_ec2_resource_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    EC2_ID_HEX_LENGTHS.contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Refuse a list whose members are not EC2 resource ids of the type `prefix` names.
+///
+/// `SubnetIdList` and `SecurityGroupIdList` are lists of unconstrained `__string` in the
+/// model (`smithy_query(query="shape", shape="SubnetIdList")`), so the id form is the
+/// handler's to enforce rather than the boundary validator's: a value that is not an id
+/// of that resource type names no resource the link could ever attach to. `Err` carries
+/// the message for the operation's `BadRequestException`.
+pub fn validate_ec2_resource_ids(
+    member: &str,
+    prefix: &str,
+    ids: &[String],
+) -> Result<(), String> {
+    for id in ids {
+        if !is_ec2_resource_id(id, prefix) {
+            return Err(format!(
+                "Invalid value for {member}: '{id}'. Each value must be of the form \
+                 {prefix}<8 or 17 hexadecimal characters>."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `SubnetIds` list that no VPC link could be built from: one naming no subnet
+/// at all, or one naming a value that is not a subnet id.
+///
+/// `SubnetIds` is required on both the request and the modelled `VpcLink` shape, and a
+/// link's network interfaces live IN its subnets, so a link with none has nowhere to
+/// attach one. `Err` carries the message for `BadRequestException`.
+pub fn validate_subnet_ids(subnet_ids: &[String]) -> Result<(), String> {
+    if subnet_ids.is_empty() {
+        return Err("Invalid value for SubnetIds: a VPC link must specify at least one \
+                    subnet."
+            .to_string());
+    }
+    validate_ec2_resource_ids("SubnetIds", SUBNET_ID_PREFIX, subnet_ids)
 }
 
 /// One entry of a domain name's `DomainNameConfigurations`.

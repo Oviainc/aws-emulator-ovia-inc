@@ -29,5 +29,7 @@ mod scheduled_report_lifecycle;
 mod scheduled_report_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;

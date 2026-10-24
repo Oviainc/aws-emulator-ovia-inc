@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTimeSeries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTimeSeries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTimeSeries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation removes the time series the request identifies — by
+//! alias, or by the `(assetId, propertyId)` pair — from the shared engine store
+//! (`crate::state`), leaving the asset property itself in place; this is the ONLY
+//! file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -192,20 +187,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTimeSeries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTimeSeriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTimeSeries"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTimeSeriesError::Modeled(
+                DeleteTimeSeriesErrorModeled::InternalFailureException(InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                }),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `workspaceName` scopes the delete to one SiteWise workspace. Workspaces are
+        // created by `CreateWorkspace`, which is still a scaffold stub here, so no
+        // workspace exists for a request to name.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            return Err(not_found(format!(
+                "The workspace {workspace} could not be found."
+            )));
+        }
+
+        // "To identify a time series, do one of the following: If the time series
+        // isn't associated with an asset property, specify the alias of the time
+        // series. If the time series is associated with an asset property, specify
+        // one of the following: The alias of the time series. The assetId and
+        // propertyId that identifies the asset property." — so the request must carry
+        // EXACTLY one of the two identifying forms. Neither form, half of the pair, or
+        // both at once identifies no one series, which is a request error and not a
+        // missing resource.
+        let stream = match (
+            input.alias.as_deref(),
+            input.asset_id.as_deref(),
+            input.property_id.as_deref(),
+        ) {
+            // The one stream the alias names, associated or not, resolved through
+            // the shared resolver every alias-addressed operation uses.
+            (Some(alias), None, None) => {
+                store.resolve_alias_series(alias).ok_or_else(|| {
+                    not_found(format!("The time series {alias} could not be found."))
+                })?
+            }
+            (None, Some(asset_label), Some(property_label)) => {
+                let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                    not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        asset_label,
+                    ))
+                })?;
+                let property_id = store
+                    .assets
+                    .get(&asset_id)
+                    .and_then(|asset| asset.property(property_label))
+                    .map(|property| property.id.clone())
+                    .ok_or_else(|| {
+                        not_found(format!(
+                            "The asset {asset_label} has no property {property_label}."
+                        ))
+                    })?;
+                crate::state::SeriesKey::Property(asset_id, property_id)
+            }
+            _ => {
+                return Err(invalid_request(
+                    "Specify either alias, or assetId and propertyId.".to_string(),
+                ))
+            }
+        };
+
+        // The stream goes, samples and all. "If you delete a time series that's
+        // associated with an asset property, the asset property still exists, but the
+        // time series will no longer be associated with this asset property": for an
+        // ASSOCIATED stream what goes is the alias binding and the samples stored
+        // against the pair, and the property itself survives; for a DISASSOCIATED one
+        // the record goes and the alias names nothing afterwards. Both forms of the
+        // request leave the store in one state.
+        match &stream {
+            crate::state::SeriesKey::Property(asset_id, property_id) => {
+                store.forget_property_series(asset_id, property_id);
+            }
+            crate::state::SeriesKey::Disassociated(alias) => {
+                store.forget_disassociated_time_series(alias);
+            }
+        }
+
+        Ok(DeleteTimeSeriesOutput)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DeleteTimeSeriesError {
+    DeleteTimeSeriesError::Modeled(DeleteTimeSeriesErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    ))
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> DeleteTimeSeriesError {
+    DeleteTimeSeriesError::Modeled(DeleteTimeSeriesErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

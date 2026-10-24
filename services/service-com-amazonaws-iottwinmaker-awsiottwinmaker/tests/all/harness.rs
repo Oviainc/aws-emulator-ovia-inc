@@ -35,6 +35,10 @@ impl Resp {
 /// One emulator: a shared engine with only this service mounted on it.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The SAME engine the mounted service holds, kept so a suite can seed or
+    /// inspect state an operation this slice has not implemented yet is the only
+    /// writer of. Requests still go through [`Emulator::call`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -46,9 +50,20 @@ impl Emulator {
         // them.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_iottwinmaker_awsiottwinmaker::EmulatedService::new(engine),
+            service_com_amazonaws_iottwinmaker_awsiottwinmaker::EmulatedService::new(engine.clone()),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// This service's store in the shared engine — the very store the mounted
+    /// handlers read and write, reached the way a handler reaches it.
+    pub(crate) fn state(
+        &self,
+    ) -> engine::ServiceState<
+        service_com_amazonaws_iottwinmaker_awsiottwinmaker::ComAmazonawsIottwinmakerAwsiottwinmakerState,
+    > {
+        service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::service_state(&*self.engine)
+            .expect("the iottwinmaker store is reachable from the shared engine")
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Resp {
@@ -152,6 +167,17 @@ impl Emulator {
     pub(crate) async fn delete_workspace(&self, workspace_id: &str) -> Resp {
         self.call("DELETE", &format!("/workspaces/{workspace_id}"), None)
             .await
+    }
+
+    /// `GetPricingPlan`: GET /pricingplan, no members and no body.
+    pub(crate) async fn get_pricing_plan(&self) -> Resp {
+        self.call("GET", "/pricingplan", None).await
+    }
+
+    /// `ListWorkspaces`: POST /workspaces-list, with any page members
+    /// (`maxResults`, `nextToken`) carried in the body.
+    pub(crate) async fn list_workspaces(&self, request: Value) -> Resp {
+        self.call("POST", "/workspaces-list", Some(request)).await
     }
 
     pub(crate) async fn execute_query(&self, body: Value) -> Resp {

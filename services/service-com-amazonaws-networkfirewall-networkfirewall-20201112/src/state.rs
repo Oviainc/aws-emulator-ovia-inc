@@ -13,7 +13,8 @@ use crate::ops::types::{
     Address, AnalysisResult, Attachment, EncryptionConfiguration, Firewall, FirewallMetadata,
     FirewallPolicy, FirewallPolicyMetadata, FirewallPolicyResponse, FirewallStatus, FlowFilter,
     FlowOperation, FlowOperationMetadata, MatchAttributes, PerObjectStatus, PortRange, RuleGroup,
-    RuleGroupResponse, SourceMetadata, SubnetMapping, SummaryConfiguration, SyncState, Tag,
+    RuleGroupMetadata, RuleGroupResponse, SourceMetadata, SubnetMapping, SummaryConfiguration,
+    SyncState, Tag,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, from the
@@ -86,6 +87,13 @@ pub const RULE_GROUP_STATELESS: &str = "STATELESS";
 pub const RULE_GROUP_STATEFUL: &str = "STATEFUL";
 /// See [`RULE_GROUP_STATELESS`].
 pub const RULE_GROUP_STATEFUL_DOMAIN: &str = "STATEFUL_DOMAIN";
+
+/// `ResourceManagedStatus` members
+/// (`smithy_query(query="shape",shape="ResourceManagedStatus")`), the scope a
+/// `ListRuleGroups` request asks for.
+pub const SCOPE_ACCOUNT: &str = "ACCOUNT";
+/// See [`SCOPE_ACCOUNT`].
+pub const SCOPE_MANAGED: &str = "MANAGED";
 
 /// `EncryptionType` members (`smithy_query(query="shape",shape="EncryptionType")`).
 pub const ENCRYPTION_AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
@@ -934,6 +942,10 @@ pub const PAGE_KIND_FIREWALL_POLICIES: &str = "firewall-policies";
 /// stamps on its cursors. See [`PAGE_KIND_FIREWALLS`].
 pub const PAGE_KIND_FLOW_OPERATIONS: &str = "flow-operations";
 
+/// The listing kind [`ListRuleGroups`](crate::ops::list_rule_groups) stamps on
+/// its cursors. See [`PAGE_KIND_FIREWALLS`].
+pub const PAGE_KIND_RULE_GROUPS: &str = "rule-groups";
+
 /// The listing kind
 /// [`ListTagsForResource`](crate::ops::list_tags_for_resource) stamps on its
 /// cursors. See [`PAGE_KIND_FIREWALLS`].
@@ -1743,6 +1755,74 @@ impl RuleGroupRecord {
             // through this API has no such topic, so the member stays absent.
             ..RuleGroupResponse::default()
         }
+    }
+
+    /// The `RuleGroupMetadata` entry `ListRuleGroups` reports for this record.
+    ///
+    /// `VendorName` is "the name of the Amazon Web Services Marketplace seller
+    /// that provides this rule group", so it stays absent for a rule group
+    /// created through this API: that rule group has no seller.
+    pub fn to_metadata(&self) -> RuleGroupMetadata {
+        RuleGroupMetadata {
+            name: Some(self.rule_group_name.clone()),
+            arn: Some(self.rule_group_arn.clone()),
+            ..RuleGroupMetadata::default()
+        }
+    }
+}
+
+/// How a `ListRuleGroups` request narrows the stored rule groups.
+///
+/// The listing "retrieves the metadata for the rule groups that you have
+/// defined", and `Scope` says which collection that is: "the default setting of
+/// `ACCOUNT` or a setting of `NULL` returns all of the rule groups in your
+/// account. A setting of `MANAGED` returns all available managed rule groups."
+///
+/// `Type` narrows the account's own rule groups by the `RuleGroupType` each was
+/// created with. The other two members describe a MANAGED rule group only —
+/// `ManagedType` is "the general category of the Amazon Web Services managed
+/// rule group" and `SubscriptionStatus` filters "the results to show only rule
+/// groups with the specified subscription status" — so a request that sets
+/// either, like one asking for the `MANAGED` scope, selects published rule
+/// groups rather than the account's own. This service holds no published
+/// catalog, since nothing creates a managed rule group (`CreateRuleGroup` makes
+/// an account one), so such a request is answered with an empty listing rather
+/// than an invented catalog.
+///
+/// INFERRED, not stated by the model: how an explicit `Scope: ACCOUNT` combines
+/// with a managed-only member. `ManagedType` and `SubscriptionStatus` each name
+/// a property only a published rule group has, so no rule group this account
+/// created can satisfy one and the listing stays empty whatever the scope says.
+/// Revisit this case if a managed catalog is ever modelled here.
+#[derive(Debug, Clone, Default)]
+pub struct RuleGroupFilter {
+    /// `ListRuleGroups$Scope`, a `ResourceManagedStatus` member.
+    pub scope: Option<String>,
+    /// `ListRuleGroups$ManagedType`, a `ResourceManagedType` member.
+    pub managed_type: Option<String>,
+    /// `ListRuleGroups$SubscriptionStatus`, a `SubscriptionStatus` member.
+    pub subscription_status: Option<String>,
+    /// `ListRuleGroups$Type`, a `RuleGroupType` member.
+    pub rule_group_type: Option<String>,
+}
+
+impl RuleGroupFilter {
+    /// Whether the request asks only for rule groups Amazon Web Services or one
+    /// of its partners publishes, of which this service holds none.
+    pub fn selects_managed_only(&self) -> bool {
+        self.scope.as_deref() == Some(SCOPE_MANAGED)
+            || self.managed_type.is_some()
+            || self.subscription_status.is_some()
+    }
+
+    /// Whether `record` — a rule group this account created — is in the narrowed
+    /// listing.
+    pub fn matches(&self, record: &RuleGroupRecord) -> bool {
+        !self.selects_managed_only()
+            && self
+                .rule_group_type
+                .as_ref()
+                .is_none_or(|wanted| *wanted == record.rule_group_type)
     }
 }
 

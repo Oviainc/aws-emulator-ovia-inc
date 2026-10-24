@@ -33,13 +33,16 @@ const IMAGE_TAG_MUTABILITY: [&str; 4] = [
 type ImagePair = (String, Option<String>);
 
 /// One row of the push table: the case name, the manifest, the tag the push carries, the
-/// media type it sends, and the media type the stored image is expected to report.
+/// media type it sends, the media type the stored image is expected to report, and the
+/// `imageSizeInBytes` the stored image is expected to report (`None` where the manifest
+/// states no layer content at all).
 type PushCase<'a> = (
     &'a str,
     &'a str,
     Option<&'a str>,
     Option<&'a str>,
     Option<&'a str>,
+    Option<i64>,
 );
 
 /// One row of the listing-filter table: the case name, the `filter` member, and the
@@ -459,13 +462,17 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
     let long_manifest = format!("{{\"schemaVersion\":2,\"history\":\"{}\"}}", "x".repeat(4096));
 
     let cases: Vec<PushCase<'_>> = vec![
-        // case, manifest, tag, media type sent, media type expected back
+        // case, manifest, tag, media type sent, media type expected back, size expected
         (
             "a docker v2 manifest, tagged, media type declared by the manifest",
             v2_manifest.as_str(),
             Some("v1"),
             None,
             Some("application/vnd.docker.distribution.manifest.v2+json"),
+            // The manifest references one blob, its configuration, and declares 7023
+            // bytes for it; it names no `layers`, so that is the whole of the image's
+            // content (and nothing to do with the manifest document's own length).
+            Some(7023),
         ),
         (
             "an OCI manifest, tagged, media type sent explicitly",
@@ -473,6 +480,8 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
             Some("oci"),
             Some("application/vnd.oci.image.manifest.v1+json"),
             Some("application/vnd.oci.image.manifest.v1+json"),
+            // An EMPTY `layers` array is a statement: no layer content, so zero bytes.
+            Some(0),
         ),
         (
             // A `config` descriptor naming no digest references no blob.
@@ -481,11 +490,15 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
             None,
             None,
             None,
+            // The one descriptor it carries names no blob, so the image references no
+            // content: zero bytes, not an unknown size.
+            Some(0),
         ),
         (
             "a tag at the length ceiling of a sensible tag, and a long manifest",
             long_manifest.as_str(),
             Some("release-2026-01-01-build-00042"),
+            None,
             None,
             None,
         ),
@@ -495,10 +508,11 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
             Some("odd"),
             Some("text/plain"),
             Some("text/plain"),
+            None,
         ),
     ];
 
-    for (case, manifest, tag, media_type_sent, media_type_expected) in cases {
+    for (case, manifest, tag, media_type_sent, media_type_expected, size_expected) in cases {
         let digest = manifest_digest(manifest);
         let mut request = json!({"repositoryName": "pushes", "imageManifest": manifest});
         if let Some(tag) = tag {
@@ -557,8 +571,8 @@ async fn a_pushed_manifest_is_stored_and_reported_under_its_own_digest() {
         );
         assert_eq!(
             at(&detail, "/imageSizeInBytes"),
-            json!(manifest.len()),
-            "case {case:?}: expected the stored manifest's size, got {:?}",
+            size_expected.map_or(Value::Null, |size| json!(size)),
+            "case {case:?}: expected imageSizeInBytes {size_expected:?}, got {:?}",
             at(&detail, "/imageSizeInBytes")
         );
         assert!(

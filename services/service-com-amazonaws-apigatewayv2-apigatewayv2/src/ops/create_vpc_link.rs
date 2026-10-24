@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcLink"))
+        let _ = ctx;
+        let bad_request = |message: String| -> Self::Error {
+            CreateVpcLinkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `SubnetIds` and `SecurityGroupIds` are lists of unconstrained `__string`, so
+        // the EC2 id form is this handler's to enforce: a value that is not an id of
+        // that resource type names nothing the link could attach to, and a link with no
+        // subnet at all has nowhere to put an interface.
+        if let Err(message) = crate::state::validate_subnet_ids(&input.subnet_ids) {
+            return Err(bad_request(message));
+        }
+        let security_group_ids = input.security_group_ids.unwrap_or_default();
+        if let Err(message) = crate::state::validate_ec2_resource_ids(
+            "SecurityGroupIds",
+            crate::state::SECURITY_GROUP_ID_PREFIX,
+            &security_group_ids,
+        ) {
+            return Err(bad_request(message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator: the router builds one shared
+            // `engine::InMemoryEngine` and hands it to every service. With no store
+            // there is nothing for this operation to persist into, which is "not served
+            // here", not a client error.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateVpcLink",
+            ));
+        };
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives: API Gateway's published quota is 10 VPC
+        // links per account per Region, and `TooManyRequestsException` is the modelled
+        // error for "a limit has been exceeded" (it carries the limit's name in
+        // `LimitType`).
+        if store.vpc_links.len() >= crate::state::MAX_VPC_LINKS {
+            return Err(CreateVpcLinkErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    limit_type: Some("VpcLink".to_string()),
+                    message: Some(format!(
+                        "The maximum number of VPC links ({}) for this account has been \
+                         reached.",
+                        crate::state::MAX_VPC_LINKS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let vpc_link_id = store.mint_vpc_link_id();
+        let record = crate::state::VpcLink {
+            vpc_link_id: vpc_link_id.clone(),
+            name: input.name,
+            security_group_ids,
+            subnet_ids: input.subnet_ids,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_date: ::std::time::SystemTime::now(),
+            // The link's interfaces are not attached when this call answers, so the
+            // record is due to become available one span from now: a transition the
+            // CLOCK owes, stored as its due instant rather than slept for.
+            available_at: ::std::time::Instant::now() + crate::state::VPC_LINK_CREATE_SPAN,
+        };
+
+        // `vpc_link_id` comes from the store's own id bijection, so it names no existing
+        // link and this inserts. Taking the entry back gives the STORED record, so what
+        // the caller is told is what a later GetVpcLink will report.
+        let stored = store.vpc_links.entry(vpc_link_id).or_insert(record).to_wire();
+        Ok(CreateVpcLinkOutput {
+            created_date: stored.created_date,
+            name: Some(stored.name),
+            security_group_ids: Some(stored.security_group_ids),
+            subnet_ids: Some(stored.subnet_ids),
+            tags: stored.tags,
+            vpc_link_id: Some(stored.vpc_link_id),
+            vpc_link_status: stored.vpc_link_status,
+            vpc_link_status_message: stored.vpc_link_status_message,
+            vpc_link_version: stored.vpc_link_version,
+        })
     }
 }

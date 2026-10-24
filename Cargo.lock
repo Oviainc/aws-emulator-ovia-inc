@@ -7102,6 +7102,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -9472,6 +9474,7 @@ dependencies = [
  "http",
  "serde_json",
  "sha2 0.10.9",
+ "sqlparser",
  "tokio",
  "tracing",
 ]

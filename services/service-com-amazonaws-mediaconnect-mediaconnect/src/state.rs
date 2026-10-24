@@ -17,14 +17,19 @@ use crate::ops::types::{
     AddBridgeOutputRequest, AddBridgeSourceRequest, AddMediaStreamRequest, AddOutputRequest,
     Bridge, BridgeFlowSource, BridgeNetworkOutput, BridgeNetworkSource, BridgeOutput, BridgeSource,
     DestinationConfiguration, EgressGatewayBridge, EncodingConfig, EncodingParameters, Encryption,
-    Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Gateway, GatewayNetwork,
+    Entitlement, FabricConfiguration, FailoverConfig, Flow, FlowTransitEncryption, Gateway,
+    GatewayNetwork,
     GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
     Interface, ListedBridge, ListedFlow,
     ListedGateway,
-    Maintenance, MediaStream, MediaStreamAttributes, MediaStreamAttributesRequest,
+    Maintenance, MaintenanceConfiguration, MediaConnectFlowRouterOutputStreamDetails, MediaStream,
+    MediaStreamAttributes, MediaStreamAttributesRequest,
+    MediaLiveInputRouterOutputStreamDetails,
     MediaStreamOutputConfiguration, MediaStreamOutputConfigurationRequest,
     MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest, MonitoringConfig,
-    NdiConfig, Output, SetSourceRequest, Source, Transport, UpdateEncryption,
+    NdiConfig, Output, RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
+    RouterOutputProtocolConfiguration, RouterOutputStreamDetails, SetSourceRequest, Source,
+    StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
     VpcInterfaceAttachment,
 };
@@ -1646,6 +1651,336 @@ impl StoredBridge {
     }
 }
 
+/// The `RouterOutputState` enum the model declares for a router output
+/// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
+/// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
+/// two a router output's creation reaches are named here; the rest belong to operations
+/// that are still scaffolded.
+pub const ROUTER_OUTPUT_STATE_CREATING: &str = "CREATING";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. A router output that finished being created is
+/// not carrying content yet: it waits in `STANDBY` until StartRouterOutput.
+pub const ROUTER_OUTPUT_STATE_STANDBY: &str = "STANDBY";
+
+/// The `RouterOutputRoutedState` enum the model declares
+/// (`smithy_query(query="shape",shape="RouterOutputRoutedState")`: ROUTED | ROUTING |
+/// UNROUTED). A router output is ROUTED exactly while a router input is routed to it
+/// (`RouterOutput$RoutedInputArn`), and UNROUTED otherwise — see
+/// [`StoredRouterOutput::routed_state`]. `ROUTING` is the transient state of the call that
+/// takes an input (TakeRouterInput), which is still scaffolded.
+pub const ROUTED_STATE_ROUTED: &str = "ROUTED";
+/// See [`ROUTED_STATE_ROUTED`].
+pub const ROUTED_STATE_UNROUTED: &str = "UNROUTED";
+
+/// The `RouterOutputType` enum the model declares
+/// (`smithy_query(query="shape",shape="RouterOutputType")`: STANDARD | MEDIACONNECT_FLOW |
+/// MEDIALIVE_INPUT). The type is not a request member: it is the variant of the output's
+/// `RouterOutputConfiguration` union, reported through
+/// [`StoredRouterOutput::output_type`].
+pub const ROUTER_OUTPUT_TYPE_STANDARD: &str = "STANDARD";
+/// See [`ROUTER_OUTPUT_TYPE_STANDARD`].
+pub const ROUTER_OUTPUT_TYPE_MEDIACONNECT_FLOW: &str = "MEDIACONNECT_FLOW";
+/// See [`ROUTER_OUTPUT_TYPE_STANDARD`].
+pub const ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT: &str = "MEDIALIVE_INPUT";
+
+/// The `MaintenanceType` enum the model declares
+/// (`smithy_query(query="shape",shape="MaintenanceType")`: PREFERRED_DAY_TIME | DEFAULT).
+/// Like the output type, it is not a request member: it is the variant of the resource's
+/// `MaintenanceConfiguration` union ([`StoredRouterOutput::maintenance_type`]).
+pub const MAINTENANCE_TYPE_PREFERRED_DAY_TIME: &str = "PREFERRED_DAY_TIME";
+/// See [`MAINTENANCE_TYPE_PREFERRED_DAY_TIME`].
+pub const MAINTENANCE_TYPE_DEFAULT: &str = "DEFAULT";
+
+/// The `FabricLatencyMode` the model documents as the DEFAULT recovery latency mode
+/// (`FabricConfiguration$RecoveryLatencyMode`: "`BALANCED` (default) – Optimizes for
+/// stream quality"), used for a request that sets no `FabricConfiguration`.
+pub const FABRIC_LATENCY_MODE_BALANCED: &str = "BALANCED";
+
+/// Bits in one megabit — the unit conversion between the tier's documented ceiling (Mbps)
+/// and a router output's `MaximumBitrate` (bits per second, as every other MediaConnect
+/// bitrate in this model is; see [`ASSIGNED_SOURCE_MAX_BITRATE_BPS`]).
+pub const BITS_PER_MEGABIT: i64 = 1_000_000;
+
+/// The maximum bitrate, in BITS PER SECOND, that the tier `tier` allows a router output,
+/// or `None` when `tier` is not one the model declares.
+///
+/// The catalog is `CreateRouterOutput$Tier`'s own documentation
+/// (`smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`: "The tier
+/// sets the maximum bitrate, in Mbps, for the router output. … `OUTPUT_20` – 20 Mbps,
+/// `OUTPUT_50` – 50 Mbps, `OUTPUT_100` – 100 Mbps, `OUTPUT_250` – 250 Mbps, `OUTPUT_500` –
+/// 500 Mbps"), converted to bits per second through [`BITS_PER_MEGABIT`].
+pub fn router_output_tier_bitrate_ceiling(tier: &str) -> Option<i64> {
+    let megabits_per_second = match tier {
+        "OUTPUT_20" => 20,
+        "OUTPUT_50" => 50,
+        "OUTPUT_100" => 100,
+        "OUTPUT_250" => 250,
+        "OUTPUT_500" => 500,
+        _ => return None,
+    };
+    Some(megabits_per_second * BITS_PER_MEGABIT)
+}
+
+/// The ceiling on how many router outputs this store holds.
+///
+/// The same bound, for the same reason, as [`MAX_GATEWAYS`]: nothing evicts a router
+/// output and a read must still answer what the create created, so the create refuses once
+/// the store is full — with the modelled `RouterOutputServiceQuotaExceededException`, "the
+/// request to create a new router output would exceed the service quotas (limits) set for
+/// the account", which the model declares on CreateRouterOutput alone. The number is this
+/// emulator's own bound, not a published AWS default.
+pub const MAX_ROUTER_OUTPUTS: usize = 1_000;
+
+/// The `RouterOutputProtocol` the protocol configuration `configuration` configures —
+/// the value `StandardRouterOutputConfiguration$Protocol` names
+/// (`smithy_query(query="shape",shape="RouterOutputProtocol")`: RTP | RIST | SRT_CALLER |
+/// SRT_LISTENER | RTMP_PUSH).
+///
+/// The protocol is implied by the union variant, so this is the ONE mapping between the
+/// two: a create derives the reported `Protocol` from it rather than trusting the request,
+/// and refuses a request whose `Protocol` names a different one.
+pub fn router_output_protocol(configuration: &RouterOutputProtocolConfiguration) -> &'static str {
+    match configuration {
+        RouterOutputProtocolConfiguration::Rtp(_) => "RTP",
+        RouterOutputProtocolConfiguration::Rist(_) => "RIST",
+        RouterOutputProtocolConfiguration::SrtCaller(_) => "SRT_CALLER",
+        RouterOutputProtocolConfiguration::SrtListener(_) => "SRT_LISTENER",
+        RouterOutputProtocolConfiguration::RtmpPush(_) => "RTMP_PUSH",
+    }
+}
+
+/// The destination address a router output's protocol configuration names, or `None` for a
+/// protocol that names none.
+///
+/// Every push protocol carries a `DestinationAddress`; an SRT LISTENER carries only a
+/// `Port`, because a listener waits for a caller instead of sending to an address — so a
+/// listener output reports no destination address.
+pub fn protocol_destination_address(
+    configuration: &RouterOutputProtocolConfiguration,
+) -> Option<String> {
+    match configuration {
+        RouterOutputProtocolConfiguration::Rtp(rtp) => Some(rtp.destination_address.clone()),
+        RouterOutputProtocolConfiguration::Rist(rist) => Some(rist.destination_address.clone()),
+        RouterOutputProtocolConfiguration::SrtCaller(caller) => {
+            Some(caller.destination_address.clone())
+        }
+        RouterOutputProtocolConfiguration::RtmpPush(push) => Some(push.destination_address.clone()),
+        RouterOutputProtocolConfiguration::SrtListener(_) => None,
+    }
+}
+
+/// The 12-character id the service mints for a ROUTER resource (output, input, network
+/// interface) from the ARN counter.
+///
+/// The modelled `RouterOutputArn` pattern
+/// (`smithy_query(query="shape",shape="RouterOutputArn")`:
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerOutput:[a-z0-9]{12}$`)
+/// fixes the id at exactly twelve `[a-z0-9]` characters, so the counter is rendered as
+/// zero-padded lowercase hex and only its low 48 bits are used — the store is bounded far
+/// below that ([`MAX_ROUTER_OUTPUTS`]), so the id never repeats within a process.
+pub fn router_resource_id(suffix: u64) -> String {
+    format!("{:012x}", suffix & 0xffff_ffff_ffff)
+}
+
+/// The resource fragment of a router output ARN: `routerOutput:<id>`, with the id
+/// [`router_resource_id`] mints.
+pub fn router_output_resource_fragment(id: &str) -> String {
+    format!("routerOutput:{id}")
+}
+
+/// Whether `arn` is a router output ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `routerOutput` resource type, then an id
+/// of the form [`router_resource_id`] mints.
+///
+/// This function is the crate's ONE encoding of the modelled `RouterOutputArn` constraint,
+/// checked segment by segment; the integration test asserts minted ARNs through it, so
+/// there is no second spelling that can drift from it.
+pub fn is_mintable_router_output_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [.., id] = segments.as_slice() else {
+        return false;
+    };
+    segments.len() == 7
+        && has_mintable_arn_prefix(&segments, "routerOutput")
+        && id.len() == 12
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether `zone` is an Availability Zone of the Region `region`.
+///
+/// `CreateRouterOutput$AvailabilityZone` must be "a valid Availability Zone for the region
+/// specified by `regionName`, or the current region if no `regionName` is provided", and
+/// AWS names an Availability Zone by its Region followed by one lowercase letter.
+pub fn is_zone_of_region(zone: &str, region: &str) -> bool {
+    zone.strip_prefix(region).is_some_and(|letter| {
+        letter.len() == 1 && letter.bytes().all(|b| b.is_ascii_lowercase())
+    })
+}
+
+/// The Availability Zone the service picks in `region` for a resource whose request named
+/// none — the first zone of that Region.
+pub fn default_availability_zone(region: &str) -> String {
+    format!("{region}a")
+}
+
+/// A router output, as the service holds it between calls. Every router output
+/// operation's response is computed from this record.
+#[derive(Debug, Clone)]
+pub struct StoredRouterOutput {
+    /// `RouterOutput$Arn` — the output's identity, and the key of
+    /// [`ComAmazonawsMediaconnectMediaconnectState::router_outputs`].
+    pub arn: String,
+    /// `RouterOutput$Id`: "the unique identifier of the router output" — the id segment of
+    /// [`Self::arn`] ([`router_resource_id`]).
+    pub id: String,
+    pub name: String,
+    /// The configuration the create stored, with `Protocol` normalised to the protocol its
+    /// `ProtocolConfiguration` configures (see [`router_output_protocol`]). Its union
+    /// variant is also what [`Self::output_type`] and [`Self::stream_details`] report.
+    pub configuration: RouterOutputConfiguration,
+    pub maximum_bitrate: i64,
+    pub routing_scope: String,
+    pub tier: String,
+    pub region_name: String,
+    pub availability_zone: String,
+    /// `RouterOutput$IpAddress`: "the IP address of the router output" — the address the
+    /// service assigns the output as it is created, from the same documentation-range pool
+    /// a flow's egress address comes from ([`assigned_egress_ip`]).
+    pub ip_address: Option<String>,
+    pub maintenance_configuration: MaintenanceConfiguration,
+    pub fabric_configuration: FabricConfiguration,
+    /// `RouterOutput$Tags`, as the create set them. Ordered, so the record has one stable
+    /// reading.
+    pub tags: BTreeMap<String, String>,
+    /// `RouterOutput$State` — see [`ROUTER_OUTPUT_STATE_CREATING`].
+    pub state: String,
+    /// The state change the clock owes this output, if any. See [`Self::settle`].
+    pub pending: Option<PendingStatus>,
+    /// `RouterOutput$RoutedInputArn`: the router input currently routed to this output, or
+    /// `None` while nothing is. Only TakeRouterInput sets it, which is still scaffolded, so
+    /// a created output is UNROUTED.
+    pub routed_input_arn: Option<String>,
+    /// `RouterOutput$Messages`: the messages the service has recorded about this output. A
+    /// freshly created output has none, and the operations that record one are still
+    /// scaffolded — the member is reported from here either way, never as a literal.
+    pub messages: Vec<RouterOutputMessage>,
+    /// The `@idempotencyToken` of the create that minted this output
+    /// (`CreateRouterOutputRequest$ClientToken`, "a unique identifier for the request to
+    /// ensure idempotency"), or `None` when the request carried none: a create replaying a
+    /// token this store already holds returns THIS record instead of minting a second one.
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl StoredRouterOutput {
+    /// Materialise the state change the clock already made due, if it is due at `now`.
+    ///
+    /// The same contract as [`StoredFlow::settle`]: this is the only write a reporting
+    /// operation (BatchGetRouterOutput) performs, because the change was owed at `due_at`
+    /// whether or not anybody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.state = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+    }
+
+    /// `RouterOutput$OutputType`, the variant of the output's configuration union.
+    pub fn output_type(&self) -> &'static str {
+        match &self.configuration {
+            RouterOutputConfiguration::Standard(_) => ROUTER_OUTPUT_TYPE_STANDARD,
+            RouterOutputConfiguration::MediaConnectFlow(_) => ROUTER_OUTPUT_TYPE_MEDIACONNECT_FLOW,
+            RouterOutputConfiguration::MediaLiveInput(_) => ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT,
+        }
+    }
+
+    /// `RouterOutput$RoutedState`: ROUTED exactly while a router input is routed to this
+    /// output, UNROUTED otherwise.
+    pub fn routed_state(&self) -> &'static str {
+        if self.routed_input_arn.is_some() {
+            ROUTED_STATE_ROUTED
+        } else {
+            ROUTED_STATE_UNROUTED
+        }
+    }
+
+    /// `RouterOutput$MaintenanceType`, the variant of the output's maintenance
+    /// configuration union.
+    pub fn maintenance_type(&self) -> &'static str {
+        match &self.maintenance_configuration {
+            MaintenanceConfiguration::PreferredDayTime(_) => MAINTENANCE_TYPE_PREFERRED_DAY_TIME,
+            MaintenanceConfiguration::Default(_) => MAINTENANCE_TYPE_DEFAULT,
+        }
+    }
+
+    /// `RouterOutput$StreamDetails` — the union member that matches the output's
+    /// configuration, carrying what the service knows about the stream it carries: for a
+    /// STANDARD output, the destination address its protocol configuration names
+    /// ([`protocol_destination_address`]); for the two that deliver into another AWS
+    /// resource, the empty details the model declares for them.
+    pub fn stream_details(&self) -> RouterOutputStreamDetails {
+        match &self.configuration {
+            RouterOutputConfiguration::Standard(standard) => RouterOutputStreamDetails::Standard(
+                StandardRouterOutputStreamDetails {
+                    destination_ip_address: protocol_destination_address(
+                        &standard.protocol_configuration,
+                    ),
+                },
+            ),
+            RouterOutputConfiguration::MediaConnectFlow(_) => {
+                RouterOutputStreamDetails::MediaConnectFlow(
+                    MediaConnectFlowRouterOutputStreamDetails {},
+                )
+            }
+            RouterOutputConfiguration::MediaLiveInput(_) => {
+                RouterOutputStreamDetails::MediaLiveInput(MediaLiveInputRouterOutputStreamDetails {})
+            }
+        }
+    }
+
+    /// The modelled `RouterOutput` for this record.
+    pub fn to_router_output(&self) -> RouterOutput {
+        RouterOutput {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            state: self.state.clone(),
+            output_type: self.output_type().to_string(),
+            configuration: self.configuration.clone(),
+            routed_state: self.routed_state().to_string(),
+            region_name: self.region_name.clone(),
+            availability_zone: self.availability_zone.clone(),
+            maximum_bitrate: self.maximum_bitrate,
+            routing_scope: self.routing_scope.clone(),
+            tier: self.tier.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            messages: self.messages.clone(),
+            tags: self
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            stream_details: self.stream_details(),
+            ip_address: self.ip_address.clone(),
+            routed_input_arn: self.routed_input_arn.clone(),
+            maintenance_type: self.maintenance_type().to_string(),
+            maintenance_configuration: self.maintenance_configuration.clone(),
+            // Nothing has scheduled maintenance for this output: the schedule members are
+            // optional, and the operations that would fill them (the maintenance slice) are
+            // still scaffolded, so they are reported as absent rather than invented.
+            maintenance_schedule_type: None,
+            maintenance_schedule: None,
+            fabric_configuration: self.fabric_configuration.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
@@ -1672,6 +2007,14 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// the model puts no uniqueness rule on `Bridge$Name`, and the bridge id in the ARN
     /// is what keeps two same-named bridges apart.
     pub bridges: BTreeMap<String, StoredBridge>,
+    /// Every router output, keyed by its ARN — the identity every router output
+    /// operation addresses one by (`@httpLabel Arn`, and the `Arns` BatchGetRouterOutput
+    /// reads them by). Ordered, so ListRouterOutputs can page stably.
+    ///
+    /// There is no index by name beside it, for the same reason as [`Self::gateways`]: the
+    /// model puts no uniqueness rule on `RouterOutput$Name`, and the generated output id in
+    /// the ARN is what keeps two same-named outputs apart.
+    pub router_outputs: BTreeMap<String, StoredRouterOutput>,
     /// Monotonic counter minting the unique fragment of every flow / source / output /
     /// entitlement ARN and of the addresses and ports the service assigns.
     pub next_arn_suffix: u64,
@@ -1702,8 +2045,8 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags)
     }
 
-    /// Settle every flow, gateway and bridge whose status change the clock already made
-    /// due.
+    /// Settle every flow, gateway, bridge and router output whose status change the clock
+    /// already made due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
@@ -1713,6 +2056,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         }
         for bridge in self.bridges.values_mut() {
             bridge.settle(now);
+        }
+        for router_output in self.router_outputs.values_mut() {
+            router_output.settle(now);
         }
     }
 
@@ -2013,13 +2359,21 @@ pub fn assigned_ingest_port(suffix: u64) -> i32 {
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        })
+        .filter(|region| is_region_token(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` can be the Region segment of an ARN this service mints: the modelled
+/// `FlowArn` / `RouterOutputArn` patterns constrain that segment to `[a-z0-9-]+`.
+///
+/// The one encoding of that constraint, shared by [`request_region`] (which ignores a
+/// credential scope that is not a region token), [`has_mintable_arn_prefix`] and the
+/// creates that take a Region as a request member (`CreateRouterOutput$RegionName`).
+pub fn is_region_token(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Whether `name` can be a flow name: it is the last segment of the ARN the service
@@ -2081,10 +2435,7 @@ fn has_mintable_arn_prefix(segments: &[&str], resource_type: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphabetic() || b == b'-')
         && service == &SERVICE_NAMESPACE
-        && !region.is_empty()
-        && region
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && is_region_token(region)
         && account.len() == 12
         && account.bytes().all(|b| b.is_ascii_digit())
         && kind == &resource_type

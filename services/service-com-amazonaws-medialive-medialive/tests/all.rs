@@ -26,6 +26,9 @@ mod channel_schedule;
 #[path = "all/cloud_watch_alarm_template_groups.rs"]
 mod cloud_watch_alarm_template_groups;
 
+#[path = "all/cloud_watch_alarm_template_update.rs"]
+mod cloud_watch_alarm_template_update;
+
 #[path = "all/cloud_watch_alarm_templates.rs"]
 mod cloud_watch_alarm_templates;
 
@@ -64,6 +67,9 @@ mod input_security_group_listing;
 
 #[path = "all/input_update.rs"]
 mod input_update;
+
+#[path = "all/monitor_deployment.rs"]
+mod monitor_deployment;
 
 #[path = "all/multiplex_deletion.rs"]
 mod multiplex_deletion;

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRouterOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRouterOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRouterOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a router output in this service's store and answers with the STORED record, read
+//! back out of the store. The output's identity is the `routerOutput` ARN minted here; the
+//! read side is BatchGetRouterOutput.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +100,27 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{StoredRouterOutput, SERVICE_NAMESPACE};
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> CreateRouterOutputError {
+    CreateRouterOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// The server-side failure for a store this service cannot reach.
+fn store_unavailable(detail: &str) -> CreateRouterOutputError {
+    CreateRouterOutputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: detail.to_string(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +195,219 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRouterOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRouterOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRouterOutput"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable(
+                "the mediaconnect router output store is unavailable",
+            ));
+        };
+
+        // `Tier` "sets the maximum bitrate, in Mbps, for the router output", so a request
+        // asking for more than its tier allows is a semantic error. The per-tier ceiling
+        // lives in `crate::state` with the documentation it comes from.
+        let Some(ceiling) = crate::state::router_output_tier_bitrate_ceiling(&input.tier) else {
+            return Err(bad_request(format!(
+                "Tier {:?} is not a router output tier this service offers.",
+                input.tier
+            )));
+        };
+        if input.maximum_bitrate <= 0 {
+            return Err(bad_request(format!(
+                "MaximumBitrate is a number of bits per second and must be positive; this \
+                 request asks for {}.",
+                input.maximum_bitrate
+            )));
+        }
+        if input.maximum_bitrate > ceiling {
+            return Err(bad_request(format!(
+                "MaximumBitrate {} bps exceeds the {} bps the {} tier allows.",
+                input.maximum_bitrate, ceiling, input.tier
+            )));
+        }
+
+        // "The Amazon Web Services Region for the router output. Defaults to the current
+        // region if not specified" — and the Region is a segment of the ARN this operation
+        // mints, which the modelled `RouterOutputArn` pattern constrains.
+        let region = match input.region_name.clone().filter(|name| !name.is_empty()) {
+            Some(name) if !crate::state::is_region_token(&name) => {
+                return Err(bad_request(format!(
+                    "RegionName {name:?} is not an Amazon Web Services Region name."
+                )))
+            }
+            Some(name) => name,
+            None => crate::state::request_region(ctx.parts()),
+        };
+
+        // `AvailabilityZone` "must be a valid Availability Zone for the region specified by
+        // regionName, or the current region if no regionName is provided"; a request that
+        // names none gets a zone of that Region.
+        let availability_zone = match input
+            .availability_zone
+            .clone()
+            .filter(|zone| !zone.is_empty())
+        {
+            Some(zone) if !crate::state::is_zone_of_region(&zone, &region) => {
+                return Err(bad_request(format!(
+                    "AvailabilityZone {zone:?} is not an Availability Zone of Region \
+                     {region:?}."
+                )))
+            }
+            Some(zone) => zone,
+            None => crate::state::default_availability_zone(&region),
+        };
+
+        // A STANDARD output's `Protocol` is implied by the variant of its
+        // `ProtocolConfiguration`, so the stored configuration reports the protocol that
+        // configuration configures, and a request naming a different one is refused rather
+        // than stored self-contradicting.
+        let configuration = match input.configuration.clone() {
+            RouterOutputConfiguration::Standard(standard) => {
+                let configured = crate::state::router_output_protocol(
+                    &standard.protocol_configuration,
+                );
+                if let Some(named) = standard
+                    .protocol
+                    .as_deref()
+                    .filter(|protocol| !protocol.is_empty())
+                {
+                    if named != configured {
+                        return Err(bad_request(format!(
+                            "Configuration sets a {configured} protocol configuration, but \
+                             Protocol names {named}."
+                        )));
+                    }
+                }
+                RouterOutputConfiguration::Standard(StandardRouterOutputConfiguration {
+                    protocol: Some(configured.to_string()),
+                    ..standard
+                })
+            }
+            // The two configurations that deliver into another AWS resource carry no
+            // protocol member to reconcile. Neither variant's target is RESOLVED here: a
+            // MediaLive input belongs to another service, and the router network interface a
+            // STANDARD configuration names is created by an operation that is still
+            // scaffolded — and the model gives this create no `NotFoundException` to answer
+            // with — so referential checks belong with those operations.
+            other => other,
+        };
+
+        // `Tags` writes the same kind of tag map TagResource writes, so a pair it carries is
+        // bounded by the same rule, named once in `crate::state`.
+        let requested_tags = input.tags.clone().unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "A create router output request may include at most {} Tags entries; this one \
+                 has {}.",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                requested_tags.len()
+            )));
+        }
+        for (key, value) in &requested_tags {
+            if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
+                return Err(bad_request(reason));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `ClientToken` is the request's `@idempotencyToken`, "a unique identifier for the
+        // request to ensure idempotency": a create replaying a token this store already
+        // holds answers with the output that token minted instead of minting a second one.
+        if let Some(token) = input.client_token.as_deref().filter(|t| !t.is_empty()) {
+            if let Some(existing) = store
+                .router_outputs
+                .values()
+                .find(|output| output.client_token.as_deref() == Some(token))
+            {
+                return Ok(CreateRouterOutputOutput {
+                    router_output: existing.to_router_output(),
+                });
+            }
+        }
+
+        // The router output store is bounded: nothing evicts a router output and a read must
+        // still answer what this operation created, so the create refuses once the store is
+        // full rather than growing it without limit. See `crate::state::MAX_ROUTER_OUTPUTS`.
+        if store.router_outputs.len() >= crate::state::MAX_ROUTER_OUTPUTS {
+            return Err(
+                CreateRouterOutputErrorModeled::RouterOutputServiceQuotaExceededException(
+                    RouterOutputServiceQuotaExceededException {
+                        message: format!(
+                            "This account already holds the maximum of {} router outputs. \
+                             Delete a router output before creating another one.",
+                            crate::state::MAX_ROUTER_OUTPUTS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let suffix = store.next_suffix();
+        let id = crate::state::router_resource_id(suffix);
+        let arn = ::engine::emulator_arn(
+            SERVICE_NAMESPACE,
+            &region,
+            &crate::state::router_output_resource_fragment(&id),
+        );
+
+        store.router_outputs.insert(
+            arn.clone(),
+            StoredRouterOutput {
+                arn: arn.clone(),
+                id,
+                name: input.name.clone(),
+                configuration,
+                maximum_bitrate: input.maximum_bitrate,
+                routing_scope: input.routing_scope.clone(),
+                tier: input.tier.clone(),
+                region_name: region,
+                availability_zone,
+                ip_address: Some(crate::state::assigned_egress_ip(suffix)),
+                // "The maintenance configuration settings for the router output": a request
+                // that sets none gets the DEFAULT maintenance configuration, which is the
+                // only other member of the union the model declares.
+                maintenance_configuration: input.maintenance_configuration.clone().unwrap_or(
+                    MaintenanceConfiguration::Default(DefaultMaintenanceConfiguration {}),
+                ),
+                // `RecoveryLatencyMode` documents `BALANCED` as its default, so an output
+                // created without a `FabricConfiguration` reports that mode.
+                fabric_configuration: input.fabric_configuration.clone().unwrap_or(
+                    FabricConfiguration {
+                        recovery_latency_mode: crate::state::FABRIC_LATENCY_MODE_BALANCED
+                            .to_string(),
+                    },
+                ),
+                tags: requested_tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                // A new router output is not ready yet: AWS answers the create with an
+                // output in the non-terminal `CREATING` state, which the clock settles into
+                // `STANDBY` — not running until StartRouterOutput — once
+                // `crate::state::TRANSITION_SPAN` has passed.
+                state: crate::state::ROUTER_OUTPUT_STATE_CREATING.to_string(),
+                pending: Some(crate::state::PendingStatus {
+                    status: crate::state::ROUTER_OUTPUT_STATE_STANDBY.to_string(),
+                    due_at: now + crate::state::TRANSITION_SPAN,
+                }),
+                // Nothing is routed to an output that has just been created.
+                routed_input_arn: None,
+                messages: Vec::new(),
+                client_token: input.client_token.clone().filter(|t| !t.is_empty()),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+
+        // The response is the STORED record, read back out of the store, not the request.
+        let router_output = store
+            .router_outputs
+            .get(&arn)
+            .map(StoredRouterOutput::to_router_output)
+            .ok_or_else(|| {
+                store_unavailable("the router output could not be read back after it was stored")
+            })?;
+        Ok(CreateRouterOutputOutput { router_output })
     }
 }

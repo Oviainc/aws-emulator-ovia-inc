@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData,
-    ResourceNotFoundException, ResourceSet, Tag,
+    ProtocolsListDataSummary, ResourceNotFoundException, ResourceSet, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -112,6 +112,13 @@ pub const DISASSOCIATION_SPAN: Duration = Duration::from_millis(500);
 /// organizational-unit ids). One of
 /// [`crate::ops::types::CUSTOMER_POLICY_SCOPE_ID_TYPE_VALUES`].
 pub const SCOPE_ID_TYPE_ACCOUNT: &str = "ACCOUNT";
+
+/// The `SecurityServiceType` of a Shield Advanced policy: the ONLY policy type
+/// `GetProtectionStatus` reports attack data for ("If you created a Shield
+/// Advanced policy, returns policy-level attack summary information … Other
+/// policy types are currently unsupported"). One of
+/// [`crate::ops::types::SECURITY_SERVICE_TYPE_VALUES`].
+pub const SECURITY_SERVICE_SHIELD_ADVANCED: &str = "SHIELD_ADVANCED";
 
 /// The default `CustomerPolicyStatus` of a policy an administrator created: the
 /// administrator can manage and delete it. One of
@@ -308,6 +315,19 @@ impl ProtocolsListRecord {
         list.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
         list
     }
+
+    /// The `ProtocolsListDataSummary` projection `ListProtocolsLists` reports:
+    /// the four members that shape declares, every one of them read off this
+    /// record, so an enumeration and a `GetProtocolsList` of the same list can
+    /// never disagree about its ARN, its name or its protocols.
+    pub fn summary(&self) -> ProtocolsListDataSummary {
+        ProtocolsListDataSummary {
+            list_arn: Some(self.list_arn.clone()),
+            list_id: Some(self.list_id.clone()),
+            list_name: Some(self.list.list_name.clone()),
+            protocols_list: Some(self.list.protocols_list.clone()),
+        }
+    }
 }
 
 /// The association between this organisation and ONE third-party firewall
@@ -363,6 +383,165 @@ impl ThirdPartyFirewallRecord {
     }
 }
 
+/// One DDoS attack Shield Advanced recorded against a resource that a Firewall
+/// Manager Shield Advanced policy protects — what `GetProtectionStatus`
+/// projects into its `ProtectionData` document.
+///
+/// The members are the ones Firewall Manager documents the `ProtectionData`
+/// document to carry ("Attack type / Account ID / ARN of the resource attacked /
+/// Start time of the attack / End time of the attack (ongoing attacks will not
+/// have an end time)", `GetProtectionStatusResponse$Data`), named as Shield
+/// Advanced's own `AttackSummary` names them, plus the attack's id.
+///
+/// `ended_at` is `None` for an ONGOING attack, which is exactly what the
+/// documented "ongoing attacks will not have an end time" means: the projection
+/// leaves the end out and the attack is never excluded by the queried period's
+/// lower bound.
+#[derive(Debug, Clone)]
+pub struct ShieldAttackRecord {
+    /// The `PolicyId` of the Shield Advanced policy the attack was recorded
+    /// under. Also the first segment of the record's key, so one policy's
+    /// attacks are a contiguous range.
+    pub policy_id: String,
+    /// Shield Advanced's own id for the attack (`AttackSummary$AttackId`).
+    pub attack_id: String,
+    /// The organisation account that owns the attacked resource.
+    pub account_id: String,
+    /// The ARN of the resource that was attacked.
+    pub resource_arn: String,
+    /// The attack's vector types (`AttackSummary$AttackVectors`) — the
+    /// documented "attack type".
+    pub attack_vectors: Vec<String>,
+    /// When the attack started. Also the second segment of the record's key, so
+    /// the keys of one policy's attacks sort chronologically.
+    pub started_at: SystemTime,
+    /// When the attack ended, or `None` while it is still ongoing.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl ShieldAttackRecord {
+    /// The key this record is held under in
+    /// [`ComAmazonawsFmsAwsfms20180101State::shield_attacks`].
+    pub fn key(&self) -> String {
+        shield_attack_key(&self.policy_id, self.started_at, &self.attack_id)
+    }
+
+    /// Whether this attack falls in the period a request queried, where either
+    /// bound may be absent (an absent bound does not constrain that side).
+    ///
+    /// An attack is IN the period when it OVERLAPS it: it started no later than
+    /// the period's end, and it had not already ended when the period began. An
+    /// ongoing attack ([`Self::ended_at`] is `None`) has not ended at all, so no
+    /// lower bound excludes it.
+    ///
+    /// The bounds arrive as modelled `TimeStamp`s, so both sides are compared in
+    /// [`epoch_nanos`] rather than converted to a `SystemTime` — the comparison
+    /// is then exact and total for every instant a `TimeStamp` can carry,
+    /// including one before the Unix epoch.
+    pub fn overlaps(
+        &self,
+        start: Option<::aws_smithy_types::DateTime>,
+        end: Option<::aws_smithy_types::DateTime>,
+    ) -> bool {
+        let started = epoch_nanos(::aws_smithy_types::DateTime::from(self.started_at));
+        end.is_none_or(|end| started <= epoch_nanos(end))
+            && start.is_none_or(|start| {
+                self.ended_at.is_none_or(|ended| {
+                    epoch_nanos(::aws_smithy_types::DateTime::from(ended)) >= epoch_nanos(start)
+                })
+            })
+    }
+
+    /// This attack as one entry of the `ProtectionData` JSON document
+    /// `GetProtectionStatus` reports.
+    ///
+    /// Timestamps are Unix time in SECONDS, which is the form Firewall Manager's
+    /// own `TimeStamp` members document as their default ("the default used by
+    /// Firewall Manager is Unix time in seconds"). An ongoing attack carries no
+    /// `EndTime` member at all rather than a null one.
+    pub fn protection_data_entry(&self) -> ::serde_json::Value {
+        let mut entry = ::serde_json::Map::new();
+        entry.insert(
+            "AttackId".to_string(),
+            ::serde_json::Value::from(self.attack_id.clone()),
+        );
+        entry.insert(
+            "AccountId".to_string(),
+            ::serde_json::Value::from(self.account_id.clone()),
+        );
+        entry.insert(
+            "ResourceArn".to_string(),
+            ::serde_json::Value::from(self.resource_arn.clone()),
+        );
+        entry.insert(
+            "AttackVectors".to_string(),
+            ::serde_json::Value::from(self.attack_vectors.clone()),
+        );
+        entry.insert(
+            "StartTime".to_string(),
+            ::serde_json::Value::from(epoch_seconds(self.started_at)),
+        );
+        if let Some(ended_at) = self.ended_at {
+            entry.insert(
+                "EndTime".to_string(),
+                ::serde_json::Value::from(epoch_seconds(ended_at)),
+            );
+        }
+        ::serde_json::Value::Object(entry)
+    }
+}
+
+/// `when` as Unix time in whole seconds.
+///
+/// `::aws_smithy_types::DateTime` is what does the conversion, so an instant
+/// reported in a JSON document and one serialized into a modelled `TimeStamp`
+/// member cannot disagree.
+pub fn epoch_seconds(when: SystemTime) -> i64 {
+    ::aws_smithy_types::DateTime::from(when).secs()
+}
+
+/// `when` as nanoseconds since the Unix epoch: the total order instants are
+/// compared in, exact for every instant a modelled `TimeStamp` can carry (an
+/// `i128` cannot overflow on the `i64` seconds a `DateTime` holds) and
+/// infallible for one before the epoch, which converting to a `SystemTime`
+/// is not.
+pub fn epoch_nanos(when: ::aws_smithy_types::DateTime) -> i128 {
+    i128::from(when.secs()) * 1_000_000_000 + i128::from(when.subsec_nanos())
+}
+
+/// The key one recorded attack is held under in
+/// [`ComAmazonawsFmsAwsfms20180101State::shield_attacks`]: the policy it was
+/// recorded under, then the instant it started, then its own id.
+///
+/// The segments are joined by `#`, which no `PolicyId` can contain (the model's
+/// `com.amazonaws.fms#PolicyId` is `^[a-z0-9A-Z-]{36}$`), so
+/// `<policy id>#` is an unambiguous prefix of exactly that policy's attacks.
+/// The start instant is zero-padded Unix time, so the lexicographic order of the
+/// keys within one policy IS chronological order — which makes a page boundary a
+/// key, the way every other paginated read of this service resumes.
+///
+/// An instant before the Unix epoch sorts as the epoch itself: Shield Advanced
+/// did not exist then, and ordering is the only thing the key decides (the
+/// record keeps the real instant).
+pub fn shield_attack_key(policy_id: &str, started_at: SystemTime, attack_id: &str) -> String {
+    let since_epoch = started_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{policy_id}#{:020}.{:09}#{attack_id}",
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos()
+    )
+}
+
+/// The prefix every key of `policy_id`'s attacks starts with — the lower bound
+/// of that policy's contiguous range in
+/// [`ComAmazonawsFmsAwsfms20180101State::shield_attacks`]. See
+/// [`shield_attack_key`].
+pub fn shield_attack_key_prefix(policy_id: &str) -> String {
+    format!("{policy_id}#")
+}
+
 /// Per-service state for com-amazonaws-fms-awsfms-20180101. A handler reaches it through [`service_state`].
 ///
 /// `policies` is a `BTreeMap` so a page boundary is a key in a total order:
@@ -411,6 +590,23 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// in it. `ListDiscoveredResources` reports what is here, filtered by the
     /// request's member accounts and resource type — never a resource it made up.
     pub discovered_resources: BTreeMap<String, DiscoveredResource>,
+    /// The DDoS attacks Shield Advanced recorded against the resources the
+    /// stored Shield Advanced policies protect, keyed by
+    /// [`shield_attack_key`] so one policy's attacks are a contiguous,
+    /// chronologically ordered range a `GetProtectionStatus` page can resume
+    /// from.
+    ///
+    /// Like [`Self::discovered_resources`] this is an INVENTORY, not a cache:
+    /// Shield Advanced detects attacks and Firewall Manager reports what it
+    /// detected, and this emulator stands in for no attack detector, so the
+    /// inventory is empty unless something put an attack in it —
+    /// `GetProtectionStatus` reports what is here, filtered by the request's
+    /// policy, member account and time period, and never an attack it made up.
+    ///
+    /// An entry outlives the deletion of its policy, and is then unreachable: a
+    /// `PolicyId` is minted once and never reused, so no later policy can read
+    /// another policy's attacks.
+    pub shield_attacks: BTreeMap<String, ShieldAttackRecord>,
 }
 
 /// The administrator gate every organisation-scoped Firewall Manager operation
@@ -823,17 +1019,19 @@ pub fn decode_key_token(token: &str) -> Option<String> {
 /// Decode a `PaginationToken` produced by [`encode_page_token`]. `None` when the
 /// token was not produced by this service.
 ///
-/// The decoded value must still be a `PolicyId` (the model's
-/// `com.amazonaws.fms#PolicyId`: 36 characters matching `^[a-z0-9A-Z-]{36}$`),
-/// so a foreign token that happens to be valid hex is refused rather than
-/// resumed from as an arbitrary key.
+/// The decoded value must still be a 36-character identifier this service mints
+/// — the form the model gives both `com.amazonaws.fms#PolicyId` and
+/// `com.amazonaws.fms#ListId` (36 characters matching `^[a-z0-9A-Z-]{36}$`), so
+/// one check serves the policy-keyed and the list-keyed pages — and a foreign
+/// token that happens to be valid hex is refused rather than resumed from as an
+/// arbitrary key.
 pub fn decode_page_token(token: &str) -> Option<String> {
     let decoded = decode_key_token(token)?;
-    let is_policy_id = decoded.len() == 36
+    let is_minted_id = decoded.len() == 36
         && decoded
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    is_policy_id.then_some(decoded)
+    is_minted_id.then_some(decoded)
 }
 
 /// Decode an account-keyed `PaginationToken` produced by

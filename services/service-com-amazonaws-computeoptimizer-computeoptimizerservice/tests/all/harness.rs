@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The wire harness both suites in this target share.
+//! The wire harness the suites in this target share.
 //!
 //! Every call goes through the same `MultiServiceRouter::dispatch` the emulator's front
-//! door uses: `POST /` with `X-Amz-Target: ComputeOptimizerService.<Operation>` and an
-//! `awsJson1_0` body. Nothing here reaches into the state struct, so what a suite built on
-//! it proves is what a client sees — and one definition of the dispatch shape means two
-//! suites cannot drift apart on the header set or the routing credential.
+//! door uses: `POST /` with `X-Amz-Target: <Prefix>.<Operation>` and an `awsJson` body.
+//! Nothing here reaches into the state struct, so what a suite built on it proves is what a
+//! client sees — and one definition of the dispatch shape means no two suites can drift
+//! apart on the header set or the routing credential.
+//!
+//! Compute Optimizer does not stand alone: an Amazon ECS service recommendation is computed
+//! over the ECS service the ECS emulator holds and the `AWS/ECS` utilization the CloudWatch
+//! emulator holds, so [`emulator_with_analysed_services`] mounts all three on ONE engine —
+//! exactly what `core/router` assembles.
 
 use std::sync::Arc;
 
@@ -33,6 +38,10 @@ pub(crate) fn auto_scaling_group_arn(name: &str) -> String {
     )
 }
 
+/// The region every request in these suites signs for; every ARN the ECS emulator mints
+/// carries it, because the SigV4 credential scope is what names a request's region.
+pub(crate) const REGION: &str = "us-east-1";
+
 /// One emulator: one engine, one shared store, reached only over HTTP.
 pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
@@ -49,13 +58,32 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
     (router, engine)
 }
 
-/// Call one operation and return the HTTP status and the parsed JSON body.
+/// Compute Optimizer, Amazon ECS and CloudWatch over ONE engine: the emulator a suite needs
+/// to drive a recommendation that is computed over another service's resources and the
+/// utilization published for them.
+pub(crate) fn emulator_with_analysed_services() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Call one Compute Optimizer operation and return the HTTP status and the parsed JSON body.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
 ) -> (u16, Value) {
-    call_in_region(router, "us-east-1", operation, body).await
+    call_in_region(router, REGION, operation, body).await
 }
 
 /// The same call at the endpoint of `region` — the region a client's SigV4 credential scope
@@ -66,18 +94,72 @@ pub(crate) async fn call_in_region(
     operation: &str,
     body: Value,
 ) -> (u16, Value) {
+    dispatch(
+        router,
+        region,
+        "compute-optimizer",
+        "application/x-amz-json-1.0",
+        &format!("ComputeOptimizerService.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// Call one Amazon ECS operation (`awsJson1_1`).
+pub(crate) async fn call_ecs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    dispatch(
+        router,
+        REGION,
+        "ecs",
+        "application/x-amz-json-1.1",
+        &format!("AmazonEC2ContainerServiceV20141113.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// Call one CloudWatch operation.
+pub(crate) async fn call_cloudwatch(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    dispatch(
+        router,
+        REGION,
+        "monitoring",
+        "application/x-amz-json-1.0",
+        &format!("GraniteServiceVersion20100801.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// Dispatch one request, returning the HTTP status and the parsed JSON body.
+async fn dispatch(
+    router: &MultiServiceRouter,
+    region: &str,
+    signing_name: &str,
+    content_type: &str,
+    target: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("ComputeOptimizerService.{operation}"))
+        .header("content-type", content_type)
+        .header("x-amz-target", target)
         // The SigV4 credential scope is what routes a request to its service, and the
         // region it names is the regional endpoint the request addressed.
         .header(
             "authorization",
             format!(
                 "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEXAMPLE/20260101/{region}/compute-optimizer/aws4_request, \
+                 Credential=AKIDEXAMPLE/20260101/{region}/{signing_name}/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=not-verified"
             ),
         )
