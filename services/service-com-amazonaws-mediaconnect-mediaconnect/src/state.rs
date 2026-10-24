@@ -2248,6 +2248,11 @@ pub const ROUTER_OUTPUT_STATE_UPDATING: &str = "UPDATING";
 /// the clock completes the deletion rather than staying readable in a deleted state. See
 /// [`StoredRouterOutput::removal_due_at`].
 pub const ROUTER_OUTPUT_STATE_DELETING: &str = "DELETING";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The transient state of a router output that is
+/// being RESTARTED: RestartRouterOutput "restarts a router output … to recover from errors
+/// or refresh the output state", and `RECOVERING` is the one value of the enum that names
+/// that work in progress.
+pub const ROUTER_OUTPUT_STATE_RECOVERING: &str = "RECOVERING";
 
 /// The `RouterOutputRoutedState` enum the model declares
 /// (`smithy_query(query="shape",shape="RouterOutputRoutedState")`: ROUTED | ROUTING |
