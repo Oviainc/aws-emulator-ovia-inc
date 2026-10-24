@@ -25,6 +25,8 @@ mod catalog_items;
 mod error_classification;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/get_site_address_reporting.rs"]
+mod get_site_address_reporting;
 #[path = "all/order_lifecycle.rs"]
 mod order_lifecycle;
 #[path = "all/orderable_instance_types.rs"]
