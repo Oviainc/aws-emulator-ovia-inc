@@ -26,6 +26,9 @@ mod execute_query;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/pricing_plan.rs"]
+mod pricing_plan;
+
 #[path = "all/reported_members.rs"]
 mod reported_members;
 

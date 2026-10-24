@@ -98,6 +98,8 @@ mod ipam_routing_policy_registrations;
 mod launch_templates;
 #[path = "all/local_gateway_route_table_virtual_interface_group_associations.rs"]
 mod local_gateway_route_table_virtual_interface_group_associations;
+#[path = "all/local_gateway_virtual_interface_groups.rs"]
+mod local_gateway_virtual_interface_groups;
 #[path = "all/mac_dedicated_hosts.rs"]
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]

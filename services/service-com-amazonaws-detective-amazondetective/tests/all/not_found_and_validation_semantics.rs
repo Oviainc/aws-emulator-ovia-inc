@@ -757,9 +757,9 @@ async fn update_datasource_packages_validates_the_requested_package_set() {
 
 /// The ingest state stored for each modelled `DatasourcePackage` on `graph_arn`, read
 /// out of the shared store so this suite asserts what was PERSISTED rather than what a
-/// reporting operation chose to render (`datasource_package_ingest` asserts the wire
-/// view through `ListDatasourcePackages`). `None` means the graph holds no record for
-/// that package at all.
+/// reporting operation chose to render (`datasource_package_ingest` and
+/// `datasource_package_reporting` assert the wire view through `ListDatasourcePackages`).
+/// `None` means the graph holds no record for that package at all.
 fn stored_package_states(
     engine: &engine::InMemoryEngine,
     graph_arn: &str,

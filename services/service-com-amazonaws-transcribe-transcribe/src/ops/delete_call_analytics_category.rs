@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCallAnalyticsCategory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCallAnalyticsCategory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCallAnalyticsCategory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored Call Analytics category of the requested name, or refuses a name
+//! this account holds no category under (see [`DeleteCallAnalyticsCategory::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +144,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCallAnalyticsCategory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCallAnalyticsCategoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCallAnalyticsCategory"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCallAnalyticsCategoryErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // A category has no status in the model
+        // (`smithy_query(query="shape", shape="CategoryProperties")`), so there is no
+        // non-terminal state a delete could be refused for and nothing the clock owes
+        // this record: presence is the whole question.
+        if store
+            .call_analytics_categories
+            .remove(&input.category_name)
+            .is_none()
+        {
+            // "This can occur when the entity you're trying to delete doesn't exist"
+            // (`BadRequestException`'s own documentation) — so a name this account holds
+            // no category under is REFUSED, not answered as an already-satisfied
+            // delete. That is also the shape and wording this service's recorded
+            // absent-category responses carry (`crate::state::not_found_message`), and
+            // it is why this path does not take the idempotent-success branch
+            // `DeleteVocabulary` takes: there the recorded wire response for an absent
+            // custom vocabulary IS the ordinary empty success, and a recording outranks
+            // the family resemblance.
+            return Err(DeleteCallAnalyticsCategoryErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::KIND_CATEGORY,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        ::tracing::info!(
+            operation = "DeleteCallAnalyticsCategory",
+            category = %input.category_name,
+            "Call Analytics category deleted"
+        );
+        Ok(DeleteCallAnalyticsCategoryOutput::default())
     }
 }

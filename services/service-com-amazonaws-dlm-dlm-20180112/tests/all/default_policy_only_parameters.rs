@@ -495,18 +495,6 @@ async fn an_update_refuses_default_only_parameters_for_a_custom_policy() {
     .policy_id();
     let stored = at(get(&router, &custom).await.policy(), "/PolicyDetails");
 
-    let default_policy = create(
-        &router,
-        json!({
-            "ExecutionRoleArn": ROLE_ARN,
-            "Description": "a default policy to patch",
-            "State": "ENABLED",
-            "DefaultPolicy": "VOLUME",
-        }),
-    )
-    .await
-    .policy_id();
-
     for parameter in default_policy_only_parameters() {
         let mut patches: Vec<(String, Value)> = Vec::new();
         if parameter.in_request_body {
@@ -542,6 +530,22 @@ async fn an_update_refuses_default_only_parameters_for_a_custom_policy() {
         if !parameter.in_request_body || !parameter.reported_verbatim {
             continue;
         }
+        // A FRESH default policy per row. These patches state ONE member at a
+        // time, and the creation frequency and the retention period are a pair:
+        // patching them onto a policy still carrying the previous row's value
+        // would answer about that pair instead of about this row's member (the
+        // pair's own rule is `interval_validation.rs`).
+        let default_policy = create(
+            &router,
+            json!({
+                "ExecutionRoleArn": ROLE_ARN,
+                "Description": "a default policy to patch",
+                "State": "ENABLED",
+                "DefaultPolicy": "VOLUME",
+            }),
+        )
+        .await
+        .policy_id();
         let case = format!("{}: patched on a default policy", parameter.case);
         let answer = update(
             &router,
