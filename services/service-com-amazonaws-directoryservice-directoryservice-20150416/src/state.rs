@@ -4,8 +4,9 @@
 //!
 //! This module owns the records the handlers in `src/ops/` share — the directories
 //! `CreateDirectory` persists, the snapshots `CreateSnapshot` takes of them, the aliases
-//! `CreateAlias` assigns, the Amazon SNS topics `RegisterEventTopic` associates, the
-//! assessments `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
+//! `CreateAlias` assigns, the computer accounts `CreateComputer` creates in them, the
+//! Amazon SNS topics `RegisterEventTopic` associates, the assessments
+//! `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
 //! the pieces of behaviour that cannot live in any single operation file:
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
@@ -38,9 +39,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Assessment, AssessmentSummary, ClientAuthenticationSettingInfo, DirectoryDescription,
-    DirectoryLimits, DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo,
-    Snapshot, SnapshotLimits, Tag,
+    Assessment, AssessmentSummary, Attribute, ClientAuthenticationSettingInfo, Computer,
+    DirectoryDescription, DirectoryLimits, DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo,
+    LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -279,6 +280,33 @@ pub const ASSESSMENT_REPORT_TYPE_CUSTOMER: &str = "CUSTOMER";
 /// IP addresses was exceeded. The default limit is 100 IP address blocks."
 pub const MAX_IP_ROUTES: usize = 100;
 
+/// The first RID this emulator hands to a computer account it creates in a directory.
+///
+/// A Windows account's SID is its domain's SID plus a relative identifier, and Active
+/// Directory reserves the RIDs below 1000 for the built-in principals every domain is
+/// created with, handing the ones from 1000 up to the accounts created in it. So the
+/// first computer account of a directory is `<domain SID>-1000` and each later one takes
+/// the next RID, which is what makes a `ComputerId` unique within its directory.
+pub const FIRST_COMPUTER_RID: u32 = 1000;
+
+/// The prefix every Active Directory domain account's SID carries: the NT authority
+/// (`S-1-5`) and the `SECURITY_NT_NON_UNIQUE` sub-authority (`21`) that marks the three
+/// sub-authorities after it as one domain's own identifier. See
+/// [`Directory::domain_sid`], which is what appends those three.
+pub const DOMAIN_SID_PREFIX: &str = "S-1-5-21";
+
+/// The most computer accounts this emulator keeps in one directory.
+///
+/// NOT an AWS quota: a resource guard, like [`MAX_SNAPSHOTS`]. `CreateComputer` models no
+/// limit-exceeded error and AWS publishes a directory's capacity as an approximate object
+/// count rather than an API limit, so this is not an emulated quota — it is what keeps a
+/// loop of creates from growing the store without end, set at the smallest capacity AWS
+/// publishes for a directory (a Simple AD `Small` directory, documented as up to 500
+/// users / roughly 2,000 directory objects). Past it `CreateComputer` is refused with the
+/// generic `ClientException` the model offers, since the model declares no bound-specific
+/// error for this operation.
+pub const MAX_COMPUTERS_PER_DIRECTORY: usize = 2_000;
+
 /// Directory Service's default quota "Manual snapshots: 5" per directory, the bound
 /// `SnapshotLimitExceededException` reports — the same bound `GetSnapshotLimits`
 /// describes as `SnapshotLimits$ManualSnapshotsLimit`.
@@ -496,6 +524,57 @@ impl ClientAuthenticationSetting {
     }
 }
 
+/// One stored computer account: the Active Directory computer object `CreateComputer`
+/// created in a directory.
+///
+/// Named `ComputerRecord` rather than `Computer` so it does not collide with the modelled
+/// `Computer` shape [`Self::to_computer`] renders it into.
+///
+/// The one-time join `Password` the create was called with is deliberately NOT a field:
+/// the model marks it `@sensitive`, no operation reports it back, and state this emulator
+/// does not need is state it must not hold \u2014 the same reason the directory record holds
+/// no administrator password.
+#[derive(Debug, Clone)]
+pub struct ComputerRecord {
+    /// The account's SID, as the modelled `Computer$ComputerId` reports it: this
+    /// directory's [`Directory::domain_sid`] plus the RID the directory handed out. See
+    /// [`FIRST_COMPUTER_RID`].
+    pub computer_id: String,
+    /// The account name as the request spelled it. The lookup key folds it to lower case
+    /// (see [`Directory::computers`]); this is what is reported back.
+    pub computer_name: String,
+    /// The organizational unit the account was placed in, when the create named one.
+    /// `None` means the directory's own default computers container, which is what
+    /// `OrganizationalUnitDistinguishedName`'s documentation describes as the placement
+    /// when the member is absent.
+    pub organizational_unit_distinguished_name: Option<String>,
+    /// The LDAP attributes the create applied to the account, in the order the request
+    /// listed them \u2014 which is what the modelled `Computer$ComputerAttributes` ("the LDAP
+    /// attributes that belong to the computer account") reports. Nothing else is invented
+    /// into it: an attribute this emulator did not apply is an attribute no caller set.
+    pub attributes: Vec<Attribute>,
+    /// When the account was created.
+    pub created_at: SystemTime,
+}
+
+impl ComputerRecord {
+    /// This account as the modelled `Computer`.
+    pub fn to_computer(&self) -> Computer {
+        Computer {
+            computer_id: Some(self.computer_id.clone()),
+            computer_name: Some(self.computer_name.clone()),
+            // Absent rather than an empty list when the create applied no attributes, so
+            // an account nothing was applied to does not report a list that was never
+            // recorded.
+            computer_attributes: if self.attributes.is_empty() {
+                None
+            } else {
+                Some(self.attributes.clone())
+            },
+        }
+    }
+}
+
 /// Separates the creation rank a cursor resumes after from the filter it was issued
 /// under, in every paginated operation of this service. Not a character a `DirectoryId`,
 /// a `SnapshotId` or a tag key the listings filter on can contain, so the two halves are
@@ -611,6 +690,17 @@ pub struct Directory {
     /// associations live on the directory record, so deleting the directory takes its
     /// associations with it.
     pub event_topics: BTreeMap<String, EventTopicRegistration>,
+    /// The computer accounts `CreateComputer` created in this directory, keyed by the
+    /// account name folded to lower case: an Active Directory account name is
+    /// case-insensitive, so that fold is what makes the duplicate check agree with the
+    /// directory it emulates. The accounts live on the directory record, so deleting the
+    /// directory takes them with it, and two directories can each hold an account of the
+    /// same name.
+    pub computers: BTreeMap<String, ComputerRecord>,
+    /// The next RID this directory's domain hands to an account created in it, starting
+    /// at [`FIRST_COMPUTER_RID`]. A pool rather than `computers.len()`: a RID a domain has
+    /// handed out is never handed out again.
+    pub next_computer_rid: u32,
     /// Whether this directory's data is reachable through the Directory Service Data
     /// API, as `DescribeDirectoryDataAccess` reports it: one of the modelled
     /// `DataAccessStatus` values, [`DATA_ACCESS_DISABLED`] until
@@ -676,6 +766,74 @@ impl Directory {
     /// the Regions it is replicated to.
     pub fn exists_in_region(&self, region: &str) -> bool {
         self.primary_region == region || self.additional_regions.contains(region)
+    }
+
+    /// This directory's domain SID: [`DOMAIN_SID_PREFIX`] plus the three sub-authorities
+    /// that identify one Active Directory domain.
+    ///
+    /// Every account of a domain carries the domain's SID, so the three sub-authorities
+    /// are derived from the directory's own id rather than minted: they are the same for
+    /// every account of this directory, stable for the life of the record, and different
+    /// for another directory, because the derivation below is injective in the id's forty
+    /// bits (each sub-authority is a bijection of them modulo its own odd multiplier) and
+    /// the ids themselves never repeat
+    /// ([`ComAmazonawsDirectoryserviceDirectoryservice20150416State::mint_directory_id`]).
+    pub fn domain_sid(&self) -> String {
+        // The id's ten hex digits, the width the modelled `DirectoryId` pattern
+        // `^d-[0-9a-f]{10}$` declares. A record is only ever stored under a minted id, so
+        // the fallback is unreachable and merely keeps this total.
+        let seed = self
+            .directory_id
+            .strip_prefix("d-")
+            .and_then(|digits| u64::from_str_radix(digits, 16).ok())
+            .unwrap_or_default();
+        // A sub-authority is a 32-bit number, and never zero: a domain SID's
+        // sub-authorities are non-zero in every SID Windows renders.
+        let sub_authority = |multiplier: u64, offset: u64| -> u32 {
+            let span = u64::from(u32::MAX);
+            (seed.wrapping_mul(multiplier).wrapping_add(offset) % span + 1) as u32
+        };
+        format!(
+            "{DOMAIN_SID_PREFIX}-{first}-{second}-{third}",
+            first = sub_authority(2_654_435_761, 1_779_033_703),
+            second = sub_authority(2_246_822_519, 3_144_134_277),
+            third = sub_authority(3_266_489_917, 1_013_904_242)
+        )
+    }
+
+    /// The domain name components a distinguished name in this directory's domain ends
+    /// with: the DNS labels of the directory's own `Name`, as `dc=` relative
+    /// distinguished names.
+    ///
+    /// The directory's `Name` is its fully qualified domain name (`CreateDirectory`'s
+    /// documentation: "The fully qualified name for the directory, such as
+    /// `corp.example.com`"), and a DN in that domain ends with one `dc=` component per
+    /// label, so this is what an `OrganizationalUnitDistinguishedName` is checked against.
+    /// Folded to lower case, because a DN's attribute values are compared
+    /// case-insensitively.
+    pub fn domain_name_labels(&self) -> Vec<String> {
+        self.name
+            .split('.')
+            .filter(|label| !label.is_empty())
+            .map(|label| label.to_lowercase())
+            .collect()
+    }
+
+    /// The key [`Self::computers`] holds `computer_name` under: the name folded to lower
+    /// case, so a lookup agrees with Active Directory's case-insensitive account names.
+    pub fn computer_key(computer_name: &str) -> String {
+        computer_name.to_lowercase()
+    }
+
+    /// Hand out the next computer account SID of this directory's domain: its
+    /// [`Self::domain_sid`] plus the next RID from the pool.
+    ///
+    /// MUTATING: the RID is consumed, so no two accounts of a directory can carry the
+    /// same `ComputerId` even after one of them is gone.
+    pub fn mint_computer_sid(&mut self) -> String {
+        let rid = self.next_computer_rid.max(FIRST_COMPUTER_RID);
+        self.next_computer_rid = rid.saturating_add(1);
+        format!("{domain}-{rid}", domain = self.domain_sid())
     }
 
     /// This directory as the modelled `DirectoryDescription`.

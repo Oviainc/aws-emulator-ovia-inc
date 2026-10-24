@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComputer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComputer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComputer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an Active Directory computer account in a stored directory and persists it on
+//! that directory's record in [`crate::state`], so the account the response reports is
+//! the account the store holds.
+//!
+//! The account's `ComputerId` is its Windows SID: the directory's own domain SID
+//! ([`crate::state::Directory::domain_sid`], derived from the directory id, so every
+//! account of one directory shares it) plus the next RID of that directory's pool
+//! ([`crate::state::FIRST_COMPUTER_RID`]), which is what makes it unique. The name is
+//! unique within the directory, compared case-insensitively the way Active Directory
+//! compares account names, and the directory must be in service — a directory still being
+//! built by the transition its create owes is answered with the modelled
+//! `DirectoryUnavailableException`, exactly as `AddIpRoutes` and
+//! `EnableDirectoryDataAccess` answer it.
+//!
+//! The service models no read of a computer account (there is no Describe/List for one in
+//! this model), so the create is the only operation that reports one; a second create of
+//! the same name is what observes the account the first one persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +168,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComputer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComputerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComputer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The account is created IN a directory, so the directory is resolved first: an
+        // id naming none is the modelled "specified entity could not be found".
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                CreateComputerErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // Creating a computer object writes into the directory itself, so it needs a
+        // directory that is in service: one still being built by the transition its create
+        // owes is unavailable, which is the modelled refusal for exactly that.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(
+                CreateComputerErrorModeled::DirectoryUnavailableException(
+                    crate::state::refusal(format!(
+                        "Directory {id} is in stage {stage} and is not available for \
+                         computer account changes",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // `OrganizationalUnitDistinguishedName` is "the fully-qualified distinguished name
+        // of the organizational unit to place the computer account in", and the unit is
+        // placed in THIS directory, so a named one has to be a distinguished name of this
+        // directory's domain: RDN-shaped (`attribute=value`, comma-separated) and ending
+        // in the `dc=` components that spell the directory's own fully qualified name.
+        // The model bounds only its length, so anything else is the modelled "one or more
+        // parameters are not valid", naming the member and the rule it broke.
+        if let Some(requested) = input.organizational_unit_distinguished_name.as_deref() {
+            let components = relative_distinguished_names(requested).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "OrganizationalUnitDistinguishedName {requested:?} is not a \
+                     distinguished name: it must be a comma-separated list of \
+                     attribute=value components"
+                ))
+            })?;
+            let labels = directory.domain_name_labels();
+            if domain_components(&components).as_deref() != Some(labels.as_slice()) {
+                return Err(invalid_parameter(format!(
+                    "OrganizationalUnitDistinguishedName {requested:?} is not in the \
+                     domain of directory {id}: it must end in the components {expected}",
+                    id = directory.directory_id,
+                    expected = labels
+                        .iter()
+                        .map(|label| format!("DC={label}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
+        }
+
+        // An account name is unique within the directory, and Active Directory compares
+        // account names case-insensitively, so the stored accounts are keyed by the folded
+        // name — which is what makes a second create of the same name, in any case, the
+        // modelled "specified entity already exists".
+        let key = crate::state::Directory::computer_key(&input.computer_name);
+        if let Some(existing) = directory.computers.get(&key) {
+            return Err(
+                CreateComputerErrorModeled::EntityAlreadyExistsException(crate::state::refusal(
+                    format!(
+                        "Directory {id} already holds the computer account {name}",
+                        id = directory.directory_id,
+                        name = existing.computer_name
+                    ),
+                ))
+                .into(),
+            );
+        }
+
+        // Nothing grows the store without end: the per-directory guard is checked before
+        // anything is minted or inserted. It is not an AWS quota — see
+        // [`crate::state::MAX_COMPUTERS_PER_DIRECTORY`] — so it is reported with the
+        // generic `ClientException` the model offers rather than a bound-specific error,
+        // which this operation declares none of.
+        if directory.computers.len() >= crate::state::MAX_COMPUTERS_PER_DIRECTORY {
+            return Err(
+                CreateComputerErrorModeled::ClientException(crate::state::refusal(format!(
+                    "Directory {id} holds the maximum number of computer accounts this \
+                     emulator keeps: {max}",
+                    id = directory.directory_id,
+                    max = crate::state::MAX_COMPUTERS_PER_DIRECTORY
+                )))
+                .into(),
+            );
+        }
+
+        // The one-time join `Password` is NOT stored: the model marks it `@sensitive`,
+        // nothing reports it back, and no later call of this service verifies it.
+        let computer_id = directory.mint_computer_sid();
+        let record = crate::state::ComputerRecord {
+            computer_id,
+            computer_name: input.computer_name,
+            organizational_unit_distinguished_name: input
+                .organizational_unit_distinguished_name,
+            // The attributes the request applied, in the order it listed them. Nothing is
+            // added to them: an attribute this emulator did not apply is one no caller set.
+            attributes: input.computer_attributes.unwrap_or_default(),
+            created_at: now,
+        };
+        directory.computers.insert(key.clone(), record);
+
+        // Read the account back out of the store, so the response cannot report an
+        // account the insert did not persist.
+        let stored = directory
+            .computers
+            .get(&key)
+            .ok_or_else(crate::state::state_unavailable)?;
+        Ok(CreateComputerOutput {
+            computer: Some(stored.to_computer()),
+        })
     }
 }
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> CreateComputerError {
+    CreateComputerErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
+}
+
+/// `dn` split into its relative distinguished names as `(attribute, value)` pairs, both
+/// folded to lower case; `None` when `dn` is not a distinguished name at all.
+///
+/// A distinguished name is a comma-separated sequence of `attribute=value` components
+/// (RFC 4514), most specific first, so a component carrying no `=`, an empty attribute or
+/// an empty value makes the whole name one no directory could resolve. Surrounding
+/// whitespace is ignored, as it is in a DN.
+fn relative_distinguished_names(dn: &str) -> Option<Vec<(String, String)>> {
+    let mut components = Vec::new();
+    for component in dn.split(',') {
+        let (attribute, value) = component.split_once('=')?;
+        let attribute = attribute.trim();
+        let value = value.trim();
+        if attribute.is_empty() || value.is_empty() {
+            return None;
+        }
+        components.push((attribute.to_lowercase(), value.to_lowercase()));
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some(components)
+}
+
+/// The domain name labels `components` spells: the values of its trailing run of `dc=`
+/// components, in order, which is how a distinguished name carries the domain it belongs
+/// to (`OU=Computers,DC=corp,DC=example,DC=com` is in `corp.example.com`).
+///
+/// `None` when the name carries no `dc=` component, or carries one before a component of
+/// another attribute: the domain components of a DN are its LAST ones, so such a name
+/// names no domain.
+fn domain_components(components: &[(String, String)]) -> Option<Vec<String>> {
+    let first = components
+        .iter()
+        .position(|(attribute, _)| attribute == DOMAIN_COMPONENT_ATTRIBUTE)?;
+    let trailing = &components[first..];
+    if trailing
+        .iter()
+        .any(|(attribute, _)| attribute != DOMAIN_COMPONENT_ATTRIBUTE)
+    {
+        return None;
+    }
+    Some(trailing.iter().map(|(_, value)| value.clone()).collect())
+}
+
+/// The LDAP attribute whose values spell a distinguished name's domain, folded to lower
+/// case the way [`relative_distinguished_names`] folds every component: `dc`, one per
+/// label of the domain's fully qualified name.
+const DOMAIN_COMPONENT_ATTRIBUTE: &str = "dc";

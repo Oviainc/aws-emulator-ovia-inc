@@ -303,6 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_authentication_settings: ::std::collections::BTreeMap::new(),
             // No event topic until `RegisterEventTopic` associates one.
             event_topics: ::std::collections::BTreeMap::new(),
+            // No computer account until `CreateComputer` creates one; the RID pool starts
+            // where Active Directory starts handing them out.
+            computers: ::std::collections::BTreeMap::new(),
+            next_computer_rid: crate::state::FIRST_COMPUTER_RID,
             // `EnableDirectoryDataAccess` is what opens the directory to the Directory
             // Service Data API; a fresh directory is closed to it.
             data_access_status: crate::state::DATA_ACCESS_DISABLED.to_string(),
