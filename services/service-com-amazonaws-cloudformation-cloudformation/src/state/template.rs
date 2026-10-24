@@ -3020,9 +3020,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// Two types this emulator provisions are in that position: an experiment template's id is
 /// minted by FIS (`Ref` returns it, and the type has no name property at all), and an AWS
 /// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
-/// where that type's `Name` is only what the create asks for.
+/// where that type's `Name` is only what the create asks for. An Amazon EMR cluster is the
+/// third: `RunJobFlow` mints the `j-` job-flow id "Ref returns the cluster ID" answers, and
+/// the type's `Name` is only the name the flow runs under.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
-    resource_type == FIS_EXPERIMENT_TEMPLATE || resource_type == WAF_REGIONAL_IP_SET
+    resource_type == FIS_EXPERIMENT_TEMPLATE
+        || resource_type == WAF_REGIONAL_IP_SET
+        || resource_type == EMR_CLUSTER
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -3035,6 +3039,11 @@ pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream
 /// bucket's physical resource id is the name its owning service creates it under — which
 /// is why [`naming_rules`] holds a GENERATED one to S3's bucket naming rules.
 pub const S3_BUCKET: &str = "AWS::S3::Bucket";
+
+/// The type of an Amazon EMR cluster: the EMR model carries
+/// `awsService.cloudFormationName: EMR`. "Ref returns the cluster ID", the `j-` job-flow id
+/// `RunJobFlow` mints, which is why [`identity_is_service_assigned`] names this type.
+pub const EMR_CLUSTER: &str = "AWS::EMR::Cluster";
 
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.
@@ -3535,7 +3544,8 @@ fn intrinsic(
             let delimiter = text(delimiter, scope, depth + 1, budget)?;
             let values = list(values, scope, depth + 1, budget)?;
             // The joined length is known before it is built, so a join whose result is
-            // past the bound is never materialised even transiently.
+            // past the bound is never materialised even transiently. It is charged for
+            // BEFORE it is allocated, rather than after.
             let joined = values
                 .iter()
                 .map(String::len)
@@ -3544,6 +3554,7 @@ fn intrinsic(
             if joined > MAX_RESOLVED_TEXT_BYTES {
                 return None;
             }
+            budget.spend_text(joined)?;
             Some(Resolved::Text(values.join(&delimiter)))
         }
         // "Fn::Select returns a single object from a list of objects by index":

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the connection definition `CreateConnection` stored under this
+//! name in the addressed Data Catalog, and refuses a name that catalog does not hold with
+//! the modelled `EntityNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `HidePassword` withholds the two password properties from every property map the answer
+//! carries ("Allows you to retrieve the connection metadata without returning the
+//! password") and `ApplyOverrideForComputeEnvironment` overlays the stored property map of
+//! the named compute environment ("specifies returning properties for the specified compute
+//! environment"); every other property is reported either way.
+//!
+//! A read: it reports what is stored and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +156,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnection"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetConnectionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Read-only: the stored definition is projected out and nothing is written.
+        let store = state.lock();
+        let Some(entry) = store.connection(&catalog_id, &input.name) else {
+            return Err(GetConnectionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Connection {} not found in catalog {catalog_id}",
+                        input.name
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // `HidePassword` withholds the password properties and
+        // `ApplyOverrideForComputeEnvironment` overlays that environment's property map;
+        // the stored entry applies them in that order, so a password a per-environment map
+        // carries is withheld too.
+        Ok(GetConnectionOutput {
+            connection: Some(entry.to_connection(
+                input.hide_password,
+                input.apply_override_for_compute_environment.as_deref(),
+            )),
+        })
     }
 }
