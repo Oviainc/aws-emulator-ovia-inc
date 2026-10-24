@@ -870,21 +870,18 @@ impl ProfilingGroup {
         span
     }
 
-    /// This group's recorded findings reports that a listing of `[start, end]` reports:
-    /// those whose analysed profile window overlaps that range, and — when
-    /// `daily_only` — only those over a daily (`P1D`) profile. Ordered by analysed
-    /// window, oldest first, then by report id, so paging a listing visits every
-    /// report exactly once however the store was written.
-    pub fn findings_reports_in(
+    /// This group's recorded findings reports that `keep` selects, in the stable order
+    /// every report listing reports them in: by analysed window, oldest first, then by
+    /// report id, so paging a listing visits every report exactly once however the
+    /// store was written.
+    fn ordered_findings_reports(
         &self,
-        start: DateTime,
-        end: DateTime,
-        daily_only: bool,
+        keep: impl Fn(&FindingsReport) -> bool,
     ) -> Vec<&FindingsReport> {
         let mut reports: Vec<&FindingsReport> = self
             .findings_reports
             .iter()
-            .filter(|report| report.overlaps(start, end) && (!daily_only || report.is_daily()))
+            .filter(|report| keep(report))
             .collect();
         reports.sort_by(|left, right| {
             left.profile_start_time
@@ -893,6 +890,29 @@ impl ProfilingGroup {
                 .then_with(|| left.id.cmp(&right.id))
         });
         reports
+    }
+
+    /// This group's recorded findings reports that a listing of `[start, end]` reports:
+    /// those whose analysed profile window overlaps that range, and — when
+    /// `daily_only` — only those over a daily (`P1D`) profile, in
+    /// [`ProfilingGroup::ordered_findings_reports`]'s stable order.
+    pub fn findings_reports_in(
+        &self,
+        start: DateTime,
+        end: DateTime,
+        daily_only: bool,
+    ) -> Vec<&FindingsReport> {
+        self.ordered_findings_reports(|report| {
+            report.overlaps(start, end) && (!daily_only || report.is_daily())
+        })
+    }
+
+    /// EVERY findings report recorded against this group, in the same stable order,
+    /// restricted to reports over daily (`P1D`) profiles when `daily_only`. The
+    /// account-wide summary (`GetFindingsReportAccountSummary`) asks about no time
+    /// range, so it reports a group's reports whatever window they analysed.
+    pub fn findings_reports(&self, daily_only: bool) -> Vec<&FindingsReport> {
+        self.ordered_findings_reports(|report| !daily_only || report.is_daily())
     }
 
     /// The most recently received profile whose receipt time falls in
@@ -1207,6 +1227,32 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         let mut names: Vec<String> = self.groups.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Every findings report recorded anywhere in this store, as the
+    /// `FindingsReportSummary` the account-wide summary
+    /// (`GetFindingsReportAccountSummary`) reports — restricted to reports over daily
+    /// (`P1D`) profiles when `daily_only`.
+    ///
+    /// Stable order: by profiling-group name (as [`Self::sorted_group_names`] orders
+    /// it), then within a group by analysed window and report id (as
+    /// [`ProfilingGroup::findings_reports`] orders it), so paging over the summary
+    /// visits every report exactly once. A group with no recorded analysis contributes
+    /// nothing: the emulator runs no recommendation analysis, so the reports summarised
+    /// here are only those [`Self::record_findings_report`] stored.
+    pub fn account_findings_report_summaries(&self, daily_only: bool) -> Vec<FindingsReportSummary> {
+        self.sorted_group_names()
+            .iter()
+            .filter_map(|name| self.groups.get(name))
+            .flat_map(|group| {
+                group
+                    .findings_reports(daily_only)
+                    .into_iter()
+                    // The group name reported is the STORED group's.
+                    .map(|report| report.summary(&group.name))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// The stored group an ARN identifies, or `None` when this store holds no resource
