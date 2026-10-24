@@ -176,10 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(secret) = store.get(&input.secret_id) else {
             return Err(ListSecretVersionIdsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Secrets Manager can't find the specified secret: {}",
-                        input.secret_id
-                    )),
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -216,9 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ListSecretVersionIdsErrorModeled::InvalidNextTokenException(
                                 InvalidNextTokenException {
                                     message: Some(
-                                        "The NextToken you provided is not valid for this \
-                                         request."
-                                            .to_string(),
+                                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                                     ),
                                 },
                             )

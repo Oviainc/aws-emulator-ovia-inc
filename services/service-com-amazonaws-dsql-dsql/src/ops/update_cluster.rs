@@ -272,12 +272,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(deletion_protection_enabled) = input.deletion_protection_enabled {
             cluster.deletion_protection_enabled = deletion_protection_enabled;
         }
-        if let Some(kms_encryption_key) = input.kms_encryption_key {
-            cluster.encryption_details = Some(crate::state::encryption_details(
-                &region,
-                Some(kms_encryption_key.as_str()),
-            ));
-            cluster.kms_encryption_key = Some(kms_encryption_key);
+        // The reserved `AWS_OWNED_KMS_KEY` names no customer key, so the cluster
+        // moves BACK to the Amazon-owned key: `encryptionDetails` then reports
+        // `AWS_OWNED_KMS_KEY` with no `kmsKeyArn`, and nothing is stored as the
+        // cluster's customer key.
+        if let Some(kms_encryption_key) = input.kms_encryption_key.as_deref() {
+            let customer_key = crate::state::customer_managed_key(Some(kms_encryption_key));
+            cluster.encryption_details =
+                Some(crate::state::encryption_details(&region, customer_key));
+            cluster.kms_encryption_key = customer_key.map(str::to_string);
         }
         if let Some(multi_region_properties) = input.multi_region_properties {
             cluster.multi_region_properties = Some(multi_region_properties);

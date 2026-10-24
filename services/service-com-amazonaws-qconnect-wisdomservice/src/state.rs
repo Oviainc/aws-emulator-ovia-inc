@@ -7,7 +7,7 @@
 //! handler answers with is derived from the records kept here, so what one request
 //! writes is what the next request reads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -15,7 +15,8 @@ use crate::ops::types::{
     AssistantAssociationOutputData, AssistantCapabilityConfiguration, AssistantData,
     AssistantIntegrationConfiguration, AssistantSummary, ExternalBedrockKnowledgeBaseConfig,
     KnowledgeBaseAssociationData, KnowledgeBaseData, OrchestratorConfigurationEntry,
-    RenderingConfiguration, ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
+    RenderingConfiguration, RecommendationData, RecommendationTrigger,
+    ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
     TagFilter, VectorIngestionConfiguration,
 };
 
@@ -354,6 +355,115 @@ fn tags_out(tags: &HashMap<String, String>) -> Option<HashMap<String, String>> {
     Some(tags.clone())
 }
 
+/// The recommendations one session has available, oldest first, with the triggers that
+/// produced them.
+///
+/// `GetRecommendations` REPORTS this feed — the operation is `@readonly` — so a read
+/// never consumes an entry: two reads of an unchanged feed answer alike, and only an
+/// acknowledgement removes one. Nothing in this model's implemented surface publishes a
+/// recommendation (the service makes one available out of band, from the contact's
+/// detected intent, and `QueryAssistant`/`SendMessage` are still scaffold stubs with
+/// their own issues), so a session's feed is empty until something calls
+/// [`RecommendationFeed::publish`] — which is exactly the "no recommendations available"
+/// case the operation documents: the call returns successfully with an empty list.
+#[derive(Debug, Clone, Default)]
+pub struct RecommendationFeed {
+    /// The available recommendations, oldest first: the order `GetRecommendations`
+    /// serves a page in, and the order the cap evicts in.
+    pub recommendations: VecDeque<RecommendationData>,
+    /// The triggers that produced them, each naming the `recommendationId`s it produced
+    /// (`RecommendationTrigger.recommendationIds`). A trigger is kept only while the
+    /// feed still holds a recommendation it names, so a trigger that names none is not
+    /// kept and not reported.
+    pub triggers: Vec<RecommendationTrigger>,
+}
+
+/// The most recommendations one session's feed holds at once, and the most triggers kept
+/// beside them.
+///
+/// A recommendation stays available until something acknowledges it
+/// (`NotifyRecommendationsReceived`, still a scaffold stub with its own issue), so an
+/// unbounded feed would let a session nobody acknowledges grow this process's heap
+/// without limit: the cap is the bound on that growth. It is a resource guard this
+/// emulator owns, NOT an AWS-published quota, and it equals the largest page
+/// `GetRecommendations` can serve ([`DEFAULT_MAX_RESULTS`], the model's `maxResults`
+/// ceiling), so a full feed can still fill any page the model allows. Publishing past it
+/// forgets the OLDEST entry, the way a live feed drops what nobody collected rather than
+/// refusing new material.
+pub const MAX_PENDING_RECOMMENDATIONS_PER_SESSION: usize = DEFAULT_MAX_RESULTS;
+
+impl RecommendationFeed {
+    /// Make one recommendation available on this session, with the trigger that produced
+    /// it (if any).
+    ///
+    /// Bounded by [`MAX_PENDING_RECOMMENDATIONS_PER_SESSION`]: the oldest recommendation
+    /// is forgotten first, and a trigger no held recommendation names is forgotten with
+    /// it.
+    pub fn publish(
+        &mut self,
+        recommendation: RecommendationData,
+        trigger: Option<RecommendationTrigger>,
+    ) {
+        self.recommendations.push_back(recommendation);
+        if let Some(trigger) = trigger {
+            self.triggers.push(trigger);
+        }
+        while self.recommendations.len() > MAX_PENDING_RECOMMENDATIONS_PER_SESSION {
+            self.recommendations.pop_front();
+        }
+        let held: HashSet<String> = self
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.recommendation_id.clone())
+            .collect();
+        self.triggers
+            .retain(|trigger| trigger.recommendation_ids.iter().any(|id| held.contains(id)));
+        while self.triggers.len() > MAX_PENDING_RECOMMENDATIONS_PER_SESSION {
+            self.triggers.remove(0);
+        }
+    }
+
+    /// The page of at most `max_results` available recommendations, oldest first, and the
+    /// triggers that produced the recommendations IN that page.
+    ///
+    /// `recommendation_type` is the modelled `recommendationType` filter — "the type of
+    /// recommendation being requested" — so a call that names one is served only the
+    /// recommendations of that `RecommendationType`.
+    pub fn page(
+        &self,
+        max_results: usize,
+        recommendation_type: Option<&str>,
+    ) -> (Vec<RecommendationData>, Vec<RecommendationTrigger>) {
+        let recommendations: Vec<RecommendationData> = self
+            .recommendations
+            .iter()
+            .filter(|recommendation| {
+                recommendation_type.is_none_or(|wanted| {
+                    recommendation.r#type.as_deref() == Some(wanted)
+                })
+            })
+            .take(max_results)
+            .cloned()
+            .collect();
+        let paged: HashSet<&str> = recommendations
+            .iter()
+            .map(|recommendation| recommendation.recommendation_id.as_str())
+            .collect();
+        let triggers: Vec<RecommendationTrigger> = self
+            .triggers
+            .iter()
+            .filter(|trigger| {
+                trigger
+                    .recommendation_ids
+                    .iter()
+                    .any(|id| paged.contains(id.as_str()))
+            })
+            .cloned()
+            .collect();
+        (recommendations, triggers)
+    }
+}
+
 /// One session of an assistant, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -370,6 +480,11 @@ pub struct Session {
     pub contact_arn: Option<String>,
     pub origin: String,
     pub created_at: SystemTime,
+    /// The recommendations available on this session, which `GetRecommendations`
+    /// reports. It lives ON the session, so the delete of the owning assistant reclaims
+    /// it with the session rather than leaving an orphan feed behind in a map beside the
+    /// sessions.
+    pub recommendations: RecommendationFeed,
 }
 
 impl Session {

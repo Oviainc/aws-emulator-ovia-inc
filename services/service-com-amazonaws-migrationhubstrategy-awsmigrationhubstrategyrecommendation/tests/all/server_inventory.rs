@@ -69,7 +69,7 @@ fn group(name: &str, value: &str) -> Value {
 }
 
 /// A server record for the inventory, with only its id set.
-fn server(id: &str) -> ServerRecord {
+pub(crate) fn server(id: &str) -> ServerRecord {
     assert!(
         !id.is_empty()
             && id.len() <= 44
@@ -190,7 +190,10 @@ fn all_ids_ascending() -> Vec<String> {
 
 /// One emulator over one shared engine, with `servers` seeded into this service's store —
 /// the same map an import's ingestion writes and `ListServers` reads.
-fn emulator_with(servers: Vec<ServerRecord>) -> MultiServiceRouter {
+///
+/// `pub(crate)` so the suites beside this one seed the same inventory through the same
+/// harness rather than standing up a second copy of it.
+pub(crate) fn emulator_with(servers: Vec<ServerRecord>) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
         let state = engine

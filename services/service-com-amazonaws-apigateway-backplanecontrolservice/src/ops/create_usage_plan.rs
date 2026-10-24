@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUsagePlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUsagePlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists a `UsagePlan` record in [`crate::state`] under a freshly minted
+//! id and answers with that STORED record. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUsagePlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The limits the request carries are refused BEFORE anything is stored when they are not
+//! limits API Gateway can meter — a negative quota count, a negative or non-finite
+//! throttle rate — through the shared [`crate::state::bound_quota_settings`] /
+//! [`crate::state::bound_throttle_settings`] checks, which apply to the plan's own
+//! `throttle` and to the per-method throttle map of every `apiStages` entry alike. An
+//! `apiStages` entry must name a stored stage of a stored API, because that is the stage
+//! the plan's limits apply to.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +98,90 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::UsagePlanEntry;
+
+impl From<&UsagePlanEntry> for CreateUsagePlanOutput {
+    /// The `UsagePlan` body for a stored plan — the one place this crate renders that
+    /// shape, so `CreateUsagePlan` and `GetUsagePlan` cannot report a record
+    /// differently.
+    fn from(entry: &UsagePlanEntry) -> Self {
+        Self {
+            id: Some(entry.id.clone()),
+            name: Some(entry.name.clone()),
+            description: entry.description.clone(),
+            // `apiStages` and `tags` are collections the stored record itself owns, so a
+            // `UsagePlan` body reports them from that record whatever they hold: a plan
+            // associated with no stage reports `apiStages: []` and an untagged plan
+            // reports `tags: {}`. Presence is never decided by emptiness — a client can
+            // tell "no stages / no tags" from "not reported".
+            api_stages: Some(entry.api_stages.clone()),
+            // A plan's throttle and quota, by contrast, are members it need not have at
+            // all: a plan created without a quota has none, which is a different record
+            // from one whose quota limit is zero.
+            throttle: entry.throttle.clone(),
+            quota: entry.quota.clone(),
+            product_code: entry.product_code.clone(),
+            tags: Some(
+                entry
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Refuse a request whose caller-sized members would grow the store past a bound, or
+/// whose limits are not limits API Gateway can meter.
+///
+/// Called BEFORE the store lock is taken, so a refused request never reaches the records
+/// at all. Each bound is a published API Gateway/AWS quota or, where the service
+/// publishes none, this emulator's own resource guard — see `crate::state`.
+fn bound_input(input: &CreateUsagePlanInput) -> Result<(), String> {
+    use crate::state::{
+        bound_chars, bound_entries, bound_quota_settings, bound_tag, bound_throttle_settings,
+        MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
+    };
+
+    bound_chars("name", &input.name, MAX_STRING_CHARS)?;
+    if let Some(description) = &input.description {
+        bound_chars("description", description, MAX_STRING_CHARS)?;
+    }
+    if let Some(throttle) = &input.throttle {
+        bound_throttle_settings("throttle", throttle)?;
+    }
+    if let Some(quota) = &input.quota {
+        bound_quota_settings("quota", quota)?;
+    }
+    if let Some(api_stages) = &input.api_stages {
+        bound_entries("apiStages", api_stages.len(), MAX_COLLECTION_ENTRIES)?;
+        for stage in api_stages {
+            // The per-method throttle map is caller-sized and carries the SAME shape the
+            // plan's own `throttle` does, so it is bounded and checked the same way.
+            let throttle = stage.throttle.as_ref();
+            bound_entries(
+                "apiStages.throttle",
+                throttle.map_or(0, ::std::collections::HashMap::len),
+                MAX_COLLECTION_ENTRIES,
+            )?;
+            for (method, settings) in throttle.into_iter().flatten() {
+                bound_chars("apiStages.throttle key", method, MAX_STRING_CHARS)?;
+                bound_throttle_settings(&format!("apiStages.throttle[{method}]"), settings)?;
+            }
+        }
+    }
+    // The tags a create carries are checked by the SAME rule `TagResource` applies, so a
+    // tag this service refuses on one path cannot be stored through the other.
+    if let Some(tags) = &input.tags {
+        bound_entries("tags", tags.len(), MAX_TAGS)?;
+        for (key, value) in tags {
+            bound_tag(key, value)?;
+        }
+    }
+    Ok(())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -169,18 +255,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUsagePlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUsagePlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUsagePlan"))
+        let bad_request = |message: String| -> Self::Error {
+            CreateUsagePlanErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized or out of range reaches the store: the request's members
+        // are bounded and its limits checked first, before the store lock is taken.
+        bound_input(&input).map_err(bad_request)?;
+
+        // Each `apiStages` entry names one stage of one API — the stage this plan's
+        // limits apply to — so both members are needed for it to name anything.
+        let requested_stages: Vec<ApiStage> = input.api_stages.unwrap_or_default();
+        for stage in &requested_stages {
+            if stage.api_id.is_none() || stage.stage.is_none() {
+                return Err(bad_request(
+                    "an apiStages entry must carry both apiId and stage".to_string(),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+
+        // Bound the growth a caller drives, at API Gateway's published quota.
+        if store.usage_plans.len() >= crate::state::MAX_USAGE_PLANS {
+            return Err(CreateUsagePlanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of usage plans exceeded: {}",
+                        crate::state::MAX_USAGE_PLANS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every API stage must name a stored stage of a stored API: the plan's limits
+        // apply to that stage, so an entry naming no stage associates the plan with
+        // nothing. Either identifier unresolvable is the modelled `NotFoundException`
+        // rather than a dangling association no later read could justify.
+        for stage in &requested_stages {
+            let api_id = stage.api_id.as_deref().unwrap_or_default();
+            let stage_name = stage.stage.as_deref().unwrap_or_default();
+            let api = store.rest_apis.get(api_id).ok_or_else(|| {
+                CreateUsagePlanErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::no_such_rest_api(api_id)),
+                })
+            })?;
+            if !api.stages.contains_key(stage_name) {
+                return Err(CreateUsagePlanErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::NO_SUCH_STAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let id = store.mint_id();
+        let sequence = store.next_sequence();
+        let entry = UsagePlanEntry {
+            id: id.clone(),
+            name: input.name,
+            description: input.description,
+            api_stages: requested_stages,
+            throttle: input.throttle,
+            quota: input.quota,
+            // The Marketplace product code is not a member of this operation's input, so
+            // a created plan carries none; see `UsagePlanEntry`.
+            product_code: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            sequence,
+        };
+
+        // `id` comes from the store's own id bijection, so it names no existing plan and
+        // this inserts. Reading the entry back means what the caller is told is what a
+        // later `GetUsagePlan` will report.
+        store.usage_plans.insert(id.clone(), entry);
+        let stored = store
+            .usage_plans
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let output = CreateUsagePlanOutput::from(stored);
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            usage_plan = ?id,
+            outcome = "created",
+            "usage plan created",
+        );
+        Ok(output)
     }
 }

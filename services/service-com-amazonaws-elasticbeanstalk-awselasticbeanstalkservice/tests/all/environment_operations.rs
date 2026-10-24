@@ -624,7 +624,7 @@ async fn describe_environment_health_reports_the_attributes_the_request_named() 
     assert_eq!(
         all.expect("InstancesHealth/Ok", case),
         "0",
-        "case {case:?}: no instance is provisioned, so every bucket is zero, got {}",
+        "case {case:?}: no enhanced health is measured on an instance here, so every bucket is zero, got {}",
         all.body
     );
     assert_eq!(
@@ -678,10 +678,11 @@ async fn describe_environment_health_reports_the_attributes_the_request_named() 
 }
 
 /// RULE: DescribeInstancesHealth reports the health of the environment's
-/// instances; this emulator provisions none, so a found environment answers with
-/// an empty instance list and the time the information was retrieved — never a
-/// continuation token for a page that does not exist, and never a token it did
-/// not issue.
+/// instances; enhanced health is measured by an agent on an instance against the
+/// application it serves, and this emulator runs neither, so a found environment
+/// answers with an empty instance list and the time the information was
+/// retrieved — never a continuation token for a page that does not exist, and
+/// never a token it did not issue.
 #[tokio::test]
 async fn describe_instances_health_reports_the_instances_an_environment_has() {
     let emulator = Emulator::new();
@@ -728,7 +729,7 @@ async fn describe_instances_health_reports_the_instances_an_environment_has() {
             health
                 .values_at("InstanceHealthList/member/InstanceId")
                 .is_empty(),
-            "case {name}: no instance is provisioned, so none is reported, got {}",
+            "case {name}: no per-instance health is measured here, so none is reported, got {}",
             health.body
         );
         assert!(

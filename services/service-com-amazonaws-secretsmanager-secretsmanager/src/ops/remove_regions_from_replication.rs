@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 RemoveRegionsFromReplicationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(
-                            "Secrets Manager can't find the specified secret.".to_string(),
+                            crate::state::SECRET_NOT_FOUND_MESSAGE.to_string(),
                         ),
                     },
                 )
@@ -196,11 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RemoveRegionsFromReplicationErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(
-                            "You can't perform this operation on the secret because it was marked \
-                             for deletion."
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
                     },
                 )
                 .into(),

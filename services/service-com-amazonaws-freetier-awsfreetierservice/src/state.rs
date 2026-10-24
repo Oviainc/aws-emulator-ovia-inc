@@ -178,7 +178,10 @@ impl Activity {
 
 /// One Free Tier usage record: an offer's limit and what the account has used
 /// of it.
-#[derive(Debug, Clone)]
+///
+/// `Default` gives the empty record [`dimension_kind`] asks which kind of value
+/// a dimension takes; it is never stored.
+#[derive(Debug, Clone, Default)]
 pub struct UsageRecord {
     pub service: String,
     pub operation: String,
@@ -227,6 +230,37 @@ impl UsageRecord {
 pub enum DimensionValue {
     Text(String),
     Number(f64),
+}
+
+impl DimensionValue {
+    /// Which kind of value this is, without the value itself.
+    pub fn kind(&self) -> DimensionKind {
+        match self {
+            Self::Text(_) => DimensionKind::Text,
+            Self::Number(_) => DimensionKind::Number,
+        }
+    }
+}
+
+/// Whether a `Dimension` compares text or magnitudes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimensionKind {
+    Text,
+    Number,
+}
+
+/// The kind of value a `Dimension` takes on a usage record, or `None` when the
+/// key names no dimension a record carries.
+///
+/// A property of the dimension alone — every record answers the same dimension
+/// with the same kind — so a filter's comparison can be checked before any
+/// record is read. Answered by asking [`UsageRecord::dimension_value`] on an
+/// empty record, so the kind reported here and the value a record answers with
+/// cannot disagree.
+pub fn dimension_kind(key: &str) -> Option<DimensionKind> {
+    UsageRecord::default()
+        .dimension_value(key)
+        .map(|value| value.kind())
 }
 
 /// Per-service state for com-amazonaws-freetier-awsfreetierservice. A handler reaches it through [`service_state`].
