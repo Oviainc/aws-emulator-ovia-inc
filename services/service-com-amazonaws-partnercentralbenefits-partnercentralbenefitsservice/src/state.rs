@@ -2191,26 +2191,72 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     usize::try_from(requested).unwrap_or(1)
 }
 
-/// A pagination token naming the record the NEXT page starts at.
+/// What separates the catalog a cursor was issued for from the record id it names.
 ///
-/// The modelled `NextToken` is opaque, so the id is hex-encoded rather than handed back
-/// in the clear — opaque to a caller, not secret: hex is trivially reversible and the
-/// token carries nothing beyond a record id. The characters it produces sit well inside
-/// the member's modelled 1..2048 length.
-pub fn encode_page_token(id: &str) -> String {
-    ::hex::encode(id)
+/// Neither side can hold it: a catalog name is `^[A-Za-z0-9_-]+$` (the modelled
+/// `CatalogName` pattern) and a record id is one of the id prefixes followed by
+/// [`ID_BODY_LEN`] `[0-9a-z]` characters, so splitting on the first occurrence recovers
+/// both halves unambiguously.
+const PAGE_TOKEN_SEPARATOR: char = ':';
+
+/// A pagination token naming the record the NEXT page starts at, for a listing of
+/// `catalog`.
+///
+/// The modelled `NextToken` is opaque, so the cursor is hex-encoded rather than handed
+/// back in the clear — opaque to a caller, not secret: hex is trivially reversible and the
+/// cursor carries nothing beyond the catalog it was issued for and a record id. Carrying
+/// the catalog is what lets [`decode_page_token`] refuse a cursor minted for another
+/// catalog's listing. The characters it produces sit well inside the member's modelled
+/// 1..2048 length.
+pub fn encode_page_token(catalog: &str, id: &str) -> String {
+    ::hex::encode(format!("{catalog}{PAGE_TOKEN_SEPARATOR}{id}"))
 }
 
-/// The record id a pagination token names, or `None` when the token is not one this
-/// service issued for a record of `prefix`'s kind.
-pub fn decode_page_token(token: &str, prefix: &str) -> Option<String> {
+/// The record id a pagination token names, or `None` when the token is not one
+/// [`encode_page_token`] minted for `catalog`'s listing of `prefix`'s record kind.
+pub fn decode_page_token(token: &str, prefix: &str, catalog: &str) -> Option<String> {
     let decoded = ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())?;
-    let body = decoded.strip_prefix(prefix)?;
+    let (issued_for, id) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+    if issued_for != catalog {
+        return None;
+    }
+    let body = id.strip_prefix(prefix)?;
     (body.len() == ID_BODY_LEN
         && body
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
-    .then_some(decoded)
+    .then(|| id.to_string())
+}
+
+/// Why a list operation refuses a `NextToken`: it is not a cursor this service issued for
+/// the collection being paged. Each list operation turns this into its OWN modelled
+/// `ValidationException` naming the member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignPageToken;
+
+/// The key a list operation resumes `records` at, given the `NextToken` the request
+/// carried — `None` when it carried none, so the page starts at the front.
+///
+/// A pagination token is a handle the service itself minted: it resumes a listing only
+/// when it decodes as a cursor [`encode_page_token`] issued for this catalog and this
+/// record kind AND still names a record this collection holds. Anything else — a shape
+/// the encoding never produces, a cursor of another catalog or another record kind, or an
+/// id no record of this collection carries — is `Err(ForeignPageToken)`, never a position
+/// to resume from.
+pub fn resume_from<Record>(
+    token: Option<&str>,
+    prefix: &str,
+    catalog: &str,
+    records: &BTreeMap<String, Record>,
+) -> Result<Option<String>, ForeignPageToken> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let id = decode_page_token(token, prefix, catalog).ok_or(ForeignPageToken)?;
+    if !records.contains_key(&id) {
+        return Err(ForeignPageToken);
+    }
+    Ok(Some(id))
 }
