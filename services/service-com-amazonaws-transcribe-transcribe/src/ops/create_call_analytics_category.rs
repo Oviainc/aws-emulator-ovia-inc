@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCallAnalyticsCategory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCallAnalyticsCategory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCallAnalyticsCategory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a new Call Analytics category — its rules, its input type and its tags —
+//! refusing a name this account already holds a category under (see
+//! [`CreateCallAnalyticsCategory::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCallAnalyticsCategory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCallAnalyticsCategoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCallAnalyticsCategory"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCallAnalyticsCategoryErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "Category names are case sensitive and must be unique within an Amazon Web
+        // Services account" (model doc for `CategoryProperties$CategoryName`). Checked
+        // and inserted under ONE lock, so N concurrent creates of one name have
+        // exactly one winner. The store is keyed by the name as sent, so two names
+        // differing only in case are two categories.
+        if store
+            .call_analytics_categories
+            .contains_key(&input.category_name)
+        {
+            return Err(CreateCallAnalyticsCategoryErrorModeled::ConflictException(
+                ConflictException {
+                    // The service's own text names the resource KIND and does not echo
+                    // the name asked for — see
+                    // [`crate::state::name_already_exists_message`].
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_CATEGORY,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.call_analytics_categories.len() >= crate::state::MAX_CALL_ANALYTICS_CATEGORIES {
+            return Err(CreateCallAnalyticsCategoryErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} Call Analytics categories for this \
+                         account. Delete a category you no longer need and try your request \
+                         again.",
+                        crate::state::MAX_CALL_ANALYTICS_CATEGORIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::CallAnalyticsCategoryRecord {
+            name: input.category_name.clone(),
+            rules: input.rules,
+            // "If you do not include InputType, your category is created as a post-call
+            // category by default" — the default is RECORDED, so every operation that
+            // reports this category reports the same input type.
+            input_type: input
+                .input_type
+                .unwrap_or_else(|| crate::state::DEFAULT_INPUT_TYPE.to_string()),
+            create_time: now,
+            // A category that has never been updated was last written when it was
+            // created, so both instants are the creation one until an update rewrites
+            // the rules.
+            last_update_time: now,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let output = CreateCallAnalyticsCategoryOutput {
+            category_properties: Some(record.to_properties()),
+        };
+        ::tracing::info!(
+            operation = "CreateCallAnalyticsCategory",
+            category = %record.name,
+            rules = record.rules.len(),
+            input_type = %record.input_type,
+            "Call Analytics category created"
+        );
+        store
+            .call_analytics_categories
+            .insert(record.name.clone(), record);
+
+        Ok(output)
     }
 }
