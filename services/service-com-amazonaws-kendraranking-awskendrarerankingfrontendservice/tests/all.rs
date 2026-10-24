@@ -15,6 +15,8 @@
 mod control_plane_fidelity;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/plan_capacity_units.rs"]
+mod plan_capacity_units;
 #[path = "all/plan_update.rs"]
 mod plan_update;
 #[path = "all/rescore_execution_plan_lifecycle.rs"]

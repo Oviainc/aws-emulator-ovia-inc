@@ -204,7 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(plan.arn.clone()),
             name: Some(plan.name.clone()),
             description: plan.description.clone(),
-            capacity_units: plan.capacity_units.clone(),
+            // Every plan HAS a capacity configuration, so this member is always
+            // reported: a plan given no additional units reads back as
+            // `RescoreCapacityUnits: 0`, which is how the service says the plan is
+            // using the default capacity.
+            capacity_units: Some(plan.capacity_units.clone()),
             created_at: Some(crate::state::timestamp(plan.created_at_millis)),
             updated_at: Some(crate::state::timestamp(plan.updated_at_millis)),
             // A transition the clock already owes is reported as due, so a plan an
