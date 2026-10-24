@@ -38,7 +38,7 @@ use backup_gateway::state::{service_state, MAINTENANCE_START_TIME_INVALID};
 
 use crate::bandwidth_rate_limit_schedule::{arn_in, arn_of_length};
 use crate::gateway_lifecycle::{
-    build_engine, build_router, call, create, create_body, never_created_arn, Reply,
+    build_engine, build_router, call, create, create_body, gateway_count, never_created_arn, Reply,
     ACTIVATION_KEY,
 };
 
@@ -155,13 +155,6 @@ fn persisted_window(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
         .gateway(arn)
         .unwrap_or_else(|| panic!("no gateway stored under {arn}"));
     format!("{:?}", record.maintenance_start_time)
-}
-
-fn gateway_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .gateway_count()
 }
 
 /// The rows of the window table: both forms the model documents and neither, at each

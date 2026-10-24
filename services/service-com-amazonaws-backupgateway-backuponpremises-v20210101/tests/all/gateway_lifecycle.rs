@@ -43,9 +43,10 @@ pub(crate) const REGION: &str = "us-west-2";
 
 /// The activation key the helpers below create gateways with.
 ///
-/// `CreateGateway` registers a gateway only for a key this service ISSUED
-/// (`state::activation_key_issued`), so every test that expects a create to succeed
-/// records its key first — see [`issue_activation_keys`].
+/// It plays no part in whether a create succeeds: the key is minted outside this API,
+/// by the activation handshake of the appliance the gateway stands for, so the service
+/// has nothing to resolve it against and every key the model accepts mints a gateway
+/// (see `gateway_activation`). It is persisted on the record it creates.
 pub(crate) const ACTIVATION_KEY: &str = "ACTIVATION-KEY123";
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
@@ -120,27 +121,20 @@ pub(crate) fn build_engine() -> Arc<engine::InMemoryEngine> {
     Arc::new(engine::InMemoryEngine::new())
 }
 
-/// Record `keys` as activation keys this service issued.
-///
-/// On AWS an activation key reaches the service out of band, from the gateway appliance
-/// that was deployed — no operation of this model issues one — so the store's registry
-/// is the only place a key can come from, and a test that wants a create to succeed puts
-/// it there, exactly as `CreateGateway` reads it.
-pub(crate) fn issue_activation_keys(engine: &Arc<engine::InMemoryEngine>, keys: &[&str]) {
-    let state = service_state(&**engine).expect("the in-memory engine must expose this state");
-    let mut store = state.lock();
-    for key in keys {
-        store.issue_activation_key(key, SystemTime::now());
-    }
+/// How many gateways the store holds — the one place the sibling suites read it from, so
+/// "the store did not grow" means the same thing in all of them.
+pub(crate) fn gateway_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    service_state(&**engine)
+        .expect("the in-memory engine must expose this state")
+        .lock()
+        .gateway_count()
 }
 
-/// The router every test dispatches through, with [`ACTIVATION_KEY`] already issued: the
-/// creates below address a gateway appliance the service has activated.
+/// The router every test dispatches through.
 pub(crate) fn build_router(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(backup_gateway::EmulatedService::new(Arc::clone(engine)));
-    issue_activation_keys(engine, &[ACTIVATION_KEY]);
     router
 }
 
@@ -543,15 +537,7 @@ async fn every_created_gateway_is_its_own_record() {
         ),
     ];
 
-    // Each row activates its own appliance, so each row's key is issued before it is
-    // used: the keys differ in length and spelling, which the refusal does not key on.
-    issue_activation_keys(
-        &engine,
-        &rows
-            .iter()
-            .map(|(_, _, activation_key, _)| *activation_key)
-            .collect::<Vec<_>>(),
-    );
+    // The rows' keys differ in length and spelling, which the create does not key on.
 
     let mut arns = BTreeSet::new();
     for (case, display_name, activation_key, tags) in &rows {

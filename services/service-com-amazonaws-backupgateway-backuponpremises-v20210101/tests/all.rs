@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bandwidth_rate_limit_schedule.rs"]
 mod bandwidth_rate_limit_schedule;
+#[path = "all/gateway_activation.rs"]
+mod gateway_activation;
 #[path = "all/gateway_lifecycle.rs"]
 mod gateway_lifecycle;
 #[path = "all/gateway_server_association.rs"]
