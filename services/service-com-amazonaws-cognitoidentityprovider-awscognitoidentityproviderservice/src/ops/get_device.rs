@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the REMEMBERED device of the signed-in user the presented access token
+//! names, rendered from the stored device: its key, the metadata its
+//! `ConfirmDevice` registered, and its create / last-modified / last-authenticated
+//! instants. A device no sign-in of that user minted, one nothing confirmed, and one
+//! the user has not chosen to remember are none of them a remembered device, so this
+//! operation refuses them — the admin reader, which reports any registered device,
+//! does not.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +176,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDevice"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // A read: this handler takes the lock to READ and writes nothing, so a
+        // later caller sees exactly what it saw.
+        let guard = state.lock();
+
+        // "Authorize this action with a signed-in user's access token" (this
+        // operation's documentation), so the device reported is the one belonging
+        // to the user that token was issued for — a request that presents no token
+        // this emulator issued names no user and is refused.
+        let (pool, user) = guard
+            .signed_in_user(input.access_token.as_deref().unwrap_or_default(), now)
+            .map_err(token_rejected)?;
+
+        if !pool.remembers_devices() {
+            return Err(device_remembering_not_configured());
+        }
+        // "Given a device key, returns information about a REMEMBERED device for the
+        // current user" (this operation's documentation), so a device that is
+        // registered but not remembered is not one this operation reports.
+        let device = user
+            .remembered_device(&input.device_key)
+            .ok_or_else(device_not_found)?;
+
+        Ok(GetDeviceOutput {
+            device: device.to_device_type(),
+        })
     }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user,
+/// which is also what an absent one gets: this operation acts on "a remembered
+/// device for the current user", and without a token there is no current user.
+fn token_rejected(rejection: crate::state::TokenRejection) -> GetDeviceError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            GetDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message
+                // names none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => user_not_found(),
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> GetDeviceError {
+    GetDeviceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> GetDeviceError {
+    GetDeviceErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal a device operation owes on a pool that activated no device
+/// remembering at all.
+fn device_remembering_not_configured() -> GetDeviceError {
+    GetDeviceErrorModeled::InvalidUserPoolConfigurationException(
+        InvalidUserPoolConfigurationException {
+            message: Some(crate::state::DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `DeviceKey` the signed-in
+/// user holds no remembered device for.
+fn device_not_found() -> GetDeviceError {
+    GetDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> GetDeviceError {
+    GetDeviceErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

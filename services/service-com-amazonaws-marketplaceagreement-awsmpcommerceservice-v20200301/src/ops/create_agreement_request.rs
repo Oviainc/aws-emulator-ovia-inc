@@ -3,8 +3,9 @@
 //! @op CreateAgreementRequest
 //! Mints the quote: the agreement request is persisted in [`crate::state`] and the
 //! `chargeSummary` it answers with is computed from the requested terms it stored. A
-//! repeated call carrying the same `clientToken` answers with the request that token
-//! already created.
+//! repeated call carrying the same `clientToken` AND the same content answers with the
+//! request that token already created; the same token carrying different content is
+//! refused as a conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -232,14 +233,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // `@idempotencyToken`: the same token names the same quote, so a retried
-        // create reports the first request rather than minting a second.
+        // create reports the first request rather than minting a second — and a
+        // token reused for DIFFERENT content is a conflict rather than an answer
+        // about another quote, which is how every idempotent create in this
+        // crate treats it (`PaymentRequest::matches_send`,
+        // `BillingAdjustmentRequest::matches_entry`).
         let replayed = input
             .client_token
             .as_deref()
             .and_then(|token| store.idempotency.get(token).cloned())
             .and_then(|id| store.agreement_requests.get(&id))
-            .map(|request| (request.id.clone(), request.charge_summary.clone()));
-        if let Some((id, charge_summary)) = replayed {
+            .map(|request| {
+                (
+                    request.id.clone(),
+                    request.charge_summary.clone(),
+                    request.matches_create(&input),
+                )
+            });
+        if let Some((id, charge_summary, matches)) = replayed {
+            if !matches {
+                return Err(CreateAgreementRequestErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::RESOURCE_TYPE_AGREEMENT_REQUEST,
+                        &id,
+                        format!(
+                            "clientToken {:?} already created agreement request {id} with \
+                             different content",
+                            input.client_token.as_deref().unwrap_or_default()
+                        ),
+                    ),
+                )
+                .into());
+            }
             return Ok(CreateAgreementRequestOutput {
                 agreement_request_id: Some(id),
                 charge_summary: Some(charge_summary),

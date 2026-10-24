@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `resourceArn`'s `@length(20..2048)` and `@pattern("^arn:.*$")` are
         // refused by the framework BEFORE this handler runs, so an ARN that
@@ -157,13 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // Only the resources of the region this request was signed for are
+        // reachable.
+        let region = crate::state::request_region(ctx);
 
         let store = state.lock();
         // An ARN that names no stored monitor and no stored probe names nothing
         // whose tags could be reported — a deleted resource, or a well-formed
         // ARN of another region, account or service.
         let tags = store
-            .resolve_tagged_resource(&input.resource_arn)
+            .resolve_tagged_resource(&region, &input.resource_arn)
             .and_then(|resource| store.tags(&resource))
             // Built straight from the borrowed stored map — the reported map IS
             // the stored one, pair for pair.

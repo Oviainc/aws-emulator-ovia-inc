@@ -200,7 +200,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             ClusterFilter {
                 name_prefix: input.cluster_name_filter.as_deref(),
-                cluster_type: None,
+                // `ClusterInfo` describes the broker nodes, the ZooKeeper
+                // ensemble and the Apache Kafka version of a PROVISIONED
+                // cluster, so that is the kind this listing reports; a
+                // serverless cluster is reported by `ListClustersV2`, whose
+                // `Cluster` shape models a member for each kind.
+                cluster_type: Some(crate::state::CLUSTER_TYPE_PROVISIONED),
             },
             resume_after.as_deref(),
             page_size,

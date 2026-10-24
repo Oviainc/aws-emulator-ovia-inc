@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGUISessionAccessDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGUISessionAccessDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates the pair of Amazon DCV session URLs a virtual computer's graphical
+//! user interface is reached through, and reports where that session has got to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGUISessionAccessDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What this operation does
+//!
+//! A GUI session runs ON the virtual computer the request names, so what this
+//! call can create depends on the state of the stored instance:
+//!
+//! * the instance is RUNNING and holds no session access — the two URLs are
+//!   created now (the session's token comes from the store's own allocator) and
+//!   the session is `starting` until the clock owes it `started`;
+//! * the instance is RUNNING and holds access that is still inside its active
+//!   hour — the SAME pair of URLs is reported again, because the session is the
+//!   resource and a second call must not silently restart its documented hour;
+//! * that hour has run out — `startExpired`, with no URLs: "Use this action to
+//!   resume the session after it expires" is `StartGUISession`'s own
+//!   documentation, so resuming is not this call's business. Until that
+//!   operation is implemented (it is still a scaffold stub, with its own issue)
+//!   an expired session has no implemented path back: that is the honest answer
+//!   while nothing can resume it, not an empty success.
+//! * the instance is still coming up — `settingUpInstance`, with
+//!   `percentageComplete` tracking the transition the clock owes it;
+//! * the instance is stopping or stopped — `notStarted`: no session is up and
+//!   none can be brought up on a computer that is not running, and the session
+//!   access is released by the clock the instant the computer leaves `running`
+//!   (`state::advance_clock`), so a stop and a start always lead to a new
+//!   session rather than to URLs that reach nothing.
+//!
+//! The modelled `Status` members this never answers — `stopping`, `stopped` and
+//! the three `failed*` ones — belong to `StopGUISession` and to failures this
+//! store does not produce; `failureReason` is therefore absent, because nothing
+//! here fails a session.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +186,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGUISessionAccessDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGUISessionAccessDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGUISessionAccessDetails"))
+        // A session URL names the endpoint THIS request arrived at, so it is
+        // read off this request rather than being a literal AWS hostname that
+        // would send the next client out of the emulator.
+        let endpoint = crate::state::request_endpoint(ctx.parts());
+        // `resourceName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused anything
+        // outside it before this body ran.
+        let name = input.resource_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let (state, due, stored) = {
+                let Some(instance) = store.instance(&name) else {
+                    return Err(not_found(&name));
+                };
+                (instance.state, instance.due, instance.gui_session.clone())
+            };
+
+            let (status, percentage_complete, sessions) = if state == crate::state::PENDING {
+                // The virtual computer itself is still being set up, which is
+                // what this modelled status says; the progress reported is the
+                // progress of the transition the clock owes the instance.
+                let percentage = due.map_or(0, |due| due.percentage_complete_at(now));
+                (
+                    crate::state::GUI_SESSION_STATUS_SETTING_UP_INSTANCE,
+                    percentage,
+                    None,
+                )
+            } else if state != crate::state::RUNNING {
+                // The computer is on its way down, or down: an Amazon DCV
+                // session runs on it, so nothing is up and nothing this call
+                // does can bring a session up. The store released the session
+                // the instant the computer left `running`
+                // (`state::advance_clock`), so a later call on a running
+                // computer creates fresh URLs rather than handing out ones that
+                // reach nothing.
+                (crate::state::GUI_SESSION_STATUS_NOT_STARTED, 0, None)
+            } else {
+                match stored {
+                    // The session's documented active hour has run out, so its
+                    // URLs reach nothing and are not reported. Resuming the
+                    // session is `StartGUISession`'s business.
+                    Some(session) if !session.is_live_at(now) => (
+                        crate::state::GUI_SESSION_STATUS_START_EXPIRED,
+                        session.percentage_complete_at(now),
+                        None,
+                    ),
+                    // Access that is still live: the same two URLs, and the
+                    // session's own status — this call neither mints a second
+                    // session for one virtual computer nor restarts its hour.
+                    Some(session) => (
+                        session.status_at(now),
+                        session.percentage_complete_at(now),
+                        Some(session.views(&name, endpoint.as_deref())),
+                    ),
+                    // Nothing is up yet: create the access details. The token
+                    // comes from the store's own allocator, never from the
+                    // request, and the store mints and writes it together, so a
+                    // caller is never handed URLs for a session the store does
+                    // not hold.
+                    None => {
+                        let Some(session) = store.create_gui_session(&name, now) else {
+                            return Err(not_found(&name));
+                        };
+                        (
+                            session.status_at(now),
+                            session.percentage_complete_at(now),
+                            Some(session.views(&name, endpoint.as_deref())),
+                        )
+                    }
+                }
+            };
+
+            Ok(CreateGUISessionAccessDetailsOutput {
+                resource_name: Some(name.clone()),
+                status: Some(status.to_string()),
+                percentage_complete: Some(percentage_complete),
+                // Nothing in this store fails a session start or an instance
+                // creation, so there is no failure to report a reason for.
+                failure_reason: None,
+                sessions,
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No virtual computer of that name is stored: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> CreateGUISessionAccessDetailsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateGUISessionAccessDetailsError {
+    CreateGUISessionAccessDetailsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

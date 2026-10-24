@@ -19,6 +19,8 @@ mod baseline_operations;
 mod control_operations;
 #[path = "all/disable_baseline.rs"]
 mod disable_baseline;
+#[path = "all/enable_baseline_persistence.rs"]
+mod enable_baseline_persistence;
 #[path = "all/enable_baseline_validation.rs"]
 mod enable_baseline_validation;
 #[path = "all/enable_control_persistence.rs"]

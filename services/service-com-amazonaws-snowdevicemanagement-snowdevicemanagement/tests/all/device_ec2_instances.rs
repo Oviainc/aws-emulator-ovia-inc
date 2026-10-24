@@ -90,8 +90,8 @@ fn unmanaged_device_ids() -> Vec<String> {
 ///
 /// The API models no device-creation operation, so the activation goes through the one
 /// state seam that puts a device in the inventory; without it the account's inventory
-/// is empty and every gated operation answers the account-level device gate (see
-/// `account_device_gate.rs`).
+/// is empty and every id-addressed operation answers the modelled
+/// `ResourceNotFoundException` (see `empty_inventory_refusals.rs`).
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     service_state(&*engine)

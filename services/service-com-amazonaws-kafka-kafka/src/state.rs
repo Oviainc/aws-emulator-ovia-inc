@@ -11,6 +11,14 @@
 //! next to the record is what makes the readers agree: they render the same stored
 //! cluster the same way.
 //!
+//! A cluster comes in the two kinds the model's `ClusterType` names, and both live
+//! in that one registry: `CreateCluster` and `CreateClusterV2`'s `Provisioned` body
+//! mint a provisioned record with [`Cluster::provisioned`], while
+//! `CreateClusterV2`'s `Serverless` body mints one with [`Cluster::serverless`],
+//! whose [`ServerlessConfig`] is what the V2 readers derive the `Serverless` shape
+//! from. One registry, so a cluster name is unique across both kinds and a reader
+//! resolves either through the same lookups.
+//!
 //! The MSK configuration registry lives here for the same reason:
 //! `CreateConfiguration` stores a [`ConfigurationRecord`] and both
 //! `ListConfigurations` and `DescribeConfiguration` render it with
@@ -76,13 +84,14 @@ use crate::ops::types::{
     EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
     JmxExporterInfo, KafkaCluster, KafkaClusterDescription, KafkaClusterSummary, LogDelivery,
     LoggingInfo, MutableClusterInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
-    OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, ProvisionedThroughput,
-    Rebalancing, ReplicationInfo, ReplicationInfoDescription, ReplicationInfoSummary,
-    ReplicatorSummary, S3DestinationConfiguration, StorageInfo, TopicConfiguration, TopicInfo,
-    ZookeeperAccess,
+    OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, ProvisionedRequest,
+    ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
+    ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, Serverless,
+    ServerlessClientAuthentication, ServerlessConnectivityInfo, ServerlessRequest, StorageInfo,
+    TopicConfiguration, TopicInfo, VpcConfig, ZookeeperAccess,
 };
 
-/// How long after `CreateCluster` a new cluster becomes `ACTIVE`.
+/// How long after a cluster create a new cluster becomes `ACTIVE`.
 ///
 /// CHOSEN, not documented: the real service takes many minutes to provision
 /// brokers. The project fixes an emulated clock-owed transition at 250–750 ms, so
@@ -188,6 +197,17 @@ pub const MAX_CLUSTERS_PER_REGION: usize = 90;
 /// regions than AWS publishes, so it can only ever be reached by a caller trying
 /// to exhaust the emulator, never by a realistic client script.
 pub const MAX_CLUSTERS_IN_REGISTRY: usize = MAX_CLUSTERS_PER_REGION * 64;
+
+/// How many entries one list of a serverless cluster's network configuration may
+/// carry: `ServerlessRequest$VpcConfigs`, and each `VpcConfig`'s subnets and
+/// security groups.
+///
+/// CHOSEN as a process-safety backstop, not a published AWS quota (the model
+/// declares no `length` on any of those lists): the lists come from the request
+/// and are STORED on the cluster, so without a ceiling one create would size
+/// every later read of that cluster. Sized well above the handful of VPCs and
+/// subnets a serverless cluster is really reached through.
+pub const MAX_SERVERLESS_VPC_ENTRIES: usize = 16;
 
 /// How long after `CreateVpcConnection` a new VPC connection becomes
 /// `AVAILABLE`.
@@ -584,10 +604,21 @@ pub const REPLICATOR_ARN_MEMBER: &str = "replicatorArn";
 /// The `ClusterType` of a cluster whose brokers this emulator provisions — one of
 /// the two values the model's `ClusterType` enum names. It is STORED on the record
 /// (see [`Cluster::cluster_type`]) rather than assumed by a reader, so a listing's
-/// `ClusterTypeFilter` tests what each cluster IS; the serverless create path
-/// (`CreateClusterV2` with a `Serverless` body) is still a scaffold, so no record
-/// carries `SERVERLESS` yet.
+/// `ClusterTypeFilter` tests what each cluster IS.
 pub const CLUSTER_TYPE_PROVISIONED: &str = "PROVISIONED";
+
+/// The `ClusterType` of a cluster that has no customer broker nodes — the model's
+/// other `ClusterType` value, which [`Cluster::serverless`] stores on the record
+/// together with the [`ServerlessConfig`] the create submitted.
+pub const CLUSTER_TYPE_SERVERLESS: &str = "SERVERLESS";
+
+/// What an operation whose subject is the broker nodes answers for a cluster that
+/// has none: the broker-node views (`ClusterInfo`, the bootstrap strings' access
+/// paths) and the broker-reconfiguring updates all describe a provisioned
+/// cluster, so each refuses a serverless one — and they refuse it in the same
+/// words, so the service says one thing about one condition.
+pub const PROVISIONED_ONLY_MESSAGE: &str =
+    "The cluster is a serverless cluster; this operation applies to provisioned clusters only.";
 
 /// The largest page a listing may report, from the `range` on the `MaxResults`
 /// shape (1..100) that `ListClusters`, `ListClustersV2` and `ListKafkaVersions`
@@ -670,6 +701,48 @@ pub struct Cluster {
     /// acting on it, and the change the clock owes it. `Some` is exactly what
     /// makes the cluster `UPDATING` with an active operation ARN.
     pub pending_update: Option<PendingUpdate>,
+    /// The serverless configuration, for a record whose [`Self::cluster_type`] is
+    /// [`CLUSTER_TYPE_SERVERLESS`]; `None` for a provisioned cluster. It is what
+    /// the `Cluster` shape's `Serverless` member is derived from, so the per-kind
+    /// detail a reader reports comes off the record rather than from the kind's
+    /// name.
+    pub serverless: Option<ServerlessConfig>,
+}
+
+/// The configuration of a serverless cluster: the VPCs its clients reach it
+/// through, the client authentication it accepts, and the one endpoint they
+/// bootstrap on. Held beside the cluster record for the same reason the
+/// provisioned configuration is: every reader derives its answer from this one
+/// stored copy.
+#[derive(Debug, Clone)]
+pub struct ServerlessConfig {
+    /// The `VpcConfigs` the create submitted, in the order it listed them.
+    pub vpc_configs: Vec<VpcConfig>,
+    /// The `ServerlessClientAuthentication` the create submitted, if any.
+    pub client_authentication: Option<ServerlessClientAuthentication>,
+    /// The single host a client bootstraps this cluster through:
+    /// `boot-<id>.kafka-serverless.<region>.amazonaws.com`, the form Amazon MSK
+    /// Serverless publishes. Reached on [`PORT_SASL_IAM`], since IAM access
+    /// control is the only client authentication MSK Serverless offers, which is
+    /// why the serverless arm of `GetBootstrapBrokers` reports one string.
+    pub bootstrap_host: String,
+}
+
+impl ServerlessConfig {
+    /// The configuration as the `Serverless` shape the V2 readers report.
+    pub fn to_serverless(&self) -> Serverless {
+        Serverless {
+            vpc_configs: self.vpc_configs.clone(),
+            client_authentication: self.client_authentication.clone(),
+            // `ServerlessRequest` models no connectivity member, so a serverless
+            // cluster runs the documented default network type and the reader
+            // reports that effective setting rather than leaving the caller to
+            // guess which default applied.
+            connectivity_info: Some(ServerlessConnectivityInfo {
+                network_type: Some(DEFAULT_NETWORK_TYPE.to_string()),
+            }),
+        }
+    }
 }
 
 /// A cluster operation in flight: the change a caller asked for, the ARN of the
@@ -2906,29 +2979,7 @@ impl Cluster {
         input: CreateClusterInput,
     ) -> Self {
         let name = input.cluster_name.as_str();
-        // The registry's counter, as the 1-based ordinal AWS puts at the end of a
-        // cluster ARN. The SAME value seeds the digest, so a cluster's uuid, DNS
-        // suffix and ARN tail all follow from one number.
-        let ordinal = suffix + 1;
-        let digest = stable_digest(&format!(
-            "{}:{region}:{name}:{ordinal}",
-            ::engine::emulator_account_id()
-        ));
-        let cluster_uuid = uuid_v4_shaped_from_digest(&digest);
-        // The DNS suffix of an MSK endpoint is a short opaque cluster id plus the
-        // cell the cluster landed in: `b-1.demo.a1b2c3.c4.kafka.<region>...`.
-        let dns_suffix = format!(
-            "{:02x}{:02x}{:02x}.c{}",
-            digest[16],
-            digest[17],
-            digest[18],
-            1 + u32::from(digest[19] % 9)
-        );
-        let arn = ::engine::emulator_arn(
-            "kafka",
-            region,
-            &format!("cluster/{name}/{cluster_uuid}-{ordinal}"),
-        );
+        let ClusterIdentity { arn, dns_suffix } = cluster_identity(region, name, suffix);
 
         // CLAMPED, not trusted: the model's own 1..15 range already refuses an
         // out-of-range request at the boundary, but this constructor must not let
@@ -2993,7 +3044,113 @@ impl Cluster {
             // `current_version` above is that revision's token.
             revision: 1,
             pending_update: None,
+            // A provisioned cluster carries no serverless configuration: the
+            // per-kind detail is stored for the kind the record IS.
+            serverless: None,
         }
+    }
+
+    /// Mint a serverless cluster: derive the cluster's identity from `suffix` the
+    /// same way [`Self::provisioned`] does, and store the submitted VPC and
+    /// client-authentication configuration as the [`ServerlessConfig`] every
+    /// reader derives the `Serverless` shape from.
+    ///
+    /// `region` is the caller's signing region, `suffix` the registry's monotonic
+    /// counter, `now` the creation instant, `name` the submitted cluster name,
+    /// `tags` the submitted tags and `request` the `Serverless` body of the
+    /// create.
+    ///
+    /// MSK Serverless provisions, scales and patches the brokers itself, so this
+    /// record holds NO broker-node configuration: the broker list is empty, the
+    /// broker count is zero, there is no ZooKeeper ensemble (nothing to connect
+    /// to) and no Apache Kafka version — this API models none for a serverless
+    /// cluster. Nothing reports those members for a serverless record: the
+    /// broker-node readers refuse this kind ([`PROVISIONED_ONLY_MESSAGE`]) and
+    /// the V2 readers report [`Self::serverless`] instead of the provisioned
+    /// detail.
+    pub fn serverless(
+        region: &str,
+        suffix: u64,
+        now: SystemTime,
+        name: String,
+        tags: Option<HashMap<String, String>>,
+        request: ServerlessRequest,
+    ) -> Self {
+        let ClusterIdentity { arn, dns_suffix } = cluster_identity(region, &name, suffix);
+        let config = ServerlessConfig {
+            vpc_configs: request.vpc_configs,
+            client_authentication: request.client_authentication,
+            bootstrap_host: format!("boot-{dns_suffix}.kafka-serverless.{region}.amazonaws.com"),
+        };
+
+        Self {
+            current_version: current_version_token(&arn, 1),
+            arn,
+            name,
+            region: region.to_string(),
+            cluster_type: CLUSTER_TYPE_SERVERLESS.to_string(),
+            // Not a member of this cluster kind: MSK Serverless runs the Apache
+            // Kafka version, and neither the create nor the `Serverless` shape
+            // names one.
+            kafka_version: String::new(),
+            creation_time: now,
+            active_due: now + CLUSTER_ACTIVATION_DELAY,
+            state: CLUSTER_STATE_CREATING.to_string(),
+            // No customer broker nodes, hence no broker-node configuration and no
+            // broker or ZooKeeper endpoints.
+            number_of_broker_nodes: 0,
+            broker_node_group_info: BrokerNodeGroupInfo::default(),
+            client_authentication: None,
+            // MSK Serverless encrypts data in transit between clients and the
+            // cluster, so the stored record says TLS rather than the
+            // provisioned-cluster default; the data volumes are encrypted with
+            // the service's own key for this region, as they are for a
+            // provisioned cluster that names none.
+            encryption_info: resolve_encryption_info(
+                region,
+                Some(EncryptionInfo {
+                    encryption_at_rest: None,
+                    encryption_in_transit: Some(EncryptionInTransit {
+                        client_broker: Some("TLS".to_string()),
+                        in_cluster: Some(true),
+                    }),
+                }),
+            ),
+            enhanced_monitoring: DEFAULT_ENHANCED_MONITORING.to_string(),
+            open_monitoring: OpenMonitoringInfo::default(),
+            logging_info: None,
+            storage_mode: DEFAULT_STORAGE_MODE.to_string(),
+            configuration_info: None,
+            rebalancing: None,
+            tags: tags.unwrap_or_default().into_iter().collect(),
+            zookeeper_connect_string: String::new(),
+            zookeeper_connect_string_tls: String::new(),
+            brokers: Vec::new(),
+            operation_arns: Vec::new(),
+            // There is no ZooKeeper ensemble to reach.
+            zookeeper_access_enabled: false,
+            revision: 1,
+            pending_update: None,
+            serverless: Some(config),
+        }
+    }
+
+    /// Whether this record is a serverless cluster — what an operation whose
+    /// subject is the broker nodes tests before it reports or reconfigures them.
+    pub fn is_serverless(&self) -> bool {
+        self.cluster_type == CLUSTER_TYPE_SERVERLESS
+    }
+
+    /// The one bootstrap string a serverless cluster has, or `None` for a
+    /// provisioned one (whose strings come from [`Self::broker_endpoints`], one
+    /// per enabled access path).
+    pub fn serverless_bootstrap_brokers(&self) -> Option<String> {
+        self.serverless.as_ref().map(|config| {
+            join_endpoints(
+                std::iter::once(config.bootstrap_host.as_str()),
+                PORT_SASL_IAM,
+            )
+        })
     }
 
     /// Apply the transitions the clock already owes this cluster: `CREATING` ->
@@ -3274,12 +3431,12 @@ impl Cluster {
             state_info: None,
             tags: Some(self.tags.clone().into_iter().collect()),
             // Exactly one of the per-kind members is reported, the one this
-            // cluster's `ClusterType` names. Only the provisioned create path is
-            // implemented, so a record of any other kind would carry neither
-            // rather than being reported as provisioned.
+            // cluster's `ClusterType` names: the provisioned detail is derived
+            // from the broker configuration the record holds, the serverless one
+            // from its [`ServerlessConfig`].
             provisioned: (self.cluster_type == CLUSTER_TYPE_PROVISIONED)
                 .then(|| self.to_provisioned()),
-            serverless: None,
+            serverless: self.serverless.as_ref().map(ServerlessConfig::to_serverless),
         }
     }
 
@@ -3452,6 +3609,74 @@ fn join_endpoints<'a>(hosts: impl Iterator<Item = &'a str>, port: u16) -> String
         .map(|host| format!("{host}:{port}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// What one cluster ordinal seeds: the cluster's ARN, and the DNS suffix its
+/// endpoints sit under.
+struct ClusterIdentity {
+    arn: String,
+    dns_suffix: String,
+}
+
+/// Derive a cluster's identity from the registry's monotonic counter, so one
+/// number seeds its uuid, its ARN tail and its endpoint host names — and both
+/// create paths mint an ARN the same way, whichever kind of cluster they
+/// register.
+fn cluster_identity(region: &str, name: &str, suffix: u64) -> ClusterIdentity {
+    // The counter, as the 1-based ordinal AWS puts at the end of a cluster ARN.
+    // The SAME value seeds the digest, so a cluster's uuid, DNS suffix and ARN
+    // tail all follow from one number.
+    let ordinal = suffix + 1;
+    let digest = stable_digest(&format!(
+        "{}:{region}:{name}:{ordinal}",
+        ::engine::emulator_account_id()
+    ));
+    let cluster_uuid = uuid_v4_shaped_from_digest(&digest);
+    ClusterIdentity {
+        arn: ::engine::emulator_arn(
+            "kafka",
+            region,
+            &format!("cluster/{name}/{cluster_uuid}-{ordinal}"),
+        ),
+        // The DNS suffix of an MSK endpoint is a short opaque cluster id plus the
+        // cell the cluster landed in: `b-1.demo.a1b2c3.c4.kafka.<region>...`.
+        dns_suffix: format!(
+            "{:02x}{:02x}{:02x}.c{}",
+            digest[16],
+            digest[17],
+            digest[18],
+            1 + u32::from(digest[19] % 9)
+        ),
+    }
+}
+
+/// The `Provisioned` body of a `CreateClusterV2`, as the `CreateClusterInput`
+/// [`Cluster::provisioned`] mints from.
+///
+/// The two requests carry the SAME provisioned configuration under different
+/// shape names, so regrouping the v2 body here is what makes a v2 provisioned
+/// create and a v1 create register one kind of record instead of two near-copies
+/// that could drift apart.
+pub fn provisioned_create_input(
+    cluster_name: String,
+    tags: Option<HashMap<String, String>>,
+    request: ProvisionedRequest,
+) -> CreateClusterInput {
+    CreateClusterInput {
+        broker_node_group_info: request.broker_node_group_info,
+        rebalancing: request.rebalancing,
+        client_authentication: request.client_authentication,
+        cluster_name,
+        configuration_info: request.configuration_info,
+        encryption_info: request.encryption_info,
+        enhanced_monitoring: request.enhanced_monitoring,
+        open_monitoring: request.open_monitoring,
+        kafka_version: request.kafka_version,
+        logging_info: request.logging_info,
+        number_of_broker_nodes: request.number_of_broker_nodes,
+        tags,
+        storage_mode: request.storage_mode,
+    }
 }
 
 /// The submitted `EncryptionInfo` with every default resolved, so the stored

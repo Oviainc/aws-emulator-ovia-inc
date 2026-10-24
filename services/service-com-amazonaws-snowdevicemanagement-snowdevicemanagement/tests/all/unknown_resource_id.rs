@@ -3,21 +3,22 @@
 //! What every id-addressed operation of this service answers for an id that names
 //! nothing, end to end over HTTP.
 //!
-//! The rule under test: once the account-level device gate has passed — the account
-//! has at least one device with Snow Device Management activated in the signed
-//! Region — an operation addressed to a resource by id answers the modelled
-//! `ResourceNotFoundException` (HTTP 404) for an id that names no such resource in
-//! that Region, never the permission refusal: `AccessDeniedException` (HTTP 403) is
-//! the ACCOUNT-level precondition only. The complement is asserted too, so the
-//! boundary between the two is pinned from both sides: in a Region with no activated
-//! device the very same calls answer the 403 gate.
+//! The rule under test: an operation addressed to a resource by id answers the
+//! modelled `ResourceNotFoundException` (HTTP 404) for an id that names no such
+//! resource in the signed Region, never the permission refusal —
+//! `AccessDeniedException` (HTTP 403) is for a caller the action is not permitted
+//! for, which is not what an id naming nothing is. The same ids are asked of a
+//! Region that holds an inventory and of one that holds none, so the answer is shown
+//! to come from the id rather than from how much the Region holds.
 //!
 //! Rows differ along what the rule generalises over: the operation (every one the
 //! model gives a `ResourceNotFoundException` and an id to resolve), the kind of id
 //! (managed device, task, the execution pair), and the SHAPE of the unknown id —
 //! both modelled `@length(1..64)` bounds, an id in the shape the store mints, ids in
 //! other shapes, and an id that exists but in ANOTHER Region, which is what makes
-//! the lookup regional rather than global.
+//! the lookup regional rather than global. The last test pins the other side of
+//! that: a task's executions are read out of the Region the task was created in, so
+//! one Region's answers never carry another's records.
 //!
 //! Nothing here asserts a value the emulator invented: the inventory is put in state
 //! through the one activation seam (the API models no device-creation operation), the
@@ -42,8 +43,8 @@ const SIGNED_REGION: &str = "us-west-2";
 /// regional.
 const OTHER_REGION: &str = "eu-central-1";
 
-/// How many devices are activated in [`SIGNED_REGION`], so the account-level gate
-/// does not fire there.
+/// How many devices are activated in [`SIGNED_REGION`], so the Region holds an
+/// inventory for an id to be looked up against.
 const ACTIVATED_DEVICES: u64 = 2;
 
 /// What the emulator answered: the HTTP status and the JSON body.
@@ -252,7 +253,7 @@ async fn create_task(router: &MultiServiceRouter, device: &str) -> String {
 fn assert_not_found(answer: &Answer, case: &str) {
     assert_eq!(
         answer.status, 404,
-        "case {case:?}: an id that names nothing past the account gate is the modelled \
+        "case {case:?}: an id that names nothing is the modelled \
          ResourceNotFoundException, got {} with {}",
         answer.status, answer.body
     );
@@ -393,48 +394,146 @@ async fn an_unknown_task_id_is_not_found_on_every_operation_that_resolves_one() 
 }
 
 #[tokio::test]
-async fn the_permission_refusal_is_the_account_level_precondition_only() {
+async fn an_execution_is_read_out_of_the_region_its_task_was_created_in() {
+    // Two Regions of the same account, each with a task over its OWN device: a
+    // request names a task id, and what it gets back must come from the partition
+    // it signed for — never another Region's execution records.
+    let (router, managed, elsewhere) = emulator_with(SIGNED_REGION, ACTIVATED_DEVICES);
+    let here = create_task(&router, &managed[0]).await;
+    let there = {
+        let answer = call(
+            &router,
+            OTHER_REGION,
+            "POST",
+            "/task",
+            Some(json!({ "targets": [&elsewhere[0]], "command": { "reboot": {} } })),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case \"fixture\": CreateTask in {OTHER_REGION} must succeed, got {} with {}",
+            answer.status, answer.body
+        );
+        answer.body["taskId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case \"fixture\": expected a taskId, got {}", answer.body))
+            .to_string()
+    };
+
+    // Rows: the Region, its own task, the one device that task targets, and the
+    // device of the OTHER Region, which none of its answers may name.
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
+        (SIGNED_REGION, &here, &managed[0], &elsewhere[0]),
+        (OTHER_REGION, &there, &elsewhere[0], &managed[0]),
+    ];
+
+    for (region, task, device, foreign_device) in rows {
+        let case = format!("ListExecutions of {task} in {region}");
+        let answer = call(
+            &router,
+            region,
+            "GET",
+            &format!("/executions?taskId={task}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a task of this Region lists its executions, got {} with {}",
+            answer.status, answer.body
+        );
+        let listed = answer.body["executions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected executions, got {}", answer.body))
+            .clone();
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case:?}: the task targets exactly one device, got {}",
+            answer.body
+        );
+        for execution in &listed {
+            assert_eq!(
+                execution["managedDeviceId"].as_str(),
+                Some(device),
+                "case {case:?}: a page may only hold this Region's executions, got {execution}"
+            );
+            assert_eq!(
+                execution["taskId"].as_str(),
+                Some(task),
+                "case {case:?}: a page may only hold this task's executions, got {execution}"
+            );
+        }
+
+        // The pair that exists resolves; the same task against the other Region's
+        // device does not, so neither half of the key crosses the partition.
+        let case = format!("DescribeExecution {task}/{device} in {region}");
+        let answer = call(
+            &router,
+            region,
+            "POST",
+            &format!("/task/{task}/execution/{device}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the pair this Region holds must describe, got {} with {}",
+            answer.status, answer.body
+        );
+        let case = format!("DescribeExecution {task}/{foreign_device} in {region}");
+        let answer = call(
+            &router,
+            region,
+            "POST",
+            &format!("/task/{task}/execution/{foreign_device}"),
+            None,
+        )
+        .await;
+        assert_not_found(&answer, &case);
+    }
+
+    // And each Region's task is unknown in the other, so its executions are
+    // unreachable from there whatever that Region holds.
+    for (region, foreign_task) in [(SIGNED_REGION, &there), (OTHER_REGION, &here)] {
+        let case = format!("ListExecutions of {foreign_task} in {region}");
+        let answer = call(
+            &router,
+            region,
+            "GET",
+            &format!("/executions?taskId={foreign_task}"),
+            None,
+        )
+        .await;
+        assert_not_found(&answer, &case);
+    }
+}
+
+#[tokio::test]
+async fn an_id_is_resolved_against_the_signed_region_whatever_that_region_holds() {
     // The SAME calls with the SAME unknown ids, in a Region this account has
-    // activated no device in: there the account-level gate answers 403 before any id
-    // is resolved. This is the complement of the two tests above, so the boundary
-    // between the 403 and the 404 is pinned from both sides.
+    // activated no device in: an id names nothing there either, so the answer is the
+    // one above. Nothing turns a sparse Region into a permission problem.
     let (router, managed, _) = emulator_with(SIGNED_REGION, ACTIVATED_DEVICES);
     let task = create_task(&router, &managed[0]).await;
-    let gated_region = "ap-northeast-1";
+    let empty_region = "ap-northeast-1";
 
     let mut rows: Vec<Request> = device_addressed("smd-ffffffffffffffff", &task);
     rows.extend(task_addressed("st-ffffffffffffffff", &managed[0]));
-    // The ids that DO exist in the signed Region are refused in the gated one too:
-    // the gate is a property of the Region, not of the id.
+    // The ids that DO exist in the signed Region name nothing in the empty one: the
+    // lookup is regional.
     rows.extend(device_addressed(&managed[0], &task));
 
     for request in rows {
-        let case = format!("{} in {gated_region}", request.operation);
+        let case = format!("{} in {empty_region}", request.operation);
         let answer = call(
             &router,
-            gated_region,
+            empty_region,
             request.method,
             &request.uri,
             request.body,
         )
         .await;
-        assert_eq!(
-            answer.status, 403,
-            "case {case:?}: a Region with no activated device is refused by the \
-             account-level gate, got {} with {}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.error_code(),
-            "AccessDeniedException",
-            "case {case:?}: expected AccessDeniedException, got {}",
-            answer.body
-        );
-        let message = answer.message().to_lowercase();
-        assert!(
-            message.contains("device") && message.contains("region"),
-            "case {case:?}: the gate states the account-level precondition, got {:?}",
-            answer.message()
-        );
+        assert_not_found(&answer, &case);
     }
 }

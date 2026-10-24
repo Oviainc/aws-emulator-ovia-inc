@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApiCache
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApiCache`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApiCache::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: enforces the documented `ttl` window, then provisions the API's one
+//! `ApiCache` in [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +169,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApiCache` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiCacheErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The cache is built from the deserialized input and the clock; no request
+        // metadata takes part, so `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateApiCacheErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(CreateApiCacheErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // `ttl` is documented "Valid values are 1–3,600 seconds" but targets an
+        // unconstrained `Long`, so the window is enforced here: a value outside it is
+        // a value the request may not carry, refused with the operation's modelled
+        // client error BEFORE anything is written, so the refusal leaves no cache
+        // behind.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApiCache"))
+        // The window is a property of the REQUEST, so it is checked before the API is
+        // resolved — the order the `apiId` check above already takes: a request that
+        // may not be sent is refused the same way whatever its `apiId` names, and only
+        // a well-formed request can produce a not-found.
+        if !crate::state::is_cache_ttl(input.ttl) {
+            return Err(CreateApiCacheErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_cache_ttl_message()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Apply what the clock owes before reading, so an earlier create's pending
+        // transition is not re-decided by this call.
+        guard.settle_api_caches(now);
+
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(CreateApiCacheErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        // The cache belongs to the API, one per API: a second create has no cache to
+        // create.
+        if api.api_cache.is_some() {
+            return Err(CreateApiCacheErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::CACHE_ALREADY_EXISTS_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // A fresh instance is reported in the non-terminal `CREATING` status and
+        // becomes available when the clock says so; nothing sleeps for it.
+        api.api_cache = Some(crate::state::ApiCacheRecord {
+            ttl: input.ttl,
+            api_caching_behavior: input.api_caching_behavior,
+            r#type: input.r#type,
+            transit_encryption_enabled: input.transit_encryption_enabled,
+            at_rest_encryption_enabled: input.at_rest_encryption_enabled,
+            health_metrics_config: input.health_metrics_config,
+            status: crate::state::CACHE_CREATING.to_string(),
+            available_at: now.checked_add(crate::state::CACHE_SPAN),
+        });
+
+        // Answer from the STORED cache, so this body is the one `GetApiCache` answers
+        // with later.
+        Ok(CreateApiCacheOutput {
+            api_cache: api
+                .api_cache
+                .as_ref()
+                .map(crate::state::ApiCacheRecord::to_api_cache),
+        })
     }
 }

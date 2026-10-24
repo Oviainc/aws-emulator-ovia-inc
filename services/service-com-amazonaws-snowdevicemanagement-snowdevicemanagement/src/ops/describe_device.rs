@@ -172,17 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate, consulted BEFORE the id is resolved: on a
-        // Region this account has activated no Snow device in, the caller never
-        // learns whether the id it named exists.
-        if !store.has_activated_device(&region) {
-            return Err(DescribeDeviceErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         store.settle(now);
 
+        // The addressed id decides the answer: one that names no device this
+        // account manages in the signed Region is the modelled
+        // `ResourceNotFoundException`. An account that manages no device at all is
+        // not a permission problem — `AccessDeniedException` is what a caller the
+        // action is not permitted for is answered with.
         let Some(device) = store.device_in(&region, &input.managed_device_id) else {
             return Err(DescribeDeviceErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(

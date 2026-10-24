@@ -92,6 +92,16 @@ pub const LIST_RUM_METRICS_DESTINATIONS: &str = "rum:ListRumMetricsDestinations"
 /// `rum:DeleteRumMetricsDestination`.
 pub const DELETE_RUM_METRICS_DESTINATION: &str = "rum:DeleteRumMetricsDestination";
 
+/// `rum:TagResource`, the action a caller must hold to write the tags of the resource its
+/// `ResourceArn` names.
+pub const TAG_RESOURCE: &str = "rum:TagResource";
+
+/// `rum:UntagResource`.
+pub const UNTAG_RESOURCE: &str = "rum:UntagResource";
+
+/// `rum:ListTagsForResource`.
+pub const LIST_TAGS_FOR_RESOURCE: &str = "rum:ListTagsForResource";
+
 /// `rum:BatchCreateRumMetricDefinitions`.
 pub const BATCH_CREATE_RUM_METRIC_DEFINITIONS: &str = "rum:BatchCreateRumMetricDefinitions";
 

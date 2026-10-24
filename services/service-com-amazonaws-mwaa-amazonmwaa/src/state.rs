@@ -61,6 +61,41 @@ pub const MAX_ENVIRONMENTS: usize = 1_000;
 /// How many tags one environment can carry, from `TagMap`'s own `@length(1, 50)`.
 pub const MAX_TAGS: usize = 50;
 
+/// How many Apache Airflow variables this emulator holds for ONE environment, and how
+/// many pools.
+///
+/// Both collections are created through the environment's own Apache Airflow REST API
+/// (`InvokeRestApi`), so they are caller-driven growth: without a ceiling a caller
+/// looping on a create could grow this process's memory without bound. Neither number is
+/// a fidelity claim about an Apache Airflow limit — Apache Airflow caps neither — they are
+/// the emulator's own ceilings, set generously so no realistic workflow meets them.
+pub const MAX_AIRFLOW_VARIABLES: usize = 500;
+
+/// How many Apache Airflow pools this emulator holds for one environment. Same reasoning
+/// as [`MAX_AIRFLOW_VARIABLES`].
+pub const MAX_AIRFLOW_POOLS: usize = 500;
+
+/// The longest key (a variable's key, a pool's name) this store keeps, in characters. The
+/// emulator's own ceiling, for the same reason as the counts above: the stored size of one
+/// entry is otherwise whatever a request carries.
+pub const MAX_AIRFLOW_KEY_LENGTH: usize = 250;
+
+/// The longest Apache Airflow variable value (or description) this store keeps, in
+/// characters. With the counts above this bounds what one environment's Apache Airflow
+/// metadata can grow to. See [`MAX_AIRFLOW_KEY_LENGTH`].
+pub const MAX_AIRFLOW_VALUE_LENGTH: usize = 4 * 1024;
+
+/// Apache Airflow's own default slot pool, which every environment's metadata database
+/// holds before any pool is created through the API: the pool a task with no `pool` set
+/// runs in, with its 128 slots and its description as Apache Airflow seeds them.
+pub const DEFAULT_POOL_NAME: &str = "default_pool";
+
+/// How many slots [`DEFAULT_POOL_NAME`] holds, as Apache Airflow seeds it.
+pub const DEFAULT_POOL_SLOTS: i64 = 128;
+
+/// The description [`DEFAULT_POOL_NAME`] carries, as Apache Airflow seeds it.
+pub const DEFAULT_POOL_DESCRIPTION: &str = "Default pool";
+
 /// `EnvironmentStatus` while the environment is being created — "The request to create
 /// the environment is in progress." (the `Status` member's own doc).
 pub const STATUS_CREATING: &str = "CREATING";
@@ -609,6 +644,10 @@ pub struct EnvironmentRecord {
     pub last_update: Option<LastUpdateRecord>,
     /// A `BTreeMap` so tags read back in a stable order.
     pub tags: BTreeMap<String, String>,
+    /// What this environment's Apache Airflow metadata database holds — the state its
+    /// Apache Airflow REST API (`InvokeRestApi`) reads and writes. Per environment,
+    /// because two environments run two web servers over two databases.
+    pub airflow: AirflowMetadata,
 }
 
 impl EnvironmentRecord {
@@ -738,6 +777,74 @@ impl EnvironmentRecord {
             },
         ]
         .into();
+    }
+}
+
+/// One Apache Airflow variable, as the environment's metadata database holds it: a key,
+/// its string value and an optional description. Written and read only through the
+/// environment's Apache Airflow REST API (`InvokeRestApi`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirflowVariable {
+    pub key: String,
+    pub value: String,
+    pub description: Option<String>,
+}
+
+/// One Apache Airflow slot pool, as the environment's metadata database holds it.
+///
+/// Only the pool's CONFIGURATION is stored. Every slot counter an Apache Airflow pool
+/// reports (occupied, running, queued, scheduled, deferred) counts task instances the
+/// scheduler placed in the pool, and nothing in this process schedules a task, so those
+/// counters are computed rather than stored: see
+/// [`crate::ops::invoke_rest_api`]. 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirflowPool {
+    pub name: String,
+    pub slots: i64,
+    pub description: Option<String>,
+    /// Whether deferred task instances occupy a slot of this pool.
+    pub include_deferred: bool,
+}
+
+/// The Apache Airflow metadata database of ONE environment, as far as this emulator holds
+/// it: the entities an Apache Airflow REST API caller creates THROUGH that API.
+///
+/// What is deliberately NOT here is the DAG inventory. An Apache Airflow DAG is defined by
+/// the Python DAG file the environment loads from its Amazon S3 DAG path, and its `dag_id`
+/// is whatever that file's code sets when the DAG processor imports it — so the inventory
+/// of an environment can only be known by EXECUTING those files, which no Apache Airflow
+/// DAG processor in this process does. The DAG collection an environment reports is
+/// therefore empty, and every DAG a request addresses by id resolves to nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirflowMetadata {
+    /// Variables by key, so a listing has a deterministic order.
+    pub variables: BTreeMap<String, AirflowVariable>,
+    /// Slot pools by name, seeded with [`DEFAULT_POOL_NAME`].
+    pub pools: BTreeMap<String, AirflowPool>,
+}
+
+impl AirflowMetadata {
+    /// The metadata database of a NEW environment: no variables, and the one pool Apache
+    /// Airflow seeds every metadata database with ([`DEFAULT_POOL_NAME`]).
+    pub fn new() -> Self {
+        Self {
+            variables: BTreeMap::new(),
+            pools: BTreeMap::from([(
+                DEFAULT_POOL_NAME.to_string(),
+                AirflowPool {
+                    name: DEFAULT_POOL_NAME.to_string(),
+                    slots: DEFAULT_POOL_SLOTS,
+                    description: Some(DEFAULT_POOL_DESCRIPTION.to_string()),
+                    include_deferred: false,
+                },
+            )]),
+        }
+    }
+}
+
+impl Default for AirflowMetadata {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

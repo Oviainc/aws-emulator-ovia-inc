@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateClusterV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateClusterV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a cluster of EITHER kind the model's `ClusterType` names and registers it
+//! in [`crate::state::ComAmazonawsKafkaKafkaState`] — the same registry
+//! `CreateCluster` writes to, so a cluster name is unique across both kinds and
+//! every reader resolves a v2-created cluster exactly as it resolves a v1-created
+//! one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateClusterV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The create's body says which kind: a `Provisioned` body carries the same
+//! configuration a v1 `CreateCluster` does, so it is regrouped by
+//! [`crate::state::provisioned_create_input`] and minted through the one
+//! provisioned path ([`crate::state::Cluster::provisioned`]); a `Serverless` body
+//! is minted by [`crate::state::Cluster::serverless`]. The two are alternatives,
+//! so a request naming both, or neither, describes no cluster and is a
+//! `BadRequestException`.
+//!
+//! A cluster name is unique within an account and region, so a second create under
+//! a name already taken — by a cluster of either kind — is a `ConflictException`,
+//! and the `Tags` the request carries go through the same admission check a later
+//! `TagResource` uses ([`crate::state::tag_write_violation`]).
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +173,259 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateClusterV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateClusterV2"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClusterV2ErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let CreateClusterV2Input {
+            cluster_name,
+            tags,
+            provisioned,
+            serverless,
+        } = input;
+
+        // Which kind of cluster this creates, decided by the body the request
+        // carries. The two bodies are alternatives: a request naming both
+        // describes two different clusters and one naming neither describes none,
+        // so both are refused before anything is minted. Everything that depends
+        // on the request alone is checked here, before the registry lock is
+        // taken.
+        let body = match (provisioned, serverless) {
+            (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
+            (None, Some(request)) => ClusterBody::Serverless(request),
+            (Some(_), Some(_)) => {
+                return Err(bad_request(
+                    "Serverless",
+                    "A create names one cluster type: Provisioned and Serverless \
+                     cannot both be given."
+                        .to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(bad_request(
+                    "Provisioned",
+                    "A create names one cluster type: either Provisioned or \
+                     Serverless must be given."
+                        .to_string(),
+                ))
+            }
+        };
+        if let Some((parameter, reason)) = body.violation() {
+            return Err(bad_request(parameter, reason));
+        }
+
+        // The tag rules apply wherever a caller supplies tags, so the set a
+        // create carries goes through the same admission check `TagResource`
+        // uses — against an empty stored set, because the cluster this request
+        // would mint carries no tags yet. A refused create registers nothing.
+        if let Some(reason) = crate::state::tag_write_violation(
+            &std::collections::BTreeMap::new(),
+            tags.iter()
+                .flatten()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(bad_request("Tags", reason));
+        }
+
+        let mut state = state.lock();
+
+        // A cluster name identifies a cluster within an account and region —
+        // whichever kind it is — so a name already in use IN THIS REGION is a
+        // conflict; the same name in another region is a different cluster.
+        if let Some(existing) = state.arn_for_name(&region, &cluster_name) {
+            return Err(
+                CreateClusterV2ErrorModeled::ConflictException(ConflictException {
+                    invalid_parameter: Some("ClusterName".to_string()),
+                    message: Some(format!(
+                        "A cluster with the name '{cluster_name}' already exists: {existing}"
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The monotonic counter is what makes each cluster's ARN and endpoints
+        // distinct; it advances whether or not anything else about the request
+        // repeats an earlier one.
+        let suffix = state.next_cluster_suffix;
+        state.next_cluster_suffix += 1;
+        let now = std::time::SystemTime::now();
+        let cluster = match body {
+            // A provisioned v2 create and a v1 create submit the same
+            // configuration, so both mint through the one provisioned path.
+            ClusterBody::Provisioned(request) => crate::state::Cluster::provisioned(
+                &region,
+                suffix,
+                now,
+                crate::state::provisioned_create_input(cluster_name, tags, *request),
+            ),
+            ClusterBody::Serverless(request) => {
+                crate::state::Cluster::serverless(&region, suffix, now, cluster_name, tags, request)
+            }
+        };
+
+        let output = CreateClusterV2Output {
+            cluster_arn: Some(cluster.arn.clone()),
+            cluster_name: Some(cluster.name.clone()),
+            // Read off the record rather than from the branch above, so the
+            // answer reports the kind the registry now holds.
+            cluster_type: Some(cluster.cluster_type.clone()),
+            state: Some(cluster.state.clone()),
+        };
+        // The registry is bounded, and it enforces its own ceilings on the one
+        // insertion path, so a create past them is refused there rather than
+        // growing the store by one more call. A refused create registers nothing,
+        // so the ordinal it reserved goes back: the counter counts clusters ever
+        // registered, not calls ever made.
+        if let Err(rejected) = state.register_cluster(cluster) {
+            state.next_cluster_suffix = suffix;
+            return Err(match rejected {
+                crate::state::RegisterRejected::RegionQuota => {
+                    CreateClusterV2ErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            invalid_parameter: Some("ClusterName".to_string()),
+                            message: Some(format!(
+                                "The account has reached its limit of {} clusters in {region}.",
+                                crate::state::MAX_CLUSTERS_PER_REGION
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                // No request member is at fault for a process-wide backstop, so
+                // this one names none.
+                crate::state::RegisterRejected::RegistryCeiling => {
+                    CreateClusterV2ErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            invalid_parameter: None,
+                            message: Some(format!(
+                                "This emulator holds its maximum of {} clusters.",
+                                crate::state::MAX_CLUSTERS_IN_REGISTRY
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                // Unreachable: the ordinal above is monotonic, so the ARN it
+                // mints is new. Reported as a server fault rather than
+                // overwriting a cluster.
+                crate::state::RegisterRejected::DuplicateArn => {
+                    CreateClusterV2ErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the minted cluster ARN is already registered".to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+        Ok(output)
     }
+}
+
+/// Which kind of cluster a `CreateClusterV2` creates, and the configuration that
+/// kind was submitted with — the model's two alternative request bodies, as the
+/// one of them this request carries.
+enum ClusterBody {
+    /// Boxed because the provisioned configuration is much the larger of the two
+    /// bodies, and this enum is only a one-of for which one the request carried.
+    Provisioned(Box<ProvisionedRequest>),
+    Serverless(ServerlessRequest),
+}
+
+impl ClusterBody {
+    /// Why this body could not describe a cluster — the member at fault and what
+    /// is wrong with it — or `None` when it is usable.
+    ///
+    /// These are the request values that SIZE what the registry then holds and
+    /// every later read of it, so they are checked here rather than trusted: the
+    /// broker count the broker list is built from, and the lengths of the
+    /// caller-supplied VPC lists a serverless cluster stores.
+    fn violation(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::Provisioned(request) => {
+                // The model's own 1..15 range refuses an out-of-range value at the
+                // boundary; it is checked again here because it is a request value
+                // that sizes the broker list.
+                (request.number_of_broker_nodes < 1
+                    || request.number_of_broker_nodes
+                        > crate::state::MAX_BROKER_NODES_PER_CLUSTER)
+                    .then(|| {
+                        (
+                            "Provisioned.NumberOfBrokerNodes",
+                            format!(
+                                "NumberOfBrokerNodes must be between 1 and {}, not {}.",
+                                crate::state::MAX_BROKER_NODES_PER_CLUSTER,
+                                request.number_of_broker_nodes
+                            ),
+                        )
+                    })
+            }
+            Self::Serverless(request) => {
+                let entries = crate::state::MAX_SERVERLESS_VPC_ENTRIES;
+                if request.vpc_configs.is_empty() {
+                    // A serverless cluster is reached through the VPCs its
+                    // configuration names, so a create that names none describes
+                    // a cluster no client could connect to.
+                    return Some((
+                        "Serverless.VpcConfigs",
+                        "VpcConfigs must name at least one VPC configuration.".to_string(),
+                    ));
+                }
+                if request.vpc_configs.len() > entries {
+                    return Some((
+                        "Serverless.VpcConfigs",
+                        format!("VpcConfigs must name at most {entries} VPC configurations."),
+                    ));
+                }
+                for config in &request.vpc_configs {
+                    if config.subnet_ids.is_empty() {
+                        return Some((
+                            "Serverless.VpcConfigs.SubnetIds",
+                            "Each VPC configuration must name at least one subnet.".to_string(),
+                        ));
+                    }
+                    if config.subnet_ids.len() > entries {
+                        return Some((
+                            "Serverless.VpcConfigs.SubnetIds",
+                            format!("A VPC configuration must name at most {entries} subnets."),
+                        ));
+                    }
+                    if config
+                        .security_group_ids
+                        .as_ref()
+                        .is_some_and(|groups| groups.len() > entries)
+                    {
+                        return Some((
+                            "Serverless.VpcConfigs.SecurityGroupIds",
+                            format!(
+                                "A VPC configuration must name at most {entries} security groups."
+                            ),
+                        ));
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Refuse the request with the modeled `BadRequestException`, naming the member at
+/// fault and what was wrong with it — the caller has to fix the request from this
+/// text alone.
+fn bad_request(parameter: &str, message: String) -> CreateClusterV2Error {
+    CreateClusterV2ErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }

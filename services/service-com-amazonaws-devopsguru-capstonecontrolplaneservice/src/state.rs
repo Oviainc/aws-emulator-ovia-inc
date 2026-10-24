@@ -1760,6 +1760,12 @@ pub const COST_ESTIMATION_TAG_TYPE: &str = "AWS::Tag";
 /// resource the reported `ResourceId` belongs to.
 pub const COST_ESTIMATION_RESOURCE_TYPE: &str = "COST_ESTIMATION";
 
+/// The `ResourceType` a notification-channel-shaped `ConflictException` reports: the
+/// kind of resource the reported `ResourceId` (a `NotificationChannelId`) belongs to.
+/// `ResourceIdType` is an unconstrained string, as it is for
+/// [`COST_ESTIMATION_RESOURCE_TYPE`].
+pub const NOTIFICATION_CHANNEL_RESOURCE_TYPE: &str = "NOTIFICATION_CHANNEL";
+
 /// Emulator-enforced ceiling on `ResourceCollection.Tags`, from the documented AWS
 /// rule rather than from the model: `TagCostEstimationResourceCollectionFilter`'s
 /// documentation states "The maximum number of tags you can specify for a cost

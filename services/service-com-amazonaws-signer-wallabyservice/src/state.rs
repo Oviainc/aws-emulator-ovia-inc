@@ -1039,13 +1039,127 @@ pub fn platform_requires_signing_material(platform_id: &str) -> bool {
 /// `^[a-zA-Z0-9_]{2,}$`.
 ///
 /// The boundary validator already refuses a modelled `ProfileName` member, so
-/// this is for a value the model does not constrain: a `nextToken`, which this
-/// service's profile pagination carries a profile name in.
+/// this is for a name read out of a value the model does not constrain: the
+/// profile name a tagging `resourceArn` carries, and the one a decoded
+/// pagination token resumes at.
 pub fn is_profile_name(value: &str) -> bool {
     (2..=64).contains(&value.len())
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Which signing profiles one profile listing enumerates: the region whose
+/// endpoint is answering, the platform the caller filtered on and the statuses a
+/// profile may carry to be reported.
+///
+/// A pagination token is issued FOR one listing and resumes only a call that
+/// enumerates that same listing, so a token carried over to another region or
+/// another filter set is refused rather than serving a page out of a different
+/// order.
+#[derive(Debug)]
+pub struct ProfileListing {
+    /// The region whose profiles are enumerated, and no other region's.
+    pub region: String,
+    /// The `platformId` filter, or `None` when the call filters on no platform.
+    pub platform_id: Option<String>,
+    /// The statuses a profile may carry to be reported, already resolved from
+    /// the caller's `statuses` and `includeCanceled`.
+    pub statuses: Vec<String>,
+}
+
+/// Version marker every profile pagination token carries, so a value in any
+/// other shape is refused instead of being read as a cursor.
+const PROFILE_PAGE_TOKEN_VERSION: &str = "v1";
+
+/// What separates the listing a cursor was issued for from the profile name it
+/// resumes at. A unit separator starts no rendered field (each one starts with a
+/// digit, see [`ProfileListing::canonical`]), so the boundary is unambiguous
+/// whatever a request put in the fields.
+const PROFILE_PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// One field of a rendered listing: its byte length, then the value.
+///
+/// Length-prefixed rather than delimiter-joined because `platformId` and
+/// `statuses` are request values this service does not constrain to an
+/// alphabet, so a delimiter could be IN one of them and make the renderings of
+/// two different listings collide — which would let a token issued for one
+/// filter set resume another.
+fn rendered_field(value: &str) -> String {
+    format!("{}:{value}", value.len())
+}
+
+impl ProfileListing {
+    /// What this listing enumerates, rendered canonically: two calls that
+    /// enumerate the same profiles in the same order render identically however
+    /// the caller spelled their filters, and two that do not never collide.
+    fn canonical(&self) -> String {
+        let mut statuses: Vec<&str> = self.statuses.iter().map(String::as_str).collect();
+        statuses.sort_unstable();
+        statuses.dedup();
+        let mut canonical = String::from(PROFILE_PAGE_TOKEN_VERSION);
+        canonical.push_str(&rendered_field(&self.region));
+        canonical.push_str(&rendered_field(
+            self.platform_id.as_deref().unwrap_or_default(),
+        ));
+        for status in statuses {
+            canonical.push_str(&rendered_field(status));
+        }
+        canonical
+    }
+
+    /// The `nextToken` a page of this listing that stops BEFORE `resume_at`
+    /// hands back.
+    ///
+    /// The cursor — the listing it was issued for and the profile name the next
+    /// page starts at — hex-encoded and followed by its digest: opaque to the
+    /// caller, which can only carry it back, and built from the unreserved
+    /// characters an `@httpQuery` value travels in unescaped.
+    pub fn page_token(&self, resume_at: &str) -> String {
+        let cursor = format!(
+            "{}{PROFILE_PAGE_TOKEN_SEPARATOR}{resume_at}",
+            self.canonical()
+        );
+        format!("{}{}", ::hex::encode(&cursor), cursor_digest(&cursor))
+    }
+
+    /// The profile name `token` resumes THIS listing at, or `None` when `token`
+    /// is not one this listing handed out: a value whose digest does not match
+    /// the cursor it carries (so anything truncated or altered in transit), or a
+    /// cursor issued for another region or another filter set.
+    pub fn resume_at(&self, token: &str) -> Option<String> {
+        // Every token is hex digits, so the split below lands on a character
+        // boundary and a value in any other alphabet is already not one of ours.
+        if !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let (encoded, digest) = token.split_at(token.len().checked_sub(DIGEST_HEX_LEN)?);
+        let cursor = String::from_utf8(::hex::decode(encoded).ok()?).ok()?;
+        if !cursor_digest(&cursor).eq_ignore_ascii_case(digest) {
+            return None;
+        }
+        let issued_for = format!("{}{PROFILE_PAGE_TOKEN_SEPARATOR}", self.canonical());
+        let resume_at = cursor.strip_prefix(&issued_for)?;
+        is_profile_name(resume_at).then(|| resume_at.to_string())
+    }
+}
+
+/// How many hex digits of a cursor's digest a pagination token carries.
+const DIGEST_HEX_LEN: usize = 16;
+
+/// A cursor's digest, as the hex digits a token ends with.
+///
+/// This is a CHECKSUM, not a signature: it makes a token tamper-EVIDENT — a
+/// value truncated or altered carries no digest of the cursor it decodes to, so
+/// it resolves to no resume point at all instead of to one the service never
+/// handed out — and it does not make a token unforgeable, since nothing here is
+/// keyed. That is what this pagination needs: what a resumed page must never do
+/// is serve a position out of a DIFFERENT enumeration, and a cursor a client
+/// reconstructed for this same listing still resolves to a name within it.
+fn cursor_digest(cursor: &str) -> String {
+    ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(cursor.as_bytes()))
+        [..DIGEST_HEX_LEN]
+        .to_string()
 }
 
 /// The region this request was signed for — the region whose endpoint is being

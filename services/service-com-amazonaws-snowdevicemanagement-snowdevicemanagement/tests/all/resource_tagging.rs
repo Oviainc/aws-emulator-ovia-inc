@@ -50,7 +50,8 @@ const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// [`SIGNED_REGION`]. The API models no device-creation operation — a device becomes
 /// manageable by being ORDERED — so the inventory enters state through the one
 /// activation seam; without it the account's inventory is empty and the device and task
-/// operations answer the account-level device gate (see `account_device_gate.rs`).
+/// operations answer the modelled `ResourceNotFoundException` (see
+/// `empty_inventory_refusals.rs`).
 const ACTIVATED_DEVICES: u64 = 3;
 
 /// One emulator: a router carrying only this service, over one shared engine, with Snow

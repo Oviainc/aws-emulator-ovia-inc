@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateDhcpOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateDhcpOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateDhcpOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Points one VPC of this service's state at one DHCP options set: the association IS the
+//! `Vpc$DhcpOptionsId` member ([`crate::state::ComAmazonawsEc2Amazonec2State::vpcs`]), where
+//! `DescribeVpcs` reads it back, so there is no second record of it to disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +84,10 @@ impl AssociateDhcpOptionsOutput {
     );
 }
 
+/// The ec2Query envelope's `<return>true</return>` success flag is NOT written here: this
+/// operation's modelled output declares no members at all, which is exactly the case
+/// `Ec2QueryEnvelope` (`crate::service`) writes the flag for — once, for every operation of
+/// this service — so the handler has nothing of its own to serialize.
 pub static ASSOCIATE_DHCP_OPTIONS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &AssociateDhcpOptionsOutput::SCHEMA;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for AssociateDhcpOptionsOutput {
@@ -156,18 +155,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateDhcpOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateDhcpOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateDhcpOptions"))
+        // `ctx` carries request metadata only; this operation reads none of it — both the
+        // VPC and the options set are named by id. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the DHCP options set, or `default` to associate no DHCP options with
+        // the VPC" (`DhcpOptionsId`): `default` is a WORD, not an id, so it is the one
+        // value that is neither shaped like an id nor looked up. Anything else must be a
+        // dhcp-options id, and a value that is not one at all is refused BEFORE the lookup
+        // — the ordering every resource of this service keeps, so a caller can tell "not a
+        // dhcp-options id" from "no such options set".
+        let associating_default = input.dhcp_options_id == state::DHCP_OPTIONS_DEFAULT;
+        if !associating_default && !state::dhcp_options_id_is_well_formed(&input.dhcp_options_id) {
+            return Err(state::invalid_dhcp_options_id_malformed(
+                &input.dhcp_options_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Associates a set of DHCP options (that you've previously created) with the
+        // specified VPC": a set this account holds no options set for is a refusal, not an
+        // association with an id nothing names.
+        if !associating_default && !store.holds_dhcp_options(&input.dhcp_options_id) {
+            return Err(state::invalid_dhcp_option_id_not_found(
+                &input.dhcp_options_id,
+            ));
+        }
+        // The VPC the association is made ON, which is also the answer to "does this VPC
+        // exist?" — taken mutably here, so the write below is made to the record this
+        // check resolved rather than to one looked up a second time.
+        let Some(vpc) = store.vpcs.get_mut(&input.vpc_id) else {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        };
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // One write, after every refusal: the association IS the VPC's `DhcpOptionsId`, so
+        // setting it is the whole of the association and `DescribeVpcs` reports it from
+        // the same place. Associating `default` stores that word, which is how the VPC
+        // reports that no DHCP options set of this account is associated with it.
+        vpc.dhcp_options_id = Some(input.dhcp_options_id);
+        Ok(AssociateDhcpOptionsOutput)
     }
 }

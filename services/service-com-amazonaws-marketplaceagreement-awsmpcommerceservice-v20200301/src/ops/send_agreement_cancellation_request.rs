@@ -200,7 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotencyToken`: the same token names the same cancellation
         // request, so a retried send reports the first one rather than asking
-        // the buyer to review a second.
+        // the buyer to review a second — and a token reused for DIFFERENT
+        // content is a conflict rather than an answer about another request,
+        // which is how every idempotent create in this crate treats it
+        // (`PaymentRequest::matches_send`,
+        // `BillingAdjustmentRequest::matches_entry`).
         let token = input
             .client_token
             .as_deref()
@@ -208,9 +212,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replayed = token
             .as_deref()
             .and_then(|key| store.idempotency.get(key).cloned())
-            .and_then(|id| store.agreement_cancellation_requests.get(&id));
+            .and_then(|id| store.agreement_cancellation_requests.get(&id))
+            .cloned();
         if let Some(stored) = replayed {
-            return Ok(to_output(stored));
+            if !stored.matches_send(&input) {
+                return Err(
+                    SendAgreementCancellationRequestErrorModeled::ConflictException(
+                        crate::state::conflict(
+                            crate::state::RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST,
+                            &stored.id,
+                            format!(
+                                "clientToken {:?} already sent agreement cancellation request {} \
+                                 with different content",
+                                stored.client_token.as_deref().unwrap_or_default(),
+                                stored.id
+                            ),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+            return Ok(to_output(&stored));
         }
 
         let Some(agreement) = store.agreements.get(&input.agreement_id) else {

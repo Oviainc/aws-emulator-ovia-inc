@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AliasListEntry, GrantConstraints, GrantListEntry, KeyMetadata, MultiRegionConfiguration,
-    MultiRegionKey, Tag, CUSTOMER_MASTER_KEY_SPEC_VALUES,
+    MultiRegionKey, Tag, CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
 };
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
@@ -1530,6 +1530,35 @@ pub fn mint_material(kind: MaterialKind) -> Option<KeyMaterial> {
         }
         MaterialKind::KeyPair => Some(KeyMaterial::KeyPairNotGenerated),
     }
+}
+
+/// `len` bytes drawn from the OS CSPRNG — the entropy behind a key this service
+/// generates for a caller rather than for a KMS key record.
+///
+/// `None` means the platform refused to produce entropy; the caller answers a
+/// modelled server error rather than handing out predictable bytes.
+pub fn random_bytes(len: usize) -> Option<Vec<u8>> {
+    let mut bytes = vec![0u8; len];
+    SystemRandom::new().fill(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// How many bytes of data key a `DataKeySpec` names, or `None` when it is not a
+/// `DataKeySpec` this service knows.
+///
+/// "Use AES_128 to generate a 128-bit symmetric key, or AES_256 to generate a
+/// 256-bit symmetric key"
+/// (`smithy_query(query="doc",shape="GenerateDataKeyWithoutPlaintextRequest",member="KeySpec")`),
+/// so the length is the bit count the spec names divided by eight — read from the
+/// spec itself, which is why every value of
+/// [`DATA_KEY_SPEC_VALUES`](crate::ops::types::DATA_KEY_SPEC_VALUES) maps without a
+/// per-value case.
+pub fn data_key_bytes(key_spec: &str) -> Option<usize> {
+    if !DATA_KEY_SPEC_VALUES.contains(&key_spec) {
+        return None;
+    }
+    let bits: usize = key_spec.strip_prefix("AES_")?.parse().ok()?;
+    (bits > 0 && bits.is_multiple_of(8)).then_some(bits / 8)
 }
 
 /// The `SigningAlgorithmSpec` values an RSA key pair supports: RSASSA-PSS and

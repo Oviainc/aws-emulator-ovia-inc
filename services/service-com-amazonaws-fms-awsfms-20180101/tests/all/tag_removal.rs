@@ -21,8 +21,9 @@
 //! The refusal rows are the same class on the other side: a `ResourceArn` that is
 //! not an ARN at all is a `ValidationException`, a well-formed ARN naming no
 //! stored resource is the modelled `ResourceNotFoundException`, and either
-//! refusal leaves every stored tag set exactly as it was. The organisation-scoped
-//! administrator gate is asserted to come before all of it.
+//! refusal leaves every stored tag set exactly as it was. Both are decided by
+//! the `ResourceArn` alone, which is what the removal needs no Firewall Manager
+//! administrator association for.
 //!
 //! The wire harness ([`crate::policy_lifecycle`]), the tag helpers
 //! ([`crate::tagging_and_managing_admins`]) and the per-kind resource seeding
@@ -33,8 +34,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_fms_awsfms_20180101::ops::types::Tag;
 use service_com_amazonaws_fms_awsfms_20180101::state;
 
-use crate::administrator_gated_operations::{associate_admin, seed_protocols_list, with_store};
-use crate::error_message_members::message_member;
+use crate::administrator_gated_operations::{
+    associate_admin, error_message, seed_protocols_list, with_store,
+};
 use crate::policy_lifecycle::{call, call_in, emulator_with_engine, error_code, ACCOUNT, REGION};
 use crate::tagging_across_resource_kinds::{create_resource, Kind, KINDS};
 use crate::tagging_and_managing_admins::{list_tags, tag_list};
@@ -455,15 +457,19 @@ async fn untag_resource_refuses_an_arn_that_names_no_stored_resource() {
     }
 }
 
-/// `UntagResource` is organisation-scoped, so with no Firewall Manager
-/// administrator association it answers the one 400 `AccessDeniedException`
-/// whatever its payload carries and whichever Region it is signed for — the
-/// decision taken before the ARN's form and before any lookup — and it removes
-/// nothing. Associating an administrator is what lets the same call through.
+/// `UntagResource` names its resource by the model's generic `ResourceArn` and
+/// is answered from that ARN alone, so it needs NO Firewall Manager
+/// administrator association: with nothing associated a malformed ARN is still
+/// the `ValidationException`, an ARN naming nothing still the modelled
+/// `ResourceNotFoundException`, and a stored resource still has exactly the keys
+/// the request names removed — and associating an administrator changes none of
+/// those answers. (The suite `tagging_administrator_gate` asserts the same rule
+/// over all three tagging operations; this row is the removal's own end-to-end
+/// check that an unassociated caller's removal reaches the store.)
 #[tokio::test]
-async fn untag_resource_is_refused_with_no_administrator_association() {
-    // Regions every row is asserted in, so a message composed from the request
-    // can be told from a constant.
+async fn untag_resource_needs_no_administrator_association() {
+    // Regions every row is asserted in, so an answer that moved with the Region
+    // could not pass.
     let regions = [REGION, "eu-central-1", "ap-southeast-4"];
     let held = pairs(&[("stage", "test"), ("team", "net")]);
     let arn = state::protocols_list_arn(REGION, PROTOCOLS_LIST_ID);
@@ -471,8 +477,9 @@ async fn untag_resource_is_refused_with_no_administrator_association() {
     for region in regions {
         let (router, engine) = emulator_with_engine();
         // The tagged resource is seeded the way its own writer writes it —
-        // through the store — so the gate under test is never opened to create
-        // it: `PutProtocolsList` is itself administrator-gated.
+        // through the store — because `PutProtocolsList` IS administrator-gated,
+        // so creating it through the API would associate an administrator this
+        // test must do without.
         with_store(&engine, |store| {
             seed_protocols_list(store, PROTOCOLS_LIST_ID, "gate.protocols", &["TCP"], false);
             let written = store.set_tags(
@@ -485,7 +492,8 @@ async fn untag_resource_is_refused_with_no_administrator_association() {
             );
         });
 
-        // The precondition, read through an implemented operation.
+        // The precondition, read through an implemented operation: nothing is
+        // associated, which GetAdminAccount reports as not-found.
         let (status, body) = call_in(&router, "GetAdminAccount", &json!({}), region).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
@@ -493,64 +501,74 @@ async fn untag_resource_is_refused_with_no_administrator_association() {
             "region {region}: expected no administrator association, got {status} with {body}"
         );
 
-        // The payload forms whose answers differ from each other once the gate
-        // is open: a malformed ARN, an ARN naming nothing, a stored resource,
-        // and an empty `TagKeys`.
-        let rows = [
+        // The payload forms whose answers differ from each other, each decided
+        // by the `ResourceArn` alone: a malformed ARN, an ARN naming nothing, a
+        // stored resource, and an empty `TagKeys` on a stored resource.
+        let malformed = "not-an-arn";
+        let unknown = state::policy_arn(REGION, UNKNOWN_POLICY_ID);
+        let rows: [(&str, Value, u16, &str); 4] = [
             (
                 "a string that is not an ARN",
-                json!({ "ResourceArn": "not-an-arn", "TagKeys": keys(&["stage"]) }),
+                json!({ "ResourceArn": malformed, "TagKeys": keys(&["stage"]) }),
+                400,
+                "ValidationException",
             ),
             (
                 "an ARN naming no policy",
-                json!({
-                    "ResourceArn": state::policy_arn(REGION, UNKNOWN_POLICY_ID),
-                    "TagKeys": keys(&["stage"]),
-                }),
-            ),
-            (
-                "the ARN of a stored protocols list",
-                json!({ "ResourceArn": &arn, "TagKeys": keys(&["stage"]) }),
+                json!({ "ResourceArn": &unknown, "TagKeys": keys(&["stage"]) }),
+                400,
+                "ResourceNotFoundException",
             ),
             (
                 "an empty TagKeys on a stored protocols list",
                 json!({ "ResourceArn": &arn, "TagKeys": keys(&[]) }),
+                200,
+                "",
+            ),
+            (
+                "the ARN of a stored protocols list",
+                json!({ "ResourceArn": &arn, "TagKeys": keys(&["stage"]) }),
+                200,
+                "",
             ),
         ];
-        for (case, body) in &rows {
+        for (case, body, expected_status, expected_code) in &rows {
             let (status, answered) = call_in(&router, "UntagResource", body, region).await;
-            assert_eq!(
-                (status, error_code(&answered).as_str()),
-                (400, "AccessDeniedException"),
-                "case {case:?} in {region}: the authorization decision comes first, so every \
-                 payload must get the administrator refusal, got {status} with {answered}"
-            );
-            let Some(message) = message_member(&answered) else {
-                panic!(
-                    "case {case:?} in {region}: the refusal must carry its message under the \
-                     member name this service's error shapes declare (`Message`), got {answered}"
-                );
+            let code = if status == 200 {
+                String::new()
+            } else {
+                error_code(&answered)
             };
-            assert!(
-                message.contains(ACCOUNT) && message.contains(region),
-                "case {case:?} in {region}: the refusal's message is composed from the request, \
-                 so it must name the calling account and the Region the administrator was looked \
-                 for in, got {message:?}"
+            assert_eq!(
+                (status, code.as_str()),
+                (*expected_status, *expected_code),
+                "case {case:?} in {region}: the ARN decides the answer with no administrator \
+                 association, got {status} with {answered}"
             );
+            if *expected_code == "ValidationException" {
+                let message = error_message(&answered);
+                assert!(
+                    message.contains(malformed),
+                    "case {case:?} in {region}: the form refusal is built from the request, so it \
+                     names the offending value, got {message:?}"
+                );
+            }
         }
 
-        // Nothing was removed: the seeded list still carries every tag.
+        // The removal reached the store: exactly the key the last row named is
+        // gone, every other key the list carried is untouched.
         with_store(&engine, |store| {
             let recorded = store.tags_for_arn(&arn).map(|tags| stored_pairs(&tags));
             assert_eq!(
                 recorded.as_ref(),
-                Some(&held),
-                "region {region}: a refused UntagResource must remove no tag, got {recorded:?}"
+                Some(&pairs(&[("team", "net")])),
+                "region {region}: an unassociated caller's removal must drop exactly the named \
+                 key, got {recorded:?}"
             );
         });
 
-        // The same call, with an administrator associated, is answered — and
-        // removes the key it names.
+        // Associating an administrator changes nothing about the answers: the
+        // repeated removal of a key already gone is still the idempotent 200.
         associate_admin(&router).await;
         let (status, body) = call_in(
             &router,
@@ -561,13 +579,15 @@ async fn untag_resource_is_refused_with_no_administrator_association() {
         .await;
         assert_eq!(
             status, 200,
-            "region {region}: an authorised caller must be answered, got {status} with {body}"
+            "region {region}: an association must change no tagging answer, got {status} with \
+             {body}"
         );
         let (status, code, got) = list_tags(&router, &arn).await;
         assert_eq!(
             (status, code.as_str(), &got),
             (200, "", &pairs(&[("team", "net")])),
-            "region {region}: expected the named key to be gone, got {status} / {code:?} / {got:?}"
+            "region {region}: the surviving key must still be there, got {status} / {code:?} / \
+             {got:?}"
         );
     }
 }

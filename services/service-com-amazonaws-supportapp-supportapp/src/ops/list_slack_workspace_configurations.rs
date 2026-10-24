@@ -2,8 +2,8 @@
 
 //! @op ListSlackWorkspaceConfigurations
 //!
-//! Enumerates the Slack workspaces registered to this account, in `teamId` order, a
-//! page at a time. Every reported member comes from the record
+//! Enumerates the Slack workspaces registered to this account, in `teamId` order, in
+//! one answer. Every reported member comes from the record
 //! `RegisterSlackWorkspaceForOrganization` stored — nothing here is canned.
 //!
 //! ## Shape of an operation
@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SLACK_WORKSPACE_CONFIGURATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Report the Slack workspaces this account has registered, a page at a time.
+    /// Report the Slack workspaces this account has registered.
     ///
     /// `@readonly`: the answer is computed from the registry
     /// `RegisterSlackWorkspaceForOrganization` writes, and nothing is stored here, so a
@@ -146,6 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // This listing is reported whole, so it mints no `nextToken` and a request that
+        // carries one names no position in anything this operation answered. See
+        // [`crate::state::pagination_token_refusal`] for the rule and the refusal.
+        if let Some(message) =
+            crate::state::pagination_token_refusal(Self::NAME, input.next_token.as_deref())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSlackWorkspaceConfigurationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -155,46 +164,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // The cursor is a position in the listing's order: the page resumes after the
-        // records the token says were already reported, so a caller that follows the
-        // tokens walks the whole store. A token this service did not mint names no
-        // position, so it is refused rather than silently read as "from the beginning".
-        // This operation models no client-input error, so the refusal goes through the
-        // scaffold's 400 `ValidationException` channel — worded in this service's own
-        // validation envelope, like every other request-validation refusal it raises.
-        let start_at = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_cursor(token).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation(
-                    crate::state::invalid_pagination_token_message(Self::NAME),
-                )
-            })?,
-        };
-
-        let mut remaining = store
+        // Every registered workspace, in the registry's `teamId` key order, which is
+        // what makes the listing deterministic.
+        let registered: Vec<SlackWorkspaceConfiguration> = store
             .slack_workspace_configurations
             .values()
-            .skip(start_at);
-
-        let page: Vec<SlackWorkspaceConfiguration> = remaining
-            .by_ref()
-            .take(crate::state::WORKSPACE_PAGE_SIZE)
             .map(crate::state::SlackWorkspaceConfig::to_modeled)
             .collect();
 
-        // A `nextToken` is returned only when a further page exists, so a caller that
-        // follows the tokens stops exactly once every registered workspace was
-        // reported.
-        let next_token = remaining
-            .next()
-            .map(|_| crate::state::encode_cursor(start_at + page.len()));
-
         Ok(ListSlackWorkspaceConfigurationsOutput {
-            next_token,
+            // Nothing was withheld, so there is no point for pagination to resume at:
+            // the member documents that the response omits the token once it returns
+            // the last set of results.
+            next_token: None,
             // The member is optional in the model, but it is what this operation
             // reports, so the list is always present — empty for an account with no
             // registered workspace.
-            slack_workspace_configurations: Some(page),
+            slack_workspace_configurations: Some(registered),
         })
     }
 }

@@ -162,12 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListMonitorsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // A listing reports the monitors of the region it was signed for and
+        // nothing else: a monitor lives in the region it was created through.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         // `state` targets a plain `string`, so the framework admits any text;
@@ -190,14 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What a monitor's state IS at the instant of this call, including the
         // activation the clock already made due — so the `state` filter and the
         // reported `state` can never disagree.
-        store.settle_all_monitors(now);
+        store.settle_monitors_in(&region, now);
 
-        // `monitors` is a `BTreeMap` keyed by `monitorName`, so this walk is
-        // already in name order — which is what makes the name-valued cursor
-        // below resolve to the same position on every request.
+        // One region's monitors are a `BTreeMap` keyed by `monitorName`, so this
+        // walk is already in name order — which is what makes the name-valued
+        // cursor below resolve to the same position on every request.
         let matching: Vec<&crate::state::Monitor> = store
-            .monitors
-            .values()
+            .monitors_in(&region)
+            .into_iter()
+            .flat_map(::std::collections::BTreeMap::values)
             .filter(|monitor| {
                 input
                     .state

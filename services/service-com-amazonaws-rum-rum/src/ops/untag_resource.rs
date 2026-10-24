@@ -4,7 +4,11 @@
 //!
 //! Removes the named tags from the resource the request's `ResourceArn` names: the stored
 //! app monitor whose ARN is that one (app monitors are RUM's only taggable resource), or
-//! HTTP 404 when no stored resource has it. The tag map it writes is the one
+//! HTTP 404 when no stored resource has it. The removal is authorized first — the caller's
+//! policies in force at the instant of the call, its identity-based ones and that
+//! monitor's resource policy, must allow this operation's action on the monitor's ARN, or
+//! the call is refused with `AccessDeniedException`/403 having removed nothing. The tag
+//! map it writes is the one
 //! `CreateAppMonitor` seeds and `GetAppMonitor` reports, so a removal is visible to every
 //! other operation that reads the monitor. A successful removal answers HTTP 204 with no
 //! content, and a request naming NO keys — `TagKeys` targets a `TagKeyList` whose
@@ -99,6 +103,15 @@ pub enum UntagResourceErrorModeled {
 /// sends the one the service sends rather than the one the model lists.
 const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
 
+// The wire code, and the status, a request IAM does not allow is refused with: this
+// service's own pair, `crate::state::ACCESS_DENIED_ERROR_CODE` and
+// `crate::state::ACCESS_DENIED_STATUS`, defined there once rather than per operation.
+// They are carried by this channel's own variant because this operation's modelled error
+// list does not declare `AccessDeniedException` — it is a common error rather than one
+// specific to an operation — while the body is the modelled shape
+// (`crate::state::access_denied`).
+use crate::state::{ACCESS_DENIED_ERROR_CODE, ACCESS_DENIED_STATUS};
+
 /// The Smithy member names of `UntagResourceRequest`, as
 /// `smithy_query(query="operation", operation="UntagResource")` lists them: `ResourceArn`
 /// (`@httpLabel`, `@required`) and `TagKeys` (`@httpQuery("tagKeys")`, `@required`,
@@ -192,6 +205,9 @@ pub enum UntagResourceError {
     /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
     /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
     NotFound(ResourceNotFoundException),
+    /// "This caller may not perform this action on this resource", carrying the modelled
+    /// `AccessDeniedException` payload and its 403 (see [`ACCESS_DENIED_ERROR_CODE`]).
+    AccessDenied(AccessDeniedException),
 }
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
@@ -207,6 +223,7 @@ impl ::std::fmt::Display for UntagResourceError {
         match self {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
+            Self::AccessDenied(e) => write!(f, "{ACCESS_DENIED_ERROR_CODE}: {}", e.message),
         }
     }
 }
@@ -223,6 +240,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
             Self::NotFound(e) => e,
+            Self::AccessDenied(e) => e,
         }
     }
 
@@ -230,6 +248,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
             Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+            Self::AccessDenied(_) => &super::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
         }
     }
 
@@ -237,6 +256,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
             Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
+            Self::AccessDenied(_) => ACCESS_DENIED_ERROR_CODE,
         }
     }
 
@@ -246,6 +266,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
             // `ResourceNotFoundException`'s own modelled `@httpError`: the code on the
             // wire changes, the status does not.
             Self::NotFound(_) => 404,
+            Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
         }
     }
 
@@ -255,6 +276,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
             // restJson1 is this service's only protocol, and the shape carries no
             // `awsQueryError` trait to honour in any case.
             Self::NotFound(_) => None,
+            Self::AccessDenied(_) => None,
         }
     }
 }
@@ -302,9 +324,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled input, with an absent `tagKeys` already read as the empty key list
         // (see [`UntagResourceWireInput`]); everything below is the modelled member.
         let UntagResourceWireInput(input) = input;
-        // The ARN in the request is the whole identity of the resource; nothing about
-        // this call depends on how the request was signed.
-        let _ = ctx;
+        // The ARN in the request is the whole identity of the resource; `ctx` carries the
+        // credential the authorization decision below is made for.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -315,11 +336,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut store = state.lock();
         // "Removes one or more tags from the specified resource": the resource is the one
         // whose stored ARN the request names, and an ARN naming none is refused with 404
         // (see [`UntagResourceError::NotFound`]) rather than answered as a silent success.
-        let Some(record) = store.app_monitor_by_arn_mut(&input.resource_arn) else {
+        // Resolved under a SHORT read lock, together with the policy in force, because
+        // what comes next is the authorization decision, which reads the IAM and STS
+        // stores and needs no lock of this service's.
+        let (resource_arn, resource_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitor_by_arn(&input.resource_arn) else {
+                return Err(UntagResourceError::NotFound(
+                    crate::state::tagged_resource_not_found(),
+                ));
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        // May this caller remove tags from THIS resource? Evaluated per call against the
+        // policies in force at this instant, like every other operation of this service,
+        // and refused before anything is written.
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::UNTAG_RESOURCE,
+            &resource_arn,
+            resource_policy.as_deref(),
+            &[],
+        ) {
+            return Err(UntagResourceError::AccessDenied(
+                crate::state::access_denied(&denial),
+            ));
+        }
+
+        let mut store = state.lock();
+        // Resolved again under the WRITE lock: the decision above held no lock, so a
+        // concurrent `DeleteAppMonitor` may have removed the resource in between.
+        let Some(record) = store.app_monitor_by_arn_mut(&resource_arn) else {
             return Err(UntagResourceError::NotFound(
                 crate::state::tagged_resource_not_found(),
             ));

@@ -185,6 +185,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // `ClusterInfo` describes a provisioned cluster's broker nodes, ZooKeeper
+        // ensemble and Apache Kafka version, so it cannot describe a cluster that
+        // has none: a serverless cluster is reported by `DescribeClusterV2`,
+        // whose `Cluster` shape models a member for each kind.
+        if cluster.is_serverless() {
+            return Err(
+                DescribeClusterErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
         Ok(DescribeClusterOutput {
             cluster_info: Some(cluster.to_cluster_info()),
         })

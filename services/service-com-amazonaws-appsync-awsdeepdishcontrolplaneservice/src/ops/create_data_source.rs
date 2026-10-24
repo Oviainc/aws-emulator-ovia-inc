@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSource
+//! Implemented: persists a data source under its API in [`crate::state`], refusing a
+//! request that does not describe a data source AppSync could reach — a missing
+//! per-type configuration, or no service role for a type AppSync must assume one to
+//! invoke. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -229,6 +233,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     member,
                     &record.r#type,
                 )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // `serviceRoleArn` is the role "the system assumes [...] when accessing the
+        // data source", and the model leaves it optional because some data source
+        // types need no credentials at all. A data source of a type AppSync can only
+        // reach by assuming a role, with no role, is one AppSync could never invoke,
+        // so the create is refused rather than stored — nothing has been written at
+        // this point, so the refusal leaves nothing behind.
+        if crate::state::data_source_needs_service_role(
+            &record.r#type,
+            crate::state::selects_iam_authorization(record.http_config.as_ref()),
+        ) && record
+            .service_role_arn
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::SERVICE_ROLE_NOT_SPECIFIED_MESSAGE.to_string()),
                 ..Default::default()
             })
             .into());

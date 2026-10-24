@@ -185,8 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The label-set rules `LimitsPerLabelSet$labelSet` documents but `LabelValue`
-        // (length 1.. only) does not model.
+        // (length 1.. only) does not model, and `LabelName`'s own modelled constraints:
+        // a label name is a map KEY, whose constraints nothing in the request walk
+        // applies (see the map-keys section of `crate::state`).
         if let Some(limits) = input.limits_per_label_set.as_deref() {
+            for entry in limits {
+                crate::state::check_map_keys(
+                    "limitsPerLabelSet",
+                    entry.label_set.keys(),
+                    &crate::state::LABEL_NAME,
+                )
+                .map_err(UpdateWorkspaceConfigurationErrorModeled::ValidationException)?;
+            }
             if let Some(message) = label_set_violation(limits) {
                 return Err(field_validation("limitsPerLabelSet", &message));
             }
@@ -352,7 +362,8 @@ fn field_validation(field: &str, message: &str) -> UpdateWorkspaceConfigurationE
 /// are not accepted. If the label name is metric name label `__name__`, then the metric
 /// part of the name must conform to the following pattern: `[a-zA-Z_:][a-zA-Z0-9_:]*`\".
 /// Label names are a map's keys, so "each label name in a label set must be unique"
-/// holds by construction.
+/// holds by construction, and their own modelled constraints are applied by
+/// [`crate::state::check_map_keys`] before this runs.
 fn label_set_violation(limits: &[LimitsPerLabelSet]) -> Option<String> {
     for entry in limits {
         // Sorted, so one invalid label set is reported the same way however the
@@ -363,14 +374,6 @@ fn label_set_violation(limits: &[LimitsPerLabelSet]) -> Option<String> {
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
         for (name, value) in labels {
-            // `LabelName` is modelled `pattern("^[a-zA-Z_][a-zA-Z0-9_]*$")`, but the
-            // boundary validator does not apply a map KEY's constraints, so the modelled
-            // rule is enforced here rather than silently stored.
-            if !is_label_name(name) {
-                return Some(format!(
-                    "label name {name:?} must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
-                ));
-            }
             if !value.is_ascii() {
                 return Some(format!(
                     "label {name} has a value that is not ASCII: label values accept ASCII characters"
@@ -394,18 +397,6 @@ fn label_set_violation(limits: &[LimitsPerLabelSet]) -> Option<String> {
         }
     }
     None
-}
-
-/// Whether `name` matches `^[a-zA-Z_][a-zA-Z0-9_]*$`, the pattern the model gives
-/// `LabelName`. Two character classes, so it is checked with character predicates
-/// rather than a pattern engine.
-fn is_label_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Whether `value` matches `[a-zA-Z_:][a-zA-Z0-9_:]*`, the pattern

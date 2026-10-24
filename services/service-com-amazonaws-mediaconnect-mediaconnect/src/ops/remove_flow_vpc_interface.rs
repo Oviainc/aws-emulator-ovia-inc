@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveFlowVpcInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveFlowVpcInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveFlowVpcInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one VPC interface from a flow PERSISTED in [`crate::state`]: the VPC interface
+//! the request names is dropped from the flow's record, so DescribeFlow stops reporting
+//! exactly that one and nothing else about the flow moves.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +84,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> RemoveFlowVpcInterfaceError {
+    RemoveFlowVpcInterfaceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow or the VPC interface
+/// `identifier` addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> RemoveFlowVpcInterfaceError {
+    RemoveFlowVpcInterfaceErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +179,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveFlowVpcInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveFlowVpcInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveFlowVpcInterface"))
+        // Nothing in this operation's answer depends on request metadata: both the flow
+        // ARN and the VPC interface name are `@httpLabel`s the deserializer already put on
+        // `input`, and the response is read back out of the stored flow. This operation
+        // mints nothing, so the request's region is not read either.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RemoveFlowVpcInterfaceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect flow store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the removal: a status change the clock
+        // already made due is materialised before the flow is read or written, exactly as
+        // RemoveFlowMediaStream, RemoveFlowOutput and the reporting operations do it.
+        store.settle_due_transitions(now);
+
+        // The flow first, so a request naming a flow the store does not hold is answered
+        // for the flow it named rather than for the VPC interface.
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+
+        // A VPC interface is addressed by NAME within its flow (`VpcInterface.Name`), so at
+        // most one position matches; a VPC interface of another flow, or one already
+        // removed, resolves nothing here.
+        let Some(position) = flow
+            .vpc_interfaces
+            .iter()
+            .position(|vpc_interface| vpc_interface.name == input.vpc_interface_name)
+        else {
+            return Err(not_found(&input.vpc_interface_name));
+        };
+
+        // "This request can be made only on a VPC interface that does not have a Source or
+        // Output associated with it. If the VPC interface is referenced by a Source or
+        // Output, you must first delete or update the Source or Output to no longer
+        // reference the VPC interface": a reference is a fact about the STORED flow, so a
+        // request to remove a referenced VPC interface is a semantic error, and it removes
+        // nothing.
+        if let Some(reference) = flow.vpc_interface_reference(&input.vpc_interface_name) {
+            return Err(bad_request(format!(
+                "VPC interface {:?} is referenced by {reference}. A VPC interface can be \
+                 removed only while it is referenced by no source and no output.",
+                input.vpc_interface_name
+            )));
+        }
+
+        let removed = flow.vpc_interfaces.remove(position);
+
+        // "The ARN of the flow that is associated with the VPC interface you removed" and
+        // "the name of the VPC interface that was removed" — both read out of the STORE
+        // rather than echoed from the request, so the response can only name what this call
+        // actually removed. Removing a VPC interface moves nothing else about the flow: its
+        // status is left as it was, because no clock owes a change for a removed VPC
+        // interface.
+        Ok(RemoveFlowVpcInterfaceOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            // "IDs of network interfaces associated with the removed VPC interface that
+            // MediaConnect was unable to remove": the elastic network interfaces of a
+            // removed VPC interface go with it — the store holds them on that record alone
+            // (`VpcInterface.NetworkInterfaceIds`), so dropping the record leaves none
+            // behind and none is reported. The member is an EMPTY list rather than absent,
+            // so a client that iterates it can tell "every network interface was removed"
+            // from "not reported" without a default.
+            non_deleted_network_interface_ids: Some(Vec::new()),
+            vpc_interface_name: Some(removed.name),
+        })
     }
 }

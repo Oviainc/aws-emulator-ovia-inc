@@ -33,7 +33,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::channel_placement_groups::{
-    create_channel, create_cluster, created, described, groups_uri, id_of, without_state,
+    create_channel, create_cluster, create_nodes, created, described, groups_uri, id_of,
+    without_state,
 };
 use crate::wire::{call, error_code, medialive};
 
@@ -299,11 +300,13 @@ async fn the_listing_pages_through_every_group_of_the_cluster_in_mint_order() {
     }
 }
 
-/// One row of the stored-group table: what the create request carries and whether
-/// a channel is placed in the group it creates.
+/// One row of the stored-group table: what the create request carries (built
+/// from the node ids the row's cluster really has, since `Nodes` is a reference
+/// to a node of that cluster) and whether a channel is placed in the group it
+/// creates.
 struct Stored {
     case: &'static str,
-    body: fn() -> Value,
+    body: fn(&[String]) -> Value,
     place_a_channel: bool,
     /// The `ChannelPlacementGroupState` the group reports straight after the
     /// create and the one the clock owes it, from the model's own enum
@@ -329,35 +332,35 @@ async fn every_listed_group_is_the_stored_group_describe_reports() {
     let table = [
         Stored {
             case: "nothing at all",
-            body: || json!({}),
+            body: |_| json!({}),
             place_a_channel: false,
             state: "UNASSIGNED",
             settled_state: "UNASSIGNED",
         },
         Stored {
             case: "a name only",
-            body: || json!({ "name": "studio-a" }),
+            body: |_| json!({ "name": "studio-a" }),
             place_a_channel: false,
             state: "UNASSIGNED",
             settled_state: "UNASSIGNED",
         },
         Stored {
             case: "a name and one node",
-            body: || json!({ "name": "studio-b", "nodes": ["node-7"] }),
+            body: |nodes| json!({ "name": "studio-b", "nodes": [nodes[0].clone()] }),
             place_a_channel: false,
             state: "ASSIGNING",
             settled_state: "ASSIGNED",
         },
         Stored {
             case: "tags too, and a channel placed in it",
-            body: || json!({ "name": "tagged", "tags": { "team": "news" } }),
+            body: |_| json!({ "name": "tagged", "tags": { "team": "news" } }),
             place_a_channel: true,
             state: "UNASSIGNED",
             settled_state: "UNASSIGNED",
         },
         Stored {
             case: "an empty node list, and a channel placed in it",
-            body: || json!({ "name": "no-nodes", "nodes": [] }),
+            body: |_| json!({ "name": "no-nodes", "nodes": [] }),
             place_a_channel: true,
             state: "UNASSIGNED",
             settled_state: "UNASSIGNED",
@@ -375,8 +378,11 @@ async fn every_listed_group_is_the_stored_group_describe_reports() {
         let router = medialive();
         let cluster = create_cluster(&router, case, "listed").await;
         let elsewhere = create_cluster(&router, case, "elsewhere").await;
+        // The node a row may associate its group with: a node of the group's own
+        // cluster is the only kind `Nodes` may name.
+        let nodes = create_nodes(&router, case, &cluster, 1).await;
 
-        let group = created(&router, case, &cluster, body()).await;
+        let group = created(&router, case, &cluster, body(&nodes)).await;
         let id = id_of(&group);
         // One group in ANOTHER cluster, which this listing must not report: a
         // group is named by both path labels.

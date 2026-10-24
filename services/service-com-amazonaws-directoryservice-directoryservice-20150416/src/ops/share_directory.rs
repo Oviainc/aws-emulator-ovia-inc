@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ShareDirectory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ShareDirectory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ShareDirectory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Shares a Managed Microsoft AD directory with a consumer account, minting that
+//! account's own `SharedDirectoryId` for it and persisting the share so
+//! `DescribeSharedDirectories` reports it. Implemented here — this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +177,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ShareDirectory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ShareDirectoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `ShareTarget` is "identifier that contains details about the directory consumer
+        // account", and its `Type` says what kind of identifier `Id` is. The modelled
+        // `TargetType` enum declares exactly one kind, `ACCOUNT`, so `Id` has to be an
+        // Amazon Web Services account id — the twelve digits the modelled `CustomerId`
+        // (`^(\d{12})$`) that reports it back as `SharedDirectory$SharedAccountId`
+        // demands. An `Id` that cannot be reported in that member is not a target this
+        // service can share with, which is the modelled refusal for exactly that.
+        let consumer_account_id = input.share_target.id.clone();
+        if !is_account_id(&consumer_account_id) {
+            return Err(ShareDirectoryErrorModeled::InvalidTargetException(
+                crate::state::refusal(format!(
+                    "ShareTarget.Id '{id}' is not an Amazon Web Services account id; a \
+                     {target_type} target is identified by its twelve-digit account id",
+                    id = input.share_target.id,
+                    target_type = input.share_target.r#type
+                )),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The share hangs off the directory the request names, so an id naming no stored
+        // directory is refused with the modelled "specified entity could not be found"
+        // and stores nothing.
+        let Some(directory) = store.directories.get(&input.directory_id) else {
+            return Err(ShareDirectoryErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+            .into());
+        };
+        let directory_type = directory.directory_type.clone();
+
+        // This operation's own documentation: "When you share your Managed Microsoft AD
+        // directory, Directory Service creates a shared directory in the directory
+        // consumer account." Sharing is a feature of that directory type alone, so a
+        // request naming a directory of another type asks for something that type does
+        // not support — the modelled refusal for exactly that. NOT dead code:
+        // `CreateDirectory` persists a Simple AD directory today, so this branch is
+        // reachable from the wire.
+        if directory_type != crate::state::TYPE_MICROSOFT_AD {
+            return Err(ShareDirectoryErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(format!(
+                    "DirectoryId {id} names a {directory_type} directory; sharing a \
+                     directory is supported for {supported} directories only",
+                    id = input.directory_id,
+                    supported = crate::state::TYPE_MICROSOFT_AD
+                )),
+            )
+            .into());
+        }
+
+        // A directory is shared with a given consumer account at most once: the share
+        // already in place is what that account uses, so a second request for it is the
+        // directory that is already shared rather than a second shared directory id.
+        if let Some(existing) = store.share_of(&input.directory_id, &consumer_account_id) {
+            return Err(ShareDirectoryErrorModeled::DirectoryAlreadySharedException(
+                crate::state::refusal(format!(
+                    "Directory {id} is already shared with account {account} as {shared}",
+                    id = input.directory_id,
+                    account = existing.shared_account_id,
+                    shared = existing.shared_directory_id
+                )),
+            )
+            .into());
+        }
+
+        // The share store is one a caller can grow with a fresh consumer account forever,
+        // so it carries its own documented per-directory maximum and the call is refused
+        // once that is reached — which is the modelled "maximum number of accounts that
+        // you can share with this directory has been reached". Checked BEFORE anything is
+        // minted or inserted, so a refused call stores nothing.
+        if store.share_count(&input.directory_id) >= crate::state::MAX_SHARES_PER_DIRECTORY {
+            return Err(ShareDirectoryErrorModeled::ShareLimitExceededException(
+                crate::state::refusal(format!(
+                    "This emulator shares one directory with at most {max} consumer accounts",
+                    max = crate::state::MAX_SHARES_PER_DIRECTORY
+                )),
+            )
+            .into());
+        }
+
+        // "The ShareMethod parameter determines whether the specified directory can be
+        // shared between Amazon Web Services accounts inside the same Amazon Web Services
+        // organization (ORGANIZATIONS). It also determines whether you can share the
+        // directory with any other Amazon Web Services account either inside or outside of
+        // the organization (HANDSHAKE). The ShareNotes parameter is only used when
+        // HANDSHAKE is called, which sends a directory sharing request to the directory
+        // consumer." So a handshake share waits for that consumer to answer — the modelled
+        // `PendingAcceptance`, which `AcceptSharedDirectory` / `RejectSharedDirectory`
+        // move it out of — while an organization share needs no answer and is put in
+        // service by the clock, leaving `Sharing` for `Shared`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ShareDirectory"))
+        // Both modelled values are named here rather than one being the other's `else`, so
+        // a `ShareMethod` this emulator has no sharing behaviour for is refused instead of
+        // silently sharing the directory some other way. The modelled enum admits only
+        // those two today, so the last arm is reached only if the model grows a third.
+        let handshake = input.share_method == crate::state::SHARE_METHOD_HANDSHAKE;
+        let (share_status, share_status_due_at) = match input.share_method.as_str() {
+            crate::state::SHARE_METHOD_HANDSHAKE => {
+                (crate::state::SHARE_STATUS_PENDING_ACCEPTANCE, None)
+            }
+            crate::state::SHARE_METHOD_ORGANIZATIONS => (
+                crate::state::SHARE_STATUS_SHARING,
+                Some(now + crate::state::TRANSITION_SPAN),
+            ),
+            unknown => {
+                return Err(ShareDirectoryErrorModeled::InvalidParameterException(
+                    crate::state::refusal(format!(
+                        "ShareMethod '{unknown}' is not a method this service shares a \
+                         directory with"
+                    )),
+                )
+                .into());
+            }
+        };
+
+        // "Directory Service creates a shared directory in the directory consumer
+        // account": the consumer's handle on the owner's directory is a `DirectoryId` of
+        // its own, minted from the same id space as a directory's, so no two resources of
+        // this service ever answer to one id.
+        let shared_directory_id = store.mint_directory_id();
+        let seq = store.next_seq();
+        store.shared_directories.insert(
+            shared_directory_id.clone(),
+            crate::state::SharedDirectoryRecord {
+                shared_directory_id: shared_directory_id.clone(),
+                owner_directory_id: input.directory_id.clone(),
+                owner_account_id: ::engine::emulator_account_id().to_string(),
+                shared_account_id: consumer_account_id,
+                share_method: input.share_method.clone(),
+                share_status: share_status.to_string(),
+                share_status_due_at,
+                // `ShareNotes` is "only used when HANDSHAKE is called": it is the message
+                // the sharing request carries to the consumer administrator, so an
+                // organization share, which sends no request, records none even when the
+                // call supplied one.
+                share_notes: if handshake { input.share_notes } else { None },
+                created_at: now,
+                last_updated: now,
+                seq,
+            },
+        );
+
+        // The operation reports the id alone: `DescribeSharedDirectories` is what reports
+        // the share back.
+        Ok(ShareDirectoryOutput {
+            shared_directory_id: Some(shared_directory_id),
+        })
     }
+}
+
+/// Whether `candidate` is an Amazon Web Services account id: the twelve decimal digits
+/// the modelled `CustomerId` pattern `^(\d{12})$` admits
+/// (`smithy_query(query="shape",shape="SharedDirectory")`), which is what
+/// `SharedDirectory$SharedAccountId` reports a share's consumer account in.
+fn is_account_id(candidate: &str) -> bool {
+    candidate.len() == 12 && candidate.bytes().all(|byte| byte.is_ascii_digit())
 }

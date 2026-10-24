@@ -255,6 +255,11 @@ impl PlantedDevice {
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
+            secret_verifier: None,
+            // A planted device stands for one a `ConfirmDevice` registered and
+            // the user chose to remember, which is what a listing reports.
+            confirmed: true,
+            remembered: true,
             create_date: UNIX_EPOCH + Duration::from_secs(self.created_at),
             last_modified_date: UNIX_EPOCH + Duration::from_secs(self.created_at + 60),
             last_authenticated_date: self

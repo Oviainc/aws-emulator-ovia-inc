@@ -1913,6 +1913,41 @@ impl StoredFlow {
         output.map(|output| format!("output {}", output.output_arn))
     }
 
+    /// What the VPC interface named `vpc_interface_name` is referenced by, as the phrase a
+    /// refusal names it by, or `None` when nothing of this flow references it.
+    ///
+    /// A source references a VPC interface by name through `Source.VpcInterfaceName` ("the
+    /// name of the VPC interface that is used for this source") and, for a source fed by a
+    /// gateway bridge, through `GatewayBridgeSource.VpcInterfaceAttachment` ("the name of
+    /// the VPC interface attachment to use for this bridge source"); an output references
+    /// one through `Output.VpcInterfaceAttachment` ("the name of the VPC interface
+    /// attachment to use for this output"). The lookup is stated once here because every
+    /// operation whose documented precondition is such a reference —
+    /// RemoveFlowVpcInterface ("can be made only on a VPC interface that does not have a
+    /// Source or Output associated with it") — must read the SAME references.
+    pub fn vpc_interface_reference(&self, vpc_interface_name: &str) -> Option<String> {
+        let source = self.sources.iter().find(|source| {
+            source.vpc_interface_name.as_deref() == Some(vpc_interface_name)
+                || source
+                    .gateway_bridge_source
+                    .as_ref()
+                    .and_then(|bridge_source| bridge_source.vpc_interface_attachment.as_ref())
+                    .and_then(|attachment| attachment.vpc_interface_name.as_deref())
+                    == Some(vpc_interface_name)
+        });
+        if let Some(source) = source {
+            return Some(format!("source {}", source.source_arn));
+        }
+        let output = self.outputs.iter().find(|output| {
+            output
+                .vpc_interface_attachment
+                .as_ref()
+                .and_then(|attachment| attachment.vpc_interface_name.as_deref())
+                == Some(vpc_interface_name)
+        });
+        output.map(|output| format!("output {}", output.output_arn))
+    }
+
     /// `ListedFlow.SourceType`: `ENTITLED` when the flow ingests through an entitlement
     /// granted by another account, `OWNED` otherwise.
     pub fn source_type(&self) -> &'static str {

@@ -6,7 +6,8 @@
 //! `CreateDirectory` persists, the snapshots `CreateSnapshot` takes of them, the aliases
 //! `CreateAlias` assigns, the computer accounts `CreateComputer` creates in them, the
 //! Amazon SNS topics `RegisterEventTopic` associates, the trust relationships
-//! `CreateTrust` establishes, the assessments
+//! `CreateTrust` establishes, the directory shares `ShareDirectory` creates, the
+//! assessments
 //! `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
 //! the pieces of behaviour that cannot live in any single operation file:
 //!
@@ -15,18 +16,21 @@
 //!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, a
 //!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
-//!   registered certificate leaving `Registering`).
+//!   registered certificate leaving `Registering`, an organization directory share
+//!   leaving `Sharing`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
 //!   modelled `DirectoryDescription`, so every operation that reports a directory
 //!   reports the same derived values (`Alias`, `AccessUrl`), and
 //!   [`SnapshotRecord::to_snapshot`] / [`EventTopicRegistration::to_event_topic`] /
-//!   [`TrustRecord::to_trust`], the
-//!   same for a stored snapshot, a stored topic association and a stored trust.
+//!   [`TrustRecord::to_trust`] / [`SharedDirectoryRecord::to_shared_directory`], the
+//!   same for a stored snapshot, a stored topic association, a stored trust and a stored
+//!   directory share.
 //! * [`encode_cursor`] / [`decode_cursor`], the opaque `NextToken` the paginated
 //!   operations of this slice (`DescribeDirectories`, `DescribeSnapshots`,
-//!   `DescribeTrusts`, `ListTagsForResource`) issue and resolve.
+//!   `DescribeTrusts`, `DescribeSharedDirectories`, `ListTagsForResource`) issue and
+//!   resolve.
 //! * [`refusal`], the one place a modelled refusal of this service is built: every error
 //!   shape the model declares carries a `Message` and a UUID-shaped `RequestId`, and this
 //!   is what mints the call's id, reports it in that member and appends it to the message
@@ -45,8 +49,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, Certificate, ClientAuthenticationSettingInfo,
     ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
-    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot,
-    SnapshotLimits, Tag, Trust,
+    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, SharedDirectory,
+    Snapshot, SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -528,6 +532,47 @@ pub const MAX_TRUSTS_PER_DIRECTORY: usize = 50;
 /// longer list can only repeat ids — and it is what keeps the caller-chosen filter from
 /// being allocated and scanned unbounded.
 pub const MAX_TRUST_IDS_PER_REQUEST: usize = 100;
+
+/// The `ShareMethod` that shares a directory inside the caller's organization: the
+/// `ORGANIZATIONS` value of the modelled `ShareMethod` enum. Such a share needs no
+/// acceptance from the consumer account, so it starts at [`SHARE_STATUS_SHARING`].
+pub const SHARE_METHOD_ORGANIZATIONS: &str = "ORGANIZATIONS";
+
+/// The `ShareMethod` that sends a sharing request to the consumer account: the
+/// `HANDSHAKE` value of the modelled `ShareMethod` enum. Such a share waits for the
+/// consumer to answer, so it rests at [`SHARE_STATUS_PENDING_ACCEPTANCE`].
+pub const SHARE_METHOD_HANDSHAKE: &str = "HANDSHAKE";
+
+/// The `ShareStatus` a share waiting for the consumer account to answer carries: the
+/// `PendingAcceptance` value of the modelled `ShareStatus` enum.
+///
+/// Not a transient the clock settles: only `AcceptSharedDirectory` or
+/// `RejectSharedDirectory` moves a share out of it.
+pub const SHARE_STATUS_PENDING_ACCEPTANCE: &str = "PendingAcceptance";
+
+/// The `ShareStatus` an organization share is in between `ShareDirectory` and
+/// [`TRANSITION_SPAN`]: the `Sharing` value of the modelled `ShareStatus` enum.
+pub const SHARE_STATUS_SHARING: &str = "Sharing";
+
+/// The `ShareStatus` a share reaches once it is in service: the `Shared` value of the
+/// modelled `ShareStatus` enum.
+pub const SHARE_STATUS_SHARED: &str = "Shared";
+
+/// The most consumer accounts one directory can be shared with in this emulator.
+///
+/// NOT an AWS quota: a resource guard. `ShareDirectory` is a write a caller can repeat
+/// with a fresh consumer account forever, so the share store carries its own
+/// per-directory bound, enforced at the single insert site in `share_directory.rs`.
+pub const MAX_SHARES_PER_DIRECTORY: usize = 50;
+
+/// The most `SharedDirectoryIds` entries a single `DescribeSharedDirectories` will
+/// resolve.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — a directory is shared with at most [`MAX_SHARES_PER_DIRECTORY`]
+/// accounts, so a longer list can only repeat ids — and it is what keeps the
+/// caller-chosen filter from being allocated and scanned unbounded.
+pub const MAX_SHARED_DIRECTORY_IDS_PER_REQUEST: usize = 100;
 
 /// The page size a paginated operation uses when the request declares none.
 ///
@@ -1400,6 +1445,70 @@ impl TrustRecord {
     }
 }
 
+/// One stored directory share: what `ShareDirectory` persisted and
+/// `DescribeSharedDirectories` reports.
+///
+/// A share is the pairing of ONE owner directory with ONE consumer account, so a
+/// directory is shared with a given account at most once — which is what
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::share_of`] resolves. The
+/// shared directory id is the consumer account's handle on the owner's directory, minted
+/// from the same id space as a directory's own id, so no two resources of this service
+/// ever answer to one `DirectoryId`.
+#[derive(Debug, Clone)]
+pub struct SharedDirectoryRecord {
+    /// "Identifier of the shared directory in the directory consumer account."
+    pub shared_directory_id: String,
+    /// "Identifier of the directory in the directory owner account." A share does not
+    /// outlive that directory: `DeleteDirectory` drops the shares naming the id it
+    /// deletes.
+    pub owner_directory_id: String,
+    /// "Identifier of the directory owner account", the account this emulator presents.
+    pub owner_account_id: String,
+    /// "Identifier of the directory consumer account that has access to the shared
+    /// directory": the `ShareTarget$Id` the request named.
+    pub shared_account_id: String,
+    /// One of the modelled `ShareMethod` values, as the request required.
+    pub share_method: String,
+    /// One of the modelled `ShareStatus` values.
+    pub share_status: String,
+    /// When the status transition an organization share owes falls due; `None` once there
+    /// is no transition left to make. See [`TRANSITION_SPAN`].
+    pub share_status_due_at: Option<SystemTime>,
+    /// The `ShareNotes` the request carried, if any. Held because the modelled
+    /// `SharedDirectory` structure reports it back to the consumer administrator, which
+    /// is the whole point of the member; it stays in this process's memory, and no
+    /// handler of this service writes state to a file or a log.
+    pub share_notes: Option<String>,
+    /// "The date and time that the shared directory was created."
+    pub created_at: SystemTime,
+    /// "The date and time that the shared directory was last updated."
+    pub last_updated: SystemTime,
+    /// Creation rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`], shared
+    /// with the directories so every listing of this service pages over one ordering.
+    pub seq: u64,
+}
+
+impl SharedDirectoryRecord {
+    /// This share as the modelled `SharedDirectory` structure.
+    ///
+    /// The one place a stored share is rendered, so every operation that reports one
+    /// reports exactly what was persisted.
+    pub fn to_shared_directory(&self) -> SharedDirectory {
+        SharedDirectory {
+            owner_account_id: Some(self.owner_account_id.clone()),
+            owner_directory_id: Some(self.owner_directory_id.clone()),
+            share_method: Some(self.share_method.clone()),
+            shared_account_id: Some(self.shared_account_id.clone()),
+            shared_directory_id: Some(self.shared_directory_id.clone()),
+            share_status: Some(self.share_status.clone()),
+            share_notes: self.share_notes.clone(),
+            created_date_time: Some(as_timestamp(self.created_at)),
+            last_updated_date_time: Some(as_timestamp(self.last_updated)),
+        }
+    }
+}
+
 /// How this service compares two spellings of ONE remote domain name: the name folded to
 /// lower case with the trailing root label dropped, so a lookup agrees with DNS, where a
 /// domain name is compared case-insensitively and the fully qualified `example.com.` names
@@ -1436,6 +1545,11 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// directory it belongs to, and `DescribeTrusts`/`VerifyTrust`/`DeleteTrust` all
     /// resolve one by trust id alone, so this is one store rather than one per directory.
     pub trusts: BTreeMap<String, TrustRecord>,
+    /// Every stored directory share, keyed by its `SharedDirectoryId`. A share names the
+    /// owner directory it was created from, and `AcceptSharedDirectory` /
+    /// `RejectSharedDirectory` resolve one by shared directory id alone, so this is one
+    /// store rather than one per directory.
+    pub shared_directories: BTreeMap<String, SharedDirectoryRecord>,
     /// Which directory owns which alias. An alias is unique across the account, so
     /// this is what `CreateAlias` checks before assigning one. An entry OUTLIVES the
     /// directory it was created for: `CreateAlias`' documentation says an alias
@@ -1650,6 +1764,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             trust.trust_state != TRUST_STATE_DELETING
                 || trust.trust_state_due_at.is_some_and(|due| now < due)
         });
+        // The status transition an organization share owes: `ShareDirectory` answers
+        // while the share is still being put in service, so the transient `Sharing`
+        // settles on `Shared`. A handshake share rests at `PendingAcceptance` instead,
+        // which no clock settles: the consumer account's answer does.
+        for share in self.shared_directories.values_mut() {
+            let Some(due) = share.share_status_due_at else {
+                continue;
+            };
+            if now >= due && share.share_status == SHARE_STATUS_SHARING {
+                share.share_status = SHARE_STATUS_SHARED.to_string();
+                share.last_updated = due;
+                share.share_status_due_at = None;
+            }
+        }
         for assessment in self.assessments.values_mut() {
             let Some(due) = assessment.status_due_at else {
                 continue;
@@ -1719,6 +1847,38 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
         self.trusts.values().find(|trust| {
             trust.directory_id == directory_id && domain_key(&trust.remote_domain_name) == key
         })
+    }
+
+    /// Directory shares in creation order — the order `DescribeSharedDirectories` pages
+    /// over.
+    pub fn shared_directories_in_creation_order(&self) -> Vec<&SharedDirectoryRecord> {
+        let mut ordered: Vec<&SharedDirectoryRecord> = self.shared_directories.values().collect();
+        ordered.sort_by_key(|share| share.seq);
+        ordered
+    }
+
+    /// The share `owner_directory_id` already holds with the consumer account
+    /// `shared_account_id`, if any: a directory is shared with a given account at most
+    /// once, so this is what a second `ShareDirectory` for it resolves as the share that
+    /// already exists.
+    pub fn share_of(
+        &self,
+        owner_directory_id: &str,
+        shared_account_id: &str,
+    ) -> Option<&SharedDirectoryRecord> {
+        self.shared_directories.values().find(|share| {
+            share.owner_directory_id == owner_directory_id
+                && share.shared_account_id == shared_account_id
+        })
+    }
+
+    /// How many consumer accounts `owner_directory_id` is currently shared with — the
+    /// count [`MAX_SHARES_PER_DIRECTORY`] bounds.
+    pub fn share_count(&self, owner_directory_id: &str) -> usize {
+        self.shared_directories
+            .values()
+            .filter(|share| share.owner_directory_id == owner_directory_id)
+            .count()
     }
 
     /// How many trust relationships `directory_id` currently holds — the count
@@ -1957,6 +2117,7 @@ modeled_failures!(
     IpRouteLimitExceededException,
     NoAvailableCertificateException,
     ServiceException,
+    ShareLimitExceededException,
     SnapshotLimitExceededException,
     TagLimitExceededException,
     UnsupportedOperationException,

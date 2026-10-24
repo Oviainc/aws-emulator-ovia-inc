@@ -253,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asked-for list.
         if let Some(unknown) = requested
             .iter()
-            .find(|id| !store.dhcp_options.contains_key(id.as_str()))
+            .find(|id| !store.holds_dhcp_options(id.as_str()))
         {
             return Err(crate::state::invalid_dhcp_option_id_not_found(unknown));
         }

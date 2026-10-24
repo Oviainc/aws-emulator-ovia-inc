@@ -201,6 +201,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 };
+                // The answer is the upgrade ladder above the version the cluster
+                // runs, and a serverless cluster runs none this API names: MSK
+                // Serverless manages Apache Kafka itself, so there is no source
+                // version to answer from.
+                if cluster.is_serverless() {
+                    return Err(GetCompatibleKafkaVersionsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("ClusterArn".to_string()),
+                            message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
                 vec![cluster.kafka_version.clone()]
             }
             None => crate::state::KAFKA_VERSION_CATALOG

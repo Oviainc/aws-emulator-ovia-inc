@@ -2,9 +2,10 @@
 
 //! End-to-end tests for the rules a MUTATION of this service's state follows:
 //!
-//! * a mutation keyed by a caller-named target is IDEMPOTENT — registering a target
-//!   already registered reports the existing resource's id, and removing one already
-//!   absent succeeds;
+//! * a REMOVAL keyed by a caller-named target is IDEMPOTENT — removing a target already
+//!   absent states what the call asks for, so it succeeds and changes nothing (a
+//!   creation keyed by a target already taken is the opposite rule, a conflict, and is
+//!   pinned by [`crate::notification_channel_conflict`]);
 //! * a write is REFUSED with the modelled client error, and persists nothing, when the
 //!   configuration it would leave stored is one the service cannot represent — a second
 //!   app-boundary key for an account that has exactly one, or customer-managed-key
@@ -22,8 +23,6 @@
 //! implementation; it is not repeated here.
 
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use crate::configuration_lifecycle::{
     cloud_formation, is_modeled_channel_id, reported_tag_collections, tags, Emulator, Reply,
@@ -31,7 +30,10 @@ use crate::configuration_lifecycle::{
 
 /// `AddNotificationChannel` input for one SNS topic, with `Config.Filters` only when
 /// `filters` is not null.
-fn channel_config(topic_arn: &str, filters: &Value) -> Value {
+///
+/// `pub(crate)` because the sibling channel suites compose the same request rather than
+/// writing a second builder for it.
+pub(crate) fn channel_config(topic_arn: &str, filters: &Value) -> Value {
     let mut config = json!({ "Sns": { "TopicArn": topic_arn } });
     if !filters.is_null() {
         config["Filters"] = filters.clone();
@@ -40,7 +42,7 @@ fn channel_config(topic_arn: &str, filters: &Value) -> Value {
 }
 
 /// The ids `ListNotificationChannels` reports, walking its pages.
-async fn listed_channel_ids(emulator: &Emulator) -> Vec<String> {
+pub(crate) async fn listed_channel_ids(emulator: &Emulator) -> Vec<String> {
     let mut ids = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -79,166 +81,12 @@ async fn listed_channel_ids(emulator: &Emulator) -> Vec<String> {
 }
 
 /// The `Id` an add reported.
-fn minted_id(reply: &Reply) -> String {
+pub(crate) fn minted_id(reply: &Reply) -> String {
     reply
         .at("/Id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
-}
-
-/// RULE: a registration keyed by its target is idempotent — the SNS topic IS the
-/// channel, so an `AddNotificationChannel` for a topic that already backs a channel
-/// reports that channel's id, mints no second channel and changes nothing, however many
-/// times it is repeated; a DIFFERENT topic still mints its own channel.
-///
-/// The rows differ in how many times the registration is repeated (1, 2, 3 and 6), in
-/// the form of `Config.Filters` (absent, one list, both lists) and in the form of the
-/// topic ARN (region, account, name); the issue's `us-west-2` topic added twice is the
-/// first row.
-#[tokio::test]
-async fn registering_an_already_registered_topic_reports_the_one_channel() {
-    let cases: [(&str, &str, Value, usize); 5] = [
-        (
-            "the reported topic, added twice",
-            "arn:aws:sns:us-west-2:000000000000:sim2real-devopsguru-topic-388962c1a961",
-            json!(null),
-            2,
-        ),
-        (
-            "a single add mints one channel",
-            "arn:aws:sns:us-east-1:123456789012:guru-alerts",
-            json!(null),
-            1,
-        ),
-        (
-            "a topic in another region, three adds",
-            "arn:aws:sns:eu-west-1:210987654321:guru-eu-alerts",
-            json!({ "Severities": ["HIGH"] }),
-            3,
-        ),
-        (
-            "a filtered topic, six adds",
-            "arn:aws:sns:ap-southeast-2:000000000000:guru-filtered-topic",
-            json!({ "Severities": ["HIGH", "MEDIUM"], "MessageTypes": ["NEW_INSIGHT"] }),
-            6,
-        ),
-        (
-            "a short topic name, two adds",
-            "arn:aws:sns:us-east-2:000000000000:g",
-            json!({ "MessageTypes": ["CLOSED_INSIGHT"] }),
-            2,
-        ),
-    ];
-
-    for (name, topic_arn, filters, repeats) in cases {
-        let emulator = Emulator::new();
-        let config = channel_config(topic_arn, &filters);
-
-        let mut ids: Vec<String> = Vec::new();
-        for attempt in 0..repeats {
-            let reply = emulator.add_notification_channel(config.clone()).await;
-            assert_eq!(
-                reply.status, 200,
-                "case {name:?}: add {attempt} must succeed, got status {} body {}",
-                reply.status, reply.raw
-            );
-            let id = minted_id(&reply);
-            assert!(
-                is_modeled_channel_id(&id),
-                "case {name:?}: add {attempt} must report a 36-char lowercase-hex id, got {id:?}"
-            );
-            ids.push(id);
-        }
-
-        let unique: BTreeSet<&String> = ids.iter().collect();
-        assert_eq!(
-            unique.len(),
-            1,
-            "case {name:?}: expected every add to report one shared id, got {ids:?}"
-        );
-
-        // Exactly one channel exists for the topic, carrying the config submitted.
-        let listed = emulator.list_notification_channels(None).await;
-        assert_eq!(
-            listed.at("/Channels").cloned().unwrap_or(Value::Null),
-            json!([{ "Id": ids[0], "Config": config }]),
-            "case {name:?}: expected exactly one channel for the topic, got {}",
-            listed.raw
-        );
-
-        // Idempotency is keyed by the TARGET, not by the operation: another topic is
-        // another channel, with an id of its own.
-        let other = emulator
-            .add_notification_channel(channel_config(
-                "arn:aws:sns:us-east-1:000000000000:guru-second-topic",
-                &filters,
-            ))
-            .await;
-        assert_eq!(
-            other.status, 200,
-            "case {name:?}: adding a second topic must succeed, got {}",
-            other.raw
-        );
-        let other_id = minted_id(&other);
-        assert_ne!(
-            other_id, ids[0],
-            "case {name:?}: a different topic must mint its own id, got {other_id:?} twice"
-        );
-        let after = listed_channel_ids(&emulator).await;
-        assert_eq!(
-            after.len(),
-            2,
-            "case {name:?}: expected two channels for two topics, got {after:?}"
-        );
-    }
-}
-
-/// How many callers race to register one topic. The reported race is 3; this goes
-/// further, because the rule is about ANY number of concurrent registrations.
-const RACERS: usize = 6;
-
-/// RULE (the same idempotency, reached concurrently): N callers registering ONE topic at
-/// the same time all succeed and all get the same single channel id, and exactly one
-/// channel exists afterwards.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_registrations_of_one_topic_all_report_one_id() {
-    let emulator = Arc::new(Emulator::new());
-    let topic_arn = "arn:aws:sns:us-west-2:000000000000:sim2real-devopsguru-topic-race";
-
-    let mut racers = Vec::new();
-    for racer in 0..RACERS {
-        let emulator = Arc::clone(&emulator);
-        let config = channel_config(topic_arn, &json!(null));
-        racers.push(tokio::spawn(async move {
-            (racer, emulator.add_notification_channel(config).await)
-        }));
-    }
-
-    let mut ids: Vec<String> = Vec::new();
-    for racer in racers {
-        let (index, reply) = racer.await.expect("the racing add task ran");
-        assert_eq!(
-            reply.status, 200,
-            "racer {index}: every concurrent add of one topic must succeed, got status {} body {}",
-            reply.status, reply.raw
-        );
-        ids.push(minted_id(&reply));
-    }
-
-    let unique: BTreeSet<&String> = ids.iter().collect();
-    assert_eq!(
-        unique.len(),
-        1,
-        "expected all {RACERS} racers to share one id, got {ids:?}"
-    );
-
-    let listed = listed_channel_ids(&emulator).await;
-    assert_eq!(
-        listed,
-        vec![ids[0].clone()],
-        "expected exactly one channel after the race, got {listed:?}"
-    );
 }
 
 /// RULE: a removal keyed by its target is idempotent — `RemoveNotificationChannel`
@@ -816,76 +664,4 @@ async fn an_opted_in_customer_managed_key_must_designate_a_key() {
     }
 }
 
-/// RULE: a repeat registration of an already-registered topic reports the existing
-/// channel, so the config a later read reports is the one the channel was created with.
-///
-/// The rows differ in HOW the repeat's `Config` differs from the stored one: identical,
-/// filters added, filters dropped, and filters changed. Each asserts the shared id and
-/// the config `ListNotificationChannels` reports afterwards, so the semantics of a
-/// differing repeat are pinned rather than left to chance.
-#[tokio::test]
-async fn a_repeat_registration_reports_the_channel_as_registered() {
-    let topic_arn = "arn:aws:sns:us-east-1:000000000000:guru-converge";
-    let with_filters = json!({ "Severities": ["HIGH"], "MessageTypes": ["NEW_INSIGHT"] });
-    let other_filters = json!({ "Severities": ["LOW"] });
-    let cases: [(&str, Value, Value); 4] = [
-        ("an identical repeat", json!(null), json!(null)),
-        (
-            "a repeat that adds filters",
-            json!(null),
-            with_filters.clone(),
-        ),
-        (
-            "a repeat that drops the filters",
-            with_filters.clone(),
-            json!(null),
-        ),
-        (
-            "a repeat that changes the filters",
-            with_filters.clone(),
-            other_filters,
-        ),
-    ];
-
-    for (name, registered, repeated) in cases {
-        let emulator = Emulator::new();
-        let registered_config = channel_config(topic_arn, &registered);
-
-        let first = emulator
-            .add_notification_channel(registered_config.clone())
-            .await;
-        assert_eq!(
-            first.status, 200,
-            "case {name:?}: the first add must succeed, got {}",
-            first.raw
-        );
-        let id = minted_id(&first);
-
-        let repeat = emulator
-            .add_notification_channel(channel_config(topic_arn, &repeated))
-            .await;
-        assert_eq!(
-            repeat.status, 200,
-            "case {name:?}: the repeat must succeed, got status {} body {}",
-            repeat.status, repeat.raw
-        );
-        assert_eq!(
-            repeat.at("/Id").and_then(Value::as_str),
-            Some(id.as_str()),
-            "case {name:?}: the repeat must report the registered id {id:?}, got {}",
-            repeat.raw
-        );
-
-        // The channel IS the registration that is already in place: the model has no
-        // operation that reconfigures one, so the repeat changes nothing and the read
-        // reports the config the channel was registered with.
-        let listed = emulator.list_notification_channels(None).await;
-        assert_eq!(
-            listed.at("/Channels").cloned().unwrap_or(Value::Null),
-            json!([{ "Id": id, "Config": registered_config }]),
-            "case {name:?}: expected the registered config unchanged, got {}",
-            listed.raw
-        );
-    }
-}
 

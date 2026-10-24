@@ -27,6 +27,8 @@ mod cancellation_request_decisions;
 mod charge_amounts;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
+#[path = "all/idempotency_token_conflicts.rs"]
+mod idempotency_token_conflicts;
 #[path = "all/payment_request_cancellation.rs"]
 mod payment_request_cancellation;
 #[path = "all/payment_request_rejection.rs"]

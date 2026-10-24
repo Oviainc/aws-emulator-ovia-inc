@@ -340,7 +340,7 @@ async fn a_filter_outside_the_documented_attribute_is_refused() {
         ),
         (
             "an unsupported comparison",
-            json!({"Attribute": "IdentityProviderArn", "Operation": "geq", "Value": "x"}),
+            json!({"Attribute": "IdentityProviderArn", "Operation": "like", "Value": "x"}),
         ),
     ];
 

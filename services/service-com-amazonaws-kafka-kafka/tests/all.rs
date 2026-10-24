@@ -27,6 +27,8 @@ mod configuration_lifecycle;
 mod configuration_revisions;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
+#[path = "all/create_cluster_v2.rs"]
+mod create_cluster_v2;
 #[path = "all/describe_cluster_v2.rs"]
 mod describe_cluster_v2;
 #[path = "all/kafka_harness.rs"]

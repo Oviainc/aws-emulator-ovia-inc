@@ -174,17 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate, consulted BEFORE any target is resolved:
-        // on a Region this account has activated no Snow device in, the caller
-        // never learns whether the device ids it named exist. It precedes the
-        // idempotency replay too — a token minted in another Region names no task
-        // here.
-        if !store.has_activated_device(&region) {
-            return Err(CreateTaskErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
+        // The idempotency replay is per Region: a token minted in another Region
+        // names no task here.
         store.settle(now);
 
         // `@idempotencyToken`: the same token, in the Region it was used in, names
@@ -254,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // device, and a device runs one execution of a task, so the key pair is
         // what de-duplicates it.
         for target in input.targets {
-            let key = (task_id.clone(), target.clone());
+            let key = (region.clone(), task_id.clone(), target.clone());
             if store.executions.contains_key(&key) {
                 continue;
             }

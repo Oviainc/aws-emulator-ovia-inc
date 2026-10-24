@@ -219,6 +219,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A map's KEYS carry the key shape's own modelled constraints, and nothing in the
+        // request walk applies them (see the map-keys section of `crate::state`) — so both
+        // maps this request carries are checked here rather than stored unchecked.
+        crate::state::check_map_keys(
+            "labels",
+            input.labels.iter().flat_map(|labels| labels.keys()),
+            &crate::state::PROMETHEUS_METRIC_LABEL_KEY,
+        )
+        .map_err(CreateAnomalyDetectorErrorModeled::ValidationException)?;
+        crate::state::check_map_keys(
+            "tags",
+            input.tags.iter().flat_map(|tags| tags.keys()),
+            &crate::state::TAG_KEY,
+        )
+        .map_err(CreateAnomalyDetectorErrorModeled::ValidationException)?;
+
         check_configuration(&input.configuration)?;
 
         let mut store = state.lock();

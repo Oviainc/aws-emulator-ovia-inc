@@ -3,7 +3,9 @@
 //! @op ListSigningProfiles
 //!
 //! Implemented: pages over the signing profiles stored for the region this
-//! request was signed for. Reporting only — it writes nothing.
+//! request was signed for, handing back an opaque `nextToken` that resumes THIS
+//! listing — same region, same filters — and nothing else. Reporting only — it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +129,20 @@ impl From<ListSigningProfilesErrorModeled> for ListSigningProfilesError {
     }
 }
 
+/// The modelled 400 for a `nextToken` that is not one this listing handed out.
+///
+/// `code` names the condition a paginating client resets on, as the service's
+/// other paginated read words it. The refused value is not echoed: a client that
+/// held a token from another listing learns that the token is not valid here, and
+/// nothing of what the token decodes to is reported back.
+fn invalid_next_token() -> ListSigningProfilesError {
+    ListSigningProfilesErrorModeled::ValidationException(ValidationException {
+        message: Some("Invalid next token provided".to_string()),
+        code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
+    })
+    .into()
+}
+
 /// The `ListSigningProfiles` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,21 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The token is the profile name the next page starts at. A token this
-        // service never handed out is refused with the modelled 400, whose `code`
-        // names the condition a paginating client resets on.
-        if let Some(token) = input.next_token.as_deref() {
-            if !crate::state::is_profile_name(token) {
-                return Err(ListSigningProfilesErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some("Invalid next token provided".to_string()),
-                        code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
-                    },
-                )
-                .into());
-            }
-        }
-
         // `maxResults` is modelled `@range(min: 1, max: 25)` and the boundary
         // validator refused anything outside it before this handler ran, so the
         // only case left is an absent value: serve the largest page the model
@@ -220,24 +221,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // Which profiles this call enumerates — the listing a page of it hands a
+        // token out for, and the only listing that token resumes.
+        let listing = crate::state::ProfileListing {
+            region,
+            platform_id: input.platform_id,
+            statuses,
+        };
+
+        // `nextToken` is this service's own opaque cursor into THIS listing, so
+        // the profile name the next page starts at is read back out of the token
+        // rather than taken from it. A value the service never handed out — one it
+        // cannot decode, or one issued for another region or another filter set —
+        // is refused with the modelled 400, whose `code` names the condition a
+        // paginating client resets on, instead of serving a page out of some other
+        // ordering.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => match listing.resume_at(token) {
+                Some(resume_at) => Some(resume_at),
+                None => return Err(invalid_next_token()),
+            },
+            None => None,
+        };
+
         let store = state.lock();
         let mut profiles = Vec::with_capacity(page_size);
         let mut next_token = None;
-        for (profile_name, profile) in store.profiles_in(&region) {
-            // Resume at the first name at or after the token, so a page is still
-            // served when the profile the token named no longer passes the
-            // filters this call carries.
-            if input
-                .next_token
+        for (profile_name, profile) in store.profiles_in(&listing.region) {
+            // Resume at the first name at or after the one the token carries, so a
+            // page is still served when the profile it named has since stopped
+            // passing the filters this listing carries.
+            if resume_at
                 .as_deref()
-                .is_some_and(|token| profile_name < token)
+                .is_some_and(|resume_at| profile_name < resume_at)
             {
                 continue;
             }
-            if !statuses.contains(&profile.status) {
+            if !listing.statuses.contains(&profile.status) {
                 continue;
             }
-            if input
+            if listing
                 .platform_id
                 .as_deref()
                 .is_some_and(|platform_id| platform_id != profile.platform_id)
@@ -245,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if profiles.len() == page_size {
-                next_token = Some(profile_name.to_string());
+                next_token = Some(listing.page_token(profile_name));
                 break;
             }
             profiles.push(profile.to_summary());

@@ -56,14 +56,14 @@ async fn cluster(router: &MultiServiceRouter, name: &str) -> String {
 /// The node collection of one cluster, which `CreateNode` and `ListNodes` are
 /// bound to (`smithy_query(query="operation", operation="CreateNode")`: `POST
 /// /prod/clusters/{ClusterId}/nodes`).
-fn nodes_uri(cluster: &str) -> String {
+pub(crate) fn nodes_uri(cluster: &str) -> String {
     format!("/prod/clusters/{cluster}/nodes")
 }
 
 /// One node of one cluster, which `DescribeNode`, `DeleteNode` and `UpdateNode`
 /// are bound to (`GET`/`DELETE`/`PUT
 /// /prod/clusters/{ClusterId}/nodes/{NodeId}`).
-fn node_uri(cluster: &str, node: &str) -> String {
+pub(crate) fn node_uri(cluster: &str, node: &str) -> String {
     format!("/prod/clusters/{cluster}/nodes/{node}")
 }
 
@@ -76,7 +76,7 @@ async fn create_node(router: &MultiServiceRouter, cluster: &str, body: Value) ->
 /// `201 Created` is the status the model gives `CreateNode`
 /// (`smithy_query(query="operation", operation="CreateNode")`: code 201), and
 /// the one every other MediaLive create answers with.
-async fn created(
+pub(crate) async fn created(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,
@@ -94,7 +94,7 @@ async fn describe_node(router: &MultiServiceRouter, cluster: &str, node: &str) -
     call(router, "GET", &node_uri(cluster, node), None).await
 }
 
-async fn delete_node(router: &MultiServiceRouter, cluster: &str, node: &str) -> (u16, Value) {
+pub(crate) async fn delete_node(router: &MultiServiceRouter, cluster: &str, node: &str) -> (u16, Value) {
     call(router, "DELETE", &node_uri(cluster, node), None).await
 }
 

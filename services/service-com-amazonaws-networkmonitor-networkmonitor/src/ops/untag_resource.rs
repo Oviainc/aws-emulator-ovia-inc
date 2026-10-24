@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `resourceArn`'s length bound and `@pattern(^arn:.*$)`, and `tagKeys`'
         // own constraints, are refused by the framework BEFORE this handler
         // runs, so reaching here means the input satisfies each of them. An
@@ -157,11 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // Only the resources of the region this request was signed for are
+        // reachable, so an ARN naming another region's monitor or probe names
+        // nothing this endpoint can untag.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         let target = store
-            .resolve_tagged_resource(&input.resource_arn)
+            .resolve_tagged_resource(&region, &input.resource_arn)
             .ok_or_else(|| {
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(format!(

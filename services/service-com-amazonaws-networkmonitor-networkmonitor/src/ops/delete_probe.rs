@@ -143,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `monitorName`'s and `probeId`'s `@pattern`s are refused by the
         // framework BEFORE this handler runs, so an id that reaches here is one
         // the service could have minted.
@@ -152,14 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // A delete reaches only the region it was signed for: a probe of another
+        // region's monitor is a different resource and stays where it is.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
-            DeleteProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
-            })
-        })?;
+        let monitor = store
+            .monitor_mut(&region, &input.monitor_name)
+            .ok_or_else(|| {
+                DeleteProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
+                })
+            })?;
         if monitor.probes.remove(&input.probe_id).is_none() {
             return Err(DeleteProbeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

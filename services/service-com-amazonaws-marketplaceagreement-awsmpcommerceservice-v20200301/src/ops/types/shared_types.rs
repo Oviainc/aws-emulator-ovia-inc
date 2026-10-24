@@ -76,28 +76,32 @@ pub struct PurchaseOrder {
     pub purchase_order_reference: Option<String>,
 }
 
+// `PartialEq` on the three term configurations a `RequestedTerm` can carry, and on the
+// dimensions one of them holds: a create whose `@idempotencyToken` already named a
+// quote compares the stored request against the submitted one by value (see
+// `RequestedTerm`). Nothing else about these shapes changes.
 #[smithy_macros::smithy(shape = "com.amazonaws.marketplaceagreement#ConfigurableUpfrontPricingTermConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigurableUpfrontPricingTermConfiguration {
     pub selector_value: String,
     pub dimensions: Vec<Dimension>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.marketplaceagreement#Dimension")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Dimension {
     pub dimension_key: String,
     pub dimension_value: i32,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.marketplaceagreement#RenewalTermConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RenewalTermConfiguration {
     pub enable_auto_renew: bool,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.marketplaceagreement#VariablePaymentTermConfiguration")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VariablePaymentTermConfiguration {
     pub payment_request_approval_strategy: String,
     pub expiration_duration: Option<String>,

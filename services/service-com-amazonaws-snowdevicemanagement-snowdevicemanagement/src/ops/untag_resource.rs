@@ -195,11 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The tagging operations are NOT behind the account-level device gate: the
-        // model declares no `AccessDeniedException` on them for it, and recorded
-        // behaviour has them answer their own not-found instead. Settling is still
-        // owed, because a tag read of a task has to see the state the clock gave
-        // it.
+        // Settling is owed here too, because a tag read of a task has to see the
+        // state the clock gave it.
         store.settle(now);
 
         let resource = match crate::state::parse_tagged_resource_arn(&input.resource_arn) {
