@@ -29,6 +29,8 @@ mod derived_chain_reads;
 mod error_contract;
 #[path = "all/error_response_shape.rs"]
 mod error_response_shape;
+#[path = "all/finality_default.rs"]
+mod finality_default;
 #[path = "all/response_fidelity.rs"]
 mod response_fidelity;
 #[path = "all/state_roundtrip.rs"]
