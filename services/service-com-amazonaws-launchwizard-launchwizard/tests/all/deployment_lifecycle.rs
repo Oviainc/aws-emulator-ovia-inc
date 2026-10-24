@@ -27,9 +27,9 @@ use crate::harness::{catalogue, walk_pages, Harness, REGION};
 pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Long enough for every clock-owed status step a lifecycle call schedules to come
-/// due (two `TRANSITION_SPAN`s plus slack). The emulator never sleeps; this is the
-/// test waiting for the clock.
-const SETTLE: Duration = Duration::from_millis(1_400);
+/// due (the three `TRANSITION_SPAN`s a create walks, plus slack). The emulator never
+/// sleeps; this is the test waiting for the clock.
+const SETTLE: Duration = Duration::from_millis(2_100);
 
 /// The settings a `CreateDeployment` for `pattern` has to carry: every field THAT
 /// pattern's published schema marks `required`, filled with one of the values it allows
@@ -287,8 +287,8 @@ async fn a_created_deployment_is_read_back_from_state_and_advances_on_the_clock(
         .clone();
     assert_eq!(
         events.len(),
-        3,
-        "case {case:?}: create plus its two clock-owed steps append three events, got {}",
+        4,
+        "case {case:?}: create plus its three clock-owed steps append four events, got {}",
         events.len()
     );
     for event in &events {
@@ -801,9 +801,9 @@ async fn delete_is_idempotent_and_observable_from_every_reader() {
         .clone();
     assert_eq!(
         events.len(),
-        6,
-        "case {case:?}: the create and its two steps, then the delete and its two steps, append \
-         six events, got {}",
+        7,
+        "case {case:?}: the create and its three clock-owed steps, then the delete's \
+         synchronous DELETE_INITIATING and its two clock-owed steps, append seven events, got {}",
         events.len()
     );
     for page_size in 1..=events.len() + 1 {
@@ -833,7 +833,7 @@ async fn delete_is_idempotent_and_observable_from_every_reader() {
         .await;
     let token = first_page["nextToken"]
         .as_str()
-        .expect("a six-event history paged at one must hand back a token")
+        .expect("a multi-event history paged at one must hand back a token")
         .to_string();
     harness
         .refused(
