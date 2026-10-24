@@ -367,11 +367,14 @@ impl DueNamedState {
 ///
 /// A Lightsail managed database is an Amazon RDS DB instance, and the member
 /// carries RDS's own DB instance status values: `creating` while the instance is
-/// being provisioned and `available` once it accepts connections (Amazon RDS
-/// User Guide, "Viewing DB instance status").
+/// being provisioned, `available` once it accepts connections, and `rebooting`
+/// while its engine is being restarted (Amazon RDS User Guide, "Viewing DB
+/// instance status").
 pub const RELATIONAL_DATABASE_STATE_CREATING: &str = "creating";
 /// See [`RELATIONAL_DATABASE_STATE_CREATING`].
 pub const RELATIONAL_DATABASE_STATE_AVAILABLE: &str = "available";
+/// See [`RELATIONAL_DATABASE_STATE_CREATING`].
+pub const RELATIONAL_DATABASE_STATE_REBOOTING: &str = "rebooting";
 
 /// `RelationalDatabaseSnapshot$state` values this slice uses — "The state of the
 /// database snapshot", a plain string in the model with no enum behind it.
@@ -435,6 +438,8 @@ pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT: &str =
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
     "UpdateRelationalDatabaseParameters";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_REBOOT_RELATIONAL_DATABASE: &str = "RebootRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -3093,9 +3098,9 @@ pub struct StoredParameterOverride {
     pub apply_method: &'static str,
     /// Whether the RUNNING engine is still waiting for a reboot to load this
     /// value — true for a value applied `pending-reboot`. It is what puts the
-    /// database in [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`], and
-    /// `RebootRelationalDatabase` (still a scaffold stub, with its own issue) is
-    /// what clears it.
+    /// database in [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`], and the engine
+    /// coming back up from a `RebootRelationalDatabase` restart is what clears
+    /// it ([`StoredRelationalDatabase::load_pending_parameters`]).
     pub pending_reboot: bool,
 }
 
@@ -5302,8 +5307,9 @@ pub struct StoredRelationalDatabase {
     /// The master endpoint address, assigned at creation so every later read
     /// reports the same one. See [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
     pub endpoint_address: String,
-    /// The current state: [`RELATIONAL_DATABASE_STATE_CREATING`] or
-    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`].
+    /// The current state: [`RELATIONAL_DATABASE_STATE_CREATING`],
+    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`] or
+    /// [`RELATIONAL_DATABASE_STATE_REBOOTING`].
     pub state: &'static str,
     /// The state the clock owes this database, while one is outstanding.
     pub due: Option<DueNamedState>,
@@ -5366,6 +5372,44 @@ impl StoredRelationalDatabase {
         );
     }
 
+    /// Start the restart of this database's engine: the database reports
+    /// [`RELATIONAL_DATABASE_STATE_REBOOTING`] and the clock owes it
+    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`] again.
+    ///
+    /// A restart happens INSIDE the database: nothing else on the record is
+    /// rewritten — the ARN, the hardware, the credentials, the windows and the
+    /// master endpoint a client connects to are all the ones the database
+    /// already had, exactly as an RDS DB instance keeps its endpoint across a
+    /// reboot.
+    ///
+    /// PRECONDITION: the database has no transition outstanding. A reboot is
+    /// accepted only in [`RELATIONAL_DATABASE_STATE_AVAILABLE`], the one state
+    /// where nothing is owed, so the `due` written here replaces none — a caller
+    /// that reached this from a state with a transition pending would drop it.
+    pub fn begin_reboot(&mut self, now_ms: i64) {
+        self.state = RELATIONAL_DATABASE_STATE_REBOOTING;
+        self.due = Some(DueNamedState::after(
+            now_ms,
+            RELATIONAL_DATABASE_STATE_AVAILABLE,
+        ));
+    }
+
+    /// The engine has (re)started after a `RebootRelationalDatabase` call, so
+    /// every parameter value that was waiting for a restart is now loaded by it:
+    /// "Parameters marked with a pending-reboot apply type are applied only
+    /// after the database is rebooted using the reboot relational database
+    /// operation" (the modelled `UpdateRelationalDatabaseParameters`
+    /// documentation).
+    ///
+    /// The VALUES are untouched — the parameter group carried them already; what
+    /// changes is that the running engine has them, which is what
+    /// [`Self::parameter_apply_status`] reports.
+    pub fn load_pending_parameters(&mut self) {
+        for set in self.parameter_overrides.values_mut() {
+            set.pending_reboot = false;
+        }
+    }
+
     /// `RelationalDatabase$parameterApplyStatus`: DERIVED from the parameter
     /// group rather than tracked beside it, where the two could disagree — a
     /// database is [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] exactly while it
@@ -5419,10 +5463,13 @@ impl StoredRelationalDatabase {
             preferred_backup_window: Some(self.preferred_backup_window.clone()),
             preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
             publicly_accessible: Some(self.publicly_accessible),
-            // The endpoint is announced once the database is serving: a database
-            // still being created accepts no connection, and reports no address
-            // to make one to.
-            master_endpoint: (self.state == RELATIONAL_DATABASE_STATE_AVAILABLE).then(|| {
+            // The endpoint is announced once the database has finished being
+            // provisioned: a database still being created accepts no connection,
+            // and reports no address to make one to. Once announced it is the
+            // database's from then on — a restart does not take it away, exactly
+            // as an RDS DB instance keeps its endpoint across a reboot — so it is
+            // reported for every state other than `creating`.
+            master_endpoint: (self.state != RELATIONAL_DATABASE_STATE_CREATING).then(|| {
                 crate::ops::types::RelationalDatabaseEndpoint {
                     port: Some(relational_database_port(self.blueprint.engine)),
                     address: Some(self.endpoint_address.clone()),
@@ -7728,8 +7775,16 @@ impl ComAmazonawsLightsailLightsail20161128State {
         for database in self.relational_databases.values_mut() {
             let Some(due) = database.due else { continue };
             if due.at_ms <= now_ms {
+                let restarting = database.state == RELATIONAL_DATABASE_STATE_REBOOTING;
                 database.state = due.state;
                 database.due = None;
+                // A database that has come back up from a restart has an engine
+                // that read its whole parameter group as it started, so this is
+                // the instant a value applied `pending-reboot` is loaded — the
+                // one thing a reboot changes about the record.
+                if restarting && database.state == RELATIONAL_DATABASE_STATE_AVAILABLE {
+                    database.load_pending_parameters();
+                }
             }
         }
         for snapshot in self.relational_database_snapshots.values_mut() {
