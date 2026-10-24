@@ -18,7 +18,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     Address, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost,
-    PrivateConnectivityConfig, Quote, Site,
+    PricingOption, PrivateConnectivityConfig, Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -101,6 +101,19 @@ pub const QUOTE_STATUS_EXPIRED: &str = "EXPIRED";
 pub const QUOTE_VALIDITY: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 60 * 60);
 
+/// The `PricingResult` a pricing request carries when the service priced it: it
+/// answers with the pricing options it found.
+///
+/// The modelled `PricingResult` enum declares exactly two values — see
+/// [`crate::ops::types::shared_types::PRICING_RESULT_VALUES`] — and they are the
+/// two outcomes of one question: either the request could be priced, or it could
+/// not.
+pub const PRICING_RESULT_PRICED: &str = "PRICED";
+
+/// The `PricingResult` a pricing request carries when the service could not price
+/// it, and so has no pricing option to report. See [`PRICING_RESULT_PRICED`].
+pub const PRICING_RESULT_UNABLE_TO_PRICE: &str = "UNABLE_TO_PRICE";
+
 /// A persisted site: the modelled [`Site`] this service answers with, plus the two
 /// whole [`Address`] values `Site` itself does not carry (it exposes only the
 /// operating address's country, state and city) and the creation order every list
@@ -143,6 +156,26 @@ pub struct OutpostRecord {
     /// first call made at or after it, which reports exactly the status the
     /// Outpost would hold had nobody called at all.
     pub active_at: Option<std::time::Instant>,
+    /// The priced subscription options a RENEWAL of this Outpost's contract can be
+    /// bought under — what `GetRenewalPricing` reports for it, and the list a
+    /// `CreateRenewal` picks a payment option and term out of.
+    ///
+    /// Kept on the Outpost's own record for the reason
+    /// [`OutpostRecord::private_connectivity`] is: renewal pricing is an attribute
+    /// of ONE Outpost (the modelled route is
+    /// `/outpost/{OutpostIdentifier}/renewal-pricing`), so deleting the Outpost
+    /// takes it with the Outpost.
+    ///
+    /// A renewal price is a figure from AWS's own price list for the hardware the
+    /// Outpost's order installed, which this emulator does not have — the same
+    /// reason `CreateQuote` reports no `QuoteOption` — so this holds only priced
+    /// options that were actually recorded and never a number the emulator made
+    /// up. Nothing in the implemented slice of this API records one: an Outpost's
+    /// priced subscriptions arrive with its order, and `CreateOrder`,
+    /// `CreateRenewal` and `GetOutpostBillingInformation` are all still scaffold
+    /// stubs with issues of their own. So a `CreateOutpost` leaves this empty, and
+    /// an Outpost with no recorded option cannot be priced.
+    pub renewal_pricing: Vec<PricingOption>,
 }
 
 /// The `CapacityTaskStatus` a capacity task carries the moment `StartCapacityTask`

@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDeviceDiscovery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDeviceDiscovery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDeviceDiscovery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a device discovery job into `crate::state`'s `device_discoveries` store under a
+//! freshly generated `DeviceDiscoveryId`, and answers with that id and the instant the job
+//! started. The job runs for [`crate::state::DEVICE_DISCOVERY_DURATION`] — the clock
+//! completes it — so `GetDeviceDiscovery` reports it `RUNNING` straight after this call and
+//! `SUCCEEDED` from its due instant.
+//!
+//! ## What a discovery finds
+//!
+//! The real service tells the controller to search its network, or queries the third-party
+//! cloud the account association names. This emulator has neither a radio nor a third-party
+//! cloud, so a job searches the only surface it has: the managed things this store already
+//! holds for the surface the request names — for a hub-connected discovery (`ZWAVE`,
+//! `ZIGBEE`, `CONTROLLER_CAPABILITY_REDISCOVERY`) the things whose stored
+//! `ParentControllerId` is the request's `ControllerIdentifier`, and for a
+//! third-party-connected one (`CLOUD`, `CUSTOM`) the things whose stored
+//! `ConnectorDestinationId` is the destination the named account association points at.
+//! `ConnectorDeviceIdList` narrows that set, as the model says ("Used as a filter"). A
+//! request that names no surface, or one nothing is attached to, discovers nothing: no
+//! device is invented for it.
+//!
+//! ## What one start costs
+//!
+//! A job's result is a SNAPSHOT, retained for as long as the job is, so both the work this
+//! call does and the memory it retains are bounded rather than left to grow with the stores
+//! it reads: the surface scan is linear in the managed-thing store (itself capped), each
+//! candidate costs ONE index lookup to classify
+//! ([`crate::state::ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::discovery_modification`]),
+//! at most [`crate::state::MAX_DISCOVERED_DEVICES_PER_DISCOVERY`] devices are recorded, and
+//! the store keeps at most [`crate::state::MAX_DEVICE_DISCOVERIES`] jobs — retiring the ones
+//! the clock made due ([`crate::state::DEVICE_DISCOVERY_RETENTION`]) and then evicting the
+//! oldest.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +184,35 @@ pub struct StartDeviceDiscovery<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The `DiscoveryType` values that search a HUB's own network: the two hub protocols, and
+/// the rediscovery of what a controller already has. Each of them names the hub it searches
+/// on `ControllerIdentifier`, so a job of one of these types finds the managed things
+/// attached to that controller. Read off `DiscoveryType`
+/// (`smithy_query(query="shape",shape="DiscoveryType")` -> ZWAVE | ZIGBEE | CLOUD | CUSTOM |
+/// CONTROLLER_CAPABILITY_REDISCOVERY); the remaining two are [`CLOUD_DISCOVERY_TYPES`].
+const HUB_DISCOVERY_TYPES: &[&str] = &["ZWAVE", "ZIGBEE", "CONTROLLER_CAPABILITY_REDISCOVERY"];
+
+/// The `DiscoveryType` values that search a THIRD-PARTY cloud: the devices reachable
+/// through the account association the request names, which is the connector destination
+/// that association was created against.
+const CLOUD_DISCOVERY_TYPES: &[&str] = &["CLOUD", "CUSTOM"];
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the job was started in, the discovery
+/// type it runs and how the call ended. No controller or account-association id and no
+/// authentication material: a log sink needs none of them to attribute the change.
+fn audit(akid: &str, region: &str, discovery_type: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "StartDeviceDiscovery",
+        akid = %akid,
+        region = %region,
+        discovery_type = %discovery_type,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> StartDeviceDiscovery<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -187,18 +239,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDeviceDiscovery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDeviceDiscoveryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this job runs in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, &input.discovery_type, "unavailable");
+            StartDeviceDiscoveryErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the device-discovery store is unavailable".to_string()),
+            })
+        })?;
+
+        // `DiscoveryType` is a modelled enum, so a value outside `DISCOVERY_TYPE_VALUES` is
+        // a client error rather than a started job. The model's own constraint walk refuses
+        // one before this handler runs; this second line states it through the SAME
+        // formatter, so the two cannot word one refusal two ways.
+        if !DISCOVERY_TYPE_VALUES.contains(&input.discovery_type.as_str()) {
+            audit(&akid, &region, &input.discovery_type, "refused");
+            return Err(StartDeviceDiscoveryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        "discoveryType",
+                        DISCOVERY_TYPE_VALUES,
+                        &input.discovery_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let started_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Retire the idempotency records the clock already made due, before anything reads
+        // them: a token past its TTL neither replays nor occupies the map. The discovery
+        // jobs the clock retired go the same way, so their snapshots stop occupying memory.
+        store.retire_expired_idempotency_tokens(started_at);
+        store.retire_expired_device_discoveries(started_at);
+
+        // A retry with the same `ClientToken` answers with the job the first call started,
+        // performing no further action — so it starts no second discovery of the same
+        // surface.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::DEVICE_DISCOVERY_RESOURCE_TYPE, token)
+        });
+        if let Some(started) = replayed.and_then(|id| store.device_discovery_in(&region, &id)) {
+            let (id, started_at) = (started.id.clone(), started.started_at);
+            drop(store);
+            audit(&akid, &region, &input.discovery_type, "replayed");
+            return Ok(StartDeviceDiscoveryOutput {
+                id: Some(id),
+                started_at: Some(crate::state::timestamp(started_at)),
+            });
+        }
+
+        // The store is bounded: at its maximum the OLDEST job is evicted rather than the
+        // store grown into, so a caller that keeps starting jobs cannot make this
+        // emulator's memory grow without end, and a start is never refused for it.
+        store.make_room_for_device_discovery();
+
+        // The surface this job searches, as the module docs state it: a controller's own
+        // network, or the connector destination the named account association points at.
+        // An account association this region does not hold names no destination, so the
+        // job searches nothing — it is not refused, because a destination this store does
+        // not hold is not evidence that the account has no such devices (the same rule
+        // `CreateAccountAssociation` states for its own reference).
+        let controller = input
+            .controller_identifier
+            .as_deref()
+            .filter(|_| HUB_DISCOVERY_TYPES.contains(&input.discovery_type.as_str()))
+            .map(str::to_string);
+        let destination = input
+            .account_association_id
+            .as_deref()
+            .filter(|_| CLOUD_DISCOVERY_TYPES.contains(&input.discovery_type.as_str()))
+            .and_then(|id| store.account_association_in(&region, id))
+            .map(|association| association.connector_destination_id.clone());
+
+        // The devices on that surface, in the order the store holds them, so the pages
+        // `ListDiscoveredDevices` hands out are deterministic. Each one is projected from
+        // its STORED record ([`crate::state::discovered_device_summary`]) and carries the
+        // modification an earlier discovery of the same device makes it, which is ONE
+        // index lookup per candidate ([`crate::state::ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::discovery_modification`])
+        // rather than a scan over the stored jobs.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDeviceDiscovery"))
+        // The scan is linear in the managed-thing store, which is itself capped
+        // ([`crate::state::MAX_MANAGED_THINGS`]), and at most
+        // [`crate::state::MAX_DISCOVERED_DEVICES_PER_DISCOVERY`] summaries are materialised
+        // and retained: a job whose surface carries more devices than that reports the
+        // first ones it found, so neither the work this call does nor the memory it retains
+        // grows with the product of the two stores.
+        let found: Vec<DiscoveredDeviceSummary> = store
+            .managed_thing_order
+            .iter()
+            .filter_map(|id| store.managed_things.get(id))
+            .filter(|thing| thing.region == region)
+            .filter(|thing| match (&controller, &destination) {
+                (Some(controller), _) => {
+                    crate::state::PARENT_CONTROLLER_ID.of(thing).as_deref() == Some(controller)
+                }
+                (None, Some(destination)) => {
+                    crate::state::CONNECTOR_DESTINATION_ID.of(thing).as_deref()
+                        == Some(destination)
+                }
+                // No surface named, nothing to search.
+                (None, None) => false,
+            })
+            // `ConnectorDeviceIdList` is a FILTER: a list that names ids keeps only the
+            // devices carrying one of them, and an absent list keeps them all.
+            .filter(|thing| {
+                input.connector_device_id_list.as_ref().is_none_or(|wanted| {
+                    crate::state::CONNECTOR_DEVICE_ID
+                        .of(thing)
+                        .is_some_and(|id| wanted.contains(&id))
+                })
+            })
+            .take(crate::state::MAX_DISCOVERED_DEVICES_PER_DISCOVERY)
+            .map(|thing| {
+                let modification = store.discovery_modification(&region, thing);
+                crate::state::discovered_device_summary(thing, modification, started_at)
+            })
+            .collect();
+
+        let sequence = store.take_sequence();
+        // `DeviceDiscoveryId` is `^[A-Za-z0-9]+$`, len 1..200, which the lowercase-hex
+        // opaque id satisfies.
+        let id = crate::state::opaque_id(sequence);
+        let discovery = crate::state::DeviceDiscovery {
+            id: id.clone(),
+            arn: crate::state::device_discovery_arn(&region, &id),
+            region: region.clone(),
+            discovery_type: input.discovery_type.clone(),
+            controller_id: input.controller_identifier,
+            connector_association_id: input.connector_association_identifier,
+            account_association_id: input.account_association_id,
+            started_at,
+            finishes_at: started_at + crate::state::DEVICE_DISCOVERY_DURATION,
+            tags: input.tags.unwrap_or_default(),
+            discovered_devices: found,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::DEVICE_DISCOVERY_RESOURCE_TYPE,
+                &token,
+                &id,
+                started_at,
+            );
+        }
+        // The insert also records, for every device the job reported, that this region's
+        // discoveries have now seen it, so the next job classifies it in one lookup.
+        store.insert_device_discovery(discovery);
+        drop(store);
+
+        audit(&akid, &region, &input.discovery_type, "started");
+        Ok(StartDeviceDiscoveryOutput {
+            id: Some(id),
+            started_at: Some(crate::state::timestamp(started_at)),
+        })
     }
 }

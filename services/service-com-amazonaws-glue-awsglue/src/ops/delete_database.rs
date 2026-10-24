@@ -179,9 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if removed.is_none() {
             return Err(DeleteDatabaseErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!(
-                        "Database {folded} not found in catalog {catalog_id}"
-                    )),
+                    message: Some(crate::state::messages::database_not_found(&input.name)),
                     from_federation_source: None,
                 },
             )

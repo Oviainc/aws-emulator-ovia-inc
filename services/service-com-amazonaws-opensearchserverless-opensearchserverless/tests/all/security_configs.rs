@@ -26,16 +26,16 @@ use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text, C
 /// A minimal IdP metadata document: `samlMetadata` is
 /// `@length(1..51200)` with `@pattern("[\u{0009}\u{000A}\u{000D}\u{0020}-\u{007E}\u{00A1}-\u{00FF}]+")`,
 /// which is printable text.
-const SAML_METADATA: &str =
+pub(crate) const SAML_METADATA: &str =
     r#"<EntityDescriptor entityID="https://idp.example.com/metadata"></EntityDescriptor>"#;
 
 /// An IAM Identity Center instance ARN of the modelled shape
 /// (`IamIdentityCenterInstanceArn`'s
 /// `^arn:(aws|aws-us-gov|aws-cn|aws-iso|aws-iso-b):sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`).
-const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
+pub(crate) const INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1234567890abcdef";
 
 /// The `samlOptions` of a request whose `name` is `name`, carrying nothing optional.
-fn saml_options() -> Value {
+pub(crate) fn saml_options() -> Value {
     json!({ "metadata": SAML_METADATA })
 }
 
@@ -46,7 +46,7 @@ fn expected_id(kind: &str, name: &str) -> String {
 
 /// Create the security configuration `body` describes, asserting it was accepted, and
 /// answer its `securityConfigDetail`.
-async fn create_config(
+pub(crate) async fn create_config(
     router: &smithy_server_runtime::MultiServiceRouter,
     body: Value,
 ) -> Value {
@@ -60,7 +60,7 @@ async fn create_config(
 }
 
 /// The summaries `ListSecurityConfigs` reports for `kind`, over every page.
-async fn list_all(
+pub(crate) async fn list_all(
     router: &smithy_server_runtime::MultiServiceRouter,
     kind: &str,
 ) -> Vec<Value> {

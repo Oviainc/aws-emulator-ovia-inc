@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDetectKeyPhrases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDetectKeyPhrases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDetectKeyPhrases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Every document of `TextList` is analysed by the SAME in-process
+//! key-phrase extractor the asynchronous key-phrases detection job runs
+//! ([`crate::ops::start_key_phrases_detection_job::key_phrases`]): RAKE over the
+//! language's stop-word list, so each reported phrase is a run of content words CUT
+//! OUT OF its own document, carrying the character offsets it really occupies and a
+//! score computed from the document's own word statistics — nothing is matched out of
+//! the request and a document cannot be analysed differently for having travelled in
+//! a batch. Batching changes only how many documents one request carries: the
+//! documented document-count and per-document byte quotas are refused with this
+//! operation's own modelled errors, through the same `crate::state` helpers the rest
+//! of the `BatchDetect*` family reads.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +91,40 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Batching changes how many documents one request carries, never how a document is
+// analysed or how large it may be: the extraction itself and the per-language
+// stop-word lists live with the key-phrases detection job that already runs them, and
+// the per-document byte quota lives with the state module, so the operations cannot
+// drift apart. Every value the modelled `LanguageCode` enum names has a stop-word
+// list there, so no language of this operation is left unanalysable.
+use super::start_key_phrases_detection_job::{key_phrases, stopwords};
+
+/// The most documents one batch may carry: the ONE ceiling the whole `BatchDetect*`
+/// family shares, [`crate::state::MAX_BATCH_DOCUMENTS`], documented twice in this
+/// operation's own model (`BatchDetectKeyPhrasesRequest$TextList` says "The list can
+/// contain a maximum of 25 documents", and `BatchSizeLimitExceededException` says
+/// "The number of documents in the request exceeds the limit of 25"). The model's
+/// `@length` trait states only the floor of 1, so the ceiling is enforced here, with
+/// the error the operation declares for it.
+const MAX_BATCH_DOCUMENTS: usize = crate::state::MAX_BATCH_DOCUMENTS;
+
+/// The largest single document in the batch, in UTF-8 bytes.
+///
+/// The same per-document real-time quota a single-document inference call enforces,
+/// [`crate::state::REALTIME_TEXT_QUOTA_BYTES`] — one document's quota cannot depend
+/// on whether it was submitted alone or in a batch. The member documentation rounds
+/// it to "5 KB"; the enforced quota is a count of BYTES, so it is that constant and
+/// not a multiple of 1024.
+///
+/// The quota is measured per document and enforced over the REQUEST: a batch
+/// carrying any document past it is refused in its entirety with the modelled
+/// `TextSizeLimitExceededException`, through
+/// [`crate::state::batch_text_size_refusal`], rather than answered with a per-index
+/// `BatchItemError`. The modelled `ErrorList` describes documents a call that was
+/// ACCEPTED could not analyse; a document the quota refuses was never accepted, so
+/// no result for the batch exists to align against.
+const MAX_DOCUMENT_BYTES: usize = crate::state::REALTIME_TEXT_QUOTA_BYTES;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +197,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDetectKeyPhrases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDetectKeyPhrasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDetectKeyPhrases"))
+        // Synchronous inference holds no state: a document's key phrases are a
+        // function of that document and `LanguageCode` alone, so repeating a call
+        // returns the same phrases with the same offsets and nothing a later caller
+        // reads is changed.
+        let _ = (ctx, &self.engine);
+
+        // The model's `@length` floor of 1 on `TextList` is enforced at the
+        // boundary; the ceiling of 25 it documents in prose is not.
+        if input.text_list.len() > MAX_BATCH_DOCUMENTS {
+            return Err(
+                BatchDetectKeyPhrasesErrorModeled::BatchSizeLimitExceededException(
+                    BatchSizeLimitExceededException {
+                        message: Some(crate::state::batch_size_limit_refusal()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-document byte quota, applied to the WHOLE request: a batch
+        // carrying an oversized document is refused before anything is analysed, so
+        // no partial `ResultList` travels with the refusal. Checked after the
+        // document count, which is the quota the service reads first.
+        if let Some(message) = crate::state::batch_text_size_refusal(
+            input.text_list.iter().map(String::as_str),
+            MAX_DOCUMENT_BYTES,
+        ) {
+            return Err(
+                BatchDetectKeyPhrasesErrorModeled::TextSizeLimitExceededException(
+                    TextSizeLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One `LanguageCode` covers the whole batch ("All documents must be in the
+        // same language"), so the language's stop-word set — the phrase delimiters
+        // the extraction reads — is built ONCE and shared by every document rather
+        // than rebuilt per document. Membership of the `LanguageCode` enum is
+        // enforced at the boundary, and every value it names has a list, so no
+        // accepted request is left without an analysis.
+        let stopwords = stopwords(&input.language_code);
+
+        // Every precondition holds, so the whole batch is analysed: `ResultList` is
+        // built in input order, so it is "sorted in ascending order by the Index
+        // field" and every entry's `Index` is its document's own zero-based position
+        // — the only mapping a caller has back to its input. No document of an
+        // accepted batch is left unanalysed, so `ErrorList` is empty; a document the
+        // extractor finds no candidate phrase in is a result with an empty
+        // `KeyPhrases` list rather than an error.
+        let result_list = input
+            .text_list
+            .iter()
+            .enumerate()
+            .map(|(position, text)| BatchDetectKeyPhrasesItemResult {
+                index: i32::try_from(position).ok(),
+                key_phrases: Some(key_phrases(text, &stopwords)),
+            })
+            .collect();
+
+        Ok(BatchDetectKeyPhrasesOutput {
+            result_list,
+            error_list: Vec::new(),
+        })
     }
 }

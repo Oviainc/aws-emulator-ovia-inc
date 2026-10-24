@@ -4,7 +4,9 @@
 //! Mints a job run on a virtual cluster and persists everything the request submitted,
 //! so `DescribeJobRun` and `ListJobRuns` read it back rather than recomputing it. The
 //! run starts `PENDING` and the clock owes it `RUNNING`
-//! ([`crate::state::TRANSITION_SPAN`]).
+//! ([`crate::state::TRANSITION_SPAN`]) — but only once the cluster has a free running
+//! slot, when it configures a `schedulerConfiguration.maxConcurrentJobRuns`. A
+//! submission into a queue that is already `maxInQueueJobRuns` deep is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -239,6 +241,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: Some(existing.arn.clone()),
                 virtual_cluster_id: Some(existing.virtual_cluster_id.clone()),
             });
+        }
+
+        // The queue is a bounded resource when the cluster configures one:
+        // `schedulerConfiguration.maxInQueueJobRuns` caps the runs that may be PENDING or
+        // SUBMITTED at once, and "when the queue is full, the service rejects StartJobRun
+        // requests with a ValidationException". Checked AFTER the replay above, so a
+        // retried submission still names the run it already made rather than being
+        // refused by the queue it is itself sitting in.
+        if let Some(limit) = state.cluster_full_queue_limit(&input.virtual_cluster_id) {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Virtual cluster {} already has {limit} job runs in queue, the maximum its scheduler configuration allows",
+                    input.virtual_cluster_id
+                )),
+            })
+            .into());
         }
 
         // The store is capped, and a finished run is reclaimed to make room. Once every

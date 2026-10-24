@@ -19,6 +19,8 @@ mod cloud_connector_lifecycle;
 mod connector_destination_lifecycle;
 #[path = "all/default_encryption_configuration.rs"]
 mod default_encryption_configuration;
+#[path = "all/device_discovery_lifecycle.rs"]
+mod device_discovery_lifecycle;
 #[path = "all/enum_value_set_rendering.rs"]
 mod enum_value_set_rendering;
 #[path = "all/event_log_configuration_lifecycle.rs"]
@@ -33,8 +35,12 @@ mod managed_thing_lifecycle;
 mod managed_thing_read_side_attributes;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/notification_configuration_lifecycle.rs"]
+mod notification_configuration_lifecycle;
 #[path = "all/ota_task_configuration_lifecycle.rs"]
 mod ota_task_configuration_lifecycle;
+#[path = "all/runtime_log_configuration_cycle.rs"]
+mod runtime_log_configuration_cycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_error_messages.rs"]

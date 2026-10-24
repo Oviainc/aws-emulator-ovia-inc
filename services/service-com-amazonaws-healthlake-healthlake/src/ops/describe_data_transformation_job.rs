@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDataTransformationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDataTransformationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDataTransformationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the data transformation job the request's `JobId` names, from the
+//! record this service's state holds for it: its status, the configuration the
+//! start call supplied, and the progress the run itself produced. A `JobId` no
+//! record holds is the modelled `ResourceNotFoundException`.
+//!
+//! `@readonly`: this operation REPORTS a job and never starts, advances or ends
+//! one. The only write it makes is
+//! [`crate::state::ComAmazonawsHealthlakeHealthlakeState::settle_transformation_jobs`],
+//! which materialises a status transition the CLOCK had already made due, owed
+//! at this instant whether or not anybody called, so two reads of a job whose
+//! span has not elapsed report the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +152,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDataTransformationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDataTransformationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDataTransformationJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeDataTransformationJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the HealthLake data transformation job registry is unavailable"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // Reporting a job's status means first letting the record catch up with
+        // the clock: a transition that was already due is materialised here,
+        // never recomputed per call.
+        store.settle_transformation_jobs();
+
+        // The not-found answer is this service's FIXED text: it names no
+        // identifier, so a well-formed `JobId` no job carries reads the same
+        // whatever the caller asked about.
+        let Some(job) = store.transformation_jobs.get(&input.job_id) else {
+            return Err(
+                DescribeDataTransformationJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::TRANSFORMATION_JOB_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeDataTransformationJobOutput {
+            transformation_job_properties: job.properties(),
+        })
     }
 }

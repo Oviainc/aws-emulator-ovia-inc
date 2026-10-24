@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetEnabledControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetEnabledControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetEnabledControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one enabled control, read from [`crate::state`] by the ARN `EnableControl`
+//! returned: the same persisted record `ListEnabledControls` summarises, plus the
+//! parameters and target regions the enablement was given. An identifier no enablement
+//! minted is `ResourceNotFoundException` (HTTP 404).
+//!
+//! Implemented: this operation no longer answers HTTP 501. It is the round-trip reader
+//! for `EnableControl`, so it is implemented alongside it.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetEnabledControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetEnabledControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetEnabledControl"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetEnabledControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        // `enabledControlIdentifier` is modelled as an `Arn`, so the only identifier the
+        // front door lets through is the ARN `EnableControl` minted — which is this
+        // map's key.
+        let resolved = store
+            .enabled_controls
+            .get(&input.enabled_control_identifier)
+            .cloned();
+        let Some(control) = resolved else {
+            return Err(GetEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no enabled control matches enabledControlIdentifier {}",
+                        input.enabled_control_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetEnabledControlOutput {
+            enabled_control_details: EnabledControlDetails {
+                arn: Some(control.arn),
+                control_identifier: Some(control.control_identifier),
+                target_identifier: Some(control.target_identifier),
+                status_summary: Some(EnablementStatusSummary {
+                    status: Some(control.status.as_wire().to_string()),
+                    last_operation_identifier: Some(control.last_operation_identifier),
+                }),
+                drift_status_summary: Some(DriftStatusSummary {
+                    drift_status: Some(control.drift_status.as_wire().to_string()),
+                    types: Some(EnabledControlDriftTypes {
+                        inheritance: Some(EnabledControlInheritanceDrift {
+                            status: Some(control.inheritance_drift_status.as_wire().to_string()),
+                        }),
+                        resource: Some(EnabledControlResourceDrift {
+                            status: Some(control.resource_drift_status.as_wire().to_string()),
+                        }),
+                    }),
+                }),
+                parent_identifier: control.parent_identifier,
+                target_regions: Some(
+                    control
+                        .target_regions
+                        .into_iter()
+                        .map(|name| Region { name: Some(name) })
+                        .collect(),
+                ),
+                parameters: Some(
+                    control
+                        .parameters
+                        .into_iter()
+                        .map(|(key, value)| EnabledControlParameterSummary { key, value })
+                        .collect(),
+                ),
+            },
+        })
     }
 }

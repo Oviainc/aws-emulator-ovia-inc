@@ -253,7 +253,11 @@ fn candidates(words: &[Word], stopwords: &HashSet<String>) -> Vec<Candidate> {
 /// One list per language the `LanguageCode` enum names, from the `stop-words` crate's
 /// ISO lists rather than a list written out here. A language the crate carries no
 /// list for leaves the set empty, which makes punctuation the only phrase delimiter.
-fn stopwords(language_code: &str) -> HashSet<String> {
+///
+/// Public beside [`key_phrases`] itself, because `BatchDetectKeyPhrases` extracts the
+/// phrases of its own documents with the SAME delimiters: one language's stop words
+/// cannot depend on whether the document travelled through a job or a batch call.
+pub fn stopwords(language_code: &str) -> HashSet<String> {
     let language = match language_code {
         "ar" => ::stop_words::LANGUAGE::Arabic,
         "de" => ::stop_words::LANGUAGE::German,

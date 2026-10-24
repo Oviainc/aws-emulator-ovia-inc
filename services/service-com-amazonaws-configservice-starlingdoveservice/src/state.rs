@@ -37,6 +37,10 @@ use crate::ops::types::ScopeConfiguration;
 // resource's current configuration as.
 use crate::ops::types::BaseConfigurationItem;
 
+// The conformance pack shapes, named separately for the same reason: the pack surface
+// landed on its own and stays out of the shared import list above.
+use crate::ops::types::{ConformancePackInputParameter, ConformancePackStatusDetail};
+
 // `AggregateResourceIdentifier` and `ConfigurationItem` are named separately for the
 // same reason: the first is how an aggregate read path NAMES one resource, the second
 // is the FULL configuration item the single-resource aggregate read reports.
@@ -392,6 +396,83 @@ pub const SNAPSHOT_DELIVERY_SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// `PutConfigRule` refuses a new rule with `MaxNumberOfConfigRulesExceededException`.
 /// 150 is the Config rules service quota (managed plus custom rules per Region).
 pub const CONFIG_RULES_QUOTA: usize = 150;
+
+/// The most resources the discovered-resource inventory holds at once, counting the
+/// entries a deletion was recorded for.
+///
+/// `PutResourceConfig` refuses a new resource past
+/// [`crate::ops::put_resource_config::ACTIVE_CUSTOM_RESOURCES_QUOTA`] ACTIVE resources
+/// with the modelled `MaxActiveResourcesExceededException`, which is the bound a caller
+/// meets; this one is the store's own, so the inventory stays bounded whatever writes it
+/// (a resource whose deletion is recorded occupies no active quota but still occupies an
+/// entry). It is the same number, because an account that holds that many active
+/// resources is already at the quota Config publishes.
+/// [`ComAmazonawsConfigserviceStarlingdoveserviceState::record_discovered_resource`]
+/// enforces it.
+pub const DISCOVERED_RESOURCES_KEPT: usize =
+    crate::ops::put_resource_config::ACTIVE_CUSTOM_RESOURCES_QUOTA;
+
+/// The most conformance packs this account and Region can hold, after which
+/// `PutConformancePack` refuses a NEW pack with
+/// `MaxNumberOfConformancePacksExceededException` ("You have reached the limit of the
+/// number of conformance packs you can create in an account. For more information, see
+/// Service Limits in the Config Developer Guide").
+///
+/// 50 is the number of conformance packs per account per Region the Config Developer
+/// Guide's "Service Limits" publishes. One engine's store stands for ONE account in ONE
+/// Region, so — like [`CONFIG_RULES_QUOTA`] — it is enforced over the whole store, and
+/// it is also what bounds how many packs [`ComAmazonawsConfigserviceStarlingdoveserviceState::conformance_packs`]
+/// can hold.
+pub const CONFORMANCE_PACKS_QUOTA: usize = 50;
+
+/// `ConformancePackState` values (`com.amazonaws.configservice#ConformancePackState`,
+/// whose documented set is `CREATE_IN_PROGRESS`, `CREATE_COMPLETE`, `CREATE_FAILED`,
+/// `DELETE_IN_PROGRESS` and `DELETE_FAILED`).
+///
+/// A pack this emulator deploys reaches only the first two: `PutConformancePack`
+/// refuses a template it cannot deploy BEFORE the pack exists, so no stored pack is in
+/// a failed creation, and nothing holds a deletion in progress.
+pub const CONFORMANCE_PACK_STATE_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+/// See [`CONFORMANCE_PACK_STATE_CREATE_IN_PROGRESS`].
+pub const CONFORMANCE_PACK_STATE_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+/// See [`CONFORMANCE_PACK_STATE_CREATE_IN_PROGRESS`]: the state of a pack whose
+/// deployment could not create the resources its template declares, which is reported
+/// with the `ConformancePackStatusReason` that says why.
+pub const CONFORMANCE_PACK_STATE_CREATE_FAILED: &str = "CREATE_FAILED";
+
+/// The service principal of the Config service that deploys a conformance pack's
+/// resources — the service the pack's service-linked role
+/// `AWSServiceRoleForConfigConforms` belongs to (`PutConformancePack`: "This API uses
+/// the AWSServiceRoleForConfigConforms service-linked role in your account to create
+/// conformance pack resources"). A Config rule a pack deployed reports it as its
+/// `CreatedBy`, which is what tells such a rule apart from one `PutConfigRule` created.
+pub const CONFORMANCE_PACK_SERVICE_PRINCIPAL: &str = "config-conforms.amazonaws.com";
+
+/// The name Config gives a Config rule a conformance pack deploys: the name the
+/// template declares for it, suffixed with the pack's own id, which is what keeps two
+/// packs declaring the same rule name from deploying one rule over the other and keeps
+/// a redeploy of the SAME pack landing on the same rule.
+pub fn conformance_pack_rule_name(declared: &str, pack_id: &str) -> String {
+    format!("{declared}-{pack_id}")
+}
+
+/// How long after the call that requested it a conformance pack's deployment is due to
+/// be complete — the `CREATE_IN_PROGRESS` -> `CREATE_COMPLETE` move
+/// (`ConformancePackState`: "CREATE_IN_PROGRESS when a conformance pack creation is in
+/// progress", "CREATE_COMPLETE when a conformance pack has been successfully created").
+///
+/// The move is one the CLOCK owes, not one the call itself makes: Config deploys the
+/// pack's CloudFormation stack after answering. AWS documents no duration for it, so
+/// the span is CHOSEN: it sits inside the 250–750 ms window this project uses for such
+/// a transition (see [`RECORDER_STATUS_SETTLE_AFTER`]), which keeps the in-progress
+/// state observable to a caller that describes the pack straight after creating it.
+pub const CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// How many conformance pack status records one `DescribeConformancePackStatus` page
+/// carries when the request does not ask for a page size — `Limit` defaults to 0, which
+/// is "unspecified" rather than "no results". 20 is `Limit`'s own maximum (range
+/// 0..20), so it is the largest page the model lets one response carry.
+pub const DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE: usize = 20;
 
 /// The third-party cloud service provider a connector connects to
 /// (`com.amazonaws.configservice#Provider`, whose only published value is `AZURE`;
@@ -1328,6 +1409,13 @@ pub struct ConfigRuleEntry {
     pub state: String,
     pub evaluation_modes: Vec<EvaluationModeConfiguration>,
     pub rule_evaluation_visibility: Option<String>,
+    /// The service principal of the Amazon Web Services service that created this rule
+    /// (`ConfigRule$CreatedBy`: "Service principal name of the service that created the
+    /// rule"), which is set for a rule a SERVICE deployed — a conformance pack deploys
+    /// its rules through its own service-linked role
+    /// ([`CONFORMANCE_PACK_SERVICE_PRINCIPAL`]) — and unset for a rule the account
+    /// created through `PutConfigRule`.
+    pub created_by: Option<String>,
     pub created_at: SystemTime,
     /// The rule's tags, taken at creation by `PutConfigRule` and changed after that
     /// by `TagResource` and `UntagResource` (`PutConfigRule`: "Use TagResource and
@@ -1373,7 +1461,7 @@ impl ConfigRuleEntry {
             input_parameters: self.input_parameters.clone(),
             maximum_execution_frequency: self.maximum_execution_frequency.clone(),
             config_rule_state: Some(self.state.clone()),
-            created_by: None,
+            created_by: self.created_by.clone(),
             evaluation_modes: Some(self.evaluation_modes.clone()),
             rule_evaluation_visibility: self.rule_evaluation_visibility.clone(),
         }
@@ -2156,6 +2244,110 @@ impl StoredQueryEntry {
     }
 }
 
+/// One conformance pack deployed in this account and Region.
+///
+/// A conformance pack is deployed as a CloudFormation stack, which is why the pack
+/// carries both its own ARN and the stack's ([`ConformancePackStatusDetail$StackArn`]).
+/// Its deployment is NOT finished when `PutConformancePack` answers: the pack is
+/// `CREATE_IN_PROGRESS` until the deployment is due (see
+/// [`CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER`]) and `CREATE_COMPLETE` from then on. The
+/// entry therefore stores the two INSTANTS and derives the state from the clock, so no
+/// read has to move it and two reads at the same instant agree.
+///
+/// What the deployment CREATED is part of the pack: the Config rules its template
+/// declares are written into
+/// [`ComAmazonawsConfigserviceStarlingdoveserviceState::config_rules`] (and their
+/// remediation configurations beside them) and named here in
+/// [`Self::deployed_rule_names`], so a pack reported complete is a pack whose resources
+/// exist; a deployment that could not create them carries [`Self::failure_reason`] and
+/// is reported `CREATE_FAILED` instead.
+///
+/// [`ConformancePackStatusDetail$StackArn`]: ConformancePackStatusDetail
+#[derive(Debug, Clone)]
+pub struct ConformancePackEntry {
+    /// `ConformancePackName`, which is unique per account per Region and is what every
+    /// conformance pack operation names the pack by.
+    pub name: String,
+    /// The `ConformancePackId` Config assigned the pack when it was created; it is the
+    /// last segment of [`Self::arn`] and never changes once minted.
+    pub id: String,
+    pub arn: String,
+    /// The ARN of the CloudFormation stack the pack is deployed as.
+    pub stack_arn: String,
+    /// The template the pack was last deployed from, byte for byte as it was sent, and
+    /// the Amazon S3 location Config stores conformance pack templates at. Both are
+    /// replaced by a later `PutConformancePack` for the same name, and
+    /// `DescribeConformancePacks` — still a scaffold with a stub issue of its own — is
+    /// what reports the pack's stored configuration back.
+    pub template_body: Option<String>,
+    pub delivery_s3_bucket: Option<String>,
+    pub delivery_s3_key_prefix: Option<String>,
+    /// The `ConformancePackInputParameter` objects the pack was deployed with.
+    pub input_parameters: Vec<ConformancePackInputParameter>,
+    /// The Config rules this pack's deployment CREATED, by the names Config gave them
+    /// ([`conformance_pack_rule_name`]).
+    ///
+    /// They are the pack's own resources, so a redeploy of this pack replaces exactly
+    /// these and nothing else in
+    /// [`ComAmazonawsConfigserviceStarlingdoveserviceState::config_rules`]. A pack whose
+    /// deployment failed ([`Self::failure_reason`]) deployed none, so this is empty.
+    pub deployed_rule_names: Vec<String>,
+    /// Why the pack's deployment failed, when it did
+    /// (`ConformancePackStatusDetail$ConformancePackStatusReason`: "The reason of
+    /// conformance pack creation failure"), which is what puts the pack in
+    /// [`CONFORMANCE_PACK_STATE_CREATE_FAILED`] rather than reporting a deployment that
+    /// created nothing as complete.
+    pub failure_reason: Option<String>,
+    /// "Last time when conformation pack creation and update was requested" — the
+    /// instant of the call that last deployed this pack.
+    pub last_update_requested_at: SystemTime,
+    /// When that deployment is due to be complete; see
+    /// [`CONFORMANCE_PACK_DEPLOY_SETTLE_AFTER`].
+    pub deployment_completes_at: SystemTime,
+    /// Tags are taken at creation and not updated by `PutConformancePack` ("Tags are
+    /// added at creation and cannot be updated with this operation"); they are this
+    /// resource's one tag set, reached through
+    /// [`ComAmazonawsConfigserviceStarlingdoveserviceState::tags_of`].
+    pub tags: TagSet,
+}
+
+impl ConformancePackEntry {
+    /// The `ConformancePackState` the pack is in at `now`: a deployment that could not
+    /// create the resources the template declares FAILED, and otherwise it is in
+    /// progress until the instant it is due to complete, and complete from then on.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if self.failure_reason.is_some() {
+            CONFORMANCE_PACK_STATE_CREATE_FAILED
+        } else if now >= self.deployment_completes_at {
+            CONFORMANCE_PACK_STATE_CREATE_COMPLETE
+        } else {
+            CONFORMANCE_PACK_STATE_CREATE_IN_PROGRESS
+        }
+    }
+
+    /// The modelled `ConformancePackStatusDetail`, read back out of state at `now`.
+    ///
+    /// `ConformancePackStatusReason` is "the reason of conformance pack creation
+    /// failure", which a deployment that is in progress or complete has none of, and
+    /// `LastUpdateCompletedTime` is "last time when conformation pack creation and
+    /// update was successful", which neither a deployment still in progress nor a failed
+    /// one has reached.
+    pub fn to_status_detail(&self, now: SystemTime) -> ConformancePackStatusDetail {
+        let complete = self.state_at(now) == CONFORMANCE_PACK_STATE_CREATE_COMPLETE;
+        ConformancePackStatusDetail {
+            conformance_pack_name: self.name.clone(),
+            conformance_pack_id: self.id.clone(),
+            conformance_pack_arn: self.arn.clone(),
+            conformance_pack_state: self.state_at(now).to_string(),
+            stack_arn: self.stack_arn.clone(),
+            conformance_pack_status_reason: self.failure_reason.clone(),
+            last_update_requested_time: timestamp(self.last_update_requested_at),
+            last_update_completed_time: complete
+                .then(|| timestamp(self.deployment_completes_at)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-configservice-starlingdoveservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -2245,6 +2437,15 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// resource's deletion, is still a scaffold with a stub issue of its own, so an
     /// account that has recorded nothing has discovered nothing and a
     /// discovered-resource read reports an empty page for every type.
+    ///
+    /// BOUNDED at [`DISCOVERED_RESOURCES_KEPT`] entries: write it through
+    /// [`Self::record_discovered_resource`], which drops the oldest configuration item
+    /// past that bound — a resource whose deletion the inventory already recorded first
+    /// — so no sequence of writes can grow this process's state without end. Each entry
+    /// is bounded in turn by what `PutResourceConfig` records: a configuration document
+    /// of at most
+    /// [`crate::ops::put_resource_config::MAX_RESOURCE_CONFIGURATION_BYTES`] and at most
+    /// [`TAGS_PER_RESOURCE_QUOTA`] tags.
     pub discovered_resources: BTreeMap<(String, String), DiscoveredResourceEntry>,
     /// Retention configurations, keyed by `RetentionConfigurationName`. A `BTreeMap`
     /// so `DescribeRetentionConfigurations` pages over a stable ordering; it holds at
@@ -2270,6 +2471,18 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// `DescribeAggregationAuthorizations` pages over a stable ordering and a page
     /// token survives authorizations granted and deleted between pages.
     pub aggregation_authorizations: BTreeMap<String, AggregationAuthorizationEntry>,
+    /// Conformance packs, keyed by `ConformancePackName` — unique per account per
+    /// Region, which is what one engine's store stands for. A `BTreeMap` so a status
+    /// read pages over a stable ordering (the packs' name ordering) and a page token
+    /// survives packs created and deleted between pages.
+    ///
+    /// BOUNDED at [`CONFORMANCE_PACKS_QUOTA`] entries: `PutConformancePack` refuses a
+    /// NEW pack past that quota and an existing name is updated in place, so no
+    /// sequence of calls can grow this map further.
+    pub conformance_packs: BTreeMap<String, ConformancePackEntry>,
+    /// Source of the next `ConformancePackId`, so every conformance pack gets a
+    /// distinct one.
+    pub next_conformance_pack_seq: u64,
 }
 
 impl ComAmazonawsConfigserviceStarlingdoveserviceState {
@@ -2323,6 +2536,49 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             if let Some(token) = client_token {
                 self.resource_evaluation_tokens.remove(&token);
             }
+        }
+    }
+
+    /// Record `entry` as a discovered resource, keyed by the `(resourceType,
+    /// resourceId)` pair that identifies it.
+    ///
+    /// This is the ONE place [`Self::discovered_resources`] GROWS, so the inventory
+    /// cannot grow this process's state without end: past
+    /// [`DISCOVERED_RESOURCES_KEPT`] entries it drops the resource whose configuration
+    /// item is oldest, taking one whose DELETION the inventory already recorded before
+    /// one that is still recorded — a deleted resource is reported only by a read that
+    /// asks for deleted resources, so it is what an inventory at its bound gives up
+    /// first. `PutResourceConfig`'s own
+    /// [`crate::ops::put_resource_config::ACTIVE_CUSTOM_RESOURCES_QUOTA`] is what a
+    /// caller meets first, with the modelled `MaxActiveResourcesExceededException`; this
+    /// bound is what holds whatever any future writer does.
+    pub fn record_discovered_resource(&mut self, entry: DiscoveredResourceEntry) {
+        let key = (entry.resource_type.clone(), entry.resource_id.clone());
+        self.discovered_resources.insert(key, entry);
+
+        while self.discovered_resources.len() > DISCOVERED_RESOURCES_KEPT {
+            // One insert can take the inventory at most one entry past the bound, so
+            // this runs once; it is a loop so the bound holds however it was filled.
+            let oldest = self
+                .discovered_resources
+                .iter()
+                .min_by(|left, right| {
+                    let key = |(key, entry): &(&(String, String), &DiscoveredResourceEntry)| {
+                        (
+                            // A resource still recorded is given up only after every
+                            // deleted one.
+                            entry.deleted_at.is_none(),
+                            entry.last_recorded_at,
+                            (*key).clone(),
+                        )
+                    };
+                    key(left).cmp(&key(right))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(key) = oldest else {
+                break;
+            };
+            self.discovered_resources.remove(&key);
         }
     }
 
@@ -2480,6 +2736,9 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         if let Some(stored_query) = self.stored_queries.values().find(|entry| entry.arn == arn) {
             return Some(&stored_query.tags);
         }
+        if let Some(pack) = self.conformance_packs.values().find(|entry| entry.arn == arn) {
+            return Some(&pack.tags);
+        }
         None
     }
 
@@ -2506,6 +2765,13 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         {
             return Some(&mut stored_query.tags);
         }
+        if let Some(pack) = self
+            .conformance_packs
+            .values_mut()
+            .find(|entry| entry.arn == arn)
+        {
+            return Some(&mut pack.tags);
+        }
         None
     }
 }
@@ -2517,6 +2783,13 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
 // import list, the constants and the test module where other fixes land.
 pub mod resource_evaluation;
 pub use resource_evaluation::*;
+
+// The Config query language — the SQL `SELECT` command a select operation takes, and
+// the configuration-item documents it is run over — lives in `state/select_query.rs`
+// for the same reason as `resource_evaluation` above, and is re-exported here so a
+// handler reaches its names as `crate::state::<name>`.
+pub mod select_query;
+pub use select_query::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -2620,6 +2893,52 @@ pub const STORED_QUERY_NAME_MAX_LENGTH: usize = 64;
 /// so every operation that refuses an absent stored query words it the same way.
 pub fn no_such_stored_query_message(name: &str) -> String {
     format!("The stored query '{name}' provided in the request does not exist.")
+}
+
+/// The ARN resource type of a conformance pack, as Config spells it in the ARNs it
+/// mints (`ConformancePackArn`, e.g.
+/// `arn:aws:config:<region>:<account>:conformance-pack/<name>/<id>`).
+pub const CONFORMANCE_PACK_ARN_RESOURCE_TYPE: &str = "conformance-pack";
+
+/// The ARN of a conformance pack: both the pack's name and the id Config assigned it
+/// are part of the ARN, the way a configuration recorder's and a stored query's are.
+pub fn conformance_pack_arn(region: &str, name: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CONFORMANCE_PACK_ARN_RESOURCE_TYPE}/{name}/{id}"),
+    )
+}
+
+/// The name prefix Config gives the CloudFormation stack a conformance pack is deployed
+/// as (the Config Developer Guide: a conformance pack deploys "a CloudFormation stack
+/// named awsconfigconforms-<conformance-pack-name>" in the account).
+pub const CONFORMANCE_PACK_STACK_NAME_PREFIX: &str = "awsconfigconforms-";
+
+/// The ARN of the CloudFormation stack a conformance pack is deployed as:
+/// `arn:aws:cloudformation:<region>:<account>:stack/awsconfigconforms-<name>/<id>`,
+/// the form a CloudFormation stack ARN takes. The ARN names the CLOUDFORMATION service
+/// rather than Config, because the stack is CloudFormation's resource.
+pub fn conformance_pack_stack_arn(region: &str, name: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(
+        "cloudformation",
+        region,
+        &format!("stack/{CONFORMANCE_PACK_STACK_NAME_PREFIX}{name}/{id}"),
+    )
+}
+
+/// The `ConformancePackId` Config assigns the `seq`-th conformance pack created in this
+/// emulator: `conformance-pack-` and sixteen base-36 characters, which satisfies
+/// `ConformancePackId`'s 1..1024 length and is ARN-safe.
+///
+/// [`splitmix64`] is a bijection on `u64`, so distinct sequence numbers give distinct
+/// ids; the mixing input differs from the other mints', so the n-th pack and the n-th
+/// recorder do not carry the same id.
+pub fn mint_conformance_pack_id(seq: u64) -> String {
+    format!(
+        "{CONFORMANCE_PACK_ARN_RESOURCE_TYPE}-{}",
+        base36(splitmix64(seq ^ 0x436f_6e66_5061_636b), 16)
+    )
 }
 
 /// The `configSnapshotId` of the `seq`-th configuration-snapshot delivery scheduled
@@ -3730,6 +4049,7 @@ mod tests {
             state: CONFIG_RULE_STATE_ACTIVE.to_string(),
             evaluation_modes: default_evaluation_modes(),
             rule_evaluation_visibility: Some(RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string()),
+            created_by: None,
             created_at: SystemTime::UNIX_EPOCH,
             tags: TagSet::new(),
             evaluation_results: compliance_types

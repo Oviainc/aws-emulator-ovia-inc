@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSecurityConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSecurityConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSecurityConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the `SecurityConfigRecord` [`crate::state`] holds under the `id` the
+//! request names, replacing only the members the request named, minting a fresh
+//! `configVersion` and stamping `lastModifiedDate`, and answers that stored record —
+//! refusing an id that names no configuration, a `configVersion` that is not the stored one
+//! and options belonging to another identity-provider type than the configuration's own.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSecurityConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSecurityConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSecurityConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSecurityConfigErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A 400 `ValidationException` for anything the model constrains but the boundary
+        // validator does not narrow — an enum's value list, and which options member the
+        // addressed configuration's own type accepts.
+        let refuse = |message: String| -> UpdateSecurityConfigError {
+            UpdateSecurityConfigErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // `IamIdentityCenterUserAttribute` and `IamIdentityCenterGroupAttribute` are enums
+        // the boundary validator does not narrow, so the handler refuses a value outside
+        // the model's own value list.
+        if let Some(updates) = input.iam_identity_center_options_updates.as_ref() {
+            for (member, value, allowed) in [
+                (
+                    "userAttribute",
+                    updates.user_attribute.as_deref(),
+                    IAM_IDENTITY_CENTER_USER_ATTRIBUTE_VALUES,
+                ),
+                (
+                    "groupAttribute",
+                    updates.group_attribute.as_deref(),
+                    IAM_IDENTITY_CENTER_GROUP_ATTRIBUTE_VALUES,
+                ),
+            ] {
+                if let Some(value) = value {
+                    if !allowed.contains(&value) {
+                        return Err(refuse(format!(
+                            "iamIdentityCenterOptionsUpdates.{member} must be one of [{}], got {value:?}",
+                            allowed.join(", ")
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A replayed `clientToken` is a RETRY of the write this call already performed, so
+        // it answers that record and writes nothing: without it a retry would be refused by
+        // its own precondition (the first call moved the version on) or would mint a second
+        // version for one write. The replay is scoped to the id THIS request addresses.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_security_config(Self::NAME, token)
+                .filter(|record| record.id == input.id)
+                .map(crate::state::SecurityConfigRecord::detail);
+            if let Some(detail) = replayed {
+                return Ok(UpdateSecurityConfigOutput {
+                    security_config_detail: Some(detail),
+                });
+            }
+        }
+
+        // `id` is the whole identity of a security configuration, so an id that names no
+        // stored record is the modelled 404 rather than a write to nothing.
+        let Some((kind, stored_version)) = store
+            .security_configs
+            .get(&input.id)
+            .map(|record| (record.kind.clone(), record.config_version.clone()))
+        else {
+            return Err(
+                UpdateSecurityConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Security config with id {} is not found",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A configuration describes the identity provider of ONE type, so the only options
+        // an update may state are that type's: another type's options member describes a
+        // provider this configuration does not have, and the type itself is not updatable
+        // (the request carries no `type`, and the id encodes it).
+        let options_for_type: [(&str, &str, bool); 3] = [
+            ("saml", "samlOptions", input.saml_options.is_some()),
+            (
+                "iamidentitycenter",
+                "iamIdentityCenterOptionsUpdates",
+                input.iam_identity_center_options_updates.is_some(),
+            ),
+            (
+                "iamfederation",
+                "iamFederationOptions",
+                input.iam_federation_options.is_some(),
+            ),
+        ];
+        for (options_kind, member, present) in options_for_type {
+            if options_kind != kind && present {
+                return Err(refuse(format!(
+                    "{member} may only be given for a security config of type \
+                     {options_kind}, and {} is of type {kind}",
+                    input.id
+                )));
+            }
+        }
+
+        // `configVersion` is `@required` and names "the version of the security
+        // configuration to be updated", so it is the precondition of the write: a version
+        // that is not the stored one means another writer has moved the configuration on,
+        // which is the conflict `ConflictException` reports. Nothing is written when it
+        // fails.
+        if stored_version != input.config_version {
+            return Err(UpdateSecurityConfigErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Security config with id {} is at version {}, not {}",
+                        input.id, stored_version, input.config_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The documented `sessionTimeout` default is applied to the options this write
+        // stores, exactly as a create applies it, so a read reports the session timeout the
+        // configuration really has rather than recomputing it.
+        let saml_options = input.saml_options.map(|options| SamlConfigOptions {
+            session_timeout: Some(
+                options
+                    .session_timeout
+                    .unwrap_or(crate::state::DEFAULT_SAML_SESSION_TIMEOUT),
+            ),
+            ..options
+        });
+
+        let written_at = crate::state::now_epoch_millis();
+        let config_version = store.next_policy_version(written_at);
+        let write = crate::state::SecurityConfigWrite {
+            description: input.description,
+            saml_options,
+            iam_identity_center_updates: input.iam_identity_center_options_updates,
+            iam_federation_options: input.iam_federation_options,
+            config_version,
+            written_at,
+        };
+        let Some(record) = store.security_configs.get_mut(&input.id) else {
+            return Err(UpdateSecurityConfigErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        record.apply(write);
+        // Rendered from the record that is now STORED, so the update cannot report anything
+        // a later `GetSecurityConfig` or `ListSecurityConfigs` would not.
+        let detail = record.detail();
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &input.id);
+        }
+
+        Ok(UpdateSecurityConfigOutput {
+            security_config_detail: Some(detail),
+        })
     }
 }

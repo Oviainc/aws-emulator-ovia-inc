@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnabledControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnabledControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnabledControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the controls `EnableControl` has enabled, oldest ARN first, narrowed by
+//! `targetIdentifier` and by every member of `filter`, and paginated by `maxResults` and
+//! `nextToken`. Derived entirely from [`crate::state`], so it is empty before any
+//! enablement and every field it reports is the one the enabling call persisted.
+//!
+//! `includeChildren` asks for the controls enabled on the target's child organizational
+//! units and accounts as well. This service records the target each control was enabled
+//! on and holds no organizational hierarchy — nothing here resolves a target ARN to its
+//! children, and a control `EnableControl` applies directly to its target inherits from
+//! no other enabled control (`parentIdentifier` absent) — so no stored control is a child
+//! of another and the flag widens the listing by nothing.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +131,45 @@ impl From<ListEnabledControlsErrorModeled> for ListEnabledControlsError {
     }
 }
 
+/// Whether `actual` is selected by a filter: a member the caller did not send selects
+/// every control, and one they did selects the controls whose value its set holds.
+fn selected(filter: &Filter<'_>, actual: &str) -> bool {
+    filter
+        .as_ref()
+        .is_none_or(|values| values.contains(actual))
+}
+
+/// As [`selected`], for a member a control may not have at all: an absent value is
+/// selected only by an absent filter, so filtering on `parentIdentifiers` returns the
+/// controls that have a parent and that parent is among the values asked for.
+fn selected_optional(filter: &Filter<'_>, actual: Option<&str>) -> bool {
+    match (filter.as_ref(), actual) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(values), Some(actual)) => values.contains(actual),
+    }
+}
+
+/// A filter list the caller sent, as the handler matches it: the values as a SET, so
+/// testing one control against it costs `O(log k)` rather than a scan, and the whole
+/// per-request scan is bounded by the store's own [`MAX_ENABLED_CONTROLS`] cap.
+///
+/// Every enum-typed member of `EnabledControlFilter` deserializes to a plain string, but
+/// the schema front door has already refused a value the model's value set does not
+/// declare (HTTP 400, as `tests/all/front_door_validation.rs` pins), so reaching this
+/// handler means each value is one of the modelled ones — and each of these lists is
+/// modelled `@length min 1, max 1`, so the front door has bounded its length too.
+///
+/// [`MAX_ENABLED_CONTROLS`]: crate::state::MAX_ENABLED_CONTROLS
+type Filter<'a> = Option<::std::collections::BTreeSet<&'a str>>;
+
+/// The values of one filter member as a [`Filter`] set, or `None` when the caller sent
+/// that member no list at all. Built BEFORE the state lock is taken, so no caller-sized
+/// work happens while the lock is held.
+fn filter_set(values: Option<&Vec<String>>) -> Filter<'_> {
+    values.map(|values| values.iter().map(String::as_str).collect())
+}
+
 /// The `ListEnabledControls` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +206,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnabledControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnabledControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnabledControls"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEnabledControlsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every member of `filter` narrows the listing; a member the caller omitted
+        // narrows nothing. The sets are built here, BEFORE the state lock below, so the
+        // only work done under the lock is one pass over the store.
+        let filter = input.filter.unwrap_or_default();
+        let control_identifiers = filter_set(filter.control_identifiers.as_ref());
+        let parent_identifiers = filter_set(filter.parent_identifiers.as_ref());
+        let statuses = filter_set(filter.statuses.as_ref());
+        let drift_statuses = filter_set(filter.drift_statuses.as_ref());
+        let inheritance_drift_statuses = filter_set(filter.inheritance_drift_statuses.as_ref());
+        let resource_drift_statuses = filter_set(filter.resource_drift_statuses.as_ref());
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed; this operation is
+        // `@readonly` and writes nothing else.
+        store.settle(::std::time::SystemTime::now());
+
+        // A stable total order over the page boundary, so a `nextToken` resumes where the
+        // previous page stopped whatever order the map iterates in. The records are
+        // BORROWED, not cloned: only the page this call returns is materialised.
+        let mut controls: Vec<&crate::state::EnabledControl> = store
+            .enabled_controls
+            .values()
+            .filter(|control| {
+                // The target narrows the listing to the controls enabled on exactly that
+                // target: see the module header on `includeChildren`, which adds nothing
+                // to this set because this service stores no hierarchy to widen it with.
+                input
+                    .target_identifier
+                    .as_deref()
+                    .is_none_or(|target| control.target_identifier == target)
+                    && selected(&control_identifiers, &control.control_identifier)
+                    && selected_optional(&parent_identifiers, control.parent_identifier.as_deref())
+                    && selected(&statuses, control.status.as_wire())
+                    && selected(&drift_statuses, control.drift_status.as_wire())
+                    && selected(
+                        &inheritance_drift_statuses,
+                        control.inheritance_drift_status.as_wire(),
+                    )
+                    && selected(
+                        &resource_drift_statuses,
+                        control.resource_drift_status.as_wire(),
+                    )
+            })
+            .collect();
+        controls.sort_by(|left, right| left.arn.cmp(&right.arn));
+
+        // The token this operation hands out is the index of the next unreturned entry,
+        // so it is only meaningful against a call carrying the same target and filter —
+        // which is what `nextToken` is documented to require.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(index) if index <= controls.len() => index,
+                _ => {
+                    return Err(ListEnabledControlsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} was not returned by a previous \
+                                 ListEnabledControls call with these parameters"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 1..200`, so the front door has already refused
+        // anything outside it; absent, every remaining entry is returned.
+        let limit = input
+            .max_results
+            .map_or(controls.len(), |max| max.max(1) as usize);
+        let end = start.saturating_add(limit).min(controls.len());
+
+        let enabled_controls: Vec<EnabledControlSummary> = controls[start..end]
+            .iter()
+            .map(|control| EnabledControlSummary {
+                arn: Some(control.arn.clone()),
+                control_identifier: Some(control.control_identifier.clone()),
+                target_identifier: Some(control.target_identifier.clone()),
+                status_summary: Some(EnablementStatusSummary {
+                    status: Some(control.status.as_wire().to_string()),
+                    last_operation_identifier: Some(control.last_operation_identifier.clone()),
+                }),
+                drift_status_summary: Some(DriftStatusSummary {
+                    drift_status: Some(control.drift_status.as_wire().to_string()),
+                    types: Some(EnabledControlDriftTypes {
+                        inheritance: Some(EnabledControlInheritanceDrift {
+                            status: Some(control.inheritance_drift_status.as_wire().to_string()),
+                        }),
+                        resource: Some(EnabledControlResourceDrift {
+                            status: Some(control.resource_drift_status.as_wire().to_string()),
+                        }),
+                    }),
+                }),
+                parent_identifier: control.parent_identifier.clone(),
+            })
+            .collect();
+
+        Ok(ListEnabledControlsOutput {
+            enabled_controls,
+            next_token: (end < controls.len()).then(|| end.to_string()),
+        })
     }
 }

@@ -346,6 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     rule_evaluation_visibility: Some(
                         crate::state::RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string(),
                     ),
+                    // `CreatedBy` names the Amazon Web Services service that created the
+                    // rule, so it stays unset for a rule the account created itself.
+                    created_by: None,
                     created_at: now,
                     tags: crate::state::tag_set(input.tags.as_deref().unwrap_or_default()),
                     evaluation_results: ::std::collections::BTreeMap::new(),
