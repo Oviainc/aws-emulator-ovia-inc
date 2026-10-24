@@ -354,24 +354,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
         // does in the other operations of this service.
         //
-        // `accountIds`: "You can only specify one account ID per request."
+        // `accountIds` names the account to report on: "You can only specify one account ID
+        // per request", it must be a 12-digit account id, and it must be an account this
+        // service can report on — this emulator presents one standalone account and records
+        // no organization, so any other account is refused rather than used as a filter key
+        // ([`crate::state::requested_account_id`], shared by every reader of this service).
         let accounts = input.account_ids.clone().unwrap_or_default();
-        if accounts.len() > 1 {
-            return Err(invalid(format!(
-                "The value supplied for parameter accountIds is not valid: you can only specify \
-                 one account ID per request, not {}.",
-                accounts.len(),
-            )));
-        }
-        // An account id is "a 12-digit Amazon Web Services account ID" (`Scope$value`) —
-        // the shape [`crate::state::is_account_id`] is the one place this service checks.
-        for account in &accounts {
-            if !crate::state::is_account_id(account) {
-                return Err(invalid(format!(
-                    "The value supplied for parameter accountIds is not valid: {account} is not a \
-                     12-digit Amazon Web Services account ID."
-                )));
-            }
+        if let Err(reason) = crate::state::requested_account_id(Some(&accounts)) {
+            return Err(invalid(reason));
         }
         let filters = requested_filters(input.filters.as_deref())?;
         // Every `serviceArns` entry must be in the documented form,

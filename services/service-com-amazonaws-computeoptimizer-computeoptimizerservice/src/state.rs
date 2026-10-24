@@ -441,6 +441,55 @@ pub fn is_account_id(value: &str) -> bool {
     value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// What a reader of this service answers when a request asks about an account other than
+/// the one this service answers for: the real service's constant refusal, which names
+/// neither the member nor the account — it states the permission that is missing and how
+/// an organization account gets it. ONE spelling for the whole crate, so no two readers
+/// can drift apart on the same refusal.
+pub const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If \
+     this is an organization account, request the management account to enable service \
+     access.";
+
+/// The account whose analysis a read request asks about — the one id `accountIds` carries,
+/// or the caller's own account when it carries none — or, as `Err`, why the request cannot
+/// be answered at all.
+///
+/// `accountIds` is the MANAGEMENT-account mechanism for naming a member account: "If your
+/// account is the management account of an organization, use this parameter to specify the
+/// member account for which you want to return \<resource\> recommendations. Only one
+/// account ID can be specified per request", and an account id is "a 12-digit Amazon Web
+/// Services account ID" (`Scope$value`). This emulator presents exactly one standalone
+/// account ([`engine::emulator_account_id`]) and records no organization, so a well-formed
+/// id naming any OTHER account asks about an account this service cannot report on: it is
+/// refused with [`CROSS_ACCOUNT_MESSAGE`], never used as a filter key and answered with an
+/// empty selection a client would read as "that account has no recommendations".
+///
+/// Shared by every reader that takes `accountIds` so one cannot accept what another
+/// refuses.
+pub fn requested_account_id(account_ids: Option<&[String]>) -> Result<String, String> {
+    let account_ids = account_ids.unwrap_or_default();
+    if account_ids.len() > 1 {
+        return Err(format!(
+            "The value supplied for parameter accountIds is not valid: only one account ID can \
+             be specified per request, not {}.",
+            account_ids.len(),
+        ));
+    }
+    let Some(account_id) = account_ids.first() else {
+        return Ok(::engine::emulator_account_id().to_string());
+    };
+    if !is_account_id(account_id) {
+        return Err(format!(
+            "The value supplied for parameter accountIds is not valid: {account_id} is not a \
+             12-digit Amazon Web Services account ID."
+        ));
+    }
+    if account_id != ::engine::emulator_account_id() {
+        return Err(CROSS_ACCOUNT_MESSAGE.to_string());
+    }
+    Ok(account_id.clone())
+}
+
 /// The region an ARN names when the request carries no SigV4 credential scope to read one
 /// from: the region the emulator's own shared AWS config names, so an unsigned call and a
 /// default-configured client agree.

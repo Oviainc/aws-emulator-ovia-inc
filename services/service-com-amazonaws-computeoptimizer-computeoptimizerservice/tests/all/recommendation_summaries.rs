@@ -376,8 +376,9 @@ fn savings_value(summary: &Value, member: &str, case: &str) -> f64 {
 }
 
 /// `accountIds` selects WHOSE findings are summarised: absent or the caller's own account
-/// reads the caller's, any other account reads nothing (this emulator presents one
-/// account), and more than one account id is refused — "Only one account ID can be
+/// reads the caller's, any other account is refused (this emulator presents one standalone
+/// account and records no organization, so no other account is a member account it can be
+/// asked about), and more than one account id is refused — "Only one account ID can be
 /// specified per request."
 #[tokio::test]
 async fn account_ids_selects_one_account_and_refuses_more_than_one() {
@@ -387,32 +388,41 @@ async fn account_ids_selects_one_account_and_refuses_more_than_one() {
     let own = caller_account();
     let unpaged = summaries_of(&get_summaries(&router, json!({})).await);
 
-    // Rows: the member is absent, empty, names the caller, and names another account.
-    let cases: [(&str, Value, bool); 4] = [
-        ("absent", json!({}), true),
-        ("empty", json!({"accountIds": []}), true),
-        ("own account", json!({"accountIds": [own.clone()]}), true),
-        (
-            "another account",
-            json!({"accountIds": ["111122223333"]}),
-            false,
-        ),
+    // Rows: the member is absent, empty, and names the caller — each reads the caller's own
+    // summaries.
+    let cases: [(&str, Value); 3] = [
+        ("absent", json!({})),
+        ("empty", json!({"accountIds": []})),
+        ("own account", json!({"accountIds": [own.clone()]})),
     ];
-    for (case, request, is_own) in cases {
+    for (case, request) in cases {
         let body = get_summaries(&router, request.clone()).await;
-        let summaries = summaries_of(&body);
-        if is_own {
-            assert_eq!(
-                summaries, unpaged,
-                "case {case:?}: expected the caller's own summaries, got {body}"
-            );
-        } else {
-            assert!(
-                summaries.is_empty(),
-                "case {case:?}: this emulator holds no other account's resources, so nothing is \
-                 summarised, got {body}"
-            );
-        }
+        assert_eq!(
+            summaries_of(&body),
+            unpaged,
+            "case {case:?}: expected the caller's own summaries, got {body}"
+        );
+    }
+
+    // Rows: another account, which this service cannot be asked about at all — refused
+    // rather than summarised as nothing. The whole class of `accountIds` values is covered
+    // in `tests/all/cross_account_requests.rs`.
+    for account_id in ["111122223333", "210987654321"] {
+        let (status, body) = call(
+            &router,
+            "GetRecommendationSummaries",
+            json!({"accountIds": [account_id]}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {account_id:?}: another account cannot be asked about, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {account_id:?}: expected InvalidParameterValueException, got {body}"
+        );
     }
 
     // Rows: two distinct ids, and the same id twice — both ask for more than one account.
