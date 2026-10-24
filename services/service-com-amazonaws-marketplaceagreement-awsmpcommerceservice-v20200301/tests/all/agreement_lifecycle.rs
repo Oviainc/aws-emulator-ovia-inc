@@ -225,7 +225,7 @@ pub(crate) fn variable_payment_term(id: &str) -> Value {
 }
 
 /// A `CreateAgreementRequest` body for a brand new agreement over `terms`.
-fn new_request(proposal: &str, terms: Vec<Value>) -> Value {
+pub(crate) fn new_request(proposal: &str, terms: Vec<Value>) -> Value {
     json!({
         "intent": "NEW",
         "agreementProposalIdentifier": proposal,
@@ -253,6 +253,22 @@ pub(crate) async fn agreement_over(
         accepted.status, accepted.body
     );
     accepted.str_at("/agreementId")
+}
+
+/// The ids of the charges a created quote minted, in the order
+/// `ChargeSummary$expectedCharges` reports them — the charges of the agreement
+/// accepting that quote creates, and so the only ids a purchase order of that
+/// accept may name.
+pub(crate) fn expected_charge_ids(created: &Answer) -> Vec<String> {
+    created.body["chargeSummary"]["expectedCharges"]
+        .as_array()
+        .map(|charges| {
+            charges
+                .iter()
+                .map(|charge| charge["id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The union member name, `type` and `id` of one accepted term.
@@ -774,14 +790,16 @@ async fn an_accepted_request_is_described_from_what_was_stored() {
         let created = create(&router, new_request("ap-offer42", requested)).await;
         let request_id = created.str_at("/agreementRequestId");
 
-        let accepted = accept(
-            &router,
-            json!({
-                "agreementRequestId": request_id,
-                "purchaseOrders": [{"chargeId": "ch-1", "purchaseOrderReference": "PO-77"}],
-            }),
-        )
-        .await;
+        // A purchase order associates a reference with one charge OF THIS
+        // quote, so the ids come from the charge summary the create answered;
+        // a quote that implies no charge is accepted with no purchase orders.
+        let mut request = json!({"agreementRequestId": request_id});
+        let charges = expected_charge_ids(&created);
+        if let Some(charge_id) = charges.first() {
+            request["purchaseOrders"] =
+                json!([{"chargeId": charge_id, "purchaseOrderReference": "PO-77"}]);
+        }
+        let accepted = accept(&router, request).await;
         assert_eq!(
             accepted.status, 200,
             "case {case:?}: accepting must succeed, got {} with {:?}",

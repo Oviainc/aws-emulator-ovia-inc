@@ -202,6 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source = Some(stored.clone());
         }
 
+        // "The acceptor can optionally provide purchase orders to associate with
+        // the agreement charges": each supplied `PurchaseOrder` associates one
+        // reference with ONE charge of the agreement being accepted, and the
+        // charges of that agreement are the ones this request's quote minted
+        // into `ChargeSummary$expectedCharges`. A list that names a charge the
+        // request does not hold, names one twice, or carries no reference to
+        // associate is refused before anything is stored — see
+        // `crate::state::validate_purchase_orders` for the rule.
+        let purchase_orders = input.purchase_orders.unwrap_or_default();
+        if let Err(refusal) = crate::state::validate_purchase_orders(
+            &purchase_orders,
+            &crate::state::expected_charge_ids(&request.charge_summary),
+        ) {
+            return Err(AcceptAgreementRequestErrorModeled::ValidationException(
+                crate::state::validation_exception(&refusal.reason, refusal.path),
+            )
+            .into());
+        }
+
         let id = store.mint_agreement_id();
         let proposal_summary = ProposalSummary {
             // The only identity of the proposal this emulator holds is the
@@ -254,9 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(crate::state::accepted_term)
                 .collect(),
-            purchase_orders: input
-                .purchase_orders
-                .unwrap_or_default()
+            purchase_orders: purchase_orders
                 .into_iter()
                 .map(|order| PurchaseOrder {
                     // "The unique identifier of the agreement associated with
