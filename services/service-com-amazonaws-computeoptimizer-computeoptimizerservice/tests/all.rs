@@ -17,6 +17,8 @@ mod auto_scaling_group_recommendations;
 mod auto_scaling_group_recommendations_export;
 #[path = "all/cross_account_requests.rs"]
 mod cross_account_requests;
+#[path = "all/cross_account_resource_arns.rs"]
+mod cross_account_resource_arns;
 #[path = "all/ebs_volume_recommendations.rs"]
 mod ebs_volume_recommendations;
 #[path = "all/ebs_volume_recommendations_export.rs"]

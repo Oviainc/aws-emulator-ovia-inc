@@ -389,7 +389,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let filters = requested_filters(input.filters.as_deref())?;
         // Every `serviceArns` entry must be in the documented form,
-        // `arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name`.
+        // `arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name`. An ARN
+        // whose ACCOUNT field names another account asks about a service this service
+        // cannot report on, exactly as `accountIds` naming that account does, so it is
+        // refused with the crate's cross-account message rather than reported in `errors`.
         let mut requested: Vec<ServiceRef> = Vec::new();
         for arn in input.service_arns.iter().flatten() {
             let Some(reference) = parse_service_arn(arn) else {
@@ -399,6 +402,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name."
                 )));
             };
+            if crate::state::is_foreign_account(&reference.account_id) {
+                return Err(foreign_account());
+            }
             requested.push(reference);
         }
         // A `nextToken` this service did not issue cannot name a page boundary.
@@ -579,6 +585,18 @@ fn invalid(message: impl Into<String>) -> GetECSServiceRecommendationsError {
         },
     )
     .into()
+}
+
+/// A 400 `InvalidParameterValueException` for a request that asks about an account other
+/// than the one this service answers for.
+///
+/// This emulator presents one standalone account (`::engine::emulator_account_id`) and
+/// records no organization, so no other account is a member account it can be asked about
+/// — in `accountIds`, or through a `serviceArns` entry whose account field names one. The
+/// refusal is worded once for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so
+/// no two readers differ.
+fn foreign_account() -> GetECSServiceRecommendationsError {
+    invalid(crate::state::CROSS_ACCOUNT_MESSAGE)
 }
 
 /// One `GetRecommendationError` entry: why one requested service has no recommendation.

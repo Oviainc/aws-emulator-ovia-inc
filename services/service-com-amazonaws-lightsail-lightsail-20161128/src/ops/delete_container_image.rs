@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteContainerImage
-//! Deletes a container image registered to one of this store's container
-//! services.
+//! Deletes a container image from the registry of one of this store's container
+//! services, accepting a reference that registry does not hold as a no-op.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -160,30 +160,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `serviceName` and `image` are modelled `@required` and the name carries
         // the modelled length and pattern, so the centralized walk refused
         // anything outside them before this body ran. What is left is what the
-        // model cannot express: the service must exist in this region, and the
-        // image name must be one that service's registry holds.
+        // model cannot express: the PARENT resource — the container service the
+        // image is deleted from — must exist in this region.
         crate::state::with_state(&*self.engine, |store| {
             let service = store
                 .container_service_mut(&region, &input.service_name)
                 .ok_or_else(|| service_does_not_exist(&input.service_name))?;
-            // This call deletes an image the service's registry HOLDS, so it
-            // can only succeed where there is one to delete: the name has to be
-            // one of the names `GetContainerImages` reports for THIS service.
-            // A name that registry does not hold names nothing to remove — the
-            // modelled `image` documentation distinguishes an image "sourced
-            // from your Lightsail container service, that [is] registered and
-            // stored on your service" (the colon-prefixed names
-            // `GetContainerImages` reports) from one "sourced from a public
-            // registry like Docker Hub", which is not stored on the service at
-            // all — and that is the modelled not-found this operation declares,
-            // the same refusal the sibling `RegisterContainerImage` answers a
-            // digest the registry does not hold with.
-            let held = service
+            // The delete states an outcome — that registry no longer holds this
+            // image name — rather than consuming an entry, so it is satisfied
+            // whether or not the name is there to remove: a reference the
+            // registry does not hold (never registered, already deleted, or a
+            // public-registry name a service never stores at all) is accepted as
+            // a no-op and answers the modelled empty success. Only the parent
+            // resource is enforced; nothing else about the registry changes.
+            if let Some(held) = service
                 .images
                 .iter()
                 .position(|image| image.image == input.image)
-                .ok_or_else(|| image_does_not_exist(&input.image))?;
-            service.images.remove(held);
+            {
+                service.images.remove(held);
+            }
             Ok(DeleteContainerImageOutput {})
         })
         .ok_or_else(unavailable)?
@@ -202,17 +198,6 @@ fn service_does_not_exist(name: &str) -> DeleteContainerImageError {
         ..Default::default()
     })
     .into()
-}
-
-/// The container service exists but its registry holds no image of that name:
-/// this operation's modelled `NotFoundException`, in the same `DoesNotExist`
-/// envelope every not-found in this crate answers with (HTTP 400, wire error
-/// `NotFoundException`, body `code` `DoesNotExist` — see `crate::scaffolded`),
-/// with a message built from the request: the image name it carried, quoted,
-/// said not to be found. An image is not a resource of the account, so the
-/// message is not the resource-type/name one.
-fn image_does_not_exist(image: &str) -> DeleteContainerImageError {
-    crate::scaffolded::Scaffolded::does_not_exist(format!("Image \"{image}\" not found."))
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

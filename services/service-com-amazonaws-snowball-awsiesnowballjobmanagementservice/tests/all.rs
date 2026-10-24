@@ -17,6 +17,8 @@ mod address_validation;
 mod cluster_cancellation;
 #[path = "all/cluster_creation.rs"]
 mod cluster_creation;
+#[path = "all/cluster_device_capability.rs"]
+mod cluster_device_capability;
 #[path = "all/cluster_node_updates.rs"]
 mod cluster_node_updates;
 #[path = "all/cluster_updates.rs"]

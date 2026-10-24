@@ -213,16 +213,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every `autoScalingGroupArns` entry must be the ARN of an Auto Scaling group;
         // an ARN that names something else cannot identify a group to report on. The
         // refusal carries the message the service answers for this condition, which the
-        // recorded AWS behaviour pins to this exact wording for any malformed ARN.
+        // recorded AWS behaviour pins to this exact wording for any malformed ARN. An ARN
+        // whose ACCOUNT field names another account asks about a group this service cannot
+        // report on, exactly as `accountIds` naming that account does, so it is refused
+        // with the crate's cross-account message rather than selecting nothing.
         let requested_arns: Vec<String> = input.auto_scaling_group_arns.clone().unwrap_or_default();
-        if requested_arns.iter().any(|arn| {
-            crate::state::parse_resource_arn(arn).is_none_or(|parsed| {
-                parsed.resource_type != crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP
-            })
-        }) {
-            return Err(invalid_parameter(
-                "Invalid Auto Scaling group ARN.".to_string(),
-            ));
+        for arn in &requested_arns {
+            let parsed = crate::state::parse_resource_arn(arn).filter(|parsed| {
+                parsed.resource_type == crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP
+            });
+            let Some(parsed) = parsed else {
+                return Err(invalid_parameter(
+                    "Invalid Auto Scaling group ARN.".to_string(),
+                ));
+            };
+            if crate::state::is_foreign_account(parsed.account_id) {
+                return Err(foreign_account());
+            }
         }
 
         // The filters are the `Filters` vocabulary of this surface, checked once in
@@ -405,6 +412,18 @@ fn invalid_parameter(message: String) -> GetAutoScalingGroupRecommendationsError
         },
     )
     .into()
+}
+
+/// A 400 `InvalidParameterValueException` for a request that asks about an account other
+/// than the one this service answers for.
+///
+/// This emulator presents one standalone account (`::engine::emulator_account_id`) and
+/// records no organization, so no other account is a member account it can be asked about
+/// — in `accountIds`, or through an `autoScalingGroupArns` entry whose account field names
+/// one. The refusal is worded once for the whole crate
+/// ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers differ.
+fn foreign_account() -> GetAutoScalingGroupRecommendationsError {
+    invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
 }
 
 /// Whether `group` passes `filter`.

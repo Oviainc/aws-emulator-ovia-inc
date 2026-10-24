@@ -25,16 +25,19 @@
 //! session, an access key id no store holds), what its policy says (nothing, an `Allow`
 //! for this action on this resource, a wildcard `Allow`, an `Allow` for a different action
 //! of the same service, an `Allow` for this action on a different resource, an explicit
-//! `Deny` beside a wildcard `Allow`), and how many keys the one request removes (none, one,
-//! several) — since the refusal cannot depend on what the request would have removed.
+//! `Deny` beside a wildcard `Allow`), where that policy LIVES (inline on the principal, in
+//! the attached managed policies, split across both), and how many keys the one request
+//! removes (none, one, several) — since the refusal cannot depend on what the request would
+//! have removed.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::RESOURCE_NOT_TAGGABLE_MESSAGE;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 
 use crate::export_lifecycle::{error_code, NOT_FOUND_STATUS};
 use crate::front_door_authorization::{
-    allow, allow_all_but, create_request, export_arn, Emulator, ACCOUNT_KEY,
+    allow, allow_all_but, create_request, deny, export_arn, Emulator, ACCOUNT_KEY,
 };
 
 /// The export every call below names.
@@ -42,6 +45,16 @@ const EXPORT_NAME: &str = "untag_authorization_export";
 
 /// How many tags each row of the table seeds on the export before its call.
 const SEEDED_KEYS: usize = 3;
+
+/// One row of the grant-PLACEMENT table: a role, the inline policy it carries (when any),
+/// the managed policies attached to it, and whether the rule must serve a session of it.
+struct PlacementRow {
+    label: &'static str,
+    role: &'static str,
+    inline: Option<String>,
+    attachments: Vec<String>,
+    allowed: bool,
+}
 
 /// One row of the table: a principal, whether the rule must serve it, and how many of the
 /// seeded keys its one `UntagResource` call asks to remove.
@@ -346,6 +359,204 @@ async fn untagging_is_authorized_on_its_own_action_before_anything_is_written() 
             assert_eq!(
                 status, 200,
                 "case {label:?}: the account's own cleanup must be served, got {status} with {body}"
+            );
+        }
+        assert!(
+            listed_tags(&emulator, label, &arn).await.is_empty(),
+            "case {label:?}: the cleanup must leave the export untagged"
+        );
+    }
+}
+
+/// Where a grant LIVES is no part of the rule: the decision is made from EVERY
+/// identity-based document in force on the principal at the instant of the call — the
+/// principal's inline policies and the default versions of the managed policies attached to
+/// it — so a grant in an attached policy serves exactly as an inline one does, and an
+/// explicit `Deny` in any one of them refuses whatever the others allow.
+///
+/// The one caller the identity decision cannot refuse is a principal carrying a document
+/// this account does not hold: an AWS-managed policy belongs to AWS, so refusing on
+/// evidence that is not in the account's store would deny access AWS permits.
+#[tokio::test]
+async fn untagging_is_decided_from_every_identity_policy_in_force() {
+    let emulator = Emulator::new();
+    let arn = seeded_export(&emulator).await;
+
+    // The managed policies the rows attach, written through IAM's OWN `CreatePolicy`, so
+    // the documents this service reads back are the ones IAM stored.
+    let grant = emulator
+        .managed_policy(
+            "bcmde-untag-managed-grant",
+            &allow("bcm-data-exports:UntagResource", &export_arn(EXPORT_NAME)),
+        )
+        .await;
+    let sibling_grant = emulator
+        .managed_policy(
+            "bcmde-untag-managed-sibling",
+            &allow("bcm-data-exports:TagResource", "*"),
+        )
+        .await;
+    let other_resource_grant = emulator
+        .managed_policy(
+            "bcmde-untag-managed-other-resource",
+            &allow(
+                "bcm-data-exports:UntagResource",
+                &export_arn("somebody_elses_export"),
+            ),
+        )
+        .await;
+    let refusal = emulator
+        .managed_policy(
+            "bcmde-untag-managed-deny",
+            &deny("bcm-data-exports:UntagResource", "*"),
+        )
+        .await;
+    // An AWS-managed policy's account segment is IAM's own `aws`
+    // (`iam_store::AWS_MANAGED_POLICY_ACCOUNT`), so the account's store holds no document
+    // for it; `ReadOnlyAccess` is one such published policy.
+    let aws_managed = format!(
+        "arn:aws:iam::{}:policy/ReadOnlyAccess",
+        iam_store::AWS_MANAGED_POLICY_ACCOUNT
+    );
+
+    // One row per placement of the documents in force: the role's inline policy, the
+    // policies attached to it, or both at once.
+    let rows: Vec<PlacementRow> = vec![
+        PlacementRow {
+            label: "the grant inline on the role",
+            role: "bcmde-untag-place-inline",
+            inline: Some(allow(
+                "bcm-data-exports:UntagResource",
+                &export_arn(EXPORT_NAME),
+            )),
+            attachments: vec![],
+            allowed: true,
+        },
+        PlacementRow {
+            label: "the grant in an attached managed policy",
+            role: "bcmde-untag-place-attached",
+            inline: None,
+            attachments: vec![grant.clone()],
+            allowed: true,
+        },
+        PlacementRow {
+            label: "an attached policy granting only the sibling action",
+            role: "bcmde-untag-place-sibling",
+            inline: None,
+            attachments: vec![sibling_grant.clone()],
+            allowed: false,
+        },
+        PlacementRow {
+            label: "an attached policy granting this action on another export",
+            role: "bcmde-untag-place-other-resource",
+            inline: None,
+            attachments: vec![other_resource_grant],
+            allowed: false,
+        },
+        PlacementRow {
+            label: "the grant spread over two attached policies",
+            role: "bcmde-untag-place-two-attached",
+            inline: None,
+            attachments: vec![sibling_grant, grant.clone()],
+            allowed: true,
+        },
+        PlacementRow {
+            label: "an inline grant beside an attached deny",
+            role: "bcmde-untag-place-attached-deny",
+            inline: Some(allow("bcm-data-exports:*", "*")),
+            attachments: vec![refusal],
+            allowed: false,
+        },
+        PlacementRow {
+            label: "an attached grant beside an inline deny",
+            role: "bcmde-untag-place-inline-deny",
+            inline: Some(deny("bcm-data-exports:UntagResource", "*")),
+            attachments: vec![grant],
+            allowed: false,
+        },
+        PlacementRow {
+            label: "an attachment whose document this account does not hold",
+            role: "bcmde-untag-place-aws-managed",
+            inline: None,
+            attachments: vec![aws_managed],
+            allowed: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let label = row.label;
+        let access_key_id = emulator
+            .assumed_role_key(row.role, row.inline.as_deref())
+            .await;
+        for attachment in &row.attachments {
+            emulator.attach_role_policy(row.role, attachment).await;
+        }
+
+        let keys = seeded_keys(index);
+        seed_tags(&emulator, label, &arn, &keys).await;
+        let before = listed_tags(&emulator, label, &arn).await;
+        let removed = vec![keys[0].clone()];
+        let (status, body) = emulator
+            .call(
+                &access_key_id,
+                "UntagResource",
+                &json!({ "ResourceArn": arn, "ResourceTagKeys": removed }),
+            )
+            .await;
+        let after = listed_tags(&emulator, label, &arn).await;
+
+        if row.allowed {
+            assert_eq!(
+                status, 200,
+                "case {label:?}: a principal whose documents allow the action must be \
+                 served, got {status} with {body}"
+            );
+            let expected: Vec<(String, String)> = before
+                .iter()
+                .filter(|(key, _)| !removed.contains(key))
+                .cloned()
+                .collect();
+            assert_eq!(
+                after, expected,
+                "case {label:?}: exactly the named key must be gone, got {after:?}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (403, "AccessDeniedException"),
+                "case {label:?}: a principal whose documents do not allow the action must be \
+                 refused, got {status} with {body}"
+            );
+            let message = body["Message"]
+                .as_str()
+                .or_else(|| body["message"].as_str())
+                .unwrap_or_default();
+            assert!(
+                message.contains("bcm-data-exports:UntagResource")
+                    && message.contains("not authorized to perform"),
+                "case {label:?}: the refusal must name the action it was decided about, got \
+                 {message:?}"
+            );
+            assert_eq!(
+                after, before,
+                "case {label:?}: a refused UntagResource must change no tag, got {after:?}"
+            );
+        }
+
+        // Leave the export as the next row finds it.
+        let leftovers: Vec<String> = after.iter().map(|(key, _)| key.clone()).collect();
+        if !leftovers.is_empty() {
+            let (status, body) = emulator
+                .call(
+                    ACCOUNT_KEY,
+                    "UntagResource",
+                    &json!({ "ResourceArn": arn, "ResourceTagKeys": leftovers }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: the account's own cleanup must be served, got {status} with \
+                 {body}"
             );
         }
         assert!(

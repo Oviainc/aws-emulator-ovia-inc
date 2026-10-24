@@ -202,12 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartCapacityTaskErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the Outpost the
+        // task would run on is resolved.
+        let region = crate::state::request_region(ctx.parts());
         // A dry run reports whether the requested pools are above or below the
         // Outpost's AVAILABLE instance capacity, and changes nothing. This emulator
         // models no installed capacity to weigh them against, so it can neither
@@ -234,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A capacity task runs ON an Outpost, so an Outpost the store does not hold
         // cannot take one: the not-found error this operation models, worded as the
         // identifier echo of the value AS SUPPLIED.
-        if !store.outposts.contains_key(&outpost_id) {
+        if store.outpost(&region, &outpost_id).is_none() {
             return Err(StartCapacityTaskErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::identifier_not_found(

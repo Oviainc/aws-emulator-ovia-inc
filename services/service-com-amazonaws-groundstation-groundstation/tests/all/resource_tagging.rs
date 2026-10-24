@@ -27,6 +27,10 @@
 //!
 //! The harness, the signed `restJson1` requests and the response reader are
 //! [`crate::scheduling_loop`]'s, reused rather than rebuilt.
+//!
+//! The table of taggable resources and the tag plumbing below are `pub(crate)`:
+//! [`crate::tag_removal`] asserts the REMOVAL half of the same surface against the same
+//! resources, through the same front door, rather than building a second copy of them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,12 +55,12 @@ use crate::tag_rules::{illegal_tag_maps, legal_tag_maps, tag_map};
 /// The label is NOT greedy (`smithy_query(query="operation", operation="TagResource")` —
 /// `POST /tags/{resourceArn}`), so an SDK percent-encodes the ARN's `/` separators into
 /// the single segment and the server percent-decodes the segment back.
-fn label(arn: &str) -> String {
+pub(crate) fn label(arn: &str) -> String {
     arn.replace('%', "%25").replace('/', "%2F")
 }
 
 /// `POST /tags/{resourceArn}` — `TagResource`, assigning `tags`.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     arn: &str,
     tags: &BTreeMap<String, String>,
@@ -92,14 +96,15 @@ async fn tag_resource_body(
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
 ///
-/// `pub(crate)` so a suite asserting what the tag read of a DELETED resource answers
-/// reaches the tag reader through this one helper.
+/// `pub(crate)` so a suite asserting what the tag read of a DELETED resource answers, and
+/// [`crate::tag_removal`] asserting what is left after a removal, reach the tag reader
+/// through this one helper.
 pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
     send(router, "GET", &format!("/tags/{}", label(arn)), None).await
 }
 
 /// The `tags` member of a reply, as a map comparable whatever order it serialized in.
-fn reported_tags(case: &str, reply: &Reply) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(case: &str, reply: &Reply) -> BTreeMap<String, String> {
     reply
         .field("tags")
         .as_object()
@@ -118,7 +123,7 @@ fn reported_tags(case: &str, reply: &Reply) -> BTreeMap<String, String> {
 }
 
 /// A tag map as a request body carries it.
-fn tags_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -176,20 +181,20 @@ fn writes() -> Vec<Write> {
 }
 
 /// One taggable resource of this service, as the suites below address it.
-struct Taggable {
-    label: String,
+pub(crate) struct Taggable {
+    pub(crate) label: String,
     /// The ARN the tag operations address it by.
-    arn: String,
+    pub(crate) arn: String,
     /// A read of the RESOURCE that reports its `tags`, where this service models one, so a
     /// tag write is asserted to land in the one map the resource's own read reports.
     /// `None` for an agent, whose `GetAgentConfiguration` answers `agentId` and
     /// `taskingDocument` only (`smithy_query(query="operation",
     /// operation="GetAgentConfiguration")`), and for an ephemeris, whose
     /// `DescribeEphemeris` is still a scaffolded 501 with its own open issue.
-    own_read: Option<String>,
+    pub(crate) own_read: Option<String>,
     /// The tags the resource was CREATED with — what a tag read reports before any
     /// `TagResource` call.
-    created_with: BTreeMap<String, String>,
+    pub(crate) created_with: BTreeMap<String, String>,
 }
 
 /// A `RegisterAgent` request: the required members of `AgentDetails` and `DiscoveryData`
@@ -233,7 +238,7 @@ fn endpoint_group_request(tags: &BTreeMap<String, String>) -> Value {
 /// `contactId` and `versionId` — `smithy_query(query="operation",
 /// operation="ReserveContact")`), so it is composed the way the model addresses the
 /// `Contact` resource, `contact/<contactId>`.
-fn contact_arn(contact_id: &str) -> String {
+pub(crate) fn contact_arn(contact_id: &str) -> String {
     format!(
         "arn:aws:groundstation:{REGION}:{}:contact/{contact_id}",
         engine::emulator_account_id()
@@ -241,7 +246,7 @@ fn contact_arn(contact_id: &str) -> String {
 }
 
 /// An agent's ARN, `agent/<agentId>`, for the same reason as [`contact_arn`].
-fn agent_arn(agent_id: &str) -> String {
+pub(crate) fn agent_arn(agent_id: &str) -> String {
     format!(
         "arn:aws:groundstation:{REGION}:{}:agent/{agent_id}",
         engine::emulator_account_id()
@@ -291,7 +296,7 @@ async fn reserve_contact(
 /// [`crate::scheduling_loop::config_data_table`], built from `smithy_query(query="shape",
 /// shape="ConfigTypeData")`), and alternate rows are created WITH tags and with none, so
 /// the merge is asserted both onto an existing map and onto an empty one.
-async fn taggable_resources(router: &MultiServiceRouter) -> Vec<Taggable> {
+pub(crate) async fn taggable_resources(router: &MultiServiceRouter) -> Vec<Taggable> {
     let mut rows: Vec<Taggable> = Vec::new();
     let created = tags_of(&[("stage", "created")]);
     let empty: BTreeMap<String, String> = BTreeMap::new();
@@ -721,7 +726,7 @@ async fn an_arn_that_names_no_resource_is_refused_by_both_tag_operations() {
 }
 
 /// A config carrying no tag, for a row that wants a resource of its own, and its ARN.
-async fn fresh_config(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn fresh_config(router: &MultiServiceRouter, name: &str) -> String {
     let (_, _, arn) = create_config(
         router,
         name,

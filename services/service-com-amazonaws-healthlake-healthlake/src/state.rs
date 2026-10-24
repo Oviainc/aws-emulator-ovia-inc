@@ -26,8 +26,9 @@
 //!
 //! The FHIR import job is the fourth: a job record belongs to the data store it
 //! imports into, is addressed by its own `JobId` WITHIN that data store, and
-//! `DescribeFHIRImportJob` reports the record held here —
-//! [`ComAmazonawsHealthlakeHealthlakeState::import_jobs`] — so an import job is
+//! `DescribeFHIRImportJob` / `ListFHIRImportJobs` both report the records held
+//! here — [`ComAmazonawsHealthlakeHealthlakeState::import_jobs`], one by `JobId`,
+//! the other filtered and paged — so an import job is
 //! dropped with the data store it belonged to exactly as an export job is.
 //! `StartFHIRImportJob` is the operation that MINTS one; it is still a scaffold
 //! stub (its own issue), so until it is written the only records in that map are
@@ -1342,8 +1343,8 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// so two starts in the same clock tick still get distinct ones.
     pub export_jobs_started: u64,
     /// Every FHIR import job, by `JobId`. A `BTreeMap` so
-    /// `ListFHIRImportJobs` can page in a stable, resumable order once it is
-    /// written. A job's record is dropped with the data store it belongs to, by
+    /// `ListFHIRImportJobs` pages in a stable, resumable order. A job's record
+    /// is dropped with the data store it belongs to, by
     /// this state's own `forget_import_jobs_for`. The ceiling on how many job
     /// records there can be belongs with the operation that MINTS them
     /// (`StartFHIRImportJob`, still a scaffold stub), which is the only place a

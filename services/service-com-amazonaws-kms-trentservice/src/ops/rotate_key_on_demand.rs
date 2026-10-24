@@ -237,11 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // managed KMS keys": a key KMS manages is a resource this operation is not
         // valid for, which is what `UnsupportedOperationException` reports.
         if key.key_manager != crate::state::KEY_MANAGER_CUSTOMER {
-            return Err(unsupported(format!(
-                "{} is not a customer managed key. You cannot initiate on-demand \
-                 rotation of an Amazon Web Services managed KMS key.",
-                key.arn
-            )));
+            return Err(unsupported());
         }
 
         // "On-demand key rotation is supported only on symmetric encryption KMS keys.
@@ -249,11 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or KMS keys in a custom key store." Which keys those are follows from the
         // key's own spec and usage rather than from one spec's name.
         if !key.is_symmetric_encryption() {
-            return Err(unsupported(format!(
-                "{} is not a symmetric encryption KMS key. On-demand key rotation is \
-                 supported only on symmetric encryption KMS keys.",
-                key.arn
-            )));
+            return Err(unsupported());
         }
 
         // Rotation replaces the key material a key encrypts under, so the key must be
@@ -279,17 +271,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "To perform on-demand rotation of a set of related multi-Region keys, ...
         // invoke the on-demand rotation on the primary Region key" — so a replica key
         // of a multi-Region set does not rotate; the primary key of its set does.
-        if let Some(primary_region) = key
+        if key
             .multi_region_topology
             .as_ref()
-            .map(|topology| topology.primary_region.clone())
-            .filter(|primary_region| *primary_region != key.region)
+            .is_some_and(|topology| topology.primary_region != key.region)
         {
-            return Err(unsupported(format!(
-                "{} is a replica key of a multi-region key. Invoke the on-demand \
-                 rotation on the primary key, in {primary_region}.",
-                key.arn
-            )));
+            return Err(unsupported());
         }
 
         // KMS generates the replacement material only for a key whose material KMS
@@ -301,11 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // originate in KMS has nothing waiting to become current, and the call is
         // refused rather than served with material the caller never supplied.
         if key.origin != crate::state::ORIGIN_AWS_KMS {
-            return Err(unsupported(format!(
-                "The key material of {} has origin {}. Import new key material for the \
-                 KMS key first; its key material state must be PENDING_ROTATION.",
-                key.arn, key.origin
-            )));
+            return Err(unsupported());
         }
 
         // "You can perform on-demand key rotation a maximum of 25 times per KMS key" —
@@ -327,10 +310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `ConflictException` reports that "an automatic rotation of this key is
-        // currently in progress or scheduled to begin within the next 20 minutes".
-        // Nothing in this slice schedules an automatic rotation (`EnableKeyRotation`
-        // is not implemented, so no key carries a rotation schedule), so no key here
-        // is in that conflict and none is manufactured.
+        // currently in progress or scheduled to begin within the next 20 minutes". A
+        // key can carry an automatic rotation schedule (`EnableKeyRotation`), but the
+        // shortest rotation period the model admits is 90 days and no automatic
+        // rotation is ever in progress, so no key here is within that window and the
+        // conflict is not manufactured.
 
         // The replacement material is drawn the way the key's first version was: from
         // the OS CSPRNG, in the form the key's spec calls for.
@@ -369,9 +353,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse a key this operation cannot rotate: "a specified parameter is not supported
 /// or a specified resource is not valid for this operation"
 /// (`smithy_query(query="doc",shape="UnsupportedOperationException")`).
-fn unsupported(message: impl Into<String>) -> RotateKeyOnDemandError {
+///
+/// KMS reports such a key with the error code alone — see
+/// [`crate::state::unsupported_rotation_message`], shared with the operations that
+/// configure automatic rotation, so one refusal does not carry prose another omits.
+fn unsupported() -> RotateKeyOnDemandError {
     RotateKeyOnDemandErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
-        message: Some(message.into()),
+        message: crate::state::unsupported_rotation_message(),
     })
     .into()
 }

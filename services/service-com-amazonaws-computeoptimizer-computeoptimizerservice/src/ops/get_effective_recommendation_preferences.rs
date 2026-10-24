@@ -6,7 +6,9 @@
 //! taking it from the most specific scope that sets it — resource, then account, then the
 //! account default, then organization — and falling back to the service's documented
 //! default (`lookBackPeriod`, `utilizationPreferences`, `preferredResources`), which the
-//! list members report as a list rather than as an absent member.
+//! list members report as a list rather than as an absent member. A `resourceArn` whose
+//! account field names another account is refused, not resolved: this emulator answers for
+//! one standalone account and records no organization.
 //!
 //! ## Shape of an operation
 //!
@@ -214,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resourceArn`: "Only EC2 instance and Auto Scaling group ARNs are currently
         // supported." The ARN also names the resource type whose preferences apply and
-        // the account whose account-level preferences apply. Refused before the store is
+        // the account that owns the resource. Refused before the store is
         // read, so InvalidParameterValueException takes precedence over the opt-in gate,
         // as it does in the other preference operations.
         let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
@@ -232,6 +234,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The ARN's ACCOUNT field names the account whose resource this request asks about.
+        // This emulator presents one standalone account (`::engine::emulator_account_id`)
+        // and records no organization, so a resource of any other account is one this
+        // service cannot answer about: refused with the cross-account message the whole
+        // crate shares ([`crate::state::CROSS_ACCOUNT_MESSAGE`], the refusal this service's
+        // other readers answer the same condition with), before the store is read, so the
+        // refusal describes the REQUEST rather than what the store holds.
+        if crate::state::is_foreign_account(resource.account_id) {
+            return Err(
+                GetEffectiveRecommendationPreferencesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::CROSS_ACCOUNT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
 
         let guard = state.lock();
         if !guard.enrollment.is_opted_in() {
@@ -253,7 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no record sets it. The resolution lives in `crate::state`
         // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::effective_preferences`])
         // so the preferences this operation REPORTS are the same ones a recommendation
-        // says it was generated under.
+        // says it was generated under — and the account-level records it considers are
+        // those of the account this service answers for, which the refusal above makes the
+        // only account a resource reaching here can belong to.
         let effective = guard.effective_preferences(&input.resource_arn, resource);
 
         Ok(GetEffectiveRecommendationPreferencesOutput {

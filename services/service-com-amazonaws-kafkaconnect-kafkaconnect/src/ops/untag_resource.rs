@@ -8,6 +8,11 @@
 //! `@idempotent` trait on this operation calls for — so every later
 //! `ListTagsForResource` answers with exactly the keys that survived.
 //!
+//! The keys a caller may name are the ones a caller could have written: a key
+//! claiming the `aws:` namespace AWS reserves for its own tags, or one outside
+//! the published tag character set, is a `BadRequestException` (HTTP 400) with
+//! nothing removed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,6 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is no failure, so the call is safe to retry.
         match state.remove_tags(&input.resource_arn, &input.tag_keys) {
             Ok(()) => Ok(UntagResourceOutput {}),
+            // A key AWS reserves is not a caller's to strip, and a key outside
+            // the tag character set is not a tag at all: the modelled 400,
+            // blaming the member that carried the keys. The model gives
+            // `TagKey` a length and no pattern, so the handler is where this is
+            // refused.
+            Err(crate::state::TagWriteRefusal::IllegalTag(breach)) => {
+                Err(UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::invalid_parameter_because(
+                        "tagKeys",
+                        &breach.reason(),
+                    )),
+                })
+                .into())
+            }
             Err(_) => Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::invalid_parameter_because(
                     "resourceArn",

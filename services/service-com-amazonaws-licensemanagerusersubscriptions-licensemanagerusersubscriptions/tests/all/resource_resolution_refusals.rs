@@ -1451,8 +1451,12 @@ async fn the_instance_view_is_recomputed_from_the_associations_that_remain() {
         "a product must stop being reported with the association behind it"
     );
 
-    // Deregistering the remaining directory's product is the same rule by another route:
-    // the view is read from the registrations, so the product goes with the registration.
+    // Deregistering the remaining directory's only product takes the LAST live
+    // registration that directory had, so the association made through it goes with the
+    // integration it depended on — and the instance leaves the view with the last
+    // association naming it rather than being reported providing nothing. The products
+    // side of that rule has its own table in
+    // `tests/all/associations_follow_their_registration.rs`.
     call(
         &h,
         "/identity-provider/DeregisterIdentityProvider",
@@ -1465,9 +1469,12 @@ async fn the_instance_view_is_recomputed_from_the_associations_that_remain() {
     .ok("deregistering the directory's product");
     let listed = call(&h, "/instance/ListInstances", &json!({})).await;
     assert_eq!(
-        products(&listed, "no registration left"),
-        Vec::<String>::new(),
-        "a product must stop being reported with its registration, got {:?}",
+        listed.ok("no registration left")["InstanceSummaries"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "an instance whose last association's directory lost its last registration must \
+         leave the view, got {:?}",
         listed.body
     );
 }

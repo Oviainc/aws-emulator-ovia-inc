@@ -207,15 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rotation_arn: rotation.arn.clone(),
             name: rotation.name.clone(),
             contact_ids: rotation.contact_ids.clone(),
-            // `StartTime` is REQUIRED on this response while `CreateRotation`'s own
-            // `StartTime` is optional (`smithy_query(query="operation",
-            // operation="CreateRotation,GetRotation")`), so a rotation created without one
-            // reports the instant the create stored it: that is when the rotation went
-            // into effect, and it is a value the store already holds rather than one this
-            // read computes afresh — two reads of an unchanged rotation answer the same.
-            start_time: rotation
-                .start_time
-                .unwrap_or_else(|| ::aws_smithy_types::DateTime::from(rotation.created_at)),
+            // `StartTime` is the effective start time `CreateRotation` assigned and
+            // persisted (the named instant, or the creation instant when the create named
+            // none), so this read projects the stored value rather than deriving one:
+            // two reads of an unchanged rotation answer the same, and `ListRotations`
+            // reports the same value for the same rotation.
+            start_time: rotation.start_time,
             time_zone_id: rotation.time_zone_id.clone(),
             recurrence: rotation.recurrence.clone(),
         })

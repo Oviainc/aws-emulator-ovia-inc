@@ -321,11 +321,124 @@ pub const RESOURCE_QUOTA: usize = 100;
 /// dimension of this store that would otherwise grow without limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// The tag-key prefix AWS reserves, across every service, for the tags it sets
+/// itself: a caller may not create, change or remove a key that starts with it.
+///
+/// `TagKey` is modelled `len 1..128` with no `@pattern`, so the boundary
+/// validator cannot refuse such a key and this service has to.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The characters a tag key or value may carry besides letters, numbers and
+/// spaces, as AWS publishes the tag character set (letters, numbers, spaces,
+/// and `+ - = . _ : / @`). Letters and numbers are read as the Unicode
+/// categories, since the set is "representable in UTF-8" rather than ASCII.
+pub const TAG_PUNCTUATION: &str = "+-=._:/@";
+
+/// Which AWS tag rule a key or value in a request breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagRuleBreach {
+    /// A key claims [`RESERVED_TAG_KEY_PREFIX`].
+    ReservedKeyPrefix,
+    /// A key or value carries a character outside the tag character set.
+    OutsideCharacterSet,
+}
+
+impl TagRuleBreach {
+    /// The reason a refusal of this breach carries — a full sentence, for the
+    /// one member-naming form every kafkaconnect rejection uses
+    /// ([`invalid_parameter_because`]).
+    ///
+    /// It names the RULE and interpolates nothing from the request: the rule is
+    /// the same whatever key or value broke it, and a map's keys arrive in no
+    /// particular order, so quoting one of them would make the message depend
+    /// on iteration order.
+    pub fn reason(self) -> String {
+        match self {
+            Self::ReservedKeyPrefix => format!(
+                "A tag key must not begin with the reserved prefix {RESERVED_TAG_KEY_PREFIX}."
+            ),
+            Self::OutsideCharacterSet => format!(
+                "A tag key or value may contain only letters, numbers, spaces and the characters {}.",
+                TAG_PUNCTUATION
+                    .chars()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        }
+    }
+}
+
+/// Whether `key` claims [`RESERVED_TAG_KEY_PREFIX`]. Compared
+/// case-INSENSITIVELY, because AWS reserves the namespace rather than one
+/// spelling of it.
+///
+/// The comparison is over BYTES: a tag key is any UTF-8 text the model's length
+/// bound allows, and slicing such a string at a byte offset would panic when
+/// the offset falls inside a multi-byte character. Taking bytes answers `false`
+/// for those keys instead, which is correct — a key whose leading bytes are not
+/// the prefix does not claim the namespace.
+fn claims_reserved_tag_prefix(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Whether every character of `text` is one a tag key or value may carry:
+/// a Unicode letter or number, a space, or one of [`TAG_PUNCTUATION`].
+fn is_tag_text(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_alphanumeric() || c == ' ' || TAG_PUNCTUATION.contains(c))
+}
+
+/// The rule the entries break, or `None` when every one of them is a tag this
+/// service may hold. `value` is `None` for an entry that is a bare key (a
+/// removal names keys only).
+///
+/// A reserved key outranks a character breach, so a request that holds both is
+/// answered the same way whatever order its map iterates in.
+fn tag_breach<'a>(
+    entries: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Option<TagRuleBreach> {
+    let mut found: Option<TagRuleBreach> = None;
+    for (key, value) in entries {
+        if claims_reserved_tag_prefix(key) {
+            return Some(TagRuleBreach::ReservedKeyPrefix);
+        }
+        if found.is_none()
+            && (!is_tag_text(key) || value.is_some_and(|value| !is_tag_text(value)))
+        {
+            found = Some(TagRuleBreach::OutsideCharacterSet);
+        }
+    }
+    found
+}
+
+/// The rule the tags of a request break, or `None` when the whole map may be
+/// stored. The check every path that writes tags runs — `TagResource` through
+/// [`ComAmazonawsKafkaconnectKafkaconnectState::attach_tags`], and each create over the `tags` its
+/// request carried — so no operation can store a tag another would refuse.
+pub fn tag_map_breach(tags: &HashMap<String, String>) -> Option<TagRuleBreach> {
+    tag_breach(
+        tags.iter()
+            .map(|(key, value)| (key.as_str(), Some(value.as_str()))),
+    )
+}
+
+/// The rule the tag keys of a request break, or `None` when every key may be
+/// acted on. The caller-supplied keys of a removal are held to the same rules:
+/// a key AWS reserves is not a caller's to strip.
+pub fn tag_key_breach(keys: &[String]) -> Option<TagRuleBreach> {
+    tag_breach(keys.iter().map(|key| (key.as_str(), None)))
+}
+
 /// Why a tag write was refused, with nothing written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagWriteRefusal {
     /// This emulator holds no resource of that ARN.
     NoSuchResource,
+    /// A key or value in the request breaks an AWS tag rule.
+    IllegalTag(TagRuleBreach),
     /// The write would leave the resource holding more than
     /// [`MAX_TAGS_PER_RESOURCE`] tags; `would_hold` is how many.
     CapExceeded { would_hold: usize },
@@ -1192,15 +1305,23 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
     /// resource already carries takes the new value, a key `incoming` does not
     /// name keeps the value it had.
     ///
-    /// Refused, with nothing written, when the ARN names no resource this
-    /// emulator holds, or when the merged set would hold more than
+    /// Refused, with nothing written, when a key or value breaks an AWS tag
+    /// rule ([`tag_map_breach`]), when the ARN names no resource this emulator
+    /// holds, or when the merged set would hold more than
     /// [`MAX_TAGS_PER_RESOURCE`] keys — the one caller-driven dimension of this
     /// store that a repeated call could otherwise grow without bound.
+    ///
+    /// The tag rules are checked BEFORE the ARN is resolved, the way a service
+    /// reads a request before looking anything up: a request the rules refuse is
+    /// refused whether or not the resource it names exists.
     pub fn attach_tags(
         &mut self,
         arn: &str,
         incoming: HashMap<String, String>,
     ) -> Result<(), TagWriteRefusal> {
+        if let Some(breach) = tag_map_breach(&incoming) {
+            return Err(TagWriteRefusal::IllegalTag(breach));
+        }
         let tags = self
             .tags_of_mut(arn)
             .ok_or(TagWriteRefusal::NoSuchResource)?;
@@ -1224,9 +1345,14 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
     /// request does not name keeps its value, and a key the resource does not
     /// carry is a no-op (so the call is safe to retry).
     ///
-    /// Refused only when the ARN names no resource this emulator holds — a
-    /// removal can never grow the stored set.
+    /// Refused, with nothing removed, when a key breaks an AWS tag rule
+    /// ([`tag_key_breach`]) — a key AWS reserves is not a caller's to strip —
+    /// and when the ARN names no resource this emulator holds; a removal can
+    /// never grow the stored set, so there is no cap to check.
     pub fn remove_tags(&mut self, arn: &str, keys: &[String]) -> Result<(), TagWriteRefusal> {
+        if let Some(breach) = tag_key_breach(keys) {
+            return Err(TagWriteRefusal::IllegalTag(breach));
+        }
         let tags = self
             .tags_of_mut(arn)
             .ok_or(TagWriteRefusal::NoSuchResource)?;

@@ -172,7 +172,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartOutpostDecommissionErrorModeled::InternalServerException(
                 InternalServerException {
@@ -180,6 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved — one region's endpoint cannot decommission another region's
+        // Outpost.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -204,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identifier echo of the value AS SUPPLIED — not of the bare id an ARN
         // resolved to. Judged before anything else is looked at, so an identifier
         // that names nothing costs nothing.
-        if !store.outposts.contains_key(&outpost_id) {
+        if store.outpost(&region, &outpost_id).is_none() {
             return Err(StartOutpostDecommissionErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::identifier_not_found(
@@ -219,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Something still associated with the Outpost stops the decommission from
         // starting, whether or not the caller asked to validate only: the blocking
         // types are what the caller has to clear first, and nothing is persisted.
-        let blocking = store.blocking_resource_types(&outpost_id);
+        let blocking = store.blocking_resource_types(&region, &outpost_id);
         if !blocking.is_empty() {
             return Ok(StartOutpostDecommissionOutput {
                 status: Some(crate::state::DECOMMISSION_STATUS_BLOCKED.to_string()),
@@ -230,11 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Nothing blocks. Either this call starts the decommission — which is what
         // gets recorded on the Outpost — or it starts nothing, because the caller
         // asked for validation alone or the decommission is already under way. The
-        // `contains_key` above proved the record is there, so the `if let` can only
-        // take its `Some` arm; it is written as one rather than unwrapped so a
-        // handler never panics on a store it just read.
+        // check above proved the record is there, so the `if let` can only take its
+        // `Some` arm; it is written as one rather than unwrapped so a handler never
+        // panics on a store it just read.
         let mut status = crate::state::DECOMMISSION_STATUS_SKIPPED;
-        if let Some(record) = store.outposts.get_mut(&outpost_id) {
+        if let Some(record) = store.outpost_mut(&region, &outpost_id) {
             if !input.validate_only && record.decommission_requested_at.is_none() {
                 record.decommission_requested_at = Some(std::time::SystemTime::now());
                 status = crate::state::DECOMMISSION_STATUS_REQUESTED;

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches the members the request names onto the [`crate::state::Api`]
+//! its `ApiId` names — refusing the `ProtocolType`-restricted ones on an api of another
+//! protocol, and a CORS document the api could never serve — and reports the stored
+//! record back. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +207,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApi"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApi"));
+        };
+        let mut store = state.lock();
+
+        // An api the store does not hold — one never created, or one a DeleteApi
+        // removed — is "the resource specified in the request was not found".
+        let Some(existing) = store.apis.get(&input.api_id) else {
+            return Err(UpdateApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_identifier_message(
+                    "API",
+                    &input.api_id,
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+        let protocol_type = existing.protocol_type.clone();
+
+        // The same members `CreateApi` gates, over the members THIS request configures:
+        // quick create (`Target`/`RouteKey`/`CredentialsArn`) and `CorsConfiguration`
+        // are each documented "Supported only for HTTP APIs", so a patch cannot put one
+        // on an api of another protocol. Checked BEFORE anything is written, so a
+        // refused patch leaves the api exactly as it was.
+        let restricted = [
+            crate::state::ProtocolRestrictedMember::http_only("Target", input.target.is_some()),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "RouteKey",
+                input.route_key.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "CorsConfiguration",
+                input.cors_configuration.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::http_only(
+                "CredentialsArn",
+                input.credentials_arn.is_some(),
+            ),
+        ];
+        if let Err(message) =
+            crate::state::validate_protocol_restricted_members(&protocol_type, &restricted)
+        {
+            return Err(bad_request(&message));
+        }
+
+        // The patch rule (`PATCH /v2/apis/{ApiId}`): a member the request carries
+        // replaces the stored one, and a member it omits leaves the stored value exactly
+        // as it was. Nothing here is defaulted — a default belongs to the create, and
+        // applying one again would silently undo a value a later `GetApi` can still
+        // report.
+        let mut updated = existing.clone();
+        if let Some(name) = input.name {
+            updated.name = name;
+        }
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+        }
+        if let Some(version) = input.version {
+            updated.version = Some(version);
+        }
+        if let Some(expression) = input.route_selection_expression {
+            updated.route_selection_expression = expression;
+        }
+        if let Some(expression) = input.api_key_selection_expression {
+            updated.api_key_selection_expression = expression;
+        }
+        if let Some(cors) = input.cors_configuration {
+            updated.cors_configuration = Some(cors);
+        }
+        if let Some(disabled) = input.disable_execute_api_endpoint {
+            updated.disable_execute_api_endpoint = disabled;
+        }
+        if let Some(disabled) = input.disable_schema_validation {
+            updated.disable_schema_validation = disabled;
+        }
+        if let Some(ip_address_type) = input.ip_address_type {
+            updated.ip_address_type = ip_address_type;
+        }
+
+        // The MERGED CORS document is what the api would carry, so that is what has to
+        // hold together (see `crate::state::validate_cors_configuration`): widening the
+        // allowed origins to the wildcard on a configuration that already allows
+        // credentials is refused, and nothing is written.
+        if let Some(cors) = updated.cors_configuration.as_ref() {
+            if let Err(message) = crate::state::validate_cors_configuration(cors) {
+                return Err(bad_request(&message));
+            }
+        }
+
+        // Quick create's members patch the resources quick create minted: "The value
+        // provided updates the integration URI and integration type"
+        // (`UpdateApi$Target`), "this value replaces the route key of the quick create
+        // route" (`UpdateApi$RouteKey`) and "this value replaces the credentials
+        // associated with the quick create integration" (`UpdateApi$CredentialsArn`).
+        // Those resources are the API-Gateway-managed ones, so an api created without
+        // quick create has none of them to replace.
+        let quick_create_integration = updated
+            .integrations
+            .iter()
+            .find(|(_, integration)| integration.api_gateway_managed)
+            .map(|(integration_id, _)| integration_id.clone());
+        let quick_create_route = updated
+            .routes
+            .iter()
+            .find(|(_, route)| route.api_gateway_managed)
+            .map(|(route_id, _)| route_id.clone());
+
+        if input.target.is_some() || input.credentials_arn.is_some() {
+            let Some(integration_id) = quick_create_integration else {
+                return Err(bad_request(
+                    "Target and CredentialsArn are part of quick create, and this API has \
+                     no quick create integration to update.",
+                ));
+            };
+            let integration = updated
+                .integrations
+                .get_mut(&integration_id)
+                .expect("the integration just found is in the api");
+            if let Some(target) = input.target {
+                // "For HTTP integrations, specify a fully qualified URL. For Lambda
+                // integrations, specify a function ARN. The type of the integration will
+                // be HTTP_PROXY or AWS_PROXY, respectively" (`UpdateApi$Target`) — the
+                // same two forms `CreateApi$Target` tells apart, told apart the same way.
+                let is_function_arn =
+                    target.starts_with(crate::ops::create_api::ARN_SCHEME_PREFIX);
+                integration.integration_type = if is_function_arn {
+                    crate::state::AWS_PROXY_INTEGRATION_TYPE
+                } else {
+                    crate::state::HTTP_PROXY_INTEGRATION_TYPE
+                }
+                .to_string();
+                integration.integration_uri = Some(target);
+                // The payload format the new type supports: "Supported values for Lambda
+                // proxy integrations are 1.0 and 2.0. For all other integrations, 1.0 is
+                // the only supported value" (`Integration$PayloadFormatVersion`).
+                integration.payload_format_version = Some(
+                    if is_function_arn {
+                        crate::state::LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION
+                    } else {
+                        crate::state::ONLY_PAYLOAD_FORMAT_VERSION
+                    }
+                    .to_string(),
+                );
+            }
+            if let Some(credentials_arn) = input.credentials_arn {
+                integration.credentials_arn = Some(credentials_arn);
+            }
+        }
+
+        if let Some(route_key) = input.route_key {
+            let Some(route_id) = quick_create_route else {
+                return Err(bad_request(
+                    "RouteKey is part of quick create, and this API has no quick create \
+                     route to update.",
+                ));
+            };
+            // A route key identifies the route within its api, so the quick-create route
+            // cannot be moved onto a key another route of the same api already holds.
+            if updated
+                .routes
+                .iter()
+                .any(|(id, route)| id != &route_id && route.route_key == route_key)
+            {
+                return Err(UpdateApiErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Route with key {route_key} already exists for this API"
+                    )),
+                })
+                .into());
+            }
+            if let Err(message) = crate::state::validate_route_key_variables(
+                &route_key,
+                updated
+                    .routes
+                    .iter()
+                    .filter(|(id, _)| *id != &route_id)
+                    .map(|(_, route)| route.route_key.as_str()),
+            ) {
+                return Err(UpdateApiErrorModeled::ConflictException(ConflictException {
+                    message: Some(message),
+                })
+                .into());
+            }
+            updated
+                .routes
+                .get_mut(&route_id)
+                .expect("the route just found is in the api")
+                .route_key = route_key;
+        }
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetApi will report. The api exists (checked above), so this replaces its
+        // record rather than minting a second one, and its id, its creation instant, its
+        // endpoint and its children are carried over by the clone.
+        store.apis.insert(input.api_id.clone(), updated);
+        let stored = store
+            .apis
+            .get(&input.api_id)
+            .map(crate::state::Api::to_wire)
+            .expect("the api just written is in the store");
+        Ok(UpdateApiOutput {
+            api_endpoint: stored.api_endpoint,
+            api_gateway_managed: stored.api_gateway_managed,
+            api_id: stored.api_id,
+            api_key_selection_expression: stored.api_key_selection_expression,
+            cors_configuration: stored.cors_configuration,
+            created_date: stored.created_date,
+            description: stored.description,
+            disable_schema_validation: stored.disable_schema_validation,
+            disable_execute_api_endpoint: stored.disable_execute_api_endpoint,
+            import_info: stored.import_info,
+            ip_address_type: stored.ip_address_type,
+            name: Some(stored.name),
+            protocol_type: Some(stored.protocol_type),
+            route_selection_expression: Some(stored.route_selection_expression),
+            tags: stored.tags,
+            version: stored.version,
+            warnings: stored.warnings,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_api` does.
+fn bad_request(message: &str) -> UpdateApiError {
+    UpdateApiErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

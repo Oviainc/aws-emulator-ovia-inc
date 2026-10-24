@@ -196,13 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let page_size = crate::state::page_size(input.max_results);
-        let resume_from = match input.next_token.as_deref() {
-            Some(token) => Some(
-                crate::state::decode_page_token(token, crate::state::APPLICATION_ID_PREFIX)
-                    .ok_or_else(invalid_next_token)?,
-            ),
-            None => None,
-        };
 
         let store = state.lock();
         let Some(catalog) = store.catalogs.get(&input.catalog) else {
@@ -218,6 +211,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // A `NextToken` only resumes this listing when it is a cursor this service issued
+        // for THIS catalog's applications and the application it names is still stored —
+        // see [`crate::state::resume_from`]; anything else is a client-fabricated or stale
+        // cursor, which is a validation failure rather than a position in the collection.
+        let resume_from = crate::state::resume_from(
+            input.next_token.as_deref(),
+            crate::state::APPLICATION_ID_PREFIX,
+            &input.catalog,
+            &catalog.applications,
+        )
+        .map_err(|_| invalid_next_token())?;
 
         // `BenefitIdentifiers` accepts either form the modelled `BenefitId` allows, so
         // each entry is resolved to the catalog's own benefit id before the comparison.
@@ -279,7 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token = page
             .get(page_size)
-            .map(|application| crate::state::encode_page_token(&application.id));
+            .map(|application| {
+                crate::state::encode_page_token(&input.catalog, &application.id)
+            });
         page.truncate(page_size);
 
         Ok(ListBenefitApplicationsOutput {

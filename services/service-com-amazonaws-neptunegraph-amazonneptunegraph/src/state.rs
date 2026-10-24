@@ -1514,6 +1514,35 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
             .filter(move |graph| graph.is_in(region))
     }
 
+    /// The snapshots `region` holds, in snapshot-id order, resuming after `after_id`
+    /// when a pagination token named a position, and restricted to the snapshots taken
+    /// from one graph when `of_graph` names one: the listing `ListGraphSnapshots` pages
+    /// over.
+    ///
+    /// The same shape as [`Self::graphs_in`], for the same reason: `snapshots` is a
+    /// `BTreeMap`, so one stable total order underlies every page and a token can name
+    /// a position in it. `of_graph` is matched against the snapshot's stored
+    /// `source_graph_id`, so a snapshot stays listed under the graph it was taken from
+    /// even once that graph is gone.
+    pub fn snapshots_in<'store>(
+        &'store self,
+        region: &'store str,
+        of_graph: Option<&'store str>,
+        after_id: Option<&str>,
+    ) -> impl Iterator<Item = &'store Snapshot> {
+        let lower = match after_id {
+            Some(id) => ::std::ops::Bound::Excluded(id.to_string()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.snapshots
+            .range((lower, ::std::ops::Bound::Unbounded))
+            .map(|(_, snapshot)| snapshot)
+            .filter(move |snapshot| {
+                snapshot.is_in(region)
+                    && of_graph.is_none_or(|graph_id| snapshot.source_graph_id == graph_id)
+            })
+    }
+
     /// Apply the snapshot transition the clock has made due, then borrow the snapshot
     /// `id` names IN `region` — `None` when this Region holds no such snapshot.
     pub fn settled_snapshot(&mut self, id: &str, region: &str, now: Instant) -> Option<&Snapshot> {
@@ -2324,10 +2353,11 @@ impl From<&Graph> for crate::ops::types::GraphSummary {
     }
 }
 
-/// The two `*Output` shapes that carry a whole snapshot record are structurally
-/// identical, so one macro renders the stored snapshot into each rather than two
-/// hand-copied field lists that could drift apart. `GraphSnapshotSummary` joins this
-/// list with `ListGraphSnapshots`.
+/// The shapes that carry a whole snapshot record are structurally identical, so one
+/// macro renders the stored snapshot into each rather than one hand-copied field list
+/// per operation, which could drift apart. `GraphSnapshotSummary` — the member
+/// `ListGraphSnapshots` reports — carries exactly those members too, so it is rendered
+/// here rather than by a listing projection of its own.
 macro_rules! snapshot_record_output {
     ($($ty:ident),+ $(,)?) => {$(
         impl From<&Snapshot> for crate::ops::types::$ty {
@@ -2348,7 +2378,11 @@ macro_rules! snapshot_record_output {
     )+};
 }
 
-snapshot_record_output!(CreateGraphSnapshotOutput, GetGraphSnapshotOutput);
+snapshot_record_output!(
+    CreateGraphSnapshotOutput,
+    GetGraphSnapshotOutput,
+    GraphSnapshotSummary,
+);
 
 /// The `*Output` shapes that carry a whole import-task record differ only in the
 /// members they add, so the members they SHARE are rendered by one macro rather than

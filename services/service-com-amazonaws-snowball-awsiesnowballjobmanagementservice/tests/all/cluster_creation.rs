@@ -586,7 +586,7 @@ async fn a_create_naming_a_resource_no_record_answers_to_stores_nothing() {
 /// One page at the largest `MaxResults` the member admits, and the absence of a
 /// `NextToken` is asserted, so a store that outgrew a page fails loudly here rather than
 /// silently answering with a truncated set.
-async fn listed_job_ids(router: &MultiServiceRouter, case: &str) -> BTreeSet<String> {
+pub(crate) async fn listed_job_ids(router: &MultiServiceRouter, case: &str) -> BTreeSet<String> {
     let listed = ok(
         router,
         "ListJobs",
