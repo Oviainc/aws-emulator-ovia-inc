@@ -12,12 +12,22 @@
 //! or when the batch carries fewer than one or more than a hundred identifiers
 //! (`ValidationException`).
 //!
+//! `GetAggregateResourceConfig` is the SAME read for ONE identifier, so the rule pinned
+//! for it is that rule: it answers the identifier with exactly the configuration item a
+//! batch read answers it with, member for member over everything the two output shapes
+//! share, and where the aggregator holds no current configuration item for the
+//! identifier — the case the batch reports unprocessed — a single read has no item to
+//! answer with and is refused `ResourceNotDiscoveredException`. Its output is the FULL
+//! `ConfigurationItem`, so it adds the resource's tags, which only the APIs documented
+//! to drop them leave out.
+//!
 //! Two further properties of a reported item are pinned with it: an item carries the
 //! configuration state the inventory holds — the account, Region, type, id, name,
 //! schema version, configuration document, capture time and the state id that orders
-//! the resource's items — and never the resource's tags, which this API does not
-//! return; and it reports a `recordingFrequency` and a `configurationItemDeliveryTime`
-//! only where the recording recorder records that resource type daily.
+//! the resource's items — and, in a BATCH read, never the resource's tags, which that
+//! API does not return; and it reports a `recordingFrequency` and a
+//! `configurationItemDeliveryTime` only where the recording recorder records that
+//! resource type daily.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — using the
@@ -123,6 +133,16 @@ type ItemCase = (
 /// recording.
 type RecordingModeCase = (&'static str, Value, &'static [(&'static str, bool)]);
 
+/// One row of the re-recording table: the case name, the configuration document and
+/// the tags the resource is recorded again with, and whether that state differs from
+/// the state it was first recorded in.
+type RerecordCase = (
+    &'static str,
+    Option<&'static str>,
+    &'static [(&'static str, &'static str)],
+    bool,
+);
+
 /// One resource the store holds: its type, its id, the custom name it carries if any,
 /// the configuration document recorded for it if any, and whether it has been deleted.
 struct Recorded {
@@ -215,6 +235,28 @@ fn seed(emulator: &Emulator, resources: &[Recorded]) {
     }
 }
 
+/// Rewrite the recorded state of one seeded resource, the way a later recording of the
+/// same resource would: its configuration document and the tags it was recorded with.
+fn rerecord(
+    emulator: &Emulator,
+    resource_type: &str,
+    resource_id: &str,
+    configuration: Option<&str>,
+    tags: &[(&str, &str)],
+) {
+    let state = service_state(&*emulator.engine).expect("the test engine is the shared engine");
+    let mut store = state.lock();
+    let entry = store
+        .discovered_resources
+        .get_mut(&(resource_type.to_string(), resource_id.to_string()))
+        .expect("the resource was seeded");
+    entry.configuration = configuration.map(str::to_string);
+    entry.tags = tags
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+}
+
 /// An account aggregation source over `accounts`, aggregating the Regions in
 /// `regions`, or every Region when `regions` is empty.
 fn account_source(accounts: &[&str], regions: &[&str]) -> Value {
@@ -277,6 +319,38 @@ fn batch(aggregator: &str, identifiers: &[Value]) -> Value {
         "ResourceIdentifiers": identifiers,
     })
 }
+
+/// The `GetAggregateResourceConfig` body for one identifier.
+fn single(aggregator: &str, resource_identifier: &Value) -> Value {
+    json!({
+        "ConfigurationAggregatorName": aggregator,
+        "ResourceIdentifier": resource_identifier,
+    })
+}
+
+/// Every member a `BaseConfigurationItem` and a `ConfigurationItem` share, from
+/// `smithy_query(query="shape", shape="BaseConfigurationItem,ConfigurationItem")`: a
+/// base item is the configuration item without `tags`, `relationships`,
+/// `relatedEvents` and `configurationItemMD5Hash`, so everything else the batch read
+/// reports the single read must report identically.
+const SHARED_MEMBERS: &[&str] = &[
+    "version",
+    "accountId",
+    "configurationItemCaptureTime",
+    "configurationItemStatus",
+    "configurationStateId",
+    "arn",
+    "resourceType",
+    "resourceId",
+    "resourceName",
+    "awsRegion",
+    "availabilityZone",
+    "resourceCreationTime",
+    "configuration",
+    "supplementaryConfiguration",
+    "recordingFrequency",
+    "configurationItemDeliveryTime",
+];
 
 /// The `(resourceType, resourceId)` of every configuration item in a response, in the
 /// order reported.
@@ -949,6 +1023,337 @@ async fn a_batch_outside_the_identifier_count_the_operation_accepts_is_refused()
             "case {case:?}: every one of the {} identifiers sent is either answered or \
              reported unprocessed, got {body}",
             identifiers.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_single_read_answers_an_identifier_with_the_item_a_batch_read_answers_it_with() {
+    // Rows differ along the same class the batch table spans: which resource type and
+    // id the identifier names, whether the resource is recorded, discovered without a
+    // configuration, deleted or absent, and whether the source account and Region are
+    // the ones this store holds data for.
+    let cases: [(&str, Value, bool); 10] = [
+        ("a recorded volume", home(EC2_VOLUME, "vol-0001"), true),
+        ("a recorded table", home(DYNAMODB_TABLE, "orders"), true),
+        ("a recorded bucket", home(S3_BUCKET, "config-bucket"), true),
+        (
+            "a resource discovered with no configuration recorded",
+            home(LAMBDA_FUNCTION, "evaluate"),
+            true,
+        ),
+        (
+            "a resource of a type nothing was recorded for",
+            home(IAM_ROLE, "config-role"),
+            false,
+        ),
+        (
+            "a resource id the inventory does not hold",
+            home(EC2_VOLUME, "vol-0404"),
+            false,
+        ),
+        (
+            "an id recorded under another type",
+            home(DYNAMODB_TABLE, "vol-0001"),
+            false,
+        ),
+        (
+            "a deleted resource, which the API does not return",
+            home(EC2_VOLUME, "vol-0009"),
+            false,
+        ),
+        (
+            "another source account, whose data this aggregator holds none of",
+            identifier(OTHER_ACCOUNT, HOME_REGION, EC2_VOLUME, "vol-0001"),
+            false,
+        ),
+        (
+            "another source Region, which holds no Config data of this account",
+            identifier(&account(), OTHER_REGION, EC2_VOLUME, "vol-0001"),
+            false,
+        ),
+    ];
+
+    let emulator = emulator_holding(&inventory()).await;
+    put_whole_account_aggregator(&emulator).await;
+
+    for (case, sent, holds_item) in cases {
+        let batched = emulator
+            .ok(
+                "BatchGetAggregateResourceConfig",
+                &batch(AGGREGATOR, std::slice::from_ref(&sent)),
+            )
+            .await;
+
+        if !holds_item {
+            assert_eq!(
+                reported_unprocessed(case, &batched),
+                pairs(&[(
+                    sent["ResourceType"].as_str().expect("the row sends a type"),
+                    sent["ResourceId"].as_str().expect("the row sends an id"),
+                )]),
+                "case {case:?}: the batch read reports the identifier unprocessed, got {batched}"
+            );
+            let (status, code) = emulator
+                .refused("GetAggregateResourceConfig", &single(AGGREGATOR, &sent))
+                .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ResourceNotDiscoveredException"),
+                "case {case:?}: the aggregator holds no configuration item for the \
+                 identifier, so a single read is refused 400 \
+                 ResourceNotDiscoveredException, got {status} {code}"
+            );
+            continue;
+        }
+
+        let body = emulator
+            .ok("GetAggregateResourceConfig", &single(AGGREGATOR, &sent))
+            .await;
+        let item = &body["ConfigurationItem"];
+        let base = &batched["BaseConfigurationItems"][0];
+        for member in SHARED_MEMBERS {
+            assert_eq!(
+                item[member], base[member],
+                "case {case:?}: both reads must report {member:?} alike, got {} from the \
+                 single read and {} from the batch read",
+                item[member], base[member]
+            );
+        }
+
+        // The read is a report: it must not change what the next read sees.
+        let again = emulator
+            .ok("GetAggregateResourceConfig", &single(AGGREGATOR, &sent))
+            .await;
+        assert_eq!(
+            again, body,
+            "case {case:?}: a second single read must report the same item, got {again}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_aggregators_own_scope_decides_whether_a_single_read_finds_the_resource() {
+    let this_account = account();
+    let home_only = [HOME_REGION];
+    let elsewhere = [OTHER_REGION];
+
+    // Rows differ along the aggregator's scope: which accounts it aggregates, over
+    // which Regions, whether the scope comes from account sources or from an
+    // organization, and which resource types its aggregator filters admit.
+    let cases: [(&str, Value, bool); 6] = [
+        (
+            "this account, every Region",
+            json!({ "AccountAggregationSources": [account_source(&[&this_account], &[])] }),
+            true,
+        ),
+        (
+            "this account, the Region the request is signed for",
+            json!({
+                "AccountAggregationSources":
+                    [account_source(&[&this_account], &home_only)],
+            }),
+            true,
+        ),
+        (
+            "this account, another Region only",
+            json!({
+                "AccountAggregationSources":
+                    [account_source(&[&this_account], &elsewhere)],
+            }),
+            false,
+        ),
+        (
+            "another account only",
+            json!({ "AccountAggregationSources": [account_source(&[OTHER_ACCOUNT], &[])] }),
+            false,
+        ),
+        (
+            "the organization, every Region",
+            json!({ "OrganizationAggregationSource": organization_source(&[]) }),
+            true,
+        ),
+        (
+            "this account, with a filter that takes in another resource type only",
+            json!({
+                "AccountAggregationSources": [account_source(&[&this_account], &[])],
+                "AggregatorFilters": {
+                    "ResourceType": { "Type": FILTER_TYPE_INCLUDE, "Value": [DYNAMODB_TABLE] },
+                },
+            }),
+            false,
+        ),
+    ];
+
+    for (case, sources, holds_item) in cases {
+        let emulator = emulator_holding(&inventory()).await;
+        put_aggregator(&emulator, AGGREGATOR, sources).await;
+        let request = single(AGGREGATOR, &home(EC2_VOLUME, "vol-0001"));
+
+        if !holds_item {
+            let (status, code) = emulator
+                .refused("GetAggregateResourceConfig", &request)
+                .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ResourceNotDiscoveredException"),
+                "case {case:?}: the resource is outside what this aggregator holds, so \
+                 the read is refused 400 ResourceNotDiscoveredException, got {status} \
+                 {code}"
+            );
+            continue;
+        }
+
+        let body = emulator.ok("GetAggregateResourceConfig", &request).await;
+        assert_eq!(
+            (
+                body["ConfigurationItem"]["resourceType"].as_str(),
+                body["ConfigurationItem"]["resourceId"].as_str(),
+            ),
+            (Some(EC2_VOLUME), Some("vol-0001")),
+            "case {case:?}: expected the configuration item of the volume, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_single_read_reports_the_tags_the_inventory_recorded_with_the_item() {
+    let emulator = emulator_holding(&inventory()).await;
+    put_whole_account_aggregator(&emulator).await;
+
+    // Rows differ along the resource read: recorded resources of three types and one
+    // discovered with no configuration document at all. Every one of them is seeded
+    // carrying the same single tag, which only the APIs documented to drop tags leave
+    // out — this one reports them.
+    let rows: [(&str, &str, &str); 4] = [
+        ("a recorded volume", EC2_VOLUME, "vol-0001"),
+        ("a recorded table", DYNAMODB_TABLE, "orders"),
+        ("a recorded bucket", S3_BUCKET, "config-bucket"),
+        ("a discovered function", LAMBDA_FUNCTION, "evaluate"),
+    ];
+
+    for (case, resource_type, resource_id) in rows {
+        let body = emulator
+            .ok(
+                "GetAggregateResourceConfig",
+                &single(AGGREGATOR, &home(resource_type, resource_id)),
+            )
+            .await;
+        let item = &body["ConfigurationItem"];
+
+        assert_eq!(
+            item["tags"],
+            json!({ "owner": "platform" }),
+            "case {case:?}: the item reports the tags the inventory recorded, got {item}"
+        );
+    }
+
+    // Re-recording the resource changes which tags the item reports, and nothing else
+    // about the read changes what a later read sees.
+    let request = single(AGGREGATOR, &home(EC2_VOLUME, "vol-0001"));
+
+    // Rows differ along what the re-recording changed: the configuration document, the
+    // tags, both, and nothing at all.
+    let changes: [RerecordCase; 4] = [
+        (
+            "another configuration document",
+            Some(r#"{"state":"in-use"}"#),
+            &[("owner", "platform")],
+            true,
+        ),
+        (
+            "another tag value",
+            Some(r#"{"state":"available"}"#),
+            &[("owner", "data")],
+            true,
+        ),
+        (
+            "no tags at all",
+            Some(r#"{"state":"available"}"#),
+            &[],
+            true,
+        ),
+        (
+            "the state it was recorded in",
+            Some(r#"{"state":"available"}"#),
+            &[("owner", "platform")],
+            false,
+        ),
+    ];
+
+    for (case, configuration, tags, _differs) in changes {
+        rerecord(&emulator, EC2_VOLUME, "vol-0001", configuration, tags);
+        let body = emulator.ok("GetAggregateResourceConfig", &request).await;
+        let expected_tags: Value = if tags.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(
+                tags.iter()
+                    .map(|(key, value)| ((*key).to_string(), json!(value)))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            body["ConfigurationItem"]["tags"], expected_tags,
+            "case {case:?}: the item reports the tags the inventory now holds, got {body}"
+        );
+        assert_eq!(
+            body["ConfigurationItem"]["configuration"].as_str(),
+            configuration,
+            "case {case:?}: the item reports the configuration document now recorded, \
+             got {body}"
+        );
+        // The read is a report: reading twice in the same state reports the same item.
+        let again = emulator.ok("GetAggregateResourceConfig", &request).await;
+        assert_eq!(
+            again, body,
+            "case {case:?}: a second read of one recorded state reports the same item, \
+             got {again}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_single_read_naming_an_aggregator_that_does_not_exist_is_refused() {
+    let emulator = emulator_holding(&inventory()).await;
+    put_whole_account_aggregator(&emulator).await;
+
+    // Rows differ along the identifier sent with the unknown aggregator name, so the
+    // refusal is about the aggregator rather than about the resource asked for: the
+    // aggregator is checked BEFORE the resource, so even an identifier the inventory
+    // holds nothing for is refused for the aggregator.
+    let cases: [(&str, &str, Value); 4] = [
+        (
+            "a name no aggregator was created under",
+            "no-such-aggregator",
+            home(EC2_VOLUME, "vol-0001"),
+        ),
+        (
+            "that same name with an identifier the inventory holds nothing for",
+            "no-such-aggregator",
+            home(IAM_ROLE, "config-role"),
+        ),
+        (
+            "a name differing from the existing one only in case",
+            "ORG-WIDE",
+            home(DYNAMODB_TABLE, "orders"),
+        ),
+        (
+            "another unknown name, naming a deleted resource",
+            "another-aggregator",
+            home(EC2_VOLUME, "vol-0009"),
+        ),
+    ];
+
+    for (case, aggregator, sent) in cases {
+        let (status, code) = emulator
+            .refused("GetAggregateResourceConfig", &single(aggregator, &sent))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "NoSuchConfigurationAggregatorException"),
+            "case {case:?}: an absent aggregator is refused 400 \
+             NoSuchConfigurationAggregatorException, got {status} {code}"
         );
     }
 }
