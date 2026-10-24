@@ -28,8 +28,9 @@ use crate::method_response::response_header;
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 
 /// `PutIntegrationResponse` for `status` on the integration of the `verb` method of
-/// `resource`.
-async fn put_integration_response(
+/// `resource`. Shared with the sibling `delete_integration` suite, which stands responses
+/// on the integrations it deletes.
+pub(crate) async fn put_integration_response(
     gateway: &Gateway,
     api: &str,
     resource: &str,
@@ -49,8 +50,9 @@ async fn put_integration_response(
 }
 
 /// `GetIntegrationResponse` for `status` on the integration of the `verb` method of
-/// `resource`.
-async fn get_integration_response(
+/// `resource`. Shared with the sibling `delete_integration` suite, which reads a deleted
+/// integration's responses back through it.
+pub(crate) async fn get_integration_response(
     gateway: &Gateway,
     api: &str,
     resource: &str,

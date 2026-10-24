@@ -156,6 +156,78 @@ pub fn unknown_reference(member: &str, kind: &str) -> ValidationException {
     }
 }
 
+/// How a resource kind of this service reads where AWS names it as the SUBJECT of a
+/// refusal: every word of the ARN resource type capitalised, so `global-network` reads
+/// "Global Network" and `core-network` reads "Core Network".
+fn kind_title(kind: &str) -> String {
+    kind.split('-')
+        .map(|word| {
+            let mut characters = word.chars();
+            match characters.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// The `Reason` a refusal carries when the request's own fields all parse and satisfy
+/// their constraints, yet the request is invalid against stored state — the modelled
+/// catch-all of `ValidationExceptionReason` (UnknownOperation, CannotParse,
+/// FieldValidationFailed, Other: `smithy_query shape=ValidationExceptionReason`).
+pub const VALIDATION_REASON_OTHER: &str = "Other";
+
+/// The modelled `ValidationException` (HTTP 400) a DELETE answers while the resource it
+/// names still owns dependent resources the caller has to remove first, or `None` when
+/// nothing blocks the delete (every count is zero).
+///
+/// Network Manager documents the emptying order each delete requires ("You must first
+/// delete all global network objects (devices, links, and sites), deregister all transit
+/// gateways, and delete any core networks", `smithy_query query="doc"
+/// shape="DeleteGlobalNetwork"`; "The site cannot be associated with any device or link",
+/// `shape="DeleteSite"`) and refuses the delete until it holds. That refusal is a
+/// VALIDATION failure of the request against the stored resource tree — HTTP 400,
+/// `ValidationException` — and NOT a `ConflictException` (409): a dependency refusal
+/// stands until the caller deletes the children, so an SDK waiter or retry loop must see a
+/// terminal 400, while 409 is this service's concurrent-state conflict (an idempotency
+/// token reused for a different request, a resource being modified) which a retry can
+/// clear. Recorded behaviour confirms it for the core-network dependent: the delete of a
+/// global network that still owns one answers HTTP 400 with code `ValidationException`,
+/// and succeeds once the core network is gone.
+///
+/// The prose names the blocking kinds the same way the recorded message does — the parent
+/// in [`kind_title`], the dependents as their ARN resource types read as words — and the
+/// identifying detail stays out of it: no `Fields` entry, because no input field is at
+/// fault, and `Reason` is [`VALIDATION_REASON_OTHER`].
+///
+/// `parent_kind` is the kind being deleted ([`GLOBAL_NETWORK_KIND`], [`SITE_KIND`], …) and
+/// `dependents` pairs each child kind with how many of it the parent still holds, in the
+/// order the message should list them; a zero count never blocks and is never named.
+pub fn dependents_block_delete(
+    parent_kind: &str,
+    dependents: &[(&str, usize)],
+) -> Option<ValidationException> {
+    let blocking: Vec<String> = dependents
+        .iter()
+        .filter(|(_, held)| *held > 0)
+        .map(|(kind, _)| kind.replace('-', " "))
+        .collect();
+    let listed = match blocking.split_last() {
+        None => return None,
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
+    Some(ValidationException {
+        message: format!(
+            "{} cannot be deleted due to an existing {listed} associated with it.",
+            kind_title(parent_kind)
+        ),
+        reason: Some(VALIDATION_REASON_OTHER.to_string()),
+        fields: None,
+    })
+}
+
 /// Every value a `ResourceType` member of this service's network-resource operations
 /// accepts, in lexicographic order so a paginated listing of them is stable.
 ///

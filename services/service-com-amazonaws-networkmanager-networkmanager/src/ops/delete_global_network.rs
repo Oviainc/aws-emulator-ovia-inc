@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlobalNetwork
-//! Deletes an existing global network, refusing with `ConflictException` (409) while it
+//! Deletes an existing global network, refusing with `ValidationException` (400) while it
 //! still owns child resources, and reporting the removed record as `DELETING`. This is
 //! the ONLY file to touch for this operation.
 //!
@@ -148,24 +148,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A global network that still owns children cannot be deleted: the caller has to
         // empty it first (DeleteSite, DeleteDevice, DeleteCoreNetwork, and the delete of
-        // each other child kind as that slice lands).
+        // each other child kind as that slice lands). The refusal is the dependency
+        // ValidationException (400) `crate::state::dependents_block_delete` builds for
+        // every delete of this service — the children must go first, which no retry of
+        // THIS call can achieve, so it is not the 409 a conflict would be.
         let sites = store.site_ids_of(&input.global_network_id);
         let core_networks = store.core_network_ids_of(&input.global_network_id);
         let devices = store.device_count_of(&input.global_network_id);
-        if !sites.is_empty() || !core_networks.is_empty() || devices > 0 {
-            return Err(DeleteGlobalNetworkErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "global network {} still contains {} site(s), {devices} device(s) and {} core network(s)",
-                        input.global_network_id,
-                        sites.len(),
-                        core_networks.len()
-                    ),
-                    resource_id: input.global_network_id.clone(),
-                    resource_type: crate::state::GLOBAL_NETWORK_KIND.to_string(),
-                },
-            )
-            .into());
+        // Listed in the order the operation's own documentation names them: "delete all
+        // global network objects (devices, links, and sites) … and delete any core
+        // networks" (a link hangs off a site, so a held link blocks through its site).
+        if let Some(refusal) = crate::state::dependents_block_delete(
+            crate::state::GLOBAL_NETWORK_KIND,
+            &[
+                (crate::state::DEVICE_KIND, devices),
+                (crate::state::SITE_KIND, sites.len()),
+                (crate::state::CORE_NETWORK_KIND, core_networks.len()),
+            ],
+        ) {
+            return Err(DeleteGlobalNetworkErrorModeled::ValidationException(refusal).into());
         }
 
         let removed = store

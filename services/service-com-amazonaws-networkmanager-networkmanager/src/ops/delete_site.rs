@@ -3,7 +3,8 @@
 //! @op DeleteSite
 //! Deletes an existing site of a global network and reports the removed record as
 //! `DELETING`; an unknown global network or site, or a site that belongs to a different
-//! global network, is a 404, and a site that still holds links is a 409. This is the
+//! global network, is a 404, and a site that still holds devices or links is refused with
+//! the dependency `ValidationException` (400). This is the
 //! ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
@@ -161,21 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deletes an existing site. The site cannot be associated with any device or
         // link." (`smithy_query query="doc" shape="DeleteSite"`) — so a site that still
-        // holds either is a conflict, never a delete that orphans them.
+        // holds either is refused, never deleted in a way that orphans them. The refusal
+        // is the dependency ValidationException (400) every delete of this service raises
+        // through `crate::state::dependents_block_delete`.
         let links = store.link_ids_of_site(&input.site_id);
         let devices = store.device_ids_of_site(&input.site_id);
-        if !links.is_empty() || !devices.is_empty() {
-            return Err(DeleteSiteErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "site {} is still associated with {} link(s) and {} device(s)",
-                    input.site_id,
-                    links.len(),
-                    devices.len()
-                ),
-                resource_id: input.site_id.clone(),
-                resource_type: crate::state::SITE_KIND.to_string(),
-            })
-            .into());
+        if let Some(refusal) = crate::state::dependents_block_delete(
+            crate::state::SITE_KIND,
+            &[
+                (crate::state::DEVICE_KIND, devices.len()),
+                (crate::state::LINK_KIND, links.len()),
+            ],
+        ) {
+            return Err(DeleteSiteErrorModeled::ValidationException(refusal).into());
         }
 
         let removed = store.sites.remove(&input.site_id).ok_or_else(|| {
