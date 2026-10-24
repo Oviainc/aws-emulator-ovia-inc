@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStorageLensConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStorageLensConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStorageLensConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the S3 Storage Lens configurations the account the request names
+//! owns, one summary entry each, in configuration-id order.
+//!
+//! Each entry is derived from the stored configuration
+//! ([`crate::state::StorageLensConfigurationRecord::entry`]): its id, the ARN
+//! this service assigned it, the home Region the put that stored it was signed
+//! for, and whether that document enabled it. The entry carries no part of the
+//! document's metric selections and no tag — `GetStorageLensConfiguration` and
+//! the tagging operations are what report those.
+//!
+//! The operation is `@paginated` and models no page-size member, so a page
+//! holds at most [`crate::state::STORAGE_LENS_CONFIGURATIONS_PAGE_SIZE`]
+//! entries and `NextToken` is returned exactly when a further configuration
+//! follows the page. A token names a POSITION in the account's own scan, so
+//! presenting it again answers the same page: listing changes nothing a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +149,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStorageLensConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStorageLensConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStorageLensConfigurations"))
+        let _ = ctx;
+
+        // The token is the opaque form of the last configuration id the
+        // previous page returned; the scan resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(config_id) => Some(config_id),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a continuation token this service issued",
+                    ))
+                }
+            },
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+        let store = state.lock();
+
+        // Scan this account's slice of the keyspace in key order, starting just
+        // after the id the token named. `Excluded` on the empty id — which no
+        // configuration can have, `ConfigId` being at least one character — is
+        // how an un-tokened scan starts at the account's first configuration.
+        let start = (input.account_id.clone(), resume_after.unwrap_or_default());
+        let mut owned = store
+            .storage_lens_configurations
+            .range((
+                ::std::ops::Bound::Excluded(start),
+                ::std::ops::Bound::Unbounded,
+            ))
+            .take_while(|((account_id, _), _)| account_id == &input.account_id)
+            .map(|(_, record)| record);
+
+        let page: Vec<ListStorageLensConfigurationEntry> = owned
+            .by_ref()
+            .take(crate::state::STORAGE_LENS_CONFIGURATIONS_PAGE_SIZE)
+            .map(crate::state::StorageLensConfigurationRecord::entry)
+            .collect();
+        // A token is returned only when the scan stopped short of the end, which
+        // is exactly when another configuration of this account follows the
+        // page.
+        let next_token = owned
+            .next()
+            .and(page.last())
+            .map(|last| crate::state::encode_page_token(&last.id));
+
+        Ok(ListStorageLensConfigurationsOutput {
+            next_token,
+            storage_lens_configuration_list: Some(page),
+        })
     }
 }

@@ -12,7 +12,7 @@
 use crate::ops::types::{
     AccessPoint, AsyncOperation, AsyncRequestParameters, AsyncResponseDetails, CreateJobInput,
     CreateMultiRegionAccessPointInput2, DeleteMultiRegionAccessPointInput2, JobDescriptor,
-    JobManifest, JobManifestGenerator, JobOperation, JobReport,
+    JobManifest, JobManifestGenerator, JobOperation, JobReport, ListStorageLensConfigurationEntry,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
     MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport, S3Tag,
     StorageLensConfiguration, StorageLensGroup, StorageLensTag, Tag, VpcConfiguration,
@@ -125,6 +125,44 @@ pub struct StorageLensConfigurationRecord {
     /// tags at all, and `GetStorageLensConfigurationTagging` /
     /// `PutStorageLensConfigurationTagging` are what report and replace them.
     pub tags: Vec<StorageLensTag>,
+    /// The configuration's S3 Storage Lens HOME Region: the Region the put that
+    /// stored this document was signed for, which is also the Region segment of
+    /// the ARN this service assigned it
+    /// ([`storage_lens_configuration_arn`]).
+    ///
+    /// Recorded on the record because the configuration document carries no
+    /// member for it while `ListStorageLensConfigurationEntry$HomeRegion` is
+    /// required: "Your metrics data is stored and retained in your designated S3
+    /// Storage Lens home Region."
+    pub home_region: String,
+}
+
+impl StorageLensConfigurationRecord {
+    /// The record as the `ListStorageLensConfigurationEntry` summary
+    /// `ListStorageLensConfigurations` returns: the configuration's id, the ARN
+    /// this service assigned it, its home Region, and whether it is enabled.
+    ///
+    /// The summary carries no part of the document's metric selections and no
+    /// tag: those are reported by `GetStorageLensConfiguration` and the tagging
+    /// operations, which is what the entry shape declares.
+    pub fn entry(&self) -> ListStorageLensConfigurationEntry {
+        ListStorageLensConfigurationEntry {
+            id: self.configuration.id.clone(),
+            // `StorageLensArn` is required on the entry, and every stored
+            // configuration carries the ARN its put assigned; it is recomputed
+            // from the record's own identity if a record ever lacks one, so the
+            // entry is never reported with an empty ARN.
+            storage_lens_arn: self
+                .configuration
+                .storage_lens_arn
+                .clone()
+                .unwrap_or_else(|| {
+                    storage_lens_configuration_arn(&self.home_region, &self.configuration.id)
+                }),
+            home_region: self.home_region.clone(),
+            is_enabled: self.configuration.is_enabled,
+        }
+    }
 }
 
 /// How a stored S3 Storage Lens configuration is keyed: the owning account id
@@ -151,6 +189,17 @@ pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 /// `PutStorageLensConfigurationTaggingRequest$Tags`): "You can set up to a
 /// maximum of 50 tags."
 pub const MAX_STORAGE_LENS_TAGS: usize = 50;
+
+/// How many entries one page of `ListStorageLensConfigurations` carries.
+///
+/// The operation is `@paginated` and its request models NO page-size member, so
+/// the service alone decides how many entries a page holds: its
+/// `NextToken` is documented as returned "if the request produced more than the
+/// maximum number of S3 Storage Lens configuration results". AWS publishes no
+/// number for that maximum, so this is the emulator's OWN page size — what it
+/// fixes is that a caller holding more configurations than one page carries is
+/// handed a continuation token rather than a truncated answer.
+pub const STORAGE_LENS_CONFIGURATIONS_PAGE_SIZE: usize = 100;
 
 /// One stored S3 Storage Lens group: the grouping document the group was
 /// created with, and the Amazon Web Services resource tags it carries.

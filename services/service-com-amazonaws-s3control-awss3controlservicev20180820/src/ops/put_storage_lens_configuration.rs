@@ -9,7 +9,10 @@
 //!
 //! `StorageLensArn` is documented read-only, so this handler assigns it from the
 //! configuration's own identity ([`crate::state::storage_lens_configuration_arn`])
-//! rather than keeping whatever a request submitted in that member.
+//! rather than keeping whatever a request submitted in that member. The Region
+//! that ARN names is the one the request was signed for, and it is recorded on
+//! the stored record as the configuration's S3 Storage Lens home Region, which
+//! `ListStorageLensConfigurations` reports.
 //!
 //! The optional `Tags` member replaces the configuration's tag set when the
 //! request carries one. That tag set is a resource of its own — the tagging
@@ -205,6 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the tag set changes only if this request carried one.
             Some(record) => {
                 record.configuration = configuration;
+                // A put stores the whole configuration, so the Region it was
+                // signed for is the configuration's home Region from now on —
+                // the same Region the ARN above names.
+                record.home_region = region;
                 if let Some(submitted) = tags {
                     record.tags = submitted;
                 }
@@ -223,6 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::StorageLensConfigurationRecord {
                         configuration,
                         tags: tags.unwrap_or_default(),
+                        home_region: region,
                     },
                 );
             }
