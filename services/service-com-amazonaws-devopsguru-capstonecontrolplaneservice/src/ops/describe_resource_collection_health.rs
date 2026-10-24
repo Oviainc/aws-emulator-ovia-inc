@@ -8,11 +8,18 @@
 //!
 //! Each entry's insight tallies are computed from the insights the store holds — the
 //! map DevOps Guru's own analysis writes and every insight read reports (see
-//! `crate::state`) — kept to the ones about that member; see [`insight_health`]. An
-//! emulator over which no analysis has run therefore reports a covered member with
-//! zeros rather than an invented insight. `AnalyzedResourceCount` follows the same rule
-//! `DescribeAccountHealth` reports the account-level count under — one monitored
-//! resource per coverage entry; see [`member_analyzed_resource_count`].
+//! `crate::state`) — kept to the ones about that member; see
+//! [`crate::state::InsightTally`]. An emulator over which no analysis has run therefore
+//! reports a covered member with zeros rather than an invented insight.
+//! `AnalyzedResourceCount` follows the same rule `DescribeAccountHealth` reports the
+//! account-level count under — one monitored resource per coverage entry; see
+//! [`crate::state::MEMBER_ANALYZED_RESOURCE_COUNT`].
+//!
+//! The member lists themselves are the store's own views
+//! ([`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::cloud_formation_healths`]
+//! and its siblings), which
+//! [`crate::ops::describe_organization_resource_collection_health`] reports over the
+//! same store, so the account-scoped and organization-scoped reads cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -147,84 +154,6 @@ impl From<DescribeResourceCollectionHealthErrorModeled> for DescribeResourceColl
     }
 }
 
-/// `InsightType`'s two values, from `INSIGHT_TYPE_VALUES`.
-const PROACTIVE: &str = "PROACTIVE";
-const REACTIVE: &str = "REACTIVE";
-
-/// `InsightStatus`'s two values, from `INSIGHT_STATUS_VALUES`.
-const ONGOING: &str = "ONGOING";
-const CLOSED: &str = "CLOSED";
-
-/// The insight tally for ONE member of the analysed resource collection.
-///
-/// `InsightHealth` carries, for that member, the number of open proactive insights,
-/// the number of open reactive insights, and the Mean Time to Recover over the CLOSED
-/// insights OF THAT MEMBER — so the tally walks the stored insights and keeps the ones
-/// `covers` says are about this member, counting the ONGOING ones by type and averaging
-/// how long each closed one took to recover (its `InsightTimeRange` end minus its
-/// start).
-///
-/// No modelled operation mints an insight — DevOps Guru derives one from anomalies in
-/// the covered resources — so `crate::state`'s `insights` map is what that analysis
-/// writes and every insight read, this one included, reports. An emulator over which no
-/// analysis has run therefore tallies an empty set and answers zeros, with no recovery
-/// time accrued to average.
-fn insight_health<'a>(
-    insights: impl Iterator<Item = &'a crate::state::InsightRecord>,
-    covers: impl Fn(&crate::state::InsightRecord) -> bool,
-) -> InsightHealth {
-    let mut open_proactive = 0i32;
-    let mut open_reactive = 0i32;
-    let mut recovered = 0i64;
-    let mut total_recovery_millis = 0i64;
-    for insight in insights.filter(|insight| covers(insight)) {
-        match (insight.insight_type.as_str(), insight.status.as_str()) {
-            (PROACTIVE, ONGOING) => open_proactive = open_proactive.saturating_add(1),
-            (REACTIVE, ONGOING) => open_reactive = open_reactive.saturating_add(1),
-            // A closed insight is no longer open; what it contributes is the time it
-            // took to recover, which only an insight whose behaviour has an end
-            // instant carries.
-            (_, CLOSED) => {
-                if let Some(end) = insight.end_time_millis {
-                    // Saturating throughout, so a stored instant pair far enough apart
-                    // to overflow cannot panic a read.
-                    total_recovery_millis = total_recovery_millis
-                        .saturating_add(end.saturating_sub(insight.start_time_millis).max(0));
-                    recovered = recovered.saturating_add(1);
-                }
-            }
-            _ => {}
-        }
-    }
-    InsightHealth {
-        open_proactive_insights: open_proactive,
-        open_reactive_insights: open_reactive,
-        // The mean over this member's closed insights; zero while none has closed,
-        // because no recovery time has been accrued.
-        mean_time_to_recover_in_milliseconds: Some(if recovered == 0 {
-            0
-        } else {
-            total_recovery_millis / recovered
-        }),
-    }
-}
-
-/// `AnalyzedResourceCount` for ONE member of the collection: how many resources DevOps
-/// Guru is monitoring within that member.
-///
-/// The analysed population is the coverage itself — see
-/// [`crate::state::ResourceCoverage::monitored_resource_count`], which states this
-/// emulator's rule: there is no real CloudFormation stack or tagged resource for it to
-/// expand a filter against, so each coverage entry IS one monitored resource, one per
-/// covered stack name and one per (app-boundary key, tag value) pair. A member of this
-/// report is exactly one such entry, so it accounts for exactly one analysed resource,
-/// and the members of a collection type therefore sum to the account-level
-/// `AnalyzedResourceCount` that [`crate::ops::describe_account_health`] reports over the
-/// same store — the two reads of one store agree instead of contradicting each other.
-fn member_analyzed_resource_count() -> Option<i64> {
-    Some(1)
-}
-
 /// The `DescribeResourceCollectionHealth` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -296,28 +225,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let token = input.next_token.as_deref();
 
         let guard = state.lock();
-        let coverage = &guard.resource_collection;
-        let insights = &guard.insights;
 
         // Exactly the requested type's list is reported; the other two stay absent,
         // because this read says nothing about a collection type it was not asked about.
         match collection_type.as_str() {
             "AWS_CLOUD_FORMATION" => {
                 // One entry per covered stack name, in the store's stable order, each
-                // tallying the insights whose own `ResourceCollection` names that stack.
-                let healths: Vec<CloudFormationHealth> = coverage
-                    .cloudformation_stack_names
-                    .iter()
-                    .map(|stack_name| CloudFormationHealth {
-                        stack_name: Some(stack_name.clone()),
-                        insight: Some(insight_health(insights.values(), |insight| {
-                            insight.resource_collection.as_ref().is_some_and(|about| {
-                                about.cloudformation_stack_names.contains(stack_name)
-                            })
-                        })),
-                        analyzed_resource_count: member_analyzed_resource_count(),
-                    })
-                    .collect();
+                // tallying the insights whose own `ResourceCollection` names that stack
+                // — the member set and the tallies the store itself derives, so the
+                // organization-scoped read of the same collection agrees with this one.
+                let healths: Vec<CloudFormationHealth> = guard.cloud_formation_healths();
                 let (page, next_token) =
                     crate::state::page(&healths, &scope, token).ok_or_else(invalid_next_token)?;
                 Ok(DescribeResourceCollectionHealthOutput {
@@ -330,27 +247,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "AWS_TAGS" => {
                 // `TagHealth` names an app-boundary key AND a tag value, so coverage
                 // contributes one entry per (key, value) pair it holds, each tallying
-                // the insights whose own tag collection names that pair. A key is
-                // covered exactly while one of its values is, so no key yields none.
-                let healths: Vec<TagHealth> = coverage
-                    .tag_collections
-                    .iter()
-                    .flat_map(|(app_boundary_key, tag_values)| {
-                        tag_values.iter().map(move |tag_value| TagHealth {
-                            app_boundary_key: Some(app_boundary_key.clone()),
-                            tag_value: Some(tag_value.clone()),
-                            insight: Some(insight_health(insights.values(), |insight| {
-                                insight.resource_collection.as_ref().is_some_and(|about| {
-                                    about
-                                        .tag_collections
-                                        .get(app_boundary_key)
-                                        .is_some_and(|values| values.contains(tag_value))
-                                })
-                            })),
-                            analyzed_resource_count: member_analyzed_resource_count(),
-                        })
-                    })
-                    .collect();
+                // the insights whose own tag collection names that pair.
+                let healths: Vec<TagHealth> = guard.tag_healths();
                 let (page, next_token) =
                     crate::state::page(&healths, &scope, token).ok_or_else(invalid_next_token)?;
                 Ok(DescribeResourceCollectionHealthOutput {
@@ -361,42 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             "AWS_SERVICE" => {
-                // `ServiceHealth` reports one entry per Amazon Web Services service
-                // DevOps Guru ANALYSED: membership is discovered by its analysis, not
-                // declared by the client (`ServiceName` is a closed enum and
-                // `UpdateResourceCollection` cannot name one), and the store's record
-                // of an analysed service is the `ServiceCollection` its insights name.
-                // So the services reported are exactly those, sorted for a stable page
-                // order, and an account whose analysis produced no insight reports an
-                // empty list rather than an invented service.
-                //
-                // `ServiceInsightHealth` models only the two open counts, so the MTTR
-                // the shared tally also computes is dropped here.
-                let analysed: std::collections::BTreeSet<&String> = insights
-                    .values()
-                    .flat_map(|insight| insight.service_names.iter())
-                    .collect();
-                let healths: Vec<ServiceHealth> = analysed
-                    .into_iter()
-                    .map(|service_name| {
-                        let tally = insight_health(insights.values(), |insight| {
-                            insight.service_names.contains(service_name)
-                        });
-                        ServiceHealth {
-                            service_name: Some(service_name.clone()),
-                            insight: Some(ServiceInsightHealth {
-                                open_proactive_insights: tally.open_proactive_insights,
-                                open_reactive_insights: tally.open_reactive_insights,
-                            }),
-                            // The coverage attributes no entry to an Amazon Web Services
-                            // service — `UpdateResourceCollection` cannot name one — so
-                            // how many monitored resources belong to this service is not
-                            // something this store records. The member is optional, so it
-                            // is omitted rather than guessed.
-                            analyzed_resource_count: None,
-                        }
-                    })
-                    .collect();
+                // One entry per Amazon Web Services service DevOps Guru ANALYSED:
+                // membership is discovered by its analysis, not declared by the client,
+                // and the store's record of an analysed service is the
+                // `ServiceCollection` its insights name.
+                let healths: Vec<ServiceHealth> = guard.service_healths();
                 let (page, next_token) =
                     crate::state::page(&healths, &scope, token).ok_or_else(invalid_next_token)?;
                 Ok(DescribeResourceCollectionHealthOutput {

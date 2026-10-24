@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrganizationResourceCollectionHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrganizationResourceCollectionHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the health of an ORGANIZATION's analysed resources, grouped by the requested
+//! `OrganizationResourceCollectionType` and paged like
+//! [`crate::ops::describe_resource_collection_health`], which reports the same member
+//! sets for one account. A pure read: it never writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrganizationResourceCollectionHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An organization-wide view belongs to the account that administers DevOps Guru for
+//! that organization — its management account or its registered delegated administrator
+//! — so this read is available to that caller alone and is otherwise the modelled HTTP
+//! 403 `AccessDeniedException`, decided before any lookup. This emulator serves one
+//! account and records no organization administrator (see
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::organization_admin_account_id`]),
+//! so every caller a client can present is refused; the report itself is computed from
+//! the coverage and insights the store holds for the member accounts the request's
+//! `AccountIds` / `OrganizationalUnitIds` filters leave in scope.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +151,75 @@ impl From<DescribeOrganizationResourceCollectionHealthErrorModeled> for Describe
     }
 }
 
+/// The modelled maximum of `OrganizationResourceCollectionMaxResults` (range 1..500),
+/// from
+/// `smithy_query(query="operation",operation="DescribeOrganizationResourceCollectionHealth")`.
+///
+/// The boundary validator already refuses a `MaxResults` outside the range, so the
+/// clamp against this ceiling cannot change a value that reaches the handler; it is what
+/// keeps one page bounded if the model ever widens.
+const MAX_RESULTS_CEILING: usize = 500;
+
+/// Which member accounts of the organization a request leaves in scope.
+///
+/// `AccountIds` is "The ID of the Amazon Web Services account" and
+/// `OrganizationalUnitIds` "The ID of the organizational unit": both NARROW the
+/// organization-wide report to the member accounts they name, so an account is in scope
+/// exactly while every filter the request carries selects it. A filter that names
+/// nothing restricts nothing, which is what an absent filter means, so an empty list and
+/// an absent member behave alike.
+struct AccountScope<'a> {
+    account_ids: Option<&'a Vec<String>>,
+    organizational_unit_ids: Option<&'a Vec<String>>,
+}
+
+impl AccountScope<'_> {
+    /// The scope a request names.
+    fn of(input: &DescribeOrganizationResourceCollectionHealthInput) -> AccountScope<'_> {
+        AccountScope {
+            account_ids: named(&input.account_ids),
+            organizational_unit_ids: named(&input.organizational_unit_ids),
+        }
+    }
+
+    /// Whether this scope holds the member account `account_id`, whose organizational
+    /// unit membership is `organizational_unit_ids`.
+    ///
+    /// An `OrganizationalUnitIds` filter selects the member accounts of the units it
+    /// names, so an account in none of them — which is every account of a store that
+    /// records no organizational unit — is out of scope rather than reported as if the
+    /// filter had not been sent.
+    fn holds(&self, account_id: &str, organizational_unit_ids: &[String]) -> bool {
+        self.account_ids
+            .is_none_or(|wanted| wanted.iter().any(|id| id == account_id))
+            && self.organizational_unit_ids.is_none_or(|wanted| {
+                wanted
+                    .iter()
+                    .any(|unit| organizational_unit_ids.iter().any(|held| held == unit))
+            })
+    }
+}
+
+/// The ids a filter member names, or `None` when it names none: an absent list and an
+/// empty one both restrict nothing (`AccountIdList` and `OrganizationalUnitIdList` are
+/// both modelled len 0..5, so an empty list is a well-formed request).
+fn named(list: &Option<Vec<String>>) -> Option<&Vec<String>> {
+    match list {
+        Some(ids) if !ids.is_empty() => Some(ids),
+        _ => None,
+    }
+}
+
+/// The entries a member account contributes to the report: its own when the request's
+/// filters leave it in scope, and none when they do not.
+fn scoped<T>(member_in_scope: bool, entries: Vec<T>) -> Vec<T> {
+    if member_in_scope {
+        entries
+    } else {
+        Vec::new()
+    }
+}
+
 /// The `DescribeOrganizationResourceCollectionHealth` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,20 +254,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrganizationResourceCollectionHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrganizationResourceCollectionHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrganizationResourceCollectionHealth"))
+        // This report is computed from the store alone: no request metadata beyond the
+        // deserialized input takes part, so the context is unused.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeOrganizationResourceCollectionHealthError::Modeled(
+                DescribeOrganizationResourceCollectionHealthErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru resource collection store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // The caller: the one account this emulator serves. An organization-wide view
+        // belongs to the account that administers DevOps Guru for the organization, so
+        // a caller that administers none is refused — decided BEFORE any lookup, so the
+        // refusal reports nothing about what the organization holds.
+        let caller = crate::state::requested_account_id(None);
+        let collection_type = input.organization_resource_collection_type.clone();
+        let scope = AccountScope::of(&input);
+        let page_size = input
+            .max_results
+            .map_or(crate::state::PAGE_SIZE, |requested| {
+                (requested as usize).clamp(1, MAX_RESULTS_CEILING)
+            });
+
+        let guard = state.lock();
+        if !guard.administers_organization(&caller) {
+            return Err(
+                DescribeOrganizationResourceCollectionHealthErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: format!(
+                            "Access denied when reading organization-wide {collection_type} \
+                             health: account {caller} does not administer DevOps Guru for an \
+                             organization"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The member accounts of the organization this store records, with the
+        // organizational units each belongs to. The store holds the coverage and the
+        // insights of the ONE account this emulator serves, and records no
+        // organizational-unit membership for it, so an `OrganizationalUnitIds` filter
+        // leaves no account in scope.
+        let member_organizational_unit_ids: Vec<String> = Vec::new();
+        let member_in_scope = scope.holds(&caller, &member_organizational_unit_ids);
+
+        // A token names an offset into ONE collection type's organization-wide report
+        // under ONE account scope, so it is scoped to both: a token from another type,
+        // another filter, or the account-scoped `DescribeResourceCollectionHealth` walk
+        // of the same type does not resolve.
+        let page_scope = format!(
+            "DescribeOrganizationResourceCollectionHealth/{collection_type}/accounts/{}/units/{}",
+            scope
+                .account_ids
+                .map_or_else(|| "-".to_string(), |ids| ids.join(",")),
+            scope
+                .organizational_unit_ids
+                .map_or_else(|| "-".to_string(), |ids| ids.join(",")),
+        );
+        let invalid_next_token = || -> DescribeOrganizationResourceCollectionHealthError {
+            DescribeOrganizationResourceCollectionHealthErrorModeled::ValidationException(
+                ValidationException {
+                    message:
+                        "NextToken does not name a page of this organization resource collection's health"
+                            .to_string(),
+                    reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "NextToken".to_string(),
+                        message:
+                            "must be a token returned by an earlier DescribeOrganizationResourceCollectionHealth for the same OrganizationResourceCollectionType, AccountIds and OrganizationalUnitIds"
+                                .to_string(),
+                    }]),
+                },
+            )
+            .into()
+        };
+        let token = input.next_token.as_deref();
+
+        // Exactly the requested type's list is reported; the other three stay absent,
+        // because this read says nothing about a collection type it was not asked about.
+        // Only the accounts the filters leave in scope contribute to that list: an
+        // out-of-scope member's coverage and insights are not part of what was asked
+        // for, so the list is empty rather than the whole organization's.
+        match collection_type.as_str() {
+            "AWS_ACCOUNT" => {
+                // One `AccountHealth` per member account in scope, each carrying that
+                // account's own open-insight counts — every insight the store holds for
+                // it, whatever resource collection the insight is about.
+                let healths: Vec<AccountHealth> = scoped(
+                    member_in_scope,
+                    vec![AccountHealth {
+                        account_id: Some(caller.clone()),
+                        insight: Some(guard.account_insight_tally().account_insight_health()),
+                    }],
+                );
+                let (page, next_token) =
+                    crate::state::page_sized(&healths, &page_scope, token, page_size)
+                        .ok_or_else(invalid_next_token)?;
+                Ok(DescribeOrganizationResourceCollectionHealthOutput {
+                    account: Some(page),
+                    cloud_formation: None,
+                    service: None,
+                    tags: None,
+                    next_token,
+                })
+            }
+            "AWS_CLOUD_FORMATION" => {
+                let healths: Vec<CloudFormationHealth> =
+                    scoped(member_in_scope, guard.cloud_formation_healths());
+                let (page, next_token) =
+                    crate::state::page_sized(&healths, &page_scope, token, page_size)
+                        .ok_or_else(invalid_next_token)?;
+                Ok(DescribeOrganizationResourceCollectionHealthOutput {
+                    account: None,
+                    cloud_formation: Some(page),
+                    service: None,
+                    tags: None,
+                    next_token,
+                })
+            }
+            "AWS_TAGS" => {
+                let healths: Vec<TagHealth> = scoped(member_in_scope, guard.tag_healths());
+                let (page, next_token) =
+                    crate::state::page_sized(&healths, &page_scope, token, page_size)
+                        .ok_or_else(invalid_next_token)?;
+                Ok(DescribeOrganizationResourceCollectionHealthOutput {
+                    account: None,
+                    cloud_formation: None,
+                    service: None,
+                    tags: Some(page),
+                    next_token,
+                })
+            }
+            "AWS_SERVICE" => {
+                let healths: Vec<ServiceHealth> =
+                    scoped(member_in_scope, guard.service_healths());
+                let (page, next_token) =
+                    crate::state::page_sized(&healths, &page_scope, token, page_size)
+                        .ok_or_else(invalid_next_token)?;
+                Ok(DescribeOrganizationResourceCollectionHealthOutput {
+                    account: None,
+                    cloud_formation: None,
+                    service: Some(page),
+                    tags: None,
+                    next_token,
+                })
+            }
+            other => {
+                // UNREACHABLE in practice, and not the primary validation site: the
+                // boundary validator already refuses an
+                // `OrganizationResourceCollectionType` outside the modelled enum before
+                // this handler runs. The arm keeps the match exhaustive without
+                // answering 501 for a bad request.
+                let allowed = ORGANIZATION_RESOURCE_COLLECTION_TYPE_VALUES.join(" | ");
+                Err(
+                    DescribeOrganizationResourceCollectionHealthErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "OrganizationResourceCollectionType must be one of {allowed}, got '{other}'"
+                            ),
+                            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "OrganizationResourceCollectionType".to_string(),
+                                message: format!("must be one of {allowed}"),
+                            }]),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
     }
 }

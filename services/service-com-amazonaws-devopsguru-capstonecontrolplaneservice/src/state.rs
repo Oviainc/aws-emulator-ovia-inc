@@ -23,9 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CloudFormationCollection, InsightTimeRange, PredictionTimeRange, ProactiveInsight,
-    ProactiveInsightSummary, ReactiveInsight, ReactiveInsightSummary, ResourceCollection,
-    ServiceCollection, TagCollection,
+    AccountInsightHealth, CloudFormationCollection, CloudFormationHealth, InsightHealth,
+    InsightTimeRange, PredictionTimeRange, ProactiveInsight, ProactiveInsightSummary,
+    ReactiveInsight, ReactiveInsightSummary, ResourceCollection, ServiceCollection, ServiceHealth,
+    ServiceInsightHealth, TagCollection, TagHealth,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -66,6 +67,256 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// writes and what the insight reads walk. A `BTreeMap` because the reads page over
     /// it: the key order is stable, which is what a page cursor needs.
     pub insights: BTreeMap<String, InsightRecord>,
+    /// The account that administers DevOps Guru for the organization this store
+    /// records, if any.
+    ///
+    /// An organization-wide read (`DescribeOrganizationResourceCollectionHealth` and
+    /// the service's other `*Organization*` operations) reports the member accounts
+    /// of an organization, which is a view only that organization's management
+    /// account or its registered DevOps Guru delegated administrator holds. No
+    /// operation of this service registers one — that registration is made through
+    /// Organizations, which this emulator does not emulate — so the field holds
+    /// `None` and the one account this emulator serves
+    /// ([`::engine::emulator_account_id`]) administers no organization. Read it
+    /// through [`Self::administers_organization`], which therefore answers `false`
+    /// for every caller a client can produce: an organization-wide read states the
+    /// rule once and refuses with its modelled `AccessDeniedException`.
+    pub organization_admin_account_id: Option<String>,
+}
+
+impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
+    /// Whether `account_id` administers the organization this store records — the
+    /// caller an organization-wide read is available to. False whenever no
+    /// administrator is recorded, which is the only state a client of this emulator
+    /// can produce: an organization-only view is then available to nobody.
+    pub fn administers_organization(&self, account_id: &str) -> bool {
+        self.organization_admin_account_id.as_deref() == Some(account_id)
+    }
+
+    /// One `CloudFormationHealth` per covered stack name, in the store's stable
+    /// order, each tallying the insights whose own `ResourceCollection` names that
+    /// stack.
+    ///
+    /// The health of the `AWS_CLOUD_FORMATION` collection, as both
+    /// `DescribeResourceCollectionHealth` and
+    /// `DescribeOrganizationResourceCollectionHealth` report it: one store, one
+    /// member set, so the account-scoped and the organization-scoped read cannot
+    /// disagree about a stack's health.
+    pub fn cloud_formation_healths(&self) -> Vec<CloudFormationHealth> {
+        self.resource_collection
+            .cloudformation_stack_names
+            .iter()
+            .map(|stack_name| CloudFormationHealth {
+                stack_name: Some(stack_name.clone()),
+                insight: Some(
+                    InsightTally::over(self.insights.values(), |insight| {
+                        insight.resource_collection.as_ref().is_some_and(|about| {
+                            about.cloudformation_stack_names.contains(stack_name)
+                        })
+                    })
+                    .insight_health(),
+                ),
+                analyzed_resource_count: Some(MEMBER_ANALYZED_RESOURCE_COUNT),
+            })
+            .collect()
+    }
+
+    /// One `TagHealth` per covered (`AppBoundaryKey`, `TagValue`) pair — `TagHealth`
+    /// names both, so a pair is a member in its own right — each tallying the
+    /// insights whose own tag collection names that pair. A key is covered exactly
+    /// while one of its values is, so no key yields none.
+    pub fn tag_healths(&self) -> Vec<TagHealth> {
+        self.resource_collection
+            .tag_collections
+            .iter()
+            .flat_map(|(app_boundary_key, tag_values)| {
+                tag_values.iter().map(move |tag_value| TagHealth {
+                    app_boundary_key: Some(app_boundary_key.clone()),
+                    tag_value: Some(tag_value.clone()),
+                    insight: Some(
+                        InsightTally::over(self.insights.values(), |insight| {
+                            insight.resource_collection.as_ref().is_some_and(|about| {
+                                about
+                                    .tag_collections
+                                    .get(app_boundary_key)
+                                    .is_some_and(|values| values.contains(tag_value))
+                            })
+                        })
+                        .insight_health(),
+                    ),
+                    analyzed_resource_count: Some(MEMBER_ANALYZED_RESOURCE_COUNT),
+                })
+            })
+            .collect()
+    }
+
+    /// One `ServiceHealth` per Amazon Web Services service DevOps Guru ANALYSED.
+    ///
+    /// Membership is discovered by that analysis, not declared by the client
+    /// (`ServiceName` is a closed enum and `UpdateResourceCollection` cannot name
+    /// one), and this store's record of an analysed service is the
+    /// `ServiceCollection` its insights name. So the services reported are exactly
+    /// those, sorted for a stable page order, and an account whose analysis produced
+    /// no insight reports an empty list rather than an invented service.
+    ///
+    /// `ServiceInsightHealth` models only the two open counts, so the MTTR the tally
+    /// also computes is dropped here. The coverage attributes no entry to an Amazon
+    /// Web Services service, so how many monitored resources belong to one is not
+    /// something this store records: the optional `AnalyzedResourceCount` is omitted
+    /// rather than guessed.
+    pub fn service_healths(&self) -> Vec<ServiceHealth> {
+        let analysed: BTreeSet<&String> = self
+            .insights
+            .values()
+            .flat_map(|insight| insight.service_names.iter())
+            .collect();
+        analysed
+            .into_iter()
+            .map(|service_name| ServiceHealth {
+                service_name: Some(service_name.clone()),
+                insight: Some(
+                    InsightTally::over(self.insights.values(), |insight| {
+                        insight.service_names.contains(service_name)
+                    })
+                    .service_insight_health(),
+                ),
+                analyzed_resource_count: None,
+            })
+            .collect()
+    }
+
+    /// The account-level tally: every insight this store holds, whatever resource
+    /// collection it is about, which is what `AccountInsightHealth` counts — "the
+    /// number of open proactive insights in your Amazon Web Services account".
+    pub fn account_insight_tally(&self) -> InsightTally {
+        InsightTally::over(self.insights.values(), |_| true)
+    }
+}
+
+/// `AnalyzedResourceCount` for ONE member of a resource collection: how many
+/// resources DevOps Guru is monitoring within that member.
+///
+/// The analysed population is the coverage itself — see
+/// [`ResourceCoverage::monitored_resource_count`] — so each coverage entry IS one
+/// monitored resource, one per covered stack name and one per (app-boundary key, tag
+/// value) pair. A member of a health report is exactly one such entry, so it accounts
+/// for exactly one analysed resource, and the members of a collection type therefore
+/// sum to the account-level `AnalyzedResourceCount` that `DescribeAccountHealth`
+/// reports over the same store — the reads of one store agree instead of contradicting
+/// each other.
+pub const MEMBER_ANALYZED_RESOURCE_COUNT: i64 = 1;
+
+/// `InsightType`'s `REACTIVE` member, as the model spells it — see
+/// `INSIGHT_TYPE_VALUES` in `ops/types/shared_types.rs`. Its `PROACTIVE` member is
+/// [`InsightRecord::PROACTIVE`].
+pub const INSIGHT_TYPE_REACTIVE: &str = "REACTIVE";
+
+/// `InsightStatus` as the model spells "the behaviour has not ended" — see
+/// `INSIGHT_STATUS_VALUES`.
+pub const INSIGHT_STATUS_ONGOING: &str = "ONGOING";
+
+/// `InsightStatus` as the model spells "the behaviour ended" — the other of
+/// `INSIGHT_STATUS_VALUES`.
+pub const INSIGHT_STATUS_CLOSED: &str = "CLOSED";
+
+/// The insight tally over a SET of stored insights: how many of them are open, by
+/// `InsightType`, and the Mean Time to Recover over the closed ones.
+///
+/// `InsightHealth`, `ServiceInsightHealth` and `AccountInsightHealth` are three
+/// projections of this one tally — the first adds the MTTR, the other two carry only
+/// the open counts — so every health read of this store computes its numbers the same
+/// way and two reads cannot contradict each other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InsightTally {
+    /// The `ONGOING` insights of type `PROACTIVE` in the set.
+    pub open_proactive: i32,
+    /// The `ONGOING` insights of type `REACTIVE` in the set.
+    pub open_reactive: i32,
+    /// The mean, over the `CLOSED` insights of the set that record an end instant, of
+    /// how long each took to recover: its `InsightTimeRange` end minus its start.
+    pub mean_time_to_recover_millis: i64,
+}
+
+impl InsightTally {
+    /// The tally over the insights `covers` keeps.
+    ///
+    /// No modelled operation mints an insight — DevOps Guru derives one from anomalies
+    /// in the covered resources — so the set walked is this store's [`insights`] map,
+    /// what that analysis writes and every insight read reports. An emulator over
+    /// which no analysis has run therefore tallies an empty set and answers zeros,
+    /// with no recovery time accrued to average.
+    ///
+    /// [`insights`]: ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insights
+    pub fn over<'a>(
+        insights: impl Iterator<Item = &'a InsightRecord>,
+        covers: impl Fn(&InsightRecord) -> bool,
+    ) -> Self {
+        let mut open_proactive = 0i32;
+        let mut open_reactive = 0i32;
+        let mut recovered = 0i64;
+        let mut total_recovery_millis = 0i64;
+        for insight in insights.filter(|insight| covers(insight)) {
+            match (insight.insight_type.as_str(), insight.status.as_str()) {
+                (InsightRecord::PROACTIVE, INSIGHT_STATUS_ONGOING) => {
+                    open_proactive = open_proactive.saturating_add(1);
+                }
+                (INSIGHT_TYPE_REACTIVE, INSIGHT_STATUS_ONGOING) => {
+                    open_reactive = open_reactive.saturating_add(1);
+                }
+                // A closed insight is no longer open; what it contributes is the time
+                // it took to recover, which only an insight whose behaviour has an end
+                // instant carries.
+                (_, INSIGHT_STATUS_CLOSED) => {
+                    if let Some(end) = insight.end_time_millis {
+                        // Saturating throughout, so a stored instant pair far enough
+                        // apart to overflow cannot panic a read.
+                        total_recovery_millis = total_recovery_millis
+                            .saturating_add(end.saturating_sub(insight.start_time_millis).max(0));
+                        recovered = recovered.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            open_proactive,
+            open_reactive,
+            // The mean over the set's closed insights; zero while none has closed,
+            // because no recovery time has been accrued.
+            mean_time_to_recover_millis: if recovered == 0 {
+                0
+            } else {
+                total_recovery_millis / recovered
+            },
+        }
+    }
+
+    /// This tally as the modelled `InsightHealth`, which carries the MTTR.
+    pub fn insight_health(&self) -> InsightHealth {
+        InsightHealth {
+            open_proactive_insights: self.open_proactive,
+            open_reactive_insights: self.open_reactive,
+            mean_time_to_recover_in_milliseconds: Some(self.mean_time_to_recover_millis),
+        }
+    }
+
+    /// This tally as the modelled `ServiceInsightHealth`, which models only the two
+    /// open counts.
+    pub fn service_insight_health(&self) -> ServiceInsightHealth {
+        ServiceInsightHealth {
+            open_proactive_insights: self.open_proactive,
+            open_reactive_insights: self.open_reactive,
+        }
+    }
+
+    /// This tally as the modelled `AccountInsightHealth`, which models only the two
+    /// open counts.
+    pub fn account_insight_health(&self) -> AccountInsightHealth {
+        AccountInsightHealth {
+            open_proactive_insights: self.open_proactive,
+            open_reactive_insights: self.open_reactive,
+        }
+    }
 }
 
 /// One insight's feedback, as `PutFeedback` stored it.

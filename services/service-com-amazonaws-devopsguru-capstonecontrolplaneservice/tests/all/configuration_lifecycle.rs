@@ -105,6 +105,20 @@ impl Emulator {
         }
     }
 
+    /// Record `account_id` as the account that administers DevOps Guru for the
+    /// organization this store records, the way the Organizations-side registration
+    /// this emulator does not emulate would.
+    ///
+    /// No modelled operation of this service registers one, so this is the only way to
+    /// drive an organization-wide read's REPORTING path; without it every caller is
+    /// refused, which is the state a client can produce.
+    pub(crate) fn delegate_organization_administration(&self, account_id: &str) {
+        let state = self
+            .engine
+            .state::<ComAmazonawsDevopsguruCapstonecontrolplaneserviceState>();
+        state.lock().organization_admin_account_id = Some(account_id.to_string());
+    }
+
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let request = http::Request::builder()

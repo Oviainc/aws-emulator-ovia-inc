@@ -29,7 +29,14 @@ use crate::configuration_lifecycle::{cloud_formation, tags, Emulator, Reply};
 /// `smithy_query(query="operation",operation="DescribeResourceCollectionHealth")`:
 /// `GET /accounts/health/resource-collection/{ResourceCollectionType}` with `NextToken`
 /// as a query parameter.
-async fn describe_health(emulator: &Emulator, collection_type: &str, next: Option<&str>) -> Reply {
+///
+/// `pub(crate)` with [`Entry`] and [`entries`], so the organization-wide health suite
+/// can compare the two reads of one store instead of re-deriving either.
+pub(crate) async fn describe_health(
+    emulator: &Emulator,
+    collection_type: &str,
+    next: Option<&str>,
+) -> Reply {
     let path = match next {
         Some(token) => format!(
             "/accounts/health/resource-collection/{collection_type}?NextToken={token}"
@@ -42,13 +49,13 @@ async fn describe_health(emulator: &Emulator, collection_type: &str, next: Optio
 /// One reported health entry, reduced to what the rule constrains: which collection
 /// member it is about, and the tallies reported for that member.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
+pub(crate) struct Entry {
     /// The member this entry reports on: a stack name, or `key=value` for a tag.
-    member: String,
-    open_proactive: Option<i64>,
-    open_reactive: Option<i64>,
-    mean_time_to_recover: Option<i64>,
-    analyzed_resource_count: Option<i64>,
+    pub(crate) member: String,
+    pub(crate) open_proactive: Option<i64>,
+    pub(crate) open_reactive: Option<i64>,
+    pub(crate) mean_time_to_recover: Option<i64>,
+    pub(crate) analyzed_resource_count: Option<i64>,
 }
 
 fn number(value: Option<&Value>) -> Option<i64> {
@@ -64,7 +71,7 @@ fn string(entry: &Value, member: &str) -> String {
 }
 
 /// The `CloudFormation` / `Tags` entries of one reply, in the order reported.
-fn entries(reply: &Reply, pointer: &str) -> Vec<Entry> {
+pub(crate) fn entries(reply: &Reply, pointer: &str) -> Vec<Entry> {
     reply
         .at(pointer)
         .and_then(Value::as_array)
@@ -132,7 +139,10 @@ async fn walk_health(emulator: &Emulator, collection_type: &str, pointer: &str) 
 /// its `AnalyzedResourceCount` is the ONE monitored resource the coverage entry itself
 /// is, the rule `ResourceCoverage::monitored_resource_count` states and
 /// `DescribeAccountHealth` reports the account-level count under.
-fn member_without_insights(member: &str) -> Entry {
+///
+/// `pub(crate)` with the rest of this suite's extractors, so the organization-wide
+/// health suite expresses the same expectation the same way.
+pub(crate) fn member_without_insights(member: &str) -> Entry {
     Entry {
         member: member.to_string(),
         open_proactive: Some(0),
@@ -664,10 +674,13 @@ async fn a_collection_type_outside_the_enum_is_refused() {
 
 /// `InsightType`'s and `InsightStatus`'s values, from
 /// `smithy_query(query="shape",shape="InsightType,InsightStatus")`.
-const PROACTIVE: &str = "PROACTIVE";
-const REACTIVE: &str = "REACTIVE";
-const ONGOING: &str = "ONGOING";
-const CLOSED: &str = "CLOSED";
+///
+/// `pub(crate)` with [`insight`] below, so the organization-wide health suite seeds the
+/// store exactly the way this one does instead of writing a second seeder.
+pub(crate) const PROACTIVE: &str = "PROACTIVE";
+pub(crate) const REACTIVE: &str = "REACTIVE";
+pub(crate) const ONGOING: &str = "ONGOING";
+pub(crate) const CLOSED: &str = "CLOSED";
 
 /// An arbitrary instant the seeded insights start from, in milliseconds since the
 /// epoch.
@@ -676,7 +689,7 @@ const START: i64 = 1_700_000_000_000;
 /// One insight, as the analysis that produces them would store it: about the stacks and
 /// tag pairs in its own `ResourceCollection`, naming `services`, and — when
 /// `recovery_millis` is given — closed after that many milliseconds.
-fn insight(
+pub(crate) fn insight(
     id: &str,
     insight_type: &str,
     status: &str,

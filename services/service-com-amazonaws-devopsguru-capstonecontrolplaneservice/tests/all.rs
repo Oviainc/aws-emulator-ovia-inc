@@ -29,6 +29,8 @@ mod insight_listing;
 mod insight_reads;
 #[path = "all/mutation_idempotency_and_tenancy.rs"]
 mod mutation_idempotency_and_tenancy;
+#[path = "all/organization_resource_collection_health.rs"]
+mod organization_resource_collection_health;
 #[path = "all/resource_collection_health.rs"]
 mod resource_collection_health;
 #[path = "all/state_roundtrip.rs"]
