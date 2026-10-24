@@ -19,6 +19,8 @@ mod delete_member;
 mod harness;
 #[path = "all/invitations.rs"]
 mod invitations;
+#[path = "all/invite_principal.rs"]
+mod invite_principal;
 #[path = "all/list_accessors.rs"]
 mod list_accessors;
 #[path = "all/list_members.rs"]
