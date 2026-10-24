@@ -5,10 +5,11 @@
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
-//! (`CreateReviewTemplate`, `GetReviewTemplate`), the answers of a workload's lens
-//! reviews (`ListAnswers`) and the answers of a review template's lens reviews
-//! (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a create is
-//! visible to the next request on the same engine. The custom lenses `ImportLens`
+//! (`CreateReviewTemplate`, `GetReviewTemplate`, `DeleteReviewTemplate`), the answers of
+//! a workload's lens reviews (`ListAnswers`) and the answers of a review template's lens
+//! reviews (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a
+//! create is visible to the next request on the same engine. The custom lenses
+//! `ImportLens`
 //! imports, the versions `CreateLensVersion` publishes from them, the content
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
@@ -3684,6 +3685,22 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.workload_shares.remove(workload_id);
         self.create_workload_share_tokens
             .retain(|token| token.workload_id != workload_id);
+        Some(record)
+    }
+
+    /// Drop a review template and everything keyed to it: any create token that resolved
+    /// to it, so a retry of the create that minted it is no longer a replay of a template
+    /// that is gone.
+    ///
+    /// Everything else a template owns — its lens reviews' notes and the answers recorded
+    /// against them — lives INSIDE [`ReviewTemplateRecord`], so it goes with the record
+    /// itself. A workload created from a template copied that template's lenses and notes
+    /// at create time (`CreateWorkload`), so it keeps them: the workload is not a child of
+    /// the template.
+    pub fn remove_review_template(&mut self, template_arn: &str) -> Option<ReviewTemplateRecord> {
+        let record = self.review_templates.remove(template_arn)?;
+        self.create_review_template_tokens
+            .retain(|token| token.template_arn != template_arn);
         Some(record)
     }
 

@@ -262,6 +262,20 @@ impl Client {
             .await
     }
 
+    /// `DeleteReviewTemplate`: `DELETE /reviewTemplates/{TemplateArn}` with the
+    /// `@idempotencyToken` bound to `@httpQuery("ClientRequestToken")`. The ARN is a
+    /// non-greedy `@httpLabel`, so it travels percent-encoded in one path segment,
+    /// exactly as an SDK sends it.
+    pub(crate) async fn delete_review_template(&self, template_arn: &str, token: &str) -> Answer {
+        let encoded = encode_path_segment(template_arn);
+        self.send(
+            "DELETE",
+            &format!("/reviewTemplates/{encoded}?ClientRequestToken={token}"),
+            None,
+        )
+        .await
+    }
+
     /// `UpdateReviewTemplateLensReview`:
     /// `PATCH /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}`. Both labels are
     /// non-greedy, so each travels percent-encoded in one path segment, exactly as an
@@ -511,6 +525,47 @@ pub(crate) fn minimal_create(name: &str, token: &str) -> Value {
         "ReviewOwner": "owner@example.com",
         "ClientRequestToken": token,
     })
+}
+
+/// A minimal valid `CreateReviewTemplate` request; callers override the members their
+/// case varies. The one review-template request builder this crate's suites share.
+pub(crate) fn minimal_template(name: &str, token: &str) -> Value {
+    json!({
+        "TemplateName": name,
+        "Description": "a review template under test",
+        "Lenses": ["wellarchitected"],
+        "ClientRequestToken": token,
+    })
+}
+
+/// The `TemplateArn` a successful `CreateReviewTemplate` answered with, checked against
+/// the modelled `TemplateArn` pattern and its `@length(50, 250)`.
+pub(crate) fn created_arn(answer: &Answer, case: &str) -> String {
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected CreateReviewTemplate 200, got {answer:?}"
+    );
+    let arn = answer
+        .body
+        .get("TemplateArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let expected_prefix = format!(
+        "arn:aws:wellarchitected:us-west-2:{}:review-template/",
+        engine::emulator_account_id()
+    );
+    let id = arn.strip_prefix(&expected_prefix).unwrap_or_default();
+    assert!(
+        id.len() == 32 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "case {case:?}: TemplateArn must be {expected_prefix}<32 hex>, got {arn:?}"
+    );
+    assert!(
+        (50..=250).contains(&arn.len()),
+        "case {case:?}: TemplateArn must satisfy @length(50, 250), got {} characters in {arn:?}",
+        arn.len()
+    );
+    arn
 }
 
 /// The `WorkloadId` a successful `CreateWorkload` answered with, checked against the

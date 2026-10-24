@@ -29,7 +29,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{created_id, minimal_create, Answer, Client};
+use super::workload_harness::{
+    created_arn, created_id, minimal_create, minimal_template, Answer, Client,
+};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
@@ -54,47 +56,6 @@ fn absent_template_arn(template_id: &str) -> String {
 
 fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
     answer.body.get(name).and_then(Value::as_str).unwrap_or("")
-}
-
-/// A minimal valid `CreateReviewTemplate` request; a caller overrides the members its
-/// case varies.
-fn minimal_template(name: &str, token: &str) -> Value {
-    json!({
-        "TemplateName": name,
-        "Description": "a review template under test",
-        "Lenses": ["wellarchitected"],
-        "ClientRequestToken": token,
-    })
-}
-
-/// The `TemplateArn` a successful `CreateReviewTemplate` answered with, checked against
-/// the modelled `TemplateArn` pattern and its `@length(50, 250)`.
-fn created_arn(answer: &Answer, case: &str) -> String {
-    assert_eq!(
-        answer.status, 200,
-        "case {case:?}: expected CreateReviewTemplate 200, got {answer:?}"
-    );
-    let arn = answer
-        .body
-        .get("TemplateArn")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let expected_prefix = format!(
-        "arn:aws:wellarchitected:us-west-2:{}:review-template/",
-        engine::emulator_account_id()
-    );
-    let id = arn.strip_prefix(&expected_prefix).unwrap_or_default();
-    assert!(
-        id.len() == 32 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
-        "case {case:?}: TemplateArn must be {expected_prefix}<32 hex>, got {arn:?}"
-    );
-    assert!(
-        (50..=250).contains(&arn.len()),
-        "case {case:?}: TemplateArn must satisfy @length(50, 250), got {} characters in {arn:?}",
-        arn.len()
-    );
-    arn
 }
 
 /// The roll-up a template with `unanswered` outstanding questions reports: every

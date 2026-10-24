@@ -238,8 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The token names a template that is no longer stored, so there is no original
             // result to return: forget the token and let this request create afresh, which
-            // is what the caller asked for. (Unreachable while `DeleteReviewTemplate` is a
-            // stub; handled here so the create stays well defined once it lands.)
+            // is what the caller asked for. (`DeleteReviewTemplate` also forgets the token
+            // when it drops the template, so this is the belt to that braces.)
             store
                 .create_review_template_tokens
                 .forget(&input.client_request_token);
