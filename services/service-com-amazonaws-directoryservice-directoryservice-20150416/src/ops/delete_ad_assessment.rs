@@ -157,12 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(::std::time::SystemTime::now());
 
         let assessment = store.assessments.get(&input.assessment_id).ok_or_else(|| {
-            DeleteADAssessmentErrorModeled::EntityDoesNotExistException(
-                EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_assessment(&input.assessment_id)),
-                    request_id: None,
-                },
-            )
+            DeleteADAssessmentErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                crate::state::no_such_assessment(&input.assessment_id),
+            ))
         })?;
 
         // "You cannot delete system-initiated assessments" — decided from the stored
@@ -171,15 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if assessment.report_type != crate::state::ASSESSMENT_REPORT_TYPE_CUSTOMER {
             return Err(
                 DeleteADAssessmentErrorModeled::UnsupportedOperationException(
-                    UnsupportedOperationException {
-                        message: Some(format!(
-                            "Directory assessment {id} is {report_type}-initiated and cannot be \
-                             deleted",
-                            id = assessment.assessment_id,
-                            report_type = assessment.report_type
-                        )),
-                        request_id: None,
-                    },
+                    crate::state::refusal(format!(
+                        "Directory assessment {id} is {report_type}-initiated and cannot be \
+                         deleted",
+                        id = assessment.assessment_id,
+                        report_type = assessment.report_type
+                    )),
                 )
                 .into(),
             );
