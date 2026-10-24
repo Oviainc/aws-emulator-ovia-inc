@@ -149,6 +149,15 @@ pub const DOMAIN_ARN_REGION: &str = "global";
 /// recordset of this account lives in.
 pub const DOMAIN_REGION_NAME: &str = "us-east-1";
 
+/// The refusal a domain or distribution call made outside [`DOMAIN_REGION_NAME`]
+/// is answered with, as the modelled `InvalidInputException` documentation
+/// states it (`smithy_query(query="doc",shape="InvalidInputException")`): those
+/// APIs are served by the N. Virginia endpoint ALONE, so a call to them from any
+/// other Region's endpoint is refused rather than served there.
+pub const DOMAIN_REGION_ONLY_MESSAGE: &str = "Domain and distribution APIs are only available in \
+     the N. Virginia (us-east-1) Amazon Web Services Region. Please set your Amazon Web Services \
+     Region configuration to us-east-1 to create, view, or edit these resources.";
+
 /// The resource portion a disk ARN carries before its id. Mirrors the
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
 /// this resource's own `ResourceType` value.
@@ -8170,10 +8179,39 @@ pub fn support_code(id: &str) -> String {
 /// answer is always one of that enum's values — a scope naming anything else is
 /// not a region this service has resources in.
 pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map(|scope| scope.region)
+    signed_region(parts)
         .filter(|region| REGION_NAME_VALUES.contains(&region.as_str()))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The Region this request's SigV4 credential scope names, verbatim, and `None`
+/// when it carries no scope at all.
+///
+/// The one place this crate reads the Region off the request: what the scope says
+/// and what the service does with it are two different questions, and the callers
+/// below answer them differently.
+fn signed_region(parts: &::http::request::Parts) -> Option<String> {
+    ::emulator_server::sigv4_credential_scope(&parts.headers).map(|scope| scope.region)
+}
+
+/// The refusal for a domain or distribution call this request cannot be served
+/// by, and `None` when it can.
+///
+/// Those APIs are served by the N. Virginia endpoint ALONE (see
+/// [`DOMAIN_REGION_ONLY_MESSAGE`]), so what decides is the Region the request's
+/// SigV4 credential scope names — whatever it names, not only the Regions this
+/// service holds resources in, since a scope naming a Region Lightsail does not
+/// serve is no more us-east-1 than any other. A request carrying no scope at all
+/// is served in [`DEFAULT_REGION`], which IS the domain Region, so it is served
+/// rather than refused.
+///
+/// The same documented restriction covers the distribution (and distribution
+/// certificate) operations, which are still scaffold stubs answering 501: when
+/// one of them is implemented it must call THIS helper rather than re-deriving
+/// the rule, so the restriction stays in one place.
+pub fn domain_region_refusal(parts: &::http::request::Parts) -> Option<String> {
+    let signed = signed_region(parts)?;
+    (signed != DOMAIN_REGION_NAME).then(|| DOMAIN_REGION_ONLY_MESSAGE.to_string())
 }
 
 /// The endpoint this emulator was reached on for this request: its `Host`
