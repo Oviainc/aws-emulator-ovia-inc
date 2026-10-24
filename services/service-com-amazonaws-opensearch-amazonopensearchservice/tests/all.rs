@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/change_progress.rs"]
 mod change_progress;
+#[path = "all/domain_health.rs"]
+mod domain_health;
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
 #[path = "all/shared_es_signing_name_claim.rs"]

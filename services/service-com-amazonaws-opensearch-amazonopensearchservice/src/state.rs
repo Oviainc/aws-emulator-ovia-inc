@@ -343,6 +343,10 @@ pub struct Domain {
     pub domain_name: String,
     /// `arn:aws:es:<region>:<account-id>:domain/<domain-name>`.
     pub arn: String,
+    /// The Region the domain was created in — the one its ARN and endpoint name, and
+    /// the one whose Availability Zones its nodes sit in (see
+    /// [`crate::ops::describe_domain_health`]).
+    pub region: String,
     pub engine_version: String,
     /// One of `EngineMode`'s values; see [`DEFAULT_ENGINE_MODE`].
     pub engine_mode: String,
