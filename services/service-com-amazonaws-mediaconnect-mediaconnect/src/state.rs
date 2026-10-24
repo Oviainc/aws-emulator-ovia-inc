@@ -635,6 +635,46 @@ pub fn tag_pair_rejection(key: &str, value: &str) -> Option<String> {
     None
 }
 
+/// The tag map a resource is created with, from the tag member of the request that created
+/// it (`FlowTags`, `OutputTags`, `SourceTags`, `EntitlementTags`, `MediaStreamTags`): the
+/// pairs the member carries, ordered, and EMPTY when the member is absent — a resource
+/// created without tags carries no tags, which is not the same as carrying none yet known.
+pub fn tag_map_of(
+    tags: Option<&std::collections::HashMap<String, String>>,
+) -> BTreeMap<String, String> {
+    tags.into_iter()
+        .flatten()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Why the tag member `tags` of a create request is not a tag map this service stores on
+/// `resource`, or `None` when it is.
+///
+/// Every tag member of a create request writes the same kind of tag map TagResource writes
+/// on the same resource, so it is bounded by the same two rules, read from the same place:
+/// each pair through [`tag_pair_rejection`], and the count through
+/// [`MAX_TAGS_PER_RESOURCE`] — a create cannot leave a resource carrying more tags than a
+/// tag write could put on it. The caller refuses past either with its own
+/// `BadRequestException`, the error the model describes for "a semantic error" in the
+/// request.
+pub fn tag_set_rejection(
+    resource: &str,
+    tags: Option<&std::collections::HashMap<String, String>>,
+) -> Option<String> {
+    let pairs = tags?;
+    if pairs.len() > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "A resource keeps at most {MAX_TAGS_PER_RESOURCE} tags; this request would give \
+             {resource} {}.",
+            pairs.len()
+        ));
+    }
+    pairs
+        .iter()
+        .find_map(|(key, value)| tag_pair_rejection(key, value))
+}
+
 /// The ceiling on how many outputs ONE FLOW holds, however many calls fill it: "You can
 /// create up to 50 outputs per flow"
 /// (`smithy_query(query="operation",operation="AddFlowOutputs")`), the one count AWS
@@ -1067,6 +1107,12 @@ pub struct StoredSource {
     /// `Source$GatewayBridgeSource` — "the source configuration for cloud flows receiving
     /// a stream from a bridge", as the request that set the source configured it.
     pub gateway_bridge_source: Option<GatewayBridgeSource>,
+    /// The source's own tags: what `SetSourceRequest$SourceTags` put on it, as TagResource
+    /// and UntagResource have since changed it. A source has its own ARN
+    /// (`Source$SourceArn`), so it is a resource the tag operations address in its own
+    /// right — see [`ComAmazonawsMediaconnectMediaconnectState::tags_of`]. `Source` itself
+    /// carries no tag member, so no flow response reports this map.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl StoredSource {
@@ -1079,9 +1125,10 @@ impl StoredSource {
     /// owned source listens on, and folds the request's transport members into
     /// `Source.Transport`.
     ///
-    /// `SetSourceRequest$SourceTags` is not stored: `Source` models no tag member, so no
-    /// implemented operation could report it — exactly as the output and media-stream tags
-    /// of a create request are not stored either.
+    /// `SetSourceRequest$SourceTags` — "the key-value pairs that can be used to tag and
+    /// organize the source" — is stored on the record: the source's ARN is a `ResourceArn`
+    /// the tag operations resolve, so those pairs are what a later ListTagsForResource on
+    /// that ARN reports.
     pub fn from_set_request(
         request: &SetSourceRequest,
         name: String,
@@ -1140,6 +1187,9 @@ impl StoredSource {
             }),
             // `Transport.Protocol` is required, so a source that names no protocol (an
             // entitled one, say) carries no transport rather than an empty one.
+            // "The key-value pairs that can be used to tag and organize the source":
+            // stored on the source, which is the resource its own ARN addresses.
+            tags: tag_map_of(request.source_tags.as_ref()),
             transport: request.protocol.clone().map(|protocol| Transport {
                 max_bitrate: assigned_source_max_bitrate(&protocol, request.max_bitrate),
                 protocol,
@@ -1252,6 +1302,12 @@ pub struct StoredOutput {
     /// output when router integration is enabled", as the request that added the output
     /// configured it.
     pub router_integration_transit_encryption: Option<FlowTransitEncryption>,
+    /// The output's own tags: what `AddOutputRequest$OutputTags` put on it, as TagResource
+    /// and UntagResource have since changed it. An output has its own ARN
+    /// (`Output$OutputArn`), so it is a resource the tag operations address in its own
+    /// right — see [`ComAmazonawsMediaconnectMediaconnectState::tags_of`]. `Output` itself
+    /// carries no tag member, so no flow response reports this map.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl StoredOutput {
@@ -1260,8 +1316,10 @@ impl StoredOutput {
     /// Every operation that adds an output to a flow (CreateFlow's `Outputs`,
     /// AddFlowOutputs) materialises it HERE, so one request shape always becomes the
     /// same stored record: the service mints the `OutputArn`, resolves `OutputStatus`
-    /// to the documented `ENABLED` default, and folds the request's transport members
-    /// into `Output.Transport`.
+    /// to the documented `ENABLED` default, folds the request's transport members
+    /// into `Output.Transport`, and keeps `AddOutputRequest$OutputTags` — "the key-value
+    /// pairs that can be used to tag and organize the output" — on the record, because the
+    /// output's ARN is a `ResourceArn` the tag operations resolve.
     pub fn from_add_request(
         request: &AddOutputRequest,
         name: String,
@@ -1297,6 +1355,9 @@ impl StoredOutput {
             router_integration_transit_encryption: request
                 .router_integration_transit_encryption
                 .clone(),
+            // "The key-value pairs that can be used to tag and organize the output":
+            // stored on the output, which is the resource its own ARN addresses.
+            tags: tag_map_of(request.output_tags.as_ref()),
             // `Transport.Protocol` is required, so an output that names no protocol
             // carries no transport rather than an empty one.
             transport: request.protocol.clone().map(|protocol| Transport {
@@ -1392,12 +1453,40 @@ pub fn materialise_media_stream_output_configurations(
         .collect()
 }
 
+/// An entitlement of a stored flow: the modelled `Entitlement` the flow reports, plus the
+/// entitlement's own tags.
+///
+/// `Entitlement` models no tag member, so the tags travel beside the projection rather
+/// than inside it — the same shape [`StoredMediaStream`] has. An entitlement DOES have its
+/// own ARN (`Entitlement$EntitlementArn`), so unlike a media stream it is a resource the
+/// tag operations address in its own right (see
+/// [`ComAmazonawsMediaconnectMediaconnectState::tags_of`]).
+#[derive(Debug, Clone, Default)]
+pub struct StoredEntitlement {
+    pub entitlement: Entitlement,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredEntitlement {
+    /// The modelled `Entitlement` for this record.
+    pub fn to_entitlement(&self) -> Entitlement {
+        self.entitlement.clone()
+    }
+
+    /// The entitlement's ARN — the identity every entitlement operation, and a tag
+    /// operation's `ResourceArn`, addresses it by.
+    pub fn arn(&self) -> &str {
+        &self.entitlement.entitlement_arn
+    }
+}
+
 /// A media stream of a stored flow: the modelled `MediaStream` the flow reports, plus
 /// the `MediaStreamTags` the request that added it carried.
 ///
-/// `MediaStream` models no tag member and the tagging operations are still scaffolded,
-/// so — like [`StoredFlow::tags`] — the tags are written here and not yet read, rather
-/// than dropped on the floor when a request carries them.
+/// `MediaStream` models no tag member, and a media stream has no ARN of its own either
+/// (it is addressed by name within its flow), so no `ResourceArn` resolves to this map:
+/// the tags are written here, rather than dropped on the floor when a request carries
+/// them, and are read by nothing yet.
 #[derive(Debug, Clone, Default)]
 pub struct StoredMediaStream {
     pub stream: MediaStream,
@@ -1583,7 +1672,7 @@ pub struct StoredFlow {
     pub encoding_config: Option<EncodingConfig>,
     pub sources: Vec<StoredSource>,
     pub outputs: Vec<StoredOutput>,
-    pub entitlements: Vec<Entitlement>,
+    pub entitlements: Vec<StoredEntitlement>,
     pub media_streams: Vec<StoredMediaStream>,
     pub vpc_interfaces: Vec<VpcInterface>,
     /// The flow's tags: what CreateFlow's `FlowTags` put on it, as TagResource and
@@ -1645,7 +1734,7 @@ impl StoredFlow {
     pub fn entitlement_names(&self) -> BTreeSet<String> {
         self.entitlements
             .iter()
-            .map(|entitlement| entitlement.name.clone())
+            .map(|entitlement| entitlement.entitlement.name.clone())
             .collect()
     }
 
@@ -1695,6 +1784,60 @@ impl StoredFlow {
         }
     }
 
+    /// The tags of the ARN-bearing sub-resource of this flow that `resource_arn` addresses
+    /// — an output, a source or an entitlement — or `None` when this flow holds no such
+    /// sub-resource.
+    ///
+    /// Each of those three has its own ARN and its own tag map, so each is a resource a
+    /// tag operation's `ResourceArn` addresses in its own right; the ARNs are minted from
+    /// disjoint resource-type fragments, so at most one sub-resource of one flow matches.
+    pub fn sub_resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        if let Some(output) = self
+            .outputs
+            .iter()
+            .find(|output| output.output_arn == resource_arn)
+        {
+            return Some(&output.tags);
+        }
+        if let Some(source) = self
+            .sources
+            .iter()
+            .find(|source| source.source_arn == resource_arn)
+        {
+            return Some(&source.tags);
+        }
+        self.entitlements
+            .iter()
+            .find(|entitlement| entitlement.arn() == resource_arn)
+            .map(|entitlement| &entitlement.tags)
+    }
+
+    /// The tags of the sub-resource `resource_arn` addresses, for a tag write. See
+    /// [`StoredFlow::sub_resource_tags`].
+    pub fn sub_resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(output) = self
+            .outputs
+            .iter_mut()
+            .find(|output| output.output_arn == resource_arn)
+        {
+            return Some(&mut output.tags);
+        }
+        if let Some(source) = self
+            .sources
+            .iter_mut()
+            .find(|source| source.source_arn == resource_arn)
+        {
+            return Some(&mut source.tags);
+        }
+        self.entitlements
+            .iter_mut()
+            .find(|entitlement| entitlement.entitlement.entitlement_arn == resource_arn)
+            .map(|entitlement| &mut entitlement.tags)
+    }
+
     /// The modelled `Flow` for this record.
     pub fn to_flow(&self) -> Flow {
         Flow {
@@ -1712,7 +1855,11 @@ impl StoredFlow {
             source_monitoring_config: self.source_monitoring_config.clone(),
             ndi_config: self.ndi_config.clone(),
             encoding_config: self.encoding_config.clone(),
-            entitlements: self.entitlements.clone(),
+            entitlements: self
+                .entitlements
+                .iter()
+                .map(StoredEntitlement::to_entitlement)
+                .collect(),
             outputs: self.outputs.iter().map(StoredOutput::to_output).collect(),
             // A flow always carries at least one source (CreateFlow refuses a request
             // without one), so the first source is `Flow.Source` and the whole list is
@@ -3517,24 +3664,45 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// The tags of the resource `resource_arn` addresses, or `None` when this service
     /// holds no tags for such a resource.
     ///
-    /// A flow is the only resource whose tags a `ResourceArn` resolves to HERE: a gateway
-    /// record carries no tag map (no gateway operation in the model takes or reports tags),
-    /// a router input and a router output each carry their own
-    /// (`StoredRouterInput::tags`, `StoredRouterOutput::tags`) but are reached by the
-    /// GLOBAL tag operations — TagGlobalResource / UntagGlobalResource /
-    /// ListTagsForGlobalResource, which cover "router inputs, router outputs and router
-    /// network interfaces" and are still scaffolded — and every remaining MediaConnect
-    /// create (bridge, reservation) is still scaffolded. So a TagResource /
-    /// UntagResource / ListTagsForResource call resolves its `ResourceArn` against the flow
-    /// store, and any other ARN addresses nothing whose tags those operations reach.
+    /// A `ResourceArn` addresses "a resource ... in the current region", and every
+    /// MediaConnect resource whose ARN this service mints and still holds in the flow
+    /// hierarchy carries its OWN tag map: the flow itself, and each of its ARN-bearing
+    /// sub-resources — an output (`Output$OutputArn`), a source (`Source$SourceArn`) and an
+    /// entitlement (`Entitlement$EntitlementArn`), each taggable through its create
+    /// request's own tag member (`AddOutputRequest$OutputTags`,
+    /// `SetSourceRequest$SourceTags`, `GrantEntitlementRequest$EntitlementTags`). So an ARN
+    /// this emulator minted and returned resolves here, whichever of those it names.
+    ///
+    /// What does NOT resolve: a resource that carries no tag map because no MediaConnect
+    /// operation takes or reports its tags (a gateway, a gateway instance, a bridge, a
+    /// reservation), a flow sub-resource with no ARN of its own (a media stream and a VPC
+    /// interface are addressed by name within their flow, so no `ResourceArn` can name
+    /// one), and a router input / router output / router network interface, whose tags are
+    /// the GLOBAL tag operations' subject (TagGlobalResource / UntagGlobalResource /
+    /// ListTagsForGlobalResource, which cover exactly those three). Any other ARN addresses
+    /// nothing whose tags these operations reach.
     pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
-        self.flows.get(resource_arn).map(|flow| &flow.tags)
+        if let Some(flow) = self.flows.get(resource_arn) {
+            return Some(&flow.tags);
+        }
+        self.flows
+            .values()
+            .find_map(|flow| flow.sub_resource_tags(resource_arn))
     }
 
     /// The tags of the resource `resource_arn` addresses, for a tag write. See
     /// [`ComAmazonawsMediaconnectMediaconnectState::tags_of`] for which ARNs resolve.
     pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
-        self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags)
+        // Two lookups rather than one `get_mut`: returning the borrow from the first
+        // branch would hold `flows` mutably borrowed across the fallback scan below, which
+        // the borrow checker refuses (a conditional-return borrow the current region
+        // inference cannot narrow).
+        if self.flows.contains_key(resource_arn) {
+            return self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags);
+        }
+        self.flows
+            .values_mut()
+            .find_map(|flow| flow.sub_resource_tags_mut(resource_arn))
     }
 
     /// Settle every flow, gateway, bridge, router input and router output whose status
@@ -4084,32 +4252,36 @@ pub fn resolve_entitlement_name(
 /// record is what the flow stores and what every reader (DescribeFlow, and the grant's own
 /// response) reports.
 ///
-/// `GrantEntitlementRequest$EntitlementTags` is not stored: `Entitlement` models no tag
-/// member, so no implemented operation can report it, exactly as the output and
-/// media-stream tags of a create request are not stored either.
+/// `GrantEntitlementRequest$EntitlementTags` — "the key-value pairs that can be used to
+/// tag and organize the entitlement" — is kept beside the projection: the entitlement's
+/// ARN is a `ResourceArn` the tag operations resolve, so those pairs are what a later
+/// ListTagsForResource on that ARN reports.
 pub fn mint_entitlement(
     request: &GrantEntitlementRequest,
     name: String,
     region: &str,
     suffix: u64,
-) -> Entitlement {
-    Entitlement {
-        entitlement_arn: ::engine::emulator_arn(
-            SERVICE_NAMESPACE,
-            region,
-            &entitlement_resource_fragment(suffix, &name),
-        ),
-        name,
-        description: request.description.clone(),
-        encryption: request.encryption.clone(),
-        entitlement_status: Some(
-            request
-                .entitlement_status
-                .clone()
-                .unwrap_or_else(|| STATUS_ENABLED.to_string()),
-        ),
-        data_transfer_subscriber_fee_percent: request.data_transfer_subscriber_fee_percent,
-        subscribers: request.subscribers.clone(),
+) -> StoredEntitlement {
+    StoredEntitlement {
+        entitlement: Entitlement {
+            entitlement_arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                region,
+                &entitlement_resource_fragment(suffix, &name),
+            ),
+            name,
+            description: request.description.clone(),
+            encryption: request.encryption.clone(),
+            entitlement_status: Some(
+                request
+                    .entitlement_status
+                    .clone()
+                    .unwrap_or_else(|| STATUS_ENABLED.to_string()),
+            ),
+            data_transfer_subscriber_fee_percent: request.data_transfer_subscriber_fee_percent,
+            subscribers: request.subscribers.clone(),
+        },
+        tags: tag_map_of(request.entitlement_tags.as_ref()),
     }
 }
 

@@ -244,6 +244,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A source carries a tag member of its own (`SetSourceRequest$SourceTags`) and an
+        // ARN of its own, so it is a resource the tagging operations address: its tag map
+        // is bounded by the same rules a tag write is (see
+        // `crate::state::tag_set_rejection`), checked before anything is stored.
+        for (index, source) in input.sources.iter().enumerate() {
+            if let Some(rejection) = crate::state::tag_set_rejection(
+                &format!("Sources[{index}]"),
+                source.source_tags.as_ref(),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // `Source.Name` is required while `SetSourceRequest.Name` is optional, so a
         // source whose request named none is named by the service — against the flow's
         // existing source names AND the names resolved for earlier sources of this same
