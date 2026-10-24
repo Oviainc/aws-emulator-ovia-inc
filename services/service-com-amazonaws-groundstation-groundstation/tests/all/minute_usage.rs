@@ -232,7 +232,11 @@ async fn usage_counts_each_months_passes_in_whole_minutes() {
 /// model_path="services/service-com-amazonaws-groundstation-groundstation/smithy-model/\
 /// com-amazonaws-groundstation-groundstation.json")` — all thirteen values, not only the
 /// ones a request can reach today, because the classification is over the whole enum.
-const STATUS_HOLDS_ANTENNA_TIME: &[(&str, bool)] = &[
+///
+/// `pub(crate)`: the same classification decides whether a contact's reservation still
+/// holds its antenna at the ground station, which `ground_station_reservations.rs`
+/// asserts, so the catalogue is written once here.
+pub(crate) const STATUS_HOLDS_ANTENNA_TIME: &[(&str, bool)] = &[
     ("AVAILABLE", false),
     ("AWS_CANCELLED", false),
     ("AWS_FAILED", false),

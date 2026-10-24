@@ -113,6 +113,7 @@ service's operations.
 | `GROUNDSTATION_APPROVED_UPLINK_BANDS_MHZ` | The uplink frequency bands this emulated account is approved to transmit on, as comma-separated `<low>-<high>` pairs in MHz (`2025-2120` approves the whole band the service operates). Read ONCE, when this service's store is first created, so setting it after the first request has no effect. |
 | `GROUNDSTATION_RESERVED_MINUTES` | The reserved-minutes pricing plan this account holds, as comma-separated entries: a bare minute count is a standing monthly commitment (`500`) and `<year>-<month>=<minutes>` is one calendar month's own allocation (`500,2026-02=750`). Read once, with the same timing. |
 | `GROUNDSTATION_SATELLITES` | The satellites this account is on-boarded to, as comma-separated entries: a bare NORAD catalogue number (`25994`) or `<norad>=<ground station>+<ground station>…` naming the ground stations the satellite is on-boarded to (`25994=Ohio 1+Oregon 1,27424`). Read once, with the same timing. |
+| `GROUNDSTATION_MAINTENANCE` | The ground station antennas AWS has taken out of service, as comma-separated entries `<ground station>/<antenna>/<maintenance type>/<start>/<end>` with the two instants in epoch seconds (`Ohio 1/Antenna 1/PLANNED/1763000000/1763003600`). Read once, with the same timing. |
 | `GROUNDSTATION_GROUND_STATIONS` | The ground stations this account is served by and the antennas at each, as comma-separated entries: a bare ground-station name (`Oregon 1`) or `<ground station>=<antenna>+<antenna>…` naming the antennas at it (`Ohio 1=Antenna 1+Antenna 2,Oregon 1`). Read once, with the same timing. |
 
 Each of these settings stands for something that happens OUTSIDE the Ground Station API,
@@ -137,17 +138,26 @@ which is why they are settings rather than operations:
   onboarding is listed here; each entry is minted a `satelliteId` and a region-less
   `satelliteArn` when the store is created.
 
+- Ground station maintenance is scheduled by AWS on its own antennas: the model declares no
+  operation that schedules it and none that reports it other than
+  `ListGroundStationReservations`. So a ground station starts with nothing out of service
+  and that listing reports only the account's own contact reservations until a maintenance
+  window is listed here; a window listed here also holds its antenna, so no pass is placed
+  on an antenna while it is under maintenance.
+
 - A ground station and its antennas are built and operated by AWS, and an account reaches
   the ones it has been granted: the model declares no operation that creates either and
   none that reports one other than the listings themselves. So an account starts knowing
   only the ground stations its satellite onboardings name, none of which lists an antenna,
   until an inventory is listed here; `ListAntennas` then reports the antennas at the named
   ground station and refuses a `groundStationId` no onboarding and no inventory records
-  with `InvalidParameterException`.
+  with `InvalidParameterException`. A pass reserved at a ground station whose antennas are
+  listed here is placed on one of THEM; at a ground station whose antennas this account has
+  not been told about, the emulator numbers them itself (`state::antenna_name`).
 
-`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV`, `RESERVED_MINUTES_ENV`, `SATELLITES_ENV`
-and `GROUND_STATIONS_ENV` are the four readers, and all land in this service's own state,
-where a test seeds them directly.
+`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV`, `RESERVED_MINUTES_ENV`, `SATELLITES_ENV`,
+`MAINTENANCE_ENV` and `GROUND_STATIONS_ENV` are the five readers, and all land in this
+service's own state, where a test seeds them directly.
 
 An `s3RecordingConfig`'s recording bucket needs NO setting: Ground Station resolves the
 bucket the `bucketArn` names against the emulator's own S3 (`HeadBucket` over the

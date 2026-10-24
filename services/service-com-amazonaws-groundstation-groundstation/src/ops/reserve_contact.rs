@@ -217,6 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_timestamp();
         let contact_id = crate::state::new_uuid();
+        // The antenna this pass is placed on. A reservation holds an antenna for its
+        // window and an antenna serves one pass at a time, so the scheduler places the
+        // contact on the first antenna of the ground station nothing else holds for that
+        // window — recorded here, when the reservation is accepted, so every later read
+        // of it (`ListGroundStationReservations`) reports the same antenna.
+        let antenna_name = guard.free_antenna(
+            &input.ground_station,
+            (
+                input.start_time.as_secs_f64(),
+                input.end_time.as_secs_f64(),
+            ),
+        );
         let contact = crate::state::Contact {
             contact_id: contact_id.clone(),
             mission_profile_arn: input.mission_profile_arn,
@@ -233,6 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 i64::from(profile.contact_post_pass_duration_seconds.unwrap_or(0)),
             ),
             ground_station: input.ground_station,
+            antenna_name,
             // A reservation is admitted into SCHEDULING; the scheduler owes it the move
             // to SCHEDULED, which any later read materialises once it is due.
             contact_status: "SCHEDULING".to_string(),

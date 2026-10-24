@@ -216,7 +216,8 @@ fn verify_against_jwks(token: &str, jwks: &Value) -> Result<Value, Rejected> {
     let public = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point);
     // A signature segment that is not base64url, or not the 64-byte R||S form
     // RFC 7518 §3.4 defines, is no signature of this key: the token is refused
-    // the same way one carrying wrong bytes is.
+    // the same way one carrying wrong bytes is (the `FIXED` algorithm accepts
+    // only that encoding).
     let signature_bytes = try_decode_base64url(segments[2]).ok_or(Rejected::BadSignature)?;
     let signing_input = format!("{}.{}", segments[0], segments[1]);
     public

@@ -269,10 +269,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .filter_map(|id| guard.contacts.get(id))
             .filter(|contact| input.status_list.contains(&contact.contact_status))
-            // A contact is in the window when its own window overlaps it.
+            // A contact is in the window when its own window overlaps it — the one
+            // reading of "these two windows collide" this service has
+            // (`crate::state::windows_overlap`), shared with the reservation listing and
+            // the antenna placement.
             .filter(|contact| {
-                contact.end_time.as_secs_f64() >= window_start
-                    && contact.start_time.as_secs_f64() <= window_end
+                crate::state::windows_overlap(
+                    (
+                        contact.start_time.as_secs_f64(),
+                        contact.end_time.as_secs_f64(),
+                    ),
+                    (window_start, window_end),
+                )
             })
             .filter(|contact| {
                 input

@@ -1723,10 +1723,12 @@ impl ::std::fmt::Debug for PoolSigningKey {
 
 impl PoolSigningKey {
     /// A freshly generated key pair, drawn from the operating system's CSPRNG
-    /// (`Generate::generate`, which `p256` fills from `getrandom`).
+    /// (`ring::rand::SystemRandom`).
     ///
     /// One scalar multiplication, so this is microseconds of work: a pool mints
     /// its key when the pool is created and no request path ever generates one.
+    /// INFALLIBLE: the only failure the generator reports is the OS CSPRNG or
+    /// the key encoding failing, neither of which a pool can be created without.
     #[must_use]
     pub fn generate() -> Self {
         let rng = ::ring::rand::SystemRandom::new();
@@ -1778,8 +1780,8 @@ impl PoolSigningKey {
     }
 }
 
-/// `key`'s public curve point as the two fixed-width coordinates a JWK
-/// publishes: the uncompressed SEC1 encoding's `x` and `y`, 32 bytes each
+/// The public curve point `point` (uncompressed SEC1, `0x04 || X || Y`) as the
+/// two fixed-width coordinates a JWK publishes: `x` and `y`, 32 bytes each
 /// (RFC 7518 §6.2.1.2 — "the octet string representation MUST utilize all
 /// octets", i.e. no leading zero is dropped).
 fn public_coordinates(key: &::ring::signature::EcdsaKeyPair) -> (Vec<u8>, Vec<u8>) {

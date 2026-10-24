@@ -35,6 +35,8 @@ mod dataflow_endpoint_groups;
 mod ephemeris_catalog;
 #[path = "all/ephemeris_description.rs"]
 mod ephemeris_description;
+#[path = "all/ground_station_reservations.rs"]
+mod ground_station_reservations;
 #[path = "all/lifecycle_writes.rs"]
 mod lifecycle_writes;
 #[path = "all/minute_usage.rs"]

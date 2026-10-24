@@ -20,9 +20,11 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — which operation serves a request. EDITED HERE: the key and
+//!   the handler stay the generated table's, but `ListGroundStationReservations` — the one
+//!   operation of this service that binds a timestamp to the query string — is served
+//!   through [`EpochSecondsQueryTimestamps`], so the `epoch-seconds` form its members
+//!   declare binds.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -39,10 +41,29 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # Timestamps in the query string
+//!
+//! `ListGroundStationReservations` binds its `startTime` and `endTime` to the query string
+//! and declares the wire form on each member: `@timestampFormat("epoch-seconds")`
+//! (`smithy_query(query="operation", operation="ListGroundStationReservations")` —
+//! `{"target": "Timestamp", "timestampFormat": "epoch-seconds", "httpQuery":
+//! "startTime", "required": true}`), so every SDK sends the number of seconds since the
+//! epoch. The schema the framework builds from the model carries no member-level
+//! `@timestampFormat`, so its query-value deserializer reads an `@httpQuery` timestamp in
+//! the protocol's default RFC-3339 `date-time` form and refuses the declared one before
+//! the operation's handler runs.
+//!
+//! [`EpochSecondsQueryTimestamps`] closes that gap for the operations of this service that
+//! bind a timestamp to the query string: a query value that is a number is read as epoch
+//! seconds, anything else is left exactly as the client sent it, so the declared form
+//! binds and nothing else about the request changes. It is the SHARED wrapper in
+//! `service_common::query_timestamps` — the gap is the generated schema's, not this
+//! service's, so the rewrite is written once for every service whose model binds a
+//! timestamp to the query string.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use service_common::query_timestamps::EpochSecondsQueryTimestamps;
+use smithy_server_runtime::{http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-groundstation-groundstation` emulated service: the generated [`ServiceDefinition`] plus
@@ -52,6 +73,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The operations that bind a timestamp to the query string, each the generated
+    /// table's own operation wrapped in [`EpochSecondsQueryTimestamps`] and built from the
+    /// SAME shared engine, so a wrapped operation reads and writes the one store. Keyed by
+    /// the routing key the protocol resolves, which is the key the generated table uses.
+    epoch_seconds_query_timestamps: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -59,8 +85,24 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // Exactly the operations whose input binds a timestamp to the query string —
+        // `ListGroundStationReservations`' `startTime` and `endTime`, the only two such
+        // members this service's model declares (`OPERATIONS.md`: no other operation lists
+        // a `(timestamp, @httpQuery(…))` input). Every other operation of this service
+        // takes its timestamps in the body, where the protocol already reads the
+        // epoch-seconds form, so wrapping them would change nothing.
+        let mut epoch_seconds_query_timestamps = OperationRoutingTable::new();
+        epoch_seconds_query_timestamps.add_operation(
+            "ListGroundStationReservations",
+            ::std::boxed::Box::new(EpochSecondsQueryTimestamps::new(
+                crate::ops::list_ground_station_reservations::ListGroundStationReservations::new(
+                    Arc::clone(&engine),
+                ),
+            )) as ::std::boxed::Box<dyn ErasedOperation>,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            epoch_seconds_query_timestamps,
         }
     }
 }
@@ -83,16 +125,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
     }
 
+    /// Serve the request through the operation the generated table's own protocol names,
+    /// wrapped in [`EpochSecondsQueryTimestamps`] for the operations that bind a timestamp
+    /// to the query string so the `epoch-seconds` form their members declare binds.
+    ///
+    /// This is NOT a re-route: the key is the one the generated table's own protocol
+    /// resolves, and the operation it names is the one served. Every other key resolves to
+    /// `None` here exactly as it does for an unedited service, leaving the generated table
+    /// to serve it.
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.epoch_seconds_query_timestamps.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
