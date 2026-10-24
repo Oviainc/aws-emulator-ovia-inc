@@ -739,6 +739,45 @@ pub fn request_based_sli_from_config(
     }
 }
 
+/// The `EvaluationType` the SLI config a request supplies describes, or `None` when the
+/// request supplies neither config.
+///
+/// The two configs are mutually exclusive, and which one a request carries is the ONLY
+/// thing that decides the kind: `SliConfig` is documented as "if this SLO is a period-based
+/// SLO, this structure defines..." and `RequestBasedSliConfig` as "if this SLO is a
+/// request-based SLO, ...". Derived in one place so every operation that accepts the pair
+/// classifies it identically.
+pub fn requested_evaluation_type(
+    sli_config: Option<&ServiceLevelIndicatorConfig>,
+    request_based_sli_config: Option<&RequestBasedServiceLevelIndicatorConfig>,
+) -> Option<&'static str> {
+    if sli_config.is_some() {
+        Some(EVALUATION_TYPE_PERIOD_BASED)
+    } else if request_based_sli_config.is_some() {
+        Some(EVALUATION_TYPE_REQUEST_BASED)
+    } else {
+        None
+    }
+}
+
+/// The `EvaluationType` a STORED SLO is of, or `None` when the record carries no indicator
+/// at all (a create that supplied neither config).
+///
+/// Judged from the record's own declared `EvaluationType`, falling back to whichever
+/// indicator it holds, so the kind of a record is read off the record rather than recomputed
+/// from the request that is trying to change it. Only the two values the modelled
+/// `EvaluationType` enum names are ever written, so any other string is treated as no
+/// declared kind and the indicator decides.
+pub fn stored_evaluation_type(slo: &ServiceLevelObjective) -> Option<&'static str> {
+    match slo.evaluation_type.as_deref() {
+        Some(EVALUATION_TYPE_PERIOD_BASED) => Some(EVALUATION_TYPE_PERIOD_BASED),
+        Some(EVALUATION_TYPE_REQUEST_BASED) => Some(EVALUATION_TYPE_REQUEST_BASED),
+        _ if slo.sli.is_some() => Some(EVALUATION_TYPE_PERIOD_BASED),
+        _ if slo.request_based_sli.is_some() => Some(EVALUATION_TYPE_REQUEST_BASED),
+        _ => None,
+    }
+}
+
 /// The `MetricSourceType` an SLI describes.
 ///
 /// `smithy_query(shape="MetricSourceType")` lists exactly six values — `AppMonitor`,

@@ -529,13 +529,13 @@ async fn update_changes_only_the_supplied_members() {
             untouched: &["Description", "Sli", "Goal", "BurnRateConfigurations"],
         },
         Case {
-            label: "RequestBasedSliConfig",
-            patch: json!({ "RequestBasedSliConfig": {
-                "RequestBasedSliMetricConfig": {
-                    "KeyAttributes": { "Type": "Service", "Name": "checkout", "Environment": "prod" }
-                }
-            } }),
-            untouched: &["Description", "Goal", "BurnRateConfigurations", "AutoInvestigationEnabled"],
+            // An SLI config of the SAME kind the record already is: the indicator is
+            // replaced, the kind is untouched (a config of the OTHER kind is refused, see
+            // `slo_evaluation_kind.rs`).
+            label: "SliConfig",
+            patch: json!({ "SliConfig": sli_config("checkout", "GET /cart", 90.0) }),
+            untouched: &["Description", "Goal", "BurnRateConfigurations", "AutoInvestigationEnabled",
+                         "EvaluationType"],
         },
     ];
 
@@ -596,17 +596,24 @@ async fn update_changes_only_the_supplied_members() {
         previous = after;
     }
 
-    // The last patch supplied `RequestBasedSliConfig`, so the record switched kinds.
+    // The last patch replaced the period-based indicator with another period-based one, so
+    // the record is still period-based and its indicator is the one the patch supplied.
     assert_eq!(
         previous["EvaluationType"].as_str(),
-        Some("RequestBased"),
-        "expected the record to become RequestBased after a RequestBasedSliConfig update, got {:?}",
+        Some("PeriodBased"),
+        "expected the record to stay PeriodBased after a SliConfig update, got {:?}",
         previous["EvaluationType"]
     );
-    assert!(
-        previous["Sli"].is_null(),
-        "expected the period-based Sli to be dropped when the SLO became request-based, got {:?}",
+    assert_eq!(
+        previous["Sli"]["MetricThreshold"].as_f64(),
+        Some(90.0),
+        "expected the supplied SliConfig to replace the stored indicator, got {:?}",
         previous["Sli"]
+    );
+    assert!(
+        previous["RequestBasedSli"].is_null(),
+        "expected a period-based record to carry no RequestBasedSli, got {:?}",
+        previous["RequestBasedSli"]
     );
 }
 
