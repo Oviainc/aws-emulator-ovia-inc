@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeviceDiscovery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeviceDiscovery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeviceDiscovery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the device discovery job `crate::state`'s `device_discoveries` store holds
+//! under the `Identifier` the URI names onto this operation's output shape — what
+//! `StartDeviceDiscovery` recorded, with the `Status` and `FinishedAt` the CLOCK gives it
+//! ([`crate::state::DeviceDiscovery::status_at`]). An `Identifier` this region holds no job
+//! under is the modelled `ResourceNotFoundException`. A pure read: it writes nothing, the
+//! status being derived from the stored due instant rather than materialised.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +168,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeviceDiscovery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeviceDiscoveryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeviceDiscovery"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetDeviceDiscoveryErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the device-discovery store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // A device discovery job is regional, as every resource of this service is: only
+        // the region that started it resolves it.
+        let region = crate::state::request_region(ctx.parts());
+        let discovery = store
+            .device_discovery_in(&region, &input.identifier)
+            .ok_or_else(|| {
+                // A read reports WHICH KIND of resource was not found; the identifier the
+                // request carried is reported on `ResourceId`.
+                GetDeviceDiscoveryErrorModeled::ResourceNotFoundException(
+                    crate::state::device_discovery_not_found_on_read(&input.identifier),
+                )
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        Ok(GetDeviceDiscoveryOutput {
+            id: discovery.id.clone(),
+            arn: discovery.arn.clone(),
+            discovery_type: discovery.discovery_type.clone(),
+            // The status the clock gives the job: running until its run is over, succeeded
+            // from then on. Nothing is written when it becomes due.
+            status: discovery.status_at(now).to_string(),
+            started_at: crate::state::timestamp(discovery.started_at),
+            controller_id: discovery.controller_id.clone(),
+            connector_association_id: discovery.connector_association_id.clone(),
+            account_association_id: discovery.account_association_id.clone(),
+            finished_at: discovery.finished_at(now).map(crate::state::timestamp),
+            // `TagsMap` is `@length(1..50)`, so a job nobody tagged reports no map rather
+            // than an empty one.
+            tags: Some(discovery.tags.clone()).filter(|tags| !tags.is_empty()),
+        })
     }
 }

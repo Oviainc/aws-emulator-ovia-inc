@@ -133,13 +133,34 @@ pub const PLATFORM_VIRTUALIZATION_TYPES: &[&str] = &["pv", "hvm"];
 /// id form). See [`managed_custom_ami_catalog`].
 const CUSTOM_AMI_ID_BODY_LENGTH: usize = 17;
 
-/// The support life-cycle states a platform branch reports, from
+/// The support life-cycle states a platform branch is HELD in, from
 /// `PlatformBranchSummary$LifecycleState`'s own documentation ("Possible values:
 /// `beta` | `supported` | `deprecated` | `retired`"). The model types that
 /// member as a plain string with no enum trait, so the value set is named here.
 /// Sorted, so a message that lists them reads the same every time.
-pub const PLATFORM_BRANCH_LIFECYCLE_STATES: &[&str] =
-    &["beta", "deprecated", "retired", "supported"];
+///
+/// This is also the value set a `ListPlatformBranches` `LifecycleState` filter
+/// term draws from — the operation documents exactly these four spellings for
+/// its filter values. What goes on the WIRE is the CAPITALIZED rendering of the
+/// state ([`reported_branch_lifecycle_state`]), which is the form the real
+/// service answers with on every shape that carries a branch life-cycle state.
+pub const PLATFORM_BRANCH_LIFECYCLE_STATES: &[&str] = &[
+    BRANCH_LIFECYCLE_BETA,
+    BRANCH_LIFECYCLE_DEPRECATED,
+    BRANCH_LIFECYCLE_RETIRED,
+    BRANCH_LIFECYCLE_SUPPORTED,
+];
+
+/// See [`PLATFORM_BRANCH_LIFECYCLE_STATES`]: a branch released for preview.
+pub const BRANCH_LIFECYCLE_BETA: &str = "beta";
+/// See [`PLATFORM_BRANCH_LIFECYCLE_STATES`]: a branch heading for retirement.
+pub const BRANCH_LIFECYCLE_DEPRECATED: &str = "deprecated";
+/// See [`PLATFORM_BRANCH_LIFECYCLE_STATES`]: a branch no account can deploy on
+/// any more, which is why it publishes no solution stack (see
+/// [`SOLUTION_STACKS`]).
+pub const BRANCH_LIFECYCLE_RETIRED: &str = "retired";
+/// See [`PLATFORM_BRANCH_LIFECYCLE_STATES`]: a branch under full support.
+pub const BRANCH_LIFECYCLE_SUPPORTED: &str = "supported";
 
 /// The environment tiers a platform branch can support, from
 /// `PlatformBranchSummary$SupportedTierList`'s documentation ("Possible values:
@@ -711,20 +732,23 @@ pub fn managed_supported_addons(supported_tiers: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A platform branch's life-cycle state as a PLATFORM VERSION reports it
-/// (`PlatformSummary$PlatformBranchLifecycleState`,
-/// `PlatformDescription$PlatformBranchLifecycleState`): the branch catalog's own
-/// state, capitalized.
+/// A platform branch's life-cycle state as the WIRE carries it, on every shape
+/// that reports one — `PlatformBranchSummary$LifecycleState`
+/// (`ListPlatformBranches`), `PlatformSummary$PlatformBranchLifecycleState` and
+/// `PlatformDescription$PlatformBranchLifecycleState`: the catalog's own state,
+/// capitalized.
 ///
 /// The model spells this value set twice and differently — `PlatformSummary`
-/// documents "`beta` | `supported` | `deprecated` | `retired`" while
-/// `PlatformDescription` documents "`Beta` | `Supported` | `Deprecated` |
-/// `Retired`" — and both cannot describe one attribute. The recorded
-/// platform-version responses of the real service settle it: they carry the
-/// capitalized form on BOTH shapes, so that is the form a platform version
-/// reports. The branch catalog keeps the spelling it holds (`ListPlatformBranches`
-/// reports its own member from it), so this rendering is IDEMPOTENT: a state
-/// already capitalized comes back unchanged.
+/// and `PlatformBranchSummary` document "`beta` | `supported` | `deprecated` |
+/// `retired`" while `PlatformDescription` documents "`Beta` | `Supported` |
+/// `Deprecated` | `Retired`" — and both cannot describe one attribute. The
+/// recorded responses of the real service settle it: a branch life-cycle state
+/// goes on the wire CAPITALIZED on all three shapes, while the lower-case
+/// spellings are the value set a `ListPlatformBranches` `LifecycleState` FILTER
+/// draws from. So the catalog HOLDS the documented lower-case state
+/// ([`PLATFORM_BRANCH_LIFECYCLE_STATES`], which is what a filter term is
+/// matched against) and every reporting path renders it through here. The
+/// rendering is IDEMPOTENT: a state already capitalized comes back unchanged.
 pub fn reported_branch_lifecycle_state(state: &str) -> String {
     let mut characters = state.chars();
     match characters.next() {
@@ -793,6 +817,14 @@ pub fn solution_stack_named(name: &str) -> Option<&'static SolutionStack> {
 pub const SOLUTION_STACKS: &[SolutionStack] = &[
     // .NET on Linux.
     SolutionStack {
+        branch_name: ".NET 10 running on 64bit Amazon Linux 2023",
+        platform_version: "3.5.0",
+        permitted_file_types: &["zip"],
+        platform_category: ".NET Core",
+        programming_languages: &[(".NET", "10")],
+        frameworks: &[],
+    },
+    SolutionStack {
         branch_name: ".NET 9 running on 64bit Amazon Linux 2023",
         platform_version: "3.4.0",
         permitted_file_types: &["zip"],
@@ -808,15 +840,39 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         programming_languages: &[(".NET", "8")],
         frameworks: &[],
     },
-    SolutionStack {
-        branch_name: ".NET Core running on 64bit Amazon Linux 2",
-        platform_version: "2.8.0",
-        permitted_file_types: &["zip"],
-        platform_category: ".NET Core",
-        programming_languages: &[(".NET Core", "")],
-        frameworks: &[],
-    },
     // .NET on Windows Server.
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server 2025",
+        platform_version: "2.20.0",
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+        frameworks: &[("IIS", "10.0")],
+    },
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server Core 2025",
+        platform_version: "2.20.0",
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+        frameworks: &[("IIS", "10.0")],
+    },
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server 2022",
+        platform_version: "2.18.0",
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+        frameworks: &[("IIS", "10.0")],
+    },
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server Core 2022",
+        platform_version: "2.18.0",
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+        frameworks: &[("IIS", "10.0")],
+    },
     SolutionStack {
         branch_name: "IIS 10.0 running on 64bit Windows Server 2019",
         platform_version: "2.16.0",
@@ -825,7 +881,15 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         programming_languages: &[(".NET", "")],
         frameworks: &[("IIS", "10.0")],
     },
-    // Docker.
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server Core 2019",
+        platform_version: "2.16.0",
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+        frameworks: &[("IIS", "10.0")],
+    },
+    // Docker: the single-container branch and the ECS-managed one.
     SolutionStack {
         branch_name: "Docker running on 64bit Amazon Linux 2023",
         platform_version: "4.2.0",
@@ -835,8 +899,8 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         frameworks: &[],
     },
     SolutionStack {
-        branch_name: "Docker running on 64bit Amazon Linux 2",
-        platform_version: "3.9.0",
+        branch_name: "ECS running on 64bit Amazon Linux 2023",
+        platform_version: "4.2.0",
         permitted_file_types: &["zip"],
         platform_category: "Docker",
         programming_languages: &[],
@@ -852,6 +916,14 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         frameworks: &[],
     },
     // Java SE (Corretto): a Java SE platform deploys a `jar`.
+    SolutionStack {
+        branch_name: "Corretto 25 running on 64bit Amazon Linux 2023",
+        platform_version: "4.5.0",
+        permitted_file_types: &["jar", "zip"],
+        platform_category: "Java",
+        programming_languages: &[("Java", "25")],
+        frameworks: &[],
+    },
     SolutionStack {
         branch_name: "Corretto 21 running on 64bit Amazon Linux 2023",
         platform_version: "4.4.0",
@@ -869,14 +941,30 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         frameworks: &[],
     },
     SolutionStack {
-        branch_name: "Corretto 11 running on 64bit Amazon Linux 2",
-        platform_version: "3.7.0",
+        branch_name: "Corretto 11 running on 64bit Amazon Linux 2023",
+        platform_version: "4.2.0",
         permitted_file_types: &["jar", "zip"],
         platform_category: "Java",
         programming_languages: &[("Java", "11")],
         frameworks: &[],
     },
+    SolutionStack {
+        branch_name: "Corretto 8 running on 64bit Amazon Linux 2023",
+        platform_version: "4.1.0",
+        permitted_file_types: &["jar", "zip"],
+        platform_category: "Java",
+        programming_languages: &[("Java", "8")],
+        frameworks: &[],
+    },
     // Node.js.
+    SolutionStack {
+        branch_name: "Node.js 24 running on 64bit Amazon Linux 2023",
+        platform_version: "6.7.0",
+        permitted_file_types: &["zip"],
+        platform_category: "Node.js",
+        programming_languages: &[("Node.js", "24")],
+        frameworks: &[],
+    },
     SolutionStack {
         branch_name: "Node.js 22 running on 64bit Amazon Linux 2023",
         platform_version: "6.6.0",
@@ -885,23 +973,15 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         programming_languages: &[("Node.js", "22")],
         frameworks: &[],
     },
-    SolutionStack {
-        branch_name: "Node.js 20 running on 64bit Amazon Linux 2023",
-        platform_version: "6.5.0",
-        permitted_file_types: &["zip"],
-        platform_category: "Node.js",
-        programming_languages: &[("Node.js", "20")],
-        frameworks: &[],
-    },
-    SolutionStack {
-        branch_name: "Node.js 18 running on 64bit Amazon Linux 2023",
-        platform_version: "6.4.0",
-        permitted_file_types: &["zip"],
-        platform_category: "Node.js",
-        programming_languages: &[("Node.js", "18")],
-        frameworks: &[],
-    },
     // PHP.
+    SolutionStack {
+        branch_name: "PHP 8.5 running on 64bit Amazon Linux 2023",
+        platform_version: "4.6.0",
+        permitted_file_types: &["zip"],
+        platform_category: "PHP",
+        programming_languages: &[("PHP", "8.5")],
+        frameworks: &[("PHP-FPM", "")],
+    },
     SolutionStack {
         branch_name: "PHP 8.4 running on 64bit Amazon Linux 2023",
         platform_version: "4.5.0",
@@ -918,13 +998,37 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         programming_languages: &[("PHP", "8.3")],
         frameworks: &[("PHP-FPM", "")],
     },
+    SolutionStack {
+        branch_name: "PHP 8.2 running on 64bit Amazon Linux 2023",
+        platform_version: "4.3.0",
+        permitted_file_types: &["zip"],
+        platform_category: "PHP",
+        programming_languages: &[("PHP", "8.2")],
+        frameworks: &[("PHP-FPM", "")],
+    },
     // Python.
+    SolutionStack {
+        branch_name: "Python 3.14 running on 64bit Amazon Linux 2023",
+        platform_version: "4.7.0",
+        permitted_file_types: &["zip"],
+        platform_category: "Python",
+        programming_languages: &[("Python", "3.14")],
+        frameworks: &[("Gunicorn", "")],
+    },
     SolutionStack {
         branch_name: "Python 3.13 running on 64bit Amazon Linux 2023",
         platform_version: "4.6.0",
         permitted_file_types: &["zip"],
         platform_category: "Python",
         programming_languages: &[("Python", "3.13")],
+        frameworks: &[("Gunicorn", "")],
+    },
+    SolutionStack {
+        branch_name: "Python 3.12 running on 64bit Amazon Linux 2023",
+        platform_version: "4.6.0",
+        permitted_file_types: &["zip"],
+        platform_category: "Python",
+        programming_languages: &[("Python", "3.12")],
         frameworks: &[("Gunicorn", "")],
     },
     SolutionStack {
@@ -935,15 +1039,15 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         programming_languages: &[("Python", "3.11")],
         frameworks: &[("Gunicorn", "")],
     },
-    SolutionStack {
-        branch_name: "Python 3.9 running on 64bit Amazon Linux 2023",
-        platform_version: "4.4.0",
-        permitted_file_types: &["zip"],
-        platform_category: "Python",
-        programming_languages: &[("Python", "3.9")],
-        frameworks: &[("Gunicorn", "")],
-    },
     // Ruby.
+    SolutionStack {
+        branch_name: "Ruby 4.0 running on 64bit Amazon Linux 2023",
+        platform_version: "3.6.0",
+        permitted_file_types: &["zip"],
+        platform_category: "Ruby",
+        programming_languages: &[("Ruby", "4.0")],
+        frameworks: &[("Puma", "")],
+    },
     SolutionStack {
         branch_name: "Ruby 3.4 running on 64bit Amazon Linux 2023",
         platform_version: "3.5.0",
@@ -953,11 +1057,11 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         frameworks: &[("Puma", "")],
     },
     SolutionStack {
-        branch_name: "Ruby 3.2 running on 64bit Amazon Linux 2023",
-        platform_version: "3.4.0",
+        branch_name: "Ruby 3.3 running on 64bit Amazon Linux 2023",
+        platform_version: "3.5.0",
         permitted_file_types: &["zip"],
         platform_category: "Ruby",
-        programming_languages: &[("Ruby", "3.2")],
+        programming_languages: &[("Ruby", "3.3")],
         frameworks: &[("Puma", "")],
     },
     // Tomcat: a Tomcat platform deploys a `war`.
@@ -970,11 +1074,27 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         frameworks: &[("Tomcat", "10.1")],
     },
     SolutionStack {
+        branch_name: "Tomcat 10.1 with Corretto 17 running on 64bit Amazon Linux 2023",
+        platform_version: "5.4.0",
+        permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "17")],
+        frameworks: &[("Tomcat", "10.1")],
+    },
+    SolutionStack {
         branch_name: "Tomcat 9 with Corretto 11 running on 64bit Amazon Linux 2023",
         platform_version: "5.3.0",
         permitted_file_types: &["war", "zip"],
         platform_category: "Tomcat",
         programming_languages: &[("Java", "11")],
+        frameworks: &[("Tomcat", "9")],
+    },
+    SolutionStack {
+        branch_name: "Tomcat 9 with Corretto 8 running on 64bit Amazon Linux 2023",
+        platform_version: "5.3.0",
+        permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "8")],
         frameworks: &[("Tomcat", "9")],
     },
 ];
@@ -2156,17 +2276,29 @@ impl PlatformBranch {
             .is_some_and(|rest| rest == self.branch_name)
     }
 
-    /// The modelled `PlatformBranchSummary` for this record.
+    /// The modelled `PlatformBranchSummary` for this record. `LifecycleState`
+    /// goes on the wire in the capitalized form the service answers with (see
+    /// [`reported_branch_lifecycle_state`]), the same rendering a platform
+    /// version's `PlatformBranchLifecycleState` carries, so the two cannot
+    /// disagree about one branch's state.
     pub fn to_summary(&self) -> PlatformBranchSummary {
         PlatformBranchSummary {
             platform_name: Some(self.platform_name.clone()),
             branch_name: Some(self.branch_name.clone()),
-            lifecycle_state: Some(self.lifecycle_state.clone()),
+            lifecycle_state: Some(reported_branch_lifecycle_state(&self.lifecycle_state)),
             branch_order: self.branch_order,
             supported_tier_list: Some(self.supported_tiers.clone()),
         }
     }
 }
+
+/// Short names for the life-cycle states the catalog table below holds, from
+/// [`PLATFORM_BRANCH_LIFECYCLE_STATES`].
+const SUPPORTED: &str = BRANCH_LIFECYCLE_SUPPORTED;
+/// See [`SUPPORTED`].
+const DEPRECATED: &str = BRANCH_LIFECYCLE_DEPRECATED;
+/// See [`SUPPORTED`].
+const RETIRED: &str = BRANCH_LIFECYCLE_RETIRED;
 
 /// The managed platform branches an account can see in a region, as
 /// `(PlatformName, BranchName, LifecycleState, BranchOrder, SupportedTierList)`.
@@ -2174,226 +2306,735 @@ impl PlatformBranch {
 /// Elastic Beanstalk's platform catalog is service-owned reference data, not
 /// something a caller creates, so it is seeded into the store by
 /// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::default`] and
-/// read from there like any other record. The names and the solution-stack
-/// generations are Elastic Beanstalk's own published platform branches; the
-/// life-cycle states span all four of [`PLATFORM_BRANCH_LIFECYCLE_STATES`] and
-/// the tier lists both of [`SUPPORTED_TIERS`], because the real catalog does
-/// and a caller filtering on either must have something to match. Which
-/// generation sits in which state moves whenever AWS retires one, so this
-/// table is the emulator's catalog rather than a snapshot of any one day's.
+/// read from there like any other record.
+///
+/// SOURCE: Elastic Beanstalk's own published platform-branch inventory — the
+/// "Elastic Beanstalk supported platforms" and "Retired platform branches"
+/// documents, which is what the real `ListPlatformBranches` enumerates. The
+/// catalog is transcribed WHOLE, not sampled: AWS reports every branch of a
+/// platform it has ever published, so each platform here carries its current
+/// branches AND the deprecated and retired generations behind them, in the
+/// documented `PlatformName` groups (a legacy preconfigured-Docker runtime is
+/// its own platform, as `GlassFish` is).
+///
+/// `BranchOrder` is "an ordinal number that designates the order in which
+/// platform branches have been added to a platform" and "a larger `BranchOrder`
+/// value designates a newer platform branch within the platform": AWS issues it
+/// per platform in STEPS OF 100, newest branch highest, leaving the operating
+/// system generations in descending bands (the Amazon Linux 2023 branches above
+/// the Amazon Linux 2 ones above the Amazon Linux ones), and two branches added
+/// together share one ordinal. It is NOT a 0,1,2… position in this table, so it
+/// is carried per row.
+///
+/// The life-cycle state is held in the documented lower-case spelling, which is
+/// the value set a `LifecycleState` filter draws from; it reaches the wire
+/// capitalized through [`reported_branch_lifecycle_state`]. The tier lists cover
+/// both of [`SUPPORTED_TIERS`]: a Linux platform runs web server and worker
+/// environments, a Windows platform and a preconfigured-Docker platform only the
+/// web server tier.
 #[allow(clippy::type_complexity)]
 const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] = &[
     // .NET on Linux.
     (
         ".NET Core on Linux",
+        ".NET 10 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        11300,
+        BOTH_TIERS,
+    ),
+    (
+        ".NET Core on Linux",
         ".NET 9 running on 64bit Amazon Linux 2023",
-        "beta",
-        2,
+        SUPPORTED,
+        11200,
         BOTH_TIERS,
     ),
     (
         ".NET Core on Linux",
         ".NET 8 running on 64bit Amazon Linux 2023",
-        "supported",
-        1,
+        SUPPORTED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        ".NET Core on Linux",
+        ".NET 6 running on 64bit Amazon Linux 2023",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        ".NET Core on Linux",
+        ".NET 6 running on 64bit Amazon Linux 2",
+        RETIRED,
+        10100,
         BOTH_TIERS,
     ),
     (
         ".NET Core on Linux",
         ".NET Core running on 64bit Amazon Linux 2",
-        "deprecated",
-        0,
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
     // .NET on Windows Server: no worker tier runs on Windows.
     (
         ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server 2025",
+        SUPPORTED,
+        10500,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server Core 2025",
+        SUPPORTED,
+        10400,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server 2022",
+        SUPPORTED,
+        10200,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server Core 2022",
+        SUPPORTED,
+        10100,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
         "IIS 10.0 running on 64bit Windows Server 2019",
-        "supported",
-        1,
+        DEPRECATED,
+        10000,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server Core 2019",
+        DEPRECATED,
+        9900,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 10.0 running on 64bit Windows Server 2016",
+        RETIRED,
+        9800,
         WEB_SERVER_ONLY,
     ),
     (
         ".NET on Windows Server",
         "IIS 10.0 running on 64bit Windows Server Core 2016",
-        "retired",
-        0,
+        RETIRED,
+        9700,
         WEB_SERVER_ONLY,
     ),
-    // Docker.
+    // Docker: the Docker platform publishes the single-container Docker branch
+    // and the ECS-managed multi-container branch of each generation.
     (
         "Docker",
         "Docker running on 64bit Amazon Linux 2023",
-        "supported",
-        2,
+        SUPPORTED,
+        12000,
+        BOTH_TIERS,
+    ),
+    (
+        "Docker",
+        "ECS running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        11500,
         BOTH_TIERS,
     ),
     (
         "Docker",
         "Docker running on 64bit Amazon Linux 2",
-        "deprecated",
-        1,
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Docker",
+        "ECS running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Docker",
+        "Docker running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
     (
         "Docker",
         "Multi-container Docker running on 64bit Amazon Linux",
-        "retired",
-        0,
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
-    // Go.
+    // GlassFish: a legacy preconfigured-Docker platform, retired whole.
+    (
+        "GlassFish",
+        "Preconfigured Docker - GlassFish 5.0 running on 64bit Amazon Linux 2",
+        RETIRED,
+        10000,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        "GlassFish",
+        "Preconfigured Docker - GlassFish 5.0 running on 64bit Amazon Linux",
+        RETIRED,
+        9900,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        "GlassFish",
+        "Preconfigured Docker - GlassFish 4.1 running on 64bit Debian jessie",
+        RETIRED,
+        9800,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        "GlassFish",
+        "Preconfigured Docker - GlassFish 4.0 running on 64bit Debian jessie",
+        RETIRED,
+        9700,
+        WEB_SERVER_ONLY,
+    ),
+    // Go. The Amazon Linux 2 generation shipped a preview branch beside the
+    // general one, so both carry that generation's ordinal.
     (
         "Go",
         "Go 1 running on 64bit Amazon Linux 2023",
-        "supported",
-        1,
+        SUPPORTED,
+        12000,
+        BOTH_TIERS,
+    ),
+    (
+        "Go",
+        "(BETA) Go 1 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
         BOTH_TIERS,
     ),
     (
         "Go",
         "Go 1 running on 64bit Amazon Linux 2",
-        "retired",
-        0,
+        RETIRED,
+        11000,
         BOTH_TIERS,
     ),
-    // Java SE (Corretto).
+    (
+        "Go",
+        "Go 1 running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
+        BOTH_TIERS,
+    ),
+    (
+        "Go",
+        "Preconfigured Docker - Go 1.4 running on 64bit Debian jessie",
+        RETIRED,
+        9900,
+        WEB_SERVER_ONLY,
+    ),
+    // Java SE (Corretto): the Amazon Linux 2023 and Amazon Linux 2 generations.
+    (
+        "Corretto",
+        "Corretto 25 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12400,
+        BOTH_TIERS,
+    ),
     (
         "Corretto",
         "Corretto 21 running on 64bit Amazon Linux 2023",
-        "supported",
-        2,
+        SUPPORTED,
+        12300,
         BOTH_TIERS,
     ),
     (
         "Corretto",
         "Corretto 17 running on 64bit Amazon Linux 2023",
-        "supported",
-        1,
+        SUPPORTED,
+        12200,
+        BOTH_TIERS,
+    ),
+    (
+        "Corretto",
+        "Corretto 11 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12100,
+        BOTH_TIERS,
+    ),
+    (
+        "Corretto",
+        "Corretto 8 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12000,
         BOTH_TIERS,
     ),
     (
         "Corretto",
         "Corretto 11 running on 64bit Amazon Linux 2",
-        "deprecated",
-        0,
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Corretto",
+        "Corretto 8 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    // Java: the legacy Java SE branches the Corretto platform replaced are
+    // published under their own platform name, the way the legacy
+    // preconfigured-Docker runtimes are platforms of their own.
+    (
+        "Java",
+        "Java 8 running on 64bit Amazon Linux",
+        RETIRED,
+        10100,
+        BOTH_TIERS,
+    ),
+    (
+        "Java",
+        "Java 7 running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
     // Node.js.
     (
         "Node.js",
+        "Node.js 24 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12300,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
         "Node.js 22 running on 64bit Amazon Linux 2023",
-        "supported",
-        3,
+        SUPPORTED,
+        12200,
         BOTH_TIERS,
     ),
     (
         "Node.js",
         "Node.js 20 running on 64bit Amazon Linux 2023",
-        "supported",
-        2,
+        RETIRED,
+        12100,
         BOTH_TIERS,
     ),
     (
         "Node.js",
         "Node.js 18 running on 64bit Amazon Linux 2023",
-        "deprecated",
-        1,
+        RETIRED,
+        12000,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 18 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11400,
         BOTH_TIERS,
     ),
     (
         "Node.js",
         "Node.js 16 running on 64bit Amazon Linux 2",
-        "retired",
-        0,
+        RETIRED,
+        11300,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 14 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11200,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 12 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js 10 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
     // PHP.
     (
         "PHP",
+        "PHP 8.5 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12400,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
         "PHP 8.4 running on 64bit Amazon Linux 2023",
-        "supported",
-        2,
+        SUPPORTED,
+        12300,
         BOTH_TIERS,
     ),
     (
         "PHP",
         "PHP 8.3 running on 64bit Amazon Linux 2023",
-        "supported",
-        1,
+        SUPPORTED,
+        12200,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 8.2 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12100,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 8.1 running on 64bit Amazon Linux 2023",
+        RETIRED,
+        12000,
         BOTH_TIERS,
     ),
     (
         "PHP",
         "PHP 8.1 running on 64bit Amazon Linux 2",
-        "retired",
-        0,
+        RETIRED,
+        11400,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 8.0 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11300,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 7.4 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11200,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 7.3 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 7.2 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 7.2 running on 64bit Amazon Linux",
+        RETIRED,
+        10400,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 7.1 running on 64bit Amazon Linux",
+        RETIRED,
+        10300,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 7.0 running on 64bit Amazon Linux",
+        RETIRED,
+        10200,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 5.6 running on 64bit Amazon Linux",
+        RETIRED,
+        10100,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "PHP 5.4 running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
     // Python.
     (
         "Python",
+        "Python 3.14 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        13500,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
         "Python 3.13 running on 64bit Amazon Linux 2023",
-        "supported",
-        3,
+        SUPPORTED,
+        13400,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.12 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        13300,
         BOTH_TIERS,
     ),
     (
         "Python",
         "Python 3.11 running on 64bit Amazon Linux 2023",
-        "supported",
-        2,
+        SUPPORTED,
+        13200,
         BOTH_TIERS,
     ),
     (
         "Python",
         "Python 3.9 running on 64bit Amazon Linux 2023",
-        "deprecated",
-        1,
+        RETIRED,
+        13100,
         BOTH_TIERS,
     ),
     (
         "Python",
         "Python 3.8 running on 64bit Amazon Linux 2",
-        "retired",
-        0,
+        RETIRED,
+        12200,
         BOTH_TIERS,
     ),
-    // Ruby.
+    (
+        "Python",
+        "Python 3.7 running on 64bit Amazon Linux 2",
+        RETIRED,
+        12100,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.6 running on 64bit Amazon Linux 2",
+        RETIRED,
+        12000,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.6 running on 64bit Amazon Linux",
+        RETIRED,
+        11200,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.4 running on 64bit Amazon Linux",
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 2.7 running on 64bit Amazon Linux",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Preconfigured Docker - Python 3.4 running on 64bit Debian jessie",
+        RETIRED,
+        10000,
+        WEB_SERVER_ONLY,
+    ),
+    // Ruby, whose Amazon Linux generation published one branch per application
+    // server (Puma, Passenger Standalone) rather than one per runtime version.
+    (
+        "Ruby",
+        "Ruby 4.0 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12400,
+        BOTH_TIERS,
+    ),
     (
         "Ruby",
         "Ruby 3.4 running on 64bit Amazon Linux 2023",
-        "supported",
-        1,
+        SUPPORTED,
+        12300,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 3.3 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12200,
         BOTH_TIERS,
     ),
     (
         "Ruby",
         "Ruby 3.2 running on 64bit Amazon Linux 2023",
-        "deprecated",
-        0,
+        RETIRED,
+        12100,
         BOTH_TIERS,
     ),
-    // Tomcat.
+    (
+        "Ruby",
+        "Ruby 3.1 running on 64bit Amazon Linux 2023",
+        RETIRED,
+        12000,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 3.0 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11300,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.7 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11200,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.6 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.5 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.6 with Puma running on 64bit Amazon Linux",
+        RETIRED,
+        10400,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.6 with Passenger Standalone running on 64bit Amazon Linux",
+        RETIRED,
+        10300,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.4 with Puma running on 64bit Amazon Linux",
+        RETIRED,
+        10200,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.4 with Passenger Standalone running on 64bit Amazon Linux",
+        RETIRED,
+        10100,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Ruby 2.3 with Puma running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
+        BOTH_TIERS,
+    ),
+    // Tomcat: a branch names its servlet container AND the JDK it runs on.
     (
         "Tomcat",
         "Tomcat 10.1 with Corretto 21 running on 64bit Amazon Linux 2023",
-        "supported",
-        2,
+        SUPPORTED,
+        12300,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 10.1 with Corretto 17 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12200,
         BOTH_TIERS,
     ),
     (
         "Tomcat",
         "Tomcat 9 with Corretto 11 running on 64bit Amazon Linux 2023",
-        "supported",
-        1,
+        SUPPORTED,
+        12100,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 9 with Corretto 8 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12000,
         BOTH_TIERS,
     ),
     (
         "Tomcat",
         "Tomcat 8.5 with Corretto 11 running on 64bit Amazon Linux 2",
-        "retired",
-        0,
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 8.5 with Corretto 8 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 8.5 with Java 8 running on 64bit Amazon Linux",
+        RETIRED,
+        10200,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 8 with Java 8 running on 64bit Amazon Linux",
+        RETIRED,
+        10100,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 7 with Java 7 running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
         BOTH_TIERS,
     ),
 ];

@@ -186,14 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.schema_name_prefix.as_deref().unwrap_or_default()
         );
 
-        let matching = registry.schemas.iter().filter(|(name, _)| {
-            input
-                .schema_name_prefix
-                .as_deref()
-                .is_none_or(|prefix| name.starts_with(prefix))
-        });
+        // Selected first (a prefix is a test on the name alone), then COLLATED: the
+        // order a registry's schemas come back in is the collation
+        // `crate::state::schema_name_order_key` defines, not the byte order the store
+        // keys them by, and `Limit`/`NextToken` page over that order — so the page a
+        // token resumes is a page of the order the caller was served.
+        let matching = crate::state::in_schema_name_order(registry.schemas.iter().filter(
+            |(name, _)| {
+                input
+                    .schema_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| name.starts_with(prefix))
+            },
+        ));
         let page = crate::state::page_by_key(
-            matching,
+            matching.into_iter(),
             &selection,
             input.next_token.as_deref(),
             page_size,
