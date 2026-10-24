@@ -37,7 +37,7 @@ pub(crate) const UNKNOWN_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-000
 /// A pattern-valid `PermissionSetArn` that was never minted. Shaped by the model's
 /// `PermissionSetArn` pattern
 /// `^arn:aws(-[a-z]{1,5}){0,3}:sso:::permissionSet/(sso)?ins-[a-zA-Z0-9-.]{16}/ps-[a-zA-Z0-9-./]{16}$`.
-const UNKNOWN_PERMISSION_SET_ARN: &str =
+pub(crate) const UNKNOWN_PERMISSION_SET_ARN: &str =
     "arn:aws:sso:::permissionSet/ssoins-0000000000000000/ps-0000000000000000";
 
 /// The 12-digit `TargetId` most rows use (`^\d{12}$`).
