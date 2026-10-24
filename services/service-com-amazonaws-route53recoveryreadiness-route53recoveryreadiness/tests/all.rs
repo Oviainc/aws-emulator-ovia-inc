@@ -34,5 +34,7 @@ mod readiness_check_lifecycle;
 mod recovery_group_lifecycle;
 #[path = "all/recovery_group_readiness_summary.rs"]
 mod recovery_group_readiness_summary;
+#[path = "all/resource_set_type_catalog.rs"]
+mod resource_set_type_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

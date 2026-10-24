@@ -50,7 +50,7 @@ fn arn_parts(scope: &str) -> (&'static str, &'static str) {
 
 /// The ARN this service mints for a regex pattern set, as
 /// `arn:aws:wafv2:<region>:<account>:<global|regional>/regexpatternset/<name>/<id>`.
-fn regex_pattern_set_arn(scope: &str, name: &str, id: &str) -> String {
+pub(crate) fn regex_pattern_set_arn(scope: &str, name: &str, id: &str) -> String {
     let (region, prefix) = arn_parts(scope);
     let account = engine::EMULATOR_ACCOUNT_ID;
     format!("arn:aws:wafv2:{region}:{account}:{prefix}/regexpatternset/{name}/{id}")
@@ -67,7 +67,7 @@ fn regular_expression_list<S: AsRef<str>>(patterns: &[S]) -> Value {
 }
 
 /// Create a regex pattern set and answer `(id, arn, lock token)`.
-async fn create_regex_pattern_set<S: AsRef<str>>(
+pub(crate) async fn create_regex_pattern_set<S: AsRef<str>>(
     waf: &Waf,
     scope: &str,
     name: &str,
@@ -95,7 +95,7 @@ async fn create_regex_pattern_set<S: AsRef<str>>(
 }
 
 /// `GetRegexPatternSet` for `(scope, name, id)`, as a 200.
-async fn get_regex_pattern_set(waf: &Waf, scope: &str, name: &str, id: &str) -> Value {
+pub(crate) async fn get_regex_pattern_set(waf: &Waf, scope: &str, name: &str, id: &str) -> Value {
     waf.ok(
         "GetRegexPatternSet",
         json!({ "Name": name, "Scope": scope, "Id": id }),

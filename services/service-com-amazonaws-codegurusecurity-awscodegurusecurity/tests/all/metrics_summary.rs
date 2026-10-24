@@ -142,8 +142,8 @@ fn ranking(case: &str, summary: &Value, member: &str, name_key: &str) -> Vec<(St
 }
 
 /// A finding as a scan run's analysis would have stored it. Seeded directly into the
-/// store: this emulator performs no analysis (see `state::SCAN_NOT_ANALYSED_MESSAGE`),
-/// so this is the only way to exercise the metrics over a non-empty store.
+/// store: no request path writes findings yet, so this is the only way to exercise the
+/// metrics over a non-empty store.
 fn seeded_finding(
     finding_id: &str,
     status: &str,

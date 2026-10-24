@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSessions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSessions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the approval sessions of ONE team, in initiation order, out of
+//! [`crate::state`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSessions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member of a reported entry is read off the [`crate::state::Session`] record
+//! `StartApprovalTeamBaseline` wrote, so a listed session can never disagree with what
+//! `GetSession` reports for the same ARN.
+//!
+//! `ApprovalTeamArn` names the team whose sessions are asked for, so this read is
+//! ARN-addressed like every other of this service: an ARN outside the caller's account is
+//! refused 403 BEFORE the lookup, and one the store does not hold earns
+//! `ResourceNotFoundException` (404) with the one not-found sentence this service states.
+//!
+//! `NextToken` is the initiation-order sequence number of the last session the previous
+//! page returned, so the next page is every matching session ordered after it: a client
+//! paging with any `MaxResults` sees each session exactly once. A token that is not one
+//! this service issued earns `ValidationException` (400).
+//!
+//! ## Filters
+//!
+//! `Filters` narrows the listing: a session is reported only when it satisfies EVERY
+//! filter the request carries. `Filter$FieldName`'s documentation names the three fields
+//! this operation supports — `ActionName`, `SessionStatus` and `InitiationTime` — and
+//! `Filter$Operator`'s names the operators each one takes: `EQ | NE | CONTAINS |
+//! NOT_CONTAINS` for `ActionName`, `EQ | NE` for `SessionStatus` and `GT | LT | GTE |
+//! LTE | BETWEEN` for `InitiationTime`, whose `BETWEEN` value is two instants written
+//! `a AND b` (`AND` case-insensitive) and is inclusive of both.
+//!
+//! A filter this operation cannot apply is REFUSED with `ValidationException` (400)
+//! rather than ignored, so a client never reads a page as narrowed when it was not: one
+//! of the other `FilterField` tokens the shared enum declares, an operator the named
+//! field does not take, a filter leaving out `FieldName`, `Operator` or `Value`, a
+//! `SessionStatus` value outside that enum's own token catalog, and a time value that
+//! names no instant are each a refusal naming the member at fault.
+//! `Filter$Value` is a plain string, so the instant in a time filter is read here rather
+//! than by the protocol: the civil part is parsed by the library and shifted by the UTC
+//! offset the one shared reader (`service_common::rfc3339::split_utc_offset`) reports, so
+//! a numeric offset names the same instant as the `Z` form.
+//!
+//! `@readonly`: see the note in `get_approval_team.rs` for why
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] is not a
+//! write of this handler's own.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +196,439 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSessions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSessionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSessions"))
+        // Every member of this answer comes off the stored sessions; nothing in the
+        // request's metadata narrows it.
+        let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can tell
+        // "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.approval_team_arn)
+            .map_err(ListSessionsErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSessionsError::Modeled(ListSessionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        // The filters are read before any session is: a request carrying one this
+        // operation cannot apply is refused, never answered with a page that silently
+        // ignored it. The order of the three refusals is deliberate: the ACCOUNT
+        // boundary above answers first, so a caller outside the account learns nothing
+        // about this request's shape; then the request's own shape (its filters and its
+        // token); then, below, whether the team exists.
+        let predicates = compile_filters(input.filters.as_deref().unwrap_or_default())?;
+
+        // The token is this service's own: the initiation-order position the next page
+        // starts after. Anything else never came from here.
+        let after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0u64,
+            Some(token) => token.parse::<u64>().map_err(|_| {
+                validation("NextToken is not a token this service issued.".to_string())
+            })?,
+        };
+        // `MaxResults` is modelled `range(1..20)` with `default: 20`, so the boundary
+        // validator has already closed it; the clamp only keeps the slice width sane.
+        let page_size =
+            usize::try_from(input.max_results.clamp(1, crate::state::MAX_LIST_PAGE)).unwrap_or(1);
+
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        if state.team(&input.approval_team_arn).is_none() {
+            // The one message this service answers every resource lookup that resolves
+            // to nothing with: a service constant that names neither the operation nor
+            // the ARN asked for (`crate::state::resource_not_found`).
+            return Err(ListSessionsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        }
+
+        let remaining: Vec<&crate::state::Session> = state
+            .team_sessions_in_initiation_order(&input.approval_team_arn)
+            .into_iter()
+            .filter(|session| session.seq > after)
+            .filter(|session| {
+                predicates
+                    .iter()
+                    .all(|predicate| predicate.matches(session))
+            })
+            .collect();
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = page
+            .last()
+            .filter(|_| remaining.len() > page.len())
+            .map(|session| session.seq.to_string());
+
+        Ok(ListSessionsOutput {
+            sessions: Some(page.iter().copied().map(entry).collect()),
+            next_token,
+        })
     }
+}
+
+/// One `ListSessions` entry for a stored session, read member by member off the record
+/// `GetSession` reports from, so the two reads cannot disagree.
+fn entry(session: &crate::state::Session) -> ListSessionsResponseSession {
+    ListSessionsResponseSession {
+        session_arn: Some(session.arn.clone()),
+        approval_team_name: Some(session.approval_team_name.clone()),
+        approval_team_arn: Some(session.approval_team_arn.clone()),
+        initiation_time: Some(::aws_smithy_types::DateTime::from(session.initiation_time)),
+        expiration_time: Some(::aws_smithy_types::DateTime::from(session.expiration_time)),
+        completion_time: session
+            .completion_time
+            .map(::aws_smithy_types::DateTime::from),
+        // `Description` is `length(min: 1, …)`, so a session that recorded none reports
+        // none rather than an empty string.
+        description: session.description.clone(),
+        // The action the session approves is fixed by what it was started FOR
+        // (`crate::state::SessionKind`), not by anything in this request.
+        action_name: Some(session.kind.action_name().to_string()),
+        protected_resource_arn: Some(session.protected_resource_arn.clone()),
+        requester_service_principal: Some(session.requester_service_principal.clone()),
+        requester_principal_arn: Some(session.requester_principal_arn.clone()),
+        requester_region: Some(session.requester_region.clone()),
+        requester_account_id: Some(session.requester_account_id.clone()),
+        status: Some(session.status.as_wire().to_string()),
+        status_code: session.status_code.map(|code| code.as_wire().to_string()),
+        status_message: session.status_message.clone(),
+        action_completion_strategy: Some(session.action_completion_strategy.as_wire().to_string()),
+        // `AdditionalSecurityRequirements` is `length(min: 0, …)`: a session with no
+        // extra requirement reports the empty list it recorded.
+        additional_security_requirements: Some(
+            session
+                .additional_security_requirements
+                .iter()
+                .map(|requirement| requirement.as_wire().to_string())
+                .collect(),
+        ),
+    }
+}
+
+/// The `FilterField` token naming the protected operation a session approves.
+const ACTION_NAME_FIELD: &str = "ActionName";
+
+/// The `FilterField` token naming a session's status.
+const SESSION_STATUS_FIELD: &str = "SessionStatus";
+
+/// The `FilterField` token naming the instant a session was initiated.
+const INITIATION_TIME_FIELD: &str = "InitiationTime";
+
+/// The filters `ListSessions` supports, as `Filter$FieldName`'s documentation lists them
+/// ("The supported filters for ListSessions are: ActionName, SessionStatus, and
+/// InitiationTime"). The other tokens the shared `FilterField` enum declares
+/// (`ApprovalTeamName`, `Vote`, `VotingTime`) belong to other requests.
+const SUPPORTED_FIELDS: &[&str] = &[
+    ACTION_NAME_FIELD,
+    SESSION_STATUS_FIELD,
+    INITIATION_TIME_FIELD,
+];
+
+/// The operators `ActionName` takes, from `Filter$Operator`'s documentation.
+const ACTION_NAME_OPERATORS: &[&str] = &["EQ", "NE", "CONTAINS", "NOT_CONTAINS"];
+
+/// The operators `SessionStatus` takes, from `Filter$Operator`'s documentation.
+const SESSION_STATUS_OPERATORS: &[&str] = &["EQ", "NE"];
+
+/// The operators `InitiationTime` takes, from `Filter$Operator`'s documentation.
+const INITIATION_TIME_OPERATORS: &[&str] = &["GT", "LT", "GTE", "LTE", "BETWEEN"];
+
+/// The operator whose value names TWO instants.
+const BETWEEN_OPERATOR: &str = "BETWEEN";
+
+/// The separator between a `BETWEEN` filter's two values: "specify values in the format
+/// `a AND b` (`AND` is case-insensitive)" (`Filter$Value`).
+const BETWEEN_SEPARATOR: &str = " AND ";
+
+/// Which member of a stored session a text filter reads.
+#[derive(Debug, Clone, Copy)]
+enum TextField {
+    ActionName,
+    SessionStatus,
+}
+
+/// How a text filter compares its value with that member.
+#[derive(Debug, Clone, Copy)]
+enum TextComparison {
+    Equal,
+    NotEqual,
+    Contains,
+    NotContains,
+}
+
+/// Which side of an instant an `InitiationTime` filter admits, and whether the instant
+/// itself is in.
+#[derive(Debug, Clone, Copy)]
+enum TimeBound {
+    After,
+    AtOrAfter,
+    Before,
+    AtOrBefore,
+}
+
+/// One compiled `Filter`: the question it asks of a stored session.
+#[derive(Debug, Clone)]
+enum Predicate {
+    Text {
+        field: TextField,
+        comparison: TextComparison,
+        value: String,
+    },
+    Time {
+        bound: TimeBound,
+        at: ::std::time::SystemTime,
+    },
+    /// `BETWEEN`, which is inclusive of both values it names.
+    Between {
+        from: ::std::time::SystemTime,
+        to: ::std::time::SystemTime,
+    },
+}
+
+impl Predicate {
+    /// Whether this session satisfies the filter.
+    fn matches(&self, session: &crate::state::Session) -> bool {
+        match self {
+            Self::Text {
+                field,
+                comparison,
+                value,
+            } => {
+                let subject = match field {
+                    TextField::ActionName => session.kind.action_name(),
+                    TextField::SessionStatus => session.status.as_wire(),
+                };
+                let value = value.as_str();
+                match comparison {
+                    TextComparison::Equal => subject == value,
+                    TextComparison::NotEqual => subject != value,
+                    TextComparison::Contains => subject.contains(value),
+                    TextComparison::NotContains => !subject.contains(value),
+                }
+            }
+            Self::Time { bound, at } => match bound {
+                TimeBound::After => session.initiation_time > *at,
+                TimeBound::AtOrAfter => session.initiation_time >= *at,
+                TimeBound::Before => session.initiation_time < *at,
+                TimeBound::AtOrBefore => session.initiation_time <= *at,
+            },
+            // A range whose lower value is above its upper one admits nothing, which is
+            // what an inclusive `a..=b` with `a > b` means; it is not a refusal.
+            Self::Between { from, to } => {
+                session.initiation_time >= *from && session.initiation_time <= *to
+            }
+        }
+    }
+}
+
+/// Compile every filter the request carries, refusing the first one this operation cannot
+/// apply. A session has to satisfy all of them, so the order they are applied in does not
+/// change the answer.
+fn compile_filters(filters: &[Filter]) -> Result<Vec<Predicate>, ListSessionsError> {
+    filters
+        .iter()
+        .enumerate()
+        .map(|(index, filter)| compile_filter(index, filter))
+        .collect()
+}
+
+/// Compile the filter at `index`, or refuse it with `ValidationException` (400).
+fn compile_filter(index: usize, filter: &Filter) -> Result<Predicate, ListSessionsError> {
+    // All three members are `@optional` in the model, so absence reaches here; a filter
+    // missing any of them states no question to ask.
+    let field = required(index, "FieldName", filter.field_name.as_deref())?;
+    let operator = required(index, "Operator", filter.operator.as_deref())?;
+    let value = required(index, "Value", filter.value.as_deref())?;
+    match field {
+        ACTION_NAME_FIELD => Ok(Predicate::Text {
+            field: TextField::ActionName,
+            comparison: text_comparison(index, field, operator, ACTION_NAME_OPERATORS)?,
+            value: value.to_string(),
+        }),
+        SESSION_STATUS_FIELD => Ok(Predicate::Text {
+            field: TextField::SessionStatus,
+            comparison: text_comparison(index, field, operator, SESSION_STATUS_OPERATORS)?,
+            // `SessionStatus` is an ENUM, so a value outside its token catalog names no
+            // status any session can be in: refused like every other filter this
+            // operation cannot apply, rather than answered with a narrowing nothing (for
+            // `EQ`) or everything (for `NE`) satisfies.
+            value: declared_status(index, value)?.to_string(),
+        }),
+        INITIATION_TIME_FIELD => time_predicate(index, operator, value),
+        other => Err(validation(format!(
+            "Filters[{index}].FieldName '{other}' is not a filter ListSessions supports; \
+             the supported filters are {}.",
+            SUPPORTED_FIELDS.join(", ")
+        ))),
+    }
+}
+
+/// A `SessionStatus` filter's value, when it is a token that enum declares.
+///
+/// The catalog is the model's own, as the generated `SESSION_STATUS_VALUES` list renders
+/// it, so this reader cannot fall behind the enum.
+fn declared_status(index: usize, value: &str) -> Result<&str, ListSessionsError> {
+    if SESSION_STATUS_VALUES.contains(&value) {
+        return Ok(value);
+    }
+    Err(validation(format!(
+        "Filters[{index}].Value '{value}' is not a status a session can be in; the \
+         {SESSION_STATUS_FIELD} filter accepts {}.",
+        SESSION_STATUS_VALUES.join(" | ")
+    )))
+}
+
+/// One member of a filter, or the refusal naming the one that is missing.
+fn required<'a>(
+    index: usize,
+    member: &str,
+    value: Option<&'a str>,
+) -> Result<&'a str, ListSessionsError> {
+    value.ok_or_else(|| {
+        validation(format!(
+            "Filters[{index}].{member} is required for the filter to be applied."
+        ))
+    })
+}
+
+/// The comparison `operator` asks for, when the field takes it.
+///
+/// One decision rather than two: the operator is read AND held to the field's own
+/// catalog in a single step, so no arm can answer a comparison the field does not take.
+fn text_comparison(
+    index: usize,
+    field: &str,
+    operator: &str,
+    supported: &[&str],
+) -> Result<TextComparison, ListSessionsError> {
+    match operator {
+        "EQ" => Some(TextComparison::Equal),
+        "NE" => Some(TextComparison::NotEqual),
+        "CONTAINS" => Some(TextComparison::Contains),
+        "NOT_CONTAINS" => Some(TextComparison::NotContains),
+        _ => None,
+    }
+    .filter(|_| supported.contains(&operator))
+    .ok_or_else(|| unsupported_operator(index, field, operator, supported))
+}
+
+/// The `InitiationTime` predicate `operator` and `value` ask for.
+fn time_predicate(
+    index: usize,
+    operator: &str,
+    value: &str,
+) -> Result<Predicate, ListSessionsError> {
+    if operator == BETWEEN_OPERATOR {
+        let Some((from, to)) = split_between(value) else {
+            return Err(validation(format!(
+                "Filters[{index}].Value must name two values in the form 'a AND b' for the \
+                 {BETWEEN_OPERATOR} operator."
+            )));
+        };
+        return Ok(Predicate::Between {
+            from: filter_instant(index, from)?,
+            to: filter_instant(index, to)?,
+        });
+    }
+    // The same one-step reading as the text comparisons above: an operator this field
+    // does not take has no bound to stand for.
+    let bound = match operator {
+        "GT" => Some(TimeBound::After),
+        "GTE" => Some(TimeBound::AtOrAfter),
+        "LT" => Some(TimeBound::Before),
+        "LTE" => Some(TimeBound::AtOrBefore),
+        _ => None,
+    }
+    .filter(|_| INITIATION_TIME_OPERATORS.contains(&operator))
+    .ok_or_else(|| {
+        unsupported_operator(
+            index,
+            INITIATION_TIME_FIELD,
+            operator,
+            INITIATION_TIME_OPERATORS,
+        )
+    })?;
+    Ok(Predicate::Time {
+        bound,
+        at: filter_instant(index, value)?,
+    })
+}
+
+/// Split a `BETWEEN` value into the two values it names, around the `AND` separator its
+/// documentation states, which is case-insensitive.
+fn split_between(value: &str) -> Option<(&str, &str)> {
+    // `to_ascii_uppercase` rewrites ASCII bytes in place and leaves every other byte
+    // alone, so an index into it is the same byte index — and the same character
+    // boundary — in the original text.
+    let folded = value.to_ascii_uppercase();
+    let at = folded.find(BETWEEN_SEPARATOR)?;
+    Some((
+        value.get(..at)?.trim(),
+        value.get(at + BETWEEN_SEPARATOR.len()..)?.trim(),
+    ))
+}
+
+/// The instant a filter value names, or the refusal naming the member at fault.
+///
+/// `Filter$Value` is a plain string, so no modelled timestamp reader has run on it, and
+/// the reader the framework uses accepts the `Z` form only. The zone suffix is therefore
+/// read through the ONE shared reader (`service_common::rfc3339::split_utc_offset`) and
+/// the civil part is handed to the library, which keeps the calendar conversion (month
+/// lengths, leap years, a fractional second) out of this operation. That reader is total
+/// over arbitrary text, so a value naming no instant is refused here.
+fn filter_instant(index: usize, value: &str) -> Result<::std::time::SystemTime, ListSessionsError> {
+    instant_named_by(value).ok_or_else(|| {
+        validation(format!(
+            "Filters[{index}].Value must be an ISO 8601 date-time, like \
+             '2026-01-01T00:00:00Z', for the {INITIATION_TIME_FIELD} filter."
+        ))
+    })
+}
+
+/// The instant an ISO 8601 date-time names, or `None` for text naming none.
+///
+/// TOTAL over arbitrary text: the value comes straight off the wire. A value carrying no
+/// zone suffix at all names no instant, since the same civil text stands for a different
+/// instant in every zone.
+fn instant_named_by(value: &str) -> Option<::std::time::SystemTime> {
+    let (civil, offset_seconds) = ::service_common::rfc3339::split_utc_offset(value)?;
+    let civil = ::aws_smithy_types::DateTime::from_str(
+        &format!("{civil}Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    let civil = ::std::time::SystemTime::try_from(civil).ok()?;
+    // The instant is the civil reading shifted BACK by the offset the text declares:
+    // 10:00+02:00 is 08:00 UTC.
+    let shift = ::std::time::Duration::from_secs(offset_seconds.unsigned_abs());
+    if offset_seconds < 0 {
+        civil.checked_add(shift)
+    } else {
+        civil.checked_sub(shift)
+    }
+}
+
+/// The refusal for an operator the named field does not take.
+fn unsupported_operator(
+    index: usize,
+    field: &str,
+    operator: &str,
+    supported: &[&str],
+) -> ListSessionsError {
+    validation(format!(
+        "Filters[{index}].Operator '{operator}' is not supported for the {field} filter; \
+         the supported operators are {}.",
+        supported.join(" | ")
+    ))
+}
+
+/// This operation's modelled `ValidationException` (400).
+fn validation(message: String) -> ListSessionsError {
+    ListSessionsError::Modeled(ListSessionsErrorModeled::ValidationException(
+        ValidationException { message },
+    ))
 }

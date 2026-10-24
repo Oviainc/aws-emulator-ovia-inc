@@ -29,8 +29,9 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
     self as cgs_state, UploadArtifact, UploadedResource, DEFAULT_REGION,
-    SCAN_NOT_ANALYSED_MESSAGE, SCAN_RESOURCE_NOT_UPLOADED_MESSAGE, STANDARD_SCAN_SETTLE_MILLIS,
-    UPLOAD_ARTIFACT_TTL_MILLIS, UPLOAD_CONTENT_MAX_BYTES, UPLOAD_CONTENT_TOTAL_MAX_BYTES,
+    SCAN_RESOURCE_NOT_UPLOADED_MESSAGE, SCAN_STATE_FAILED, SCAN_STATE_SUCCESSFUL,
+    STANDARD_SCAN_SETTLE_MILLIS, UPLOAD_ARTIFACT_TTL_MILLIS, UPLOAD_CONTENT_MAX_BYTES,
+    UPLOAD_CONTENT_TOTAL_MAX_BYTES,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -53,16 +54,17 @@ struct SettledRun {
 
 /// What a request to a published upload target answered.
 #[derive(Debug)]
-struct TargetAnswer {
-    status: u16,
+pub(crate) struct TargetAnswer {
+    pub(crate) status: u16,
     /// The wire error code of a refusal, from `x-amzn-errortype`; empty on a success.
-    error_code: String,
-    body: Vec<u8>,
+    pub(crate) error_code: String,
+    pub(crate) body: Vec<u8>,
 }
 
 /// The `requestHeaders` a `CreateUploadUrl` answered with — "the required headers when
-/// uploading your resource".
-fn required_headers(answer: &Answer) -> BTreeMap<String, String> {
+/// uploading your resource". Shared with `crate::scan_completion`, which drives the same
+/// documented upload.
+pub(crate) fn required_headers(answer: &Answer) -> BTreeMap<String, String> {
     answer
         .get("requestHeaders")
         .as_object()
@@ -92,7 +94,7 @@ fn split_url(url: &str) -> (&str, &str) {
 /// Address a published upload target exactly as a client does: `method` against the host
 /// and path the URL names, with the headers the response said are required, and with NO
 /// credential of any kind — a pre-signed URL is followed unsigned.
-async fn send_to_target(
+pub(crate) async fn send_to_target(
     router: &MultiServiceRouter,
     method: &str,
     url: &str,
@@ -126,7 +128,7 @@ async fn send_to_target(
 }
 
 /// Perform the documented upload: `PUT` the archive to the published target.
-async fn upload(
+pub(crate) async fn upload(
     router: &MultiServiceRouter,
     url: &str,
     headers: &BTreeMap<String, String>,
@@ -208,7 +210,7 @@ async fn wait_for_settle() {
 /// `n` bytes of a zip-shaped archive: the local-file-header signature every zip starts
 /// with (`PK\x03\x04`), then filler, so a case's bytes are distinguishable and are not
 /// text.
-fn archive_of(len: usize, seed: u8) -> Vec<u8> {
+pub(crate) fn archive_of(len: usize, seed: u8) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(len);
     for index in 0..len {
         bytes.push(match index {
@@ -314,9 +316,8 @@ async fn the_published_target_receives_every_shape_of_resource_and_holds_it_for_
         artifacts.push((case, scan_name, artifact));
     }
 
-    // A scan started on an uploaded resource reports that it HAD a resource: the run
-    // still ends in the modelled failure state, because this emulator runs no detectors,
-    // but not for want of the archive.
+    // A scan started on an uploaded resource HAD a resource to analyse, so its run is
+    // carried out and ends in the modelled successful state, reporting no error.
     for (case, scan_name, artifact) in &artifacts {
         let created = create_scan(&router, json!({ "scanName": scan_name }), artifact).await;
         assert_eq!(
@@ -333,9 +334,12 @@ async fn the_published_target_receives_every_shape_of_resource_and_holds_it_for_
             "case {case:?}: GetScan expected 200, got {run:?}"
         );
         assert_eq!(
-            run.error_message, SCAN_NOT_ANALYSED_MESSAGE,
-            "case {case:?}: a run started on an uploaded resource must not report a missing \
-             upload, got {run:?}"
+            run.scan_state, SCAN_STATE_SUCCESSFUL,
+            "case {case:?}: a run started on an uploaded resource completes, got {run:?}"
+        );
+        assert_eq!(
+            run.error_message, "",
+            "case {case:?}: a run that did not fail carries no errorMessage, got {run:?}"
         );
     }
 }
@@ -401,7 +405,7 @@ async fn a_run_started_on_a_target_nothing_was_uploaded_to_reports_the_missing_r
             "case {case:?}: a run with no uploaded resource must report that, got {run:?}"
         );
         assert_eq!(
-            run.scan_state, "Failed",
+            run.scan_state, SCAN_STATE_FAILED,
             "case {case:?}: the run ends in the modelled failure state, got {run:?}"
         );
     }

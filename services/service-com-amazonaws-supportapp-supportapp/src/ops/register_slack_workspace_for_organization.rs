@@ -215,11 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RegisterSlackWorkspaceForOrganizationErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(format!(
-                            "this account already has the maximum of {} registered Slack \
-                             workspaces",
-                            crate::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS
-                        )),
+                        // The same validation envelope every other request-validation
+                        // refusal of this service is worded in, naming the operation
+                        // that was called and restating the documented quota.
+                        message: Some(crate::state::workspace_quota_exceeded_message(Self::NAME)),
                     },
                 )
                 .into(),

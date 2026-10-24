@@ -45,5 +45,7 @@ mod resource_policies;
 mod resource_tags;
 #[path = "all/session_cancellation.rs"]
 mod session_cancellation;
+#[path = "all/session_listing.rs"]
+mod session_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -25,6 +25,8 @@ mod managed_rule_groups;
 mod parameter_validation;
 #[path = "all/regex_pattern_set_lifecycle.rs"]
 mod regex_pattern_set_lifecycle;
+#[path = "all/regex_pattern_set_listing.rs"]
+mod regex_pattern_set_listing;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/rule_group_lifecycle.rs"]

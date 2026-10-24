@@ -2,9 +2,9 @@
 
 //! @op CreateConnector
 //!
-//! Mints a connector: derives its `Type` from the request, stores a full record keyed by a
-//! freshly minted ARN, and answers that ARN. The connector starts `CREATING`; the clock
-//! owes it `ACTIVE` (see [`crate::state::TRANSITION_SPAN`]).
+//! Mints a connector: derives its `Type` and its SCEP `Endpoint` from the request, stores a
+//! full record keyed by a freshly minted ARN, and answers that ARN. The connector starts
+//! `CREATING`; the clock owes it `ACTIVE` (see [`crate::state::TRANSITION_SPAN`]).
 //!
 //! ## Shape of an operation
 //!
@@ -280,7 +280,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let connector_id = crate::state::new_uuid();
         let arn = crate::state::connector_arn(&region, &connector_id);
-        let endpoint = crate::state::connector_endpoint(&region, &connector_id);
+        // `VpcEndpointId` chooses HOW the connector is reachable: without one it is
+        // "accessible over the public internet", with one "accessible only through that
+        // specific VPC endpoint" (the member's own doc). Neither `Connector` nor
+        // `ConnectorSummary` models a `VpcEndpointId` member, so `Endpoint` — the SCEP URL a
+        // client is configured against — is where that choice shows up.
+        let endpoint = crate::state::connector_endpoint(
+            &region,
+            &connector_id,
+            input.vpc_endpoint_id.as_deref(),
+        );
 
         // `Type` follows from the request: absent `MobileDeviceManagement` means a
         // general-purpose connector, an `IntuneConfiguration` means an Intune one — and only

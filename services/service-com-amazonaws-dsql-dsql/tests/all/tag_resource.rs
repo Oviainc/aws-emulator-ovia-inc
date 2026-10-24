@@ -431,6 +431,10 @@ async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
 
 /// RULE: an ARN that names no Aurora DSQL resource at all is refused as invalid input
 /// (400 `ValidationException`) rather than looked up — never with the scaffold's 501.
+///
+/// The BODY of that refusal — the modelled `@required` `reason`, the `fieldList`
+/// naming the member, and the three operations on the tagging path agreeing about
+/// all of it — is asserted in `tests/all/tagging_arn_refusal_body.rs`.
 #[tokio::test]
 async fn tagging_an_arn_that_names_no_dsql_resource_is_refused_as_invalid() {
     let dsql = Dsql::new();

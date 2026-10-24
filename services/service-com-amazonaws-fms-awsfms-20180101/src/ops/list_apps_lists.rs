@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAppsLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAppsLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAppsLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of `AppsListDataSummary` projections of the stored
+//! applications lists, in the stable `ListId` order the store keeps them in. A
+//! REPORTING operation: it writes nothing.
+//!
+//! `DefaultLists` selects WHICH namespace is enumerated — the Firewall Manager
+//! MANAGED lists when it is true, the customer's own lists when it is false (its
+//! modelled default) — the same split `GetAppsList` resolves an id in with its
+//! `DefaultList` member, read off the one stored flag so the two cannot
+//! disagree.
+//!
+//! Organisation-scoped, so it is refused by
+//! [`crate::state::require_administrator`] with HTTP 400 `AccessDeniedException`
+//! when the account/Region has no Firewall Manager administrator association —
+//! before any token is decoded — exactly as the `GetAppsList`, `PutAppsList` and
+//! `DeleteAppsList` operations on the same records are.
+//!
+//! Paging follows the model's `@paginated(inputToken: NextToken, outputToken:
+//! NextToken, items: AppsLists, pageSize: MaxResults)`: at most `MaxResults`
+//! summaries per page, and a `NextToken` ONLY when a list of the selected
+//! namespace remains after the page. The token is opaque and carries the
+//! `ListId` the next page starts at, so it round-trips into the next page
+//! without a server-side cursor.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +142,12 @@ impl From<ListAppsListsErrorModeled> for ListAppsListsError {
     }
 }
 
+/// The largest page `ListAppsLists` serves, which is the maximum the model's
+/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults` (range
+/// 1..100). It bounds the response for every caller, and is the same bound
+/// `ListProtocolsLists` applies.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListAppsLists` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +184,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAppsLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppsListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAppsLists"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAppsListsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // The authorization gate, BEFORE the pagination token is examined.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // A token this service did not mint names no page boundary. The model
+        // declares no client-input error for ListAppsLists, so refuse it as a bad
+        // request rather than inventing a page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a pagination token issued by ListAppsLists",
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // `apps_lists` is ordered by `ListId`, so the boundary is a key: resume at
+        // the first id at or after the token's. With no token the lower bound is
+        // the empty id, which sorts before every `ListId`.
+        let lower = start.unwrap_or_default();
+        // `DefaultLists` chooses the namespace: a Firewall Manager managed list and
+        // a customer list are separate resources that share one id space, and the
+        // stored flag is what tells them apart — the same way `GetAppsList`
+        // resolves an id.
+        let mut remaining = store
+            .apps_lists
+            .range(lower..)
+            .filter(|(_, record)| record.default_list == input.default_lists);
+
+        // The page is bounded by the modelled `PaginationMaxResults` range
+        // (1..100), clamped rather than only capped so a page can never be
+        // empty-with-a-token (which a client would follow forever) if that
+        // validation ever changes.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(0)
+            .clamp(1, MAX_PAGE_SIZE);
+        let apps_lists: Vec<AppsListDataSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.summary())
+            .collect();
+        // A token only when a list of the selected namespace is left AFTER this
+        // page, so the last page carries none.
+        let next_token = remaining
+            .next()
+            .map(|(list_id, _)| crate::state::encode_page_token(list_id));
+
+        Ok(ListAppsListsOutput {
+            apps_lists: Some(apps_lists),
+            next_token,
+        })
     }
 }

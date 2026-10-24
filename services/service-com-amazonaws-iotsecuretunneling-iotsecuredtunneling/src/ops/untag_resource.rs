@@ -3,7 +3,9 @@
 //! @op UntagResource
 //!
 //! Removes the named tag keys from the tag store of the tunnel `resourceArn`
-//! names; a key that is not set is left alone.
+//! names; a key that is not set is left alone. A key in the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
+//! `ValidationException` and removes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +144,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A tag key in the reserved `aws:` namespace belongs to AWS, which a
+        // caller may no more delete than set, and the modelled `TagKey` pattern
+        // admits `:` so the boundary walk cannot refuse it. Checked before
+        // anything is removed, so a request naming one such key removes none of
+        // its keys.
+        if let Some(key) =
+            crate::state::first_reserved_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::reserved_tag_key_message("tagKeys", key),
+            ));
         }
 
         if let Some(stored) = store.tags.get_mut(&input.resource_arn) {

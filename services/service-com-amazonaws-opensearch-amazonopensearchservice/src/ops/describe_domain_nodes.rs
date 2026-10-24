@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDomainNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDomainNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the nodes of the stored [`crate::state::Domain`] record — one
+//! `DomainNodesStatus` per node the domain's `ClusterConfig` provisions, derived from
+//! that record and nothing else.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDomainNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A domain's nodes come in the roles its cluster configuration turns on: data nodes
+//! always ([`NODE_TYPE_DATA`]), dedicated master nodes while
+//! `DedicatedMasterEnabled` is on, and warm nodes while `WarmEnabled` is — each in
+//! the number and of the instance type the `ClusterConfig` member that defines that
+//! role names, each placed in one of the domain's Availability Zones by the shared
+//! topology in [`crate::state`], so this operation and `DescribeDomainHealth` can
+//! never describe one domain's zones differently.
+//!
+//! What is CONFIGURED (the node's role, instance type, zone and storage) is reported
+//! in whatever state the domain is; whether a node is serving or in standby is
+//! something only a RUNNING cluster has, so `NodeStatus` is the modelled
+//! `NotAvailable` until the provisioning the clock owes the domain has fallen due.
+//! A role whose count the record carries no value for contributes no node: an
+//! unknown node is not reported as a node.
+//!
+//! Reporting the nodes materialises only the configuration change the clock already
+//! owed the domain, exactly as [`crate::ops::describe_domain`] does; nothing else is
+//! written.
+//!
+//! Nothing a caller sends sizes this answer: the per-role counts are request fields,
+//! so they are reported only up to [`NODE_CENSUS_LIMIT`], and the zones they spread
+//! over only within the values `ZoneAwarenessConfig$AvailabilityZoneCount`
+//! publishes.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +97,238 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{configured_zone_count, nodes_per_zone, standby_zone_count, zone_name, Domain};
+
+/// `NodeType`'s `Data`: a data node, the role `ClusterConfig$InstanceCount` and
+/// `InstanceType` configure.
+const NODE_TYPE_DATA: &str = "Data";
+
+/// `NodeType`'s `Master`: a dedicated master node, the role
+/// `ClusterConfig$DedicatedMasterCount` and `DedicatedMasterType` configure.
+const NODE_TYPE_MASTER: &str = "Master";
+
+/// `NodeType`'s `Ultrawarm`: a warm node, the role `ClusterConfig$WarmCount` and
+/// `WarmType` configure. `NodeType` is documented as saying "whether the nodes is a
+/// data, master, or UltraWarm node", and `OpenSearchWarmPartitionInstanceType` names
+/// only `ultrawarm1` instances, so a warm node is reported under this value.
+const NODE_TYPE_ULTRAWARM: &str = "Ultrawarm";
+
+/// `NodeStatus`'s `Active`: the node sits in a zone serving the cluster.
+const NODE_STATUS_ACTIVE: &str = "Active";
+
+/// `NodeStatus`'s `StandBy`: the node sits in the zone a multi-AZ-with-standby domain
+/// keeps out of the rotation.
+const NODE_STATUS_STANDBY: &str = "StandBy";
+
+/// `NodeStatus`'s `NotAvailable`: whether the node is active or in standby is not
+/// something the service can report.
+const NODE_STATUS_NOT_AVAILABLE: &str = "NotAvailable";
+
+/// `StorageTypeName`'s `ebs`: "Elastic Block Storage" attached to the node, which
+/// `EBSOptions` configures.
+const STORAGE_TYPE_EBS: &str = "ebs";
+
+/// `StorageTypeName`'s `instance`: "built-in storage available for the instance".
+const STORAGE_TYPE_INSTANCE: &str = "instance";
+
+/// How many nodes of ONE role this operation reports.
+///
+/// This is the emulator's OWN bound on the answer — it models neither Service Quotas
+/// nor an account's adjustments — set at the number OpenSearch Service publishes as
+/// its default data-nodes-per-domain quota. The per-role counts are request fields
+/// (`CreateDomain` and `UpdateDomainConfig` persist the caller's `ClusterConfig`
+/// verbatim, and `IntegerClass` carries no `@range`), so without this bound one
+/// create could size an unbounded response; nothing a caller sends may do that.
+const NODE_CENSUS_LIMIT: i32 = 80;
+
+/// One role a domain's nodes are provisioned in: the `NodeType` the response reports
+/// them under, how many of them the record configures, the instance type they run,
+/// and whether EBS volumes attach to them.
+struct NodeRole {
+    node_type: &'static str,
+    count: Option<i32>,
+    instance_type: Option<String>,
+    ebs_attached: bool,
+}
+
+/// A node's storage, as the three storage members report it.
+struct Storage {
+    /// `StorageType`: "indicates if the node has EBS or instance storage".
+    type_name: &'static str,
+    /// `StorageVolumeType`, for a node on an EBS volume.
+    volume_type: Option<String>,
+    /// `StorageSize`, for a node whose storage size the record carries.
+    size: Option<String>,
+}
+
+/// The roles the stored cluster configuration provisions nodes in.
+///
+/// Data nodes are always one of them — `ClusterConfig$InstanceCount` is the "number
+/// of data nodes in the cluster" — while dedicated master nodes and warm nodes exist
+/// only where the configuration turns them on, so a cluster without them has no node
+/// of that role rather than a count of zero.
+///
+/// `ClusterConfig$NodeOptions` can configure one further role, but
+/// `NodeOptionsNodeType` models only `coordinator` and `NodeType` has no value for
+/// it, so a coordinator node has no node type this response could report it under.
+fn roles(cluster: &ClusterConfig) -> Vec<NodeRole> {
+    let mut roles = vec![NodeRole {
+        node_type: NODE_TYPE_DATA,
+        count: cluster.instance_count,
+        instance_type: cluster.instance_type.clone(),
+        ebs_attached: true,
+    }];
+    if cluster.dedicated_master_enabled == Some(true) {
+        roles.push(NodeRole {
+            node_type: NODE_TYPE_MASTER,
+            count: cluster.dedicated_master_count,
+            instance_type: cluster.dedicated_master_type.clone(),
+            ebs_attached: false,
+        });
+    }
+    if cluster.warm_enabled == Some(true) {
+        roles.push(NodeRole {
+            node_type: NODE_TYPE_ULTRAWARM,
+            count: cluster.warm_count,
+            instance_type: cluster.warm_type.clone(),
+            ebs_attached: false,
+        });
+    }
+    roles
+}
+
+/// The Availability Zone each of a role's nodes sits in, one entry per node: the
+/// index of its zone among the domain's zones, or `None` where the configuration
+/// names no supported number of zones ([`configured_zone_count`]) and the zone a node
+/// sits in is therefore unknown.
+///
+/// Empty for a count the record carries no value for, or a negative one: the role's
+/// nodes are then unknown, and an unknown node is not reported as a node. A count
+/// above [`NODE_CENSUS_LIMIT`] is reported up to that bound.
+fn node_zones(count: Option<i32>, zones: Option<i32>) -> Vec<Option<usize>> {
+    let Some(count) = count
+        .filter(|count| *count >= 0)
+        .map(|count| count.min(NODE_CENSUS_LIMIT))
+    else {
+        return Vec::new();
+    };
+    let Some(zones) = zones else {
+        return vec![None; usize::try_from(count).unwrap_or(0)];
+    };
+    nodes_per_zone(Some(count), zones)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(zone, nodes)| {
+            let nodes = usize::try_from(nodes.unwrap_or(0)).unwrap_or(0);
+            (0..nodes).map(move |_| Some(zone))
+        })
+        .collect()
+}
+
+/// The `NodeId` of the `index`-th node of one role.
+///
+/// DERIVED from the domain the node belongs to, the role it fills and its index
+/// within that role as a name-based v5 UUID — the way this service derives every id
+/// that has to be the same on the next call — so no two nodes share an id and the id
+/// a caller read in one call is the id the next call reports, which a freshly
+/// generated id would not be. The hyphen-free form's 32 hexadecimal digits sit inside
+/// `NodeId`'s `@length(min: 10, max: 40)`.
+fn node_id(domain_id: &str, node_type: &str, index: usize) -> String {
+    ::uuid::Uuid::new_v5(
+        &::uuid::Uuid::NAMESPACE_OID,
+        format!("opensearch/domainNode/{domain_id}/{node_type}/{index}").as_bytes(),
+    )
+    .simple()
+    .to_string()
+}
+
+/// What a node's storage is reported as.
+///
+/// `StorageTypeName` documents the two kinds a domain's storage comes in —
+/// `instance`, "built-in storage available for the instance", and `ebs` — and
+/// `EBSOptions` is about "EBS volumes attached to data nodes", so a node is on EBS
+/// only where it fills a role EBS volumes attach to AND the domain has them turned
+/// on. Every other node runs on its instance's own storage, whose size is a property
+/// of the instance type rather than of the domain record, so there is no size to
+/// report for it — matching `StorageVolumeType`, which is "only applicable for data
+/// nodes".
+fn storage(ebs_attached: bool, ebs: Option<&EBSOptions>) -> Storage {
+    let attached = ebs
+        .filter(|_| ebs_attached)
+        .filter(|options| options.ebs_enabled == Some(true));
+    match attached {
+        Some(options) => Storage {
+            type_name: STORAGE_TYPE_EBS,
+            volume_type: options.volume_type.clone(),
+            // `StorageSize` is "the storage size of the node, in GiB", which is the
+            // unit `EBSOptions$VolumeSize` is specified in. A negative size is no
+            // size at all, so it is reported as none rather than as a size.
+            size: options
+                .volume_size
+                .filter(|size| *size >= 0)
+                .map(|size| size.to_string()),
+        },
+        None => Storage {
+            type_name: STORAGE_TYPE_INSTANCE,
+            volume_type: None,
+            size: None,
+        },
+    }
+}
+
+/// A node's `NodeStatus`: "indicates if the node is active or in standby".
+///
+/// A node in one of the domain's standby zones is in standby and one in a zone
+/// serving the cluster is active — but only once the cluster is up: before then no
+/// node is running, so which of the two it is is not something the service can
+/// report, which is what `NotAvailable` says. It says the same for a node whose zone
+/// the configuration does not name, since standby is a property of the zone the node
+/// sits in.
+fn node_status(up: bool, zone: Option<usize>, serving_zones: Option<usize>) -> &'static str {
+    match (up, zone, serving_zones) {
+        (true, Some(zone), Some(serving)) => {
+            if zone < serving {
+                NODE_STATUS_ACTIVE
+            } else {
+                NODE_STATUS_STANDBY
+            }
+        }
+        _ => NODE_STATUS_NOT_AVAILABLE,
+    }
+}
+
+/// The nodes of the stored domain, as `DescribeDomainNodes` reports them: every role
+/// the configuration provisions, in zone order within each role.
+fn domain_nodes(domain: &Domain) -> Vec<DomainNodesStatus> {
+    let cluster = &domain.cluster_config;
+    let up = domain.cluster_is_up();
+    let zones = configured_zone_count(cluster);
+    let standby = usize::try_from(standby_zone_count(cluster)).unwrap_or(0);
+    // The standby zones are the LAST of the domain's zones, so every zone before this
+    // index is one serving the cluster.
+    let serving_zones = zones
+        .and_then(|zones| usize::try_from(zones).ok())
+        .map(|zones| zones.saturating_sub(standby));
+
+    let mut nodes = Vec::new();
+    for role in roles(cluster) {
+        let storage = storage(role.ebs_attached, domain.ebs_options.as_ref());
+        for (index, zone) in node_zones(role.count, zones).into_iter().enumerate() {
+            nodes.push(DomainNodesStatus {
+                node_id: Some(node_id(&domain.domain_id, role.node_type, index)),
+                node_type: Some(role.node_type.to_string()),
+                availability_zone: zone.and_then(|zone| zone_name(&domain.region, zone)),
+                instance_type: role.instance_type.clone(),
+                node_status: Some(node_status(up, zone, serving_zones).to_string()),
+                storage_type: Some(storage.type_name.to_string()),
+                storage_volume_type: storage.volume_type.clone(),
+                storage_size: storage.size.clone(),
+            });
+        }
+    }
+    nodes
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +403,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDomainNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDomainNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDomainNodes"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Reporting the nodes materialises only the configuration change the clock
+        // already owed this domain at `now` — it would have fallen due whether or not
+        // anybody called. Nothing else about the record changes on a read.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            DescribeDomainNodesErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        Ok(DescribeDomainNodesOutput {
+            domain_nodes_status_list: Some(domain_nodes(domain)),
+        })
     }
 }

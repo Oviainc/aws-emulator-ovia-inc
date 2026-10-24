@@ -287,7 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before this call is materialised before the quota below counts documents.
         store.materialize_due(now);
 
-        if store.document(&region, &input.name).is_some() {
+        // A name is taken when the Region already holds a document of it, whether a
+        // caller created it or Systems Manager publishes it. The reserved-prefix rule
+        // above already refuses every published name, so this is the backstop rather
+        // than the first line of defence.
+        if store.resolve_document(&region, &input.name).is_some() {
             return Err(CreateDocumentErrorModeled::DocumentAlreadyExists(
                 DocumentAlreadyExists {
                     message: Some(format!(
@@ -336,12 +340,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             document_type,
             document_format,
             target_type: input.target_type.clone(),
-            hash: document_hash(&input.content),
+            hash: crate::state::document_content_hash(&input.content),
             content: input.content.clone(),
             parsed,
             requires: input.requires.clone(),
             attachment_names: attachment_names(input.attachments.as_deref()),
             tags: crate::state::to_btree_map(input.tags.clone()),
+            // "The Amazon Web Services user that created the document": this create ran
+            // for the emulator's one account.
+            owner: ::engine::emulator_account_id().to_string(),
             created_date: now,
             // "The status of the SSM document": a document Systems Manager is still
             // registering is `Creating`, and the clock owes its move to `Active` at
@@ -357,14 +364,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             document_description: Some(description),
         })
     }
-}
-
-/// The hash the system takes over a document's content: "The Sha256 or Sha1 hash
-/// created by the system when the document was created" (`DocumentDescription$Hash`),
-/// with "Sha1 hashes have been deprecated", rendered hex the way AWS reports it.
-fn document_hash(content: &str) -> String {
-    use ::sha2::Digest;
-    ::hex::encode(::sha2::Sha256::digest(content.as_bytes()))
 }
 
 /// The attachment names `AttachmentsInformation` reports — "details about the document

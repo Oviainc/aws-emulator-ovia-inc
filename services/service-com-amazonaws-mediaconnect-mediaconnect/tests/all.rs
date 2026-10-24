@@ -89,6 +89,8 @@ mod router_outputs;
 mod state_roundtrip;
 #[path = "all/update_bridge.rs"]
 mod update_bridge;
+#[path = "all/update_bridge_output.rs"]
+mod update_bridge_output;
 #[path = "all/update_bridge_source.rs"]
 mod update_bridge_source;
 #[path = "all/update_bridge_state.rs"]

@@ -33,6 +33,8 @@ mod administrator_gated_operations;
 mod apps_list_lifecycle;
 #[path = "all/apps_list_reporting.rs"]
 mod apps_list_reporting;
+#[path = "all/apps_lists_enumeration.rs"]
+mod apps_lists_enumeration;
 #[path = "all/compliance_status.rs"]
 mod compliance_status;
 #[path = "all/error_message_members.rs"]

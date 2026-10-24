@@ -59,7 +59,7 @@ const QUESTION_DESCRIPTION_MEMBERS: [&str; 5] = [
 
 /// A minimal valid `CreateProfile` request; a caller overrides the members its case
 /// varies.
-fn minimal_profile(name: &str, token: &str) -> Value {
+pub(crate) fn minimal_profile(name: &str, token: &str) -> Value {
     json!({
         "ProfileName": name,
         "ProfileDescription": "a profile under test",
@@ -74,18 +74,18 @@ fn minimal_profile(name: &str, token: &str) -> Value {
 /// A well-formed `ProfileArn` (the modelled
 /// `^arn:aws[-a-z]*:wellarchitected:[a-z]{2}(-gov)?-[a-z]+-\d:\d{12}:profile/[a-z0-9]+$`)
 /// that no stored profile carries.
-fn absent_profile_arn(profile_id: &str) -> String {
+pub(crate) fn absent_profile_arn(profile_id: &str) -> String {
     format!(
         "arn:aws:wellarchitected:us-west-2:{}:profile/{profile_id}",
         engine::emulator_account_id()
     )
 }
 
-fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
+pub(crate) fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
     answer.body.get(name).and_then(Value::as_str).unwrap_or("")
 }
 
-fn profile_of(answer: &Answer) -> Value {
+pub(crate) fn profile_of(answer: &Answer) -> Value {
     answer
         .body
         .get("Profile")
@@ -95,7 +95,7 @@ fn profile_of(answer: &Answer) -> Value {
 
 /// The `(ProfileArn, ProfileVersion)` a successful `CreateProfile` answered with, checked
 /// against the modelled `ProfileArn` pattern and its `@length(..2084)`.
-fn created(answer: &Answer, case: &str) -> (String, String) {
+pub(crate) fn created(answer: &Answer, case: &str) -> (String, String) {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected CreateProfile 200, got {answer:?}"
@@ -129,7 +129,7 @@ fn created(answer: &Answer, case: &str) -> (String, String) {
 /// The `ProfileQuestions` a request's updates must be recorded as: one entry per
 /// `QuestionId` in question-id order, each carrying the choices selected for it as a set.
 /// Computed here from the request, independently of the code under test.
-fn expected_questions(updates: &Value) -> Value {
+pub(crate) fn expected_questions(updates: &Value) -> Value {
     let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for update in updates.as_array().cloned().unwrap_or_default() {
         let question_id = update

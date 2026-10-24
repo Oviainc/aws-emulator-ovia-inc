@@ -145,7 +145,8 @@ pub const READINESS_UNKNOWN: &str = "UNKNOWN";
 /// shape="CreateResourceSetRequest", member="ResourceSetType")`).
 ///
 /// This is the catalog a readiness rule can apply to, and therefore the set of values
-/// `ListRules`' `ResourceType` filter accepts.
+/// every resource-type member of this API accepts: the type a resource set declares as
+/// well as the `ListRules` filter.
 pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::ApiGateway::Stage",
     "AWS::ApiGatewayV2::Stage",
@@ -173,20 +174,22 @@ pub const SUPPORTED_RESOURCE_TYPES: &[&str] = &[
 ///
 /// A CONSTANT, resource-agnostic text, like this service's other refusals: the rejected
 /// value is NOT echoed back and the supported-type catalog is NOT enumerated. The
-/// member it refuses (`ListRules`' `ResourceType`) targets a plain `__string` — no
-/// `@enum`, no `@pattern`, no value list (`smithy_query(query="operation",
-/// operation="ListRules")`) — so the refusal is the OPERATION's own unknown-type check,
-/// not a boundary constraint report: a generated "Member must be one of …" clause would
+/// members it refuses carry no modelled value set — `ListRules`' `ResourceType` is a
+/// plain `__string`, and a resource set's `ResourceSetType` carries only a `@pattern`
+/// (`smithy_query(query="operation", operation="ListRules,CreateResourceSet")`) — so the
+/// refusal is the OPERATION's own unknown-type check, not a boundary constraint report:
+/// a generated "Member must be one of …" clause would
 /// publish the emulator's own catalog as part of the wire contract, and a client reading
 /// the enumeration out of the message would learn a value set the service does not have.
 pub const UNKNOWN_RESOURCE_TYPE_MESSAGE: &str = "Unknown resource type.";
 
-/// Refuse a resource-type filter this API has no readiness rules for.
+/// Refuse a resource type this API has no readiness rules for.
 ///
-/// A filter value outside [`SUPPORTED_RESOURCE_TYPES`] names no resource type this
-/// service has rules for, so it is refused rather than silently ignored — a filter that
+/// A value outside [`SUPPORTED_RESOURCE_TYPES`] names no resource type this service has
+/// rules for, so it is refused rather than honoured: as a `ListRules` filter, one that
 /// is honoured for supported values and dropped for unsupported ones would hand back
-/// the whole catalog for a typo. The refusal carries
+/// the whole catalog for a typo; as the type of a resource set, a stored record would
+/// claim a type the rule surface says does not exist. The refusal carries
 /// [`UNKNOWN_RESOURCE_TYPE_MESSAGE`], which is the same whatever was asked for.
 pub fn validate_resource_type(value: &str) -> Result<(), &'static str> {
     if SUPPORTED_RESOURCE_TYPES.contains(&value) {

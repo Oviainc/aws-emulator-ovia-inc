@@ -1090,9 +1090,9 @@ async fn the_immutable_mode_the_create_omitted_is_the_service_applied_one() {
     );
 }
 
-/// An update REPLACES the whole manifest set, so it is bounded by the same ceiling the
-/// create is: at the ceiling it is accepted, one past it is refused with the modeled
-/// quota error and the stored set is untouched.
+/// An update REPLACES the whole manifest set, so it is bounded by the same range the
+/// create is: at the ceiling it is accepted, one past it is refused as an input failure
+/// (`NUM_MANIFESTS_HIGH`) and the stored set is untouched.
 #[tokio::test]
 async fn an_update_cannot_push_an_endpoint_past_the_manifest_ceiling() {
     // The emulator's own ceiling, from crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT.
@@ -1114,9 +1114,9 @@ async fn an_update_cannot_push_an_endpoint_past_the_manifest_ceiling() {
             .map(|index| json!({"ManifestName": format!("m-{index}")}))
             .collect()
     };
-    for (label, count, expected_status) in [
-        ("at the ceiling", MAX_MANIFESTS, 200),
-        ("one past the ceiling", MAX_MANIFESTS + 1, 402),
+    for (label, count, accepted) in [
+        ("at the ceiling", MAX_MANIFESTS, true),
+        ("one past the ceiling", MAX_MANIFESTS + 1, false),
     ] {
         let (status, body) = emulator
             .update_endpoint(
@@ -1127,16 +1127,13 @@ async fn an_update_cannot_push_an_endpoint_past_the_manifest_ceiling() {
                 &[],
             )
             .await;
-        assert_eq!(
-            status, expected_status,
-            "case {label:?}: expected {expected_status}, got {status} {body}"
-        );
-        if expected_status == 402 {
+        if accepted {
             assert_eq!(
-                error_type(&body),
-                "ServiceQuotaExceededException",
-                "case {label:?}: expected ServiceQuotaExceededException, got {body}"
+                status, 200,
+                "case {label:?}: expected 200, got {status} {body}"
             );
+        } else {
+            assert_validation(label, status, &body, "NUM_MANIFESTS_HIGH");
             assert_eq!(
                 emulator.get_endpoint("grp", "chan", "ep").await.1["HlsManifests"]
                     .as_array()

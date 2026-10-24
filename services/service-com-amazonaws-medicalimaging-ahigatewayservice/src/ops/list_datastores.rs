@@ -7,6 +7,11 @@
 //! (`@readonly`): it writes nothing of its own, and only materialises the status
 //! changes the clock already owed.
 //!
+//! Only the data stores of the region the request was addressed to
+//! ([`crate::state::request_region`]) are enumerated — a data store is a regional
+//! resource — so a listing in a region nothing was created in answers an empty
+//! `datastoreSummaries`.
+//!
 //! The continuation token is opaque on the wire — hex over a marked encoding of the
 //! FULL sort key the next page starts at — so a string this service did not mint is
 //! refused, and paging cannot skip or repeat a store even when the one the token named
@@ -127,7 +132,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         // The status filter must name a modelled `DatastoreStatus`. The boundary
@@ -198,9 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Total order over the whole collection — creation instant first, id to break a
         // tie — so a page boundary is stable no matter how the underlying map iterates.
+        // Only the data stores of the region this request was addressed to are
+        // enumerated: a data store exists in ONE region, so another region's stores are
+        // not part of this collection at all.
         let mut ordered: Vec<&crate::state::Datastore> = store
-            .datastores
-            .values()
+            .datastores_in(&region)
             .filter(|datastore| {
                 status_filter.is_none_or(|status| datastore.datastore_status == status)
             })

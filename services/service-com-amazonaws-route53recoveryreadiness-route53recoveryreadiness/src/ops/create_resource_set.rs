@@ -172,9 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // `ResourceSetType` targets a shape that carries the `@pattern` the API
-        // documents, so the boundary validator has already refused a bad type; the
-        // NAME's input shape carries no constraint, so this is where the rule the
+        // The NAME's input shape carries no constraint, so this is where the rule the
         // output shape states is applied.
         crate::state::validate_name("ResourceSetName", &input.resource_set_name)
             .map_err(|message| {
@@ -182,6 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(message),
                 })
             })?;
+        // The `@pattern` only says the value is SHAPED like a CloudFormation type name;
+        // the member's documentation enumerates the closed catalog of types the
+        // readiness feature can audit, so a pattern-shaped value outside that catalog
+        // names no type this service has readiness rules for and is refused rather than
+        // stored. The same catalog ([`crate::state::SUPPORTED_RESOURCE_TYPES`]) is what
+        // the rule-listing surface admits, so the two cannot disagree about which types
+        // exist.
+        crate::state::validate_resource_type(&input.resource_set_type).map_err(|message| {
+            CreateResourceSetErrorModeled::ValidationException(ValidationException {
+                message: Some(message.to_string()),
+            })
+        })?;
         // CC-02 growth bound: one accepted record must not be arbitrarily large.
         crate::state::validate_resources(&input.resources)
             .and_then(|()| crate::state::validate_tags(input.tags.as_ref()))

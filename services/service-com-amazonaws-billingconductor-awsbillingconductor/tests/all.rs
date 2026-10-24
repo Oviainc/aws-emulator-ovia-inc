@@ -59,6 +59,8 @@ mod pricing_rule_rate_exclusivity;
 mod pricing_rule_update;
 #[path = "all/pricing_rules_associated_to_pricing_plan.rs"]
 mod pricing_rules_associated_to_pricing_plan;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_surface.rs"]

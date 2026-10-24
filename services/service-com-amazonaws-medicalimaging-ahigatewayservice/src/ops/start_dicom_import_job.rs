@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        let datastore_is_active = match store.datastores.get(&input.datastore_id) {
+        // Reached in the region this request was addressed to: a data store exists in
+        // ONE region, so one held in another is not found here at all.
+        let datastore_is_active = match store.datastore_in(&region, &input.datastore_id) {
             Some(datastore) => datastore.is_active(),
             None => {
                 return Err(StartDICOMImportJobErrorModeled::ResourceNotFoundException(
@@ -201,13 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already in the ledger names the job it submitted, so the repeat call reports
         // that job's CURRENT status rather than submitting a second one.
         let token_key = crate::state::client_token_key(
+            &region,
             &format!("StartDICOMImportJob/{}", input.datastore_id),
             &input.client_token,
         );
         if let Some(existing_id) = store.client_tokens.get(&token_key).cloned() {
             if let Some(existing) = store
-                .datastores
-                .get(&input.datastore_id)
+                .datastore_in(&region, &input.datastore_id)
                 .and_then(|datastore| datastore.import_jobs.get(&existing_id))
             {
                 return Ok(StartDICOMImportJobOutput {
@@ -224,8 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // emulator's own ([`crate::state::MAX_IMPORT_JOBS_PER_DATASTORE`]), refused
         // with the operation's modelled quota error.
         if store
-            .datastores
-            .get(&input.datastore_id)
+            .datastore_in(&region, &input.datastore_id)
             .is_some_and(|datastore| {
                 datastore.import_jobs.len() >= crate::state::MAX_IMPORT_JOBS_PER_DATASTORE
             })
@@ -264,8 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Persist FIRST, and refuse rather than branch past the insert: answering 200
         // with a jobId that was never stored would dress absence as success.
         store
-            .datastores
-            .get_mut(&input.datastore_id)
+            .datastore_in_mut(&region, &input.datastore_id)
             .ok_or_else(|| {
                 StartDICOMImportJobErrorModeled::InternalServerException(InternalServerException {
                     message: "the data store could not be reached while submitting the import job"

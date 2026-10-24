@@ -49,5 +49,7 @@ mod stream_listing;
 mod stream_target_authorization;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tagging_arn_refusal_body.rs"]
+mod tagging_arn_refusal_body;
 #[path = "all/vpc_endpoint_service_name.rs"]
 mod vpc_endpoint_service_name;

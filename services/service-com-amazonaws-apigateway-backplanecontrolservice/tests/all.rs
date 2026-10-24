@@ -148,3 +148,5 @@ mod rest_api_create_from_import;
 mod usage_plan_collection;
 #[path = "all/domain_name_access_associations.rs"]
 mod domain_name_access_associations;
+#[path = "all/stage_invoke_endpoint.rs"]
+mod stage_invoke_endpoint;

@@ -287,6 +287,70 @@ pub fn placement_conflict_failure(member: &str) -> crate::ops::types::Validation
     )
 }
 
+/// The tag-key namespace that belongs to Amazon Web Services itself: a key beginning
+/// with this prefix marks a tag the platform applies, so a caller can neither create
+/// one nor delete one.
+///
+/// It is a SERVICE rule rather than a shape constraint: the modelled `TagKey`
+/// (`^[\w.:/=+-@]+$`, `smithy_query(query="shape",shape="TagKey")`) admits a colon, so
+/// the boundary validator passes such a key and the handler is what refuses it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` claims the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// The PREFIX is compared case-insensitively — the namespace is reserved however it is
+/// spelled — while the rest of the key stays the case-sensitive string the caller gave.
+/// A key whose fourth byte falls inside a multi-byte character claims nothing: `get`
+/// answers `None` off a character boundary, so such a key is an ordinary one.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The sentence refusing `member` for carrying tag keys in the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace, or `None` when it carries none.
+///
+/// Built from the request alone: it names the member, every reserved key the request
+/// gave (in sorted order, so a map's iteration order cannot change the text) and the
+/// prefix that is reserved.
+pub fn reserved_tag_key_refusal<'a, I: IntoIterator<Item = &'a str>>(
+    member: &str,
+    keys: I,
+) -> Option<String> {
+    let reserved: BTreeSet<&str> = keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if reserved.is_empty() {
+        return None;
+    }
+    let (noun, verb) = if reserved.len() == 1 {
+        ("key", "claims")
+    } else {
+        ("keys", "claim")
+    };
+    let listed = reserved
+        .iter()
+        .map(|key| format!("{key:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{member} carries the tag {noun} {listed}, which {verb} the reserved \
+         {RESERVED_TAG_KEY_PREFIX} prefix; that namespace belongs to Amazon Web Services, \
+         so a caller can neither create nor delete a tag key in it"
+    ))
+}
+
+/// The `fieldList` entry for [`reserved_tag_key_refusal`], for an operation whose
+/// refusal is an aggregated `ValidationException` ([`aggregate_validation_error`]).
+pub fn reserved_tag_key_failure<'a, I: IntoIterator<Item = &'a str>>(
+    member: &str,
+    keys: I,
+) -> Option<crate::ops::types::ValidationExceptionField> {
+    reserved_tag_key_refusal(member, keys)
+        .map(|message| field_failure_stated(member, message))
+}
+
 /// A `ValidationException` refusing a request that no single member explains.
 pub fn request_validation_error(message: impl Into<String>) -> ValidationException {
     ValidationException {
@@ -1880,36 +1944,51 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
         });
     }
 
-    /// Make room for one more environment, and report whether there is any.
+    /// Whether the store can take one more environment — a pure READ, so a create that
+    /// is then refused for some other reason has changed nothing.
     ///
-    /// Below [`MAX_ENVIRONMENTS`] there is nothing to do. At the cap, the retention
-    /// rule documented on that constant applies: the longest-deleted record is purged
-    /// to admit the new environment, and only a store whose every record is still live
+    /// Below [`MAX_ENVIRONMENTS`] there is always room. At the cap, the retention rule
+    /// documented on that constant applies: a finished (`DELETED`) record can be purged
+    /// to admit the new environment, so only a store whose every record is still live
     /// answers `false` — a live record is never evicted, because a later read must
     /// still report it.
     ///
-    /// Call it after [`Self::materialise_due_transitions`], so an environment whose
-    /// deletion has come due counts as deleted here.
-    pub fn reserve_environment_slot(&mut self) -> bool {
+    /// Ask it after [`Self::materialise_due_transitions`], so an environment whose
+    /// deletion has come due counts as deleted here. The purge itself is
+    /// [`Self::reclaim_environment_slot`].
+    pub fn has_room_for_environment(&self) -> bool {
+        self.environments.len() < MAX_ENVIRONMENTS
+            || self.longest_deleted_environment().is_some()
+    }
+
+    /// Make the room [`Self::has_room_for_environment`] found, by purging the
+    /// longest-deleted record once the store is at [`MAX_ENVIRONMENTS`]; below the cap
+    /// there is nothing to purge.
+    ///
+    /// Call it IMMEDIATELY before inserting the new environment, with nothing that can
+    /// fail left in between: the purge is the one irreversible thing a create does to
+    /// another record, so it must not happen for a create that then answers an error.
+    pub fn reclaim_environment_slot(&mut self) {
         if self.environments.len() < MAX_ENVIRONMENTS {
-            return true;
+            return;
         }
-        let longest_deleted = self
-            .environments
+        if let Some(environment_id) = self.longest_deleted_environment() {
+            self.environments.remove(&environment_id);
+        }
+    }
+
+    /// The `environmentId` of the finished (`DELETED`) record that has been deleted
+    /// longest, which is the one the retention rule reclaims first. `None` when every
+    /// record is still live.
+    fn longest_deleted_environment(&self) -> Option<String> {
+        self.environments
             .values()
             .filter(|environment| environment.state == STATE_DELETED)
             .min_by(|left, right| {
                 (left.modified_at_ms, left.environment_id.as_str())
                     .cmp(&(right.modified_at_ms, right.environment_id.as_str()))
             })
-            .map(|environment| environment.environment_id.clone());
-        match longest_deleted {
-            Some(environment_id) => {
-                self.environments.remove(&environment_id);
-                true
-            }
-            None => false,
-        }
+            .map(|environment| environment.environment_id.clone())
     }
 
     /// The environment `environment_id` names, if this service holds it IN `region`.

@@ -147,9 +147,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            UntagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.resource_arn)),
-            })
+            UntagResourceErrorModeled::NotFoundException(crate::state::pipe_not_found(
+                crate::state::pipe_name_in_arn(&input.resource_arn),
+            ))
         })?;
 
         // Removing a key the pipe does not carry removes nothing and fails nothing, so the

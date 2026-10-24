@@ -52,6 +52,11 @@ const FLOW_ARN: &str =
 /// An output ARN matching the `OutputArn` member pattern
 /// `^arn:.+:mediaconnect.+:output:.+$`.
 const OUTPUT_ARN: &str = "arn:aws:mediaconnect:us-east-1:000000000000:output:collision-case";
+/// A router input ARN matching the `RouterInputArn` shape's pattern
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`
+/// (`smithy_query(query="shape",shape="RouterInputArn")`).
+const ROUTER_INPUT_ARN: &str =
+    "arn:aws:mediaconnect:us-east-1:000000000000:routerInput:abc123def456";
 
 /// One expectation about which item a `crate::ops::…` path names.
 struct TypeRow {
@@ -265,11 +270,16 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             },
         ),
         (
+            // Implemented: it answers the modelled `NotFoundException` (404) for a bridge
+            // ARN this store does not hold.
             "UpdateBridgeOutput",
             "PUT",
             format!("/v1/bridges/{BRIDGE_ARN}/outputs/output-1"),
             "{}",
-            Reached::ScaffoldedStub,
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
         ),
         (
             // Implemented: it answers the modelled `NotFoundException` (404) for a flow
@@ -306,6 +316,15 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
                 status: 404,
                 code: "NotFoundException",
             },
+        ),
+        (
+            // Still a scaffold: it answers the 501 that names it, which is what proves a
+            // request on its own route reaches ITS handler and not a neighbour's.
+            "UpdateRouterInput",
+            "PUT",
+            format!("/v1/routerInput/{ROUTER_INPUT_ARN}"),
+            "{}",
+            Reached::ScaffoldedStub,
         ),
         (
             // Implemented: it answers the modelled `NotFoundException` (404) for a flow

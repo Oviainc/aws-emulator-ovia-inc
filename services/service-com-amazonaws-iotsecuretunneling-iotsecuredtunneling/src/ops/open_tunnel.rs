@@ -186,6 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A tag key in the reserved `aws:` namespace is AWS's own to set, so a
+        // caller-supplied one is refused wherever tags enter this service —
+        // here as well as in `TagResource`, in the same words, and before
+        // anything is minted or stored.
+        if let Some(key) = input.tags.as_deref().and_then(|tags| {
+            crate::state::first_reserved_tag_key(tags.iter().map(|tag| tag.key.as_str()))
+        }) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::reserved_tag_key_message("tags", key),
+            ));
+        }
+
         // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags, and the two tagging
         // entry points agree: refused here as well as in `TagResource`, before
         // anything is minted or stored. The modelled `TagList` length bounds one

@@ -25,6 +25,8 @@ mod domain_batch_describe;
 mod domain_health;
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
+#[path = "all/domain_nodes.rs"]
+mod domain_nodes;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]

@@ -224,7 +224,8 @@ pub struct StoredConnector {
     pub status_reason: Option<String>,
     /// The transition the clock owes, or `None` in a settled status.
     pub pending: Option<PendingTransition>,
-    /// The connector's HTTPS public SCEP URL.
+    /// The connector's HTTPS SCEP URL — derived from the access path the create chose, so a
+    /// connector restricted to one VPC endpoint reports a different host from a public one.
     pub endpoint: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -601,13 +602,38 @@ pub fn connector_arn_of_challenge(challenge_arn: &str) -> Option<&str> {
         .map(|(connector, _)| connector)
 }
 
-/// The connector's HTTPS public SCEP URL (the `Endpoint` member's whole doc).
+/// DNS suffix of a host reachable over the public internet, which is where a connector
+/// created without a VPC endpoint id serves.
+const PUBLIC_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// DNS suffix of a host reachable only through an interface VPC endpoint — the `vpce.`
+/// label AWS PrivateLink puts in front of [`PUBLIC_DNS_SUFFIX`] for an endpoint-specific
+/// DNS name. A connector whose create named a VPC endpoint serves only there.
+const PRIVATE_DNS_SUFFIX: &str = "vpce.amazonaws.com";
+
+/// The connector's HTTPS SCEP URL.
 ///
 /// The model states only that it is an HTTPS SCEP URL, so the host is derived from the
 /// connector's own id and the Region the request was signed for: stable across reads,
 /// distinct for two connectors, and carrying no clock or request id.
-pub fn connector_endpoint(region: &str, connector_id: &str) -> String {
-    format!("https://{connector_id}.scep.{ARN_SERVICE}.{region}.amazonaws.com")
+///
+/// The access path the create chose is part of that derivation, because it is what makes the
+/// URL reachable: with no VPC endpoint id the connector is "accessible over the public
+/// internet" (the `VpcEndpointId` member's own doc) and the host sits under the public DNS
+/// suffix; with one, the connector is "accessible only through that specific VPC endpoint",
+/// so the host is qualified by that endpoint's id and sits under the PrivateLink suffix
+/// instead. Two connectors that differ only in that choice therefore report different hosts.
+pub fn connector_endpoint(
+    region: &str,
+    connector_id: &str,
+    vpc_endpoint_id: Option<&str>,
+) -> String {
+    match vpc_endpoint_id {
+        Some(vpc_endpoint_id) => format!(
+            "https://{connector_id}.scep.{vpc_endpoint_id}.{ARN_SERVICE}.{region}.{PRIVATE_DNS_SUFFIX}"
+        ),
+        None => format!("https://{connector_id}.scep.{ARN_SERVICE}.{region}.{PUBLIC_DNS_SUFFIX}"),
+    }
 }
 
 /// The OIDC parameters an Intune connector publishes for the caller to copy into their

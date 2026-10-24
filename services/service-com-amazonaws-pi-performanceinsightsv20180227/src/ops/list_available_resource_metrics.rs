@@ -26,6 +26,15 @@
 //! gives for an absent, another account's or a wrong-`ServiceType` data source
 //! (see [`crate::state::is_data_source_identifier`]).
 //!
+//! The two refusals are ORDERED: the data source is resolved and authorized
+//! BEFORE the request's `MetricTypes` are inspected. Which metrics a data source
+//! can be queried for is a property of the engine family behind the
+//! `(ServiceType, Identifier)` pair — that member scopes every type by engine
+//! ("All engines", "All engines except for Amazon DocumentDB") — so a request
+//! addressing a data source this account may not read is answered with the
+//! authorization refusal whatever metric types it names, exactly as
+//! `ListAvailableResourceDimensions` answers its own metric list.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -189,14 +198,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
 
+        // Nothing about the data source is answered until the request is
+        // authorized for it: a caller listing the metrics of a data source this
+        // account does not monitor gets the modelled refusal, not an
+        // authoritative-looking catalog. The gate comes FIRST because everything
+        // below judges the request's `MetricTypes` against the catalog the
+        // ADDRESSED data source publishes, which is unknown until the
+        // `(ServiceType, Identifier)` pair has been resolved — the same order
+        // `ListAvailableResourceDimensions` applies to its own metric list.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
         // `MetricTypes` is a list of `SanitizedString`, so the model cannot hold a
         // caller to the four types its own documentation publishes ("os", "db",
         // "db.sql.stats", "db.sql_tokenized.stats", each scoped to the engines
         // that publish it). This loop is what does: a type the service publishes
-        // for no engine, and one the requested `ServiceType` does not publish, are
-        // both argument errors, answered BEFORE the authorization gate so a
-        // request whose own members do not hold together is still answered as the
-        // argument error it is.
+        // for no engine, and one the engine family behind the requested
+        // `ServiceType` does not publish ("All engines except for Amazon
+        // DocumentDB"), are both argument errors about what the resolved data
+        // source carries.
         let mut requested: Vec<&MetricTypeCatalog> = Vec::new();
         for name in &input.metric_types {
             let Some(catalog) = PUBLISHED_METRIC_TYPES
@@ -226,14 +247,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 requested.push(catalog);
             }
-        }
-
-        // Nothing about the data source is answered until the request is
-        // authorized for it: a caller listing the metrics of a data source this
-        // account does not monitor gets the modelled refusal, not an
-        // authoritative-looking catalog.
-        if !crate::state::is_data_source_identifier(&input.identifier) {
-            return Err(not_authorized());
         }
 
         // The metrics of the requested types, in the order the caller named the

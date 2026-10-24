@@ -20,14 +20,14 @@
 //!   request's resolved route key against this service's signing name. EDITED HERE: it
 //!   claims the control plane as the framework's own rule does, and beside it a request
 //!   addressed to a DEPLOYED STAGE's invoke URL — the `execute-api` data plane, which no
-//!   route key names (see [`execute_api`]).
+//!   route key names (see [`invoke`]).
 //! - `override_operation` — which operation serves a request. EDITED HERE: the key and
 //!   the handler stay the generated table's, but each operation is served through
 //!   [`StatedPerOperation`], which states a refused request the way this service states
 //!   it and, ahead of that, answers a query value that cannot be converted to its
 //!   member's modelled type through [`query_coercion`] — a deserialization failure, not
 //!   a constraint violation. A request addressed to a stage invoke URL is served by
-//!   [`execute_api::ExecuteApiSurface`] instead, which the model's routing key cannot
+//!   [`invoke::serve`] instead, which the model's routing key cannot
 //!   name.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
@@ -70,13 +70,15 @@
 //! `{rest-api-id}.execute-api.{region}.amazonaws.com`, whose first label is the api's own
 //! id: it names no service, so the front door can resolve no target service from such a
 //! request and answers `404 UnknownService` for a URL this service told the caller to use.
+//! A client on the machine this emulator runs on resolves that host nowhere at all, so it
+//! points at the emulator's own endpoint and names the api by the STAGE segment of its
+//! path; [`invoke`] resolves both addressings.
 //!
 //! Three seams carry it, and nothing else changes — the same shape
 //! `services/service-com-amazonaws-mediapackagev2-mediapackagev2` uses for its data plane:
 //!
-//! - [`Service::can_handle`] also claims a request addressed to the invoke endpoint of an
-//!   api this service HOLDS ([`invoke::invoke_api_id`]), which is what routes it here at
-//!   all;
+//! - [`Service::can_handle`] also claims a request addressed to a deployed stage of an api
+//!   this service HOLDS ([`invoke::claims_parts`]), which is what routes it here at all;
 //! - [`Service::override_routing_error`] serves the invoke that presents NO credential. An
 //!   invoke names no modelled operation by construction (`/{stage}/{path}` is not in the
 //!   model), so the router reaches exactly this seam for it, and reaches it BEFORE
@@ -356,12 +358,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for CredentialedDataPlane<Eng> 
         _ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            if invoke::invoke_api_id_of_request(req).is_none() {
-                // Unreachable: `override_operation` names this only for a request whose
-                // host is an api's own `execute-api` endpoint.
-                return svc.definition().routing_error_response(req);
+            if invoke::claims_request(&*self.engine, req) {
+                return invoke::serve(&*self.engine, req);
             }
-            invoke::serve(&*self.engine, req)
+            // Unreachable: `override_operation` names this only for a request this data
+            // plane claims.
+            svc.definition().routing_error_response(req)
         })
     }
 
@@ -511,22 +513,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if can_handle_parts(parts) {
             return true;
         }
-        // And the DATA plane: a request addressed to the `execute-api` invoke endpoint of
-        // an api THIS service holds a record for. That host's first label is the api's own
-        // id, which names no service, so the front door can resolve no target service from
-        // it and answers `404 UnknownService` for a URL this service told the caller to
-        // use (`crate::service::invoke`).
+        // And the DATA plane: a request addressed to a DEPLOYED STAGE of an api THIS
+        // service holds a record for. Such a request names no modelled operation and
+        // carries no credential scope naming this service, so the front door could resolve
+        // no target service for it and answered `404 UnknownService` — for a URL this
+        // service told the caller to use (`crate::service::invoke`).
         //
         // The claim is narrowed to an api this service HOLDS, read from the one shared
-        // store, rather than to the host shape alone, because the same host shape is the
-        // invoke endpoint of an HTTP or WebSocket api of the V2 service too: each service
-        // claiming only the ids it minted keeps one claimant per request. `@connections`
-        // is excluded for the same reason — it is ApiGatewayManagementApi's modelled path
-        // space on this host.
-        invoke::invoke_api_id(parts).is_some_and(|api_id| {
-            crate::state::service_state(&*self.engine)
-                .is_some_and(|state| state.lock().rest_apis.contains_key(api_id))
-        })
+        // store, rather than to a host or a path shape alone, because the same shapes are
+        // the invoke endpoint of an HTTP or WebSocket api of the V2 service too: each
+        // service claiming only the ids it minted keeps one claimant per request.
+        // `@connections` is excluded for the same reason — it is ApiGatewayManagementApi's
+        // modelled path space on this host.
+        invoke::claims_parts(&*self.engine, parts)
     }
 
     fn override_operation(
@@ -545,8 +544,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // an `AWS_IAM` method: a credential this names is verified by the router before the
         // method is served, so the two cannot disagree about what counts as a credential
         // (a presigned URL carries its scope in the query string, not in a header).
-        if invoke::invoke_api_id_of_request(req).is_some()
-            && invoke::carries_sigv4_credential(req)
+        if invoke::claims_request(&*self.engine, req) && invoke::carries_sigv4_credential(req)
         {
             return Some(&self.credentialed_data_plane);
         }
@@ -590,7 +588,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Anything else keeps the protocol-correct default for this service's envelope
         // (query -> 400 InvalidAction text/xml, awsJson -> 404, rpcv2Cbor -> 404,
         // rest -> 501) by returning `None`.
-        invoke::invoke_api_id_of_request(req).map(|_| invoke::serve(&*self.engine, req))
+        if invoke::claims_request(&*self.engine, req) {
+            return Some(invoke::serve(&*self.engine, req));
+        }
+        None
     }
 
     fn override_framework_error(

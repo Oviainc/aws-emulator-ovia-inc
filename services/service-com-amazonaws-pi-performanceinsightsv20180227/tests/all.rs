@@ -25,6 +25,8 @@ mod identity_based_authorization;
 mod input_validation;
 #[path = "all/metric_aggregate_function.rs"]
 mod metric_aggregate_function;
+#[path = "all/metric_type_refusal_order.rs"]
+mod metric_type_refusal_order;
 #[path = "all/performance_analysis_reports.rs"]
 mod performance_analysis_reports;
 #[path = "all/pi_harness.rs"]

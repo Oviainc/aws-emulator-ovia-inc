@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op LookupDeveloperIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `LookupDeveloperIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`LookupDeveloperIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +102,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most developer user identifiers one page of this listing carries when the request
+/// names no `MaxResults`: the modelled maximum of that member itself (`QueryLimit`,
+/// `range 1..60` —
+/// `smithy_query(query="operation",operation="LookupDeveloperIdentity")`), so a caller
+/// that asks for no particular page size gets the largest page it could have asked for.
+const DEFAULT_MAX_RESULTS: usize = 60;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,18 +182,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `LookupDeveloperIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(LookupDeveloperIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("LookupDeveloperIdentity"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                LookupDeveloperIdentityErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the identity-pool store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A LOOKUP: it reports what the developer-identity mappings of a stored pool
+        // already say and writes nothing, so a later caller sees exactly what it saw.
+        let store = state.lock();
+
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
+            return Err(
+                LookupDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "IdentityPool '{}' not found.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A developer identity is a login of the pool keyed by the pool's own
+        // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
+        // users" — whose value is the developer user identifier. A pool that names no
+        // developer provider therefore holds no developer-identity mapping at all.
+        let developer_provider = pool.developer_provider_name.clone();
+
+        // An identity the request names must be one of THIS pool's: an identity belongs
+        // to the pool that minted it and never moves, so a request reaching an identity
+        // of another pool is refused as one the caller may not reach here, while an
+        // identity no pool holds is simply not stored.
+        if let Some(identity_id) = &input.identity_id {
+            let Some(identity) = store.identities.get(identity_id) else {
+                return Err(
+                    LookupDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("Identity '{identity_id}' not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if identity.identity_pool_id != input.identity_pool_id {
+                return Err(
+                    LookupDeveloperIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(format!(
+                                "Access to Identity '{identity_id}' is forbidden."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The identity a developer user identifier of this pool is registered under, if
+        // any — the mapping `GetOpenIdTokenForDeveloperIdentity` wrote.
+        let registered_to = developer_provider
+            .as_deref()
+            .zip(input.developer_user_identifier.as_deref())
+            .and_then(|(provider, identifier)| {
+                store
+                    .linked_identity(&input.identity_pool_id, provider, identifier)
+                    .cloned()
+            });
+
+        // Every developer user identifier of one identity of this pool, in the stable
+        // order the store reports its logins in. A pool that names no developer provider
+        // has no such login at all.
+        let identifiers_of = |identity_id: &str| -> Vec<String> {
+            developer_provider.as_deref().map_or_else(Vec::new, |provider| {
+                store.logins_of_identity(&input.identity_pool_id, provider, identity_id)
+            })
+        };
+
+        // "Either IdentityID or DeveloperUserIdentifier must not be null. If you supply
+        // only one of these values, the other value will be searched in the database and
+        // returned as a part of the response. If you supply both, DeveloperUserIdentifier
+        // will be matched against IdentityID [...] Otherwise, a ResourceConflictException
+        // is thrown."
+        let (identity_id, identifiers) = match (
+            input.identity_id.clone(),
+            input.developer_user_identifier.clone(),
+        ) {
+            (Some(identity_id), Some(identifier)) => {
+                if registered_to.as_deref() != Some(identity_id.as_str()) {
+                    return Err(
+                        LookupDeveloperIdentityErrorModeled::ResourceConflictException(
+                            ResourceConflictException {
+                                message: Some(format!(
+                                    "Developer user identifier '{identifier}' is not registered \
+                                     under identity '{identity_id}'."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // Verified against the store, so the response is the request's own pair.
+                (identity_id, vec![identifier])
+            }
+            (Some(identity_id), None) => {
+                let identifiers = identifiers_of(&identity_id);
+                (identity_id, identifiers)
+            }
+            (None, Some(identifier)) => {
+                let Some(identity_id) = registered_to else {
+                    return Err(
+                        LookupDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: Some(format!(
+                                    "Developer user identifier '{identifier}' is not registered \
+                                     in identity pool '{}'.",
+                                    input.identity_pool_id
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                (identity_id, vec![identifier])
+            }
+            (None, None) => {
+                return Err(
+                    LookupDeveloperIdentityErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "Invalid value for parameters IdentityId and \
+                                 DeveloperUserIdentifier: at least one of them must be \
+                                 supplied."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // A page resumes at the identifier the previous page's token named. The list is
+        // sorted, so the resumption point is the first identifier that is not before the
+        // cursor: a token this pool issued keeps advancing even if the identifier it named
+        // was unlinked between two pages, and a token this service did not mint for this
+        // pool does not decode at all and is the only refusal here.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_pagination_token(&input.identity_pool_id, token)
+                else {
+                    return Err(
+                        LookupDeveloperIdentityErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(
+                                    "Invalid value for parameter NextToken: it is not a \
+                                     pagination token this identity pool issued."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                identifiers.partition_point(|identifier| identifier.as_str() < cursor.as_str())
+            }
+        };
+
+        // `MaxResults` carries a modelled 1..60 range, so a value outside it was refused
+        // before this handler ran; its absence is [`DEFAULT_MAX_RESULTS`]. The floor of
+        // one is belt-and-braces for a path the model does not cover: a page of zero would
+        // answer a token that never advances, so pagination keeps making progress whatever
+        // reaches here.
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .max(1);
+        let end = start.saturating_add(page_size).min(identifiers.len());
+
+        // The token is absent on the last page, which is how a caller knows it is done.
+        let next_token = identifiers
+            .get(end)
+            .map(|cursor| crate::state::encode_pagination_token(&input.identity_pool_id, cursor));
+
+        Ok(LookupDeveloperIdentityOutput {
+            identity_id: Some(identity_id),
+            developer_user_identifier_list: Some(identifiers[start..end].to_vec()),
+            next_token,
+        })
     }
 }

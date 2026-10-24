@@ -11,10 +11,11 @@
 //! later read. An unknown group or channel is a `ResourceNotFoundException`; an
 //! endpoint name already used on that channel is a `ConflictException`.
 //!
-//! Two rules the model states but cannot express as a member constraint are enforced
-//! before anything is stored, both through [`crate::state::manifest_set_violation`]:
-//! an endpoint needs at least one manifest (`NUM_MANIFESTS_LOW`), and no manifest family
-//! its `ContainerType` cannot serve. The operation is also `@idempotent` and binds
+//! The rules the model states but cannot express as a member constraint are enforced
+//! before anything is stored, all through [`crate::state::manifest_set_violation`]: the
+//! manifest count stays inside the permitted range (`NUM_MANIFESTS_LOW` /
+//! `NUM_MANIFESTS_HIGH`), and no manifest family its `ContainerType` cannot serve. The
+//! operation is also `@idempotent` and binds
 //! `ClientToken` with `@idempotencyToken`: an unchanged repeat under the same token
 //! replays the endpoint it created, and a changed one is a `ConflictException` /
 //! `IDEMPOTENT_PARAMETER_MISMATCH`.
@@ -310,8 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The manifest-set rules are about the request alone, so they are decided before
         // the store is consulted and before anything is written: an endpoint with no
-        // manifest can serve nothing, and a manifest family its container type cannot
-        // carry would be published as an unplayable URL.
+        // manifest can serve nothing, a count past the ceiling would make the stored
+        // record's size caller-chosen (every manifest is persisted with its computed
+        // URL), and a manifest family its container type cannot carry would be published
+        // as an unplayable URL.
         if let Some(violation) = crate::state::manifest_set_violation(
             &input.container_type,
             manifest_counts(&input),
@@ -423,20 +426,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // Every submitted manifest is persisted with its computed URL, so the record's
-        // size is bounded too, not just the number of records. The same ceiling bounds
-        // the update path, so an endpoint's record size cannot be grown past it later.
-        if let Some(message) = crate::state::manifest_ceiling_exceeded(manifest_counts(&input)) {
-            return Err(
-                CreateOriginEndpointErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
         let name = input.origin_endpoint_name.clone();
         let at = crate::state::ManifestLocation {
             egress_domain: &egress_domain,

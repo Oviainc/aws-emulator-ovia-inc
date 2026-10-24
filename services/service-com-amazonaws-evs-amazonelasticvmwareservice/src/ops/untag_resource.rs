@@ -2,7 +2,12 @@
 
 //! @op UntagResource
 //! Removes the named tag keys from the stored environment the ARN names. `@idempotent`:
-//! a key the resource does not carry is not an error. An ARN this service holds no
+//! a key the resource does not carry is not an error. A key in AWS's reserved `aws:`
+//! namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased)
+//! is refused with this operation's own tag-policy refusal and removes nothing: that
+//! namespace is Amazon Web Services' own, so a caller can neither create nor delete a
+//! tag key in it. That is a rule about the REQUEST, so it is judged before the ARN is
+//! resolved, exactly as in `TagResource`. An ARN this service holds no
 //! environment for is a `ResourceNotFoundException` — the tagging surface's own,
 //! answered with HTTP 400 and carrying the request's `resourceArn` (see
 //! `crate::scaffolded`).
@@ -159,6 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut state = state.lock();
         state.materialise_due_transitions();
+
+        // The reserved `aws:` namespace is Amazon Web Services' own: a caller can no
+        // more delete a tag in it than create one, so a request naming such a key is
+        // refused with this operation's tag-policy refusal (HTTP 400) and removes
+        // nothing — the same rule `TagResource` applies to the keys it writes.
+        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(
+                UntagResourceErrorModeled::TagPolicyException(TagPolicyException {
+                    message: refusal,
+                })
+                .into(),
+            );
+        }
 
         let environment = state
             .environment_by_arn_mut(&input.resource_arn)

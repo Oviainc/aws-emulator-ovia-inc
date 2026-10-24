@@ -266,6 +266,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let cluster_name = crate::state::fold_name(&input.cluster_name);
+        // The node the cluster's shards run on, checked against the node types MemoryDB
+        // publishes. A VALUE check, so it is made BEFORE the request's references to
+        // other resources are resolved: a node type this service does not offer is
+        // refused whether or not the ACL, parameter group or subnet group the request
+        // names exists.
+        if let Some(message) = crate::state::node_type_rejection(&input.node_type) {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // `ACLName` names an ACL, so it is bounded by the same name rule before it is
         // resolved: a malformed name is a VALUE the service refuses, not an ACL that
         // happens not to exist.
@@ -286,6 +299,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // run is a value it cannot serve, and a version belonging to ANOTHER engine is a
         // combination that names no engine version at all.
         let engine = input.engine.clone();
+        // Every MemoryDB cluster is a REPLICATED cluster, so an engine that does not
+        // replicate can back none of them: that is a combination of what was asked for
+        // and what the engine can do, and it is the stronger statement about `Engine`,
+        // so it is made before the catalog check below.
+        if let Some(message) = crate::state::engine_replication_rejection(engine.as_deref()) {
+            return Err(
+                CreateClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         if let Some(message) = crate::state::engine_rejection(engine.as_deref()) {
             return Err(CreateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
@@ -410,6 +437,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "The maximum number of clusters ({}) has been reached.",
                             crate::state::MAX_RESOURCES_PER_KIND
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A cluster restored from a snapshot can only come from a snapshot that exists:
+        // `SnapshotName` names a resource, so it is resolved against the store — and
+        // resolved BEFORE the cluster's ACL, which is the reference this operation
+        // resolves last. This service keeps no snapshots (every snapshot write path is
+        // still scaffolded, so none can ever have been created), so no name names one.
+        if let Some(snapshot_name) = input.snapshot_name.as_deref() {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!("A snapshot named {snapshot_name} does not exist.")),
+                },
+            )
+            .into());
+        }
+        // A cluster joining a multi-Region cluster can only join one that exists:
+        // `MultiRegionClusterName` names a resource, so it too is resolved against the
+        // store before the ACL. This service keeps no multi-Region clusters (that write
+        // path is still scaffolded), so no name names one.
+        if let Some(multi_region_cluster_name) = input.multi_region_cluster_name.as_deref() {
+            return Err(
+                CreateClusterErrorModeled::MultiRegionClusterNotFoundFault(
+                    MultiRegionClusterNotFoundFault {
+                        message: Some(format!(
+                            "Multi-Region Cluster {multi_region_cluster_name} does not exist."
                         )),
                     },
                 )

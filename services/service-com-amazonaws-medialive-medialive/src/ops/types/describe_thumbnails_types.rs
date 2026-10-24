@@ -32,12 +32,96 @@ pub struct ThumbnailDetail {
     pub thumbnails: Option<Vec<Thumbnail>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#Thumbnail")]
+/// `Thumbnail`, with its schema written out instead of derived because `TimeStamp`
+/// targets `__timestampIso8601`, which is `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices, and every member is optional
+/// exactly as the derive has them.
+///
+/// Like `ClusterAlert` it DOES carry a deserializer: it is the element of
+/// `ThumbnailDetail$Thumbnails`, and the derive on that shape reads each element through
+/// `DeserializableStruct`.
 #[derive(Debug, Clone, Default)]
 pub struct Thumbnail {
     pub body: Option<String>,
     pub content_type: Option<String>,
     pub thumbnail_type: Option<String>,
     pub time_stamp: Option<::aws_smithy_types::DateTime>,
+}
+
+impl Thumbnail {
+    const M_BODY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("Thumbnail", "Body", "body", String, 0);
+    const M_CONTENT_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("Thumbnail", "ContentType", "contentType", String, 1);
+    // `ThumbnailType` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_THUMBNAIL_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("Thumbnail", "ThumbnailType", "thumbnailType", String, 2);
+    const M_TIME_STAMP: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("Thumbnail", "TimeStamp", "timeStamp", 3);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#Thumbnail",
+            shared_types::NAMESPACE,
+            "Thumbnail",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_BODY,
+            &Self::M_CONTENT_TYPE,
+            &Self::M_THUMBNAIL_TYPE,
+            &Self::M_TIME_STAMP,
+        ],
+    );
+}
+
+pub static THUMBNAIL_SCHEMA: &::aws_smithy_schema::Schema = &Thumbnail::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Thumbnail {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.body.as_ref() {
+            serializer.write_string(&Self::M_BODY, value.as_str())?;
+        }
+        if let Some(value) = self.content_type.as_ref() {
+            serializer.write_string(&Self::M_CONTENT_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.thumbnail_type.as_ref() {
+            serializer.write_string(&Self::M_THUMBNAIL_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.time_stamp.as_ref() {
+            serializer.write_timestamp(&Self::M_TIME_STAMP, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Thumbnail {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut thumbnail = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => thumbnail.body = Some(reader.read_string(&Self::M_BODY)?),
+                Some(1) => {
+                    thumbnail.content_type = Some(reader.read_string(&Self::M_CONTENT_TYPE)?);
+                }
+                Some(2) => {
+                    thumbnail.thumbnail_type = Some(reader.read_string(&Self::M_THUMBNAIL_TYPE)?);
+                }
+                Some(3) => {
+                    thumbnail.time_stamp = Some(reader.read_timestamp(&Self::M_TIME_STAMP)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(thumbnail)
+    }
 }
 

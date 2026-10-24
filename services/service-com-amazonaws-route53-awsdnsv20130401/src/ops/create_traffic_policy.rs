@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +74,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use crate::state::{
+    resource_location, traffic_policy_record_type, StoredTrafficPolicy,
+    StoredTrafficPolicyVersion, FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICIES,
+};
+
+/// The refusal text a `Name` that already names a traffic policy is answered
+/// with (`TrafficPolicyAlreadyExists`, HTTP 409).
+///
+/// A CONSTANT, naming neither the name nor the policy already carrying it: the
+/// shape's own documentation states the rule without either ("A traffic policy
+/// that has the same value for Name already exists"), and the id of the policy
+/// holding the name is server-generated, so a refusal quoting it would differ
+/// on every run. The policy holding the name is in state, where a
+/// traffic-policy read reports it.
+const TRAFFIC_POLICY_ALREADY_EXISTS_MESSAGE: &str =
+    "A traffic policy with the specified name already exists.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -154,18 +164,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            CreateTrafficPolicyErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The document IS the policy's definition, and the policy's `Type` is
+        // the record type that document names, so a document the format does
+        // not define has no policy to create and no type to report.
+        let record_type = traffic_policy_record_type(&input.document).map_err(|reason| {
+            CreateTrafficPolicyErrorModeled::InvalidTrafficPolicyDocument(
+                InvalidTrafficPolicyDocument {
+                    message: Some(format!("Invalid traffic policy document: {reason}")),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+
+        // The account's own quota: a caller chooses the name freely, so without
+        // this the store would grow for every distinct one it sends.
+        if store.traffic_policies.len() >= MAX_TRAFFIC_POLICIES {
+            return Err(CreateTrafficPolicyErrorModeled::TooManyTrafficPolicies(
+                TooManyTrafficPolicies {
+                    message: Some(format!(
+                        "the current account has reached the limit of {MAX_TRAFFIC_POLICIES} \
+                         traffic policies"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The name identifies the policy for the caller, so a second policy
+        // cannot take a name the account already holds: a further version of
+        // the existing one is created through CreateTrafficPolicyVersion.
+        if store.traffic_policy_with_name(&input.name).is_some() {
+            return Err(CreateTrafficPolicyErrorModeled::TrafficPolicyAlreadyExists(
+                TrafficPolicyAlreadyExists {
+                    message: Some(TRAFFIC_POLICY_ALREADY_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_traffic_policy_id();
+        let mut versions = BTreeMap::new();
+        versions.insert(
+            FIRST_TRAFFIC_POLICY_VERSION,
+            StoredTrafficPolicyVersion {
+                record_type,
+                document: input.document,
+                comment: input.comment,
+            },
+        );
+        store.traffic_policies.insert(
+            id.clone(),
+            StoredTrafficPolicy {
+                id: id.clone(),
+                name: input.name,
+                versions,
+            },
+        );
+
+        // Read the response back out of the store, so what the caller is told
+        // is what a later GetTrafficPolicy will tell it.
+        let traffic_policy = store
+            .traffic_policies
+            .get(&id)
+            .and_then(|policy| policy.to_traffic_policy(FIRST_TRAFFIC_POLICY_VERSION))
+            .expect("the traffic policy just inserted must be present");
+        Ok(CreateTrafficPolicyOutput {
+            location: resource_location(
+                ctx,
+                &format!("trafficpolicy/{id}/{FIRST_TRAFFIC_POLICY_VERSION}"),
+            ),
+            traffic_policy,
+        })
     }
 }

@@ -6,9 +6,12 @@
 //! `GetCampaignState` serve the same record. The create is GATED on the Connect
 //! instance it names being onboarded to Campaigns — the instance store
 //! `StartInstanceOnboardingJob` writes and `GetConnectInstanceConfig` reads — and
-//! answers the modelled `ResourceNotFoundException` (HTTP 404) when it is not. The
-//! store is bounded at `crate::state::MAX_CAMPAIGNS`; past that a create answers the
-//! modelled `ServiceQuotaExceededException` (HTTP 402).
+//! answers the modelled `ResourceNotFoundException` (HTTP 404) when it is not. A
+//! campaign name identifies a campaign within its Connect instance, so a create for
+//! a name that instance already holds mints nothing and answers the modelled
+//! `ConflictException` (HTTP 409). The store is bounded at
+//! `crate::state::MAX_CAMPAIGNS`; past that a create answers the modelled
+//! `ServiceQuotaExceededException` (HTTP 402).
 //!
 //! ## Shape of an operation
 //!
@@ -225,6 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.next_campaign_id();
         let arn = crate::state::campaign_arn(&region, &id);
 
+        // Kept for the refusal below: both members move into the record.
+        let requested_name = input.name.clone();
+        let requested_instance = input.connect_instance_id.clone();
+
         let stored = store.insert_new_campaign(crate::state::StoredCampaign {
             id,
             arn,
@@ -259,6 +266,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         x_amz_error_type: None,
                     },
                 )
+                .into())
+            }
+            // The Connect instance already holds a campaign of that name. A
+            // campaign name identifies a campaign within its instance, so this
+            // request names a resource that exists rather than describing a new
+            // one: nothing is stored and it is refused with the error the model
+            // declares for a conflict with the current state of the resource.
+            Err(crate::state::InsertRejected::NameTaken) => {
+                return Err(CreateCampaignErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "A campaign named {requested_name} already exists in Connect instance {requested_instance}"
+                    ),
+                    x_amz_error_type: None,
+                })
                 .into())
             }
             // The id the store minted is already in use. Nothing was stored, and

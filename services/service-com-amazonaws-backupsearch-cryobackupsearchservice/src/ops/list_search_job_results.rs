@@ -2,7 +2,11 @@
 
 //! @op ListSearchJobResults
 //! Pages over the matches one search job recorded: exactly the `Results` held on that
-//! job's record in [`crate::state`], paged by `MaxResults`/`NextToken`. An identifier
+//! job's record in [`crate::state`], paged by `MaxResults`/`NextToken`. Those are the
+//! items of the recovery points the job's scope resolved to that its `ItemFilters`
+//! admitted, recorded when the scan got through its scope — so this listing and
+//! `GetSearchJob`'s `ItemsMatchedCount` are read off the same record and cannot
+//! disagree. An identifier
 //! this account holds no job for is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation

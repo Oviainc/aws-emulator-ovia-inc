@@ -1081,6 +1081,9 @@ pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
 /// The `NextToken` scope `ListRotationOverrides` issues and accepts.
 pub const TOKEN_SCOPE_ROTATION_OVERRIDES: &str = "rotation-overrides";
 
+/// The `NextToken` scope `ListPageResolutions` issues and accepts.
+pub const TOKEN_SCOPE_PAGE_RESOLUTIONS: &str = "page-resolutions";
+
 /// Cut `items` (already filtered, in key order, and already positioned past any
 /// `NextToken`) down to one page.
 ///

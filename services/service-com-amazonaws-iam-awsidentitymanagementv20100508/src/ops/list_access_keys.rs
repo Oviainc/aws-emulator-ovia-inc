@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccessKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccessKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccessKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccessKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccessKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAccessKeysErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION in the key order the marker
+        // names, so a token this service's encoding cannot have produced is refused
+        // rather than silently read as "start from the beginning" — the same rule
+        // `ListUsers` follows. A token that decodes but names a key deleted since the
+        // previous page is NOT an error: the position still orders the remainder.
+        let resume_after = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(crate::state::MARKER_SCOPE_ACCESS_KEYS, marker) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Invalid Marker: the value is not a marker this service issued",
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default for
+        // an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it "returns information about the access key IDs associated with the
+        // specified IAM user" and writes nothing. The secret is not stored and so
+        // cannot be reported, which is why only metadata is: "the secret access key is
+        // accessible only during key and user creation".
+        let store = state.lock();
+
+        // Whose keys: the named user, or — with no `UserName` — "the user name is
+        // determined implicitly based on the Amazon Web Services access key ID used to
+        // sign the request", resolved through the key bindings exactly as `GetUser`
+        // resolves it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccessKeys"))
+        // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real
+        // IAM also serves a nameless call made with ACCOUNT ROOT credentials ("the root
+        // user returns it's own access key IDs"). This emulator holds no root user
+        // entity, so such a call would have to report keys under a user name nothing
+        // minted; it is refused instead, exactly as `CreateAccessKey` refuses it. That
+        // path is declined, not implemented.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => {
+                let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+                match store.access_keys.get(&caller_akid) {
+                    Some(record) => record.user_key.clone(),
+                    None => {
+                        // Neither modelled error fits: the request named no entity to
+                        // be missing, so the refusal goes through the crate's generic
+                        // client-input channel (HTTP 400, `ValidationException`).
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Must specify userName when calling with non-User credentials",
+                        ));
+                    }
+                }
+            }
+        };
+
+        // The keys reported are those of an IAM user the account holds: a name the
+        // account does not hold names no user whose keys could be reported, which is
+        // the one modelled client error this operation declares.
+        let Some(user) = store.users.get(&user_key) else {
+            return Err(ListAccessKeysErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        };
+        // Reported in the case the user was created with, not the case the request
+        // happened to spell, since IAM names "are not distinguished by case".
+        let user_name = user.user_name.clone();
+
+        let tail = store.access_keys.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+        let selected = tail.filter(|(_, record)| record.user_key == user_key);
+
+        let mut access_key_metadata = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (access_key_id, record) in selected {
+            if access_key_metadata.len() == page_size {
+                // There is at least one more key of this user, so the caller needs
+                // another page to see it.
+                is_truncated = true;
+                break;
+            }
+            access_key_metadata.push(AccessKeyMetadata {
+                user_name: Some(user_name.clone()),
+                access_key_id: Some(access_key_id.clone()),
+                status: Some(record.status.clone()),
+                create_date: Some(record.create_date),
+            });
+            last_key = Some(access_key_id.clone());
+        }
+
+        Ok(ListAccessKeysOutput {
+            // "If there is none, the operation returns an empty list" — the member is
+            // required, and empty is the answer for a user holding no keys.
+            access_key_metadata,
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(crate::state::MARKER_SCOPE_ACCESS_KEYS, key)
+                    })
+                })
+                .flatten(),
+            is_truncated,
+        })
     }
 }

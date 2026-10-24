@@ -36,6 +36,10 @@
 //! of a resource of a given type ([`resource_id_of_type`]) from here, so the
 //! `<type>/<id>` and `<type>:<id>` forms are read in one place too.
 //!
+//! [`is_iam_principal_arn`] reads the one ARN class that is not a service's resource at all:
+//! an IAM PRINCIPAL — the identity a policy grants to. It spans two vendors and several
+//! resource types, so it is a union of forms rather than a [`Requirement`].
+//!
 //! [`Requirement`] is the form above that: what a member the model DOCUMENTS as the ARN of
 //! a particular AWS resource has to name (an IAM role, a Secrets Manager secret, an S3
 //! object, an ACM certificate), with the constants for the resources several services bind.
@@ -288,11 +292,98 @@ pub const ACM_CERTIFICATE: Requirement = Requirement {
     label: "a Certificate Manager certificate",
 };
 
+/// The IDENTITY ARN forms, as (the ARN's vendor field, the resource type, the number of
+/// `/`-separated name segments that follow it).
+///
+/// An identity is not a resource of one service, so it is a union rather than a
+/// [`Requirement`], which fixes a single vendor and at most one resource type: IAM mints
+/// the long-lived identities (the account itself, a user, a role) and STS the temporary
+/// ones (an assumed-role session, a federated user), and a policy's principal element
+/// names any of them.
+///
+/// The account root names no further segment. A user, a role and a federated user name
+/// one — but a user's and a role's name may be preceded by a PATH
+/// (`role/service-role/<name>`), so the count is a minimum. An assumed-role session names
+/// the role and the session it opened.
+const IDENTITY_RESOURCES: &[(&str, &str, usize)] = &[
+    ("iam", "root", 0),
+    ("iam", "user", 1),
+    ("iam", "role", 1),
+    ("sts", "assumed-role", 2),
+    ("sts", "federated-user", 1),
+];
+
+/// The digits an AWS account id carries: every account id is exactly twelve of them, which
+/// is what an identity ARN's account field holds.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Whether `value` is the ARN of an AWS IAM PRINCIPAL — an identity a policy can grant to.
+///
+/// For a member a model documents as the ARN of a user or a role, or as a resource-based
+/// policy's principal: the models target those at a bare string (often with no more than
+/// an `aws.api#arnReference`), so the boundary validator admits any text and reading the
+/// identity form is the handler's job. A value outside these forms denotes no identity at
+/// all, so it is a parameter violation rather than an identity that happens not to exist.
+///
+/// Admitted are the five forms [`IDENTITY_RESOURCES`] lists, in any partition. Beyond
+/// those, an identity ARN is GLOBAL — IAM and STS write no Region into one — and its
+/// account field is the id of the account that owns the identity, which is exactly
+/// [`ACCOUNT_ID_DIGITS`] digits. The principal grammar has no partial wildcard either (only
+/// the whole-element `"*"`, which is not an ARN), so a value carrying `*` or `?` matches
+/// identities rather than naming one, and an identity's path and name are written with `/`
+/// alone, so one carrying a `:` is not a name IAM or STS mints.
+///
+/// A service whose own model states this grammar as a `@pattern` (with its own length
+/// bounds on each segment) enforces that pattern instead: this is the form for the members
+/// whose models state nothing.
+#[must_use]
+pub fn is_iam_principal_arn(value: &str) -> bool {
+    let Some(arn) = parse(value) else {
+        return false;
+    };
+    let global = arn.region.is_empty();
+    let owned_by_an_account = arn.account.len() == ACCOUNT_ID_DIGITS
+        && arn.account.bytes().all(|byte| byte.is_ascii_digit());
+    let names_one_identity = !arn.resource.contains(['*', '?', ':']);
+    global
+        && owned_by_an_account
+        && names_one_identity
+        && IDENTITY_RESOURCES
+            .iter()
+            .any(|(vendor, resource_type, segments)| {
+                arn.vendor == *vendor && names_identity(arn.resource, resource_type, *segments)
+            })
+}
+
+/// Whether the resource field `resource` names an identity of type `resource_type`: the
+/// type alone when the form names no segment (the account root), and otherwise the type, a
+/// `/`, and at least `segments` non-empty `/`-separated segments.
+fn names_identity(resource: &str, resource_type: &str, segments: usize) -> bool {
+    let Some(rest) = resource.strip_prefix(resource_type) else {
+        return false;
+    };
+    if segments == 0 {
+        return rest.is_empty();
+    }
+    let Some(named) = rest.strip_prefix('/') else {
+        return false;
+    };
+    let mut named_segments = 0usize;
+    for part in named.split('/') {
+        if part.is_empty() {
+            return false;
+        }
+        named_segments += 1;
+    }
+    named_segments >= segments
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_resource_arn_of, parse, parse_of, region_of, resource_id_of_type, resource_type, vendor,
-        Requirement, ACM_CERTIFICATE, IAM_ROLE, S3_OBJECT, SECRETS_MANAGER_SECRET,
+        is_iam_principal_arn, is_resource_arn_of, parse, parse_of, region_of, resource_id_of_type,
+        resource_type, vendor, Requirement, ACM_CERTIFICATE, IAM_ROLE, S3_OBJECT,
+        SECRETS_MANAGER_SECRET,
     };
 
     /// The vendor field is read from the third position, whatever the resource
@@ -755,6 +846,147 @@ mod tests {
                 phrase, *expected,
                 "case {:?}: expected {expected:?}, got {phrase:?}",
                 requirement.label
+            );
+        }
+    }
+
+    /// An identity ARN is one of the five forms IAM and STS write, in any partition, with
+    /// no Region, a numeric account and no wildcard — and nothing else.
+    #[test]
+    fn an_identity_arn_is_one_of_the_forms_iam_and_sts_write() {
+        // (case, value, whether it names an identity)
+        let rows: &[(&str, &str, bool)] = &[
+            ("the account root", "arn:aws:iam::000000000000:root", true),
+            ("an IAM user", "arn:aws:iam::123456789012:user/bob", true),
+            (
+                "an IAM user under a path",
+                "arn:aws:iam::123456789012:user/engineering/bob",
+                true,
+            ),
+            ("an IAM role", "arn:aws:iam::123456789012:role/Agent", true),
+            (
+                "a role under a path, as a service-linked role is written",
+                "arn:aws:iam::123456789012:role/aws-service-role/ops.amazonaws.com/Role",
+                true,
+            ),
+            (
+                "an assumed-role session",
+                "arn:aws:sts::123456789012:assumed-role/Agent/session",
+                true,
+            ),
+            (
+                "a federated user",
+                "arn:aws:sts::123456789012:federated-user/Bob",
+                true,
+            ),
+            (
+                "an identity in another partition",
+                "arn:aws-us-gov:iam::123456789012:role/Agent",
+                true,
+            ),
+            ("not an ARN at all", "not-an-arn", false),
+            ("a bare account id", "123456789012", false),
+            ("the empty string", "", false),
+            ("blank text", "   ", false),
+            ("another vendor's resource", "arn:aws:s3:::some-bucket", false),
+            (
+                "a CodeGuru Profiler resource",
+                "arn:aws:codeguru-profiler:us-east-1:123456789012:profilingGroup/pg",
+                false,
+            ),
+            (
+                "an IAM resource that is no identity",
+                "arn:aws:iam::123456789012:policy/ReadOnly",
+                false,
+            ),
+            (
+                "an identity type of the other vendor",
+                "arn:aws:iam::123456789012:assumed-role/Agent/session",
+                false,
+            ),
+            (
+                "a root the other vendor does not write",
+                "arn:aws:sts::123456789012:root",
+                false,
+            ),
+            (
+                "a Region, which an identity ARN never carries",
+                "arn:aws:iam:us-east-1:123456789012:role/Agent",
+                false,
+            ),
+            ("an empty account", "arn:aws:iam:::role/Agent", false),
+            (
+                "an account that is not a number",
+                "arn:aws:iam::my-account:role/Agent",
+                false,
+            ),
+            (
+                "an account id shorter than twelve digits",
+                "arn:aws:iam::1:role/Agent",
+                false,
+            ),
+            (
+                "an account id longer than twelve digits",
+                "arn:aws:iam::0000000000000:role/Agent",
+                false,
+            ),
+            (
+                "a colon inside the name, which IAM does not write",
+                "arn:aws:iam::123456789012:role/Agent:extra",
+                false,
+            ),
+            (
+                "a wildcard in the name",
+                "arn:aws:iam::123456789012:role/*",
+                false,
+            ),
+            (
+                "a wildcard inside the name",
+                "arn:aws:iam::123456789012:role/Agent*",
+                false,
+            ),
+            (
+                "a single-character wildcard",
+                "arn:aws:iam::123456789012:user/bo?",
+                false,
+            ),
+            ("a bare wildcard", "*", false),
+            (
+                "a role with no name",
+                "arn:aws:iam::123456789012:role/",
+                false,
+            ),
+            (
+                "a role type with no separator",
+                "arn:aws:iam::123456789012:role",
+                false,
+            ),
+            (
+                "a session with no session name",
+                "arn:aws:sts::123456789012:assumed-role/Agent",
+                false,
+            ),
+            (
+                "a resource type that merely starts like one",
+                "arn:aws:iam::123456789012:rootkit",
+                false,
+            ),
+            (
+                "the colon form, which IAM does not write for an identity",
+                "arn:aws:iam::123456789012:role:Agent",
+                false,
+            ),
+            (
+                "the vendor in another case",
+                "arn:aws:IAM::123456789012:role/Agent",
+                false,
+            ),
+        ];
+        for (case, value, expected) in rows {
+            let answered = is_iam_principal_arn(value);
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected {expected}, got {answered} for {value:?}"
             );
         }
     }

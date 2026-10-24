@@ -14,8 +14,10 @@
 //! * `Engine`, `EngineVersion` and `ParameterGroupFamily` are filters that COMPOSE:
 //!   a version is reported only when it matches all of them;
 //! * a combination naming no version the service offers \u2014 a version only ANOTHER
-//!   engine has, an unknown engine, an unknown version \u2014 is the modelled
-//!   `InvalidParameterCombinationException`, never an empty page;
+//!   engine has, an unknown version, a family belonging to another engine \u2014 is the
+//!   modelled `InvalidParameterValueException`, never an empty page, while an `Engine`
+//!   the service does not run at all is the modelled
+//!   `InvalidParameterCombinationException` naming it;
 //! * `DefaultOnly` reports the greatest minor version of each parameter group family;
 //! * the listing pages over the whole catalog in catalog order for any `MaxResults`;
 //! * describing engine versions is a READ: it changes nothing a later caller sees.
@@ -217,11 +219,13 @@ async fn filters_select_exactly_the_matching_catalog_entries() {
     }
 }
 
-/// A combination that names no version the service offers is the modelled
-/// `InvalidParameterCombinationException`, not an empty page: a version only ANOTHER
-/// engine offers, a family belonging to another engine, an engine the catalog does not
-/// have, a version nothing has. The cross-engine rows are derived from the catalog, so
-/// the rule is checked for every ordered pair of engines.
+/// A filter naming no version the service offers is the modelled
+/// `InvalidParameterValueException`, not an empty page: a version only ANOTHER engine
+/// offers, a family belonging to another engine, a version nothing has. The
+/// cross-engine rows are derived from the catalog, so the rule is checked for every
+/// ordered pair of engines. An `Engine` the catalog does not publish is the OTHER
+/// refusal, asserted after the table: the engine is checked on its own, so it answers
+/// `InvalidParameterCombinationException` naming the engine asked for.
 #[tokio::test]
 async fn a_combination_naming_no_offered_version_is_refused() {
     let router = router();
@@ -249,15 +253,33 @@ async fn a_combination_naming_no_offered_version_is_refused() {
          got {catalog:?}",
         "cross-engine rows"
     );
-    // An engine and a version the catalog does not publish at all, in each shape a
+    // A version and a family the catalog does not publish at all, in each shape a
     // filter can take.
-    rows.push(json!({ "Engine": "no-such-engine" }));
     rows.push(json!({ "EngineVersion": "99.99" }));
     rows.push(json!({ "ParameterGroupFamily": "memorydb_no-such-family" }));
     rows.push(json!({ "Engine": catalog[0].engine, "EngineVersion": "99.99" }));
 
     for request in rows {
         let case = format!("refused {request}");
+        let (status, body) = call(&router, "DescribeEngineVersions", &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {case:?}: expected 400 InvalidParameterValueException, \
+             got {status} with {body}"
+        );
+    }
+
+    // An `Engine` this service does not run: refused on the engine alone, whatever else
+    // the request filters on, and in a letter case no published engine uses \u2014 `Engine`
+    // is an enum-like value rather than a resource name, so it is not folded.
+    let unknown_engine: [Value; 3] = [
+        json!({ "Engine": "no-such-engine" }),
+        json!({ "Engine": "no-such-engine", "EngineVersion": catalog[0].version }),
+        json!({ "Engine": catalog[0].engine.to_uppercase() }),
+    ];
+    for request in unknown_engine {
+        let case = format!("unknown engine {request}");
         let (status, body) = call(&router, "DescribeEngineVersions", &request).await;
         assert_eq!(
             (status, error_code(&body).as_str()),

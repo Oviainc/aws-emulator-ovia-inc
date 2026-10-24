@@ -22,6 +22,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+
 use crate::ops::types::{
     ExternalSecretRotationMetadataItem, ReplicationStatusType, RotationRulesType, Tag,
 };
@@ -351,6 +353,118 @@ pub fn is_valid_secret_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || SECRET_NAME_EXTRA_CHARS.contains(c))
 }
 
+/// The wildcard a policy statement names when it grants access to every
+/// principal.
+pub const POLICY_WILDCARD: &str = "*";
+
+/// What a resource policy document that is not a policy document is refused
+/// with: `MalformedPolicyDocumentException` is "The resource policy has syntax
+/// errors." (this service's Smithy model), and the message names the grammar
+/// the document has to satisfy rather than quoting the document back.
+pub const MALFORMED_POLICY_MESSAGE: &str = "Syntax errors in policy. The resource policy must be \
+     a JSON object whose Statement is a statement, or a non-empty list of statements, each with an \
+     Effect of Allow or Deny.";
+
+/// What a `BlockPublicPolicy` request that names a policy granting broad access
+/// is refused with: `PublicPolicyException` is "The BlockPublicPolicy parameter
+/// is set to true, and the resource policy did not prevent broad access to the
+/// secret." (this service's Smithy model).
+pub const PUBLIC_POLICY_MESSAGE: &str = "Resource policy blocked by BlockPublicPolicy: the policy \
+     allows broad access to the secret.";
+
+/// The policy elements a statement can name a principal under. A principal is
+/// either the bare wildcard string or a map from principal type to one or more
+/// identifiers, so the values of every type are what a wildcard can appear in.
+const PRINCIPAL_ELEMENTS: &[&str] = &["Principal", "NotPrincipal"];
+
+/// Parse a resource policy document, or answer the
+/// `MalformedPolicyDocumentException` message for one that is not a policy
+/// document.
+///
+/// The grammar enforced is the IAM policy-document one: the document is a JSON
+/// object, its `Statement` element is one statement or a non-empty list of
+/// them, and every statement is an object carrying an `Effect` of `Allow` or
+/// `Deny`. Everything else a statement may carry is passed through untouched,
+/// so a document this emulator does not interpret still round-trips byte for
+/// byte.
+pub fn parse_resource_policy(document: &str) -> Result<Value, String> {
+    let parsed: Value =
+        ::serde_json::from_str(document).map_err(|_| MALFORMED_POLICY_MESSAGE.to_string())?;
+    if !parsed.is_object() {
+        return Err(MALFORMED_POLICY_MESSAGE.to_string());
+    }
+    let statements = policy_statements(&parsed).ok_or_else(|| MALFORMED_POLICY_MESSAGE.to_string())?;
+    if statements.is_empty() {
+        return Err(MALFORMED_POLICY_MESSAGE.to_string());
+    }
+    for statement in &statements {
+        if statement_effect(statement).is_none() {
+            return Err(MALFORMED_POLICY_MESSAGE.to_string());
+        }
+    }
+    Ok(parsed)
+}
+
+/// The statements of a policy document: the single statement a `Statement`
+/// object is, or the list one holds. `None` for a document whose `Statement` is
+/// missing or is neither.
+fn policy_statements(policy: &Value) -> Option<Vec<&Value>> {
+    match policy.get("Statement")? {
+        Value::Object(_) => Some(vec![&policy["Statement"]]),
+        Value::Array(items) => items
+            .iter()
+            .all(Value::is_object)
+            .then(|| items.iter().collect()),
+        _ => None,
+    }
+}
+
+/// A statement's effect, lower-cased, or `None` when it names neither of the
+/// two the grammar allows.
+fn statement_effect(statement: &Value) -> Option<String> {
+    let effect = statement.get("Effect")?.as_str()?.to_ascii_lowercase();
+    matches!(effect.as_str(), "allow" | "deny").then_some(effect)
+}
+
+/// Whether a policy document grants broad access to the secret, which is what
+/// a request that blocks public policies refuses: "Specifies whether to block
+/// resource-based policies that allow broad access to the secret, for example
+/// those that use a wildcard for the principal"
+/// (`PutResourcePolicyRequest$BlockPublicPolicy`, this service's Smithy model).
+///
+/// Broad access is an ALLOW statement whose principal is the wildcard — the
+/// bare `"*"`, or `"*"` among the identifiers of any principal type it maps. A
+/// policy whose every allow statement names a concrete principal, and one that
+/// only denies, grant no broad access however many statements they carry.
+pub fn policy_grants_public_access(policy: &Value) -> bool {
+    policy_statements(policy)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|statement| {
+            statement_effect(statement).as_deref() == Some("allow")
+                && names_wildcard_principal(statement)
+        })
+}
+
+/// Whether a statement names the wildcard principal.
+fn names_wildcard_principal(statement: &Value) -> bool {
+    PRINCIPAL_ELEMENTS
+        .iter()
+        .filter_map(|element| statement.get(element))
+        .any(is_wildcard_principal)
+}
+
+/// Whether one `Principal` element is the wildcard: the bare string, or a map
+/// from principal type to identifiers one of which is the wildcard.
+fn is_wildcard_principal(principal: &Value) -> bool {
+    match principal {
+        Value::String(value) => value == POLICY_WILDCARD,
+        Value::Array(items) => items.iter().any(is_wildcard_principal),
+        Value::Object(types) => types.values().any(is_wildcard_principal),
+        _ => false,
+    }
+}
+
 /// The region this request is addressed to, taken from its SigV4 credential
 /// scope so an ARN reports the region the caller actually signed for.
 pub fn request_region(parts: &::http::request::Parts) -> String {
@@ -644,6 +758,13 @@ pub struct Secret {
     /// replicated to. Empty for a secret that does not participate in
     /// cross-region replication.
     pub replicas: Vec<Replica>,
+    /// The resource-based permission policy document attached to this secret,
+    /// exactly as the caller supplied it; `None` for a secret no policy is
+    /// attached to. `GetResourcePolicy` "retrieves the JSON text of the
+    /// resource-based policy document attached to the secret" (this service's
+    /// Smithy model), so the document is stored verbatim rather than
+    /// re-serialized.
+    pub resource_policy: Option<String>,
     /// Versions in the order they were created.
     pub versions: Vec<SecretVersion>,
 }
@@ -674,6 +795,7 @@ impl Secret {
             next_rotation_date: None,
             pending_rotation_version_id: None,
             replicas: Vec::new(),
+            resource_policy: None,
             versions: Vec::new(),
         }
     }
@@ -847,6 +969,33 @@ impl Secret {
     /// what [`TAGS_PER_SECRET`] bounds.
     pub fn tag_count_after(&self, tags: &[Tag]) -> usize {
         tag_count_after_attaching(&self.tags, tags)
+    }
+
+    /// Attach `policy` to the secret, replacing whatever policy it carried.
+    ///
+    /// `PutResourcePolicy` "attaches a resource-based permission policy to a
+    /// secret" and one secret carries at most one such policy, so a second call
+    /// replaces the document rather than adding to it. Attaching one modifies
+    /// the secret, which is what `LastChangedDate` reports ("The last date and
+    /// time that this secret was modified in any way", this service's Smithy
+    /// model).
+    pub fn attach_resource_policy(&mut self, policy: String, at: SystemTime) {
+        self.resource_policy = Some(policy);
+        self.last_changed_date = at;
+    }
+
+    /// Detach the resource policy, reporting whether the secret carried one.
+    ///
+    /// `DeleteResourcePolicy` "deletes the resource-based permission policy
+    /// attached to the secret" (this service's Smithy model) and models no
+    /// error for a secret that carries none, so detaching nothing succeeds —
+    /// and, having changed nothing, leaves `LastChangedDate` where it was.
+    pub fn detach_resource_policy(&mut self, at: SystemTime) -> bool {
+        let had = self.resource_policy.take().is_some();
+        if had {
+            self.last_changed_date = at;
+        }
+        had
     }
 
     /// The replica held for `region`, if any.

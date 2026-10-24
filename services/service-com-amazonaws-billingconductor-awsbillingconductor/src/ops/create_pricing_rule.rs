@@ -13,6 +13,10 @@
 //! (`billingconductor-payer-account-authorization-gate-absent-across-the`). This
 //! handler decides what the request says and what state holds.
 //!
+//! A `Tags` key in the reserved `aws:` namespace is refused with the modelled 400
+//! `ValidationException` and nothing is minted (see
+//! [`crate::state::check_tag_keys_not_reserved`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,6 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Tag-on-create takes caller-supplied tag keys, so the reserved `aws:` namespace
+        // is refused here exactly as `TagResource` refuses it: from the request alone,
+        // before anything is minted, so a create naming such a key leaves no resource
+        // and no tag behind (see [`crate::state::check_tag_keys_not_reserved`]).
+        if let Err(refusal) = crate::state::check_tag_keys_not_reserved(
+            "Tags",
+            input.tags.iter().flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(CreatePricingRuleErrorModeled::ValidationException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreatePricingRuleErrorModeled::InternalServerException(
                 InternalServerException {
