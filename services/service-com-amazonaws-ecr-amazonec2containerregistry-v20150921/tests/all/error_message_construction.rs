@@ -11,9 +11,12 @@
 //! 2. a layer-upload diagnostic states what a client needs to recover — the byte the
 //!    upload expects next on a non-contiguous part, and nothing but the verdict on a
 //!    digest that does not match;
-//! 3. a parameter-constraint clause names the MEMBER at fault (not the validating walk's
-//!    path to it) and states the constraint the way AWS states it: an expression with no
-//!    escape a regular expression does not need, and prose for an ARN-valued member;
+//! 3. a parameter ECR validates ITSELF — one the request carries, and an ARN wherever it
+//!    carries one — is named by its API label (not the validating walk's path to it) and
+//!    its constraint stated in ECR's own words: an expression with no escape a regular
+//!    expression does not need, and prose for an ARN-valued member. (A member the
+//!    model-driven walk caught inside a NESTED structure keeps that walk's path and
+//!    wording; that half of the rule is pinned in `parameter_constraint_clauses.rs`.)
 //! 4. a refusal caused by a per-resource state names the resource that refused.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
@@ -495,10 +498,15 @@ const PREFIX_EXPRESSION: &str =
 const WRONG_NAMESPACE_SECRET: &str =
     "arn:aws:secretsmanager:eu-west-1:000000000000:secret:not-the-pull-through-namespace";
 
-/// A refused input member is stated as the MEMBER at fault — never the validating walk's
-/// path to the value — and the constraint as AWS states it: an ARN-valued member in prose
-/// naming the value, every other `@pattern` as the expression with no escape a regular
-/// expression does not need, and every other constraint unchanged.
+/// A parameter ECR validates itself is stated as the MEMBER at fault — never the
+/// validating walk's path to the value — with the constraint in ECR's own words: an
+/// ARN-valued member in prose naming the value, every other `@pattern` as the expression
+/// with no escape a regular expression does not need, and every other constraint
+/// unchanged.
+///
+/// Every row is such a parameter: one the request CARRIES (a top-level member, or an
+/// element of one of its lists, which is a value of that same parameter) or an ARN-valued
+/// member, which ECR checks the form of wherever the request carries it.
 ///
 /// The rows differ along what the rule generalises over: which constraint failed
 /// (`@pattern` on a plain string, on an ARN, `@length`, `@required`), where the member
@@ -506,7 +514,7 @@ const WRONG_NAMESPACE_SECRET: &str =
 /// list — and the second element of that list, so the position cannot be in the name),
 /// which member is ARN-valued, and which operation was called.
 #[tokio::test]
-async fn a_refused_member_is_stated_as_aws_states_it() {
+async fn a_parameter_ecr_validates_itself_is_stated_as_aws_states_it() {
     /// One `SigningRule` naming `arn` as its signing profile.
     fn signing_rule(arn: &str) -> Value {
         json!({"signingProfileArn": arn})
@@ -628,8 +636,9 @@ async fn a_refused_member_is_stated_as_aws_states_it() {
             message, expected,
             "case {case:?}: expected the clause {expected:?}, got {message:?}"
         );
-        // Two spellings AWS never emits: a collection step out of the validating walk's
-        // path, and a backslash before a slash.
+        // Two spellings AWS never emits for a parameter of its OWN validation: a
+        // collection step out of the validating walk's path, and a backslash before a
+        // slash.
         assert!(
             !message.contains(".member"),
             "case {case:?}: the clause must not carry a collection step, got {message:?}"

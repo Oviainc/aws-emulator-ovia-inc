@@ -1795,12 +1795,21 @@ pub const ROUTER_INPUT_TYPE_MEDIALIVE_CHANNEL: &str = "MEDIALIVE_CHANNEL";
 /// The `RouterOutputState` enum the model declares for a router output
 /// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// two a router output's creation reaches are named here; the rest belong to operations
-/// that are still scaffolded.
+/// three a router output's creation and deletion reach are named here; the rest belong to
+/// operations that are still scaffolded.
 pub const ROUTER_OUTPUT_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. A router output that finished being created is
 /// not carrying content yet: it waits in `STANDBY` until StartRouterOutput.
 pub const ROUTER_OUTPUT_STATE_STANDBY: &str = "STANDBY";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The state a router output is in while its delete
+/// is in progress — `DeleteRouterOutputResponse$State` is "the current state of the deleted
+/// router output, indicating where it is in the deletion process".
+///
+/// `RouterOutputState` carries NO terminal deleted value, unlike `GatewayState`'s
+/// `DELETED`, so a router output delete is a HARD delete: the record LEAVES the store once
+/// the clock completes the deletion rather than staying readable in a deleted state. See
+/// [`StoredRouterOutput::removal_due_at`].
+pub const ROUTER_OUTPUT_STATE_DELETING: &str = "DELETING";
 
 /// The `RouterOutputRoutedState` enum the model declares
 /// (`smithy_query(query="shape",shape="RouterOutputRoutedState")`: ROUTED | ROUTING |
@@ -2367,6 +2376,17 @@ pub struct StoredRouterOutput {
     /// ensure idempotency"), or `None` when the request carried none: a create replaying a
     /// token this store already holds returns THIS record instead of minting a second one.
     pub client_token: Option<String>,
+    /// When the clock completes the delete of this router output, set by DeleteRouterOutput
+    /// and `None` while the output is live.
+    ///
+    /// A router output delete is a HARD delete — `RouterOutputState` has no terminal deleted
+    /// value (see [`ROUTER_OUTPUT_STATE_DELETING`]) — so this is the instant the deletion
+    /// the call accepted becomes complete: until then the output is readable in `DELETING`
+    /// and a repeated delete answers the same thing, and from then on the store no longer
+    /// holds it. The removal is owed at this instant whether or not anybody calls, which is
+    /// why a reporting operation may materialise it
+    /// ([`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`]).
+    pub removal_due_at: Option<SystemTime>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
 }
@@ -2375,8 +2395,8 @@ impl StoredRouterOutput {
     /// Materialise the state change the clock already made due, if it is due at `now`.
     ///
     /// The same contract as [`StoredFlow::settle`]: this is the only write a reporting
-    /// operation (BatchGetRouterOutput) performs, because the change was owed at `due_at`
-    /// whether or not anybody called.
+    /// operation (BatchGetRouterOutput, GetRouterOutput) performs, because the change was
+    /// owed at `due_at` whether or not anybody called.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(pending) = self.pending.take() {
             if now >= pending.due_at {
@@ -2385,6 +2405,20 @@ impl StoredRouterOutput {
                 self.pending = Some(pending);
             }
         }
+    }
+
+    /// Whether this router output's delete has been accepted, so it is on its way out of
+    /// the store rather than live. See [`Self::removal_due_at`].
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the clock has made this output's removal due at `now` — the same spelling
+    /// [`StoredRouterInput::is_removal_due`] uses, so the two record types are settled by
+    /// one rule in
+    /// [`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`].
+    pub fn is_removal_due(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due_at| now >= due_at)
     }
 
     /// `RouterOutput$OutputType`, the variant of the output's configuration union.
@@ -2520,6 +2554,10 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// operation addresses one by (`@httpLabel Arn`, and the `Arns` BatchGetRouterOutput
     /// reads them by). Ordered, so ListRouterOutputs can page stably.
     ///
+    /// A router output whose delete has been accepted is still in this map, in `DELETING`,
+    /// until the clock completes the delete; then it LEAVES, because `RouterOutputState`
+    /// has no terminal deleted value (see [`StoredRouterOutput::removal_due_at`]).
+    ///
     /// There is no index by name beside it, for the same reason as [`Self::gateways`]: the
     /// model puts no uniqueness rule on `RouterOutput$Name`, and the generated output id in
     /// the ARN is what keeps two same-named outputs apart.
@@ -2541,11 +2579,12 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     ///
     /// A flow is the only resource whose tags a `ResourceArn` resolves to HERE: a gateway
     /// record carries no tag map (no gateway operation in the model takes or reports tags),
-    /// a router input carries its own (`StoredRouterInput::tags`) but is reached by the
+    /// a router input and a router output each carry their own
+    /// (`StoredRouterInput::tags`, `StoredRouterOutput::tags`) but are reached by the
     /// GLOBAL tag operations — TagGlobalResource / UntagGlobalResource /
     /// ListTagsForGlobalResource, which cover "router inputs, router outputs and router
     /// network interfaces" and are still scaffolded — and every remaining MediaConnect
-    /// create (bridge, router output, reservation) is still scaffolded. So a TagResource /
+    /// create (bridge, reservation) is still scaffolded. So a TagResource /
     /// UntagResource / ListTagsForResource call resolves its `ResourceArn` against the flow
     /// store, and any other ARN addresses nothing whose tags those operations reach.
     pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
@@ -2560,7 +2599,7 @@ impl ComAmazonawsMediaconnectMediaconnectState {
 
     /// Settle every flow, gateway, bridge, router input and router output whose status
     /// change the clock already made due, and materialise the removal of every router input
-    /// whose deletion has come due.
+    /// and router output whose deletion has come due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
@@ -2577,12 +2616,15 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         for router_output in self.router_outputs.values_mut() {
             router_output.settle(now);
         }
-        // A router input whose removal the clock has made due stops existing: the deletion
-        // was owed at that instant whether or not anybody called, and `RouterInputState`
-        // declares no terminal state the record could be reported in afterwards (see
-        // [`StoredRouterInput::removal_due_at`]).
+        // A router input or router output whose removal the clock has made due stops
+        // existing: the deletion was owed at that instant whether or not anybody called,
+        // and neither `RouterInputState` nor `RouterOutputState` declares a terminal state
+        // the record could be reported in afterwards (see
+        // [`StoredRouterInput::removal_due_at`] and [`StoredRouterOutput::removal_due_at`]).
         self.router_inputs
             .retain(|_, router_input| !router_input.is_removal_due(now));
+        self.router_outputs
+            .retain(|_, router_output| !router_output.is_removal_due(now));
     }
 
     /// The router input `arn` addresses, with everything the clock already made due
@@ -2922,8 +2964,10 @@ pub fn assigned_ingest_ip(suffix: u64) -> String {
     format!("198.51.100.{}", 1 + (suffix % 254))
 }
 
-/// The egress address of a flow — `Flow.EgressIp`, "the IP address from which video
-/// will be sent to output destinations".
+/// The egress address this service assigns to a resource that SENDS content: a flow's
+/// `Flow.EgressIp`, "the IP address from which video will be sent to output destinations",
+/// and a standard router output's `RouterOutput$IpAddress`, "the IP address of the router
+/// output".
 ///
 /// From the RFC 5737 range `203.0.113.0/24`, reserved for documentation. Like
 /// [`assigned_ingest_ip`], a wrapping pool of 254 addresses that never route anywhere.

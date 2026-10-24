@@ -83,6 +83,8 @@ mod relational_database_lifecycle;
 mod relational_database_parameter_updates;
 #[path = "all/relational_database_parameters.rs"]
 mod relational_database_parameters;
+#[path = "all/relational_database_snapshot_listing.rs"]
+mod relational_database_snapshot_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]

@@ -18,6 +18,14 @@
 //! ignored if the resource already exists" — and the response's `tags` is the
 //! resource's stored tag map, which `TagResource` and `UntagResource` also write.
 //!
+//! `expirationDate` is the parameter's DEADLINE: it is "the date when deployment
+//! parameters expire and are scheduled for deletion", so once it passes the
+//! parameter is gone ([`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`],
+//! applied here before this request resolves anything) and a call for the same
+//! identity creates a NEW resource rather than updating the expired one. It is
+//! also OPTIONAL, so an update that omits it leaves the stored date alone: only
+//! the members a request carries are applied.
+//!
 //! A write is TARGETED: the operation "is targeted by `catalog` and
 //! `agreementId`" for the product its URI names, so a request whose
 //! product/agreement pair this account does not hold is answered with the
@@ -232,6 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // The expiry the clock has already made due, BEFORE this request resolves
+        // anything: `expirationDate` is "the date when deployment parameters expire
+        // and are scheduled for deletion", so a parameter past its date is gone
+        // whether or not anybody called, and this write must not update it. With it
+        // purged, a request for that identity finds no record and mints a fresh
+        // resource — which is what AWS answers once the old one has been deleted.
+        store.purge_expired(now);
+
         // The write TARGET first: `PutDeploymentParameter` "creates or updates a
         // deployment parameter and is targeted by catalog and agreementId" for
         // the product the URI addresses, and the model declares
@@ -307,7 +323,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 };
                 record.secret_string = input.deployment_parameter.secret_string;
-                record.expiration_date = input.expiration_date;
+                // `expirationDate` is OPTIONAL, so an update that omits it says
+                // nothing about expiry and leaves the stored date as it was: only
+                // the members the request carries are applied, and an absent member
+                // is not an instruction to clear persisted state. A request that
+                // does name a date replaces it.
+                if let Some(expiration_date) = input.expiration_date {
+                    record.expiration_date = Some(expiration_date);
+                }
                 record.updated_at = now;
                 resource_arn
             }

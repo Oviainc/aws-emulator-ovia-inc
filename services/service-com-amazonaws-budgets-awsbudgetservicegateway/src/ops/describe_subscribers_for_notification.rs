@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSubscribersForNotification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSubscribersForNotification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSubscribersForNotification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the subscribers stored for ONE notification of a budget, a page at a time.
+//! The notification is addressed by what it alerts on
+//! ([`crate::state::same_notification`]), since it carries no id; a budget this
+//! account does not hold, and a notification that budget does not hold, are both
+//! `NotFoundException`. This is a pure read: nothing about the budget changes.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSubscribersForNotification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSubscribersForNotificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSubscribersForNotification"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSubscribersForNotificationErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "budgets is mounted on an engine that holds no state for it".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let store = state.lock();
+        let stored = store
+            .budgets
+            .get(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DescribeSubscribersForNotificationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "Unable to get subscribers: {} - the budget doesn't exist.",
+                            input.budget_name
+                        )),
+                    },
+                )
+            })?;
+        let held = crate::state::find_notification(stored, &input.notification).ok_or_else(|| {
+            DescribeSubscribersForNotificationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Unable to get subscribers: {} - the notification doesn't exist.",
+                    input.budget_name
+                )),
+            })
+        })?;
+
+        let (page, next_token) = crate::state::page(
+            &held.subscribers,
+            input.max_results,
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeSubscribersForNotificationErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some("The pagination token is invalid.".to_string()),
+                },
+            )
+        })?;
+
+        Ok(DescribeSubscribersForNotificationOutput {
+            subscribers: Some(page),
+            next_token,
+        })
     }
 }

@@ -114,6 +114,8 @@ mod local_gateway_virtual_interface_groups;
 mod mac_dedicated_hosts;
 #[path = "all/modify_subnet_attribute.rs"]
 mod modify_subnet_attribute;
+#[path = "all/nat_gateway_addresses.rs"]
+mod nat_gateway_addresses;
 #[path = "all/network_insights_access_scope_analyses.rs"]
 mod network_insights_access_scope_analyses;
 #[path = "all/network_performance_data.rs"]
