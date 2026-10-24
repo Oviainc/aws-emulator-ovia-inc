@@ -215,7 +215,7 @@ impl ComAmazonawsInterconnectInterconnectState {
             if due {
                 if let Some(pending) = stored.pending_transition.take() {
                     stored.connection.state = pending.state;
-                    if stored.connection.state == "deleted" {
+                    if stored.connection.state == DELETED_CONNECTION_STATE {
                         stored.evict_due = Some(now + DELETED_RECORD_RETENTION);
                     }
                 }
@@ -265,6 +265,29 @@ impl ComAmazonawsInterconnectInterconnectState {
             .pending_transition
             .as_ref()
             .map_or_else(|| stored.connection.state.clone(), |p| p.state.clone())
+    }
+
+    /// The stored connection an `AmazonResourceName` names, for the tagging
+    /// operations that identify a resource by its ARN rather than by its id.
+    ///
+    /// The ARN identifies the resource in FULL — partition, region and account
+    /// included — so an ARN whose fields differ from the stored one names a
+    /// resource this store does not hold, exactly as an unknown id does. A
+    /// connection that has reached the terminal `deleted` state is gone too: the
+    /// store keeps the record readable so a caller polling a delete sees the
+    /// terminal state, but a deleted resource has no tag set to read or change.
+    pub fn connection_by_arn(&self, arn: &str) -> Option<&StoredConnection> {
+        let id = connection_id_from_arn(arn)?;
+        self.connections.get(id).filter(|stored| holds_arn(stored, arn))
+    }
+
+    /// [`Self::connection_by_arn`] for the tagging operations that WRITE the tag
+    /// set, resolving the same resource under the same rule.
+    pub fn connection_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredConnection> {
+        let id = connection_id_from_arn(arn)?;
+        self.connections
+            .get_mut(id)
+            .filter(|stored| holds_arn(stored, arn))
     }
 
     /// Make room for one more record: while the store is at [`MAX_STORED_RECORDS`],
@@ -473,6 +496,15 @@ pub fn connection_id_from_arn(arn: &str) -> Option<&str> {
 /// all, which is a fault in the request rather than a missing resource.
 pub fn not_a_connection_arn_message(arn: &str) -> String {
     format!("{REFUSAL_ENVELOPE}{arn} is not the ARN of an Interconnect {ARN_RESOURCE_TYPE}")
+}
+
+/// The terminal `ConnectionState` a completed `DeleteConnection` settles into.
+pub const DELETED_CONNECTION_STATE: &str = "deleted";
+
+/// Whether `stored` is the live resource `arn` names: the stored ARN matches field
+/// for field, and the connection has not reached the terminal deleted state.
+fn holds_arn(stored: &StoredConnection, arn: &str) -> bool {
+    stored.connection.arn == arn && stored.connection.state != DELETED_CONNECTION_STATE
 }
 
 /// The `ConnectionState` values an `UpdateConnection` is permitted FROM.

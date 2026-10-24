@@ -789,6 +789,13 @@ use crate::ops::types::{
 };
 use crate::scaffolded::Scaffolded;
 
+/// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
+/// charge and the error channel `CreateTrafficMirrorFilter` and
+/// `DescribeTrafficMirrorFilters` share. Re-exported, so a handler reaches them as
+/// `crate::state::<item>` like every other primitive of this module.
+pub mod traffic_mirror_filters;
+pub use traffic_mirror_filters::*;
+
 /// The `Reservation` shape, under the name the scaffold generated for it.
 ///
 /// `com.amazonaws.ec2#Reservation` is both `RunInstances`'s output shape and the
@@ -1539,6 +1546,18 @@ pub const BLOCK_PUBLIC_ACCESS_OFF: &str = "off";
 /// Per-service state for com-amazonaws-ec2-amazonec2. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEc2Amazonec2State {
+    /// Every Traffic Mirror filter the account holds, by `TrafficMirrorFilterId`, as the
+    /// modelled [`crate::ops::types::TrafficMirrorFilter`] shape itself — so a member a
+    /// writer sets round-trips through `DescribeTrafficMirrorFilters` without a
+    /// field-by-field copy that can silently drop one. Ordered by id, the one stable order
+    /// that describe reports and pages over, so a pagination token can name the id the next
+    /// page starts at. Starts EMPTY: a fresh account holds no Traffic Mirror filter until
+    /// `CreateTrafficMirrorFilter` mints one. See [`traffic_mirror_filters`].
+    pub traffic_mirror_filters: BTreeMap<String, crate::ops::types::TrafficMirrorFilter>,
+    /// A `CreateTrafficMirrorFilter` `ClientToken` and the Traffic Mirror filter id it
+    /// minted, so a repeat of the same request answers with that filter instead of
+    /// creating a second one.
+    pub traffic_mirror_filter_client_tokens: HashMap<String, String>,
     /// Reservations by `ReservationId`.
     pub reservations: HashMap<String, ReservationRecord>,
     /// Reservation ids in launch order: the stable order `DescribeInstances`
@@ -2095,6 +2114,8 @@ pub struct ComAmazonawsEc2Amazonec2State {
 impl Default for ComAmazonawsEc2Amazonec2State {
     fn default() -> Self {
         let mut state = Self {
+            traffic_mirror_filters: BTreeMap::new(),
+            traffic_mirror_filter_client_tokens: HashMap::new(),
             reservations: HashMap::new(),
             reservation_order: Vec::new(),
             instances: HashMap::new(),

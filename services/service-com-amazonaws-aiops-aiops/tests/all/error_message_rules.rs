@@ -203,13 +203,13 @@ fn modelled_member_pattern(input: &Schema, member: &str) -> Option<&'static str>
     Some(declared.as_any().downcast_ref::<PatternTrait>()?.regex)
 }
 
-/// The three forms `InvestigationGroupIdentifier` admits, each naming a group that
-/// cannot be resolved: a bare name and a bare 16-character id (which the service
-/// resolves no group from at all, whether or not a group carries them) and the full
-/// ARN of a group that was never created.
+/// Identifier forms that resolve no group: a bare label no group carries, a bare
+/// 16-character id (a form the modelled pattern admits but no `{identifier}` member
+/// documents, so it resolves nothing even when a group carries that id) and the full ARN
+/// of a group that was never created.
 fn unknown_identifiers() -> Vec<(&'static str, String)> {
     vec![
-        ("a bare name", "no-such-group".to_string()),
+        ("a bare name no group carries", "no-such-group".to_string()),
         ("a bare id", "AAAAAAAAAAAAAAAA".to_string()),
         (
             "a full ARN",
@@ -220,8 +220,7 @@ fn unknown_identifiers() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The ARN of the group named `name`, read off `ListInvestigationGroups` — the only
-/// way to turn a name into the ARN that addresses the group.
+/// The ARN of the group named `name`, read off `ListInvestigationGroups`.
 async fn arn_of(router: &MultiServiceRouter, name: &str) -> String {
     let response = router
         .dispatch(request("GET", "/investigationGroups", None))
@@ -610,8 +609,8 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
     let arn = arn_of(&router, "policy-probe").await;
     let policy_uri = format!("/investigationGroups/{}/policy", label(&arn));
 
-    // The bare name is not an address, so the same call through it still reports the
-    // GROUP absent even though the group exists.
+    // The group's own name is the second identifier form the member documents, so the
+    // same call through it reports the POLICY absent — the group itself resolves.
     let (status, code, by_name) = call(
         &router,
         "GET",
@@ -625,8 +624,8 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
         "case \"addressed by the bare name\": expected a 404, got {by_name:?}"
     );
     assert_eq!(
-        by_name, group_absent,
-        "case \"addressed by the bare name\": expected {group_absent:?}, got {by_name:?}"
+        by_name, policy_absent,
+        "case \"addressed by the bare name\": expected {policy_absent:?}, got {by_name:?}"
     );
 
     let (status, code, after_create) = call(&router, "GET", &policy_uri, None).await;

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrafficMirrorFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrafficMirrorFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrafficMirrorFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrafficMirrorFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTrafficMirrorFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrafficMirrorFilter"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            require_service_state, tags_from_specifications, traffic_mirror_filter_limit_exceeded,
+            traffic_mirror_filter_payload_bytes, MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES,
+            MAX_TRAFFIC_MIRROR_FILTERS, TRAFFIC_MIRROR_FILTER_TAGGABLE_RESOURCE,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // modelled `TrafficMirrorFilter` names no Region and no ARN. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // "The tags to assign to a Traffic Mirror filter"
+        // (`CreateTrafficMirrorFilterRequest$TagSpecifications`): the filter is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded. The tag payload's own bounds are the
+        // ones every create in this crate holds its tags to, so they are applied by the one
+        // shared reader.
+        let tags: Vec<Tag> = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            TRAFFIC_MIRROR_FILTER_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        // The record this call would store, built BEFORE the store is locked. "A Traffic
+        // Mirror filter is a set of rules that defines the traffic to mirror. By default,
+        // no traffic is mirrored" (`CreateTrafficMirrorFilter`), and the network services a
+        // filter mirrors are what `ModifyTrafficMirrorFilterNetworkServices` adds — so a
+        // filter is created with no rule in either direction and no network service, and
+        // the three sets are reported as the empty sets they are rather than left out.
+        let filter = TrafficMirrorFilter {
+            // Minted by the store at the insert, so an id is never chosen twice.
+            traffic_mirror_filter_id: None,
+            ingress_filter_rules: Some(Vec::new()),
+            egress_filter_rules: Some(Vec::new()),
+            network_services: Some(Vec::new()),
+            description: input.description.clone(),
+            tags: Some(tags),
+        };
+        // The caller-chosen bytes this create would retain for the process's lifetime,
+        // counted by the ONE definition of that charge. A COUNT ceiling admits gigabytes on
+        // its own, because the record holds strings the caller chose the length of, so both
+        // are asked below.
+        let payload_bytes =
+            traffic_mirror_filter_payload_bytes(&filter, input.client_token.as_deref());
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`CreateTrafficMirrorFilterRequest$ClientToken`) —
+        // one token names the one filter it created, so a replay reports that filter and
+        // creates nothing. Read here, answered below the DryRun check, because a replay
+        // stores nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.traffic_mirror_filter_client_tokens.get(token).cloned());
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if replayed.is_none() && !store.has_traffic_mirror_filter_capacity() {
+            return Err(traffic_mirror_filter_limit_exceeded(format!(
+                "This emulator holds {MAX_TRAFFIC_MIRROR_FILTERS} Traffic Mirror filters, \
+                 which is as many as it stores"
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(traffic_mirror_filter_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let traffic_mirror_filter_id = match replayed {
+            Some(traffic_mirror_filter_id) => traffic_mirror_filter_id,
+            None => store.insert_traffic_mirror_filter(filter, input.client_token.as_deref()),
+        };
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeTrafficMirrorFilters` will see rather than the request object.
+        store
+            .traffic_mirror_filters
+            .get(&traffic_mirror_filter_id)
+            .cloned()
+            .map(|traffic_mirror_filter| CreateTrafficMirrorFilterOutput {
+                traffic_mirror_filter: Some(traffic_mirror_filter),
+                // "Unique, case-sensitive identifier that you provide"
+                // (`CreateTrafficMirrorFilterResult$ClientToken`): the token the REQUEST
+                // carried, echoed, and nothing at all when it carried none.
+                client_token: input.client_token.clone(),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Traffic Mirror filter '{traffic_mirror_filter_id}' \
+                     could not be read back"
+                ))
+            })
     }
 }

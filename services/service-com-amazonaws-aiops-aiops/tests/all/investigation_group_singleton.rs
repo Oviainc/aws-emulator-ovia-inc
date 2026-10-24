@@ -17,8 +17,10 @@
 //! 2. A group's encryption configuration is always reported: omitting it on the
 //!    create selects the Amazon Web Services owned key, and that is what a read
 //!    reports.
-//! 3. A group is addressed by its ARN alone; every other identifier the modelled
-//!    pattern admits resolves to nothing, on every operation that takes one.
+//! 3. A group is addressed by either of the two forms its `{identifier}` documents —
+//!    its NAME or its ARN; every other identifier the modelled pattern admits resolves
+//!    to nothing, on every operation that takes one. (The full name-form table lives in
+//!    `investigation_group_identifier_forms.rs`.)
 //! 4. A resource policy document must be a JSON policy document; one that is not is
 //!    refused and not attached.
 //! 5. A `crossAccountConfigurations` entry must name an account other than the
@@ -646,16 +648,19 @@ async fn an_omitted_encryption_configuration_reads_back_as_the_aws_owned_key() {
     }
 }
 
-/// A group is addressed by its ARN alone. The modelled `InvestigationGroupIdentifier`
-/// pattern also admits a bare `[\-_A-Za-z0-9]{1,512}` label, and such an identifier
-/// reaches the handler, but the service resolves no group from one: every operation
+/// A group is addressed by its NAME or its ARN — the two forms every `{identifier}`
+/// member documents ("Specify either the name or the ARN of the investigation group")
+/// and the modelled `InvestigationGroupIdentifier` pattern spells out. Every OTHER
+/// identifier the pattern admits reaches the handler and resolves nothing: the service
 /// reports the group absent.
 ///
-/// Rows differ along the identifier FORM (the group's own name, its own bare id, a
-/// label nothing carries) and, for the ARN form, along which single ARN field is
-/// changed — and they are asserted against every operation that takes an identifier.
+/// Rows differ along the identifier FORM (the group's own bare id — a form no member
+/// documents — and a label nothing carries) and, for the ARN form, along which single
+/// ARN field is changed; they are asserted against every operation that takes an
+/// identifier. The tagging operations' `resourceArn` is documented as the ARN with no
+/// name alternative, so a bare form never addresses a tag set either.
 #[tokio::test]
-async fn only_the_arn_resolves_a_group() {
+async fn an_identifier_that_is_neither_the_name_nor_the_arn_resolves_nothing() {
     let router = emulator();
     let name = "addressable-only-by-arn";
     let arn = create_ok(&router, REGION, &minimal(name)).await;
@@ -666,7 +671,6 @@ async fn only_the_arn_resolves_a_group() {
         .to_string();
 
     let unresolvable = [
-        ("the group's own name", name.to_string()),
         ("the group's own bare id", id.clone()),
         ("a label nothing carries", "no-such-group".to_string()),
         ("an id-shaped label nothing carries", "A".repeat(16)),
@@ -774,12 +778,19 @@ async fn only_the_arn_resolves_a_group() {
     }
 
     // The ARN still resolves, so the 404s above are about the identifier form and not
-    // about the group having gone missing.
+    // about the group having gone missing — and so does the group's own NAME, the other
+    // documented form.
     let group = get_ok(&router, REGION, &arn, "the ARN itself").await;
     assert_eq!(
         group.get("name").and_then(Value::as_str),
         Some(name),
         "the ARN must still resolve the group, got {group:?}"
+    );
+    let by_name = get_ok(&router, REGION, name, "the group's own name").await;
+    assert_eq!(
+        by_name, group,
+        "the name must resolve the same record the ARN does, \
+         got {by_name:?} vs {group:?}"
     );
     let (status, tagged) = tag(&router, &arn, &json!({ "Team": "ops" })).await;
     assert_eq!(

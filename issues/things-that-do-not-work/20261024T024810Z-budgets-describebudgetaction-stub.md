@@ -11,6 +11,8 @@ _Operation: DescribeBudgetAction | Class: stub_
 
 ## Description
 
+> _RESOLVED by the fix for `20261024T024810Z-budgets-executebudgetaction-stub`: `DescribeBudgetAction` is implemented (it reads one stored action back, materialising only the settle the clock already owed) and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is deleted. It was implemented there as the round-trip reader for the action that fix creates and executes. Nothing is left to do here; this report is kept only until a scan files it as done._
+
 `DescribeBudgetAction` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-budgets-awsbudgetservicegateway/src/ops/describe_budget_action.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
 
 That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.

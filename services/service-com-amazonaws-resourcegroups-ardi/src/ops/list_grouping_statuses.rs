@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupingStatuses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupingStatuses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupingStatuses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the grouping status [`crate::state`] holds for each resource of the group
+//! `Group` names: the action last performed on it (`GROUP` or `UNGROUP`), how that
+//! action ended, and when. The listing is computed from the stored records, ordered by
+//! resource ARN, narrowed by the request's `Filters`, and paged through `MaxResults` and
+//! an opaque `NextToken`. A reporting operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupingStatuses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupingStatusesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupingStatuses"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. This operation reports stored state
+        // and changes none, so it emits no audit record either.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupingStatusesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every filter is checked BEFORE anything is read, so a request carrying a
+        // filter this listing cannot apply is refused rather than answering a page it
+        // did not ask for. The names are the modelled `ListGroupingStatusesFilterName`
+        // values, and each one's values must lie in the domain it selects over.
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            match filter.name.as_str() {
+                FILTER_STATUS => {
+                    if let Some(value) = filter.values.iter().find(|value| {
+                        !crate::state::GROUPING_STATUS_VALUES.contains(&value.as_str())
+                    }) {
+                        return Err(bad_request(format!(
+                            "Filters contains the {FILTER_STATUS} value {value}, which is not \
+                             valid: expected one of {}",
+                            crate::state::GROUPING_STATUS_VALUES.join(", "),
+                        )));
+                    }
+                }
+                FILTER_RESOURCE_ARN => {
+                    if let Some(value) = filter
+                        .values
+                        .iter()
+                        .find(|value| !crate::state::is_resource_arn(value))
+                    {
+                        return Err(bad_request(format!(
+                            "Filters contains the {FILTER_RESOURCE_ARN} value {value}, which is \
+                             not a resource ARN"
+                        )));
+                    }
+                }
+                other => {
+                    return Err(bad_request(format!(
+                        "Filters contains the filter name {other}, which is not valid: expected \
+                         one of {}",
+                        FILTER_NAME_VALUES.join(", "),
+                    )))
+                }
+            }
+        }
+
+        let store = state.lock();
+        // `Group` is the only identifier this operation models, and it carries either
+        // a bare group name or a group ARN; `lookup` resolves both. This operation
+        // models no `NotFoundException`, so an identifier that resolves to no stored
+        // group is refused with the modelled `BadRequestException`.
+        let not_found = || bad_request(crate::state::GROUP_NOT_FOUND_MESSAGE);
+        let name = store.lookup(input.group.as_str()).ok_or_else(not_found)?;
+        let group = store.groups.get(&name).ok_or_else(not_found)?;
+
+        // The token is this service's own opaque encoding of the resource ARN the
+        // previous page stopped at, scoped to THIS listing of THIS group; anything
+        // else cannot name a resume point in it.
+        let listing = listing_of(&name);
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match crate::state::decode_page_token(&listing, token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(bad_request(
+                        "NextToken is not valid: it was not issued by a previous \
+                         ListGroupingStatuses call for this group",
+                    ))
+                }
+            },
+        };
+
+        // The listing order is resource-ARN order, which the store already holds the
+        // records in (a `BTreeMap` keyed by ARN) and which the resume key below is
+        // compared against.
+        let mut remaining: Vec<(&String, &crate::state::GroupingStatusRecord)> = group
+            .grouping_statuses
+            .iter()
+            .filter(|(resource_arn, record)| {
+                filters
+                    .iter()
+                    .all(|filter| matches_filter(resource_arn, record, filter))
+            })
+            .collect();
+        if let Some(resume) = resume_after.as_deref() {
+            remaining.retain(|(resource_arn, _)| resource_arn.as_str() > resume);
+        }
+        let page_size = page_size(input.max_results)?.min(remaining.len());
+        let page = &remaining[..page_size];
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|(resource_arn, _)| {
+                    crate::state::encode_page_token(&listing, resource_arn)
+                })
+            })
+            .flatten();
+
+        Ok(ListGroupingStatusesOutput {
+            // Reported from the stored group, so a request that addressed it by name
+            // and one that addressed it by ARN are answered with the same identifier.
+            group: Some(group.group_arn.clone()),
+            grouping_statuses: Some(
+                page.iter()
+                    .map(|(resource_arn, record)| record.to_item(resource_arn))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The listing one group's grouping-status pagination tokens belong to: a token
+/// issued here resumes THIS listing of THAT group, and no other.
+fn listing_of(group_name: &str) -> String {
+    format!("grouping-statuses/{group_name}")
+}
+
+/// The `status` filter name: selects the records whose `Status` is one of the
+/// filter's values.
+///
+/// Source for this and [`FILTER_RESOURCE_ARN`]:
+/// `smithy_query(query="shape",shape="ListGroupingStatusesFilterName")`.
+const FILTER_STATUS: &str = "status";
+
+/// The `resource-arn` filter name: selects the records of the resources the
+/// filter's values name.
+const FILTER_RESOURCE_ARN: &str = "resource-arn";
+
+/// Every filter name the modelled `ListGroupingStatusesFilterName` declares.
+const FILTER_NAME_VALUES: [&str; 2] = [FILTER_STATUS, FILTER_RESOURCE_ARN];
+
+/// The largest page the modelled `MaxResults` can ask for (`range 1..50`), and the
+/// page size used when the caller asks for none: the model documents `MaxResults`
+/// as "the maximum number of resources and their statuses returned in the
+/// response", and answering at the modelled maximum bounds the response and keeps
+/// the `NextToken` loop working the same way whether or not `MaxResults` was sent.
+const MAX_RESULTS: usize = 50;
+
+/// How many records one page carries, from the caller's `MaxResults`.
+///
+/// The framework refuses a value outside the modelled range before this handler
+/// runs; checking it again here keeps the conversion lossless rather than letting a
+/// negative value wrap into "every record".
+fn page_size(max_results: Option<i32>) -> Result<usize, ListGroupingStatusesError> {
+    match max_results {
+        None => Ok(MAX_RESULTS),
+        Some(max) => usize::try_from(max)
+            .ok()
+            .filter(|size| (1..=MAX_RESULTS).contains(size))
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "MaxResults {max} is not valid: it must be between 1 and {MAX_RESULTS}"
+                ))
+            }),
+    }
+}
+
+/// Whether the record of `resource_arn` satisfies one `ListGroupingStatusesFilter`:
+/// a filter selects a record when ANY of its values matches the member the filter
+/// name selects over, and every filter a request carries has to hold.
+fn matches_filter(
+    resource_arn: &str,
+    record: &crate::state::GroupingStatusRecord,
+    filter: &ListGroupingStatusesFilter,
+) -> bool {
+    match filter.name.as_str() {
+        FILTER_STATUS => filter.values.contains(&record.status),
+        FILTER_RESOURCE_ARN => filter.values.iter().any(|value| value == resource_arn),
+        // Unreachable: a filter name this listing does not know is refused before any
+        // record is read.
+        _ => false,
+    }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> ListGroupingStatusesError {
+    ListGroupingStatusesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
