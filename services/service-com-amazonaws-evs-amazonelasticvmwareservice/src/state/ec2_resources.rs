@@ -31,8 +31,17 @@
 //!   [`release_vlan_subnets`]) rather than existing only inside this service's records:
 //!   an id no other service holds would name nothing.
 //!
-//! Nothing else is written: the VPC, the service access subnet and the Elastic IP
-//! addresses an environment is deployed into belong to the caller and are only read.
+//! * an Elastic IP address `AssociateEipToVlan` associates with a public HCX VLAN stays
+//!   ALLOCATED to the caller, but the ASSOCIATION is an EC2 fact — `allocationId` is an
+//!   EC2 allocation and the `eipassoc-` id the operation reports is an EC2
+//!   `AssociationId` — so it is written onto that allocation's own `Address` record
+//!   ([`associate_elastic_ip`]) and cleared from it again ([`release_elastic_ips`]):
+//!   `DescribeAddresses` then reports the address a VLAN is using as associated, and one
+//!   allocation cannot be associated twice over.
+//!
+//! Nothing else is written: the VPC and the service access subnet an environment is
+//! deployed into belong to the caller and are only read, and no Elastic IP address is
+//! ever allocated or released here — only associated and disassociated.
 //!
 //! Nothing in this module does arithmetic on an address or a prefix length of its own:
 //! every judgement about a CIDR block a caller supplied is EC2's own published helper
@@ -316,21 +325,129 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
     })
 }
 
-/// The Elastic IP address the allocation `allocation_id` names, as EC2 holds it.
+/// What came of asking Amazon EC2 to record the association of an Elastic IP allocation
+/// with an Amazon EVS VLAN subnet.
 ///
-/// `None` when the account holds no such allocation, when the allocation carries no
-/// public address, or when the EC2 store cannot be read: the association is then
-/// reported without an `ipAddress` rather than with an address nothing allocated.
-pub fn elastic_ip_address<Eng: Send + Sync + 'static>(
+/// An `eipassoc-` id is an EC2 identifier and the association is a change to the EC2
+/// `Address` record — the one `DescribeAddresses` answers from — so EC2 is where the
+/// association is made and where the id comes from, never this service.
+#[derive(Debug, Clone)]
+pub enum ElasticIpAssociation {
+    /// EC2 recorded the association on the allocation's `Address`: the `AssociationId`
+    /// it minted, and the public address it holds for the allocation.
+    Associated {
+        /// The `eipassoc-` id EC2's own id minter gave the association.
+        association_id: String,
+        /// The Elastic IP address EC2 holds for the allocation, when it holds one.
+        ip_address: Option<String>,
+    },
+    /// The allocation is ALREADY associated — with another VLAN, or with any other EC2
+    /// resource — so nothing was written: one Elastic IP address carries one association
+    /// at a time (`Resource.AlreadyAssociated`).
+    AlreadyAssociated {
+        /// The association the allocation already carries.
+        association_id: String,
+        /// The instance it is associated with, when it is associated with one.
+        instance_id: Option<String>,
+    },
+    /// The account's EC2 store holds no allocation of that id, so there was no `Address`
+    /// record to associate. Whether such a request is refused is not this function's
+    /// question — it reports what it found.
+    NoSuchAllocation,
+    /// There is no readable EC2 store on this engine, so nothing was written and nothing
+    /// is known: the same "evidence of nothing" answer every other function here gives.
+    NoEc2Store,
+}
+
+/// Record on the account's own Amazon EC2 store that `allocation_id` is now associated
+/// with an Amazon EVS VLAN subnet, and answer the association EC2 made.
+///
+/// `AssociateEipToVlan` consumes an EC2 resource: `allocationId` is "the Elastic IP
+/// address allocation ID" of the caller's account and the `eipassoc-` id the operation
+/// reports is an EC2 `AssociationId`, so the association has to live on the EC2 `Address`
+/// record rather than only inside this service — otherwise `DescribeAddresses` reports an
+/// address as unassociated while a VLAN is using it, and the same allocation could be
+/// associated twice over. An allocation EC2 already holds an association for is NOT
+/// re-associated: it is reported back as [`ElasticIpAssociation::AlreadyAssociated`] so
+/// the caller can refuse the request, which is EC2's own single-use rule for an Elastic IP
+/// address (`Resource.AlreadyAssociated`).
+///
+/// `networkInterfaceId`, `networkInterfaceOwnerId` and `privateIpAddress` stay ABSENT on
+/// the record: they name the elastic network interface in the VLAN subnet the address is
+/// bound to, and this emulator mints no interface for the HCX appliance, so an id here
+/// would name a resource no operation could resolve — exactly the reading EC2's own
+/// `AssociateAddress` takes of those members.
+///
+/// The caller holds this service's own store while this runs, which is the one safe
+/// nesting order (EVS -> EC2), the same as [`launch_host_instance`].
+pub fn associate_elastic_ip<Eng: Send + Sync + 'static>(
     engine: &Eng,
     allocation_id: &str,
-) -> Option<String> {
-    let state = ec2_state(engine)?;
-    let store = state.lock();
-    store
-        .addresses
-        .get(allocation_id)
-        .and_then(|address| address.public_ip.clone())
+) -> ElasticIpAssociation {
+    let Some(state) = ec2_state(engine) else {
+        return ElasticIpAssociation::NoEc2Store;
+    };
+    let mut store = state.lock();
+    let Some(held) = store.addresses.get(allocation_id) else {
+        return ElasticIpAssociation::NoSuchAllocation;
+    };
+    if let Some(association_id) = held.association_id.clone() {
+        return ElasticIpAssociation::AlreadyAssociated {
+            association_id,
+            instance_id: held.instance_id.clone(),
+        };
+    }
+    // The id comes from EC2's OWN monotonic id source, so no two associations of the
+    // account share one whether EC2 or Amazon EVS made them. `eipassoc-` + 17 hex digits
+    // is 26 characters, which is also the `@length(max: 26)` this service's own
+    // `AssociationId` carries.
+    let association_id = store.next_id(ec2::ELASTIC_IP_ASSOCIATION_ID_PREFIX);
+    let Some(address) = store.addresses.get_mut(allocation_id) else {
+        return ElasticIpAssociation::NoSuchAllocation;
+    };
+    address.association_id = Some(association_id.clone());
+    ElasticIpAssociation::Associated {
+        association_id,
+        ip_address: address.public_ip.clone(),
+    }
+}
+
+/// End the EC2 associations `associations` names — each `(allocation id, association
+/// id)` — on the account's own Amazon EC2 store, and report how many were ended.
+///
+/// The inverse of [`associate_elastic_ip`], and the counterpart of
+/// [`release_vlan_subnets`]: an Elastic IP address a VLAN no longer uses goes back to
+/// being an unassociated allocation of the account, "disassociated … but remains
+/// allocated to your account" (EC2's `AssociateAddress` doc on the same transition), so
+/// it can be associated again. Only an address whose `AssociationId` is still the one
+/// this service recorded is touched, so a later association made elsewhere for the same
+/// allocation is never cleared by a stale record of ours.
+pub fn release_elastic_ips<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    associations: &[(String, String)],
+) -> usize {
+    if associations.is_empty() {
+        return 0;
+    }
+    let Some(state) = ec2_state(engine) else {
+        return 0;
+    };
+    let mut store = state.lock();
+    let mut released = 0;
+    for (allocation_id, association_id) in associations {
+        let ours = store
+            .addresses
+            .get(allocation_id)
+            .and_then(|address| address.association_id.as_deref())
+            == Some(association_id.as_str());
+        if ours {
+            // EC2's own primitive for ending an association, so an address released by
+            // Amazon EVS is left in exactly the state `DisassociateAddress` leaves one in.
+            store.detach_elastic_ip(allocation_id);
+            released += 1;
+        }
+    }
+    released
 }
 
 /// The `Subnet$Type` Amazon EC2 reports for a subnet Amazon EVS provisioned:

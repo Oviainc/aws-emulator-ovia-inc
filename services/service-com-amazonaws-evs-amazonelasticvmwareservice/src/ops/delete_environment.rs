@@ -5,7 +5,11 @@
 //! then owes it, stamping `modifiedAt`, and removes the environment's VLAN subnets
 //! from the account's own Amazon EC2 store — "environment deletion also deletes the
 //! associated Amazon EVS VLAN subnets", and those are real subnets of the caller's VPC
-//! ([`crate::state::ec2_resources::release_vlan_subnets`]). The other half of that
+//! ([`crate::state::ec2_resources::release_vlan_subnets`]), and ends the Elastic IP
+//! associations its VLANs were holding on the account's own `Address` records
+//! ([`crate::state::ec2_resources::release_elastic_ips`]): an environment that is gone
+//! consumes none of the account's Elastic IP addresses, which stay allocated to it. The
+//! other half of that
 //! sentence, the "Amazon Web Services Secrets Manager secrets that Amazon EVS created",
 //! has nothing to delete: this emulator creates no VCF credential secret, which is why
 //! `Environment$credentials` is absent (see [`crate::state::StoredEnvironment`]).
@@ -224,6 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The EC2 subnets this deletion releases — only on the call that starts the
         // deletion, so a repeat releases nothing a second time.
         let mut vlan_subnet_ids: Vec<String> = Vec::new();
+        // The EC2 Elastic IP associations it releases, as `(allocation id, association
+        // id)` pairs — the VLAN subnet the address was bound to goes away with the
+        // environment, so the association does too.
+        let mut released_eips: Vec<(String, String)> = Vec::new();
         if !already_going_away {
             environment.state = crate::state::STATE_DELETING.to_string();
             environment.modified_at_ms = crate::state::now_ms();
@@ -241,6 +249,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .vlans
                 .iter()
                 .map(|vlan| vlan.subnet_id.clone())
+                .collect();
+            released_eips = environment
+                .vlans
+                .iter()
+                .flat_map(|vlan| vlan.eip_associations.iter())
+                .filter_map(|association| {
+                    Some((
+                        association.allocation_id.clone()?,
+                        association.association_id.clone()?,
+                    ))
+                })
                 .collect();
         }
 
@@ -269,6 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // environment's own state does. The EC2 store is written while this service's
         // lock is held, the same order `CreateEnvironment` takes the two locks in.
         crate::state::ec2_resources::release_vlan_subnets(&*self.engine, &vlan_subnet_ids);
+        // The same reading for the Elastic IP addresses the environment's VLANs were
+        // using: the allocations remain the account's, but nothing is associated with a
+        // VLAN subnet that is being deleted, so a later associate can use them again.
+        crate::state::ec2_resources::release_elastic_ips(&*self.engine, &released_eips);
 
         Ok(DeleteEnvironmentOutput {
             environment: Some(deleted),
