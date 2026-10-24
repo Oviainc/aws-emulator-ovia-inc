@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::MESSAGE_MOVE_TASK_START_DELAY;
 
 use super::support::{
-    account, all_attributes, call, create_ok, emulator, error_code, expected_arn, messages, ok,
+    account, all_attributes, call, create_ok, dead_letter_queue, emulator, error_code,
+    expected_arn, messages, ok, redrives_to, send_all, OTHER_ACCOUNT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -39,60 +40,6 @@ const DELIVERY_DEADLINE: Duration = Duration::from_secs(20);
 /// the documented `ReceiveMessageRequest$WaitTimeSeconds` range ("an integer from 0 to
 /// 20").
 const RECEIVE_WAIT_SECONDS: u64 = 1;
-
-/// An account id that is not this emulator's, for the rows that check a `SourceArn`
-/// belonging to somebody else.
-const OTHER_ACCOUNT: &str = "123456789012";
-
-/// Create a queue called `name` and a queue called `<name>-source` whose `RedrivePolicy`
-/// drives its messages to it, which is what makes the first queue a dead-letter queue.
-/// Returns `(dead-letter queue url, dead-letter queue ARN, source queue url)`.
-async fn dead_letter_queue(
-    router: &MultiServiceRouter,
-    name: &str,
-) -> (String, String, String) {
-    let dead_letter_url = create_ok(router, name, &json!({})).await;
-    let dead_letter_arn = expected_arn(name);
-    let source_url = redrives_to(router, &format!("{name}-source"), &dead_letter_arn).await;
-    (dead_letter_url, dead_letter_arn, source_url)
-}
-
-/// Create a queue called `name` whose `RedrivePolicy` names `dead_letter_arn` as its
-/// dead-letter target, and return its url.
-async fn redrives_to(
-    router: &MultiServiceRouter,
-    name: &str,
-    dead_letter_arn: &str,
-) -> String {
-    let policy = json!({"deadLetterTargetArn": dead_letter_arn, "maxReceiveCount": "1"});
-    create_ok(
-        router,
-        name,
-        &json!({"RedrivePolicy": policy.to_string()}),
-    )
-    .await
-}
-
-/// Send `bodies` to the queue at `url` and return the `MessageId` each send minted, in
-/// send order.
-async fn send_all(router: &MultiServiceRouter, url: &str, bodies: &[String]) -> Vec<String> {
-    let mut ids = Vec::with_capacity(bodies.len());
-    for body in bodies {
-        let reply = ok(
-            router,
-            "SendMessage",
-            json!({"QueueUrl": url, "MessageBody": body}),
-        )
-        .await;
-        ids.push(
-            reply["MessageId"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case send {body}: no MessageId in {reply}"))
-                .to_string(),
-        );
-    }
-    ids
-}
 
 /// One queue attribute as an integer, which is how every `ApproximateNumberOfMessages*`
 /// attribute is reported.

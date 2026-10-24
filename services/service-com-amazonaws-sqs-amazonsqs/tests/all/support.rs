@@ -42,6 +42,11 @@ pub fn account() -> &'static str {
     engine::emulator_account_id()
 }
 
+/// An account id that is not this emulator's, for the rows that check an ARN belonging to
+/// somebody else. Every suite asserting that refusal shares it rather than re-deriving
+/// one; the suites that use it assert it differs from [`account`].
+pub const OTHER_ACCOUNT: &str = "123456789012";
+
 /// The url a queue named `name` must be reachable at: `<endpoint>/<account>/<name>`.
 pub fn expected_url(name: &str) -> String {
     format!("https://{HOST}/{}/{name}", account())
@@ -151,4 +156,51 @@ pub async fn all_attributes(
     )
     .await;
     as_map(&reported["Attributes"])
+}
+
+/// Create a queue called `name` and a queue called `<name>-source` whose `RedrivePolicy`
+/// drives its messages to it, which is what makes the first queue a dead-letter queue —
+/// the only kind of source a message movement task supports.
+///
+/// Returns `(dead-letter queue url, dead-letter queue ARN, source queue url)`.
+pub async fn dead_letter_queue(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (String, String, String) {
+    let dead_letter_url = create_ok(router, name, &json!({})).await;
+    let dead_letter_arn = expected_arn(name);
+    let source_url = redrives_to(router, &format!("{name}-source"), &dead_letter_arn).await;
+    (dead_letter_url, dead_letter_arn, source_url)
+}
+
+/// Create a queue called `name` whose `RedrivePolicy` names `dead_letter_arn` as its
+/// dead-letter target, and return its url.
+pub async fn redrives_to(
+    router: &MultiServiceRouter,
+    name: &str,
+    dead_letter_arn: &str,
+) -> String {
+    let policy = json!({"deadLetterTargetArn": dead_letter_arn, "maxReceiveCount": "1"});
+    create_ok(router, name, &json!({"RedrivePolicy": policy.to_string()})).await
+}
+
+/// Send `bodies` to the queue at `url` and return the `MessageId` each send minted, in
+/// send order.
+pub async fn send_all(router: &MultiServiceRouter, url: &str, bodies: &[String]) -> Vec<String> {
+    let mut ids = Vec::with_capacity(bodies.len());
+    for body in bodies {
+        let reply = ok(
+            router,
+            "SendMessage",
+            json!({"QueueUrl": url, "MessageBody": body}),
+        )
+        .await;
+        ids.push(
+            reply["MessageId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case send {body}: no MessageId in {reply}"))
+                .to_string(),
+        );
+    }
+    ids
 }

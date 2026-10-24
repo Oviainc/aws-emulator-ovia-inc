@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/delete_message_batch.rs"]
 mod delete_message_batch;
+#[path = "all/list_message_move_tasks.rs"]
+mod list_message_move_tasks;
 #[path = "all/message_lifecycle.rs"]
 mod message_lifecycle;
 #[path = "all/message_move_task.rs"]
