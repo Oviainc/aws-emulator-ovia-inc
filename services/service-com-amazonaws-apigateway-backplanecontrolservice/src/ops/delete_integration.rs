@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the `Integration` a method carries, together with the integration responses
+//! that hang off it (they are stored ON the integration record, so they go with it). The
+//! method itself, its method responses and every other method of the resource are
+//! untouched.
+//!
+//! Each identifier the request carries is resolved against stored state before anything
+//! is removed, so a request naming an API, a resource or a verb that does not exist, or
+//! a method that carries no integration, is refused with the modelled
+//! `NotFoundException` (404) and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -135,6 +136,15 @@ impl From<DeleteIntegrationErrorModeled> for DeleteIntegrationError {
     }
 }
 
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> DeleteIntegrationError {
+    DeleteIntegrationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The `DeleteIntegration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -171,18 +181,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIntegration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Every identifier the request carries is resolved against stored state before
+        // anything is removed, each naming its own record so the refusal says which one
+        // was not found.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        let method = resource
+            .methods
+            .get_mut(&super::put_method::method_key(&input.http_method))
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // A method with no integration has nothing to delete: the identifier in the URI
+        // names a record that does not exist, and the refusal must leave state as it
+        // found it — so the record is TESTED before it is removed.
+        if method.integration.is_none() {
+            return Err(not_found(crate::state::NO_SUCH_INTEGRATION));
+        }
+        // Dropping the stored record is what makes a later read of the integration, and
+        // of the integration responses stored on it, answer `NotFoundException`.
+        method.integration = None;
+        Ok(DeleteIntegrationOutput)
     }
 }

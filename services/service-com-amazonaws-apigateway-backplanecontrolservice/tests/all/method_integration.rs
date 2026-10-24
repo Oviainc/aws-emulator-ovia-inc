@@ -121,7 +121,10 @@ pub(crate) async fn get_method(gateway: &Gateway, api: &str, resource: &str, ver
 
 /// An AWS integration ARN, the form `uri` documents for the `AWS`/`AWS_PROXY` types:
 /// `arn:{partition}:apigateway:{region}:{service}:path|action/{service_api}`.
-fn aws_integration_uri(tail: &str) -> String {
+///
+/// Shared with the sibling `delete_integration` suite, which stands AWS integrations up
+/// to delete them.
+pub(crate) fn aws_integration_uri(tail: &str) -> String {
     format!("arn:aws:apigateway:us-east-1:{tail}")
 }
 
