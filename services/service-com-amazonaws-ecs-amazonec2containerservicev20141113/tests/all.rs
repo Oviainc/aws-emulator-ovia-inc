@@ -51,6 +51,8 @@ mod service_validation;
 mod state_roundtrip;
 #[path = "all/tag_set_reads.rs"]
 mod tag_set_reads;
+#[path = "all/tagging_writes.rs"]
+mod tagging_writes;
 #[path = "all/task_definition_deregistration.rs"]
 mod task_definition_deregistration;
 #[path = "all/task_definition_projection.rs"]

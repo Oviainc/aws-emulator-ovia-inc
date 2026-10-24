@@ -152,6 +152,27 @@ impl Control {
         out
     }
 
+    /// This configuration with `name` in place of its own, under the case name `case` —
+    /// the one place the update suite varies a single member, so it states no second
+    /// configuration builder of its own.
+    pub(crate) fn with_name(&self, case: &str, name: &str) -> Control {
+        Control {
+            case: case.to_string(),
+            name: name.to_string(),
+            ..self.clone()
+        }
+    }
+
+    /// This configuration with `description` in place of its own (`None` leaving the
+    /// optional member out entirely), under the case name `case`.
+    pub(crate) fn with_description(&self, case: &str, description: Option<&str>) -> Control {
+        Control {
+            case: case.to_string(),
+            description: description.map(str::to_string),
+            ..self.clone()
+        }
+    }
+
     /// Assert that `config` — an `OriginAccessControlConfig` element the emulator
     /// serialised — reports exactly this configuration.
     pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {

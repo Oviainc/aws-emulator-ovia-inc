@@ -40,9 +40,10 @@
 //!
 //! # What is deliberately left alone
 //!
-//! * Every other answer of `InvokeRestApi`: the scaffold's 501 for an environment that
-//!   exists (no Apache Airflow runs in this process), the framework's 400 refusal of an
-//!   input outside its modelled constraints, and any success.
+//! * Every other answer of `InvokeRestApi`: the modelled `RestApiClientException` /
+//!   `RestApiServerException` an Apache Airflow call's own failure is carried by, the
+//!   framework's 400 refusal of an input outside its modelled constraints, and any
+//!   success.
 //! * The control-plane operations, and the BODY of the other two `env.`-host-prefixed ones
 //!   (`CreateCliToken`, `CreateWebLoginToken`). Those mint a token in the service itself
 //!   rather than proxying a request to an environment's web server, and the recorded
@@ -271,8 +272,8 @@ mod tests {
     fn any_other_answer_is_left_byte_for_byte() {
         for (case, body) in [
             (
-                "the scaffold's 501 body",
-                r#"{"__type":"NotImplemented","message":"no Airflow"}"#,
+                "the body of an Apache Airflow call's own failure",
+                r#"{"__type":"RestApiClientException","RestApiStatusCode":404}"#,
             ),
             (
                 "a framework refusal",

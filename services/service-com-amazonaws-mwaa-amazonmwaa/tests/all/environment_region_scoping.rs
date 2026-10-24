@@ -451,8 +451,8 @@ async fn a_name_addressed_operation_resolves_nothing_outside_the_environments_re
         }
 
         // The positive control: in its OWN Region every one of those calls resolves the
-        // environment. `InvokeRestApi` answers 501 there (no Apache Airflow runs in this
-        // process), which is still the lookup succeeding rather than failing.
+        // environment, and the proxied one serves the Apache Airflow call against that
+        // environment's own state.
         let own_region_calls: Vec<(&str, &str, String, Option<Value>, u16)> = vec![
             ("GetEnvironment", "GET", format!("/environments/{name}"), None, 200),
             (
@@ -474,7 +474,7 @@ async fn a_name_addressed_operation_resolves_nothing_outside_the_environments_re
                 "POST",
                 format!("/restapi/{name}"),
                 Some(json!({"Path": "/dags", "Method": "GET"})),
-                501,
+                200,
             ),
             (
                 "UpdateEnvironment",

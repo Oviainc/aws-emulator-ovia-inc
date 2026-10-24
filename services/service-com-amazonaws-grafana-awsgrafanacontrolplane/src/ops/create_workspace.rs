@@ -319,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: "CREATING".to_string(),
             pending: Some(crate::state::PendingTransition {
                 due: now + crate::state::LIFECYCLE_TRANSITION,
-                status: "ACTIVE".to_string(),
+                status: crate::state::WORKSPACE_ACTIVE.to_string(),
             }),
             grafana_version: input
                 .grafana_version

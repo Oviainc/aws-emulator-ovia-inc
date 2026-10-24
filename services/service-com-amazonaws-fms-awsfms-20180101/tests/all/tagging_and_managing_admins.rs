@@ -20,16 +20,16 @@
 //!   the caller, and is `ResourceNotFoundException` — not an empty page — when
 //!   none does.
 //!
-//! The tagging operations are organisation-scoped, so each tagging test opens
-//! the administrator gate with [`associate_admin`] first: what the gate itself
-//! answers with no association is asserted by the sibling
-//! `tagging_administrator_gate` suite, and what an AUTHORISED caller gets is
-//! what this suite is about.
+//! Each tagging test here associates an administrator with [`associate_admin`]
+//! first, because the resources it tags are created through the
+//! organisation-scoped writers (`PutPolicy`), which ARE gated. The tagging
+//! operations themselves are not: that they answer the same with and without an
+//! association is asserted by the sibling `tagging_administrator_gate` suite.
 
 use serde_json::{json, Value};
 
 use crate::administrator_gated_operations::associate_admin;
-use crate::policy_lifecycle::{call, emulator, error_code, ACCOUNT, REGION};
+use crate::policy_lifecycle::{call, call_in, emulator, error_code, ACCOUNT, REGION};
 
 /// A minimal policy document: every required `Policy` member and nothing else.
 /// What is varied in these tests is the TAGS and the ARN, not the policy.
@@ -139,7 +139,24 @@ pub(crate) async fn list_tags(
     router: &smithy_server_runtime::MultiServiceRouter,
     arn: &str,
 ) -> (u16, String, Vec<(String, String)>) {
-    let (status, body) = call(router, "ListTagsForResource", &json!({ "ResourceArn": arn })).await;
+    list_tags_in(router, arn, REGION).await
+}
+
+/// [`list_tags`], signed for an explicit Region: a tag set is keyed by the ARN,
+/// so a suite asserting the same answer in several Regions reads it back through
+/// this one reader rather than its own copy.
+pub(crate) async fn list_tags_in(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    arn: &str,
+    region: &str,
+) -> (u16, String, Vec<(String, String)>) {
+    let (status, body) = call_in(
+        router,
+        "ListTagsForResource",
+        &json!({ "ResourceArn": arn }),
+        region,
+    )
+    .await;
     let code = if status == 200 {
         String::new()
     } else {

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutInstanceCommunicationLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutInstanceCommunicationLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutInstanceCommunicationLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists the instance-wide communication limits on the Connect instance's
+//! record, replacing whatever it held, so `GetInstanceCommunicationLimits` reports
+//! the config this call carried. Idempotent, as the model declares: the same call
+//! twice leaves the same config stored.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutInstanceCommunicationLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutInstanceCommunicationLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutInstanceCommunicationLimits"))
+        // The modelled `@length` of `communicationLimitsList` sits on a union member,
+        // which the centralized constraint walk does not reach, so an over-long list
+        // is refused here — as a bad request, before anything is looked up or stored,
+        // and through the same check every other operation that takes a
+        // `CommunicationLimits` uses.
+        if let Some(message) = crate::state::communication_limits_violation(
+            "communicationLimitsConfig.allChannelSubtypes.communicationLimitsList",
+            input.communication_limits_config.all_channel_subtypes.as_ref(),
+        ) {
+            return Err(
+                PutInstanceCommunicationLimitsErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutInstanceCommunicationLimitsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 instance store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // One guard spans the onboarding check and the write, so a concurrent delete
+        // of the instance's record cannot leave these limits on a record that is no
+        // longer in the store.
+        let stored = state.lock().put_instance_communication_limits(
+            &input.connect_instance_id,
+            input.communication_limits_config,
+            now,
+        );
+
+        // The call was asked to change what this service holds for the instance, so it
+        // leaves one audit record naming the caller, the instance and how it ended —
+        // never the limits themselves.
+        crate::state::audit_onboarding_change(
+            ctx.parts(),
+            Self::NAME,
+            &input.connect_instance_id,
+            if stored {
+                "accepted"
+            } else {
+                "ResourceNotFoundException"
+            },
+        );
+        if !stored {
+            // Instance-wide limits are configuration of the instance, so an instance
+            // with no finished onboarding job has nothing to configure — the same 404
+            // its config read answers, decided by the same predicate.
+            return Err(
+                PutInstanceCommunicationLimitsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_config_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(PutInstanceCommunicationLimitsOutput)
     }
 }

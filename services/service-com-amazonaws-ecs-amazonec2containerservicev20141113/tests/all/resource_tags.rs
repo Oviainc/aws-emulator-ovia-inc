@@ -26,10 +26,10 @@ use crate::task_lifecycle::container;
 
 /// The cluster the resources that live INSIDE a cluster (a service, a task, a container
 /// instance) are created in.
-const CLUSTER: &str = "demo";
+pub(crate) const CLUSTER: &str = "demo";
 
 /// The family of the task-definition revision the service and the task below run.
-const RUNNABLE_FAMILY: &str = "runnable";
+pub(crate) const RUNNABLE_FAMILY: &str = "runnable";
 
 /// A container image, as a container definition names one.
 const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
@@ -40,7 +40,7 @@ const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 /// (`ListTagsForResource$resourceArn`), plus the capacity provider
 /// `TagResource$resourceArn` adds.
 #[derive(Debug, Clone, Copy)]
-enum Kind {
+pub(crate) enum Kind {
     CapacityProvider,
     Cluster,
     ContainerInstance,
@@ -55,7 +55,7 @@ enum Kind {
 /// `name` is the identifier the kind's create takes — a cluster name, a capacity-provider
 /// name, a task-definition family, a service name or an EC2 instance id. A task has no
 /// caller-chosen name, so the row's value is unused for [`Kind::Task`].
-async fn create(
+pub(crate) async fn create(
     router: &MultiServiceRouter,
     kind: Kind,
     name: &str,
@@ -159,7 +159,7 @@ async fn create(
 /// The `{key, value}` pairs a reported tag list carries, SORTED: two readers of one tag
 /// set must report the same pairs, which is what this compares, rather than the order a
 /// particular map happened to hold them in.
-fn pairs(tags: &[Value], case: &str) -> Vec<(String, String)> {
+pub(crate) fn pairs(tags: &[Value], case: &str) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = tags
         .iter()
         .map(|tag| {
@@ -177,7 +177,7 @@ fn pairs(tags: &[Value], case: &str) -> Vec<(String, String)> {
 }
 
 /// The tags `ListTagsForResource` reports for one ARN, as a sorted pair list.
-async fn listed(
+pub(crate) async fn listed(
     router: &MultiServiceRouter,
     resource_arn: &str,
     case: &str,
@@ -195,7 +195,7 @@ async fn listed(
 /// Create the cluster the in-cluster resources live in, with capacity registered so a
 /// task placed with the EC2 launch type has somewhere to run, and one plain
 /// task-definition revision for the service and the task to run.
-async fn setup(router: &MultiServiceRouter) {
+pub(crate) async fn setup(router: &MultiServiceRouter) {
     cluster_with_capacity(router, CLUSTER, "setup").await;
     register_definition(router, RUNNABLE_FAMILY, "setup").await;
 }

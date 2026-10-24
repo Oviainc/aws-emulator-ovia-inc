@@ -69,6 +69,8 @@ mod domain_region_restriction;
 mod domain_zone;
 #[path = "all/export_snapshot_records.rs"]
 mod export_snapshot_records;
+#[path = "all/gui_session_access_details.rs"]
+mod gui_session_access_details;
 #[path = "all/instance_delete_attachments.rs"]
 mod instance_delete_attachments;
 #[path = "all/instance_error_envelope.rs"]

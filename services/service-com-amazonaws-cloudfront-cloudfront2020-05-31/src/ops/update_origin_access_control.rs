@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOriginAccessControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOriginAccessControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOriginAccessControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of the origin access control an id names, WHOLE: the
+//! operation's payload is a complete `OriginAccessControlConfig`, so the stored
+//! configuration becomes the submitted one down to the members it leaves out, and a fresh
+//! version token is minted — "the new version of the origin access control after it has
+//! been updated" — which is the one a later `If-Match` against this control is checked
+//! against. Reports the record as it then stands, read from the store rather than from the
+//! request.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is written, so a
+//! refused update leaves the stored control and its version token exactly as they were:
+//!
+//! * an id no stored control holds — `NoSuchOriginAccessControl` (HTTP 404);
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid";
+//!   one that carries a token that is not this control's current one —
+//!   `PreconditionFailed` (HTTP 412), so an update only lands on the configuration its
+//!   caller actually read ([`crate::state::check_if_match`]);
+//! * a `Name` past the documented bound — "You can specify up to 64 characters" —
+//!   `InvalidArgument` (HTTP 400), the SAME check the create path applies, so an update
+//!   cannot store a configuration the create would have refused;
+//! * a set of parameters ANOTHER stored control already holds —
+//!   `OriginAccessControlAlreadyExists` (HTTP 409), "An origin access control with the
+//!   specified parameters already exists": the conflict is over the whole set of
+//!   parameters, exactly as the create path reads it, and the control being updated
+//!   already holds its own parameters, so re-submitting them is not a conflict with
+//!   itself.
+//!
+//! `IllegalUpdate` ("The update contains modifications that are not allowed") is not
+//! reachable here: an `OriginAccessControlConfig` carries no member documented as fixed
+//! for the control's life — unlike a distribution's `CallerReference` — so there is no
+//! modification to refuse on. `AccessDenied` is unreachable here, as it is from every
+//! other operation in this service: the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +105,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +182,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOriginAccessControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOriginAccessControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOriginAccessControl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.origin_access_control_config;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it, as every mutating handler here does. A control itself has no
+        // transition owed: the model gives it no status, so one this service accepts is
+        // usable at once.
+        store.settle(::std::time::SystemTime::now());
+
+        // The control being updated is looked up first: every refusal below is about the
+        // record this id names, and nothing is minted for an id the store does not hold.
+        let Some(current_etag) = store
+            .origin_access_control(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                UpdateOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
+                    crate::state::no_such_origin_access_control(),
+                )
+                .into(),
+            );
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    UpdateOriginAccessControlErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(UpdateOriginAccessControlErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "A name to identify the origin access control. You can specify up to 64
+        // characters." The member carries no `@length` in the model, so the documented
+        // bound is refused here — with the refusal this operation models for an unusable
+        // argument — exactly as the create path refuses it.
+        let name_length = config.name.chars().count();
+        if name_length > crate::state::MAX_ORIGIN_ACCESS_CONTROL_NAME {
+            return Err(UpdateOriginAccessControlErrorModeled::InvalidArgument(
+                crate::state::origin_access_control_name_too_long(name_length),
+            )
+            .into());
+        }
+
+        // "An origin access control with the specified parameters already exists": the
+        // conflict is over the whole set of parameters, so an update asking for exactly
+        // what ANOTHER stored control asks for is refused leaving both untouched. The
+        // control being updated already holds its own parameters, which is why the
+        // holder's id is compared: re-submitting them is not a conflict with itself.
+        if let Some(holder) = store
+            .origin_access_control_with_config(&config)
+            .filter(|holder| holder.id != input.id)
+            .map(|holder| holder.id.clone())
+        {
+            return Err(
+                UpdateOriginAccessControlErrorModeled::OriginAccessControlAlreadyExists(
+                    OriginAccessControlAlreadyExists {
+                        message: Some(
+                            crate::state::origin_access_control_already_exists_message(&holder),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_origin_access_control_config(&input.id, config) else {
+            return Err(
+                UpdateOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
+                    crate::state::no_such_origin_access_control(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(UpdateOriginAccessControlOutput {
+            // "The origin access control after it has been updated" — read from the record
+            // just written, never from the request.
+            origin_access_control: Some(stored.to_origin_access_control()),
+            // "The new version of the origin access control after it has been updated" — a
+            // fresh token, so the version this caller just replaced no longer satisfies an
+            // `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }
