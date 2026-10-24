@@ -15,6 +15,8 @@
 mod email_contact_timestamp_wire_form;
 #[path = "all/email_contacts.rs"]
 mod email_contacts;
+#[path = "all/resource_tag_writes.rs"]
+mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
