@@ -921,12 +921,16 @@ async fn an_update_merges_only_the_members_it_carries() {
             "case {name}: an update keeps the ARN the create stored"
         );
 
-        // The update is in flight: the clock owes AVAILABLE and a SUCCESS LastUpdate.
+        // The update is in flight: Amazon MWAA snapshots the environment's database
+        // before it applies the change, so the first status an accepted update reports is
+        // CREATING_SNAPSHOT; the clock then owes UPDATING, AVAILABLE and a SUCCESS
+        // LastUpdate.
         let during = harness.environment(name).await;
         assert_eq!(
             during.get("Status").cloned(),
-            Some(json!("UPDATING")),
-            "case {name}: an environment under update reports UPDATING"
+            Some(json!(state::STATUS_CREATING_SNAPSHOT)),
+            "case {name}: an environment under update first reports CREATING_SNAPSHOT, got {:?}",
+            during.get("Status")
         );
         assert_eq!(
             during.pointer("/LastUpdate/Status").cloned(),
