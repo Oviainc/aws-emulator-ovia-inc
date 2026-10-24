@@ -24,6 +24,12 @@ use serde_json::{json, Value};
 use service_com_amazonaws_fms_awsfms_20180101::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The administrator association every organisation-scoped Firewall Manager
+// operation needs, opened the way a client does. The gate itself — what the
+// policy operations answer with no association — is asserted by the
+// `policy_administrator_gate` suite; here it is only the precondition.
+use crate::administrator_gated_operations::associate_admin;
+
 /// The Region the test requests are signed for. Deliberately not the emulator's
 /// `us-east-1` default, so an ARN built from the default would not pass.
 pub(crate) const REGION: &str = "us-west-2";
@@ -227,6 +233,15 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// [`emulator`] with this account associated as the Firewall Manager default
+/// administrator, which is the precondition the policy operations are
+/// organisation-scoped on.
+pub(crate) async fn emulator_with_administrator() -> MultiServiceRouter {
+    let router = emulator();
+    associate_admin(&router).await;
+    router
+}
+
 /// Create one case's policy and return the `PutPolicy` response body.
 async fn put_new(router: &MultiServiceRouter, case: &Case) -> Value {
     let (status, body) = call(
@@ -247,7 +262,7 @@ async fn put_new(router: &MultiServiceRouter, case: &Case) -> Value {
 /// ARN, and `GetPolicy` reads back exactly what was stored.
 #[tokio::test]
 async fn put_policy_mints_identifiers_and_get_policy_reads_the_stored_policy_back() {
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     let catalog = service_com_amazonaws_fms_awsfms_20180101::ops::types::SECURITY_SERVICE_TYPE_VALUES;
 
     for case in cases() {
@@ -348,7 +363,7 @@ async fn put_policy_mints_identifiers_and_get_policy_reads_the_stored_policy_bac
 async fn the_policy_arn_names_the_region_the_request_was_signed_for() {
     // Regions chosen to differ in partition-independent shape (prefix, digits).
     for region in ["us-east-1", "eu-central-1", "ap-southeast-4"] {
-        let router = emulator();
+        let router = emulator_with_administrator().await;
         for case in cases() {
             let (status, body) = call_in(
                 &router,
@@ -378,7 +393,7 @@ async fn the_policy_arn_names_the_region_the_request_was_signed_for() {
 /// rotates it, so the token that just worked no longer does.
 #[tokio::test]
 async fn an_update_requires_the_current_token_and_rotates_it() {
-    let router = emulator();
+    let router = emulator_with_administrator().await;
 
     for case in cases() {
         let put = put_new(&router, &case).await;
@@ -478,7 +493,7 @@ async fn an_update_requires_the_current_token_and_rotates_it() {
 /// remain, and round-trips to the next page.
 #[tokio::test]
 async fn list_policies_pages_the_stored_policies_and_projects_each_summary() {
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     let cases = cases();
 
     // Store the whole table, keeping what each row should project to.
@@ -598,7 +613,7 @@ async fn list_policies_pages_the_stored_policies_and_projects_each_summary() {
 #[tokio::test]
 async fn delete_policy_removes_the_policy_from_state() {
     for delete_all_resources in [None, Some(false), Some(true)] {
-        let router = emulator();
+        let router = emulator_with_administrator().await;
         let mut ids = Vec::new();
         for case in cases() {
             let put = put_new(&router, &case).await;
@@ -674,7 +689,7 @@ async fn the_page_and_the_policy_store_are_bounded() {
     const MAX_POLICIES: usize = 250;
     const { assert!(MAX_POLICIES > MAX_PAGE_SIZE) };
 
-    let router = emulator();
+    let router = emulator_with_administrator().await;
     let case = &cases()[0];
     for created in 0..MAX_POLICIES {
         let (status, body) = call(
@@ -768,7 +783,7 @@ async fn an_unknown_policy_id_is_not_found() {
     ];
 
     for stored_first in [false, true] {
-        let router = emulator();
+        let router = emulator_with_administrator().await;
         if stored_first {
             for case in cases() {
                 put_new(&router, &case).await;
