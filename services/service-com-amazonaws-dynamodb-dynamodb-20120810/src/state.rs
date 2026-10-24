@@ -10,7 +10,7 @@
 //! previous request wrote.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
@@ -1365,6 +1365,117 @@ pub fn new_table_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
 
+/// The tags a resource carries, and the set an EVENTUALLY CONSISTENT tag read can see
+/// yet.
+///
+/// A tag write lands on the resource at once and becomes visible to the tag reader a
+/// span later: "TagResource is an asynchronous operation. If you issue a
+/// ListTagsOfResource request immediately after a TagResource request, DynamoDB might
+/// return your previous tag set, if there was one, or an empty tag set. This is because
+/// ListTagsOfResource uses an eventually consistent query, and the metadata for your
+/// tags or table might not be available at that moment. ... The application or removal
+/// of tags using TagResource and UntagResource APIs is eventually consistent.
+/// ListTagsOfResource API will only reflect the changes after a few seconds" (the
+/// `TagResource` doc, repeated on `UntagResource` and `ListTagsOfResource`). AWS
+/// publishes no figure for "a few seconds", so the span is this emulator's CHOSEN one —
+/// the same [`STATUS_TRANSITION`] every other asynchronous change here takes: non-zero,
+/// so a caller that reads straight after a tag write still observes the set that was
+/// visible before it, and short enough that a client that re-polls settles quickly.
+///
+/// Each write records the set it left WITH ITS OWN due instant, so a later write never
+/// postpones an earlier one's visibility and the reader always reports the newest set
+/// whose span has elapsed. Nothing sleeps for the span: the propagation is materialised
+/// by [`Self::apply_due_propagation`], which
+/// [`ComAmazonawsDynamodbDynamodb20120810State::apply_due_transitions`] finishes on
+/// every request, whether or not anybody asked for the tags.
+#[derive(Debug, Default)]
+pub struct ResourceTags {
+    /// What the writes have left on the resource: the set the next write merges into or
+    /// removes from, and what the tag ceiling is measured against.
+    stored: TagSet,
+    /// The newest set whose propagation has fallen due, which is the one a tag read
+    /// reports.
+    visible: TagSet,
+    /// One entry per tag write still propagating — the set that write left, and when the
+    /// clock owes its visibility — oldest first, so they become visible in the order
+    /// they were written.
+    propagating: VecDeque<(SystemTime, TagSet)>,
+}
+
+impl ResourceTags {
+    /// The tag set a `CreateTable` seeds. It propagates like any other tag change, so a
+    /// table's tags are readable once the create has propagated — the instant the table
+    /// itself becomes `ACTIVE`.
+    pub fn seeded(tags: TagSet, now: SystemTime) -> Self {
+        let mut seeded = Self::default();
+        if !tags.is_empty() {
+            seeded.stored = tags;
+            seeded.record(now);
+        }
+        seeded
+    }
+
+    /// The set the writes have left on the resource. This is what a WRITE reads — never
+    /// what a reporting operation reports, which is [`Self::visible`].
+    pub fn stored(&self) -> &TagSet {
+        &self.stored
+    }
+
+    /// The set an eventually consistent tag read reports.
+    pub fn visible(&self) -> &TagSet {
+        &self.visible
+    }
+
+    /// How many tags the resource would carry once `incoming` were merged in: a key it
+    /// already holds is overwritten rather than added, so only new keys grow the set.
+    pub fn count_after_merging(&self, incoming: &TagSet) -> usize {
+        self.stored.len()
+            + incoming
+                .keys()
+                .filter(|key| !self.stored.contains_key(*key))
+                .count()
+    }
+
+    /// Merge `incoming` into the stored set — "If you try to add an existing tag (same
+    /// key), the existing tag value will be updated to the new value" (the `Tag$Key`
+    /// doc), and every key the request does not name keeps its value — and start the
+    /// propagation that makes the result visible.
+    pub fn merge(&mut self, incoming: TagSet, now: SystemTime) {
+        self.stored.extend(incoming);
+        self.record(now);
+    }
+
+    /// Drop exactly the tag keys named, leaving every other one alone, and start the
+    /// propagation of what is left. A key the resource does not carry is nothing to
+    /// remove, so the call is idempotent.
+    pub fn remove<'k>(&mut self, keys: impl IntoIterator<Item = &'k str>, now: SystemTime) {
+        for key in keys {
+            self.stored.remove(key);
+        }
+        self.record(now);
+    }
+
+    /// Materialise every propagation the clock has already made due, oldest first, so
+    /// the visible set ends up the one the newest elapsed write left.
+    pub fn apply_due_propagation(&mut self, now: SystemTime) {
+        while self
+            .propagating
+            .front()
+            .is_some_and(|(due, _)| now >= *due)
+        {
+            if let Some((_, propagated)) = self.propagating.pop_front() {
+                self.visible = propagated;
+            }
+        }
+    }
+
+    /// Record the set the write at `now` left, due to be visible one span later.
+    fn record(&mut self, now: SystemTime) {
+        self.propagating
+            .push_back((now + STATUS_TRANSITION, self.stored.clone()));
+    }
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
@@ -1402,9 +1513,9 @@ pub struct Table {
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
     /// The tags this table carries: the set `CreateTable` seeded and every later
-    /// `TagResource`/`UntagResource` edited, and the one thing
-    /// `ListTagsOfResource` reports.
-    pub tags: TagSet,
+    /// `TagResource`/`UntagResource` edited, together with the set the eventually
+    /// consistent `ListTagsOfResource` can see yet (see [`ResourceTags`]).
+    pub tags: ResourceTags,
     pub creation_date_time: SystemTime,
     /// When the clock owes this table its `CREATING` -> `ACTIVE` transition.
     pub active_at: SystemTime,
@@ -1463,31 +1574,6 @@ impl Table {
     /// Whether the clock has already made this table's removal due.
     pub fn removal_due(&self, now: SystemTime) -> bool {
         self.removed_at.is_some_and(|due| now >= due)
-    }
-
-    /// How many tags this table would carry once `incoming` were merged in: a key it
-    /// already holds is overwritten rather than added, so only new keys grow the set.
-    pub fn tag_count_after_merging(&self, incoming: &TagSet) -> usize {
-        self.tags.len()
-            + incoming
-                .keys()
-                .filter(|key| !self.tags.contains_key(*key))
-                .count()
-    }
-
-    /// Merge `incoming` into this table's tag set: "If you try to add an existing tag
-    /// (same key), the existing tag value will be updated to the new value" (the
-    /// `Tag$Key` doc), and every key the request does not name keeps its value.
-    pub fn merge_tags(&mut self, incoming: TagSet) {
-        self.tags.extend(incoming);
-    }
-
-    /// Drop exactly the tag keys named, leaving every other one alone. A key this
-    /// table does not carry is nothing to remove, so the call is idempotent.
-    pub fn remove_tags<'k>(&mut self, keys: impl IntoIterator<Item = &'k str>) {
-        for key in keys {
-            self.tags.remove(key);
-        }
     }
 
     /// The name of the `HASH` key attribute.
@@ -2098,7 +2184,8 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
 impl ComAmazonawsDynamodbDynamodb20120810State {
     /// Materialise the changes the clock has already made due: a table whose
     /// `DeleteTable` span has elapsed is gone, a table whose metering interval has
-    /// elapsed reports freshly counted `ItemCount`/`TableSizeBytes` figures, and a
+    /// elapsed reports freshly counted `ItemCount`/`TableSizeBytes` figures, a tag
+    /// write whose propagation span has elapsed becomes visible to the tag reader, and a
     /// `ClientRequestToken` whose idempotency window has elapsed no longer stands for
     /// the transaction it named.
     ///
@@ -2115,6 +2202,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             tables.retain(|_, table| !table.removal_due(now));
             for table in tables.values_mut() {
                 table.refresh_due_counters(now);
+                table.tags.apply_due_propagation(now);
             }
         }
         self.regions.retain(|_, tables| !tables.is_empty());
