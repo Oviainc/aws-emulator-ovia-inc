@@ -213,6 +213,49 @@ pub fn effective_recording_configuration(
     }
 }
 
+/// The dotted path of the member that names the storage configuration a stage records
+/// its participants into, as the wire spells it — what a refusal of that member names.
+pub const RECORDING_STORAGE_CONFIGURATION_MEMBER: &str =
+    "autoParticipantRecordingConfiguration.storageConfigurationArn";
+
+/// The resource kind a recording configuration's reference names, as
+/// [`unresolved_reference_message`] states it.
+const STORAGE_CONFIGURATION_RESOURCE: &str = "storage configuration";
+
+/// The recording configuration a stage holds, given what its create or update request
+/// supplied AND the storage configurations this account actually holds: the ONE place a
+/// supplied configuration is both defaulted ([`effective_recording_configuration`]) and
+/// resolved, so a create and an update accept and refuse the same request.
+///
+/// A non-empty `storageConfigurationArn` is a REFERENCE to a storage configuration of
+/// this same service ("ARN of the StorageConfiguration resource to use for individual
+/// participant recording"), so one this store holds no configuration for is refused
+/// instead of being copied into the stage: a stage attached to a configuration that does
+/// not exist would report recording as wired up while nothing can record. `Err` is the
+/// sentence to put on the calling operation's `ValidationException`, worded by
+/// [`unresolved_reference_message`]; `operation` is that operation's name. Called before
+/// anything is minted or written, so a refused request leaves the store as it was.
+///
+/// The empty string names no resource — it is the documented "no storage configuration"
+/// value — so it is resolved by nothing and keeps the documented reset.
+pub fn resolved_recording_configuration(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    operation: &str,
+    requested: Option<AutoParticipantRecordingConfiguration>,
+) -> Result<AutoParticipantRecordingConfiguration, String> {
+    let configuration = effective_recording_configuration(requested);
+    let arn = configuration.storage_configuration_arn.as_str();
+    if !arn.is_empty() && !state.storage_configurations.contains_key(arn) {
+        return Err(unresolved_reference_message(
+            operation,
+            RECORDING_STORAGE_CONFIGURATION_MEMBER,
+            STORAGE_CONFIGURATION_RESOURCE,
+            arn,
+        ));
+    }
+    Ok(configuration)
+}
+
 // ---------------------------------------------------------------------------
 // A stage's data-plane endpoints
 //
@@ -2362,6 +2405,26 @@ pub fn resource_not_found_message(identifier: &str) -> String {
 /// it names the resource the quota is on and the limit that was reached.
 pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
     format!("Resource: {resource} quota exceeded limit: {limit}")
+}
+
+/// How this service states a request whose member names a resource of this service that
+/// this account holds none of: the operation, the dotted member path, the kind of
+/// resource the member must name and the identifier the request sent, in the construction
+/// every other member refusal of this service uses ([`violation_clause`]).
+///
+/// One rule for every member that carries a REFERENCE to another resource of this
+/// service, so a dangling reference is refused in the same words whichever operation and
+/// member carried it.
+pub fn unresolved_reference_message(
+    operation: &str,
+    member: &str,
+    resource: &str,
+    identifier: &str,
+) -> String {
+    format!(
+        "{operation}.{member} is required to name a {resource} this account holds, \
+         found {identifier}"
+    )
 }
 
 /// How this service states a `nextToken` it did not issue: the operation, the member
