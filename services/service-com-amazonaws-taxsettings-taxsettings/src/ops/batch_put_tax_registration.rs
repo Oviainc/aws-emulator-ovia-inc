@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutTaxRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutTaxRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutTaxRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores ONE submitted TRN as the tax registration of EVERY account the request
+//! names: the per-account fan-out of `PutTaxRegistration`, with the same entry
+//! validation ([`crate::state::check_tax_registration_entry`]) and the same write
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::store_registration`]),
+//! so a registration written here reads back exactly as one written there.
+//!
+//! Two refusal channels, which are not interchangeable:
+//!
+//! * the ENTRY, and the request's shape, are judged before anything is stored —
+//!   an entry no account may be registered with is refused with the modelled
+//!   `ValidationException` and the store is left untouched, and an `accountIds`
+//!   outside the 1..=550 the model sets on it never reaches this handler: the
+//!   boundary validator refuses it, naming the member and the bound.
+//! * an account the service could not write while the entry itself was fine is
+//!   reported in the response's `errors` list, which names that account and why.
+//!   Today the one such reason is the resident bound
+//!   [`crate::state::MAX_STORED_REGISTRATIONS`], the same bound
+//!   `PutTaxRegistration` answers `ConflictException` for; reporting it per
+//!   account is what the `errors` member is for.
+//!
+//! `status` is the status the registrations were stored with — `Pending`, while
+//! the validation each write started is outstanding (see
+//! `ops/put_tax_registration.rs`) — and is reported only when at least one
+//! account was written: a call that stored nothing has no stored status.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +198,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutTaxRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutTaxRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchPutTaxRegistrationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let entry = &input.tax_registration_entry;
+
+        // `accountIds` carries the model's `@length` 1..=550, which the boundary
+        // validator refuses outside of before this handler runs — reaching here
+        // means the request named between 1 and 550 accounts.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutTaxRegistration"))
+        // The entry is judged once, for the whole call: it is the same entry for
+        // every account, so an entry no account may be registered with refuses
+        // the call rather than failing account by account, and nothing is stored.
+        crate::state::check_tax_registration_entry(entry)
+            .map_err(BatchPutTaxRegistrationErrorModeled::ValidationException)?;
+
+        let mut errors: Vec<BatchPutTaxRegistrationError2> = Vec::new();
+        let mut stored_status: Option<String> = None;
+        let written_at = ::std::time::Instant::now();
+        let mut store = state.lock();
+        for account_id in &input.account_ids {
+            // The same write `PutTaxRegistration` performs, so one entry cannot
+            // be stored two different ways. An account the write refuses — a new
+            // record this emulator has no room for — is reported against that
+            // account, and the rest of the batch still goes through.
+            match store.store_registration(account_id, entry, written_at) {
+                Ok(status) => stored_status = Some(status),
+                Err(conflict) => errors.push(BatchPutTaxRegistrationError2 {
+                    account_id: account_id.clone(),
+                    message: conflict.message,
+                    // The code this account's own single-account write would
+                    // have failed with: `PutTaxRegistration` answers the
+                    // resident bound with its modelled `ConflictException`.
+                    code: Some("ConflictException".to_string()),
+                }),
+            }
+        }
+        drop(store);
+
+        Ok(BatchPutTaxRegistrationOutput {
+            status: stored_status,
+            errors,
+        })
     }
 }

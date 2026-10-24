@@ -221,19 +221,20 @@ async fn a_read_reports_the_lists_its_include_asks_for() {
     .await;
 
     // One row per include list, asserting what each of the three optional lists carries
-    // under it. `statistics` is the eight launch-type counters
-    // (`Cluster$statistics`: "Additional information about your clusters that are
-    // separated by launch type"), which only a STATISTICS read computes.
+    // under it. `statistics` is the launch-type counters, four for each of the four
+    // launch types the `LaunchType` enum defines (`Cluster$statistics`: "Additional
+    // information about your clusters that are separated by launch type"), which only a
+    // STATISTICS read computes.
     let cases: [(&str, Value, usize, usize, usize); 5] = [
         ("no include", json!([]), 0, 0, 0),
         ("SETTINGS", json!(["SETTINGS"]), 1, 0, 0),
         ("TAGS", json!(["TAGS"]), 0, 0, 1),
-        ("STATISTICS", json!(["STATISTICS"]), 0, 8, 0),
+        ("STATISTICS", json!(["STATISTICS"]), 0, 16, 0),
         (
             "all three",
             json!(["SETTINGS", "STATISTICS", "TAGS"]),
             1,
-            8,
+            16,
             1,
         ),
     ];

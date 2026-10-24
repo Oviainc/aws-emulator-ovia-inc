@@ -78,7 +78,14 @@
 //!   list the API takes, and a `Configurations` entry's `ConfigurationProperties` onto the
 //!   API's `Properties`. Its identity is its owning service's as well ("Ref returns the
 //!   cluster ID"), so its arm answers the `j-` job-flow id Amazon EMR minted as the
-//!   resource's physical id.
+//!   resource's physical id;
+//! * `AWS::GuardDuty::Detector`'s are the `CreateDetector` request's own members spelled
+//!   with an initial capital (`Enable` / `enable`), all the way down, so its arm carries the
+//!   whole evaluated document through the same re-casing [`lower_camel_members`] the ECS
+//!   arm needs and lifts out the tag list, which the create takes as a map. A detector's id
+//!   is GuardDuty's OWN to mint — `CreateDetector` takes no identifier and answers with
+//!   `detectorId` — so, as for the FIS, AWS WAF Classic and Amazon EMR types above, what
+//!   the stack reports for the resource is the id that create answered with.
 //!
 //! No arm invents a value: a property the template does not declare is absent from the
 //! request, and what the owning service answers is what the stack records. A property an
@@ -98,7 +105,8 @@ use super::provisioning::{
 };
 use super::template::{
     CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER,
-    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
+    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, GUARDDUTY_DETECTOR, SNS_TOPIC, SQS_QUEUE,
+    WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -133,6 +141,7 @@ pub(super) enum Provisioner {
     SnsTopic,
     FisExperimentTemplate,
     WafRegionalIpSet,
+    GuardDutyDetector,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -151,6 +160,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
+        GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         _ => None,
     }
 }
@@ -183,6 +193,7 @@ impl Provisioner {
                 create_experiment_template(ctx, region, resource).await
             }
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
+            Self::GuardDutyDetector => create_detector(ctx, region, resource).await,
         }
     }
 
@@ -266,6 +277,7 @@ impl Provisioner {
                 delete_experiment_template(ctx, region, physical_resource_id).await
             }
             Self::WafRegionalIpSet => delete_ip_set(ctx, region, physical_resource_id).await,
+            Self::GuardDutyDetector => delete_detector(ctx, region, physical_resource_id).await,
         }
     }
 
@@ -309,6 +321,7 @@ impl Provisioner {
                 describe_experiment_template(ctx, region, physical_resource_id).await
             }
             Self::WafRegionalIpSet => describe_ip_set(ctx, region, physical_resource_id).await,
+            Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
         }
     }
 }
@@ -3027,6 +3040,194 @@ async fn call_waf_regional(
         request,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon GuardDuty: AWS::GuardDuty::Detector
+// ---------------------------------------------------------------------------
+
+/// Amazon GuardDuty's signing name, from its model (`sigv4Name: guardduty`,
+/// `endpointPrefix: guardduty`). GuardDuty speaks `restJson1`, so its operations are
+/// addressed by their `@http` METHOD and URI rather than by an `X-Amz-Target`.
+const GUARDDUTY_SIGNING_NAME: &str = "guardduty";
+
+/// The URI `CreateDetector` is bound to, and the collection a detector's own URI hangs
+/// off: `POST /detector` creates one, `GET /detector/{DetectorId}` reads it and
+/// `DELETE /detector/{DetectorId}` deletes it
+/// (`smithy_query(operation="CreateDetector,GetDetector,DeleteDetector")`).
+const GUARDDUTY_DETECTOR_URI: &str = "/detector";
+
+/// The error classes GuardDuty answers a client rejection under.
+///
+/// GuardDuty models ONE client error (`BadRequestException`, httpError 400) and answers
+/// with the specific class in the body's `__type`
+/// (`services/service-com-amazonaws-guardduty-guarddutyapiservice/src/scaffolded.rs`), so
+/// the code alone does not distinguish a detector id that names no detector of this
+/// account from any other rejection — which is why [`delete_detector`] confirms one by
+/// reading the detector back rather than reading "already deleted" off the code.
+const GUARDDUTY_INVALID_INPUT: &str = "InvalidInputException";
+const GUARDDUTY_BAD_REQUEST: &str = "BadRequestException";
+
+/// Create the detector an `AWS::GuardDuty::Detector` declares.
+///
+/// The type's properties ARE `CreateDetector`'s own members, spelled with an initial
+/// capital — `Enable`, `FindingPublishingFrequency`, `DataSources` and `Features` against
+/// `enable`, `findingPublishingFrequency`, `dataSources` and `features`, every one of them
+/// a `jsonName` of `smithy_query(operation="CreateDetector")` — and the correspondence
+/// holds all the way down (`DataSources.Kubernetes.AuditLogs.Enable` is
+/// `dataSources.kubernetes.auditLogs.enable`;
+/// `DataSources.MalwareProtection.ScanEc2InstanceWithFindings.EbsVolumes` is
+/// `dataSources.malwareProtection.scanEc2InstanceWithFindings.ebsVolumes`; a `Features`
+/// entry's `Name`, `Status` and `AdditionalConfiguration[].Status` are `name`, `status` and
+/// `additionalConfiguration[].status` — `smithy_query(shape="DataSourceConfigurations,
+/// KubernetesConfiguration,MalwareProtectionConfiguration,ScanEc2InstanceWithFindings,
+/// S3LogsConfiguration,DetectorFeatureConfiguration,DetectorAdditionalConfiguration")`).
+/// So the whole evaluated document is carried through [`lower_camel_members`] rather than
+/// mapped member by member, which is the same re-casing `AWS::ECS::Cluster` needs and is
+/// safe for the same reason: no property of this type carries a MAP of caller data. The
+/// one exception is `Tags`, a list of `{Key, Value}` pairs where the create takes a map
+/// ([`tag_map`]), lifted out before the walk.
+///
+/// VALUES are untouched: an enum value, a boolean and a number are what the template
+/// declared, and GuardDuty's own validation is what judges them — its refusal leaves the
+/// stack `CREATE_FAILED` rather than a detector configured differently from the template.
+///
+/// A detector's id is GuardDuty's OWN to mint — `CreateDetector` takes no identifier and
+/// answers with `detectorId` — so that answer is reported back as the resource's physical
+/// id, which is what `Ref` resolves to and what a client then passes as `DetectorId`. It is
+/// also the type's one published `Fn::GetAtt` attribute (`Id`), so that is re-reported off
+/// the identity GuardDuty assigned rather than the one the naming rules computed.
+async fn create_detector(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    if let Some(properties) = resource.properties.as_object() {
+        for (property, value) in properties {
+            if property == "Tags" {
+                continue;
+            }
+            request.insert(lower_initial(property), lower_camel_members(value));
+        }
+    }
+    let tags = resource
+        .properties
+        .get("Tags")
+        .map(tag_map)
+        .unwrap_or_default();
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        GUARDDUTY_SIGNING_NAME,
+        region,
+        "POST",
+        GUARDDUTY_DETECTOR_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let Some(detector_id) = reported.get("detectorId").and_then(Value::as_str) else {
+        // The create answered 2xx without the id its output models. Nothing addresses a
+        // detector without one, so this is reported as a failure rather than recorded as
+        // a resource with a physical id nothing minted.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "CreateDetector answered no detectorId".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), detector_id.to_string());
+    Ok(Created {
+        physical_resource_id: Some(detector_id.to_string()),
+        attributes,
+    })
+}
+
+/// Delete the detector a stack created, addressed by its id — this resource's physical id,
+/// which is what `Ref` returns for the type.
+///
+/// A detector GuardDuty no longer resolves the id to is already in the state the delete
+/// asks for. GuardDuty answers every client rejection under one class, so the code alone
+/// does not say WHICH rejection it was: a refusal is confirmed by reading the detector
+/// back, and only a read that refuses it too — the id resolves to no detector — is treated
+/// as already deleted. A refusal of a detector GuardDuty still holds is reported, so
+/// nothing passes off a deletion that did not happen.
+async fn delete_detector(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = format!("{GUARDDUTY_DETECTOR_URI}/{physical_resource_id}");
+    let refusal =
+        match call_rest_json(ctx, GUARDDUTY_SIGNING_NAME, region, "DELETE", &uri, None).await {
+            Ok(_) => return Ok(()),
+            Err(refusal) => refusal,
+        };
+    if !guardduty_rejected(&refusal) {
+        return Err(refusal);
+    }
+    match call_rest_json(ctx, GUARDDUTY_SIGNING_NAME, region, "GET", &uri, None).await {
+        // The detector is still there, so the delete really was refused.
+        Ok(_) => Err(refusal),
+        // GuardDuty does not resolve the id: the detector is already in the state the
+        // delete asks for. Judged on the client-rejection class, so a transport or
+        // internal failure of the confirming read is reported rather than mistaken for a
+        // deletion — that failure says nothing about whether the detector is there.
+        Err(confirmation) if guardduty_rejected(&confirmation) => Ok(()),
+        Err(confirmation) => Err(confirmation),
+    }
+}
+
+/// The detector's configuration as GuardDuty reports it, for drift detection.
+///
+/// A detector GuardDuty no longer resolves the id to was deleted: a READ has only that one
+/// reading of the client-rejection class this service answers with (unlike
+/// [`delete_detector`], where the same class could also be a refusal of the delete
+/// itself), so that class is `Ok(None)`.
+///
+/// Only the two properties `GetDetector` reports in the SAME shape the type declares them
+/// in are reported, because a property the actual document does not carry is not evidence
+/// of anything (`super::drift::differs`): `Enable`, which the detector's required `Status`
+/// is — "a Boolean value that specifies whether the detector is to be enabled", and
+/// `DetectorStatus` is `ENABLED`/`DISABLED` — and `FindingPublishingFrequency`, the same
+/// enum on both sides. `DataSources` and `Features` are reported as RESULT shapes, with a
+/// per-switch status and the instant it last changed rather than the enable flags the
+/// properties are, and `Tags` as a map where the property is a list of pairs; comparing
+/// either would need a mapping this module would have to invent, so neither is reported
+/// and neither is ever read as drift.
+async fn describe_detector(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    /// The `DetectorStatus` of a detector that is enabled (`smithy_query(shape=
+    /// "DetectorStatus")`: `DISABLED | ENABLED`).
+    const ENABLED: &str = "ENABLED";
+
+    let uri = format!("{GUARDDUTY_DETECTOR_URI}/{physical_resource_id}");
+    let reported =
+        match call_rest_json(ctx, GUARDDUTY_SIGNING_NAME, region, "GET", &uri, None).await {
+            Ok(reported) => reported,
+            Err(refusal) if guardduty_rejected(&refusal) => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+    let mut actual = Map::new();
+    if let Some(status) = reported.get("status").and_then(Value::as_str) {
+        actual.insert("Enable".to_string(), Value::Bool(status == ENABLED));
+    }
+    if let Some(frequency) = reported.get("findingPublishingFrequency") {
+        actual.insert("FindingPublishingFrequency".to_string(), frequency.clone());
+    }
+    Ok(Some(Value::Object(actual)))
+}
+
+/// Whether a refusal is GuardDuty REJECTING the request — the class a detector id that
+/// resolves to no detector of this account comes back under — rather than a transport or
+/// internal failure, which says nothing about whether the detector is there.
+fn guardduty_rejected(refusal: &Refusal) -> bool {
+    refusal.code == GUARDDUTY_INVALID_INPUT || refusal.code == GUARDDUTY_BAD_REQUEST
 }
 
 #[cfg(test)]

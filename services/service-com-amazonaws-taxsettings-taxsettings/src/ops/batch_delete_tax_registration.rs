@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteTaxRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteTaxRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteTaxRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tax registration of EVERY account the request names: the
+//! per-account fan-out of `DeleteTaxRegistration`, so later reads of those
+//! accounts answer `ResourceNotFoundException` and they no longer appear in
+//! `ListTaxRegistrations`.
+//!
+//! An account the service could not delete — one holding no registration, which
+//! is what `DeleteTaxRegistration` answers 404 for — is reported in the
+//! response's `errors` list naming that account, and the rest of the batch is
+//! still deleted. `accountIds` carries the model's `@length` 1..=5, which the
+//! boundary validator refuses outside of before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +147,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteTaxRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteTaxRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteTaxRegistration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchDeleteTaxRegistrationErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+
+        let mut errors: Vec<BatchDeleteTaxRegistrationError2> = Vec::new();
+        let mut store = state.lock();
+        for account_id in &input.account_ids {
+            if store.registrations.remove(account_id).is_none() {
+                let missing = crate::state::no_tax_registration();
+                errors.push(BatchDeleteTaxRegistrationError2 {
+                    account_id: account_id.clone(),
+                    message: missing.message,
+                    // The code this account's own single-account delete would
+                    // have failed with: `DeleteTaxRegistration` answers an
+                    // account holding no registration with its modelled
+                    // `ResourceNotFoundException`.
+                    code: Some("ResourceNotFoundException".to_string()),
+                });
+            }
+        }
+        drop(store);
+
+        Ok(BatchDeleteTaxRegistrationOutput { errors })
     }
 }
