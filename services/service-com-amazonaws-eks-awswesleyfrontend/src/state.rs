@@ -136,6 +136,128 @@ pub const UPDATE_TYPE_ASSOCIATE_ENCRYPTION_CONFIG: &str = "AssociateEncryptionCo
 /// configuration under (`smithy_query query="shape" shape="UpdateParamType"`).
 pub const UPDATE_PARAM_ENCRYPTION_CONFIG: &str = "EncryptionConfig";
 
+/// How many asynchronous updates one cluster's history keeps.
+///
+/// Amazon EKS publishes no limit on how many updates `ListUpdates` can report, so
+/// this is CHOSEN to bound the store rather than cited: `UpdateClusterConfig`
+/// mints one record per accepted configuration change, so without a cap a caller
+/// that keeps changing the configuration would grow this map once per request.
+/// Large enough that a caller's recent update history is reported exactly, and
+/// enforced by evicting the oldest TERMINAL update
+/// ([`ClusterRecord::record_update`]).
+pub const MAX_UPDATES_PER_CLUSTER: usize = 50;
+
+/// The `UpdateType` members a cluster configuration change reports
+/// (`smithy_query query="shape" shape="UpdateType"`), one per CATEGORY of
+/// configuration `UpdateClusterConfig` can change: an `Update` carries a single
+/// `type`, so the type is the category of the change the call asked for.
+pub const UPDATE_TYPE_LOGGING: &str = "LoggingUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — the endpoint access half of
+/// `resourcesVpcConfig` (public/private access and the public access CIDRs).
+pub const UPDATE_TYPE_ENDPOINT_ACCESS: &str = "EndpointAccessUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — the VPC half of `resourcesVpcConfig` (the
+/// subnets and security groups the control plane uses).
+pub const UPDATE_TYPE_VPC_CONFIG: &str = "VpcConfigUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `resourcesVpcConfig.controlPlaneEgressMode`.
+pub const UPDATE_TYPE_CONTROL_PLANE_EGRESS: &str = "ControlPlaneEgressUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `accessConfig`.
+pub const UPDATE_TYPE_ACCESS_CONFIG: &str = "AccessConfigUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `upgradePolicy`.
+pub const UPDATE_TYPE_UPGRADE_POLICY: &str = "UpgradePolicyUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `zonalShiftConfig`.
+pub const UPDATE_TYPE_ZONAL_SHIFT_CONFIG: &str = "ZonalShiftConfigUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — the three EKS Auto Mode capabilities
+/// (`computeConfig`, `storageConfig` and `kubernetesNetworkConfig`'s
+/// `elasticLoadBalancing`), which are one category because they are the
+/// capabilities Auto Mode manages.
+pub const UPDATE_TYPE_AUTO_MODE: &str = "AutoModeUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `remoteNetworkConfig`.
+pub const UPDATE_TYPE_REMOTE_NETWORK_CONFIG: &str = "RemoteNetworkConfigUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `deletionProtection`.
+pub const UPDATE_TYPE_DELETION_PROTECTION: &str = "DeletionProtectionUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — `controlPlaneScalingConfig`.
+pub const UPDATE_TYPE_CONTROL_PLANE_SCALING_CONFIG: &str = "ControlPlaneScalingConfigUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — the three Kubernetes control plane component
+/// configurations (`kubeApiServerConfig`, `kubeSchedulerConfig` and
+/// `kubeControllerManagerConfig`).
+pub const UPDATE_TYPE_CONTROL_PLANE_COMPONENT_CONFIG: &str = "ControlPlaneComponentConfigUpdate";
+/// See [`UPDATE_TYPE_LOGGING`] — the generic cluster configuration update, which
+/// is what one call changing members of MORE than one category reports: the
+/// change is a configuration update that no single narrower type names.
+pub const UPDATE_TYPE_CONFIG: &str = "ConfigUpdate";
+
+/// The `UpdateParamType` keys a cluster configuration change reports its
+/// requested values under (`smithy_query query="shape"
+/// shape="UpdateParamType"`). One key per member the request can carry, so a
+/// caller reading the update back sees which values it asked to change.
+pub const UPDATE_PARAM_CLUSTER_LOGGING: &str = "ClusterLogging";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_ENDPOINT_PUBLIC_ACCESS: &str = "EndpointPublicAccess";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_ENDPOINT_PRIVATE_ACCESS: &str = "EndpointPrivateAccess";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_PUBLIC_ACCESS_CIDRS: &str = "PublicAccessCidrs";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_SUBNETS: &str = "Subnets";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_SECURITY_GROUPS: &str = "SecurityGroups";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_CONTROL_PLANE_EGRESS_MODE: &str = "ControlPlaneEgressMode";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_AUTHENTICATION_MODE: &str = "AuthenticationMode";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_UPGRADE_POLICY: &str = "UpgradePolicy";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_ZONAL_SHIFT_CONFIG: &str = "ZonalShiftConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_COMPUTE_CONFIG: &str = "ComputeConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_STORAGE_CONFIG: &str = "StorageConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_KUBERNETES_NETWORK_CONFIG: &str = "KubernetesNetworkConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_REMOTE_NETWORK_CONFIG: &str = "RemoteNetworkConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_DELETION_PROTECTION: &str = "DeletionProtection";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`] — the tier a scaling change moves the
+/// control plane TO.
+pub const UPDATE_PARAM_UPDATED_TIER: &str = "UpdatedTier";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`] — the tier it moves FROM.
+pub const UPDATE_PARAM_PREVIOUS_TIER: &str = "PreviousTier";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_KUBE_API_SERVER_CONFIG: &str = "KubeApiServerConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_KUBE_SCHEDULER_CONFIG: &str = "KubeSchedulerConfig";
+/// See [`UPDATE_PARAM_CLUSTER_LOGGING`].
+pub const UPDATE_PARAM_KUBE_CONTROLLER_MANAGER_CONFIG: &str = "KubeControllerManagerConfig";
+
+/// The `ControlPlaneEgressModeType` members
+/// (`smithy_query query="shape" shape="ControlPlaneEgressModeType"`). "Once set
+/// to `CUSTOMER_ROUTED`, this setting cannot be changed back to `AWS_MANAGED` on
+/// the same cluster" (`VpcConfigRequest$controlPlaneEgressMode`), which is what
+/// `UpdateClusterConfig` enforces with them.
+pub const CONTROL_PLANE_EGRESS_AWS_MANAGED: &str = "AWS_MANAGED";
+/// See [`CONTROL_PLANE_EGRESS_AWS_MANAGED`].
+pub const CONTROL_PLANE_EGRESS_CUSTOMER_ROUTED: &str = "CUSTOMER_ROUTED";
+
+/// The `AuthenticationMode` members, in the order a cluster may move through
+/// them (`smithy_query query="shape" shape="AuthenticationMode"`).
+///
+/// A cluster can only move TOWARDS the API-based mode: "you can switch from
+/// `CONFIG_MAP` to `API_AND_CONFIG_MAP` and from `API_AND_CONFIG_MAP` to `API`,
+/// but you can't switch back" (Amazon EKS User Guide, "Grant IAM users access to
+/// Kubernetes with EKS access entries"), so the index of a mode in this list is
+/// how far along that one-way ladder it is.
+pub const AUTHENTICATION_MODE_LADDER: &[&str] = &["CONFIG_MAP", "API_AND_CONFIG_MAP", "API"];
+
+/// How far along [`AUTHENTICATION_MODE_LADDER`] `mode` is, or `None` when it is
+/// not one of the modelled modes.
+pub fn authentication_mode_rank(mode: &str) -> Option<usize> {
+    AUTHENTICATION_MODE_LADDER
+        .iter()
+        .position(|known| *known == mode)
+}
+
 /// How long an asynchronous cluster update reports `InProgress` before the clock
 /// owes it `Successful` and the change it carries is applied to the cluster.
 ///
@@ -1183,15 +1305,19 @@ pub struct ClusterRecord {
     ///
     /// They live on the cluster because that is what scopes them: `DescribeUpdate`
     /// and `ListUpdates` both name a cluster, and deleting the cluster must drop
-    /// its updates. A `BTreeMap` so a listing walks a stable, sorted order. Each
-    /// operation that mints an update refuses to start a second one while one is
-    /// in flight, `AssociateEncryptionConfig` is refused once encryption is
-    /// enabled, `CreateCertificateAuthority` once the cluster holds
+    /// its updates. A `BTreeMap` so a listing walks a stable, sorted order.
+    ///
+    /// BOUNDED at [`MAX_UPDATES_PER_CLUSTER`] entries, which
+    /// [`ClusterRecord::record_update`] enforces by evicting the oldest TERMINAL
+    /// update as it appends. Some minters are self-limiting on their own —
+    /// `AssociateEncryptionConfig` is refused once encryption is enabled,
+    /// `CreateCertificateAuthority` once the cluster holds
     /// [`MAX_CERTIFICATE_AUTHORITIES_PER_CLUSTER`] certificate authorities, and
     /// `AssociateIdentityProviderConfig` mints at most one update per
-    /// configuration it associates — so this map holds a bounded number of
-    /// entries per cluster and
-    /// [`MAX_STORED_CLUSTERS`] bounds it.
+    /// configuration it associates — but `UpdateClusterConfig` can be called
+    /// again for every configuration change a caller makes, so the history needs
+    /// a bound of its own rather than relying on its minters. With that cap per
+    /// cluster, [`MAX_STORED_CLUSTERS`] bounds the whole store.
     pub updates: BTreeMap<String, UpdateRecord>,
 }
 
@@ -1201,9 +1327,9 @@ pub struct ClusterRecord {
 /// returns what the call that started the update wrote, and what a later
 /// `CancelUpdate` recorded on it, rather than recomputing either. Three fields
 /// are not reported: `succeeds_at` is the instant the clock owes this update its
-/// `Successful` status, `pending_encryption_config` is the change applied to the
-/// cluster at that same instant, and `cancellation_request_token` is what makes
-/// a retried cancel request idempotent.
+/// `Successful` status, `pending_config` is the change applied to the cluster at
+/// that same instant, and `cancellation_request_token` is what makes a retried
+/// cancel request idempotent.
 #[derive(Debug, Clone)]
 pub struct UpdateRecord {
     pub id: String,
@@ -1215,9 +1341,13 @@ pub struct UpdateRecord {
     /// When set, the instant at which the clock owes this update the move from
     /// `InProgress` to `Successful`. Cleared once the move is materialised.
     pub succeeds_at: Option<SystemTime>,
-    /// The `encryptionConfig` this update puts on its cluster when it completes,
-    /// for an `AssociateEncryptionConfig` update. Taken when applied.
-    pub pending_encryption_config: Option<Vec<EncryptionConfig>>,
+    /// The change this update puts on its cluster when it completes — the
+    /// `encryptionConfig` an `AssociateEncryptionConfig` carries, or the
+    /// configuration members an `UpdateClusterConfig` carries. Taken when
+    /// applied. `None` on an update whose work is not a change to the cluster
+    /// record itself (associating an identity provider, appending a certificate
+    /// authority), which writes its own resource instead.
+    pub pending_config: Option<PendingClusterConfig>,
     /// "The latest cancellation information for the update. This field is
     /// present only if any cancellation is attempted for the update"
     /// (`Update$cancellation`) — written by `CancelUpdate`.
@@ -1264,6 +1394,92 @@ impl UpdateRecord {
             // `CancelUpdate` has attempted one.
             errors: None,
             cancellation: self.cancellation.clone(),
+        }
+    }
+}
+
+/// The change an in-flight update will put on its cluster when it completes.
+///
+/// A cluster update is asynchronous — "Cluster updates are asynchronous... During
+/// an update, the cluster status moves to UPDATING... When the update is complete
+/// ... the cluster status moves to Active" (`UpdateClusterConfig`) — so the
+/// requested values are held HERE until the clock completes the update, and only
+/// then written onto the [`ClusterRecord`]. One struct for every member a change
+/// can carry, so an update holds exactly one pending change rather than a field
+/// per operation that mints one.
+///
+/// A member left `None` is a member this change does not touch: applying the
+/// change leaves whatever the cluster already reports for it.
+#[derive(Debug, Clone, Default)]
+pub struct PendingClusterConfig {
+    pub logging: Option<Logging>,
+    pub resources_vpc_config: Option<VpcConfigResponse>,
+    pub kubernetes_network_config: Option<KubernetesNetworkConfigResponse>,
+    pub access_config: Option<AccessConfigResponse>,
+    pub upgrade_policy: Option<UpgradePolicyResponse>,
+    pub zonal_shift_config: Option<ZonalShiftConfigResponse>,
+    pub compute_config: Option<ComputeConfigResponse>,
+    pub storage_config: Option<StorageConfigResponse>,
+    pub remote_network_config: Option<RemoteNetworkConfigResponse>,
+    pub deletion_protection: Option<bool>,
+    pub control_plane_scaling_config: Option<ControlPlaneScalingConfig>,
+    pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
+    pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
+    pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
+    /// The `encryptionConfig` an `AssociateEncryptionConfig` update enables. It
+    /// is a list rather than an `Option`-wrapped member of the cluster record,
+    /// so an empty list here would mean "enable nothing"; the `Option` is what
+    /// distinguishes a change that does not touch encryption at all.
+    pub encryption_config: Option<Vec<EncryptionConfig>>,
+}
+
+impl PendingClusterConfig {
+    /// Write this change onto `record`, which is what completing the update does.
+    pub fn apply(self, record: &mut ClusterRecord) {
+        if let Some(logging) = self.logging {
+            record.logging = Some(logging);
+        }
+        if let Some(vpc_config) = self.resources_vpc_config {
+            record.resources_vpc_config = Some(vpc_config);
+        }
+        if let Some(network_config) = self.kubernetes_network_config {
+            record.kubernetes_network_config = Some(network_config);
+        }
+        if let Some(access_config) = self.access_config {
+            record.access_config = Some(access_config);
+        }
+        if let Some(upgrade_policy) = self.upgrade_policy {
+            record.upgrade_policy = Some(upgrade_policy);
+        }
+        if let Some(zonal_shift_config) = self.zonal_shift_config {
+            record.zonal_shift_config = Some(zonal_shift_config);
+        }
+        if let Some(compute_config) = self.compute_config {
+            record.compute_config = Some(compute_config);
+        }
+        if let Some(storage_config) = self.storage_config {
+            record.storage_config = Some(storage_config);
+        }
+        if let Some(remote_network_config) = self.remote_network_config {
+            record.remote_network_config = Some(remote_network_config);
+        }
+        if let Some(deletion_protection) = self.deletion_protection {
+            record.deletion_protection = deletion_protection;
+        }
+        if let Some(scaling_config) = self.control_plane_scaling_config {
+            record.control_plane_scaling_config = Some(scaling_config);
+        }
+        if let Some(kube_api_server_config) = self.kube_api_server_config {
+            record.kube_api_server_config = Some(kube_api_server_config);
+        }
+        if let Some(kube_scheduler_config) = self.kube_scheduler_config {
+            record.kube_scheduler_config = Some(kube_scheduler_config);
+        }
+        if let Some(controller_manager_config) = self.kube_controller_manager_config {
+            record.kube_controller_manager_config = Some(controller_manager_config);
+        }
+        if let Some(encryption_config) = self.encryption_config {
+            record.encryption_config = encryption_config;
         }
     }
 }
@@ -1320,9 +1536,9 @@ impl ClusterRecord {
             };
             update.status = UPDATE_SUCCESSFUL.to_string();
             update.succeeds_at = None;
-            let encryption_config = update.pending_encryption_config.take();
-            if let Some(encryption_config) = encryption_config {
-                self.encryption_config = encryption_config;
+            let pending = update.pending_config.take();
+            if let Some(pending) = pending {
+                pending.apply(self);
             }
             // An update only starts from an `ACTIVE` cluster, so completing one
             // hands the cluster back to the status it was taken from.
@@ -1352,6 +1568,36 @@ impl ClusterRecord {
         self.updates
             .values()
             .find(|update| update.client_request_token.as_deref() == Some(token))
+    }
+
+    /// Append `update` to this cluster's update history, keeping that history
+    /// bounded at [`MAX_UPDATES_PER_CLUSTER`].
+    ///
+    /// `UpdateClusterConfig` mints one record per accepted configuration change,
+    /// so this map is the one structure here that grows per REQUEST rather than
+    /// per resource name. Reaching the cap evicts the OLDEST TERMINAL update — a
+    /// `Successful`, `Cancelled` or `Failed` one, whose work is done and whose
+    /// record nothing is owed from — so a caller that keeps changing the
+    /// configuration keeps its recent history exact while the emulator's memory
+    /// stays bounded. An update still `InProgress` is never evicted: the clock
+    /// still owes it a status move and the change it carries.
+    pub fn record_update(&mut self, update: UpdateRecord) {
+        self.updates.insert(update.id.clone(), update);
+        while self.updates.len() > MAX_UPDATES_PER_CLUSTER {
+            let Some(oldest_terminal) = self
+                .updates
+                .values()
+                .filter(|update| !update.is_in_progress())
+                .min_by_key(|update| update.created_at)
+                .map(|update| update.id.clone())
+            else {
+                // Every entry is still in flight, which the one-update-at-a-time
+                // rule each minter enforces makes unreachable; there is nothing
+                // this may drop, so the history is left as it is.
+                break;
+            };
+            self.updates.remove(&oldest_terminal);
+        }
     }
 
     /// Whether this is an EKS Auto Mode cluster, which is what
@@ -3673,9 +3919,9 @@ impl CertificateAuthorityRecord {
             }],
             client_request_token: self.client_request_token.clone(),
             succeeds_at: self.distribution_complete_at,
-            // This update carries no encryption change; that is
-            // `AssociateEncryptionConfig`'s field.
-            pending_encryption_config: None,
+            // This update's work is the trust distribution onto the CA record,
+            // not a change to the cluster's own configuration.
+            pending_config: None,
             // Nothing has attempted to cancel this update yet; `CancelUpdate`
             // writes both of these.
             cancellation: None,

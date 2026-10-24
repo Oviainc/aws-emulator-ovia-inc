@@ -27,5 +27,7 @@ mod state_roundtrip;
 mod supplemental_tax_registrations;
 #[path = "all/tax_exemption_types.rs"]
 mod tax_exemption_types;
+#[path = "all/tax_exemptions.rs"]
+mod tax_exemptions;
 #[path = "all/tax_registration_lifecycle.rs"]
 mod tax_registration_lifecycle;

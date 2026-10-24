@@ -1632,6 +1632,27 @@ impl EndpointKind {
             Self::Agent => "an AWS Ground Station Agent endpoint",
         }
     }
+
+    /// Whether an endpoint of this kind can be attached only with the `securityDetails`
+    /// triple, i.e. whether a request that omits it describes nothing the service can
+    /// create.
+    ///
+    /// `EndpointDetails` leaves `securityDetails` optional (`smithy_query(query="shape",
+    /// shape="EndpointDetails")`), and what it carries is "a list of subnets, a list of
+    /// security groups and a role to connect streams to instances"
+    /// (`smithy_query(query="doc", shape="SecurityDetails")`) — the elastic network
+    /// interfaces GROUND STATION itself places to deliver a [`Self::Dataflow`]
+    /// endpoint's stream. A [`Self::Agent`] endpoint's stream is carried by the agent the
+    /// customer runs on their own instance, so its shape marks everything it needs
+    /// `@required` of itself (`name`, `egressAddress`, `ingressAddress` —
+    /// `smithy_query(query="shape", shape="AwsGroundStationAgentEndpoint")`) and the VPC
+    /// placement does not apply to it; one is accepted with or without the member.
+    pub fn requires_security_details(self) -> bool {
+        match self {
+            Self::Dataflow => true,
+            Self::Agent => false,
+        }
+    }
 }
 
 /// The endpoint members `details` sets, by the modelled member name and the kind of

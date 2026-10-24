@@ -9,7 +9,7 @@
 //! way instead of each rebuilding it from the raw fields.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ::aws_smithy_types::base64;
 
@@ -17,8 +17,8 @@ use crate::ops::types::{
     AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority, ConflictException,
     IndonesiaAdditionalInfo, InternalServerException, Jurisdiction, ResourceNotFoundException,
     SupplementalTaxRegistration, SupplementalTaxRegistrationEntry, TaxDocumentMetadata,
-    TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
-    ValidationException, ValidationExceptionField,
+    TaxExemption, TaxExemptionDetails, TaxExemptionType, TaxRegistration, TaxRegistrationEntry,
+    TaxRegistrationWithJurisdiction, ValidationException, ValidationExceptionField,
 };
 
 /// The `TaxRegistrationStatus` values, from the model's enum
@@ -59,6 +59,18 @@ pub const SETTLED_REGISTRATION_STATUS: &str = STATUS_REJECTED;
 /// `Pending` the write reported, and it is short enough that a caller polling for
 /// a terminal status gets one.
 pub const TRN_VALIDATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `EntityExemptionAccountStatus` values, from the model's enum
+/// (`None | Valid | Expired | Pending`), which is what `TaxExemption$status`
+/// reports for one exemption of an account.
+pub const EXEMPTION_STATUS_NONE: &str = "None";
+/// See [`EXEMPTION_STATUS_NONE`]: the exemption is in force.
+pub const EXEMPTION_STATUS_VALID: &str = "Valid";
+/// See [`EXEMPTION_STATUS_NONE`]: the exemption's expiration date has passed.
+pub const EXEMPTION_STATUS_EXPIRED: &str = "Expired";
+/// See [`EXEMPTION_STATUS_NONE`]: the submitted exemption certificate has not
+/// been reviewed yet.
+pub const EXEMPTION_STATUS_PENDING: &str = "Pending";
 
 /// The `HeritageStatus` values, from the model's enum (`OptIn | OptOut`).
 pub const HERITAGE_STATUS_OPT_IN: &str = "OptIn";
@@ -221,6 +233,19 @@ pub struct ComAmazonawsTaxsettingsTaxsettingsState {
     /// from it, so every supplemental TRN gets its own and a deleted one's id is
     /// never handed out again.
     pub minted_authority_ids: u64,
+    /// The tax exemptions recorded for each account, keyed by its 12-digit
+    /// account id.
+    ///
+    /// A `BTreeMap` so a listing enumerates in one stable order and a page token
+    /// can name the key the previous page stopped after, the same way
+    /// [`Self::registrations`] does. An account with no exemption has no entry
+    /// here — never an empty vector — so "this service holds exemptions for the
+    /// account" is one question with one answer.
+    ///
+    /// `PutTaxExemption` is the writer AWS models for this map (it submits an
+    /// exemption certificate for review); it is still a scaffold stub with its
+    /// own issue, so today the readers report what is seeded here.
+    pub exemptions: BTreeMap<String, Vec<StoredTaxExemption>>,
 }
 
 impl ComAmazonawsTaxsettingsTaxsettingsState {
@@ -294,6 +319,61 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         let status = stored.status.clone();
         self.registrations.insert(account_id.to_string(), stored);
         Ok(status)
+    }
+
+    /// Whether this service reports tax exemptions for `account_id` at all —
+    /// that is, whether the account is one of those a caller of this service may
+    /// read exemptions for.
+    ///
+    /// The exemption reads address "accounts listed in a consolidated billing
+    /// family" (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#ListTaxExemptions")`),
+    /// so the accounts they can answer for are the caller's own account and the
+    /// accounts whose tax settings this service holds — the only accounts it is
+    /// ever told about. Any other 12-digit id names an account outside that
+    /// family, which this service holds no tax-settings resource for.
+    ///
+    /// Comparing a REQUEST-SUPPLIED id against [`::engine::emulator_account_id`]
+    /// is a real discriminator (an id naming another account fails it), unlike
+    /// comparing the CALLER against it — see [`MANAGEMENT_ACCOUNT_ONLY`] for why
+    /// the latter would admit every call.
+    pub fn reports_exemptions_for(&self, account_id: &str) -> bool {
+        account_id == ::engine::emulator_account_id()
+            || self.registrations.contains_key(account_id)
+            || self.exemptions.contains_key(account_id)
+    }
+
+    /// The `TaxExemptionDetails` the exemption reads report for `account_id` at
+    /// `now`, or `None` when this service holds no exemption for it.
+    ///
+    /// An account the service knows but holds no exemption for therefore gets no
+    /// entry in the reported map: the reads report the exemptions an account
+    /// has, and an account with none has nothing to report.
+    ///
+    /// The `heritageObtained*` members describe an exemption INHERITED from the
+    /// consolidated billing family's management account. No operation this
+    /// service models records such an inheritance — the same reason
+    /// `ListTaxRegistrations` reports no `taxInheritanceDetails` — so there is
+    /// nothing stored to report and they stay absent.
+    pub fn exemption_details(
+        &self,
+        account_id: &str,
+        now: SystemTime,
+    ) -> Option<TaxExemptionDetails> {
+        let stored = self.exemptions.get(account_id)?;
+        if stored.is_empty() {
+            return None;
+        }
+        Some(TaxExemptionDetails {
+            tax_exemptions: Some(
+                stored
+                    .iter()
+                    .map(|exemption| exemption.to_tax_exemption(now))
+                    .collect(),
+            ),
+            heritage_obtained_details: None,
+            heritage_obtained_parent_entity: None,
+            heritage_obtained_reason: None,
+        })
     }
 
     /// The `authorityId` of the stored supplemental TRN with this type and
@@ -541,6 +621,68 @@ impl StoredTaxRegistration {
             None
         } else {
             Some(self.tax_document_metadatas.clone())
+        }
+    }
+}
+
+/// One tax exemption recorded for an account.
+///
+/// The dates are wall-clock instants ([`SystemTime`]) rather than [`Instant`]s
+/// because the model reports them as `Timestamp`s to the caller, and because
+/// whether an exemption has expired is a fact about the calendar.
+#[derive(Debug, Clone)]
+pub struct StoredTaxExemption {
+    /// `TaxExemption$authority`: the address domain (country, and state where
+    /// the exemption is a state one) the exemption applies in.
+    pub authority: Authority,
+    /// `TaxExemption$taxExemptionType`: the entry of
+    /// [`TAX_EXEMPTION_TYPE_CATALOG`] the exemption was granted under.
+    pub exemption_type: TaxExemptionType,
+    /// When the exemption takes effect. `None` while that is not decided (an
+    /// exemption still under review has no effective date yet).
+    pub effective_date: Option<SystemTime>,
+    /// When the exemption lapses. `None` for one that does not expire.
+    pub expiration_date: Option<SystemTime>,
+    /// When this service recorded the exemption —
+    /// `TaxExemption$systemEffectiveDate`, "the tax exemption recording time in
+    /// the `TaxSettings` system".
+    pub system_effective_date: Option<SystemTime>,
+    /// The exemption's recorded `EntityExemptionAccountStatus`
+    /// ([`EXEMPTION_STATUS_VALID`] and friends).
+    pub status: String,
+}
+
+impl StoredTaxExemption {
+    /// The status a read reports at `now`.
+    ///
+    /// Lapsing is a transition the CLOCK owes: an exemption whose expiration
+    /// date has passed is expired at that instant whether or not anybody called,
+    /// so a read reports [`EXEMPTION_STATUS_EXPIRED`] for it rather than the
+    /// status it was recorded with. Every other status is reported as recorded —
+    /// a `Pending` certificate becomes valid only when a reviewer decides it
+    /// does, which is not something the clock can make due.
+    pub fn reported_status(&self, now: SystemTime) -> &str {
+        if self.status == EXEMPTION_STATUS_VALID
+            && self.expiration_date.is_some_and(|expires| expires <= now)
+        {
+            EXEMPTION_STATUS_EXPIRED
+        } else {
+            &self.status
+        }
+    }
+
+    /// The `TaxExemption` shape the exemption reads report for this record at
+    /// `now`.
+    pub fn to_tax_exemption(&self, now: SystemTime) -> TaxExemption {
+        TaxExemption {
+            authority: self.authority.clone(),
+            tax_exemption_type: self.exemption_type.clone(),
+            effective_date: self.effective_date.map(::aws_smithy_types::DateTime::from),
+            expiration_date: self.expiration_date.map(::aws_smithy_types::DateTime::from),
+            system_effective_date: self
+                .system_effective_date
+                .map(::aws_smithy_types::DateTime::from),
+            status: Some(self.reported_status(now).to_string()),
         }
     }
 }
@@ -1455,6 +1597,24 @@ pub fn invalid_authority_id() -> ValidationException {
 pub fn no_tax_registration() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: "No tax registration found".to_string(),
+    }
+}
+
+/// This service's modelled `ResourceNotFoundException` (HTTP 404) for an
+/// exemption read that names an account this service holds no tax-settings
+/// resource for — one outside the caller's consolidated billing family (see
+/// [`ComAmazonawsTaxsettingsTaxsettingsState::reports_exemptions_for`]).
+///
+/// It carries its `message` only, for the reason [`no_tax_registration`] gives.
+/// The 404 and the `ResourceNotFoundException` shape are the contract; the
+/// wording is this emulator's own, built from the request so the caller is told
+/// WHICH of the accounts it named is the one with nothing behind it.
+pub fn no_exemptions_for_account(account_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "Account {account_id} is not in your consolidated billing family, so it has no tax \
+             exemptions to report."
+        ),
     }
 }
 

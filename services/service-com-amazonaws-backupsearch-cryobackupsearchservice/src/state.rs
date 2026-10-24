@@ -425,8 +425,30 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// Every export job, keyed by its `ExportJobIdentifier`.
     pub export_jobs: HashMap<String, ExportJob>,
     /// Export-job identifiers in creation order, so `ListSearchResultExportJobs` pages
-    /// deterministically.
+    /// deterministically. `ListSearchResultExportJobs` walks this backwards (see
+    /// [`export_jobs_newest_first`](Self::export_jobs_newest_first)), exactly as
+    /// `ListSearchJobs` walks `job_order`.
     pub export_job_order: Vec<String>,
+}
+
+/// The records `order` names, NEWEST-CREATED FIRST.
+///
+/// `order` holds identifiers in creation order and is only ever appended to, so walking
+/// it backwards is exactly newest-first and is stable across calls; an identifier the
+/// map no longer holds is skipped rather than reported as a gap.
+///
+/// ONE helper behind BOTH job listings of this service
+/// ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::jobs_newest_first`] and
+/// [`ComAmazonawsBackupsearchCryobackupsearchserviceState::export_jobs_newest_first`]),
+/// so the two cannot drift apart on the order the service reports its jobs in.
+fn newest_first<'a, T>(
+    order: &'a [String],
+    records: &'a HashMap<String, T>,
+) -> impl Iterator<Item = &'a T> {
+    order
+        .iter()
+        .rev()
+        .filter_map(|identifier| records.get(identifier))
 }
 
 impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
@@ -517,10 +539,7 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// `job_order` and `search_jobs` are written together, so an identifier in the order
     /// always resolves.
     pub fn jobs_newest_first(&self) -> impl Iterator<Item = &SearchJob> {
-        self.job_order
-            .iter()
-            .rev()
-            .filter_map(|identifier| self.search_jobs.get(identifier))
+        newest_first(&self.job_order, &self.search_jobs)
     }
 
     /// The recovery points this store holds that `scope` selects — the scan's resolved
@@ -583,13 +602,17 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         self.export_jobs.get(identifier)
     }
 
-    /// Every export job in creation order, which is the sequence
-    /// `ListSearchResultExportJobs` filters and pages. `export_job_order` and
-    /// `export_jobs` are written together, so an identifier in the order always resolves.
-    pub fn export_jobs_in_order(&self) -> impl Iterator<Item = &ExportJob> {
-        self.export_job_order
-            .iter()
-            .filter_map(|identifier| self.export_jobs.get(identifier))
+    /// Every export job NEWEST-CREATED FIRST, which is the sequence
+    /// `ListSearchResultExportJobs` filters and pages — the SAME order
+    /// [`jobs_newest_first`](Self::jobs_newest_first) reports a search job listing in,
+    /// because the rule is the service's and not one listing's: a job listing of this
+    /// service reports the most recently created job first, so a single-page read is
+    /// "the latest export job".
+    ///
+    /// `export_job_order` and `export_jobs` are written together, so an identifier in
+    /// the order always resolves.
+    pub fn export_jobs_newest_first(&self) -> impl Iterator<Item = &ExportJob> {
+        newest_first(&self.export_job_order, &self.export_jobs)
     }
 
     /// The export job the `StartSearchResultExportJob` call carrying `token` minted, if

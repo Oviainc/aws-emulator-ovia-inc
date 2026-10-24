@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetTaxExemptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetTaxExemptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetTaxExemptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tax exemptions this service holds for each account the request
+//! names, and refuses the call when one of them names an account outside the
+//! caller's consolidated billing family
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::reports_exemptions_for`]).
+//!
+//! It is a report: nothing is written. The one thing it derives from the clock is
+//! an exemption's reported status — an exemption whose expiration date has passed
+//! is expired at that instant whether or not anybody called
+//! ([`crate::state::StoredTaxExemption::reported_status`]) — and that derivation
+//! leaves the stored record untouched, so what a later caller sees is what the
+//! clock had already made true.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +147,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetTaxExemptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetTaxExemptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetTaxExemptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetTaxExemptionsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+
+        // `accountIds` is "List of unique account identifiers" and carries the
+        // model's `@length` 1..=5, which the boundary validator refuses outside
+        // of before this handler runs. An id named twice names the SAME account,
+        // so it is reported once: the response is a map keyed by account id,
+        // which could not hold it twice anyway.
+        let mut named: Vec<&str> = Vec::new();
+        for account_id in &input.account_ids {
+            if !named.contains(&account_id.as_str()) {
+                named.push(account_id.as_str());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // The request is judged before anything is reported: an account this
+        // service holds no tax-settings resource for is not one the caller may
+        // read exemptions for, so the CALL is refused rather than a partial map
+        // returned that silently drops it.
+        for account_id in &named {
+            if !store.reports_exemptions_for(account_id) {
+                return Err(BatchGetTaxExemptionsErrorModeled::ResourceNotFoundException(
+                    crate::state::no_exemptions_for_account(account_id),
+                )
+                .into());
+            }
+        }
+
+        let tax_exemption_details_map: ::std::collections::HashMap<String, TaxExemptionDetails> =
+            named
+                .iter()
+                .filter_map(|account_id| {
+                    store
+                        .exemption_details(account_id, now)
+                        .map(|details| ((*account_id).to_string(), details))
+                })
+                .collect();
+        drop(store);
+
+        Ok(BatchGetTaxExemptionsOutput {
+            tax_exemption_details_map: Some(tax_exemption_details_map),
+            // `failedAccounts` is "the list of accounts that failed to get tax
+            // exemptions". Every account this call reports on was read from one
+            // store under one lock, so none of them can fail on its own: an
+            // account the caller may not read is refused above, and an account
+            // with no exemption is reported by having no entry in the map. The
+            // member is therefore present and empty rather than omitted — no
+            // account failed.
+            failed_accounts: Some(Vec::new()),
+        })
     }
 }

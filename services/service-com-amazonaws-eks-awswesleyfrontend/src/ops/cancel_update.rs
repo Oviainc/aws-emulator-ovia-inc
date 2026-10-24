@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // itself is recorded the way the model describes it.
         update.status = UPDATE_CANCELLED.to_string();
         update.succeeds_at = None;
-        update.pending_encryption_config = None;
+        update.pending_config = None;
         update.cancellation = Some(Cancellation {
             status: Some(CANCELLATION_STATUS_SUCCESSFUL.to_string()),
             reason: Some(
