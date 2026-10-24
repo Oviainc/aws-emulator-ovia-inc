@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAlertManagerDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAlertManagerDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: parses and persists the workspace's ONE alert manager definition, and
+//! answers from the PERSISTED record. The definition starts in `CREATING` and the clock
+//! owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); a workspace that
+//! already has one is refused with `ConflictException`, and `clientToken` makes the
+//! call idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAlertManagerDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +159,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAlertManagerDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAlertManagerDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAlertManagerDefinition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAlertManagerDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The document is checked HERE: before the store lock is taken, so one caller's
+        // document never holds the shared store against every other caller, and before
+        // the workspace is resolved, because a request that fails the member's own rule
+        // is a bad REQUEST whatever resource it names.
+        if let Err(invalid) = crate::state::validate_alert_manager_definition(&input.data) {
+            return Err(CreateAlertManagerDefinitionErrorModeled::ValidationException(
+                ValidationException {
+                    message: invalid.message().to_string(),
+                    reason: invalid.reason().to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "data".to_string(),
+                        message: invalid.message().to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The workspace the URI names is resolved next, so a call on a workspace that
+        // does not exist is answered as the missing resource it is, with the one constant
+        // sentence every per-workspace refusal in this crate reports.
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(CreateAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `AlertManagerDefinitionStatusCode` documents the rule the service follows: a
+        // definition changes only "until definition is ACTIVE and workspace status is
+        // ACTIVE", and `WorkspaceStatusCode$ACTIVE` is the status at which a workspace
+        // "has been created and is usable". Adding a definition to a workspace that is
+        // still being created, or being deleted, would leave an inconsistent state —
+        // `ConflictException` (409), the same reading `CreateRuleGroupsNamespace` applies.
+        if workspace.status_code != crate::state::STATUS_ACTIVE {
+            return Err(CreateAlertManagerDefinitionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Workspace {} is {}; an alert manager definition can be created only when the workspace status is {}",
+                        workspace.workspace_id,
+                        workspace.status_code,
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        if let Some(existing) = workspace.alert_manager_definition.as_ref() {
+            // `clientToken` carries `@idempotencyToken`: re-sending the very call that
+            // created this definition — the same token AND the same document — is that
+            // same call, so it answers with the definition it already created, as long as
+            // that definition is still the record that call left. A token reused with a
+            // different document is a different call, and conflicts too.
+            if input.client_token.is_some()
+                && existing.create_token == input.client_token
+                && existing.data == input.data
+                && existing.status_code != crate::state::DEFINITION_STATUS_DELETING
+            {
+                return Ok(response_for(existing));
+            }
+            // "If a workspace already has an alert manager definition, don't use this
+            // operation to update it. Instead, use PutAlertManagerDefinition" — a second
+            // create would leave an inconsistent state, so it is ConflictException (409).
+            // The sentence is the one constant
+            // [`crate::state::ALERT_MANAGER_DEFINITION_EXISTS_MESSAGE`]; the workspace it
+            // refused rides in `resourceId`, where the model puts it.
+            return Err(CreateAlertManagerDefinitionErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::ALERT_MANAGER_DEFINITION_EXISTS_MESSAGE.to_string(),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::ALERT_MANAGER_DEFINITION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let definition = crate::state::AlertManagerDefinition {
+            data: input.data,
+            // `AlertManagerDefinitionStatusCode$CREATING`: "Definition is being
+            // created" — and the clock owes the move to ACTIVE at `transition_due`.
+            status_code: crate::state::DEFINITION_STATUS_CREATING.to_string(),
+            created_at: now,
+            modified_at: now,
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            create_token: input.client_token,
+            change_token: None,
+        };
+        let response = response_for(&definition);
+        let workspace_arn = workspace.arn.clone();
+        workspace.alert_manager_definition = Some(definition);
+        drop(store);
+
+        // The call changed stored state, so it leaves an access record naming the
+        // operation, the resource and the key id the request presented — nothing of the
+        // document itself.
+        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+        Ok(response)
+    }
+}
+
+/// The response for a stored definition: its status, read off the persisted record.
+fn response_for(
+    definition: &crate::state::AlertManagerDefinition,
+) -> CreateAlertManagerDefinitionOutput {
+    CreateAlertManagerDefinitionOutput {
+        status: AlertManagerDefinitionStatus {
+            status_code: definition.status_code.clone(),
+            // `AlertManagerDefinitionStatus$statusReason` is "If there is a failure, the
+            // reason for the failure" — absent while nothing has failed.
+            status_reason: None,
+        },
     }
 }

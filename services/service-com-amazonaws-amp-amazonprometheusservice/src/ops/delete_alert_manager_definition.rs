@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAlertManagerDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAlertManagerDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the deletion of the workspace's stored alert manager
+//! definition. The definition moves to `DELETING` and the clock owes its removal
+//! ([`crate::state::TRANSITION_DELAY`]); a workspace holding no definition is refused
+//! with `ResourceNotFoundException`, and `clientToken` makes the call idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAlertManagerDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +169,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAlertManagerDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAlertManagerDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAlertManagerDefinition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAlertManagerDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(DeleteAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The one constant sentence every per-workspace refusal in this crate
+                    // reports; the id the caller named rides in `resourceId`.
+                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let workspace_id = workspace.workspace_id.clone();
+        let workspace_arn = workspace.arn.clone();
+        let workspace_status = workspace.status_code.clone();
+        let Some(definition) = workspace.alert_manager_definition.as_mut() else {
+            return Err(DeleteAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Workspace {workspace_id} has no alert manager definition"),
+                    resource_id: workspace_id,
+                    resource_type: crate::state::ALERT_MANAGER_DEFINITION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `clientToken` carries `@idempotencyToken`: re-sending the very call that
+        // started the pending deletion is that same call, so it is accepted again
+        // instead of conflicting with the deletion it already started.
+        let replays_pending_delete = input.client_token.is_some()
+            && definition.change_token == input.client_token
+            && definition.status_code == crate::state::DEFINITION_STATUS_DELETING;
+
+        // `AlertManagerDefinitionStatusCode` states the rule on every transient entry:
+        // "Update/Deletion is disallowed until definition is ACTIVE and workspace status
+        // is ACTIVE."
+        if !replays_pending_delete
+            && (definition.status_code != crate::state::DEFINITION_STATUS_ACTIVE
+                || workspace_status != crate::state::STATUS_ACTIVE)
+        {
+            return Err(DeleteAlertManagerDefinitionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "the alert manager definition of workspace {workspace_id} is {} and the workspace is {workspace_status}; deletions are allowed only when both are {}",
+                        definition.status_code,
+                        crate::state::DEFINITION_STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace_id,
+                    resource_type: crate::state::ALERT_MANAGER_DEFINITION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        if !replays_pending_delete {
+            definition.status_code = crate::state::DEFINITION_STATUS_DELETING.to_string();
+            definition.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+            definition.change_token = input.client_token;
+        }
+        drop(store);
+
+        // The call changed stored state (or replayed the call that did), so it leaves an
+        // access record naming the operation, the resource and the key id the request
+        // presented — see `crate::state::record_state_change`.
+        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+
+        Ok(DeleteAlertManagerDefinitionOutput)
     }
 }

@@ -188,6 +188,12 @@ pub const NAMESPACE_STATUS_DELETING: &str = "DELETING";
 /// the resource affected", so the emulator reports the resource's AWS type name.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "AWS::APS::Workspace";
 
+/// The alert manager definition a workspace may hold: its record, its statuses and
+/// the rule that decides whether a `data` blob is one. Re-exported, so a handler
+/// names `crate::state::…` for it exactly as it does for a workspace.
+pub mod alert_manager;
+pub use alert_manager::*;
+
 /// The `resourceType` those same exceptions report for a rule groups namespace. The
 /// name is the one the model itself gives the resource: `RuleGroupsNamespaceArn`
 /// carries `@arnReference(type: "AWS::APS::RuleGroupsNamespace")`.
@@ -444,6 +450,11 @@ pub struct Workspace {
     /// deletion, so replaying that exact call stays idempotent rather than
     /// conflicting with the deletion it already started.
     pub delete_token: Option<String>,
+    /// This workspace's alert manager definition, of which it holds at most one:
+    /// `CreateAlertManagerDefinition` "creates the alert manager definition in a
+    /// workspace" and refuses a second one, so the record hangs off the workspace and
+    /// is released with it.
+    pub alert_manager_definition: Option<AlertManagerDefinition>,
     /// What `DescribeWorkspaceConfiguration` reports and `UpdateWorkspaceConfiguration`
     /// writes: the workspace's label set limits, retention period and sample windows.
     pub configuration: WorkspaceConfiguration,
@@ -744,6 +755,16 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     pub fn materialize_due(&mut self, now: SystemTime) {
         let mut deleted: Vec<String> = Vec::new();
         for workspace in self.workspaces.values_mut() {
+            // The alert manager definition's own pending transition, owed on the same
+            // terms: the record settles itself and says when it is gone.
+            if workspace
+                .alert_manager_definition
+                .as_mut()
+                .is_some_and(|definition| definition.settle_due(now))
+            {
+                workspace.alert_manager_definition = None;
+            }
+
             // A detector's own pending transitions, owed on the same terms. A workspace
             // removed below takes its detectors with it, so this only has to settle the
             // detectors of a workspace that stays.
@@ -941,6 +962,23 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// Record a call that CHANGED this service's state, so an emulator run is auditable the
+/// way CloudTrail makes a real one: the operation, the resource it changed and the
+/// access-key id the REQUEST presented.
+///
+/// Carries request metadata ONLY — `emulator_server::extract_akid` reads the id out of
+/// the presented `Authorization` header. The emulator's own credentials, the caller's
+/// secrets and the stored document itself stay out of it, so the record names what
+/// happened without reproducing what was sent.
+pub fn record_state_change(operation: &str, resource: &str, parts: &::http::request::Parts) {
+    tracing::info!(
+        operation,
+        resource,
+        access_key_id = %::emulator_server::extract_akid(&parts.headers),
+        "aps state change"
+    );
 }
 
 /// A workspace ARN: `arn:aws:aps:<region>:<account>:workspace/<workspaceId>`, as

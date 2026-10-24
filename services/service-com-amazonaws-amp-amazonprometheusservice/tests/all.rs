@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/alert_manager_definition.rs"]
+mod alert_manager_definition;
 #[path = "all/anomaly_detector_lifecycle.rs"]
 mod anomaly_detector_lifecycle;
 #[path = "all/default_scraper_configuration.rs"]

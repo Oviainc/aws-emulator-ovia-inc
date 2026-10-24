@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAlertManagerDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAlertManagerDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reads the workspace's stored alert manager definition back — its
+//! document, its status and its create/modify instants — and reports
+//! `ResourceNotFoundException` when the workspace holds none. A pure read: it writes
+//! only the lifecycle transitions the clock already owes
+//! ([`crate::state::ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAlertManagerDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAlertManagerDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAlertManagerDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAlertManagerDefinition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeAlertManagerDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(DescribeAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The one constant sentence every per-workspace refusal in this
+                    // crate reports; the id the caller named rides in `resourceId`.
+                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let Some(definition) = workspace.alert_manager_definition.as_ref() else {
+            return Err(DescribeAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Workspace {} has no alert manager definition",
+                        workspace.workspace_id
+                    ),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::ALERT_MANAGER_DEFINITION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeAlertManagerDefinitionOutput {
+            alert_manager_definition: AlertManagerDefinitionDescription {
+                status: AlertManagerDefinitionStatus {
+                    status_code: definition.status_code.clone(),
+                    status_reason: None,
+                },
+                // "The actual alert manager definition" — the stored bytes, unchanged.
+                data: definition.data.clone(),
+                created_at: ::aws_smithy_types::DateTime::from(definition.created_at),
+                modified_at: ::aws_smithy_types::DateTime::from(definition.modified_at),
+            },
+        })
     }
 }

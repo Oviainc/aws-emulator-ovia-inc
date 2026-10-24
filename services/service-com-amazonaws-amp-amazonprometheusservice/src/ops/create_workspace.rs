@@ -292,6 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             anomaly_detector_tokens: ::std::collections::HashMap::new(),
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
             delete_token: None,
+            // A workspace is created without an alert manager definition:
+            // `CreateAlertManagerDefinition` is what adds one.
+            alert_manager_definition: None,
             // A workspace is created with the service's default configuration, which
             // `DescribeWorkspaceConfiguration` reports until an
             // `UpdateWorkspaceConfiguration` changes it.

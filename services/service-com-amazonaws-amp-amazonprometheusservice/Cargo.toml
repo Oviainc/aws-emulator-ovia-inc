@@ -27,7 +27,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # Reads the rule group names out of a caller-supplied rules file (a YAML document), so
 # the documented bound on the combined length of a namespace name and a rule group name
-# is measured against the file's real contents. Same pinned version the apigateway,
+# is measured against the file's real contents, and reads the alert manager definition
+# (`AlertManagerDefinitionData`) the same way. Same pinned version the apigateway,
 # cloudformation and greengrassv2 crates read caller-supplied YAML with; yaml-rust2 is a
 # pure-Rust YAML 1.2 implementation. The tests parse the default scraper configuration
 # this service serves with it too, so the blob is asserted to be a YAML document with the
