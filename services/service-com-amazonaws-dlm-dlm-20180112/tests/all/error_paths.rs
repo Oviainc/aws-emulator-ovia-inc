@@ -3,7 +3,7 @@
 //! What Amazon Data Lifecycle Manager answers for a request it refuses, end to
 //! end over HTTP.
 //!
-//! Four rules, each asserted over a table that spans the class rather than the
+//! Five rules, each asserted over a table that spans the class rather than the
 //! one request an issue cited:
 //!
 //! 1. A request outside a modelled input constraint, on an operation whose model
@@ -21,6 +21,10 @@
 //!    BEFORE any policy is stored or changed.
 //! 4. A tag key a caller SETS may not begin with the reserved `aws:` prefix, in
 //!    any case, on any operation that sets tags.
+//! 5. On an operation that declares no 400-class client error, a `PolicyId`
+//!    outside the member's modelled constraints is the modelled
+//!    `ResourceNotFoundException` (HTTP 404) too — the same error shape and
+//!    payload a well-formed id that resolves to nothing gets.
 //!
 //! Every row goes through the router, so each case exercises routing, the
 //! authorization step, the member-constraint walk and the handler — the same path
@@ -762,4 +766,196 @@ async fn a_reserved_aws_tag_key_may_not_be_set() {
             );
         }
     }
+}
+
+/// RULE 5 — an operation that declares no 400-class client error answers a
+/// `PolicyId` outside the member's modelled constraints with the client error it
+/// DOES model for the resource it addresses: `ResourceNotFoundException` (404),
+/// with the same members and the same payload a well-formed id that resolves to
+/// nothing gets, and never with an error type the model does not declare.
+///
+/// `GetLifecyclePolicy` and `DeleteLifecyclePolicy` are the two such operations
+/// (`smithy_query(query="operation", operation="GetLifecyclePolicy")`:
+/// `InternalServerException`, `LimitExceededException`,
+/// `ResourceNotFoundException` only), and each addresses one policy by the
+/// `@httpLabel` `PolicyId` — `@pattern(^policy-[a-f0-9]+$)`, `@length(0..64)`.
+///
+/// The rows differ along WHICH part of those constraints the id breaks (the
+/// prefix, the hex alphabet, the case, the required hex digit, the length
+/// maximum) and along forms a client plausibly sends (a user-typed name, an id
+/// belonging to another service); the last two rows are WELL-FORMED ids the rule
+/// must leave to the handler — the length maximum itself and an absent id — and
+/// the block after the table is the id that still resolves, which must be served.
+#[tokio::test]
+async fn a_policy_id_outside_its_modelled_constraints_is_a_resource_not_found_exception() {
+    let router = emulator();
+    let existing = created_policy(&router, "id form subject", interval_schedule("Daily")).await;
+
+    // `@length(max: 64)` counts the whole id, prefix included: `policy-` is seven
+    // characters, so 57 hex digits is the maximum and 58 is one past it.
+    let at_length_maximum = format!("policy-{}", "a".repeat(57));
+    let past_length_maximum = format!("policy-{}", "a".repeat(58));
+
+    // (case, the PolicyId) — every row names no policy, whether because the
+    // modelled constraints refuse the id or because the store holds none.
+    let cases: Vec<(&str, String)> = vec![
+        ("a user-typed name", "not-a-policy-id".to_string()),
+        (
+            "an id with uppercase hex digits",
+            "policy-ABCDEF0123456789".to_string(),
+        ),
+        (
+            "an id whose prefix is upper-cased",
+            "POLICY-0123456789abcdef".to_string(),
+        ),
+        (
+            "an id with a digit outside the hex alphabet",
+            "policy-00g1".to_string(),
+        ),
+        (
+            "the prefix alone, with no hex digit after it",
+            "policy-".to_string(),
+        ),
+        (
+            "an id belonging to another service",
+            "vol-0123456789abcdef0".to_string(),
+        ),
+        (
+            "an id carrying a separator after its hex digits",
+            "policy-0123abcd-2".to_string(),
+        ),
+        (
+            "an id one character past the length maximum",
+            past_length_maximum,
+        ),
+        // Well formed, so the handler decides, and it finds nothing: the answer
+        // must be indistinguishable from the rows above.
+        ("an id at the length maximum", at_length_maximum),
+        (
+            "a well-formed id that names no policy",
+            // The store mints ids in sequence from `policy-0000000000000001`, so
+            // an id at the other end of that space is one it has not minted.
+            "policy-ffffffffffffffff".to_string(),
+        ),
+    ];
+
+    // The answer a WELL-FORMED absent id gets is the yardstick: whatever form the
+    // unresolvable id took, the error must carry the same members.
+    let reference = call(&router, "GET", "/policies/policy-fffffffffffffffe", None).await;
+    let reference_members = error_members(&reference);
+
+    for (case, id) in &cases {
+        for (operation, method) in [
+            ("GetLifecyclePolicy", "GET"),
+            ("DeleteLifecyclePolicy", "DELETE"),
+        ] {
+            let answer = call(&router, method, &format!("/policies/{id}"), None).await;
+            let case = format!("{operation}: {case}");
+            assert_eq!(
+                answer.status, RESOURCE_NOT_FOUND_STATUS,
+                "case {case:?} with {id:?}: expected HTTP {RESOURCE_NOT_FOUND_STATUS}, got {} \
+                 with {:?}",
+                answer.status, answer.body
+            );
+            assert!(
+                answer.error_code().ends_with(RESOURCE_NOT_FOUND_EXCEPTION),
+                "case {case:?} with {id:?}: expected the modelled \
+                 {RESOURCE_NOT_FOUND_EXCEPTION}, got {:?}",
+                answer.error_code()
+            );
+            assert_eq!(
+                answer.body["Code"],
+                json!(RESOURCE_NOT_FOUND_CODE),
+                "case {case:?} with {id:?}: expected Code {RESOURCE_NOT_FOUND_CODE:?}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body["ResourceType"],
+                json!(POLICY_RESOURCE_TYPE),
+                "case {case:?} with {id:?}: expected ResourceType {POLICY_RESOURCE_TYPE:?}, \
+                 got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body["ResourceIds"],
+                json!([id]),
+                "case {case:?} with {id:?}: ResourceIds must name the id that resolved to \
+                 nothing, got {:?}",
+                answer.body
+            );
+            // The modelled shape declares `Message`; the lowercase `message` key
+            // belongs to the envelope this service's model does not declare.
+            assert!(
+                answer.body["Message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(id.as_str())),
+                "case {case:?} with {id:?}: the Message member must name the resource asked \
+                 for, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.body["message"],
+                Value::Null,
+                "case {case:?} with {id:?}: the modelled error carries no lowercase message \
+                 key, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                error_members(&answer),
+                reference_members,
+                "case {case:?} with {id:?}: an unresolvable id must answer the same error \
+                 members whatever form it took, got {:?}",
+                answer.body
+            );
+        }
+    }
+
+    // None of those refusals touched the store: the one policy created above is
+    // still readable, and is still the only one.
+    let listed = call(&router, "GET", "/policies", None).await;
+    assert_eq!(
+        listed.body["Policies"].as_array().map(Vec::len),
+        Some(1),
+        "a refused id must create or remove no policy, got {:?}",
+        listed.body
+    );
+    assert_eq!(
+        read_policy(&router, &existing).await["Description"],
+        json!("id form subject"),
+        "a refused id must leave the stored policy alone"
+    );
+
+    // And an id the modelled constraints accept still reaches the handler, which
+    // serves it: the read answers the policy, the delete removes it, and only
+    // then does the same id answer the not-found error, in the same shape.
+    let deleted = call(&router, "DELETE", &format!("/policies/{existing}"), None).await;
+    assert_eq!(
+        deleted.status, 200,
+        "a well-formed id that names a policy must be deleted, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    let gone = call(&router, "GET", &format!("/policies/{existing}"), None).await;
+    assert_eq!(
+        gone.status, RESOURCE_NOT_FOUND_STATUS,
+        "the deleted policy must answer HTTP {RESOURCE_NOT_FOUND_STATUS}, got {} with {:?}",
+        gone.status, gone.body
+    );
+    assert_eq!(
+        error_members(&gone),
+        reference_members,
+        "a deleted id and a refused id must answer the same error members, got {:?}",
+        gone.body
+    );
+}
+
+/// The members an error body carries, sorted — what makes two refusals the same
+/// error shape to a client.
+fn error_members(answer: &Answer) -> Vec<String> {
+    let mut members: Vec<String> = answer
+        .body
+        .as_object()
+        .map(|body| body.keys().cloned().collect())
+        .unwrap_or_default();
+    members.sort();
+    members
 }

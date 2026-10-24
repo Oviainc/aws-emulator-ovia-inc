@@ -4188,12 +4188,30 @@ pub fn paginate(
     token: Option<&str>,
     page_limit: usize,
 ) -> Result<(Vec<String>, Option<String>), String> {
+    let (window, next) = paginate_window(keys.len(), max_results, token, page_limit)?;
+    Ok((keys[window].to_vec(), next))
+}
+
+/// The WINDOW of an ordered list of `len` entries one page covers, and the token
+/// the page after it is asked for with.
+///
+/// [`paginate`] over the keys themselves; this is for a caller that holds the
+/// ORDERED RECORDS and wants that same page of them without looking any record up
+/// again by key. Both go through this one function, so the token a report issues
+/// and the token it accepts cannot drift between them. `Err(token)` is the token
+/// rejection [`paginate`] documents.
+pub fn paginate_window(
+    len: usize,
+    max_results: Option<i32>,
+    token: Option<&str>,
+    page_limit: usize,
+) -> Result<(std::ops::Range<usize>, Option<String>), String> {
     let start = match token.filter(|t| !t.is_empty()) {
         Some(t) => {
             let start = t.parse::<usize>().map_err(|_| t.to_string())?;
             // A token this service issued always names an entry that exists: it is
-            // emitted only while `consumed < keys.len()`.
-            if start >= keys.len() {
+            // emitted only while `end < len`.
+            if start >= len {
                 return Err(t.to_string());
             }
             start
@@ -4205,14 +4223,13 @@ pub fn paginate(
         .filter(|m| *m > 0)
         .unwrap_or(page_limit)
         .min(page_limit);
-    let page: Vec<String> = keys.iter().skip(start).take(limit).cloned().collect();
-    let consumed = start.saturating_add(page.len());
-    let next = if consumed < keys.len() {
-        Some(consumed.to_string())
+    let end = start.saturating_add(limit).min(len);
+    let next = if end < len {
+        Some(end.to_string())
     } else {
         None
     };
-    Ok((page, next))
+    Ok((start..end, next))
 }
 
 /// The feature set `CreateDetector` gives a detector when the request names no
@@ -4429,13 +4446,21 @@ pub fn apply_data_sources(
 }
 
 // ---------------------------------------------------------------------------
-// Listing malware scans
+// Reporting malware scans
 //
-// `ListMalwareScans` reports the account's SET of the scans [`MalwareScan`]
-// records, narrowed by a `ListMalwareScansFilterCriteria` and ordered by a
-// `SortCriteria`, so the criterion lookup, the filter and the sort live here —
-// once — beside the record they read, and the operation builds only its own
+// `ListMalwareScans` and `DescribeMalwareScans` both report a SET of the
+// [`MalwareScan`] records, narrowed by a filter criteria structure and ordered by
+// a `SortCriteria`, so the criterion lookup, the filter and the sort live here —
+// once — beside the record they read, and each operation builds only its own
 // modelled output.
+//
+// The two operations differ ONLY in their criterion-key enum
+// (`ListMalwareScansCriterionKey` against `CriterionKey`) and in the shape of the
+// criteria structure that carries them, so the rules that do not depend on either
+// — the condition comparison ([`filter_condition_matches`]), the two refusal rules
+// ([`validate_scan_criteria`]) and the conjunction over entries
+// ([`scan_criteria_match`]) — take the entries as `(key, condition)` pairs plus
+// the key list, and each operation supplies its own key lookup.
 // ---------------------------------------------------------------------------
 
 /// Every `ListMalwareScansCriterionKey` member a filter may name: the crate's
@@ -4447,6 +4472,11 @@ pub const MALWARE_SCAN_CRITERION_KEYS: &[&str] =
 /// condition can compare: `FilterCondition.GreaterThan` / `LessThan` are `long`
 /// bounds (`smithy_query(shape="FilterCondition")`), which every other key's
 /// value — an ARN, an id, an enum member — has no numeric form for.
+///
+/// It is the temporal member of BOTH criterion enums — `SCAN_START_TIME` is a
+/// member of `ListMalwareScansCriterionKey` and of `CriterionKey`
+/// (`smithy_query(shape="CriterionKey")`) — so one constant serves both
+/// scan-reporting operations.
 pub const MALWARE_SCAN_TEMPORAL_KEY: &str = "SCAN_START_TIME";
 
 /// Resolve one scan value by its `ListMalwareScansCriterionKey`, or `None` when
@@ -4476,18 +4506,24 @@ pub fn malware_scan_criterion_value(scan: &MalwareScan, key: &str) -> Option<Att
     Some(value)
 }
 
-/// Does `scan` satisfy one `FilterCondition` on `key`?
+/// Does `value` — the value a criterion key resolves to, or `None` when the record
+/// has none — satisfy one `FilterCondition`?
 ///
 /// `EqualsValue` compares the value's text. An instant has two textual forms a
 /// client could reasonably send — its ISO-8601 rendering and its epoch
 /// milliseconds — and either matches, because the model fixes neither.
 ///
 /// A condition that populates nothing constrains nothing, on EVERY key: it selects
-/// every scan, including one whose value for that key is absent. Only a condition
-/// that does constrain can exclude a scan the key has no value for.
-fn malware_scan_condition_matches(
-    scan: &MalwareScan,
-    key: &str,
+/// every record, including one whose value for that key is absent. Only a condition
+/// that does constrain can exclude a record the key has no value for.
+///
+/// `FilterCondition` is the ONE condition shape both scan-reporting operations
+/// filter through — `ListMalwareScans`'s `ListMalwareScansFilterCriterion` and
+/// `DescribeMalwareScans`'s `FilterCriterion` both target it
+/// (`smithy_query(shape="FilterCriterion")`) — so the comparison lives here once
+/// and each operation supplies only its own key lookup.
+pub fn filter_condition_matches(
+    value: Option<Attribute>,
     condition: &crate::ops::types::FilterCondition,
 ) -> bool {
     let constrains = condition.equals_value.is_some()
@@ -4496,7 +4532,7 @@ fn malware_scan_condition_matches(
     if !constrains {
         return true;
     }
-    let Some(value) = malware_scan_criterion_value(scan, key) else {
+    let Some(value) = value else {
         return false;
     };
     if let Some(expected) = condition.equals_value.as_deref() {
@@ -4538,22 +4574,58 @@ pub fn malware_scan_matches(
     scan: &MalwareScan,
     criteria: Option<&crate::ops::types::ListMalwareScansFilterCriteria>,
 ) -> bool {
-    let Some(criterion) = criteria.and_then(|c| c.list_malware_scans_filter_criterion.as_ref())
-    else {
-        return true;
-    };
-    for entry in criterion {
-        let Some(key) = entry.list_malware_scans_criterion_key.as_deref() else {
+    scan_criteria_match(list_malware_scans_criterion_pairs(criteria), |key| {
+        malware_scan_criterion_value(scan, key)
+    })
+}
+
+/// Does a record satisfy EVERY entry of a filter criteria structure?
+///
+/// `criterion` is the structure's entries as `(key, condition)` pairs, each
+/// optional: an entry naming no key, or carrying no condition, constrains nothing.
+/// `value` resolves one of the record's values by criterion key — the one thing
+/// that differs between the two scan-reporting operations, each of which has a
+/// criterion enum of its own.
+pub fn scan_criteria_match<'a>(
+    criterion: impl IntoIterator<
+        Item = (
+            Option<&'a str>,
+            Option<&'a crate::ops::types::FilterCondition>,
+        ),
+    >,
+    value: impl Fn(&str) -> Option<Attribute>,
+) -> bool {
+    for (key, condition) in criterion {
+        let (Some(key), Some(condition)) = (key, condition) else {
             continue;
         };
-        let Some(condition) = entry.filter_condition.as_ref() else {
-            continue;
-        };
-        if !malware_scan_condition_matches(scan, key, condition) {
+        if !filter_condition_matches(value(key), condition) {
             return false;
         }
     }
     true
+}
+
+/// A `ListMalwareScansFilterCriteria`'s entries as the pairs the shared filter
+/// rules read.
+fn list_malware_scans_criterion_pairs(
+    criteria: Option<&crate::ops::types::ListMalwareScansFilterCriteria>,
+) -> impl Iterator<
+    Item = (
+        Option<&str>,
+        Option<&crate::ops::types::FilterCondition>,
+    ),
+> {
+    criteria
+        .and_then(|c| c.list_malware_scans_filter_criterion.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            (
+                entry.list_malware_scans_criterion_key.as_deref(),
+                entry.filter_condition.as_ref(),
+            )
+        })
 }
 
 /// Refuse a `ListMalwareScansFilterCriteria` this service cannot evaluate, with
@@ -4567,24 +4639,41 @@ pub fn malware_scan_matches(
 pub fn validate_malware_scan_criteria(
     criteria: Option<&crate::ops::types::ListMalwareScansFilterCriteria>,
 ) -> Result<(), String> {
-    let Some(criterion) = criteria.and_then(|c| c.list_malware_scans_filter_criterion.as_ref())
-    else {
-        return Ok(());
-    };
-    for entry in criterion {
-        let Some(key) = entry.list_malware_scans_criterion_key.as_deref() else {
+    validate_scan_criteria(
+        list_malware_scans_criterion_pairs(criteria),
+        MALWARE_SCAN_CRITERION_KEYS,
+    )
+}
+
+/// Refuse a filter criteria structure this service cannot evaluate, with the
+/// message the refusal carries.
+///
+/// `criterion` is the structure's entries as `(key, condition)` pairs and `keys`
+/// the members the operation's criterion enum declares. Two rules, the same for
+/// every operation that filters scans: the key must be one of `keys`, and an
+/// ordering bound applies only to [`MALWARE_SCAN_TEMPORAL_KEY`], the one key whose
+/// value is an instant.
+pub fn validate_scan_criteria<'a>(
+    criterion: impl IntoIterator<
+        Item = (
+            Option<&'a str>,
+            Option<&'a crate::ops::types::FilterCondition>,
+        ),
+    >,
+    keys: &[&str],
+) -> Result<(), String> {
+    for (key, condition) in criterion {
+        let Some(key) = key else {
             continue;
         };
-        if !MALWARE_SCAN_CRITERION_KEYS.contains(&key) {
+        if !keys.contains(&key) {
             return Err(format!(
                 "filterCriteria: '{key}' is not a malware scan criterion key. Supported keys are {}.",
-                MALWARE_SCAN_CRITERION_KEYS.join(", ")
+                keys.join(", ")
             ));
         }
-        let orders = entry
-            .filter_condition
-            .as_ref()
-            .is_some_and(|c| c.greater_than.is_some() || c.less_than.is_some());
+        let orders =
+            condition.is_some_and(|c| c.greater_than.is_some() || c.less_than.is_some());
         if orders && key != MALWARE_SCAN_TEMPORAL_KEY {
             return Err(format!(
                 "filterCriteria: greaterThan and lessThan compare instants, so they apply only to {MALWARE_SCAN_TEMPORAL_KEY}, not to '{key}'."
@@ -4614,9 +4703,10 @@ pub const MALWARE_SCAN_ATTRIBUTES: [&str; 8] = [
 /// scan first.
 pub const MALWARE_SCAN_DEFAULT_SORT_ATTRIBUTE: &str = "scanStartedAt";
 
-/// A sort with no explicit `OrderBy` on the default attribute runs newest-first,
-/// like [`sort_findings`].
-const DESCENDING_BY_DEFAULT: bool = true;
+/// A scan sort that names no explicit `OrderBy` runs newest-first, like
+/// [`sort_findings`] — the order both scan-reporting operations report an
+/// unordered request in, so they cannot disagree about "unordered".
+pub const DESCENDING_BY_DEFAULT: bool = true;
 
 /// Resolve one scan attribute by its `MalwareScan` member name, or `None` when
 /// this service does not model that name.

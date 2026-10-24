@@ -143,6 +143,13 @@ pub struct CloudWatchAlarmTemplateRecord {
     /// The `CloudWatchAlarmTemplateComparisonOperator` the request supplied (the
     /// handler refuses any value the model does not declare).
     pub comparison_operator: String,
+    /// The M of the template's "M out of N" alarm — "The number of datapoints
+    /// within the evaluation period that must be breaching to trigger the
+    /// alarm". Always set once the template exists: a create that supplies no M
+    /// is stored with the `evaluation_periods` N it did supply (see
+    /// `insert_alarm_template`), so the setting is readable for the whole
+    /// lifetime of the resource. `Option` only because the member is optional on
+    /// the wire; every path that writes a record fills it in.
     pub datapoints_to_alarm: Option<i32>,
     pub evaluation_periods: i32,
     pub metric_name: String,
@@ -223,6 +230,17 @@ impl ComAmazonawsMedialiveMedialiveState {
             region,
             &format!("cloudwatch-alarm-template:{id}"),
         );
+        // `DatapointsToAlarm` is the M of an "M out of N" alarm ("The number of
+        // datapoints WITHIN the evaluation period that must be breaching to
+        // trigger the alarm") and `EvaluationPeriods` is its N ("The number of
+        // periods over which data is compared to the specified threshold"). A
+        // create that names no M asks for no M-of-N relaxation, which is the
+        // alarm that trips when every evaluated period breaches — M = N — so the
+        // stored template carries that count rather than nothing, and every
+        // operation that reports the template reads the setting back.
+        let datapoints_to_alarm = template
+            .datapoints_to_alarm
+            .unwrap_or(template.evaluation_periods);
         // A template is ready the moment it exists — the model gives it no status
         // member and no transient state — so the clock owes it no transition, and
         // nothing has modified it since it was created.
@@ -236,7 +254,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 name: template.name,
                 description: template.description,
                 comparison_operator: template.comparison_operator,
-                datapoints_to_alarm: template.datapoints_to_alarm,
+                datapoints_to_alarm: Some(datapoints_to_alarm),
                 evaluation_periods: template.evaluation_periods,
                 metric_name: template.metric_name,
                 period: template.period,
@@ -261,6 +279,13 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// the whole record. The id, the ARN, the region, the tags and `CreatedAt`
     /// are the template's identity and are never rewritten; `ModifiedAt` moves
     /// to `now` because this call is what modified it.
+    ///
+    /// `DatapointsToAlarm` is a partial write like every other member, which
+    /// makes the M the create settled a STICKY setting of the template: an update
+    /// that moves `EvaluationPeriods` alone changes N and leaves M where it was,
+    /// whether the create named that M or [`Self::insert_alarm_template`] implied
+    /// it from the N of the day. Nothing recomputes M per call, because a request
+    /// that names no M asks for no change to it.
     ///
     /// The identifier resolution, the group resolution, the name-uniqueness rule
     /// and the write live together here, so a handler cannot check one of them
@@ -411,7 +436,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// request's region goes, and the miss is the only thing a handler has to
     /// refuse. Once it is gone every later read of either of its identifiers
     /// misses, its name is free again and the group that held it no longer counts
-    /// it (so an emptied group becomes deletable).
+    /// it — which is what releases the membership
+    /// `DeleteCloudWatchAlarmTemplateGroup` refuses a non-empty group over, since
+    /// that count is derived from the templates that exist
+    /// ([`Self::alarm_template_ids_in_group`]), so an emptied group becomes
+    /// deletable.
     pub fn delete_alarm_template(
         &mut self,
         region: &str,
@@ -467,9 +496,11 @@ impl ComAmazonawsMedialiveMedialiveState {
 /// reports the empty map, not an absent member — for the reason the shared
 /// `template_group_output` states: the member is modelled as a `TagMap`, zero
 /// tags is an empty map rather than an unknown one, and this service's other
-/// resources already report it that way. `DatapointsToAlarm` and `Description`
-/// keep their own rule: both are optional on the request, so a template created
-/// without one reports it absent rather than inventing a value for it.
+/// resources already report it that way. `DatapointsToAlarm` is reported the same
+/// way, because the store always holds one (`insert_alarm_template` fills a
+/// create that named no M with its N). `Description` keeps its own rule: it is
+/// optional on the request and nothing implies a description, so a template
+/// created without one reports it absent rather than inventing a value.
 macro_rules! alarm_template_output {
     ($out:ident, $template:expr) => {{
         let template: &$crate::state::CloudWatchAlarmTemplateRecord = $template;

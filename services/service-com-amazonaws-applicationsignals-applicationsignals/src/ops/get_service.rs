@@ -156,7 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// A read: it projects what the store holds about that entity and persists nothing.
     /// The range is refused when it does not run forwards — a rule about the PAIR of
-    /// members, so it is enforced here rather than by a per-member constraint.
+    /// members, so it is enforced here rather than by a per-member constraint — and so is a
+    /// `KeyAttributes` map that identifies no entity, a rule about the CONTENT of the map
+    /// that the model expresses only as bounds
+    /// ([`crate::state::entity_identity_refusal`]).
     ///
     /// The reported `StartTime`/`EndTime` are the requested ones. The member documents
     /// that the real service may answer a window rounded to the nearest hour; this
@@ -175,10 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
         {
-            return Err(GetServiceErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
-            })
-            .into());
+            return Err(refused(message));
+        }
+        if let Some(message) = crate::state::entity_identity_refusal(&input.key_attributes) {
+            return Err(refused(message));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -201,4 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             log_group_references: None,
         })
     }
+}
+
+/// This operation's modelled refusal of a request it will not serve: `ValidationException`
+/// (HTTP 400), the only client error it declares beyond throttling.
+fn refused(message: String) -> GetServiceError {
+    GetServiceErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -90,6 +90,21 @@
 //!   is GuardDuty's OWN to mint — `CreateDetector` takes no identifier and answers with
 //!   `detectorId` — so, as for the FIS, AWS WAF Classic and Amazon EMR types above, what
 //!   the stack reports for the resource is the id that create answered with.
+//! * `AWS::RDS::DBInstance`'s and `AWS::RDS::DBSubnetGroup`'s are the members
+//!   `CreateDBInstance` / `CreateDBSubnetGroup` take, named identically on both sides
+//!   except the two Amazon RDS spells differently (`VPCSecurityGroups` is
+//!   `VpcSecurityGroupIds`, `CustomIAMInstanceProfile` is `CustomIamInstanceProfile`), so
+//!   each arm walks the declaration against its create's member catalogue
+//!   ([`CREATE_DB_INSTANCE_MEMBERS`], [`CREATE_DB_SUBNET_GROUP_MEMBERS`], taken from that
+//!   service's own model) and writes each member as the awsQuery form carries it — a list
+//!   under the element name its list member's `@xmlName` fixes
+//!   (`SubnetIds.SubnetIdentifier.1`). A property the catalogue does not carry is REFUSED,
+//!   except the few that are members of a DIFFERENT call and are documented as such
+//!   ([`DB_INSTANCE_PROPERTIES_NOT_SENT`]). Both identities are CloudFormation's — "Ref
+//!   returns the DBInstanceIdentifier" / "the DBSubnetGroupName" — so each arm sets that
+//!   member from the resource's physical id, and the DB instance's published endpoint,
+//!   ARN and resource id are replaced by the ones Amazon RDS answered with, since those
+//!   are the values a client reaches the database through.
 //!
 //! ## The tags every created resource carries
 //!
@@ -124,8 +139,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::provisioning::{
-    call_json_rpc, call_query, call_rest_json, xml_element, xml_entry_map, Created, Refusal,
-    AWS_JSON_1_0, AWS_JSON_1_1,
+    call_json_rpc, call_query, call_rest_json, xml_element, xml_entry_map, xml_scalar_children,
+    Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
     CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER,
@@ -143,6 +158,15 @@ const IAM_ROLE: &str = "AWS::IAM::Role";
 
 /// `AWS::CodePipeline::Pipeline`: "Ref returns the pipeline name".
 const CODEPIPELINE_PIPELINE: &str = "AWS::CodePipeline::Pipeline";
+
+/// `AWS::RDS::DBInstance`: "Ref returns the DBInstanceIdentifier", so a resource of this
+/// type is a DB instance of Amazon RDS addressed by its physical resource id.
+const RDS_DB_INSTANCE: &str = "AWS::RDS::DBInstance";
+
+/// `AWS::RDS::DBSubnetGroup`: "Ref returns the DBSubnetGroupName" — the group a DB
+/// instance's `DBSubnetGroupName` names, which Amazon RDS resolves before it will create
+/// an instance in it.
+const RDS_DB_SUBNET_GROUP: &str = "AWS::RDS::DBSubnetGroup";
 
 /// The code a refusal carries where the change a deployment asks for is one this emulator
 /// has not written the owning API call for. It is the same code the scaffold's own 501
@@ -167,6 +191,8 @@ pub(super) enum Provisioner {
     FisExperimentTemplate,
     WafRegionalIpSet,
     GuardDutyDetector,
+    RdsDbInstance,
+    RdsDbSubnetGroup,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -187,6 +213,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
+        RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
+        RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         _ => None,
     }
 }
@@ -245,6 +273,12 @@ impl Provisioner {
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
             Self::GuardDutyDetector => {
                 create_detector(ctx, region, resource, propagated).await
+            }
+            Self::RdsDbInstance => {
+                create_db_instance(ctx, region, resource, propagated).await
+            }
+            Self::RdsDbSubnetGroup => {
+                create_db_subnet_group(ctx, region, resource, propagated).await
             }
         }
     }
@@ -357,6 +391,12 @@ impl Provisioner {
             }
             Self::WafRegionalIpSet => delete_ip_set(ctx, region, physical_resource_id).await,
             Self::GuardDutyDetector => delete_detector(ctx, region, physical_resource_id).await,
+            // The delete carries one member off the resource's own declaration
+            // (`DeleteAutomatedBackups`), so it takes the record rather than the id.
+            Self::RdsDbInstance => delete_db_instance(ctx, region, resource).await,
+            Self::RdsDbSubnetGroup => {
+                delete_db_subnet_group(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -404,6 +444,12 @@ impl Provisioner {
             }
             Self::WafRegionalIpSet => describe_ip_set(ctx, region, physical_resource_id).await,
             Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
+            Self::RdsDbInstance => {
+                describe_db_instance(ctx, region, physical_resource_id).await
+            }
+            Self::RdsDbSubnetGroup => {
+                describe_db_subnet_group(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -2541,14 +2587,14 @@ async fn create_topic(
         parameters.push((format!("Attributes.entry.{entry}.key"), name.clone()));
         parameters.push((format!("Attributes.entry.{entry}.value"), value.clone()));
     }
-    for (index, (key, value)) in tags_of(&resource.properties, propagated)
-        .iter()
-        .enumerate()
-    {
-        let member = index + 1;
-        parameters.push((format!("Tags.member.{member}.Key"), key.clone()));
-        parameters.push((format!("Tags.member.{member}.Value"), value.clone()));
-    }
+    // Amazon SNS's own `Tag` shape carries no `@xmlName` on its list member, so its tag
+    // list is indexed under the Smithy default element ([`push_tag_list`]).
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "member",
+        &tags_of(&resource.properties, propagated),
+    );
     if let Some(policy) = resource.properties.get("DataProtectionPolicy") {
         parameters.push(("DataProtectionPolicy".to_string(), attribute_text(policy)));
     }
@@ -3712,6 +3758,574 @@ async fn describe_detector(
 /// internal failure, which says nothing about whether the detector is there.
 fn guardduty_rejected(refusal: &Refusal) -> bool {
     refusal.code == GUARDDUTY_INVALID_INPUT || refusal.code == GUARDDUTY_BAD_REQUEST
+}
+
+// ---------------------------------------------------------------------------
+// Amazon RDS: AWS::RDS::DBInstance, AWS::RDS::DBSubnetGroup
+// ---------------------------------------------------------------------------
+
+/// Amazon RDS's signing name and API version, from its model (`sigv4Name: rds`, service
+/// shape `AmazonRDSv19`, `version: 2014-10-31`), which speaks `awsQuery` — so its calls
+/// ride on [`call_query`] rather than on [`call_json_rpc`].
+const RDS_SIGNING_NAME: &str = "rds";
+const RDS_API_VERSION: &str = "2014-10-31";
+
+/// The error codes Amazon RDS answers for resources it does not hold:
+/// `DBInstanceNotFoundFault`'s and `DBSubnetGroupNotFoundFault`'s own `awsQueryError`
+/// codes, which is what an awsQuery client branches on.
+const DB_INSTANCE_NOT_FOUND: &str = "DBInstanceNotFound";
+const DB_SUBNET_GROUP_NOT_FOUND: &str = "DBSubnetGroupNotFoundFault";
+
+/// How one member of a create reaches an awsQuery form body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMember {
+    /// One value under the member's own name (`Engine=mysql`).
+    Scalar,
+    /// A list, whose entries are indexed from 1 under the element name the list's own
+    /// member `@xmlName` fixes (`SubnetIds.SubnetIdentifier.1`); the Smithy default for a
+    /// list member that carries none is `member`. A STRUCTURED entry's own members follow
+    /// the index (`Tags.Tag.1.Key`).
+    List(&'static str),
+}
+
+/// The members `CreateDBInstance` takes, from Amazon RDS's own model
+/// (`smithy_query(query="operation", operation="CreateDBInstance")`), with each list's
+/// element name from its list shape's member `@xmlName`
+/// (`smithy_query(query="shape", shape="VpcSecurityGroupIdList")`).
+///
+/// This is the catalogue the declaration of an `AWS::RDS::DBInstance` is walked against:
+/// the type's properties ARE these members, so a property whose name is one of them (or
+/// renames to one, [`DB_INSTANCE_RENAMED_PROPERTIES`]) is passed through under it.
+const CREATE_DB_INSTANCE_MEMBERS: &[(&str, QueryMember)] = &[
+    ("AllocatedStorage", QueryMember::Scalar),
+    ("AutoMinorVersionUpgrade", QueryMember::Scalar),
+    ("AvailabilityZone", QueryMember::Scalar),
+    ("BackupRetentionPeriod", QueryMember::Scalar),
+    ("BackupTarget", QueryMember::Scalar),
+    ("CACertificateIdentifier", QueryMember::Scalar),
+    ("CharacterSetName", QueryMember::Scalar),
+    ("CopyTagsToSnapshot", QueryMember::Scalar),
+    ("CustomIamInstanceProfile", QueryMember::Scalar),
+    ("DBCapacityReservationIdentifier", QueryMember::Scalar),
+    ("DBClusterIdentifier", QueryMember::Scalar),
+    ("DBInstanceClass", QueryMember::Scalar),
+    ("DBInstanceIdentifier", QueryMember::Scalar),
+    ("DBName", QueryMember::Scalar),
+    ("DBParameterGroupName", QueryMember::Scalar),
+    ("DBSecurityGroups", QueryMember::List("DBSecurityGroupName")),
+    ("DBSubnetGroupName", QueryMember::Scalar),
+    ("DBSystemId", QueryMember::Scalar),
+    ("DatabaseInsightsMode", QueryMember::Scalar),
+    ("DedicatedLogVolume", QueryMember::Scalar),
+    ("DeletionProtection", QueryMember::Scalar),
+    ("Domain", QueryMember::Scalar),
+    ("DomainAuthSecretArn", QueryMember::Scalar),
+    ("DomainDnsIps", QueryMember::List("member")),
+    ("DomainFqdn", QueryMember::Scalar),
+    ("DomainIAMRoleName", QueryMember::Scalar),
+    ("DomainOu", QueryMember::Scalar),
+    ("EnableCloudwatchLogsExports", QueryMember::List("member")),
+    ("EnableCustomerOwnedIp", QueryMember::Scalar),
+    ("EnableIAMDatabaseAuthentication", QueryMember::Scalar),
+    ("EnablePerformanceInsights", QueryMember::Scalar),
+    ("Engine", QueryMember::Scalar),
+    ("EngineLifecycleSupport", QueryMember::Scalar),
+    ("EngineVersion", QueryMember::Scalar),
+    ("Iops", QueryMember::Scalar),
+    ("KmsKeyId", QueryMember::Scalar),
+    ("LicenseModel", QueryMember::Scalar),
+    ("ManageMasterUserPassword", QueryMember::Scalar),
+    ("MasterUserAuthenticationType", QueryMember::Scalar),
+    ("MasterUserPassword", QueryMember::Scalar),
+    ("MasterUserSecretKmsKeyId", QueryMember::Scalar),
+    ("MasterUsername", QueryMember::Scalar),
+    ("MaxAllocatedStorage", QueryMember::Scalar),
+    ("MonitoringInterval", QueryMember::Scalar),
+    ("MonitoringRoleArn", QueryMember::Scalar),
+    ("MultiAZ", QueryMember::Scalar),
+    ("MultiTenant", QueryMember::Scalar),
+    ("NcharCharacterSetName", QueryMember::Scalar),
+    ("NetworkType", QueryMember::Scalar),
+    ("OptionGroupName", QueryMember::Scalar),
+    ("PerformanceInsightsKMSKeyId", QueryMember::Scalar),
+    ("PerformanceInsightsRetentionPeriod", QueryMember::Scalar),
+    ("Port", QueryMember::Scalar),
+    ("PreferredBackupWindow", QueryMember::Scalar),
+    ("PreferredMaintenanceWindow", QueryMember::Scalar),
+    ("ProcessorFeatures", QueryMember::List("ProcessorFeature")),
+    ("PromotionTier", QueryMember::Scalar),
+    ("PubliclyAccessible", QueryMember::Scalar),
+    ("StorageEncrypted", QueryMember::Scalar),
+    ("StorageThroughput", QueryMember::Scalar),
+    ("StorageType", QueryMember::Scalar),
+    ("Tags", QueryMember::List("Tag")),
+    ("TdeCredentialArn", QueryMember::Scalar),
+    ("TdeCredentialPassword", QueryMember::Scalar),
+    ("Timezone", QueryMember::Scalar),
+    ("VpcSecurityGroupIds", QueryMember::List("VpcSecurityGroupId")),
+];
+
+/// The two properties of `AWS::RDS::DBInstance` whose `CreateDBInstance` member is spelled
+/// differently: the resource type's `VPCSecurityGroups` is the API's
+/// `VpcSecurityGroupIds` ("a list of the VPC security group IDs to assign to the DB
+/// instance"), and its `CustomIAMInstanceProfile` is the API's
+/// `CustomIamInstanceProfile`. Every other property is its member's own name.
+const DB_INSTANCE_RENAMED_PROPERTIES: &[(&str, &str)] = &[
+    ("VPCSecurityGroups", "VpcSecurityGroupIds"),
+    ("CustomIAMInstanceProfile", "CustomIamInstanceProfile"),
+];
+
+/// The properties of `AWS::RDS::DBInstance` the walk over the declaration does NOT turn
+/// into a `CreateDBInstance` member, each for a reason of its own. Every other property
+/// the catalogue does not carry is refused rather than dropped ([`query_members`]).
+const DB_INSTANCE_PROPERTIES_NOT_SENT: &[&str] = &[
+    // The identifier CloudFormation decides, which is this resource's physical id ("Ref
+    // returns the DBInstanceIdentifier"): the arm sets the member from that id, so the
+    // walk must not also push the declared spelling of it.
+    "DBInstanceIdentifier",
+    // The tag list carries the declared tags AND the ones CloudFormation propagates to the
+    // resource, so the arm builds it out of both ([`tags_of`]).
+    "Tags",
+    // Members of a DIFFERENT call, which say nothing about the instance a create makes:
+    // `ModifyDBInstance` takes `AllowMajorVersionUpgrade`, `ApplyImmediately`,
+    // `CertificateRotationRestart` and `UseDefaultProcessorFeatures` (each governs how a
+    // LATER modification is applied), and `DeleteDBInstance` takes
+    // `DeleteAutomatedBackups` — which is why [`delete_db_instance`] reads that one off
+    // the resource's own record when it deletes the instance.
+    "AllowMajorVersionUpgrade",
+    "ApplyImmediately",
+    "CertificateRotationRestart",
+    "UseDefaultProcessorFeatures",
+    "DeleteAutomatedBackups",
+    // Read-only members CloudFormation publishes as this type's RETURN values: a create
+    // neither takes them nor could be told them.
+    "CertificateDetails",
+    "DbiResourceId",
+    "Endpoint",
+    "MasterUserSecret",
+];
+
+/// The members `CreateDBSubnetGroup` takes, from the same model, read the same way.
+const CREATE_DB_SUBNET_GROUP_MEMBERS: &[(&str, QueryMember)] = &[
+    ("DBSubnetGroupDescription", QueryMember::Scalar),
+    ("DBSubnetGroupName", QueryMember::Scalar),
+    ("SubnetIds", QueryMember::List("SubnetIdentifier")),
+    ("Tags", QueryMember::List("Tag")),
+];
+
+/// `AWS::RDS::DBSubnetGroup`'s two properties the arm itself pushes, for the same reasons
+/// the DB instance's are ([`DB_INSTANCE_PROPERTIES_NOT_SENT`]): the name CloudFormation
+/// decides, and the tag list it merges.
+const DB_SUBNET_GROUP_PROPERTIES_NOT_SENT: &[&str] = &["DBSubnetGroupName", "Tags"];
+
+/// Create the DB instance an `AWS::RDS::DBInstance` declares.
+///
+/// The type's properties are `CreateDBInstance`'s own members
+/// ([`CREATE_DB_INSTANCE_MEMBERS`]), so the evaluated declaration IS the request, with the
+/// one value CloudFormation decides — the `DBInstanceIdentifier`, which is this resource's
+/// physical id — set on the way out, and the tag list built from the declared tags plus the
+/// ones CloudFormation propagates.
+///
+/// What the create ANSWERS replaces the identifiers CloudFormation's naming rules had
+/// computed for the resource: the ARN, the `DbiResourceId` and the endpoint are Amazon
+/// RDS's to assign, and the whole point of provisioning the instance is that the handle the
+/// stack publishes addresses the database RDS really holds. The identifier itself is not
+/// replaced — it is the one the instance was created under.
+async fn create_db_instance(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_DB_INSTANCE_MEMBERS,
+        DB_INSTANCE_RENAMED_PROPERTIES,
+        DB_INSTANCE_PROPERTIES_NOT_SENT,
+        RDS_DB_INSTANCE,
+    )?;
+    parameters.push((
+        "DBInstanceIdentifier".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "Tag",
+        &tags_of(&resource.properties, propagated),
+    );
+    let answered = call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "CreateDBInstance",
+        &parameters,
+    )
+    .await?;
+
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = xml_element(&answered, "DBInstanceArn").filter(|arn| !arn.is_empty()) {
+        // The type publishes one ARN, so the conventional `Arn` attribute every type
+        // answers is that same value ([`super::template::conventional_attributes`]): both
+        // are re-pointed at the ARN the instance really carries.
+        attributes.insert("Arn".to_string(), arn.clone());
+        attributes.insert("DBInstanceArn".to_string(), arn);
+    }
+    if let Some(resource_id) =
+        xml_element(&answered, "DbiResourceId").filter(|id| !id.is_empty())
+    {
+        attributes.insert("DbiResourceId".to_string(), resource_id);
+    }
+    // `Endpoint` is a structure (`<Endpoint><Address/><Port/>…`), and the two members the
+    // type publishes are read off it by name.
+    let endpoint = xml_scalar_children(&answered, "Endpoint");
+    for member in ["Address", "Port"] {
+        if let Some(value) = endpoint.get(member).and_then(scalar_text) {
+            attributes.insert(format!("Endpoint.{member}"), value);
+        }
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the DB instance a stack created, addressed by its identifier — this resource's
+/// physical id. An instance Amazon RDS no longer has (`DBInstanceNotFound`) is already in
+/// the state the delete asks for.
+///
+/// `DeleteDBInstance` requires the caller to say what becomes of the data: "you must
+/// specify the `FinalDBSnapshotIdentifier` parameter" unless the snapshot is skipped. This
+/// emulator's CloudFormation implements no `DeletionPolicy` — nothing in this crate reads
+/// that resource attribute, and a stack's deletion deletes every resource it created — so
+/// the call is the form CloudFormation makes for the `Delete` policy, which skips the final
+/// snapshot. The one member the type's own declaration carries for the delete,
+/// `DeleteAutomatedBackups`, is read off the record and sent as declared.
+///
+/// Amazon RDS answers the delete by putting the instance in `deleting` and removing it a
+/// moment later, so this arm then WAITS for it to be gone
+/// ([`confirm_db_instance_deleted`]): CloudFormation deletes a stack's resources in
+/// dependency order and waits for each deletion to complete before it deletes what that
+/// resource sat in, and a DB subnet group whose instance is still there is still in use.
+async fn delete_db_instance(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let mut parameters = vec![
+        (
+            "DBInstanceIdentifier".to_string(),
+            resource.physical_resource_id.clone(),
+        ),
+        ("SkipFinalSnapshot".to_string(), "true".to_string()),
+    ];
+    if let Some(declared) = resource
+        .properties
+        .get("DeleteAutomatedBackups")
+        .and_then(scalar_text)
+    {
+        parameters.push(("DeleteAutomatedBackups".to_string(), declared));
+    }
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DeleteDBInstance",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => {
+            confirm_db_instance_deleted(ctx, region, &resource.physical_resource_id).await;
+            Ok(())
+        }
+        Err(refusal) if refusal.code == DB_INSTANCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// How often this module checks whether an accepted DB instance deletion has finished, and
+/// how many times.
+///
+/// The product is the longest a stack's deletion waits for ONE instance to go: an upper
+/// bound on the wait, not a duration anything is owed. Amazon RDS reports a deleted
+/// instance as `deleting` and removes it a moment later (its own transition span), so the
+/// check is far shorter than that moment and the whole wait is a small multiple of it —
+/// enough that a loaded machine still gets there, and bounded so a `DeleteStack` of several
+/// instances cannot hold its request open.
+const DELETION_CHECK_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(25);
+const DELETION_CHECKS: usize = 24;
+
+/// Wait until Amazon RDS no longer holds the instance whose deletion it has ACCEPTED.
+///
+/// Returns as soon as the instance is gone, and gives up after [`DELETION_CHECKS`] checks
+/// — the delete itself succeeded, so a wait that runs out is not a failure of it; what
+/// fails then is whatever the next delete of the same stack needs the instance gone for,
+/// reported as that service's own refusal. Any other refusal of the READ ends the wait the
+/// same way: it says nothing about whether the instance is there, and the delete was
+/// accepted either way.
+async fn confirm_db_instance_deleted(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) {
+    for _ in 0..DELETION_CHECKS {
+        match describe_db_instance(ctx, region, physical_resource_id).await {
+            // The instance is gone: the deletion RDS accepted has finished.
+            Ok(None) | Err(_) => return,
+            Ok(Some(_)) => {}
+        }
+        ::tokio::time::sleep(DELETION_CHECK_INTERVAL).await;
+    }
+}
+
+/// The DB instance's configuration as Amazon RDS reports it, for drift detection. An
+/// instance it no longer has (`DBInstanceNotFound`) was deleted.
+///
+/// A DB instance is reported as a STRUCTURE whose scalar members are named exactly as this
+/// type's properties are (`Engine`, `DBInstanceClass`, `AllocatedStorage`, `MultiAZ`), so
+/// those members are the actual configuration the declared one is compared against. Its
+/// composite members are not: `VpcSecurityGroups`, `DBParameterGroups` and `Subnets` are
+/// reported as MEMBERSHIP structures carrying a status, where the properties are plain id
+/// and name lists, so comparing either would need a mapping this module would have to
+/// invent — and a property the actual document does not carry is not evidence of anything
+/// ([`super::drift`]).
+async fn describe_db_instance(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "DBInstanceIdentifier".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DescribeDBInstances",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered,
+            "DBInstance",
+        )))),
+        Err(refusal) if refusal.code == DB_INSTANCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the DB subnet group an `AWS::RDS::DBSubnetGroup` declares.
+///
+/// The type's four properties are `CreateDBSubnetGroup`'s own members, named identically on
+/// both sides, with the name CloudFormation decides and the merged tag list pushed by this
+/// arm the way the DB instance's are. The group is what a DB instance's
+/// `DBSubnetGroupName` names, and Amazon RDS resolves that name before it will create an
+/// instance (`DBSubnetGroupNotFoundFault`), so a stack that declares both has to create
+/// this one for real too.
+async fn create_db_subnet_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_DB_SUBNET_GROUP_MEMBERS,
+        &[],
+        DB_SUBNET_GROUP_PROPERTIES_NOT_SENT,
+        RDS_DB_SUBNET_GROUP,
+    )?;
+    parameters.push((
+        "DBSubnetGroupName".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "Tag",
+        &tags_of(&resource.properties, propagated),
+    );
+    let answered = call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "CreateDBSubnetGroup",
+        &parameters,
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = xml_element(&answered, "DBSubnetGroupArn").filter(|arn| !arn.is_empty())
+    {
+        // The group's own ARN, which is the resource's: the conventional `Arn` attribute
+        // the type answers is re-pointed at the one Amazon RDS reports.
+        attributes.insert("Arn".to_string(), arn);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the DB subnet group a stack created, addressed by its name — this resource's
+/// physical id. A group Amazon RDS no longer has (`DBSubnetGroupNotFoundFault`) is already
+/// in the state the delete asks for.
+async fn delete_db_subnet_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        "DBSubnetGroupName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DeleteDBSubnetGroup",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == DB_SUBNET_GROUP_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The DB subnet group's configuration as Amazon RDS reports it, for drift detection. A
+/// group it no longer has (`DBSubnetGroupNotFoundFault`) was deleted.
+///
+/// Its scalar members are read the same way the DB instance's are, which covers the one
+/// property a declaration can drift in under the same name
+/// (`DBSubnetGroupDescription`); `SubnetIds` is reported as the `Subnets` structure list,
+/// which is not that property's form, so it is not compared.
+async fn describe_db_subnet_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "DBSubnetGroupName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        RDS_SIGNING_NAME,
+        region,
+        RDS_API_VERSION,
+        "DescribeDBSubnetGroups",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered,
+            "DBSubnetGroup",
+        )))),
+        Err(refusal) if refusal.code == DB_SUBNET_GROUP_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The awsQuery parameters an evaluated property document is, against the member catalogue
+/// of the create that takes it.
+///
+/// `renamed` is the properties whose member is spelled differently, and `not_sent` the ones
+/// the ARM itself pushes or that belong to another call. Every other property has to be a
+/// member of the catalogue: one that is not is REFUSED, because a resource created without
+/// a property its declaration asked for is configured differently from what the template
+/// declared — and the stack would have reported it as created.
+fn query_members(
+    properties: &Value,
+    members: &[(&str, QueryMember)],
+    renamed: &[(&str, &str)],
+    not_sent: &[&str],
+    resource_type: &str,
+) -> Result<Vec<(String, String)>, Refusal> {
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    let Some(properties) = properties.as_object() else {
+        return Ok(parameters);
+    };
+    for (property, value) in properties {
+        if not_sent.contains(&property.as_str()) {
+            continue;
+        }
+        let member = renamed
+            .iter()
+            .find(|(declared, _)| *declared == property.as_str())
+            .map_or(property.as_str(), |(_, member)| *member);
+        let Some((_, shape)) = members.iter().find(|(name, _)| *name == member) else {
+            return Err(Refusal {
+                code: NOT_IMPLEMENTED.to_string(),
+                message: format!(
+                    "this emulator does not send {resource_type}'s {property} property to \
+                     the service that owns the type, so the resource was not created"
+                ),
+            });
+        };
+        match shape {
+            QueryMember::Scalar => {
+                parameters.push((member.to_string(), attribute_text(value)));
+            }
+            QueryMember::List(element) => push_list(&mut parameters, member, element, value),
+        }
+    }
+    Ok(parameters)
+}
+
+/// Write one LIST member into an awsQuery form body: each entry indexed from 1 under
+/// `element`, with a structured entry's own members following the index.
+///
+/// A value the template did not write as a list is the one-entry list of itself, so a
+/// single value a template spells without the sequence syntax is not dropped.
+fn push_list(
+    parameters: &mut Vec<(String, String)>,
+    member: &str,
+    element: &str,
+    declared: &Value,
+) {
+    let entries: Vec<&Value> = match declared {
+        Value::Array(values) => values.iter().collect(),
+        single => vec![single],
+    };
+    for (index, value) in entries.iter().enumerate() {
+        let position = index + 1;
+        match value {
+            Value::Object(entry) => {
+                for (name, inner) in entry {
+                    parameters.push((
+                        format!("{member}.{element}.{position}.{name}"),
+                        attribute_text(inner),
+                    ));
+                }
+            }
+            scalar => parameters.push((
+                format!("{member}.{element}.{position}"),
+                attribute_text(scalar),
+            )),
+        }
+    }
+}
+
+/// Write a tag set as the `Tag` structure list an awsQuery create takes, with the
+/// `Key`/`Value` members Amazon RDS's own `Tag` shape spells.
+fn push_tag_list(
+    parameters: &mut Vec<(String, String)>,
+    member: &str,
+    element: &str,
+    tags: &[(String, String)],
+) {
+    for (index, (key, value)) in tags.iter().enumerate() {
+        let position = index + 1;
+        parameters.push((format!("{member}.{element}.{position}.Key"), key.clone()));
+        parameters.push((
+            format!("{member}.{element}.{position}.Value"),
+            value.clone(),
+        ));
+    }
 }
 
 #[cfg(test)]

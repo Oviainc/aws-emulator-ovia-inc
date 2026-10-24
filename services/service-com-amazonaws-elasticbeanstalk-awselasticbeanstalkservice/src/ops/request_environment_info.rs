@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RequestEnvironmentInfo
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RequestEnvironmentInfo`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RequestEnvironmentInfo::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: compiles the requested information for the stored environment's own
+//! Amazon EC2 instances — one file per instance, written into the account's Elastic
+//! Beanstalk storage bucket in object storage — and answers empty; the compile finishes
+//! when the clock makes it due, and `RetrieveEnvironmentInfo` reports it from then until
+//! the files are deleted. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RequestEnvironmentInfo` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RequestEnvironmentInfoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RequestEnvironmentInfo"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RequestEnvironmentInfoError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+
+        // What this request compiles, read under the lock; the lock is DROPPED
+        // before the compile below, which reaches object storage in process.
+        let (environment_id, ec2_instance_ids, log, subject, mut discarded) = {
+            let mut store = state.lock();
+            store.materialize_due_transitions();
+
+            // "You must specify either this or an EnvironmentName, or both. If
+            // you do not specify either, Elastic Beanstalk returns
+            // MissingRequiredParameter error"; "If no such environment is
+            // found, RequestEnvironmentInfo returns an InvalidParameterValue
+            // error."
+            let environment_id = store
+                .environment_id_for(
+                    input.environment_id.as_deref(),
+                    input.environment_name.as_deref(),
+                )
+                .map_err(|refusal| match refusal {
+                    crate::state::EnvironmentRefusal::NoIdentifier => {
+                        RequestEnvironmentInfoError::missing_required_parameter(
+                            "Must specify either EnvironmentId or EnvironmentName.",
+                        )
+                    }
+                    crate::state::EnvironmentRefusal::NotFound(message) => {
+                        RequestEnvironmentInfoError::invalid_parameter_value(message)
+                    }
+                })?;
+
+            let environment = store.environments.get(&environment_id).ok_or_else(|| {
+                RequestEnvironmentInfoError::invalid_parameter_value(
+                    crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+                )
+            })?;
+            // The information is compiled FROM the environment's Amazon EC2
+            // instances ("compiles the last lines from the application server
+            // log files of every Amazon EC2 instance in your environment"), so
+            // an environment that is shutting down or already shut down — whose
+            // instances this service has deleted with the rest of its resources
+            // — has nothing left to compile from.
+            if environment.status == crate::state::STATUS_TERMINATING || environment.is_terminated()
+            {
+                return Err(RequestEnvironmentInfoError::invalid_parameter_value(format!(
+                    "Environment {} is not in a state from which environment information can be requested. Current status: {}.",
+                    environment.environment_name, environment.status
+                )));
+            }
+
+            // The instances the sample covers are the ones the environment is
+            // made of right now, read from the one inventory
+            // `DescribeEnvironmentResources` reports — never a list of this
+            // handler's own.
+            let ec2_instance_ids = environment
+                .resources
+                .as_ref()
+                .map(|resources| resources.instances.clone())
+                .unwrap_or_default();
+            let subject = environment.event_subject();
+            // Taken only once the request is going to be served: a refused
+            // request leaves the deleted compiles in the store for the next
+            // call to discard, rather than forgetting the files it owes object
+            // storage.
+            let discarded = store.take_deleted_environment_info();
+            // `InfoType` is `@required` and modelled as an enum, so the
+            // boundary validator has already refused a request that names none
+            // or one outside `ENVIRONMENT_INFO_TYPE_VALUES`.
+            let log = store.environment_activity_log(
+                &environment_id,
+                crate::state::environment_info_log_lines(input.info_type.as_str()),
+            );
+            (environment_id, ec2_instance_ids, log, subject, discarded)
+        };
+
+        // "Initiates a request to COMPILE the specified type of information":
+        // the file is written into the account's Elastic Beanstalk storage
+        // bucket, in object storage, and the URL a later retrieve reports is a
+        // presigned download of that object.
+        let compiled = crate::state::compile_environment_info(
+            ctx,
+            &region,
+            &environment_id,
+            input.info_type.as_str(),
+            &ec2_instance_ids,
+            &log,
+        )
+        .await;
+
+        let request_id = crate::state::new_request_id();
+        {
+            let mut store = state.lock();
+            // A request for the same information recompiles it, so what the
+            // previous compile left in object storage is discarded with it.
+            discarded.extend(store.begin_environment_info_compile(
+                &environment_id,
+                input.info_type.as_str(),
+                compiled,
+                &request_id,
+            ));
+            // The compile has STARTED here; the event for its completion is
+            // recorded when the clock makes that completion due.
+            store.record_activity_start(
+                &request_id,
+                crate::state::REQUEST_ENVIRONMENT_INFO_ACTIVITY,
+                subject,
+            );
+        }
+        crate::state::discard_compiled_environment_info(ctx, &region, &discarded).await;
+        Ok(RequestEnvironmentInfoOutput)
     }
 }

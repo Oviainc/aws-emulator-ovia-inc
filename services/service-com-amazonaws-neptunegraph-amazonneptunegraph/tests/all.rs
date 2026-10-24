@@ -21,6 +21,8 @@ mod graph_lifecycle;
 mod graph_run_state;
 #[path = "all/graph_snapshot_lifecycle.rs"]
 mod graph_snapshot_lifecycle;
+#[path = "all/import_task_lifecycle.rs"]
+mod import_task_lifecycle;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
 #[path = "all/resource_tagging.rs"]

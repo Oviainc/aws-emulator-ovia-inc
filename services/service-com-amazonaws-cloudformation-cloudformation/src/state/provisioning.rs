@@ -877,6 +877,83 @@ pub(super) fn xml_entry_map(document: &str, parent: &str) -> ::serde_json::Map<S
     }
 }
 
+/// Each DIRECT child element of `parent` that holds TEXT, as the JSON object the rest of
+/// this module compares: one entry per such element, keyed by its own name.
+///
+/// This is how an awsQuery answer carries a resource's scalar members — Amazon RDS reports
+/// a DB instance as `<DBInstance><DBInstanceClass>db.t3.micro</DBInstanceClass>…` — so it
+/// is the reader for a service whose answer is a STRUCTURE rather than the entry map
+/// [`xml_entry_map`] reads.
+///
+/// Only the first `parent` element, and only its own children: the walk starts at that
+/// element's start tag and stops at its end tag, so a second structure elsewhere in the
+/// document (the next DB instance of a list) is not folded into this one. A child that
+/// HOLDS other elements is not a scalar and is left out entirely rather than reported as
+/// the concatenation of its descendants' text; an empty element (`<Iops/>`) is the empty
+/// value of that member, which is what the answering service reported.
+pub(super) fn xml_scalar_children(
+    document: &str,
+    parent: &str,
+) -> ::serde_json::Map<String, Value> {
+    use ::quick_xml::events::Event;
+
+    let mut reader = ::quick_xml::Reader::from_str(document);
+    reader.config_mut().trim_text(false);
+    let mut members = ::serde_json::Map::new();
+    let mut inside = false;
+    // How many elements are open BELOW `parent`: a direct child opens at 0, and only a
+    // child read at that level is one of this structure's own members.
+    let mut depth = 0usize;
+    // The direct child being read, while it is still a candidate scalar, and its text.
+    let mut member: Option<String> = None;
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                let name = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
+                if !inside {
+                    inside = name == parent;
+                    continue;
+                }
+                if depth == 0 {
+                    member = Some(name);
+                    text.clear();
+                } else {
+                    // The child this is nested in holds elements, so it is not a scalar.
+                    member = None;
+                }
+                depth += 1;
+            }
+            Ok(Event::Text(found)) if inside && depth == 1 => {
+                text.push_str(&found.xml10_content().unwrap_or_default());
+            }
+            Ok(Event::Empty(empty)) if inside && depth == 0 => {
+                let name = String::from_utf8_lossy(empty.local_name().as_ref()).into_owned();
+                members.insert(name, Value::String(String::new()));
+            }
+            Ok(Event::End(end)) if inside => {
+                let name = String::from_utf8_lossy(end.local_name().as_ref()).into_owned();
+                if depth == 0 {
+                    if name == parent {
+                        return members;
+                    }
+                    continue;
+                }
+                if depth == 1 {
+                    if let Some(read) = member.take() {
+                        if read == name {
+                            members.insert(read, Value::String(::std::mem::take(&mut text)));
+                        }
+                    }
+                }
+                depth -= 1;
+            }
+            Ok(Event::Eof) | Err(_) => return members,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// A service's error answer as the code it carries and the message it worded. The code is
 /// the last segment of the awsJson `__type`
 /// (`com.amazonaws.firehose#ResourceInUseException` -> `ResourceInUseException`), which is

@@ -132,7 +132,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this request was signed for: a deregistration reaches an
+        // application registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeregisterApplicationErrorModeled::InternalServerException(
                 crate::state::store_unavailable(),
@@ -141,22 +143,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
 
-        let Some(application) = state.applications.remove(&input.application_id) else {
+        if !state
+            .region(&region)
+            .applications
+            .contains_key(&input.application_id)
+        {
             // This operation models no `ResourceNotFoundException`, so an id naming no
-            // registered application is refused as a validation failure — the same
-            // construction `GetApplication` answers that condition with, since the two
-            // refuse the same thing at the same status and error shape.
+            // application registered in this account and Region is refused as a
+            // validation failure — the same construction `GetApplication` answers that
+            // condition with, since the two refuse the same thing at the same status and
+            // error shape.
             return Err(DeregisterApplicationErrorModeled::ValidationException(
                 crate::state::no_registered_application(&input.application_id),
             )
             .into());
-        };
+        }
+
+        // The application was just found in this Region, so reaching for the partition
+        // to write mints nothing.
+        let region_state = state.region_entry(&region);
+        let application = region_state
+            .applications
+            .remove(&input.application_id)
+            .expect("the application was found in this region just above");
 
         // Everything held for the application goes with it: its tags, keyed by its ARN,
         // and every operation record filed against it — nothing else would ever reclaim
         // them, and the resource they describe no longer exists.
-        state.tags_by_arn.remove(&application.arn);
-        state.forget_operations_for(&application.id);
+        region_state.tags_by_arn.remove(&application.arn);
+        region_state.forget_operations_for(&application.id);
+        // A Region that no longer holds anything is not a Region this store has to keep
+        // a partition for.
+        state.forget_region_if_empty(&region);
 
         Ok(DeregisterApplicationOutput {})
     }

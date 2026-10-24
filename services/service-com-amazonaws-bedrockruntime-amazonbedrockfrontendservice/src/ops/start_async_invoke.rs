@@ -5,6 +5,13 @@
 //! registry in [`crate::state`], mints an `invocationArn`, and persists the
 //! record `GetAsyncInvoke` and `ListAsyncInvokes` then report.
 //!
+//! Two things are checked before anything is minted, because a refused request
+//! must leave no job behind: the model must be one the provider publishes
+//! asynchronous invocation for ([`crate::state::ModelEntry::supports_async_invoke`]),
+//! and `modelInput` must satisfy that model's own published request schema
+//! ([`crate::state::async_model_input_violation`]). Each is a
+//! `ValidationException` (400).
+//!
 //! `@idempotent` with an `@idempotencyToken` `clientRequestToken`: a repeat of
 //! the same payload under the same token returns the invocation already
 //! minted, and the same token with a different payload is a `ConflictException`.
@@ -213,6 +220,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // Asynchronous invocation is published per model, so a model this
+        // service recognises but does not serve asynchronously is refused here,
+        // before any job is minted.
+        if !model.supports_async_invoke {
+            return Err(StartAsyncInvokeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::ASYNC_INVOKE_UNSUPPORTED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The provider validates `modelInput` against the model's own published
+        // request schema; a body outside it is refused synchronously, so a
+        // malformed job is never minted, listed or reported.
+        let model_input = crate::state::document_to_json(&input.model_input);
+        if let Some(detail) =
+            crate::state::async_model_input_violation(&model.model_id, &model_input)
+        {
+            return Err(StartAsyncInvokeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::malformed_model_input_message(&detail)),
+                },
+            )
+            .into());
+        }
+
         let fingerprint = crate::state::async_invoke_fingerprint(
             &model.model_id,
             &input.model_input,
@@ -278,11 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.log_invocation(crate::state::InvocationLogEntry {
             model_id: model.model_id,
             kind: crate::state::InvokeKind::Async,
-            input_tokens: crate::state::body_input_tokens(
-                crate::state::document_to_json(&input.model_input)
-                    .to_string()
-                    .as_bytes(),
-            ),
+            input_tokens: crate::state::body_input_tokens(model_input.to_string().as_bytes()),
             output_tokens: 0,
             at_millis: submit_time,
         });

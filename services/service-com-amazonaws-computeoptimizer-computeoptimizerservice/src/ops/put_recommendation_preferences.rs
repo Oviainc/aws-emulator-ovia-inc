@@ -317,17 +317,15 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
         ));
     }
 
-    // EVERY preference this operation can set is settable only for the resource types the
-    // service supports it for, and a request that sets one for another resource type is
-    // refused — the preference a resource type does not carry cannot be put on it. One
+    // A preference member is settable for every `ResourceType` the enum admits EXCEPT
+    // where that member's OWN documentation restricts it ("can only be set for …"), and a
+    // request that sets a so-restricted member for another resource type is refused. One
     // table so no member's restriction can drift from another's; the allowed lists are
-    // each the resource types that preference's own documentation names.
+    // each the resource types that preference's own documentation names, and a member
+    // whose documentation names none (`enhancedInfrastructureMetrics`,
+    // `inferredWorkloadTypes`, `savingsEstimationMode`) is absent from the table and so
+    // accepted for every resource type.
     for (member, is_set, resource_types) in [
-        (
-            "enhancedInfrastructureMetrics",
-            input.enhanced_infrastructure_metrics.is_some(),
-            ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES,
-        ),
         (
             "externalMetricsPreference",
             input.external_metrics_preference.is_some(),
@@ -407,16 +405,6 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
 /// The `CustomizableMetricName` value whose headroom, but not threshold, is settable.
 const MEMORY_UTILIZATION: &str = "MemoryUtilization";
 
-/// The `ResourceType` values an `enhancedInfrastructureMetrics` preference may be set for.
-/// The feature exists for EC2 instances and Auto Scaling groups: the effective-preference
-/// member of the same name documents its application as reviewable through "the
-/// GetAutoScalingGroupRecommendations and GetEC2InstanceRecommendations actions", and no
-/// other resource type's recommendations carry it.
-const ENHANCED_INFRASTRUCTURE_METRICS_RESOURCE_TYPES: &[&str] = &[
-    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
-    crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
-];
-
 /// The `ResourceType` values an `externalMetricsPreference` may be set for: "This
 /// preference can only be set for the Ec2Instance resource type."
 const EXTERNAL_METRICS_RESOURCE_TYPES: &[&str] = &[crate::state::RESOURCE_TYPE_EC2_INSTANCE];
@@ -440,7 +428,41 @@ const PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES: &[&str] = &[
     crate::state::RESOURCE_TYPE_EC2_INSTANCE,
     crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
     crate::state::RESOURCE_TYPE_EBS_VOLUME,
-    "EcsService",
-    "RdsDBInstance",
-    "AuroraDBClusterStorage",
+    crate::state::RESOURCE_TYPE_ECS_SERVICE,
+    crate::state::RESOURCE_TYPE_RDS_DB_INSTANCE,
+    crate::state::RESOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE,
 ];
+
+#[cfg(test)]
+mod tests {
+    /// A restriction list may only name values the model's `ResourceType` enum admits: a
+    /// list naming anything else would refuse a resource type the enum does not have (dead)
+    /// or, worse, misspell one it does and refuse every request for it. Checked once here
+    /// rather than per request, because the lists are consts.
+    #[test]
+    fn every_restriction_list_names_only_modelled_resource_types() {
+        for (name, resource_types) in [
+            (
+                "EXTERNAL_METRICS_RESOURCE_TYPES",
+                super::EXTERNAL_METRICS_RESOURCE_TYPES,
+            ),
+            (
+                "UTILIZATION_PREFERENCES_RESOURCE_TYPES",
+                super::UTILIZATION_PREFERENCES_RESOURCE_TYPES,
+            ),
+            (
+                "PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES",
+                super::PREFERENCE_AT_RESOURCE_LEVEL_RESOURCE_TYPES,
+            ),
+        ] {
+            for allowed in resource_types {
+                assert!(
+                    super::RESOURCE_TYPE_VALUES.contains(allowed),
+                    "case {name:?}: {allowed:?} is not a modelled ResourceType value, which \
+                     must be one of {:?}",
+                    super::RESOURCE_TYPE_VALUES,
+                );
+            }
+        }
+    }
+}

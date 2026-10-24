@@ -209,10 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // A configuration is created with no EventRule and no channel
             // association; `CreateEventRule` adds to the EventRule index as
-            // rules are created, and `AssociateChannel` (still a 501 stub) adds
-            // to the channel one.
+            // rules are created, and `AssociateChannel` adds to the channel one.
             event_rule_sources: std::collections::BTreeSet::new(),
-            channel_arns: std::collections::BTreeSet::new(),
+            channel_arns: std::collections::BTreeMap::new(),
             sequence,
         };
         store.configurations.insert(arn.clone(), record);

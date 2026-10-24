@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelImportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelImportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancels an import task: the one operation that stops a bulk load this service
+//! accepted. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelImportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## The rule this handler implements
+//!
+//! A cancellation is accepted only for a task whose import is still in flight; it is
+//! accepted rather than completed, so the task reports the modelled `CANCELLING`
+//! status and the clock owes it the move to `CANCELLED`, and the graph the task was
+//! loading stops importing when the task stops. A task that has already stopped, or
+//! is already winding down, has no work left to cancel and is refused
+//! `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +163,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelImportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelImportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelImportTask"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelImportTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // The lookup settles the transition the clock already made due first, so a
+        // task whose load has already stopped is judged on the status it stopped in
+        // rather than on the status it was accepted with.
+        let Some(task) = store.settled_import_task_mut(&input.task_identifier, now) else {
+            return Err(CancelImportTaskErrorModeled::ResourceNotFoundException(
+                crate::state::import_task_not_found(&input.task_identifier),
+            )
+            .into());
+        };
+
+        // Only a task whose import is still in flight has work to stop: one that has
+        // already stopped, and one that is already winding down, is a conflict rather
+        // than a second cancellation.
+        let status = task.status;
+        if !status.is_cancellable() {
+            let task_id = task.id.clone();
+            return Err(CancelImportTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "import task {task_id} is in status {} and cannot be cancelled",
+                        status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // Cancellation is ACCEPTED, not completed: the modelled status of a cancelled
+        // task is CANCELLING ("Status is CANCELLING when the import task is
+        // cancelled"), and the clock owes the move to CANCELLED a fixed span later
+        // (`crate::state::PROVISIONING_SPAN`), so a caller that reads the task straight
+        // after this call still sees it winding down.
+        task.begin_transition(
+            crate::state::ImportTaskStatus::Cancelling,
+            crate::state::ImportTaskStatus::Cancelled,
+            Some(crate::state::IMPORT_CANCELLED_REASON.to_string()),
+            now,
+        );
+        let graph_id = task.graph_id.clone();
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetImportTask answers.
+        let output = Self::Output::from(&*task);
+
+        // The graph is IMPORTING for as long as the task runs, so stopping the task is
+        // what ends that: the graph settles back to AVAILABLE when the cancellation
+        // completes rather than when the cancelled load would have finished. A graph
+        // whose own transition has already come due, or that was deleted meanwhile, is
+        // left alone.
+        if let Some(graph) = store.settled_graph_mut(&graph_id, now) {
+            if graph.status == crate::state::GraphStatus::Importing {
+                graph.begin_transition(
+                    crate::state::GraphStatus::Importing,
+                    crate::state::GraphStatus::Available,
+                    now,
+                );
+            }
+        }
+
+        Ok(output)
     }
 }

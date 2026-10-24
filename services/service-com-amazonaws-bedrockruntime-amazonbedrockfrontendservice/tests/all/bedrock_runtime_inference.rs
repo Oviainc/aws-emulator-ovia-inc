@@ -217,19 +217,22 @@ fn emulator_with_engine() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
 }
 
 /// The emulator under test, when a test does not read the state directly.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the other suites of this target drive the SAME harness rather
+/// than each growing its own copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().1
 }
 
 /// One HTTP exchange.
-struct Call {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Call {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Call {
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|error| {
             panic!(
                 "response body is not JSON ({error}): {}",
@@ -240,7 +243,7 @@ impl Call {
 
     /// The wire error code: the `x-amzn-errortype` header restJson1 sets, or the
     /// body's `__type` when a value could not be rendered as a header.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         if let Some(value) = self.headers.get("x-amzn-errortype") {
             return value.to_str().unwrap_or_default().to_string();
         }
@@ -260,7 +263,7 @@ impl Call {
     }
 }
 
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -287,7 +290,7 @@ async fn send(
     }
 }
 
-async fn post_json(
+pub(crate) async fn post_json(
     router: &MultiServiceRouter,
     path: &str,
     body: &serde_json::Value,
@@ -302,7 +305,7 @@ async fn post_json(
     .await
 }
 
-async fn get(router: &MultiServiceRouter, path: &str) -> Call {
+pub(crate) async fn get(router: &MultiServiceRouter, path: &str) -> Call {
     send(router, "GET", path, &[], Vec::new()).await
 }
 
@@ -1072,12 +1075,14 @@ async fn every_served_inference_call_is_recorded_in_the_inference_log() {
     )
     .await;
     assert_eq!(conversed.status, 200, "Converse must be served");
+    // Asynchronous invocation is published only for the video generation
+    // models, so the async leg of the log is exercised against one of those.
     let started = post_json(
         &router,
         "/async-invoke",
         &serde_json::json!({
-            "modelId": model_id,
-            "modelInput": {"inputText": "and me"},
+            "modelId": "luma.ray-v2:0",
+            "modelInput": {"prompt": "and me"},
             "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://bucket/out"}},
         }),
     )
@@ -1111,9 +1116,11 @@ async fn every_served_inference_call_is_recorded_in_the_inference_log() {
         ],
         "expected the log in call order with each API's own kind, got {kinds:?}"
     );
-    for entry in &logged {
+    // The synchronous calls name the text model, the asynchronous one the video
+    // model it is the only API published for.
+    for (entry, expected) in logged.iter().zip([model_id, model_id, "luma.ray-v2:0"]) {
         assert_eq!(
-            entry.model_id, model_id,
+            entry.model_id, expected,
             "expected the resolved model id on every entry, got {entry:?}"
         );
         assert!(
@@ -1928,7 +1935,10 @@ async fn an_invoke_body_is_checked_against_the_invoked_family_request_schema() {
 #[tokio::test]
 async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back() {
     let router = emulator();
-    let model_id = "amazon.nova-pro-v1:0";
+    // An asynchronously invocable model: `StartAsyncInvoke` is published for the
+    // video generation models, and `modelInput` is checked against this one's
+    // own request schema.
+    let model_id = "luma.ray-v2:0";
 
     // Rows differ in token (present/absent), tags and output configuration.
     let rows: Vec<(&str, serde_json::Value)> = vec![
@@ -1937,7 +1947,7 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
             serde_json::json!({
                 "modelId": model_id,
                 "clientRequestToken": "tok-1",
-                "modelInput": {"messages": [{"role": "user", "content": [{"text": "render"}]}]},
+                "modelInput": {"prompt": "render a kite", "duration": "9s"},
                 "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix"}},
                 "tags": [{"key": "team", "value": "platform"}],
             }),
@@ -1946,7 +1956,7 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
             "without a token",
             serde_json::json!({
                 "modelId": model_id,
-                "modelInput": {"inputText": "render something else"},
+                "modelInput": {"prompt": "render something else"},
                 "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://other-bucket/out"}},
             }),
         ),
@@ -1955,7 +1965,7 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
             serde_json::json!({
                 "modelId": model_id,
                 "clientRequestToken": "tok-3",
-                "modelInput": {"inputText": "third"},
+                "modelInput": {"prompt": "third", "resolution": "540p"},
                 "outputDataConfig": {"s3OutputDataConfig": {
                     "s3Uri": "s3://bucket/third",
                     "bucketOwner": "000000000000",
@@ -2060,7 +2070,7 @@ async fn start_async_invoke_persists_a_record_that_get_async_invoke_reports_back
 
     // The same token with a different payload conflicts.
     for (case, change) in [
-        ("a different modelInput", serde_json::json!({"inputText": "different"})),
+        ("a different modelInput", serde_json::json!({"prompt": "different"})),
         ("a different output location", serde_json::Value::Null),
     ] {
         let mut conflicting = rows[0].1.clone();
@@ -2144,8 +2154,8 @@ async fn an_in_progress_invocation_settles_into_the_modelled_failure_state() {
         &router,
         "/async-invoke",
         &serde_json::json!({
-            "modelId": "amazon.nova-pro-v1:0",
-            "modelInput": {"inputText": "render"},
+            "modelId": "luma.ray-v2:0",
+            "modelInput": {"prompt": "render"},
             "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix"}},
         }),
     )
@@ -2226,9 +2236,9 @@ async fn list_async_invokes_pages_in_the_requested_order_without_gaps_or_duplica
             &router,
             "/async-invoke",
             &serde_json::json!({
-                "modelId": "amazon.nova-lite-v1:0",
+                "modelId": "luma.ray-v2:0",
                 "clientRequestToken": format!("tok-{index}"),
-                "modelInput": {"inputText": format!("job {index}")},
+                "modelInput": {"prompt": format!("job {index}")},
                 "outputDataConfig": {"s3OutputDataConfig": {
                     "s3Uri": format!("s3://bucket/job-{index}"),
                 }},
@@ -2375,8 +2385,12 @@ async fn list_async_invokes_applies_its_status_and_submit_time_filters() {
             &router,
             "/async-invoke",
             &serde_json::json!({
-                "modelId": "amazon.titan-text-lite-v1",
-                "modelInput": {"inputText": format!("job {index}")},
+                "modelId": "amazon.nova-reel-v1:0",
+                "modelInput": {
+                    "taskType": "TEXT_VIDEO",
+                    "textToVideoParams": {"text": format!("job {index}")},
+                    "videoGenerationConfig": {"durationSeconds": 6, "fps": 24},
+                },
                 "outputDataConfig": {"s3OutputDataConfig": {"s3Uri": "s3://bucket/out"}},
             }),
         )
@@ -2617,7 +2631,7 @@ async fn listed_arns(router: &MultiServiceRouter, query: &str) -> Vec<String> {
 /// Whether `value` matches the modelled `InvocationArn` pattern
 /// `^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:async-invoke/[a-z0-9]{12}$`,
 /// checked field by field rather than with a regex dependency.
-fn is_invocation_arn(value: &str) -> bool {
+pub(crate) fn is_invocation_arn(value: &str) -> bool {
     let fields: Vec<&str> = value.split(':').collect();
     let [arn, partition, service, region, account, resource] = fields.as_slice() else {
         return false;
@@ -2644,7 +2658,7 @@ fn is_invocation_arn(value: &str) -> bool {
 /// Percent-encode the characters an ARN carries that cannot sit in a path
 /// segment unescaped. Only `:` and `/` occur in the ARNs these tests build; a
 /// future ARN shape with other reserved characters would need more.
-fn encode_path(value: &str) -> String {
+pub(crate) fn encode_path(value: &str) -> String {
     value.replace(':', "%3A").replace('/', "%2F")
 }
 

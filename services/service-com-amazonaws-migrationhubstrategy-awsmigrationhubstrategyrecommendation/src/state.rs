@@ -45,7 +45,7 @@ use crate::ops::types::{
     GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
-    StrategyOption, SystemInfo, TransformationTool, ValidationException,
+    StrategyOption, SystemInfo, TransformationTool, ValidationException, GROUP_NAME_VALUES,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -1298,6 +1298,41 @@ pub fn require_bucket(
              with \"{BUCKET_NAME_PREFIX}\" prefix"
         )),
     })
+}
+
+/// Refuse a request member whose value is not one the enumeration it targets declares.
+///
+/// `declared` is the generated value list of the member's target shape (the `*_VALUES`
+/// constants in [`crate::ops::types`], rendered from the model's own `enum` definitions),
+/// so the catalog a value is held to is the model's and never one written out by hand.
+///
+/// An ABSENT member is `Ok`: an optional member that was not sent carries no value that
+/// could be outside the enumeration, and a `@required` one never reaches here because the
+/// boundary validator refuses its absence first. The handler has to do this because the
+/// boundary validator admits ANY string for an enum-targeting member — an `enum`'s value
+/// list is not a constraint it enforces — so without this check an undeclared value would
+/// be persisted and reported back as if the service had accepted it.
+///
+/// Refused with the service's one `ValidationException` (HTTP 400) sentence
+/// ([`invalid_request_body`]), the same refusal every other rule the model cannot express
+/// answers; each operation maps it into its own error channel.
+pub fn check_enum(value: Option<&str>, declared: &[&str]) -> Result<(), ValidationException> {
+    match value {
+        Some(named) if !declared.contains(&named) => Err(invalid_request_body()),
+        _ => Ok(()),
+    }
+}
+
+/// Hold every entry of an import-group list to the `GroupName` catalog.
+///
+/// A `Group`'s `name` targets `GroupName`, so the same enum rule as [`check_enum`] applies
+/// to it one level down, inside each element of the list: a request naming a group kind
+/// the model does not declare is refused rather than stored. Its `value` is a free-form
+/// string and is held only to what the model expresses about it.
+pub fn check_group_names(groups: &[Group]) -> Result<(), ValidationException> {
+    groups
+        .iter()
+        .try_for_each(|group| check_enum(group.name.as_deref(), GROUP_NAME_VALUES))
 }
 
 /// `GetAssessment`'s refusal of an `id` that names no assessment of this account.

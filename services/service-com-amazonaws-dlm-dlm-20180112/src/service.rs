@@ -21,13 +21,17 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — which operation serves a request. EDITED HERE: the key
-//!   and the handler stay the generated table's, but every operation that models
-//!   `InvalidRequestException` is served through [`InModelledEnvelope`], which
-//!   (a) authorizes `iam:PassRole` for an `ExecutionRoleArn` the request names,
-//!   ahead of the operation — the order the real front door works in, and the only
-//!   place a refusal can precede the member's own `@pattern` — and (b) refuses a
-//!   request outside a modelled constraint with that operation's own
+//!   and the handler stay the generated table's, but every operation is served
+//!   through the envelope that states its own pre-handler refusals. An operation
+//!   that models `InvalidRequestException` goes through [`InModelledEnvelope`],
+//!   which (a) authorizes `iam:PassRole` for an `ExecutionRoleArn` the request
+//!   names, ahead of the operation — the order the real front door works in, and
+//!   the only place a refusal can precede the member's own `@pattern` — and
+//!   (b) refuses a request outside a modelled constraint with that operation's own
 //!   `InvalidRequestException` instead of the framework's pre-dispatch envelope.
+//!   An operation that models NO client error for a refused parameter goes through
+//!   [`InNotFoundEnvelope`], which answers an identifier outside its modelled
+//!   constraints with that operation's modelled `ResourceNotFoundException`.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -61,9 +65,13 @@
 //!    pre-dispatch envelope would answer the right status under the error type
 //!    `ValidationException`, a shape this service's model does not declare, with
 //!    the prose in a lowercase `message` key the modelled shape does not have.
-//!    The two operations whose model declares no client error
-//!    (`GetLifecyclePolicy`, `DeleteLifecyclePolicy`) are left to that envelope:
-//!    an operation answers only the errors it models.
+//!    The two operations that declare no 400-class client error at all
+//!    (`GetLifecyclePolicy`, `DeleteLifecyclePolicy`) answer the only client error
+//!    they DO model for the resource they address: a `PolicyId` outside
+//!    `PolicyId`'s `@pattern` or `@length` can denote no lifecycle policy, so it
+//!    is `ResourceNotFoundException` (404) naming that id, the same error and the
+//!    same payload a well-formed id that resolves to nothing gets. An operation
+//!    answers only the errors it models.
 //! 3. **The cross-member rules the model cannot express** — which `PolicyDetails`
 //!    members may be combined, and which tag keys may be set. Those live in the
 //!    handlers, which already hold the state the rule is about.
@@ -86,6 +94,14 @@ const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 
 /// The HTTP status that shape's `@httpError` declares.
 const INVALID_REQUEST_EXCEPTION_STATUS: u16 = 400;
+
+/// The error type of the resource error the policy-addressed operations model:
+/// the shape `com.amazonaws.dlm#ResourceNotFoundException`
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The HTTP status that shape's `@httpError` declares.
+const RESOURCE_NOT_FOUND_EXCEPTION_STATUS: u16 = 404;
 
 /// The path segment a validation path puts between a collection and its element
 /// (`schedules.1.member.createRule`). It names no parameter of the request, so a
@@ -169,6 +185,31 @@ impl DlmRequest for crate::ops::types::ListTagsForResourceInput {}
 impl DlmRequest for crate::ops::types::TagResourceInput {}
 impl DlmRequest for crate::ops::types::UntagResourceInput {}
 
+/// An operation input that addresses ONE lifecycle policy by the `PolicyId` in
+/// its URI, on an operation whose model declares no client error for a refused
+/// parameter.
+///
+/// Both such operations (`GetLifecyclePolicy`, `DeleteLifecyclePolicy`) declare
+/// exactly one input member — that `@httpLabel` id — so every modelled-constraint
+/// refusal of one of their requests is a refusal of the id, and the id is what
+/// the answer reports as the resource that was not found.
+trait PolicyAddressedRequest {
+    /// The `PolicyId` this request names.
+    fn policy_id(&self) -> &str;
+}
+
+impl PolicyAddressedRequest for crate::ops::types::GetLifecyclePolicyInput {
+    fn policy_id(&self) -> &str {
+        self.policy_id.as_str()
+    }
+}
+
+impl PolicyAddressedRequest for crate::ops::types::DeleteLifecyclePolicyInput {
+    fn policy_id(&self) -> &str {
+        self.policy_id.as_str()
+    }
+}
+
 /// The `com-amazonaws-dlm-dlm-20180112` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -176,23 +217,23 @@ impl DlmRequest for crate::ops::types::UntagResourceInput {}
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The operations that model `InvalidRequestException`, each the generated
-    /// table's own operation wrapped in [`InModelledEnvelope`] and built from the
-    /// SAME shared engine, so a wrapped operation reads and writes the one store.
-    /// Keyed by the routing key the protocol resolves, which is the key the
+    /// Every operation served through one of this service's modelled-error
+    /// envelopes, each the generated table's own operation wrapped and built from
+    /// the SAME shared engine, so a wrapped operation reads and writes the one
+    /// store. Keyed by the routing key the protocol resolves, which is the key the
     /// generated table uses.
-    in_modelled_envelope: OperationRoutingTable,
+    modelled_error_envelopes: OperationRoutingTable,
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`InModelledEnvelope`] and keyed by its operation shape name — the routing key
+/// `$envelope` and keyed by its operation shape name — the routing key
 /// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
 macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+    ($table:expr, $engine:expr, $envelope:ident, $($module:ident :: $operation:ident),+ $(,)?) => {
         $(
             $table.add_operation(
                 stringify!($operation),
-                ::std::boxed::Box::new(InModelledEnvelope::new(
+                ::std::boxed::Box::new($envelope::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
@@ -205,14 +246,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut in_modelled_envelope = OperationRoutingTable::new();
+        let mut modelled_error_envelopes = OperationRoutingTable::new();
         // Every operation whose model declares `InvalidRequestException`
-        // (`smithy_query(query="digest")`). `GetLifecyclePolicy` and
-        // `DeleteLifecyclePolicy` declare no client error, so they are not here:
-        // an operation answers only the errors it models.
+        // (`smithy_query(query="digest")`): a refused parameter is stated in that
+        // error.
         wrap_operations!(
-            in_modelled_envelope,
+            modelled_error_envelopes,
             engine,
+            InModelledEnvelope,
             create_lifecycle_policy::CreateLifecyclePolicy,
             get_lifecycle_policies::GetLifecyclePolicies,
             list_tags_for_resource::ListTagsForResource,
@@ -220,9 +261,22 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             untag_resource::UntagResource,
             update_lifecycle_policy::UpdateLifecyclePolicy,
         );
+        // The two operations that declare NO 400-class client error
+        // (`smithy_query(query="operation", operation="GetLifecyclePolicy")`:
+        // `InternalServerException`, `LimitExceededException`,
+        // `ResourceNotFoundException` only). Each addresses one policy by an
+        // `@httpLabel` `PolicyId`, so an id outside that member's constraints is
+        // answered with the not-found error they do model.
+        wrap_operations!(
+            modelled_error_envelopes,
+            engine,
+            InNotFoundEnvelope,
+            delete_lifecycle_policy::DeleteLifecyclePolicy,
+            get_lifecycle_policy::GetLifecyclePolicy,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            in_modelled_envelope,
+            modelled_error_envelopes,
         }
     }
 }
@@ -288,6 +342,106 @@ where
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
     }
+}
+
+/// One modelled operation that addresses a lifecycle policy by an `@httpLabel`
+/// `PolicyId` and declares NO 400-class client error, served so that an id
+/// outside that member's modelled constraints is answered with an error the
+/// operation does model.
+///
+/// `GetLifecyclePolicy` and `DeleteLifecyclePolicy` model exactly
+/// `InternalServerException` (500), `LimitExceededException` (429) and
+/// `ResourceNotFoundException` (404). A `PolicyId` outside `PolicyId`'s
+/// `@pattern` / `@length` is a value no lifecycle policy's id can take, so it
+/// resolves to no policy, and the answer is the same `ResourceNotFoundException`
+/// a well-formed id that resolves to nothing gets: one error shape, one payload,
+/// whatever form the unresolvable id took. Left to the framework's pre-dispatch
+/// envelope instead, such a request is answered under the error type
+/// `ValidationException` — a shape this model does not declare — with the prose
+/// in a lowercase `message` key, so an SDK surfaces an unmodelled error for an id
+/// a client can plausibly pass.
+///
+/// Nothing else is re-implemented: a request this wrapper does not refuse is
+/// handed to the generated [`ErasedOperation::run`], which owns deserialize ->
+/// validate -> handle -> serialize and every modelled error. In particular the
+/// handler, not this wrapper, decides whether a WELL-FORMED id resolves — this
+/// layer never reads the store and never writes it, so a refused delete removes
+/// nothing.
+struct InNotFoundEnvelope<O> {
+    operation: O,
+}
+
+impl<O> InNotFoundEnvelope<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for InNotFoundEnvelope<O>
+where
+    O: Operation + ErasedOperation,
+    O::Input: PolicyAddressedRequest,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // Read the protocol out before the await, as `InModelledEnvelope`
+            // does: `&dyn ErasedServiceDefinition` is not `Sync` and this future
+            // is.
+            let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            if let Some(unresolvable) = unresolvable_policy::<O>(protocol, req) {
+                return unresolvable;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// This service's `ResourceNotFoundException` for the `PolicyId` `req` names,
+/// when that id is outside the member's modelled constraints and so denotes no
+/// policy; `None` when the id is well formed and the request reaches the handler,
+/// which is what decides whether it resolves.
+///
+/// `None` also when the request cannot be read at all — a request the codec
+/// rejects is not an id that failed to resolve, so the framework's own walk words
+/// it — and when the error cannot be serialized, which leaves that walk to refuse
+/// the request rather than answering with no reason at all.
+///
+/// The constraint walk is the framework's own ([`constraints::validate`] over the
+/// operation's input schema), so this cannot find a different set from the walk
+/// that follows it.
+fn unresolvable_policy<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<RtResponse>
+where
+    O::Input: PolicyAddressedRequest,
+{
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
+    if constraints::validate(&input, O::INPUT_SCHEMA).is_empty() {
+        return None;
+    }
+    let not_found = crate::state::policies_not_found(&[input.policy_id().to_string()]);
+    protocol
+        .serialize_error(
+            &not_found,
+            &crate::ops::types::shared_types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+            RESOURCE_NOT_FOUND_EXCEPTION,
+            RESOURCE_NOT_FOUND_EXCEPTION_STATUS,
+        )
+        .ok()
 }
 
 /// This service's answer to `req`, when it is one of the two refusals that
@@ -463,16 +617,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
-        // resolves, and the operation it names is the one served — wrapped in
-        // `InModelledEnvelope` for every operation that models
-        // `InvalidRequestException`, so that operation's refusals are stated the
-        // way this service states them and an `ExecutionRoleArn`'s `iam:PassRole`
-        // is authorized ahead of the operation (and so ahead of the
-        // member-constraint walk), as the real front door does it. Every other
-        // key resolves to `None` here exactly as it does for an unedited service,
-        // leaving the generated table to serve it.
+        // resolves, and the operation it names is the one served — wrapped in the
+        // envelope that states the refusals preceding that operation's handler in
+        // an error its model declares (`InModelledEnvelope` where that is
+        // `InvalidRequestException`, and `InNotFoundEnvelope` for the two
+        // policy-addressed operations that model no 400-class client error), so an
+        // `ExecutionRoleArn`'s `iam:PassRole` is authorized ahead of the operation
+        // (and so ahead of the member-constraint walk), as the real front door
+        // does it. Every other key resolves to `None` here exactly as it does for
+        // an unedited service, leaving the generated table to serve it.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.in_modelled_envelope.get(key)
+        self.modelled_error_envelopes.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

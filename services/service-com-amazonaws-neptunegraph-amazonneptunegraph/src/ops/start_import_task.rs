@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartImportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartImportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a bulk import into an existing graph. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartImportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## The rule this handler implements
+//!
+//! The call mints an import task against a stored graph that is `AVAILABLE`, persists
+//! it, and reports the stored record with the modelled `INITIALIZING` status; the
+//! graph loads data (`IMPORTING`) for as long as the task runs. A graph that is not
+//! stored is `ResourceNotFoundException` (404) and one that is not `AVAILABLE` is
+//! `ConflictException` (409), because an import needs a serving graph
+//! ("The graph needs to be empty and in the AVAILABLE state").
+//!
+//! ## Why an accepted task stops FAILED
+//!
+//! Nothing in this emulator reads the task's `source`: there is no bulk loader, and
+//! no outbound connection to the location the request names. A task may therefore
+//! never report a stage, a count or a `SUCCEEDED` status for a load nothing
+//! performed, so the clock settles every accepted task into the modelled `FAILED`
+//! status carrying `crate::state::IMPORT_NOT_RUN_REASON`, which says exactly that.
+//! Until then the task is in flight and `CancelImportTask` can stop it.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +190,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartImportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartImportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartImportTask"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartImportTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `source` is a bare `String` in the model — no `@length`, no `@pattern` — so
+        // it is the one caller-sized member that reaches the store unchecked, and the
+        // only one whose emptiness nothing refuses at the boundary. A required
+        // location cannot be the empty string, and the upper bound lives beside the
+        // write that stores it (`crate::state::MAX_IMPORT_SOURCE_CHARS`). Neither
+        // refusal echoes the value: the one that broke the upper bound is exactly the
+        // value that must not be sent back. The scheme is NOT constrained here,
+        // because `source` is documented as "an Amazon S3 path, or ... a Neptune
+        // database endpoint or snapshot", so no one scheme is required.
+        let source_chars = input.source.chars().count();
+        let source_requirement = if source_chars == 0 {
+            Some("Member must have length greater than or equal to 1".to_string())
+        } else if source_chars > crate::state::MAX_IMPORT_SOURCE_CHARS {
+            Some(format!(
+                "Member must have length less than or equal to {}, got {source_chars}",
+                crate::state::MAX_IMPORT_SOURCE_CHARS
+            ))
+        } else {
+            None
+        };
+        if let Some(requirement) = source_requirement {
+            return Err(StartImportTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&[crate::state::length_clause(
+                        "source",
+                        &requirement,
+                    )]),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Documented member dependency: `blankNodeHandling` "must be provided when
+        // format is ntriples", because an NTRIPLES load has to be told what to do with
+        // the dataset's blank nodes. No modelled trait can express it, so it is
+        // refused here rather than accepted and silently ignored.
+        if input.format.as_deref() == Some(NTRIPLES_FORMAT) && input.blank_node_handling.is_none() {
+            return Err(StartImportTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&[
+                        crate::state::constraint_clause(
+                            "blankNodeHandling",
+                            None,
+                            &format!(
+                                "Member must be provided when format is {NTRIPLES_FORMAT}"
+                            ),
+                        ),
+                    ]),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // Data is imported INTO a graph, so the graph has to exist. The lookup settles
+        // the transitions the clock already made due first, so a graph whose
+        // provisioning has come due can accept an import.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+            return Err(StartImportTaskErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        };
+        let graph_id = graph.id.clone();
+        let graph_status = graph.status;
+
+        // The store is shared and grows by one task per call, and a task is never
+        // reclaimed, so it has a ceiling (`crate::state::MAX_IMPORT_TASKS`). This
+        // operation models no quota error, so reaching the ceiling is reported with the
+        // `ConflictException` it does model: the request conflicts with what the store
+        // already holds.
+        if store.import_tasks.len() >= crate::state::MAX_IMPORT_TASKS {
+            return Err(StartImportTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "this emulator holds at most {} import tasks",
+                        crate::state::MAX_IMPORT_TASKS
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // "The graph needs to be empty and in the AVAILABLE state": while an earlier
+        // transition is still outstanding the graph's data is in flight, which is the
+        // same precondition `UpdateGraph` and `CreateGraphSnapshot` state. Emptiness is
+        // not checked here — this emulator has no graph data plane, so a stored graph
+        // holds no data for an import to collide with.
+        if graph_status != crate::state::GraphStatus::Available {
+            return Err(StartImportTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "graph {graph_id} is in status {} and cannot accept an import task",
+                        graph_status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_import_task_id();
+        let mut task = crate::state::ImportTask {
+            id,
+            graph_id: graph_id.clone(),
+            source: input.source,
+            format: input.format,
+            parquet_type: input.parquet_type,
+            blank_node_handling: input.blank_node_handling,
+            // `failOnError` defaults to true: "if set to true, the default, or if
+            // omitted, the import operation halts immediately when an error is
+            // encountered" (the modelled `GetImportTask` doc for `importOptions`).
+            fail_on_error: input.fail_on_error.unwrap_or(true),
+            role_arn: input.role_arn,
+            import_options: input.import_options,
+            status: crate::state::ImportTaskStatus::Initializing,
+            status_reason: None,
+            // The task is run once and nothing retries it.
+            attempt_number: 1,
+            pending: None,
+        };
+        // The load has not begun when the call returns, and nothing here can perform
+        // it, so the clock owes the task the modelled FAILED status a fixed span later
+        // — long enough that a caller acting straight after this call still sees the
+        // task in flight, and can cancel it.
+        task.begin_transition(
+            crate::state::ImportTaskStatus::Initializing,
+            crate::state::ImportTaskStatus::Failed,
+            Some(crate::state::IMPORT_NOT_RUN_REASON.to_string()),
+            now,
+        );
+
+        // An import takes the TARGET GRAPH through IMPORTING (a modelled `GraphStatus`
+        // value); the clock owes the move back to AVAILABLE the same span later, so a
+        // caller that reads the graph straight after this call still sees the transient
+        // status.
+        if let Some(graph) = store.graphs.get_mut(&graph_id) {
+            graph.begin_transition(
+                crate::state::GraphStatus::Importing,
+                crate::state::GraphStatus::Available,
+                now,
+            );
+        }
+
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetImportTask answers.
+        let output = Self::Output::from(&task);
+        store.insert_import_task(task);
+        Ok(output)
     }
 }
+
+/// The modelled `Format` value for RDF N-Triples data
+/// (`smithy_query(query="shape",shape="Format")`), the one format whose load needs
+/// `blankNodeHandling`.
+const NTRIPLES_FORMAT: &str = "NTRIPLES";

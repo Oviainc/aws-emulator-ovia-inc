@@ -113,6 +113,15 @@ pub const RESOURCE_TYPE_AUTO_SCALING_GROUP: &str = "AutoScalingGroup";
 /// either domain uses one of these two constants rather than the literal.
 pub const RESOURCE_TYPE_ECS_SERVICE: &str = "EcsService";
 
+/// The `ResourceType` an Amazon RDS DB instance is analysed as (`RESOURCE_TYPE_VALUES`).
+///
+/// Not to be confused with [`SOURCE_TYPE_RDS_DB_INSTANCE`], which spells the same word in
+/// the `RecommendationSourceType` domain a findings row carries.
+pub const RESOURCE_TYPE_RDS_DB_INSTANCE: &str = "RdsDBInstance";
+
+/// The `ResourceType` Aurora DB cluster storage is analysed as (`RESOURCE_TYPE_VALUES`).
+pub const RESOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE: &str = "AuroraDBClusterStorage";
+
 /// The account's Compute Optimizer enrollment: one record per account, as the service
 /// models it (`GetEnrollmentStatus` takes no input and returns exactly one).
 #[derive(Debug, Clone)]

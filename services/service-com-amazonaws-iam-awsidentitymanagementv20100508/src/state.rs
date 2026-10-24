@@ -264,6 +264,12 @@ pub const MARKER_SCOPE_ROLE_POLICIES: &str = "role-policies";
 /// select within the order rather than changing it.
 pub const MARKER_SCOPE_ENTITIES_FOR_POLICY: &str = "entities-for-policy";
 
+/// The marker scope of the account's alias collection, which
+/// `ListAccountAliases` pages over. It is its OWN scope, exactly as the user and
+/// role collections are, so a marker issued while paging another collection is
+/// not read as a position among the aliases.
+pub const MARKER_SCOPE_ACCOUNT_ALIASES: &str = "account-aliases";
+
 /// The marker scope of the account's service-specific credentials, which
 /// `ListServiceSpecificCredentials` pages over. One scope covers the whole
 /// collection because that operation pages over the same key order whichever user
@@ -579,6 +585,20 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// because the total ARN order is what lets
     /// `ListAttachedRolePolicies` hand out a resumable marker.
     pub role_attached_policies: BTreeMap<String, BTreeSet<String>>,
+    /// The account's alias, when one has been created. An `Option` rather than a
+    /// collection because an account holds AT MOST ONE: "Lists the account alias
+    /// associated with the Amazon Web Services account (Note: you can have only
+    /// one)" (`ListAccountAliases`). `CreateAccountAlias` is what fills it —
+    /// "your AWS account can have only one alias. If you create a new alias for
+    /// your AWS account, the new alias replaces the previous alias" (the AWS
+    /// Sign-In User Guide page "Creating, deleting, and listing an AWS account
+    /// alias", which `CreateAccountAlias`'s own documentation links to) — and
+    /// `DeleteAccountAlias` is what clears it.
+    ///
+    /// Stored verbatim: `accountAliasType`'s pattern
+    /// (`^[a-z0-9]([a-z0-9]|-(?!-)){1,61}[a-z0-9]$`) admits only lowercase, so
+    /// there is no case to fold and no [`name_key`] to build.
+    pub account_alias: Option<String>,
     /// Monotonic counter feeding [`next_user_id`](Self::next_user_id).
     pub user_id_seq: u64,
     /// Monotonic counter feeding [`next_role_id`](Self::next_role_id).

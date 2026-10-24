@@ -141,7 +141,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this request was signed for: a listing reports the applications
+        // registered at THIS regional endpoint and no others.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListApplicationsErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
@@ -180,8 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The ids that match, in id order: the page is taken over ids so only the
-        // applications actually returned are projected onto `ApplicationSummary`.
-        let matching: Vec<(String, String)> = state
+        // applications actually returned are projected onto `ApplicationSummary`. Only
+        // this Region's applications are candidates — a Region nothing was registered
+        // in holds none, so the listing there is empty.
+        let region_state = state.region(&region);
+        let matching: Vec<(String, String)> = region_state
             .applications
             .values()
             .filter(|application| {
@@ -202,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let applications: Vec<ApplicationSummary> = page
             .items
             .iter()
-            .filter_map(|id| state.applications.get(id))
-            .map(|application| application.summary(state.tags_for(&application.arn)))
+            .filter_map(|id| region_state.applications.get(id))
+            .map(|application| application.summary(region_state.tags_for(&application.arn)))
             .collect();
 
         Ok(ListApplicationsOutput {

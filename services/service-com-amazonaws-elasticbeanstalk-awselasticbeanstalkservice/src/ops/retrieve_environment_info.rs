@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetrieveEnvironmentInfo
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RetrieveEnvironmentInfo`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RetrieveEnvironmentInfo::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the information a `RequestEnvironmentInfo` of the same
+//! `InfoType` compiled for the stored environment — one entry per Amazon EC2 instance
+//! the compile sampled, each carrying the presigned Amazon S3 URL of that instance's
+//! compiled file — from the moment the compile finishes until the files are deleted.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +136,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RetrieveEnvironmentInfo` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RetrieveEnvironmentInfoErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RetrieveEnvironmentInfo"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RetrieveEnvironmentInfoError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let (environment_info, discarded) = {
+            let mut store = state.lock();
+            // The only writes a report performs, and both are changes the clock
+            // already made due — an environment's status, and the deletion of a
+            // compile whose 15 minutes are up — owed whether or not anybody
+            // called.
+            store.materialize_due_transitions();
+
+            // "You must specify either this or an EnvironmentName, or both. If
+            // you do not specify either, Elastic Beanstalk returns
+            // MissingRequiredParameter error"; "If no such environment is
+            // found, returns an InvalidParameterValue error."
+            let environment_id = store
+                .environment_id_for(
+                    input.environment_id.as_deref(),
+                    input.environment_name.as_deref(),
+                )
+                .map_err(|refusal| match refusal {
+                    crate::state::EnvironmentRefusal::NoIdentifier => {
+                        RetrieveEnvironmentInfoError::missing_required_parameter(
+                            "Must specify either EnvironmentId or EnvironmentName.",
+                        )
+                    }
+                    crate::state::EnvironmentRefusal::NotFound(message) => {
+                        RetrieveEnvironmentInfoError::invalid_parameter_value(message)
+                    }
+                })?;
+            if !store.environments.contains_key(&environment_id) {
+                return Err(RetrieveEnvironmentInfoError::invalid_parameter_value(
+                    crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+                ));
+            }
+
+            // Taken only once the request is going to be served, so a refused
+            // one leaves the deleted compiles for the next call to discard.
+            let discarded = store.take_deleted_environment_info();
+            // "Retrieves the compiled information from a
+            // RequestEnvironmentInfo request": the entries are the ones the
+            // request for THIS `InfoType` compiled, so an environment nobody
+            // asked about, an `InfoType` nobody asked for, a compile the clock
+            // has not finished and a compile whose files have been deleted all
+            // report an empty — but present — list, rather than claiming
+            // information this service does not hold.
+            (
+                store.compiled_environment_info(&environment_id, input.info_type.as_str()),
+                discarded,
+            )
+        };
+        // The lock is dropped first: withdrawing a deleted compile's files from
+        // object storage reaches another service in process.
+        crate::state::discard_compiled_environment_info(ctx, &region, &discarded).await;
+        Ok(RetrieveEnvironmentInfoOutput {
+            environment_info: Some(environment_info),
+        })
     }
 }

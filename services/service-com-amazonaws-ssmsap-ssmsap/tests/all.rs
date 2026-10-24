@@ -19,6 +19,8 @@ mod application_reference_refusals;
 mod pattern_violation_messages;
 #[path = "all/register_application_conditional_requirements.rs"]
 mod register_application_conditional_requirements;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rendering.rs"]

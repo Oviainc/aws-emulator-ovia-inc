@@ -486,9 +486,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?,
         };
-        let parameters =
+        let mut parameters =
             crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The template this change set would put on the stack is what says which of its
+        // parameters are masked, so the declaration is recorded on the set the change set
+        // stores — and `ExecuteChangeSet` carries it onto the stack with the values.
+        crate::state::record_no_echo(&template_body, &mut parameters);
+        let parameters = parameters;
 
         // The change list is what a change set IS: "Creates a list of changes that will be
         // applied to a stack so that you can review the changes before executing them."

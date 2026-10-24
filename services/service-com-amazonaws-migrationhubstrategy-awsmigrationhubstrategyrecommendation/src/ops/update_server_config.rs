@@ -120,14 +120,14 @@ fn refused() -> UpdateServerConfigError {
 
 /// Refuse a value that is not one the named enumeration declares.
 ///
-/// An absent member names no value, so it is accepted; enum membership is checked here
-/// because the boundary validator does not enforce it (the same reason `ListServers`
-/// checks its `serverCriteria` and `PutPortfolioPreferences` its `applicationMode`).
+/// The membership test itself is the service's [`crate::state::check_enum`] (an absent
+/// member names no value, so it is accepted); this wrapper only lifts its
+/// `ValidationException` into this operation's error channel. Enum membership is checked
+/// in the handler because the boundary validator does not enforce it (the same reason
+/// `ListServers` checks its `serverCriteria` and `PutPortfolioPreferences` its
+/// `applicationMode`).
 fn check_enum(value: Option<&str>, declared: &[&str]) -> Result<(), UpdateServerConfigError> {
-    match value {
-        Some(value) if !declared.contains(&value) => Err(refused()),
-        _ => Ok(()),
-    }
+    crate::state::check_enum(value, declared).map_err(|_| refused())
 }
 
 /// The strategy option this request stores against the server, or `None` when it names

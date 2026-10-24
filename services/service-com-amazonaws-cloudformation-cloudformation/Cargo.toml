@@ -75,6 +75,7 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-codepipeline-codepipeline-20150709 = { workspace = true }
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 
 [lints]
 workspace = true

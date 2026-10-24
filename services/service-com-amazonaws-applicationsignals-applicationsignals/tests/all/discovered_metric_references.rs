@@ -187,8 +187,8 @@ fn service_entity(name: &str, environment: &str) -> Value {
 ///
 /// They span what the rule generalises over: a service with TWO operations, an edge into a
 /// remote SERVICE, an edge into a remote RESOURCE (whose far end is identified by
-/// `ResourceType`/`Identifier` rather than by `Name`), an entity with a one-attribute
-/// identity, and an environment that differs between two services.
+/// `ResourceType`/`Identifier` rather than by `Name`), an entity whose identity names no
+/// `Environment`, and an environment that differs between two services.
 async fn seed(router: &MultiServiceRouter) {
     create_slo(
         router,
@@ -246,11 +246,11 @@ async fn seed(router: &MultiServiceRouter) {
     .await;
     create_slo(
         router,
-        "a one-attribute identity",
+        "an identity that names no Environment",
         json!({
             "Name": "billing-latency",
             "SliConfig": { "SliMetricConfig": {
-                "KeyAttributes": { "Name": "billing" },
+                "KeyAttributes": { "Type": "Service", "Name": "billing" },
                 "MetricType": "LATENCY"
             }}
         }),
@@ -295,10 +295,10 @@ async fn every_reported_entry_carries_the_metrics_of_its_own_identity() {
             expected: vec![dimension_set(&["Environment=prod", "Service=checkout"])],
         },
         Case {
-            case: "GetService billing, a one-attribute identity",
+            case: "GetService billing, an identity that names no Environment",
             method: "POST",
             path: "/service",
-            body: Some(json!({ "KeyAttributes": { "Name": "billing" } })),
+            body: Some(json!({ "KeyAttributes": { "Type": "Service", "Name": "billing" } })),
             member: None,
             expected: vec![dimension_set(&["Service=billing"])],
         },
@@ -310,7 +310,7 @@ async fn every_reported_entry_carries_the_metrics_of_its_own_identity() {
             member: Some("ServiceSummaries"),
             // In the order the read reports them, which is the identity order the store
             // holds (its attributes in key order): the two `Environment`-first identities,
-            // then the one-attribute `Name=billing`.
+            // then the `Name`-first one.
             expected: vec![
                 dimension_set(&["Environment=prod", "Service=checkout"]),
                 dimension_set(&["Environment=staging", "Service=orders"]),

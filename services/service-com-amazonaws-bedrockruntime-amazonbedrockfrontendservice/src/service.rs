@@ -160,16 +160,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) before any handler
+        // runs. This service is `restJson1`, where AWS answers such a refusal as
+        // `400 ValidationException` with the `N validation error(s) detected: …`
+        // envelope the framework already renders — except for ONE difference, which
+        // is why this delegates rather than returning `None`: AWS quotes a
+        // `@pattern` requirement WITHOUT the anchors a whole-value pattern wraps it
+        // in, so `outputDataConfig.s3OutputDataConfig.s3Uri` reads
+        // `… pattern: s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?` rather than
+        // leaking the `^`/`$` into the client-facing text. The CHECK still uses the
+        // model's pattern as written; only the rendering drops them, and it is the
+        // one shared implementation in `service_common`, so this service cannot
+        // drift from the others.
+        service_common::validation_message::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(

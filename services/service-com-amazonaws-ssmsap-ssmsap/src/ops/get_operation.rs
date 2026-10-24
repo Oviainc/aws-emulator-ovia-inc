@@ -135,7 +135,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region this request was signed for: an operation record belongs to the
+        // Region the call that filed it was made in.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetOperationErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
@@ -144,9 +146,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // polled, so materialising that here reports what the operation already is.
         state.settle(::std::time::SystemTime::now());
 
-        let Some(operation) = state.operations.get(&input.operation_id) else {
+        let Some(operation) = state.region(&region).operations.get(&input.operation_id) else {
             // This operation models no `ResourceNotFoundException`, so an id that names
-            // no record is refused rather than answered with a synthesized success.
+            // no record of this account and Region is refused rather than answered with
+            // a synthesized success.
             return Err(GetOperationErrorModeled::ValidationException(
                 crate::state::validation(format!(
                     "No operation with ID {} exists in this account and Region",
