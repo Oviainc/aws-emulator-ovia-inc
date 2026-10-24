@@ -195,31 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A malformed request is refused before the store is read, so
         // InvalidParameterValueException takes precedence over the opt-in gate below, as
-        // it does in this service's other readers.
+        // it does in this service's other readers; so is a request naming an account this
+        // service cannot report on.
         //
-        // From the model's own `accountIds` doc: "Only one account ID can be specified per
-        // request."
-        let requested_accounts = input.account_ids.as_deref().unwrap_or_default();
-        if requested_accounts.len() > 1 {
-            return Err(
-                GetRecommendationSummariesErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "The value supplied for parameter accountIds is not valid: only one \
-                             account ID can be specified per request, not {}.",
-                            requested_accounts.len()
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        // An absent (or empty) `accountIds` asks for the caller's own findings; a member
-        // account id asks for that account's, which this emulator holds none of.
-        let account_id = requested_accounts
-            .first()
-            .cloned()
-            .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
+        // `accountIds` is the management account's mechanism for naming a MEMBER account
+        // ("Only one account ID can be specified per request"), and this emulator presents
+        // one standalone account and records no organization — so the account summarised is
+        // the caller's own, and any other id is refused rather than summarised as nothing
+        // ([`crate::state::requested_account_id`], shared by every reader of this service).
+        let account_id = crate::state::requested_account_id(input.account_ids.as_deref())
+            .map_err(invalid_parameter)?;
 
         // A `nextToken` this operation did not issue cannot name a page boundary.
         let resume_at = match input.next_token.as_deref() {
@@ -227,17 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match crate::state::decode_summary_page_token(token) {
                 Some(resource_type) => Some(resource_type),
                 None => {
-                    return Err(
-                        GetRecommendationSummariesErrorModeled::InvalidParameterValueException(
-                            InvalidParameterValueException {
-                                message: Some(
-                                    "The value supplied for parameter nextToken is not valid."
-                                        .to_string(),
-                                ),
-                            },
-                        )
-                        .into(),
-                    )
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid.".to_string(),
+                    ))
                 }
             },
         };
@@ -296,6 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             recommendation_summaries: Some(recommendation_summaries),
         })
     }
+}
+
+/// A 400 `InvalidParameterValueException` — "The value supplied for the input parameter is
+/// out of range or not valid" — carrying why this request's value is not.
+fn invalid_parameter(message: String) -> GetRecommendationSummariesError {
+    GetRecommendationSummariesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }
 
 /// How many entries `inferredWorkloadSavings` reports, from that member's own doc: "The

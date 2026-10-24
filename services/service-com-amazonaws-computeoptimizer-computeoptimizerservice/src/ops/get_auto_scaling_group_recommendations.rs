@@ -12,6 +12,11 @@
 //! architectures and the inferred workload types, and the look-back period and the
 //! effective preferences from the account's stored recommendation preferences.
 //!
+//! A request whose `accountIds` names an account other than the one this emulator presents
+//! asks about a member account of an organization this service records none of, so it is
+//! refused with `InvalidParameterValueException` rather than answered with an empty list
+//! ([`crate::state::requested_account_id`], shared with this service's other readers).
+//!
 //! This operation REPORTS; it writes nothing to the store.
 //!
 //! ## Shape of an operation
@@ -196,25 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A malformed request is refused BEFORE the store is read, so
         // InvalidParameterValueException takes precedence over the opt-in gate below, as
-        // it does in this service's other readers.
-        let account_ids: Vec<String> = input.account_ids.clone().unwrap_or_default();
-        // "Only one account ID can be specified per request."
-        if account_ids.len() > 1 {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter accountIds is not valid: only one account ID \
-                 can be specified per request, not {}.",
-                account_ids.len(),
-            )));
-        }
-        if let Some(account_id) = account_ids
-            .iter()
-            .find(|id| !crate::state::is_account_id(id))
-        {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter accountIds is not valid: {account_id} is not a \
-                 12-digit Amazon Web Services account ID.",
-            )));
-        }
+        // it does in this service's other readers; so is a request naming an account this
+        // service cannot report on. "The ID of the Amazon Web Services account for which
+        // to return Auto Scaling group recommendations": the one account the request
+        // names, or the caller's own account where it names none
+        // ([`crate::state::requested_account_id`], which every reader of this service
+        // resolves `accountIds` through).
+        let account_id = crate::state::requested_account_id(input.account_ids.as_deref())
+            .map_err(invalid_parameter)?;
 
         // Every `autoScalingGroupArns` entry must be the ARN of an Auto Scaling group;
         // an ARN that names something else cannot identify a group to report on. The
@@ -294,14 +288,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-
-        // "The ID of the Amazon Web Services account for which to return Auto Scaling
-        // group recommendations": the one account the request names, or the caller's own
-        // account where it names none.
-        let account_id = account_ids
-            .first()
-            .cloned()
-            .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
 
         // When the Auto Scaling group recommendations were last generated: the analysis
         // the account's enrollment started, which came due one analysis span after the

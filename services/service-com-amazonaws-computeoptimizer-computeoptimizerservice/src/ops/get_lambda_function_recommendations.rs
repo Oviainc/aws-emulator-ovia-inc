@@ -351,52 +351,26 @@ fn invalid_parameter(message: String) -> GetLambdaFunctionRecommendationsError {
 /// What this operation answers when a request asks about an account other than the one this
 /// service answers for: the real service's constant refusal, which names neither the member
 /// nor the account — it states the permission that is missing and how an organization
-/// account gets it. Worded exactly as this service's other findings readers word it, so one
-/// cannot drift from another.
+/// account gets it. Worded once for the whole crate
+/// ([`crate::state::CROSS_ACCOUNT_MESSAGE`]), so one reader cannot drift from another.
 fn foreign_account() -> GetLambdaFunctionRecommendationsError {
-    invalid_parameter(
-        "Invalid permission to access another account. If this is an organization account, \
-         request the management account to enable service access."
-            .to_string(),
-    )
+    invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
 }
 
 /// The account whose recommendations this request asks for: the one id `accountIds` carries,
 /// or the caller's own account when it carries none.
 ///
-/// "Only one account ID can be specified per request"
-/// (`GetLambdaFunctionRecommendations$accountIds`), and an `AccountId` is a 12-digit Amazon
-/// Web Services account id (`Scope$value`), so anything else is refused rather than silently
-/// answered for the caller. An id that is well-formed but names another account is refused
-/// by [`foreign_account`]: this emulator presents one standalone account
-/// (`::engine::emulator_account_id`) and records no organization, so no other account is a
-/// member account it can be asked about.
+/// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID
+/// can be specified per request" (`GetLambdaFunctionRecommendations$accountIds`), an
+/// `AccountId` is a 12-digit Amazon Web Services account id (`Scope$value`), and an id that
+/// is well-formed but names another account is refused by [`foreign_account`] \u2014 this
+/// emulator presents one standalone account (`::engine::emulator_account_id`) and records
+/// no organization, so no other account is a member account it can be asked about. This
+/// wrapper only lifts the reason into this operation's error channel.
 fn requested_account_id(
     account_ids: Option<&[String]>,
 ) -> Result<String, GetLambdaFunctionRecommendationsError> {
-    let account_ids = account_ids.unwrap_or_default();
-    if account_ids.len() > 1 {
-        return Err(invalid_parameter(format!(
-            "The value supplied for parameter accountIds is not valid: only one account ID can \
-             be specified per request, not {}.",
-            account_ids.len(),
-        )));
-    }
-    match account_ids.first() {
-        None => Ok(::engine::emulator_account_id().to_string()),
-        Some(account_id) => {
-            if !crate::state::is_account_id(account_id) {
-                return Err(invalid_parameter(format!(
-                    "The value supplied for parameter accountIds is not valid: {account_id} is \
-                     not a 12-digit Amazon Web Services account ID."
-                )));
-            }
-            if account_id != ::engine::emulator_account_id() {
-                return Err(foreign_account());
-            }
-            Ok(account_id.clone())
-        }
-    }
+    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
 }
 
 /// The function VERSIONS this request asks about, by the resource part of their ARN, or
