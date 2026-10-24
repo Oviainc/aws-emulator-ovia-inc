@@ -3,9 +3,9 @@
 //! @op DescribeExecution
 //! Reports the stored execution the `(taskId, managedDeviceId)` pair addresses — the
 //! work one target device does for one task — after the clock has carried every
-//! execution the span has elapsed on to its next state. A Region this account has
-//! activated no device in is refused by the account-level device gate
-//! (`AccessDeniedException`) before either id is resolved.
+//! execution the span has elapsed on to its next state. A pair naming no stored
+//! execution of this Region is answered with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,13 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate, consulted BEFORE either id is resolved.
-        if !store.has_activated_device(&region) {
-            return Err(DescribeExecutionErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         store.settle(now);
 
         // "The ID of the task that the action is describing": a task of another
@@ -182,8 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let key = (input.task_id.clone(), input.managed_device_id.clone());
-        let Some(execution) = store.executions.get(&key) else {
+        let Some(execution) = store.execution_in(
+            &region,
+            &input.task_id,
+            &input.managed_device_id,
+        ) else {
             // The pair addresses one execution; when the task did not target this
             // device there is none to report.
             return Err(DescribeExecutionErrorModeled::ResourceNotFoundException(

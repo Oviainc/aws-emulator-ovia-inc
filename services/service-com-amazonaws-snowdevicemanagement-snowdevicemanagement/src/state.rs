@@ -7,29 +7,27 @@
 //! device-creation operation, so a device enters the inventory only through
 //! [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::activate_devices`],
 //! never through a request. An account/region that has activated no device
-//! therefore holds an EMPTY inventory, which is the precondition the service's
-//! account-level device gate reports: every operation the model declares
-//! `AccessDeniedException` on is refused with [`no_devices_in_region`] before it
-//! resolves any id (see
-//! [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::has_activated_device`]).
-//! Everything else in here is minted by a caller: `CreateTask` persists a [`Task`]
-//! plus one [`Execution`] per target, `CancelTask` moves them to `CANCELED`, and
-//! the reporting operations compute their answers from these records.
+//! therefore holds an EMPTY inventory, and that is answered from state like any
+//! other: a list operation reports an empty page and an id-addressed one reports
+//! [`not_found`], because an empty inventory says nothing about what the caller is
+//! permitted to do. Everything else in here is minted by a caller: `CreateTask`
+//! persists a [`Task`] plus one [`Execution`] per target, `CancelTask` moves them
+//! to `CANCELED`, and the reporting operations compute their answers from these
+//! records.
 //!
 //! The inventory and the tasks are REGIONAL, the way the service is: Snow Device
 //! Management reports "all devices on your Amazon Web Services account that have
 //! Amazon Web Services Snow Device Management enabled in the Amazon Web Services
 //! Region where the command is run", so a record carries the region it belongs to
-//! and is invisible — and ungated — in every other one.
+//! and is invisible in every other one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccessDeniedException, Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice,
-    ExecutionSummary, Instance, InstanceBlockDeviceMapping, InstanceState, InstanceSummary,
-    PhysicalNetworkInterface, ResourceNotFoundException, SecurityGroupIdentifier,
-    SoftwareInformation, TaskSummary,
+    Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice, ExecutionSummary, Instance,
+    InstanceBlockDeviceMapping, InstanceState, InstanceSummary, PhysicalNetworkInterface,
+    ResourceNotFoundException, SecurityGroupIdentifier, SoftwareInformation, TaskSummary,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -111,20 +109,6 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// not this prose.
 pub const TAG_RESOURCE_INVALID_ARN_MESSAGE: &str = "Invalid input resource arn";
 
-/// What the account-level device gate ([`no_devices_in_region`],
-/// [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::has_activated_device`])
-/// is refused with.
-///
-/// Recorded behaviour of the real service: a request to a Region where the account
-/// has no Snow device with Snow Device Management activated is refused with
-/// `AccessDeniedException` (the model gives the shape and its `@httpError 403`; it
-/// gives no text), and the refusal names device/region availability rather than an
-/// IAM principal: it never says whether any id exists, which is why one message
-/// answers every such request. It is an ACCOUNT-level precondition only: past it,
-/// an id that names no record is the modelled `ResourceNotFoundException`
-/// ([`not_found`]).
-pub const NO_DEVICES_MESSAGE: &str = "No devices found in this region.";
-
 /// The root device volume of every Amazon EC2 instance the fixture places on a
 /// device.
 ///
@@ -153,7 +137,7 @@ pub struct Device {
     pub managed_device_id: String,
     pub managed_device_arn: String,
     /// The Region this device has Snow Device Management enabled in. A request
-    /// signed for any other Region neither sees it nor is let past the gate by it.
+    /// signed for any other Region does not see it.
     pub region: String,
     /// "The type of Amazon Web Services Snow Family device."
     pub device_type: String,
@@ -381,10 +365,14 @@ pub struct ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     pub devices: BTreeMap<String, Device>,
     /// Every task, keyed by `taskId`.
     pub tasks: BTreeMap<String, Task>,
-    /// Every execution, keyed by `(taskId, managedDeviceId)` — the pair
-    /// `DescribeExecution` addresses one by, and an order `ListExecutions`
-    /// paginates over.
-    pub executions: BTreeMap<(String, String), Execution>,
+    /// Every execution, keyed by `(region, taskId, managedDeviceId)`: the Region
+    /// the task was created in, then the pair `DescribeExecution` addresses one
+    /// by. The Region leads the key so a record is read out of the same partition
+    /// the request resolved its task in — reach them through [`Self::execution_in`]
+    /// / [`Self::executions_in`] rather than by rebuilding the key — and the
+    /// `managedDeviceId` trails it, which is the order `ListExecutions` paginates
+    /// over within one task.
+    pub executions: BTreeMap<(String, String, String), Execution>,
     /// A `CreateTask` `clientToken` to the task that token created, keyed by the
     /// `(region, clientToken)` pair the token was used in, so a repeated create
     /// reports the first task instead of minting a second — and a token reused in
@@ -398,23 +386,49 @@ pub struct ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     device_id_seq: u64,
 }
 
-/// The `AccessDeniedException` the account-level device gate answers with.
-///
-/// Every operation the model declares `AccessDeniedException` on consults the gate
-/// BEFORE resolving any id, so a caller of a Region with no activated device never
-/// learns whether a particular device or task id exists there.
-pub fn no_devices_in_region() -> AccessDeniedException {
-    AccessDeniedException {
-        message: NO_DEVICES_MESSAGE.to_string(),
-    }
-}
-
 impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
-    /// Whether this account has any device with Snow Device Management activated in
-    /// `region` — the account-level precondition every device- and task-scoped
-    /// operation of this service is gated on.
-    pub fn has_activated_device(&self, region: &str) -> bool {
-        self.devices.values().any(|device| device.region == region)
+    /// The execution the `(taskId, managedDeviceId)` pair addresses in `region`, or
+    /// `None` when that Region holds no such record.
+    pub fn execution_in(
+        &self,
+        region: &str,
+        task_id: &str,
+        managed_device_id: &str,
+    ) -> Option<&Execution> {
+        self.executions.get(&(
+            region.to_string(),
+            task_id.to_string(),
+            managed_device_id.to_string(),
+        ))
+    }
+
+    /// Every execution of the task `task_id` names in `region`, with the
+    /// `managedDeviceId` each belongs to, in that id's order.
+    pub fn executions_in<'a>(
+        &'a self,
+        region: &'a str,
+        task_id: &'a str,
+    ) -> impl Iterator<Item = (&'a str, &'a Execution)> + 'a {
+        self.executions
+            .iter()
+            .filter(move |((execution_region, execution_task, _), _)| {
+                execution_region.as_str() == region && execution_task.as_str() == task_id
+            })
+            .map(|((_, _, managed_device_id), execution)| (managed_device_id.as_str(), execution))
+    }
+
+    /// Every execution of the task `task_id` names in `region`, to change.
+    pub fn executions_in_mut<'a>(
+        &'a mut self,
+        region: &'a str,
+        task_id: &'a str,
+    ) -> impl Iterator<Item = &'a mut Execution> + 'a {
+        self.executions
+            .iter_mut()
+            .filter(move |((execution_region, execution_task, _), _)| {
+                execution_region.as_str() == region && execution_task.as_str() == task_id
+            })
+            .map(|(_, execution)| execution)
     }
 
     /// The device `managed_device_id` names in `region`, or `None` when this
@@ -433,6 +447,15 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             .filter(|task| task.region == region)
     }
 
+    /// The task `task_id` names in `region`, to change: the mutable counterpart of
+    /// [`Self::task_in`], so a write lands in the partition the read resolved it
+    /// in.
+    pub fn task_in_mut(&mut self, region: &str, task_id: &str) -> Option<&mut Task> {
+        self.tasks
+            .get_mut(task_id)
+            .filter(|task| task.region == region)
+    }
+
     /// Activate Snow Device Management on `count` devices in `region`, answering
     /// the ids they were given.
     ///
@@ -441,8 +464,8 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// device-creation operation, because a device becomes manageable by being
     /// ORDERED — a Snow Family job created with remote management enabled — which
     /// is another service's API. Until something activates a device here, this
-    /// account's inventory in `region` is empty and every gated operation answers
-    /// [`no_devices_in_region`], which is what AWS answers for such an account.
+    /// account's inventory in `region` is empty, so a list operation answers an
+    /// empty page and an id-addressed one answers [`not_found`].
     ///
     /// Ids, ARNs and job ids are the store's own: an id is minted from the
     /// monotonic device counter (so it is unique across Regions), and two

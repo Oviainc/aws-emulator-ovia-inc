@@ -163,15 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate comes FIRST, before the task id and before
-        // the request's `nextToken` are judged: both are request-carried state,
-        // and a gated caller learns nothing about either.
-        if !store.has_activated_device(&region) {
-            return Err(ListExecutionsErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         store.settle(now);
 
         // The token carries the device id the next page resumes at; a value this
@@ -203,14 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut executions = Vec::with_capacity(page_size);
         let mut next_token = None;
-        for ((task_id, managed_device_id), execution) in &store.executions {
-            if task_id != &input.task_id {
-                continue;
-            }
+        // Read through the Region-scoped accessor, so the records enumerated come
+        // from the same partition the task was resolved in just above.
+        for (managed_device_id, execution) in store.executions_in(&region, &input.task_id) {
             // Resume at the first device id at or after the token.
             if resume_at
                 .as_deref()
-                .is_some_and(|key| managed_device_id.as_str() < key)
+                .is_some_and(|key| managed_device_id < key)
             {
                 continue;
             }

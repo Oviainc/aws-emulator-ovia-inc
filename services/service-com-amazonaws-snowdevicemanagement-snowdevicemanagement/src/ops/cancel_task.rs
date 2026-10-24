@@ -157,13 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate, consulted BEFORE the id is resolved.
-        if !store.has_activated_device(&region) {
-            return Err(CancelTaskErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         // Settle first, so this call cancels only what the clock had not already
         // carried to a terminal state.
         store.settle(now);
@@ -179,12 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to stop; its record keeps the state and the instant it reached it.
         let cancellable = task.state == "IN_PROGRESS";
         if cancellable {
-            if let Some(task) = store.tasks.get_mut(&input.task_id) {
+            // The writes stay in the partition the lookup above resolved: both
+            // reach their records through the Region-scoped accessors, so a
+            // request can only ever change what its own Region holds.
+            if let Some(task) = store.task_in_mut(&region, &input.task_id) {
                 task.state = "CANCELED".to_string();
                 task.last_updated_at = now;
             }
-            for ((task_id, _), execution) in store.executions.iter_mut() {
-                if task_id != &input.task_id || execution.is_terminal() {
+            for execution in store.executions_in_mut(&region, &input.task_id) {
+                if execution.is_terminal() {
                     continue;
                 }
                 execution.state = "CANCELED".to_string();
