@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedNotificationConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedNotificationConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedNotificationConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +74,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The page token codec every paginated listing in this service shares: the
+// cursor here is the publication sequence of the last configuration on the page,
+// and the next page is everything published before it.
+use crate::state::{decode_page_token, encode_page_token};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -117,6 +113,19 @@ impl From<ListManagedNotificationConfigurationsErrorModeled> for ListManagedNoti
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The page size this operation uses when a request names none: "Defaults to
+/// 20", from the `maxResults` member's own documentation. The modelled range
+/// (1..100) bounds what a request may ask for, and the boundary validator
+/// refuses anything outside it before this handler runs.
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+/// The smallest page a request may ask for: the `min` of the `maxResults`
+/// member's modelled `@range` (1..100 — `smithy_query`'s signature for this
+/// operation carries it). The boundary validator already refuses anything below
+/// it before this handler runs, so this is a defence-in-depth check: it never
+/// fires through the modelled path.
+const MIN_MAX_RESULTS: usize = 1;
 
 /// The `ListManagedNotificationConfigurations` operation.
 ///
@@ -154,18 +163,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedNotificationConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedNotificationConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedNotificationConfigurations"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListManagedNotificationConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the notifications store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                // A token this process never issued is refused, rather than
+                // silently restarting the listing at the newest record.
+                ListManagedNotificationConfigurationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "nextToken is not a token this service issued".to_string(),
+                        reason: Some("fieldValidationFailed".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: "the value is not a pagination token this service issued"
+                                .to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // "ordered by creation time in reverse chronological order (newest
+        // first)", so the most recently published configuration leads the
+        // listing and a page token walks backwards through publication order.
+        let mut ordered = store.managed_configurations_in_publication_order();
+        ordered.reverse();
+
+        let matching: Vec<&crate::state::ManagedNotificationConfigurationRecord> = ordered
+            .into_iter()
+            .filter(|record| {
+                // `channelIdentifier` selects the managed configurations that
+                // deliver to that channel, looked up on the record's own
+                // associations.
+                match input.channel_identifier.as_deref() {
+                    Some(channel) => record.channel_identifiers.contains_key(channel),
+                    None => true,
+                }
+            })
+            .collect();
+
+        let start = match resume_after {
+            Some(cursor) => matching
+                .iter()
+                .position(|record| record.sequence < cursor)
+                .unwrap_or(matching.len()),
+            None => 0,
+        };
+        let page_size = match input.max_results {
+            Some(requested) => usize::try_from(requested)
+                .ok()
+                .filter(|size| *size >= MIN_MAX_RESULTS)
+                .ok_or_else(|| {
+                    // The modelled range (1..100) makes this unreachable through
+                    // the boundary validator; refuse rather than answering an
+                    // empty page the caller would read as an empty catalog.
+                    ListManagedNotificationConfigurationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "maxResults must be a positive count".to_string(),
+                            reason: Some("fieldValidationFailed".to_string()),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "maxResults".to_string(),
+                                message: "the value is not a positive count".to_string(),
+                            }]),
+                        },
+                    )
+                })?,
+            None => DEFAULT_MAX_RESULTS,
+        };
+
+        let page: Vec<&crate::state::ManagedNotificationConfigurationRecord> =
+            matching.iter().skip(start).take(page_size).copied().collect();
+
+        // A token is emitted only while configurations remain behind this page;
+        // the final page carries none.
+        let next_token = match page.last() {
+            Some(last) if start + page.len() < matching.len() => {
+                Some(encode_page_token(last.sequence))
+            }
+            _ => None,
+        };
+
+        Ok(ListManagedNotificationConfigurationsOutput {
+            next_token,
+            managed_notification_configurations: page
+                .into_iter()
+                .map(|record| ManagedNotificationConfigurationStructure {
+                    arn: record.arn.clone(),
+                    name: record.name.clone(),
+                    description: record.description.clone(),
+                })
+                .collect(),
+        })
     }
 }

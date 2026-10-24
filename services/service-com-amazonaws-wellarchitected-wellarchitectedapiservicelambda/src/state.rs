@@ -3372,8 +3372,8 @@ pub struct AgentGoalRecord {
 
 impl AgentGoalRecord {
     /// The `GoalSummary` projection every goal operation answers with
-    /// (`CreateAgentGoal`, `GetAgentGoal`, and — once they are implemented —
-    /// `UpdateAgentGoal` and `ListAgentGoals`), so one place decides how a stored goal
+    /// (`CreateAgentGoal`, `GetAgentGoal`, `ListAgentGoals`, and — once it is
+    /// implemented — `UpdateAgentGoal`), so one place decides how a stored goal
     /// is reported.
     pub fn to_summary(&self) -> GoalSummary {
         GoalSummary {
@@ -4738,6 +4738,20 @@ pub fn encode_agent_context_next_token(context_id: &str) -> String {
 /// the token is not one this service issued.
 pub fn decode_agent_context_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("x")?.as_str()?.to_string())
+}
+
+/// Encode a `ListAgentGoals` cursor: the goal `UUID` last served, in the same opaque
+/// scheme as [`encode_next_token`]. Goals are enumerated in id order, so that id is the
+/// whole cursor. Its own key, so a cursor issued by another paginated operation is not a
+/// cursor here.
+pub fn encode_agent_goal_next_token(goal_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "g": goal_id }))
+}
+
+/// The goal `UUID` a `ListAgentGoals` `NextToken` points just past, or `None` when the
+/// token is not one this service issued.
+pub fn decode_agent_goal_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("g")?.as_str()?.to_string())
 }
 
 /// Encode a `ListAgentProfiles` cursor: the `AgentProfileArn` last served, in the same

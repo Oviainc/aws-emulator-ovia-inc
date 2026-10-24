@@ -123,6 +123,40 @@ pub(crate) fn is_configuration_arn(value: &str) -> bool {
     is_arn_id(id)
 }
 
+/// The `category`/`sub-category` segments of a
+/// `ManagedNotificationConfigurationOsArn`, from the pattern the model declares:
+/// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:managed-notification-configuration/category/[a-zA-Z0-9\-]{3,64}/sub-category/[a-zA-Z0-9\-]{3,64}$`.
+/// Checked by hand, like [`is_configuration_arn`] beside it, so these suites
+/// need no regex dependency; `None` when `value` does not match the pattern.
+pub(crate) fn managed_configuration_arn_segments(value: &str) -> Option<(String, String)> {
+    let rest = value.strip_prefix("arn:")?;
+    let (partition, rest) = rest.split_once(':')?;
+    if !(3..=10).contains(&partition.len())
+        || !partition
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'-')
+    {
+        return None;
+    }
+    let rest = rest.strip_prefix("notifications::")?;
+    let (account, resource) = rest.split_once(':')?;
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let path = resource.strip_prefix("managed-notification-configuration/category/")?;
+    let (category, sub_category) = path.split_once("/sub-category/")?;
+    let segment_ok = |segment: &str| {
+        (3..=64).contains(&segment.len())
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !segment_ok(category) || !segment_ok(sub_category) {
+        return None;
+    }
+    Some((category.to_string(), sub_category.to_string()))
+}
+
 /// Whether `value` matches the `EventRuleArn` pattern the model declares,
 /// `^arn:[a-z-]{3,10}:notifications::[0-9]{12}:configuration/[a-z0-9]{27}/rule/[a-z0-9]{27}$`
 /// — a configuration arn with a `/rule/<id>` segment appended.
