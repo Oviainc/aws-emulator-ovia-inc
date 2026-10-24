@@ -56,7 +56,7 @@ use crate::response_headers_policy_lifecycle::{assert_absent, escape, is_policy_
 
 /// `POST /2020-05-31/cache-policy` with the `CachePolicyConfig` document `body` — the
 /// member the operation binds to the HTTP payload.
-async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -68,7 +68,7 @@ async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/cache-policy/{Id}`.
-async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -80,7 +80,7 @@ async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/cache-policy/{Id}/config`.
-async fn get_policy_config(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_policy_config(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -101,20 +101,20 @@ async fn get_policy_config(router: &MultiServiceRouter, id: &str) -> Answer {
 /// record reports what was submitted" testable for absent members too; `Some(vec![])` is
 /// the wrapper carrying a `Quantity` of zero and no items.
 #[derive(Debug, Clone)]
-struct Parameters {
+pub(crate) struct Parameters {
     /// `EnableAcceptEncodingGzip`, which the model makes required inside this block.
-    gzip: bool,
+    pub(crate) gzip: bool,
     /// `EnableAcceptEncodingBrotli`, which the model leaves optional.
-    brotli: Option<bool>,
+    pub(crate) brotli: Option<bool>,
     /// A value of `CachePolicyHeaderBehavior`.
-    header_behavior: String,
-    headers: Option<Vec<String>>,
+    pub(crate) header_behavior: String,
+    pub(crate) headers: Option<Vec<String>>,
     /// A value of `CachePolicyCookieBehavior`.
-    cookie_behavior: String,
-    cookies: Option<Vec<String>>,
+    pub(crate) cookie_behavior: String,
+    pub(crate) cookies: Option<Vec<String>>,
     /// A value of `CachePolicyQueryStringBehavior`.
-    query_string_behavior: String,
-    query_strings: Option<Vec<String>>,
+    pub(crate) query_string_behavior: String,
+    pub(crate) query_strings: Option<Vec<String>>,
 }
 
 impl Default for Parameters {
@@ -138,7 +138,7 @@ impl Default for Parameters {
 impl Parameters {
     /// The `ParametersInCacheKeyAndForwardedToOrigin` XML, in the model's member
     /// declaration order.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<ParametersInCacheKeyAndForwardedToOrigin>\
              <EnableAcceptEncodingGzip>{}</EnableAcceptEncodingGzip>",
@@ -173,20 +173,20 @@ impl Parameters {
 /// One `CachePolicyConfig` a client submits. `MinTTL` is the one TTL the model makes
 /// required; a `None` TTL is left out of the document entirely.
 #[derive(Debug, Clone, Default)]
-struct Policy {
-    case: &'static str,
-    name: String,
-    comment: Option<String>,
-    min_ttl: i64,
-    default_ttl: Option<i64>,
-    max_ttl: Option<i64>,
-    parameters: Option<Parameters>,
+pub(crate) struct Policy {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
+    pub(crate) comment: Option<String>,
+    pub(crate) min_ttl: i64,
+    pub(crate) default_ttl: Option<i64>,
+    pub(crate) max_ttl: Option<i64>,
+    pub(crate) parameters: Option<Parameters>,
 }
 
 impl Policy {
     /// The `CachePolicyConfig` XML a client sends for this configuration, in the model's
     /// member declaration order.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out =
             format!("<CachePolicyConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">");
         if let Some(comment) = &self.comment {
@@ -243,15 +243,15 @@ const QUERY_STRING_BEHAVIORS: &[&str] = CACHE_POLICY_QUERY_STRING_BEHAVIOR_VALUE
 /// The `DefaultTTL` CloudFront uses for a configuration that names none:
 /// `CachePolicyConfig$DefaultTTL`, "The default value for this field is 86400 seconds (one
 /// day)" (`smithy_query(query="doc",shape="CachePolicyConfig",member="DefaultTTL")`).
-const DOCUMENTED_DEFAULT_TTL: i64 = 86_400;
+pub(crate) const DOCUMENTED_DEFAULT_TTL: i64 = 86_400;
 
 /// The `MaxTTL` CloudFront uses for a configuration that names none:
 /// `CachePolicyConfig$MaxTTL`, "The default value for this field is 31536000 seconds (one
 /// year)" (`smithy_query(query="doc",shape="CachePolicyConfig",member="MaxTTL")`).
-const DOCUMENTED_MAX_TTL: i64 = 31_536_000;
+pub(crate) const DOCUMENTED_MAX_TTL: i64 = 31_536_000;
 
 /// A list of owned strings from string literals, for the tables below.
-fn strings(values: &[&str]) -> Vec<String> {
+pub(crate) fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
@@ -262,7 +262,7 @@ fn strings(values: &[&str]) -> Vec<String> {
 /// each of the three name lists absent, carrying no items, one item and many, behaviours
 /// drawn from the three model-derived catalogs, TTLs at zero, one, the two documented
 /// defaults and past them, and names carrying XML metacharacters.
-fn policy_table() -> Vec<Policy> {
+pub(crate) fn policy_table() -> Vec<Policy> {
     vec![
         Policy {
             case: "the required members alone: a name and MinTTL, nothing else",
@@ -369,7 +369,7 @@ fn policy_table() -> Vec<Policy> {
 
 /// Assert the `CachePolicyConfig` element `config` reports exactly what `policy`
 /// submitted: every member it carried, and no element for a member it left out.
-fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
+pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
     let case = policy.case;
 
     match &policy.comment {

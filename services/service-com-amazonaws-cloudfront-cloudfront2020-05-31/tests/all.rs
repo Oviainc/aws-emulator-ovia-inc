@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/cache_policy_lifecycle.rs"]
 mod cache_policy_lifecycle;
+#[path = "all/cache_policy_update.rs"]
+mod cache_policy_update;
 #[path = "all/continuous_deployment_policies.rs"]
 mod continuous_deployment_policies;
 #[path = "all/distribution_config_defaults.rs"]

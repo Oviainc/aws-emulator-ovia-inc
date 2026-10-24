@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCachePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCachePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCachePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of the cache policy an id names, WHOLE: "all the fields are
+//! updated with the values provided in the request. You cannot update some fields
+//! independent of others" — so the stored configuration becomes the submitted one down to
+//! the members it leaves out, `LastModifiedTime` moves to now, and a fresh version token is
+//! minted, which is the one a later `If-Match` against this policy is checked against.
+//! Reports the record as it then stands, read from the store rather than from the request.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is written, so a
+//! refused update leaves the stored policy, its version token and its `LastModifiedTime`
+//! exactly as they were:
+//!
+//! * an id no stored policy holds — `NoSuchCachePolicy` (HTTP 404);
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid";
+//!   one that carries a token that is not this policy's current one — `PreconditionFailed`
+//!   (HTTP 412), so an update only lands on the configuration its caller actually read
+//!   ([`crate::state::check_if_match`]);
+//! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
+//!   `InconsistentQuantities` (HTTP 400), the same rule every CloudFront list wrapper obeys
+//!   ([`crate::state::cache_policy_quantity_mismatch`]);
+//! * a configuration whose TTLs are not ordered `MinTTL` <= `DefaultTTL` <= `MaxTTL`, one
+//!   that names a negative TTL, or one whose `Comment` is past the documented 128
+//!   characters — `InvalidArgument` (HTTP 400), the SAME check the create path applies
+//!   ([`crate::state::cache_policy_config_invalid`]);
+//! * a `Name` ANOTHER policy already holds — `CachePolicyConfig$Name` is "A unique name to
+//!   identify the cache policy", so renaming a policy onto a name that is taken is
+//!   `CachePolicyAlreadyExists` (HTTP 409); the name this policy already holds is its own,
+//!   so an update that keeps its name is not a conflict with itself.
+//!
+//! `IllegalUpdate` ("The update contains modifications that are not allowed") is not
+//! reachable here: a `CachePolicyConfig` carries no member documented as fixed for the
+//! policy's life — unlike a distribution's `CallerReference` — so there is no modification
+//! to refuse on. The three per-list quota refusals (`TooManyCookiesInCachePolicy`,
+//! `TooManyHeadersInCachePolicy`, `TooManyQueryStringsInCachePolicy`) are unreachable for
+//! the reason the create path states: their maximum is an account quota CloudFront can
+//! raise and neither the model nor the shape documentation states a number for it, so a
+//! bound invented for them would refuse configurations the service accepts. `AccessDenied`
+//! is unreachable here, as it is from every other operation in this service: the emulator
+//! authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +132,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,18 +214,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCachePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCachePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCachePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.cache_policy_config;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The policy being updated is looked up first: every refusal below is about the
+        // record this id names, and nothing is minted for an id the store does not hold.
+        let Some(current_etag) = store.cache_policy(&input.id).map(|stored| stored.etag.clone())
+        else {
+            return Err(UpdateCachePolicyErrorModeled::NoSuchCachePolicy(
+                crate::state::no_such_cache_policy(),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateCachePolicyErrorModeled::InvalidIfMatchVersion(
+                    InvalidIfMatchVersion {
+                        message: Some(
+                            "The If-Match version is missing or not valid: supply the ETag of \
+                             the cache policy's current version"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateCachePolicyErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "The value of Quantity and the size of Items don't match." — walked over every
+        // wrapper this configuration reaches, exactly as the create path walks it.
+        if let Some(message) = crate::state::cache_policy_quantity_mismatch(&config) {
+            return Err(UpdateCachePolicyErrorModeled::InconsistentQuantities(
+                InconsistentQuantities {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The documented constraints on the configuration's own members — the TTL ordering
+        // and the comment bound — hold on every payload that states a configuration, so an
+        // update cannot store one the create would have refused.
+        if let Some(message) = crate::state::cache_policy_config_invalid(&config) {
+            return Err(UpdateCachePolicyErrorModeled::InvalidArgument(
+                InvalidArgument {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "A unique name to identify the cache policy": a name identifies ONE policy, so a
+        // name another policy holds cannot be moved onto this one. The policy being updated
+        // already holds its own name, which is why the holder's id is compared.
+        if store
+            .cache_policy_named(&config.name)
+            .is_some_and(|holder| holder.id != input.id)
+        {
+            return Err(UpdateCachePolicyErrorModeled::CachePolicyAlreadyExists(
+                crate::state::cache_policy_already_exists(&config.name),
+            )
+            .into());
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_cache_policy_config(&input.id, config, now) else {
+            return Err(UpdateCachePolicyErrorModeled::NoSuchCachePolicy(
+                crate::state::no_such_cache_policy(),
+            )
+            .into());
+        };
+
+        Ok(UpdateCachePolicyOutput {
+            // "A cache policy." — read from the record just written, never from the request.
+            cache_policy: Some(stored.to_cache_policy()),
+            // "The current version of the cache policy" — a fresh token, so the version
+            // this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

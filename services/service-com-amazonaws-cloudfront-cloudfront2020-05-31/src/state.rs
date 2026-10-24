@@ -2233,6 +2233,38 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Replace the configuration of the cache policy `id` names, and report the record as
+    /// it now stands.
+    ///
+    /// `UpdateCachePolicy` replaces the configuration WHOLE — "When you update a cache
+    /// policy configuration, all the fields are updated with the values provided in the
+    /// request. You cannot update some fields independent of others." — so the stored
+    /// configuration becomes the one submitted, down to the members the request left out;
+    /// `LastModifiedTime` becomes `now` ("the date and time when the cache policy was last
+    /// modified"), and the version token is freshly minted, so the token the caller matched
+    /// on no longer satisfies an `If-Match` against this policy. Nothing else about a cache
+    /// policy changes: the id is the one it was created under, and a policy carries no
+    /// status and no propagation deadline.
+    ///
+    /// `None` when the store holds no such policy, checked BEFORE the mint so a version
+    /// token is never spent on a policy that is not there.
+    pub fn apply_cache_policy_config(
+        &mut self,
+        id: &str,
+        config: CachePolicyConfig,
+        now: SystemTime,
+    ) -> Option<&StoredCachePolicy> {
+        if !self.cache_policies.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.cache_policies.get_mut(id)?;
+        stored.config = config;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the comment of the key value store `name` names, and report the record as
     /// it now stands.
     ///
