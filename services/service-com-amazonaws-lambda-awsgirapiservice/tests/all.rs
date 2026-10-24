@@ -39,6 +39,8 @@ mod function_recursion_config;
 mod function_url_config;
 #[path = "all/function_version_listing.rs"]
 mod function_version_listing;
+#[path = "all/layer_listing.rs"]
+mod layer_listing;
 #[path = "all/layer_versions.rs"]
 mod layer_versions;
 #[path = "all/policy_versions_and_resources.rs"]

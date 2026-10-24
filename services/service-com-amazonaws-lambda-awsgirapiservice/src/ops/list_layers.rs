@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLayers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLayers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLayers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the layers the store holds in the Region the request addresses, one entry
+//! per layer, each carrying the newest version that layer still holds. Every member
+//! comes out of [`crate::state`]: the ARNs the layer was published with, the newest
+//! version the store still has under the name, and the metadata that version was
+//! published with. A pure report — this operation writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLayers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLayersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLayers"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLayersErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // The model declares `MaxItems` as `@range(min: 1, max: 50)`, so the boundary
+        // validator has already refused anything outside it; this handler enforces the
+        // same floor itself rather than letting a page size of zero reach the pagination
+        // arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{requested}' at 'maxItems' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1"
+            )));
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        // A layer is a REGIONAL resource: it is published into one Region and its ARNs
+        // carry that Region, so the layers this call can enumerate are the ones
+        // published in the Region the caller addressed. The Region of the call comes
+        // from its own SigV4 credential scope and the comparison is against the Region
+        // stored on the record.
+        let region = crate::state::request_region(ctx);
+
+        // "Specify a runtime identifier to list only layers that indicate that they're
+        // compatible with that runtime. Specify a compatible architecture to include
+        // only layers that are compatible with that instruction set architecture."
+        // Both filters are applied to the layer's newest held version ALONE, because
+        // this operation "shows information about the latest version of each" layer: an
+        // older version declaring the runtime does not put the layer back in the answer.
+        let runtime = input.compatible_runtime.as_deref();
+        let architecture = input.compatible_architecture.as_deref();
+
+        let store = state.lock();
+        // The store keys layers by name, so its own order is the order the entries are
+        // reported and paginated in.
+        let entries: Vec<LayersListItem> = store
+            .layers
+            .values()
+            .filter(|record| record.region == region)
+            .filter_map(|record| {
+                // A layer whose every version has been deleted is a layer there is no
+                // latest version to show information about, so it is not listed at all.
+                let latest = record.latest_held_version()?;
+                latest
+                    .is_compatible_with(runtime, architecture)
+                    .then(|| LayersListItem {
+                        layer_name: Some(record.name.clone()),
+                        layer_arn: Some(record.arn.clone()),
+                        // "The newest version of the layer" — the highest-numbered one
+                        // the store still holds, which is why deleting the newest
+                        // version leaves the one below it as the layer's latest.
+                        latest_matching_version: Some(record.version_summary(latest)),
+                    })
+            })
+            .collect();
+
+        // The marker is the name of the last layer the previous page reported, so the
+        // next page starts at the first layer ordered after it and no layer is ever
+        // reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|entry| entry.layer_name.as_deref().is_some_and(|name| name > marker))
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListLayersOutput {
+            layers: Some(page.to_vec()),
+            // "A pagination token returned when the response doesn't contain all
+            // layers" — so it is absent on the last page, and it is the key of the last
+            // entry THIS page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .and_then(|entry| entry.layer_name.clone()),
+        })
     }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListLayersError {
+    ListLayersErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }

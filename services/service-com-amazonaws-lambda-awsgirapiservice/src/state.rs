@@ -102,10 +102,10 @@ use crate::ops::types::{
     DurableConfig, Environment, EnvironmentResponse, EphemeralStorage,
     EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, FileSystemConfig,
     FilterCriteria, FunctionCodeLocation, GetLayerVersionOutput, ImageConfig, ImageConfigResponse,
-    InstanceRequirements, Layer, LayerVersionContentOutput, LoggingConfig, PropagateTags,
-    ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object, RuntimeVersionConfig,
-    ScalingConfig, SelfManagedEventSource, SelfManagedKafkaEventSourceConfig, SnapStartResponse,
-    SourceAccessConfiguration,
+    InstanceRequirements, Layer, LayerVersionContentOutput, LayerVersionsListItem, LoggingConfig,
+    PropagateTags, ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object,
+    RuntimeVersionConfig, ScalingConfig, SelfManagedEventSource, SelfManagedKafkaEventSourceConfig,
+    SnapStartResponse, SourceAccessConfiguration,
     TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
 };
 
@@ -1686,6 +1686,28 @@ impl LayerVersionRecord {
             ..LayerVersionContentOutput::default()
         }
     }
+
+    /// Whether this version declares itself compatible with `runtime` and with
+    /// `architecture`, which is the filter `ListLayers` and `ListLayerVersions` share:
+    /// "Specify a runtime identifier to list only layers that indicate that they're
+    /// compatible with that runtime. Specify a compatible architecture to include only
+    /// layers that are compatible with that instruction set architecture."
+    ///
+    /// A filter the caller did not name matches every version. A version that declares
+    /// no compatible runtime (or architecture) at all indicates compatibility with
+    /// none, so a request filtered to one does not match it.
+    #[must_use]
+    pub fn is_compatible_with(&self, runtime: Option<&str>, architecture: Option<&str>) -> bool {
+        runtime.is_none_or(|runtime| {
+            self.compatible_runtimes
+                .iter()
+                .any(|declared| declared == runtime)
+        }) && architecture.is_none_or(|architecture| {
+            self.compatible_architectures
+                .iter()
+                .any(|declared| declared == architecture)
+        })
+    }
 }
 
 /// One layer and every version published under its name.
@@ -1731,6 +1753,37 @@ impl LayerRecord {
             // A list the caller named nothing in is absent from the answer rather than
             // reported empty: the model gives neither member a default, so an unnamed
             // one is a member this version carries no value for.
+            compatible_architectures: (!version.compatible_architectures.is_empty())
+                .then(|| version.compatible_architectures.clone()),
+            compatible_runtimes: (!version.compatible_runtimes.is_empty())
+                .then(|| version.compatible_runtimes.clone()),
+            license_info: version.license_info.clone(),
+        }
+    }
+
+    /// The newest version of this layer the store still holds, or `None` once every
+    /// version published under the name has been deleted.
+    ///
+    /// This is NOT [`LayerRecord::latest_version`], which is the highest number ever
+    /// published so a number is never handed out twice: `DeleteLayerVersion` takes a
+    /// version out of [`LayerRecord::versions`] and leaves that counter where it is, so
+    /// the newest version a read can report is the highest one still stored.
+    #[must_use]
+    pub fn latest_held_version(&self) -> Option<&LayerVersionRecord> {
+        self.versions.values().next_back()
+    }
+
+    /// The `LayerVersionsListItem` a listing reports for one of this layer's versions,
+    /// built entirely out of what is stored.
+    #[must_use]
+    pub fn version_summary(&self, version: &LayerVersionRecord) -> LayerVersionsListItem {
+        LayerVersionsListItem {
+            layer_version_arn: Some(self.version_arn(version.version)),
+            version: version.version,
+            description: version.description.clone(),
+            created_date: Some(version.created.clone()),
+            // A list the caller named nothing in is absent from the answer rather than
+            // reported empty, exactly as [`LayerRecord::version_detail`] reports it.
             compatible_architectures: (!version.compatible_architectures.is_empty())
                 .then(|| version.compatible_architectures.clone()),
             compatible_runtimes: (!version.compatible_runtimes.is_empty())
