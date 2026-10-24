@@ -87,6 +87,68 @@ pub fn is_reserved_tag_key(tag_key: &str) -> bool {
     key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
+/// The punctuation an AWS tag key admits beside letters, digits and separators. AWS's
+/// tagging rules publish the character set of a tag key as letters, numbers, spaces
+/// representable in UTF-8 and `_ . : / = + - @`; a principal tag is referenced from an IAM
+/// policy as a session tag of the federated principal, so a key outside that set names a
+/// tag no policy could ever reference.
+pub const TAG_KEY_PUNCTUATION: &str = "_.:/=+-@";
+
+/// Whether `tag_key` is spelled with the characters a tag key admits
+/// ([`TAG_KEY_PUNCTUATION`] beside letters, digits and separator whitespace, in any
+/// script). The emptiness and the length of a key are the MODELLED bounds of the shape it
+/// is written through, checked where it is read; this is the character rule alone.
+pub fn is_well_formed_tag_key(tag_key: &str) -> bool {
+    tag_key.chars().all(|character| {
+        character.is_alphanumeric()
+            // A separator, which is what AWS's rule admits as a "space": a control
+            // character is whitespace to Rust but is not a separator.
+            || (character.is_whitespace() && !character.is_control())
+            || TAG_KEY_PUNCTUATION.contains(character)
+    })
+}
+
+/// The most providers of ONE pool this emulator holds a principal-tag attribute map for.
+/// Not an AWS quota: THIS emulator's own ceiling on a store that grows by one record per
+/// `SetPrincipalTagAttributeMap` call naming a provider it has not seen before — the
+/// provider name is a free-form caller string — and whose records live for the process. Set
+/// to the same order as the other per-request ceilings here, well above the providers one
+/// pool can configure, so a legitimate caller never meets it, while a caller varying the
+/// name cannot grow the store without limit. A call that would create a record past it is
+/// refused with the modelled `InvalidParameterException`; replacing the mapping of a
+/// provider already stored is never refused for it.
+pub const MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL: usize = 50;
+
+/// The principal-tag attribute map of ONE identity provider of one identity pool, as
+/// `SetPrincipalTagAttributeMap` wrote it and `GetPrincipalTagAttributeMap` reports it.
+/// A set call REPLACES the provider's whole mapping, so one record holds everything that
+/// mapping consists of.
+#[derive(Debug, Clone, Default)]
+pub struct PrincipalTagAttributeMap {
+    /// Whether the call asked for the default (username and clientID) attribute mappings.
+    pub use_defaults: bool,
+    /// Principal tag key -> the user attribute (claim) it is taken from, ordered so a read
+    /// reports the same map twice. Empty when the call carried no `PrincipalTags`.
+    pub principal_tags: BTreeMap<String, String>,
+}
+
+/// The DEFAULT principal-tag attribute map, which a call asking for the default mappings
+/// configures. `SetPrincipalTagAttributeMap`'s own doc calls them the "default (username
+/// and clientID) attribute mappings", so those are the two tags; each is taken from the
+/// claim an issued OpenID Connect token carries it in — the subject (`sub`), which names
+/// the identity, and the audience (`aud`), which names what the token was issued to (see
+/// [`open_id_token`]). Choosing the defaults is a choice INSTEAD of a custom mapping, so
+/// this map is the provider's whole mapping rather than something merged into one.
+pub const DEFAULT_PRINCIPAL_TAGS: [(&str, &str); 2] = [("clientID", "aud"), ("username", "sub")];
+
+/// [`DEFAULT_PRINCIPAL_TAGS`] as a stored mapping.
+pub fn default_principal_tags() -> BTreeMap<String, String> {
+    DEFAULT_PRINCIPAL_TAGS
+        .iter()
+        .map(|(tag_key, attribute)| (tag_key.to_string(), attribute.to_string()))
+        .collect()
+}
+
 /// The most mapping rules one identity provider may carry, from the model's own doc for
 /// `RulesConfigurationType$Rules`: "An array of rules. You can specify up to 25 rules per
 /// identity provider." (`smithy_query(query="shape",shape="RulesConfigurationType")`).
@@ -195,6 +257,14 @@ pub struct ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// pool with no entry has had no `SetIdentityPoolRoles` call, which is an EMPTY role
     /// configuration, not a missing pool.
     pub identity_pool_roles: HashMap<String, IdentityPoolRoles>,
+    /// The principal-tag attribute map of one `(IdentityPoolId, IdentityProviderName)`
+    /// pair, as `SetPrincipalTagAttributeMap` wrote it. A pair with no entry has had no
+    /// such call, so there is no mapping of that provider's attributes to report. The two
+    /// parts are kept as separate key fields rather than joined into one string: the
+    /// provider name comes from the caller and any separator it may also contain would
+    /// make two distinct providers share a key. Bounded per pool by
+    /// [`MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL`].
+    pub principal_tag_attribute_maps: HashMap<(String, String), PrincipalTagAttributeMap>,
     /// Identities by `IdentityId`.
     pub identities: HashMap<String, Identity>,
     /// The identities of one pool, in the order `GetId` minted them, so a paginated
@@ -219,6 +289,18 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// Whether another pool would take this emulator past [`MAX_IDENTITY_POOLS`].
     pub fn identity_pool_store_is_full(&self) -> bool {
         self.identity_pools.len() >= MAX_IDENTITY_POOLS
+    }
+
+    /// Whether this pool already holds as many principal-tag attribute maps as
+    /// [`MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL`] allows, so a mapping for a provider it
+    /// does not hold one for yet would take it past that ceiling. Replacing the mapping of
+    /// a provider it already holds grows nothing, so the caller asks only about a NEW one.
+    pub fn principal_tag_attribute_map_store_is_full(&self, identity_pool_id: &str) -> bool {
+        self.principal_tag_attribute_maps
+            .keys()
+            .filter(|(pool, _)| pool == identity_pool_id)
+            .count()
+            >= MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL
     }
 
     /// Whether another identity in this pool would take it past
@@ -387,12 +469,15 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     }
 
     /// Remove a pool with everything that belongs to it — its identities, their login
-    /// index entries, their outstanding credentials and the OIDC tokens it issued — and
+    /// index entries, their outstanding credentials, the OIDC tokens it issued and the
+    /// principal-tag attribute maps of its providers — and
     /// report the access key ids whose credentials the caller must now forget. `None` when
     /// no such pool is stored.
     pub fn delete_identity_pool(&mut self, identity_pool_id: &str) -> Option<Vec<String>> {
         self.identity_pools.remove(identity_pool_id)?;
         self.identity_pool_roles.remove(identity_pool_id);
+        self.principal_tag_attribute_maps
+            .retain(|(pool, _), _| pool != identity_pool_id);
         let identity_ids = self
             .identities_by_pool
             .remove(identity_pool_id)
