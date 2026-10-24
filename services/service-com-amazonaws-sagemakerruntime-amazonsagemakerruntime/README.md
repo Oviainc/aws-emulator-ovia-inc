@@ -105,3 +105,44 @@ State lives in the SINGLE shared engine, keyed by type. Reach it through
 Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
+
+## Where this service's endpoints come from
+
+SageMaker Runtime is a DATA PLANE: its model declares only `InvokeEndpoint`,
+`InvokeEndpointAsync` and `InvokeEndpointWithResponseStream`, and no operation that
+creates, updates or describes an endpoint — that belongs to the SageMaker control plane
+(`services/service-com-amazonaws-sagemaker-sagemaker`). So this crate keeps NO endpoint
+of its own: every invocation resolves the endpoint it names in the control plane's own
+store, through the one shared engine, and a name that store does not hold is refused with
+the modelled `ValidationError` (HTTP 400) rather than answered.
+
+That question — "does the account host this endpoint, and is a deployment behind it?" —
+is asked in ONE place, `crate::state::resolve_endpoint`, and each of the three operations
+maps the answer onto its own modelled errors. It is also the only place that writes to the
+control plane, and only to materialise the `Creating -> InService` transition the clock
+already owed (the same write `DescribeEndpoint` makes).
+
+What this crate's own state holds is what the data plane itself produced: the bounded log
+of the invocations it answered (`EndpointInvocation`, with the request's non-sensitive
+members and the outcome) and the bounded queue of the asynchronous submissions it accepted
+(`AsyncInvocation`).
+
+An in-process caller that needs an endpoint creates it through the control plane, exactly
+as a client would, not through this crate:
+
+```rust
+// `CreateModel` -> `CreateEndpointConfig` -> `CreateEndpoint` on the control plane, then
+// invoke through this service. `tests/all/endpoint_invocation.rs` does precisely this.
+```
+
+A real endpoint runs a customer-owned inference container — customer code in a container
+image, which a generated emulator does not run. So NOTHING here computes a prediction:
+an invocation that resolves is answered with the modelled `ModelError` (HTTP 424) saying
+no container returned an inference, never a synthesised `Body`; and an accepted
+asynchronous submission leaves `InProgress` for the modelled failure state once its
+outcome falls due, never a `Completed` claiming an output object nothing wrote.
+
+`InvokeEndpointWithResponseStream` is HAND-AUTHORED (the scaffold generator declines a
+`@streaming` event-stream output — see `src/ops/SKIPPED_STUBS.md`) and is routed through
+`Service::override_operation` in `src/service.rs`. It frames no event stream: a
+`PayloadPart` carries the model's own output, and nothing produced one.

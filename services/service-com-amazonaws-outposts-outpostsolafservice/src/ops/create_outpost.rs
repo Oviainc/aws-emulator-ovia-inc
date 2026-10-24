@@ -285,6 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Outpost nobody has ordered hardware for has no priced renewal
                 // option and `GetRenewalPricing` reports it cannot be priced.
                 renewal_pricing: Vec::new(),
+                // Hardware is installed on the site after an order is fulfilled,
+                // not by the call that creates the Outpost, so a just-created
+                // Outpost carries no asset and `ListAssets` reports none for it.
+                assets: Vec::new(),
             },
         );
 
