@@ -31,10 +31,9 @@
 //! from the response of the call under test: the read-only
 //! `ListPricingRulesAssociatedToPricingPlan` (404 `ResourceNotFoundException` for a plan
 //! that is not stored) is the existence probe, an `Arn`-only `UpdatePricingPlan` reports
-//! what state holds, and `CreatePricingPlan` consults the name-uniqueness index.
-//! `ListPricingPlans` — the one reader that would report all of it at once — is still a
-//! scaffold (`src/ops/list_pricing_plans.rs` carries the `SCAFFOLDED, NOT IMPLEMENTED`
-//! marker), so it is not used here.
+//! what state holds, and `CreatePricingPlan` consults the name-uniqueness index. The
+//! reader that reports all of it at once, `ListPricingPlans`, is the subject of
+//! `tests/all/pricing_plan_list.rs`.
 
 use bytes::Bytes;
 use serde_json::{json, Value};

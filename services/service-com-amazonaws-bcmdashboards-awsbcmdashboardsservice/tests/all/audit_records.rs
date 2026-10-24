@@ -21,6 +21,8 @@ use tracing::{Event, Metadata, Subscriber};
 use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::AUDIT_TARGET;
 
 use super::dashboard_lifecycle::{call, ok_call, router, PRESENTED_AKID, REQUEST_SOURCE};
+use super::scheduled_report_execution::create_report;
+use super::scheduled_report_lifecycle::source_dashboard;
 
 /// One captured event: its target and its fields, rendered as strings.
 #[derive(Clone, Debug)]
@@ -344,4 +346,91 @@ async fn the_quota_refusal_is_audited() {
         "-",
         "ServiceQuotaExceededException",
     );
+}
+
+/// `ExecuteScheduledReport` accounts for itself: the execution it triggers and each
+/// refusal it answers leave one record naming the report and the outcome, while the two
+/// calls that change nothing — the dry run and the idempotent retry — leave none.
+#[tokio::test]
+async fn scheduled_report_executions_are_audited() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "AuditExecSource").await;
+    let enabled = create_report(&router, &dashboard_arn, "Audited Report", None, None).await;
+    let other = create_report(&router, &dashboard_arn, "Audited Other", None, None).await;
+    let paused = create_report(
+        &router,
+        &dashboard_arn,
+        "Audited Paused",
+        Some("DISABLED"),
+        None,
+    )
+    .await;
+
+    let token = "audited-exec-token-0001";
+    let triggering = json!({"arn": enabled, "clientToken": token});
+
+    // The triggered execution.
+    {
+        let (capture, _guard) = capture_events();
+        ok_call(&router, "ExecuteScheduledReport", &triggering).await;
+        assert_record(
+            &capture.record_for("ExecuteScheduledReport"),
+            "ExecuteScheduledReport",
+            &enabled,
+            "SUCCESS",
+        );
+    }
+
+    // The idempotent retry and the dry run each change nothing, so each accounts for
+    // nothing — the same rule the reporting operations follow above.
+    for (label, request) in [
+        ("idempotent retry", triggering.clone()),
+        ("dry run", json!({"arn": enabled, "dryRun": true})),
+    ] {
+        let (capture, _guard) = capture_events();
+        ok_call(&router, "ExecuteScheduledReport", &request).await;
+        let leaked = capture.records_for("ExecuteScheduledReport");
+        assert!(
+            leaked.is_empty(),
+            "case {label}: a call that changes nothing must emit no audit record, captured {leaked:?}"
+        );
+    }
+
+    // Every refusal, with the modelled error as its outcome and the requested ARN as the
+    // resource — including the ARN that resolves to no report at all.
+    let absent = "arn:aws:bcm-dashboards::000000000000:scheduled-report/never-created";
+    let cases: &[(Value, u16, &str, &str)] = &[
+        (
+            json!({"arn": paused}),
+            400,
+            paused.as_str(),
+            "ValidationException",
+        ),
+        (
+            json!({"arn": other, "clientToken": token}),
+            409,
+            other.as_str(),
+            "ConflictException",
+        ),
+        (
+            json!({"arn": absent}),
+            400,
+            absent,
+            "ResourceNotFoundException",
+        ),
+    ];
+    for (request, expected_status, resource, outcome) in cases {
+        let (capture, _guard) = capture_events();
+        let (status, body) = call(&router, "ExecuteScheduledReport", request).await;
+        assert_eq!(
+            status, *expected_status,
+            "case {outcome}: expected {expected_status}, got {status}: {body}"
+        );
+        assert_record(
+            &capture.record_for("ExecuteScheduledReport"),
+            "ExecuteScheduledReport",
+            resource,
+            outcome,
+        );
+    }
 }

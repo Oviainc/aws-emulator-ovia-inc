@@ -34,6 +34,11 @@
 //! the source the workflow status it carried before the copy, since a copy changes
 //! nothing about the source. Nothing here sleeps.
 //!
+//! A copy also carries the source's PIXEL DATA: the image frames the source holds when
+//! the copy is admitted are delivered to the destination by the same clock-owed
+//! transition that releases it, so `GetImageFrame` serves them from the destination once
+//! the copy has completed and finds nothing there before that.
+//!
 //! ---
 //!
 //! # Modeled contract for `CopyImageSet`
@@ -295,6 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A copy leaves the source's content alone, so the status it reports once the
         // copy has completed is the one it carried going in.
         let source_workflow_status_before_copy = source.latest_version.workflow_status;
+        // The pixel data this copy carries to its destination: read from the source as
+        // it stands when the copy is admitted, delivered when the copy completes.
+        let copied_image_frames = source.image_frames.clone();
         let held_image_sets = datastore.image_sets.len();
 
         // Every refusal the destination can raise, before anything is written.
@@ -366,6 +374,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             due_at: now + crate::state::IMAGE_SET_COPY_DELAY,
             image_set_state: ImageSetState::Active,
             workflow_status: ImageSetWorkflowStatus::Copied,
+            // The destination holds the source's pixel data once the copy has
+            // COMPLETED, never before: a frame is readable exactly when the copy that
+            // delivers it lands.
+            delivered_image_frames: Some(copied_image_frames),
         };
 
         let datastore = store.datastores.get_mut(&input.datastore_id).ok_or_else(|| {
@@ -430,6 +442,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         source.latest_version.updated_at = now;
         source.pending = Some(PendingImageSetTransition {
             workflow_status: source_workflow_status_before_copy,
+            // A copy READS its source and writes its destination, so the release of the
+            // source's read-only lock delivers no pixel data.
+            delivered_image_frames: None,
             ..copy_due
         });
 

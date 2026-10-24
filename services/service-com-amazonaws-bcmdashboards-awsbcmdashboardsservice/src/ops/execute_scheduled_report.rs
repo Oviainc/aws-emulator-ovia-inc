@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteScheduledReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteScheduledReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteScheduledReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Triggers one immediate execution of the stored scheduled report the requested ARN is
+//! the key of, outside its schedule, and answers whether that execution was triggered
+//! together with the report's health after the request.
+//!
+//! The decisions, each taken from this service's persisted state rather than from the
+//! request:
+//!
+//! * An ARN no report is stored under is refused with the service's not-found answer
+//!   (`crate::scaffolded::Scaffolded::resource_not_found`, HTTP 400 with the error code
+//!   `ResourceNotFoundException` and the requested ARN in `resourceId`), exactly as
+//!   `GetScheduledReport` refuses one.
+//! * A report whose `scheduleConfig.state` is `DISABLED` is refused with the modelled
+//!   `ValidationException` (400): the model documents "The scheduled report must be in
+//!   ENABLED state. Calling this operation on a DISABLED scheduled report returns a
+//!   ValidationException."
+//! * `healthStatus` is DERIVED from the store by
+//!   `crate::state::ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::scheduled_report_health`
+//!   — healthy exactly while the dashboard the report renders and every widget its
+//!   `widgetIds` name still resolve — and the execution is triggered only when the
+//!   configuration does resolve, so `executionTriggered` is false on an `UNHEALTHY`
+//!   report and the report's `lastExecutionAt` does not move.
+//! * `dryRun` is a validation only: the ARN and the schedule state are still checked and
+//!   the health is still computed and returned, but nothing is written and no execution
+//!   is triggered, so `executionTriggered` is false.
+//! * A `clientToken` makes the call idempotent for
+//!   `crate::state::EXECUTION_IDEMPOTENCY_WINDOW` (the minute the model documents): a
+//!   retry presenting the same token for the same report answers the first call's
+//!   outcome and triggers nothing, and the same token presented for a DIFFERENT report
+//!   inside that window is a conflicting reuse, refused with the modelled
+//!   `ConflictException` (409) rather than answered with another report's outcome.
+//!
+//! A triggered execution writes two members of the stored record — `lastExecutionAt`
+//! and `healthStatus` — which `GetScheduledReport` and `ListScheduledReports` then read
+//! back; the configuration itself, `updatedAt` included, is untouched, because an
+//! execution does not update the report. Every call that changes the store (the
+//! execution, and the refusals that are state-change attempts) emits the audit record
+//! `crate::state::record_state_change` writes; the dry run and the idempotent retry
+//! change nothing, so they emit none — the same rule this service's reporting
+//! operations follow.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +197,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteScheduledReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteScheduledReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteScheduledReport"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExecuteScheduledReportErrorModeled::InternalServerException(InternalServerException {
+                message: "the dashboard store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The report the ARN is the key of. Cloned so the health below can read the rest
+        // of the store (the dashboard the report renders) while the record is in hand.
+        let Some(record) = state.scheduled_reports.get(&input.arn).cloned() else {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.arn,
+                crate::scaffolded::RESOURCE_NOT_FOUND_CODE,
+            );
+            return Err(crate::scaffolded::Scaffolded::resource_not_found(
+                &input.arn,
+                format!("Scheduled report not found: {}", input.arn),
+            ));
+        };
+
+        // "The scheduled report must be in ENABLED state. Calling this operation on a
+        // DISABLED scheduled report returns a ValidationException."
+        if record.schedule_state() != crate::state::SCHEDULE_STATE_ENABLED {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.arn,
+                "ValidationException",
+            );
+            return Err(ExecuteScheduledReportErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Member must be in {} state: scheduled report {}",
+                        crate::state::SCHEDULE_STATE_ENABLED,
+                        input.arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "When set to true, validates the scheduled report configuration without
+        // triggering an actual execution": a reporting path. It writes NOTHING — not the
+        // health refresh, not the idempotency record — so a dry run leaves every later
+        // caller seeing exactly what it would have seen without it — and, changing
+        // nothing, it accounts for nothing in the audit stream, as this service's
+        // reporting operations do.
+        if input.dry_run == Some(true) {
+            return Ok(ExecuteScheduledReportOutput {
+                health_status: Some(state.scheduled_report_health(&record, now)),
+                execution_triggered: Some(false),
+            });
+        }
+
+        // The idempotency records the clock has already finished with, dropped before any
+        // of them can be read as a retry.
+        state.expire_execution_tokens(now);
+
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(prior) = state.scheduled_report_executions.get(token) {
+                if prior.arn == input.arn {
+                    // A retry inside the documented window: the first call's outcome,
+                    // and no second execution. It triggers nothing and changes nothing
+                    // a later caller sees, so — like the dry run — it emits no audit
+                    // record; the execution it replays already emitted one.
+                    return Ok(ExecuteScheduledReportOutput {
+                        health_status: Some(prior.health_status.clone()),
+                        execution_triggered: Some(prior.execution_triggered),
+                    });
+                }
+                let conflicting_arn = prior.arn.clone();
+                crate::state::record_state_change(ctx, Self::NAME, &input.arn, "ConflictException");
+                return Err(ExecuteScheduledReportErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "Client token {token} was already used to execute scheduled report {conflicting_arn}"
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The health the store establishes for this report right now, and with it
+        // whether the execution could be triggered at all: a report whose dashboard or
+        // widgets no longer resolve has nothing to render, so nothing is triggered.
+        let health_status = state.scheduled_report_health(&record, now);
+        let execution_triggered = health_status.status_code == crate::state::HEALTH_STATUS_HEALTHY;
+
+        // Present: the key was read under this same lock a few lines above, and nothing
+        // between here and there can remove it.
+        if let Some(stored) = state.scheduled_reports.get_mut(&input.arn) {
+            // The health this request refreshed, which the readers project from here on.
+            stored.health_status = Some(health_status.clone());
+            if execution_triggered {
+                stored.last_execution_at = Some(now);
+            }
+            // `updated_at` is deliberately untouched: an execution does not update the
+            // report's configuration.
+        }
+
+        if let Some(token) = input.client_token {
+            state.scheduled_report_executions.insert(
+                token,
+                crate::state::ScheduledReportExecution {
+                    arn: input.arn.clone(),
+                    executed_at: now,
+                    execution_triggered,
+                    health_status: health_status.clone(),
+                },
+            );
+        }
+
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(
+            ctx,
+            Self::NAME,
+            &input.arn,
+            if execution_triggered {
+                "SUCCESS"
+            } else {
+                // An audit outcome, not a health code: the request was answered, and
+                // the health it refreshed says why nothing was triggered.
+                "NOT_TRIGGERED"
+            },
+        );
+
+        Ok(ExecuteScheduledReportOutput {
+            health_status: Some(health_status),
+            execution_triggered: Some(execution_triggered),
+        })
     }
 }
