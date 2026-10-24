@@ -34,7 +34,7 @@ const FRONT_DOOR_MESSAGE: &str = "Invalid request body";
 /// An ARN-shaped value of exactly `length` characters that satisfies `Arn`'s
 /// `@pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$`, so the only constraint a row varies is
 /// `@length` (min 20, max 2048).
-fn arn_of_length(length: usize) -> String {
+pub(crate) fn arn_of_length(length: usize) -> String {
     let prefix = "arn:aws";
     assert!(
         length > prefix.len(),
