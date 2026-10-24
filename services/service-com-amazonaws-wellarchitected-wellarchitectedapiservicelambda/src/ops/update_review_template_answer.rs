@@ -246,8 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `AnswerReason` and `ChoiceStatus` / `ChoiceReason` are modelled enums, whose
         // value sets the boundary does not enforce, so a value outside one is refused here
-        // rather than stored.
-        if let Some(exception) = enum_member_refusal(&input) {
+        // rather than stored — through the one place this service words that refusal,
+        // shared with `UpdateAnswer`.
+        if let Some(exception) = crate::state::answer_enum_refusal(
+            input.reason.as_deref(),
+            input.choice_updates.as_ref(),
+        ) {
             return Err(
                 UpdateReviewTemplateAnswerErrorModeled::ValidationException(exception).into(),
             );
@@ -256,41 +260,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `ChoiceId` is a choice of THIS question (`ReviewTemplateAnswer$Choices` is the
         // only place a client discovers them), so one that names no choice of it belongs
         // to no answer of this question and is refused rather than stored.
-        for (member, choice_ids) in [
-            (
-                SELECTED_CHOICES_MEMBER,
-                input.selected_choices.clone().unwrap_or_default(),
-            ),
-            (
-                CHOICE_UPDATES_MEMBER,
-                input
-                    .choice_updates
-                    .as_ref()
-                    .map(|updates| updates.keys().cloned().collect())
-                    .unwrap_or_default(),
-            ),
-        ] {
-            let mut undefined: Vec<String> = choice_ids
-                .into_iter()
-                .filter(|choice_id| !question.defines_choice(choice_id))
-                .collect();
-            if !undefined.is_empty() {
-                // Sorted and deduplicated so the refusal does not depend on the order the
-                // request listed the choices in.
-                undefined.sort_unstable();
-                undefined.dedup();
-                return Err(UpdateReviewTemplateAnswerErrorModeled::ValidationException(
-                    crate::state::member_constraint_exception(
-                        member,
-                        &format!(
-                            "every choice must be a choice of question {}, which {} is not",
-                            question.question_id,
-                            undefined.join(", ")
-                        ),
-                    ),
-                )
-                .into());
-            }
+        if let Some(exception) = crate::state::undefined_choice_refusal(
+            question,
+            input.selected_choices.as_deref(),
+            input.choice_updates.as_ref(),
+        ) {
+            return Err(
+                UpdateReviewTemplateAnswerErrorModeled::ValidationException(exception).into(),
+            );
         }
 
         let answer = template.answer_mut(&input.lens_alias, question);
@@ -358,56 +335,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The member a refused `SelectedChoices` value is reported under
-/// (`UpdateReviewTemplateAnswerInput$SelectedChoices`).
-const SELECTED_CHOICES_MEMBER: &str = "SelectedChoices";
-
-/// The member a refused `ChoiceUpdates` key is reported under
-/// (`UpdateReviewTemplateAnswerInput$ChoiceUpdates`).
-const CHOICE_UPDATES_MEMBER: &str = "ChoiceUpdates";
-
-/// The member a refused `Reason` is reported under
-/// (`UpdateReviewTemplateAnswerInput$Reason`).
-const REASON_MEMBER: &str = "Reason";
-
-/// The refusal for the first enum member of this request carrying a value outside its
-/// modelled value set, if any does: the answer's own `Reason` (an `AnswerReason`) and each
-/// `ChoiceUpdate`'s `Status` (a `ChoiceStatus`) and `Reason` (a `ChoiceReason`).
-///
-/// A `ChoiceUpdates` entry is reported under the path that reaches it, so a caller is told
-/// WHICH choice's update it has to fix. The entries are judged in `ChoiceId` order, so the
-/// member a refusal names does not depend on the request map's iteration order.
-fn enum_member_refusal(input: &UpdateReviewTemplateAnswerInput) -> Option<ValidationException> {
-    let mut members: Vec<(String, &str, &[&str])> = Vec::new();
-    if let Some(reason) = input.reason.as_deref() {
-        members.push((REASON_MEMBER.to_string(), reason, ANSWER_REASON_VALUES));
-    }
-    let mut updates: Vec<(&String, &ChoiceUpdate)> = input.choice_updates.iter().flatten().collect();
-    updates.sort_by_key(|(choice_id, _)| *choice_id);
-    for (choice_id, update) in updates {
-        members.push((
-            format!("{CHOICE_UPDATES_MEMBER}.{choice_id}.Status"),
-            update.status.as_str(),
-            CHOICE_STATUS_VALUES,
-        ));
-        if let Some(reason) = update.reason.as_deref() {
-            members.push((
-                format!("{CHOICE_UPDATES_MEMBER}.{choice_id}.Reason"),
-                reason,
-                CHOICE_REASON_VALUES,
-            ));
-        }
-    }
-    members
-        .into_iter()
-        .find(|(_, value, allowed)| !allowed.contains(value))
-        .map(|(member, _, allowed)| {
-            crate::state::member_constraint_exception(
-                &member,
-                &format!(
-                    "Member must satisfy enum value set: [{}]",
-                    allowed.join(", ")
-                ),
-            )
-        })
-}
+// The member names a refused `SelectedChoices` / `ChoiceUpdates` / `Reason` is reported
+// under, and the whole refusal walk over this request's enum members and `ChoiceId`s, live
+// in `crate::state` (`answer_enum_refusal`, `undefined_choice_refusal`): `UpdateAnswer`
+// records an answer from the very same two members, so the two operations must not word
+// the refusal differently.
