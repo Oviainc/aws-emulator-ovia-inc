@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPricingPlans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPricingPlans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPricingPlans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the pricing plans this service holds, one page at a time: the read that
+//! `CreatePricingPlan`, `UpdatePricingPlan`, `DeletePricingPlan` and the pricing-rule
+//! association operations are all observable through at once.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +113,22 @@ impl From<ListPricingPlansErrorModeled> for ListPricingPlansError {
     }
 }
 
+/// The modelled view of a stored plan. `Size` is passed in because it is DERIVED from
+/// the plan's pricing-rule associations rather than held on the record: "the pricing
+/// rules count that's currently associated with this pricing plan list element". A plan
+/// associated with no rule counts 0, which is what it holds, rather than the model's
+/// unenforced `@range(min: 1)` floor; that is the same answer `UpdatePricingPlan` gives.
+fn element(plan: &crate::state::PricingPlanRecord, size: i64) -> PricingPlanListElement {
+    PricingPlanListElement {
+        name: Some(plan.name.clone()),
+        arn: Some(plan.arn.clone()),
+        description: plan.description.clone(),
+        size,
+        creation_time: plan.creation_time_millis,
+        last_modified_time: plan.last_modified_time_millis,
+    }
+}
+
 /// The `ListPricingPlans` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +165,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPricingPlans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPricingPlansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPricingPlans"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPricingPlansErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `Filters.Arns` is "a list of pricing plan Amazon Resource Names (ARNs) to
+        // retrieve information": an absent filter selects every stored plan, and an ARN
+        // may be given in either spelling the `PricingPlanArn` pattern allows, so both
+        // sides are normalised before they are compared.
+        let wanted: Option<Vec<String>> = input.filters.and_then(|filters| filters.arns).map(
+            |arns| {
+                arns.iter()
+                    .map(|arn| crate::state::normalize_pricing_plan_arn(arn))
+                    .collect()
+            },
+        );
+
+        // `pricing_plans` is ordered by ARN, and an ARN carries the monotonic id this
+        // service mints, so the sequence is creation order and a `NextToken` names the
+        // same cut point on the next call. The AWS-managed plans belong to no account
+        // and are not stored, so they are not this account's plans to report.
+        let selected: Vec<(String, PricingPlanListElement)> = state
+            .pricing_plans
+            .iter()
+            .filter(|(arn, _)| wanted.as_ref().is_none_or(|wanted| wanted.contains(arn)))
+            .map(|(arn, plan)| {
+                let size = state
+                    .associated_pricing_rule_arns(arn)
+                    .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
+                    .unwrap_or_default();
+                (arn.clone(), element(plan, size))
+            })
+            .collect();
+
+        let (pricing_plans, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+
+        Ok(ListPricingPlansOutput {
+            // "The billing period for which the described pricing plans are applicable."
+            // This emulator keeps no per-billing-period history of a plan, so every
+            // period reports the plans as they stand now and the answer names the period
+            // the request asked about; a request that named none leaves it absent rather
+            // than inventing one -- the same choice the sibling readers
+            // (`ListPricingRules`, `ListPricingRulesAssociatedToPricingPlan`) make.
+            billing_period: input.billing_period,
+            pricing_plans: Some(pricing_plans),
+            next_token,
+        })
     }
 }

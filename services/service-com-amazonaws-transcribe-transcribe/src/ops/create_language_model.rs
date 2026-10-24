@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLanguageModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLanguageModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLanguageModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a custom language model built from the training data a request names
+//! (see [`CreateLanguageModel::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -191,23 +184,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_LANGUAGE_MODEL_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Record the custom language model this request describes.
+    ///
+    /// A model's training (and tuning) data can only come from the Amazon S3 location
+    /// at `InputDataConfig$S3Uri`, which this operation models `@required` and for
+    /// which it publishes no inline alternative ("The location of your training and
+    /// tuning files (this must be an Amazon S3 URI)"). Reading that location is work
+    /// this emulator cannot perform, so the resource is recorded — the control plane
+    /// is real — and the training it cannot run ends in the service's own modelled
+    /// failure state: `IN_PROGRESS` here, then `FAILED` with a `FailureReason` once
+    /// the clock makes the transition due (see
+    /// [`crate::state::LanguageModelRecord`]).
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLanguageModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLanguageModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLanguageModel"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLanguageModelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "must be unique within an Amazon Web Services account. If you try to create
+        // a new custom language model with the same name as an existing custom
+        // language model, you get a ConflictException error" (model doc for
+        // `CreateLanguageModelRequest$ModelName`). Checked and inserted under one
+        // lock, so N concurrent creates of one name have exactly one winner. The name
+        // is unique within THIS family: a language model and a custom vocabulary are
+        // two resource types, each with its own ARN.
+        if store.language_models.contains_key(&input.model_name) {
+            return Err(CreateLanguageModelErrorModeled::ConflictException(
+                ConflictException {
+                    // As the other creates here: the kind, not the caller's name.
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_LANGUAGE_MODEL,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.language_models.len() >= crate::state::MAX_LANGUAGE_MODELS {
+            return Err(CreateLanguageModelErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} custom language models for \
+                         this account. Delete a custom language model you no longer \
+                         need and try your request again.",
+                        crate::state::MAX_LANGUAGE_MODELS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::LanguageModelRecord::in_progress(
+            input.model_name.clone(),
+            sequence,
+            input.language_code,
+            input.base_model_name,
+            input.input_data_config,
+            input.encryption_configuration,
+            input.tags.unwrap_or_default(),
+            now,
+        );
+
+        // The response is the record just stored, never the request echoed back.
+        let output = CreateLanguageModelOutput {
+            model_name: Some(record.name.clone()),
+            language_code: Some(record.language_code.clone()),
+            base_model_name: Some(record.base_model_name.clone()),
+            input_data_config: Some(record.input_data_config.clone()),
+            model_status: Some(record.status.clone()),
+        };
+        ::tracing::info!(
+            operation = "CreateLanguageModel",
+            model = %record.name,
+            status = %record.status,
+            "custom language model recorded; its training data is not read"
+        );
+        store.language_models.insert(record.name.clone(), record);
+
+        Ok(output)
     }
 }

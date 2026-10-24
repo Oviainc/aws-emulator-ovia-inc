@@ -368,6 +368,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             environment_class,
         };
 
+        // The rules the model cannot state: the S3 path/version pairing, judged on the
+        // request's own members, and the value sets and cross-member bounds, judged on the
+        // configuration this create would store (the request's values where it carried
+        // them, the service defaults resolved above where it did not). Refused before the
+        // store is touched, so nothing is recorded for a request AWS would not provision.
+        crate::state::RequestedS3Objects {
+            plugins_s3_path: input.plugins_s3_path.as_deref(),
+            plugins_s3_object_version: input.plugins_s3_object_version.as_deref(),
+            requirements_s3_path: input.requirements_s3_path.as_deref(),
+            requirements_s3_object_version: input.requirements_s3_object_version.as_deref(),
+            startup_script_s3_path: input.startup_script_s3_path.as_deref(),
+            startup_script_s3_object_version: input.startup_script_s3_object_version.as_deref(),
+        }
+        .validate()
+        .map_err(validation)?;
+        spec.validate().map_err(validation)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);

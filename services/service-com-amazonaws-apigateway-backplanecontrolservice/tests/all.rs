@@ -116,3 +116,5 @@ mod update_deployment;
 mod delete_documentation_part;
 #[path = "all/update_stage_setting_spellings.rs"]
 mod update_stage_setting_spellings;
+#[path = "all/deployment_collection.rs"]
+mod deployment_collection;
