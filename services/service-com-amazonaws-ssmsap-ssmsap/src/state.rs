@@ -19,7 +19,9 @@
 //! A configuration check is the service's OTHER asynchronous unit of work:
 //! `StartConfigurationChecks` files one [`StoredConfigurationCheckOperation`] per
 //! requested check in [`RegionState::configuration_check_operations`], which
-//! `GetConfigurationCheckOperation` reads back by its id — in that Region alone, like
+//! `GetConfigurationCheckOperation` reads back by its id and
+//! `ListConfigurationCheckOperations` reports per application
+//! ([`RegionState::configuration_check_operations_for`]) — in that Region alone, like
 //! every other record.
 //!
 //! The record is the stored half; the wire half (`Application`, `ApplicationSummary`,
@@ -561,6 +563,24 @@ impl StoredConfigurationCheckOperation {
             rule_status_counts: None,
         }
     }
+
+    /// The value a `ListConfigurationCheckOperations` filter whose `Name` is `name`
+    /// compares against, or `None` when this record has no such attribute.
+    ///
+    /// The names are the string-valued members the model gives
+    /// `ConfigurationCheckOperation` — `Id`, `ApplicationId`, `Status`,
+    /// `ConfigurationCheckId` — which is the shape that listing returns, so a filter
+    /// names something the response itself reports. See
+    /// [`CONFIGURATION_CHECK_FILTER_NAMES`].
+    pub fn filter_attribute(&self, name: &str) -> Option<&str> {
+        match name {
+            "Id" => Some(self.id.as_str()),
+            "ApplicationId" => Some(self.application_id.as_str()),
+            "Status" => Some(self.status.as_str()),
+            "ConfigurationCheckId" => Some(self.check_id.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// The configuration checks one `StartConfigurationChecks` call runs, in the order
@@ -907,6 +927,52 @@ impl RegionState {
                 && record.check_id == check_id
                 && record.status == OPERATION_STATUS_INPROGRESS
         })
+    }
+
+    /// The configuration check operations filed against `application_id`, in the order
+    /// a listing reports and pages them: by their own `OperationId`, which is the order
+    /// [`Self::configuration_check_operations`] is keyed in, so the keys a page is taken
+    /// over are already ascending and a `NextToken` resumes where the previous page
+    /// stopped.
+    ///
+    /// `latest_per_check` is the `LATEST_PER_CHECK` listing mode: only the most recently
+    /// STARTED record of each `ConfigurationCheckType` survives, so the listing holds one
+    /// row per check the application has ever had run rather than every run of it. Two
+    /// records started in the same instant are ordered by their ids, so the choice is
+    /// deterministic. `false` is `ALL_OPERATIONS`: every record, nothing collapsed.
+    ///
+    /// Call [`Self::settle`] first, so a record whose terminal status the clock already
+    /// owes is reported in it.
+    pub fn configuration_check_operations_for(
+        &self,
+        application_id: &str,
+        latest_per_check: bool,
+    ) -> Vec<&StoredConfigurationCheckOperation> {
+        let mine = self
+            .configuration_check_operations
+            .values()
+            .filter(|record| record.application_id == application_id);
+        if !latest_per_check {
+            return mine.collect();
+        }
+        let mut latest: BTreeMap<&str, &StoredConfigurationCheckOperation> = BTreeMap::new();
+        for record in mine {
+            latest
+                .entry(record.check_id.as_str())
+                .and_modify(|held| {
+                    if (record.start_time, record.id.as_str())
+                        > (held.start_time, held.id.as_str())
+                    {
+                        *held = record;
+                    }
+                })
+                .or_insert(record);
+        }
+        // Back into the order the whole listing is paged in: by operation id.
+        let mut kept: Vec<&StoredConfigurationCheckOperation> =
+            latest.into_values().collect();
+        kept.sort_by(|left, right| left.id.cmp(&right.id));
+        kept
     }
 
     /// Drop every operation record filed against `application_id`, configuration check
@@ -1306,6 +1372,13 @@ pub fn conflict(message: impl Into<String>) -> ConflictException {
 /// are case-sensitive, as `Filter$Name`'s documentation states.
 pub const FILTER_NAMES: &[&str] = &["Id", "DiscoveryStatus", "Type", "Arn"];
 
+/// The `Name` values a `ListConfigurationCheckOperations` filter may carry: the
+/// string-valued members the model gives `ConfigurationCheckOperation`, which is the
+/// shape that listing returns. Filter names are case-sensitive, as `Filter$Name`'s
+/// documentation states. See [`StoredConfigurationCheckOperation::filter_attribute`].
+pub const CONFIGURATION_CHECK_FILTER_NAMES: &[&str] =
+    &["Id", "ApplicationId", "Status", "ConfigurationCheckId"];
+
 /// `FilterOperator` for exact equality; one of the model's `FilterOperator` values
 /// (see [`crate::ops::types::FILTER_OPERATOR_VALUES`]).
 pub const FILTER_OPERATOR_EQUALS: &str = "Equals";
@@ -1391,7 +1464,19 @@ pub fn filters_within_bounds(filters: &[Filter]) -> Result<(), ValidationExcepti
 /// caller's value is iterated; because it is the ceiling the length bound already
 /// implies, it can never drop a value the caller sent.
 pub fn filter_matches(application: &StoredApplication, filter: &Filter) -> bool {
-    let Some(actual) = application.filter_attribute(&filter.name) else {
+    filter_matches_attribute(application.filter_attribute(&filter.name), filter)
+}
+
+/// Whether the attribute one filter names satisfies it, where `actual` is the value the
+/// record reports for `filter.name` and `None` means the record has no such attribute
+/// (which nothing matches).
+///
+/// This is the comparison every filtered listing of this service shares — see
+/// [`filter_matches`] for `ListApplications` and
+/// [`StoredConfigurationCheckOperation::filter_attribute`] for the configuration check
+/// listing — so one rule decides what a `FilterOperator` means whatever is being listed.
+pub fn filter_matches_attribute(actual: Option<&str>, filter: &Filter) -> bool {
+    let Some(actual) = actual else {
         return false;
     };
     filter
