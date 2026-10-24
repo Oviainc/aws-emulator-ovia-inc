@@ -29,6 +29,8 @@ mod outpost_assets;
 mod outpost_decommission;
 #[path = "all/private_connectivity.rs"]
 mod private_connectivity;
+#[path = "all/private_connectivity_ownership.rs"]
+mod private_connectivity_ownership;
 #[path = "all/quote_lifecycle.rs"]
 mod quote_lifecycle;
 #[path = "all/renewal_pricing.rs"]
