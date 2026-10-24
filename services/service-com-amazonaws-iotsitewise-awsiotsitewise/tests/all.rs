@@ -50,6 +50,12 @@ mod dataset_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/pipeline_executions.rs"]
+mod pipeline_executions;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/refusal_message_rule.rs"]
 mod refusal_message_rule;
 
