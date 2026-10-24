@@ -11,6 +11,10 @@
 //! would LEAVE is checked against the modelled `Tags` `@length` — the bound is on the
 //! resource's tags, not on one request's entries.
 //!
+//! A key in the reserved `aws:` namespace is refused outright: the member's doc defers to
+//! the AWS-wide tagging restrictions, which reserve that prefix for AWS's own tags (see
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,6 +156,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         crate::state::check_resource_arn(Self::NAME, &input.resource_arn).map_err(|message| {
+            crate::state::validation_failed(
+                TagResourceErrorModeled::ValidationException,
+                message,
+            )
+        })?;
+
+        // The `aws:` namespace is AWS's own to write (see
+        // [`crate::state::RESERVED_TAG_KEY_PREFIX`]): a key claiming it is refused here,
+        // before the resource is even resolved — it is a fact about the REQUEST, so it
+        // does not depend on which resource the ARN names — and so before any tag is
+        // written.
+        crate::state::check_tag_keys_unreserved(
+            Self::NAME,
+            "tags",
+            input.tags.keys().map(String::as_str),
+        )
+        .map_err(|message| {
             crate::state::validation_failed(
                 TagResourceErrorModeled::ValidationException,
                 message,

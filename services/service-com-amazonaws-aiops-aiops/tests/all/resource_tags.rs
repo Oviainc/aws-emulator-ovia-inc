@@ -16,6 +16,11 @@
 //! naming no resource is the tagging frontend's 404 [`TAGGING_NOT_FOUND`] from all
 //! three (`tests/all/tagging_frontend_errors.rs` is where that rule is pinned).
 //!
+//! The one key namespace a caller does NOT own is pinned here too: a key beginning with
+//! [`RESERVED_TAG_KEY_PREFIX`] names a tag Amazon Web Services itself applies, so every
+//! tag WRITE — the `tags` map of a create, `TagResource` and `UntagResource` — refuses a
+//! request naming one and leaves the stored set exactly as it was.
+//!
 //! An account holds ONE investigation group per Region, so every row below that needs
 //! its own group signs for its own Region ([`region`]).
 
@@ -23,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_aiops_aiops::state::MAX_TAGS;
+use service_com_amazonaws_aiops_aiops::state::{MAX_TAGS, RESERVED_TAG_KEY_PREFIX};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region a case signs for when it only needs one.
@@ -60,6 +65,11 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/AIOpsAssistantRole";
 /// `ResourceNotFoundException` (which the resource operations keep). The rule and its
 /// source live on `state::TAGGING_RESOURCE_NOT_FOUND`.
 const TAGGING_NOT_FOUND: &str = "NotFoundException";
+
+/// The error code the TAGGING operations refuse a bad tag WRITE with: the tagging
+/// frontend's own `BadRequestException`, the code recorded for a tag set past the
+/// published maximum (the rule lives on `state::tag_capacity_rejection`).
+const TAGGING_BAD_REQUEST: &str = "BadRequestException";
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
 fn emulator() -> MultiServiceRouter {
@@ -623,8 +633,8 @@ async fn the_per_resource_tag_maximum_bounds_the_resulting_set() {
     );
     assert_eq!(
         error_code(&body),
-        "BadRequestException",
-        "case \"one key past the maximum\": expected BadRequestException, got {body:?}"
+        TAGGING_BAD_REQUEST,
+        "case \"one key past the maximum\": expected {TAGGING_BAD_REQUEST}, got {body:?}"
     );
     let after = list_tags_ok(&router, &arn, "one key past the maximum").await;
     assert_eq!(
@@ -792,4 +802,245 @@ async fn tag_sets_are_per_resource() {
         expected(&[]),
         "case \"the second group\": only its own tags may change, got {got:?}"
     );
+}
+
+/// Tag keys inside the reserved namespace, each row a DIFFERENT form of a key beginning
+/// with [`RESERVED_TAG_KEY_PREFIX`]: the prefix alone, real AWS system keys, a
+/// one-character suffix, a non-ASCII suffix, and the longest key the modelled `TagKey`
+/// admits (length 1..128, `smithy_query(query="shape",shape="Tags")`).
+fn reserved_keys() -> Vec<(String, String)> {
+    vec![
+        (
+            "the reserved prefix alone".to_string(),
+            RESERVED_TAG_KEY_PREFIX.to_string(),
+        ),
+        (
+            "a CloudFormation system key".to_string(),
+            format!("{RESERVED_TAG_KEY_PREFIX}cloudformation:stack-name"),
+        ),
+        (
+            "the creator system key".to_string(),
+            format!("{RESERVED_TAG_KEY_PREFIX}created-by"),
+        ),
+        (
+            "a one-character suffix".to_string(),
+            format!("{RESERVED_TAG_KEY_PREFIX}x"),
+        ),
+        (
+            "a non-ASCII suffix the modelled pattern admits".to_string(),
+            format!("{RESERVED_TAG_KEY_PREFIX}Проект Опс"),
+        ),
+        (
+            "the longest key the model admits, 128 characters".to_string(),
+            format!(
+                "{RESERVED_TAG_KEY_PREFIX}{}",
+                "k".repeat(128 - RESERVED_TAG_KEY_PREFIX.chars().count())
+            ),
+        ),
+    ]
+}
+
+/// Keys that merely RESEMBLE the reserved namespace without being in it — the prefix
+/// without its colon, the prefix inside the key rather than at its start, and the
+/// letters `aws` followed by another character the modelled pattern admits. These are
+/// ordinary caller-owned keys, so the same rule that refuses [`reserved_keys`] must
+/// leave them alone.
+fn lookalike_keys() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("the bare letters, no colon", "aws"),
+        ("the letters inside a longer word", "awsome"),
+        ("the letters with a separator that is not a colon", "aws_internal"),
+        ("the reserved prefix away from the start", "team:aws:owner"),
+        ("the letters followed by a dash", "aws-managed"),
+    ]
+}
+
+/// A tag key in the reserved `aws:` namespace names a tag Amazon Web Services itself
+/// applies, so a caller may neither CREATE, CHANGE nor DELETE one: every tag write —
+/// the `tags` map of `CreateInvestigationGroup`, `TagResource` and `UntagResource` —
+/// refuses the whole request with the tagging frontend's 400
+/// [`TAGGING_BAD_REQUEST`] and leaves the stored tag set exactly as it was, including
+/// the caller-owned keys the same request named.
+///
+/// The rule is the AWS-wide tagging restriction on the `aws:` key prefix; no modelled
+/// constraint expresses it (the `TagKey` pattern
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$` admits `:`), so the handlers are what must apply
+/// it. Rows span the forms of a reserved key ([`reserved_keys`]) and the three writing
+/// operations, with the reserved key alone and beside a caller-owned key.
+#[tokio::test]
+async fn a_reserved_tag_key_is_refused_by_every_tag_write() {
+    let router = emulator();
+
+    // Every refused create below is attempted in ONE region: a create that stores
+    // nothing leaves that region's single-group quota free, which the successful create
+    // at the end of this test is what proves.
+    let create_region = region(0);
+    let tagged_region = region(1);
+    let arn = group_with_tags(&router, &tagged_region, "reserved-probe", Some(&[("Team", "ops")]))
+        .await;
+    let stored = expected(&[("Team", "ops")]);
+
+    for (form, key) in reserved_keys() {
+        // CreateInvestigationGroup: the reserved key alone, and beside a key the caller
+        // does own.
+        for (shape, pairs) in [
+            ("alone", vec![(key.as_str(), "mine")]),
+            (
+                "beside a caller-owned key",
+                vec![(key.as_str(), "mine"), ("Team", "ops")],
+            ),
+        ] {
+            let case = format!("CreateInvestigationGroup with {form} {shape}");
+            let (status, body) = call_in(
+                &router,
+                &create_region,
+                "POST",
+                "/investigationGroups",
+                Some(&json!({
+                    "name": "reserved-at-create",
+                    "roleArn": ROLE_ARN,
+                    "tags": tags_body(&pairs),
+                })),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} / {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                TAGGING_BAD_REQUEST,
+                "case {case:?}: expected {TAGGING_BAD_REQUEST}, got {body:?}"
+            );
+
+            // TagResource, on a group that exists and already carries a tag.
+            let case = format!("TagResource with {form} {shape}");
+            let (status, body) = tag(&router, &arn, &tags_body(&pairs)).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} / {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                TAGGING_BAD_REQUEST,
+                "case {case:?}: expected {TAGGING_BAD_REQUEST}, got {body:?}"
+            );
+            let got = list_tags_ok(&router, &arn, &case).await;
+            assert_eq!(
+                got, stored,
+                "case {case:?}: a refused TagResource must store nothing, expected {stored:?}, \
+                 got {got:?}"
+            );
+        }
+
+        // UntagResource: a caller may not delete a system tag either, and naming one
+        // refuses the whole removal — the caller-owned key beside it stays put.
+        for (shape, keys) in [
+            ("alone", vec![key.as_str()]),
+            (
+                "beside a caller-owned key",
+                vec![key.as_str(), "Team"],
+            ),
+        ] {
+            let case = format!("UntagResource with {form} {shape}");
+            let (status, body) = untag(&router, &arn, &keys).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status} / {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                TAGGING_BAD_REQUEST,
+                "case {case:?}: expected {TAGGING_BAD_REQUEST}, got {body:?}"
+            );
+            let got = list_tags_ok(&router, &arn, &case).await;
+            assert_eq!(
+                got, stored,
+                "case {case:?}: a refused UntagResource must remove nothing, expected \
+                 {stored:?}, got {got:?}"
+            );
+        }
+
+        // The refusal states the rule and carries nothing the request sent: the key
+        // itself is not echoed back.
+        let (_, body) = tag(&router, &arn, &tags_body(&[(key.as_str(), "mine")])).await;
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            key == RESERVED_TAG_KEY_PREFIX || !message.contains(key.as_str()),
+            "case {form:?}: the refusal must not echo the key {key:?}, got {message:?}"
+        );
+    }
+
+    // Not one of the refused creates stored a group: the region still holds room for
+    // its one investigation group, which is only true if every one of them stored
+    // nothing.
+    let created = group_with_tags(&router, &create_region, "after-the-refusals", None).await;
+    let got = list_tags_ok(&router, &created, "after the refused creates").await;
+    assert_eq!(
+        got,
+        expected(&[]),
+        "a refused create must have stored nothing, got {got:?}"
+    );
+}
+
+/// A key that merely resembles the reserved namespace is an ordinary caller-owned key:
+/// the same three writes that refuse [`reserved_keys`] store, report and remove every
+/// row of [`lookalike_keys`] unchanged, so the refusal is keyed on the reserved PREFIX
+/// and not on the letters appearing anywhere in a key.
+#[tokio::test]
+async fn keys_that_only_resemble_the_reserved_prefix_are_ordinary_tags() {
+    let router = emulator();
+
+    for (index, (case, key)) in lookalike_keys().iter().enumerate() {
+        // Written at create, and read back through ListTagsForResource.
+        let arn = group_with_tags(
+            &router,
+            &region(index),
+            &format!("lookalike-{index}"),
+            Some(&[(key, "mine")]),
+        )
+        .await;
+        let got = list_tags_ok(&router, &arn, case).await;
+        assert_eq!(
+            got,
+            expected(&[(key, "mine")]),
+            "case {case:?}: {key:?} is a caller-owned key and must round-trip, got {got:?}"
+        );
+
+        // Changed through TagResource.
+        let (status, body) = tag(&router, &arn, &tags_body(&[(key, "changed")])).await;
+        assert_eq!(
+            status,
+            200,
+            "case {case:?}: expected 200 from TagResource for {key:?}, got {status} / {} / \
+             {body:?}",
+            error_code(&body)
+        );
+        let got = list_tags_ok(&router, &arn, case).await;
+        assert_eq!(
+            got,
+            expected(&[(key, "changed")]),
+            "case {case:?}: {key:?} must take the new value, got {got:?}"
+        );
+
+        // And removed through UntagResource.
+        let (status, body) = untag(&router, &arn, &[key]).await;
+        assert_eq!(
+            status,
+            200,
+            "case {case:?}: expected 200 from UntagResource for {key:?}, got {status} / {} / \
+             {body:?}",
+            error_code(&body)
+        );
+        let got = list_tags_ok(&router, &arn, case).await;
+        assert_eq!(
+            got,
+            expected(&[]),
+            "case {case:?}: {key:?} must be removable, got {got:?}"
+        );
+    }
 }

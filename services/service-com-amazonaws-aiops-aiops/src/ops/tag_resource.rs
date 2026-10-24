@@ -4,7 +4,9 @@
 //! Stores the request's key-value pairs on the investigation group `{resourceArn}`
 //! names, adding to the tags it already carries and overwriting the value of a key it
 //! already has; the tagging frontend's 404 `NotFoundException` when nothing matches
-//! ([`crate::state::TAGGING_RESOURCE_NOT_FOUND`]).
+//! ([`crate::state::TAGGING_RESOURCE_NOT_FOUND`]) and its 400 `BadRequestException`
+//! for a key in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace or a
+//! resulting tag set past the published maximum.
 //!
 //! ## Shape of an operation
 //!
@@ -150,12 +152,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every tag key's and value's length and pattern is a modelled constraint the
         // centralized walk has already refused anything outside of. The `Tags` map
         // carries NO modelled length, so the published per-resource maximum is applied
-        // here \u2014 to the set the resource ENDS UP with, which is what the rule bounds.
+        // here \u2014 to the set the resource ENDS UP with, which is what the rule bounds \u2014
+        // and neither does any modelled constraint exclude the reserved `aws:` key
+        // namespace, so that rule is applied here too.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
+
+        // The `aws:` prefix marks a tag Amazon Web Services itself applied, which a
+        // caller may not create or change, and no modelled constraint excludes such a
+        // key — so this is where that rule is applied. It is a rule about the REQUEST
+        // alone, so it is applied before the store is consulted and nothing is written.
+        if let Some(why) =
+            crate::state::reserved_tag_key_rejection(input.tags.keys().map(String::as_str))
+        {
+            return Err(crate::scaffolded::Scaffolded::bad_request(why));
+        }
 
         // This service is regional: the endpoint this request reached holds only the
         // groups of the Region it was signed for, so another Region's group is absent
