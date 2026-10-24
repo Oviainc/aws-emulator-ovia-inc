@@ -13,13 +13,19 @@
 //!   follow from sizing each dimension so that its observed PEAK leaves the service's
 //!   documented default headroom, the option being the smallest Fargate task size that
 //!   holds both dimensions;
+//! * the option's savings opportunity is the difference between what the current task size
+//!   and the recommended one cost per month at the public Fargate per-vCPU-hour and
+//!   per-GB-hour prices, for the tasks the service keeps running, and the recommendation
+//!   names the pricing source that estimate came from;
+//! * the option's container recommendations are the task definition's own container
+//!   reservations carried to the recommended task size;
 //! * a service the analysis has no input for — unknown, not on Fargate, or with no
 //!   observation inside the window — is reported in `errors` rather than given an invented
 //!   recommendation.
 //!
 //! Every row differs along what that rule generalises over: the observed utilization, the
-//! current task size and the form it is registered in, the look-back period in force, and
-//! which analysis input is missing.
+//! current task size and the form it is registered in, how many tasks the service keeps
+//! running, the look-back period in force, and which analysis input is missing.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -37,6 +43,19 @@ const CPU_METRIC: &str = "CPUUtilization";
 /// See [`CPU_METRIC`].
 const MEMORY_METRIC: &str = "MemoryUtilization";
 
+/// The public on-demand Fargate prices every money figure an ECS service recommendation
+/// reports is computed from: one vCPU-hour and one GB-hour of Fargate compute, which is how
+/// AWS Fargate's pricing is published (per vCPU per hour and per GB per hour).
+///
+/// Stated here so the expectation is computed independently of the handler; they are the
+/// handler's own `FARGATE_PRICE_PER_VCPU_HOUR` / `FARGATE_PRICE_PER_GB_HOUR` and must stay
+/// in step with them.
+const PRICE_PER_VCPU_HOUR: f64 = 0.040_48;
+/// See [`PRICE_PER_VCPU_HOUR`].
+const PRICE_PER_GB_HOUR: f64 = 0.004_445;
+/// Hours in a month, the factor an hourly price becomes a monthly figure by: 365 × 24 / 12.
+const HOURS_PER_MONTH: f64 = 730.0;
+
 /// One row of the analysis table: a service's persisted size, what was observed for it, and
 /// the recommendation that follows.
 #[derive(Debug)]
@@ -46,6 +65,9 @@ struct AnalysisCase {
     /// The task definition's task-level `cpu`/`memory`, in the form it is registered with.
     cpu: &'static str,
     memory: &'static str,
+    /// How many tasks the service keeps running — the multiplier between what one task of
+    /// the size above costs and what the SERVICE costs.
+    desired_count: i64,
     /// What those forms mean in CPU units and MiB — the current configuration the
     /// recommendation must report.
     current_cpu: f64,
@@ -80,6 +102,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "overprovisioned",
             cpu: "1024",
             memory: "2048",
+            desired_count: 1,
             current_cpu: 1024.0,
             current_memory: 2048.0,
             cpu_values: [20.0, 40.0],
@@ -95,6 +118,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "cpubound",
             cpu: "1024",
             memory: "2048",
+            desired_count: 4,
             current_cpu: 1024.0,
             current_memory: 2048.0,
             cpu_values: [60.0, 95.0],
@@ -110,6 +134,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "optimized",
             cpu: "256",
             memory: "512",
+            desired_count: 2,
             current_cpu: 256.0,
             current_memory: 512.0,
             cpu_values: [50.0, 70.0],
@@ -125,6 +150,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "saturated",
             cpu: "512",
             memory: "1024",
+            desired_count: 2,
             current_cpu: 512.0,
             current_memory: 1024.0,
             cpu_values: [90.0, 99.0],
@@ -140,6 +166,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "memoryheavy",
             cpu: "1 vCPU",
             memory: "8GB",
+            desired_count: 3,
             current_cpu: 1024.0,
             current_memory: 8192.0,
             cpu_values: [70.0, 80.0],
@@ -155,6 +182,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "largest",
             cpu: "4096",
             memory: "30GB",
+            desired_count: 1,
             current_cpu: 4096.0,
             current_memory: 30_720.0,
             cpu_values: [40.0, 50.0],
@@ -174,6 +202,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             service: "mixed",
             cpu: "4096",
             memory: "8GB",
+            desired_count: 7,
             current_cpu: 4096.0,
             current_memory: 8192.0,
             cpu_values: [2.0, 5.0],
@@ -183,6 +212,25 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             risk: "Medium",
             option_cpu: 2048.0,
             option_memory: 10_240.0,
+        },
+        AnalysisCase {
+            // A service that keeps NO task running costs nothing, so there is nothing to
+            // save however oversized its task size is: the saving is zero, and so is the
+            // percentage of a monthly cost of zero.
+            name: "an oversized service that keeps no task running",
+            service: "notasks",
+            cpu: "2048",
+            memory: "4096",
+            desired_count: 0,
+            current_cpu: 2048.0,
+            current_memory: 4096.0,
+            cpu_values: [10.0, 20.0],
+            memory_values: [10.0, 20.0],
+            finding: "Overprovisioned",
+            reason_codes: &["CPUOverprovisioned", "MemoryOverprovisioned"],
+            risk: "VeryLow",
+            option_cpu: 512.0,
+            option_memory: 1024.0,
         },
     ];
 
@@ -202,6 +250,7 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             test.service,
             &format!("{}family", test.service),
             "FARGATE",
+            test.desired_count,
             case,
         )
         .await;
@@ -358,13 +407,71 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
             "case {case:?}: expected the recommended memory {}, got {option}",
             test.option_memory
         );
-        // A savings opportunity is a price difference and a container recommendation needs
-        // per-container utilization; the emulator holds neither, so neither is invented.
+        // The money the recommendation is for: what the two task sizes cost per month at
+        // the public Fargate prices, for the tasks this service keeps running. A
+        // recommendation that costs the same or more saves nothing rather than a negative
+        // amount.
+        let current_cost = monthly_cost(test.current_cpu, test.current_memory, test.desired_count);
+        let option_cost = monthly_cost(test.option_cpu, test.option_memory, test.desired_count);
+        let expected_saving = round2((current_cost - option_cost).max(0.0));
+        let expected_percentage = if current_cost == 0.0 {
+            0.0
+        } else {
+            round2(expected_saving / current_cost * 100.0)
+        };
+        let savings = &option["savingsOpportunity"];
         assert!(
-            option["savingsOpportunity"].is_null()
-                && option["savingsOpportunityAfterDiscounts"].is_null()
-                && option["containerRecommendations"].is_null(),
-            "case {case:?}: expected no invented savings or container recommendation, got {option}"
+            (savings["estimatedMonthlySavings"]["value"]
+                .as_f64()
+                .unwrap_or(f64::NAN)
+                - expected_saving)
+                .abs()
+                < 0.01,
+            "case {case:?}: expected a monthly saving of {expected_saving}, got {savings}"
+        );
+        assert_eq!(
+            savings["estimatedMonthlySavings"]["currency"].as_str(),
+            Some("USD"),
+            "case {case:?}: expected the saving in USD, got {savings}"
+        );
+        assert!(
+            (savings["savingsOpportunityPercentage"]
+                .as_f64()
+                .unwrap_or(f64::NAN)
+                - expected_percentage)
+                .abs()
+                < 0.01,
+            "case {case:?}: expected a saving of {expected_percentage}% of the current monthly \
+             cost, got {savings}"
+        );
+        // The pricing source those figures came from.
+        assert_eq!(
+            found["effectiveRecommendationPreferences"]["savingsEstimationMode"]["source"].as_str(),
+            Some("PublicPricing"),
+            "case {case:?}: expected the pricing source of the estimate, got {found}"
+        );
+        // No savings-estimation-mode preference is in force here, so no after-discount
+        // saving is reported (the preference is what activates it).
+        assert!(
+            option["savingsOpportunityAfterDiscounts"].is_null(),
+            "case {case:?}: no savings-estimation-mode preference is set, so no after-discount \
+             saving is reported, got {option}"
+        );
+
+        // The container recommendations are the task definition's own reservations carried
+        // to the recommended task size, in the share of the task they reserve today.
+        assert_eq!(
+            option["containerRecommendations"],
+            json!([{
+                "containerName": "web",
+                "cpu": scaled(128.0, test.current_cpu, test.option_cpu),
+                "memorySizeConfiguration": {
+                    "memory": scaled(256.0, test.current_memory, test.option_memory),
+                    "memoryReservation": scaled(192.0, test.current_memory, test.option_memory),
+                },
+            }]),
+            "case {case:?}: expected the container reservations at the recommended task size, \
+             got {option}"
         );
         let projected = list(option, "projectedUtilizationMetrics", case);
         for (name, values, current, recommended) in [
@@ -410,6 +517,117 @@ async fn a_recommendation_is_computed_from_the_service_and_its_observed_utilizat
         arns, expected,
         "the inventory sweep: expected every analysed service, got {body}"
     );
+}
+
+/// The after-discount savings opportunity is reported only once the account activates the
+/// savings-estimation-mode preference for this resource type; the figures are the on-demand
+/// ones, because no Savings Plans commitment is recorded against a service's Fargate spend.
+#[tokio::test]
+async fn after_discount_savings_are_reported_only_when_the_preference_activates_them() {
+    let router = emulator_with_analysed_services();
+    opt_in(&router).await;
+    let cluster = "discounts";
+    create_cluster(&router, cluster, "setup").await;
+    let published_at = now_secs() - 3_600;
+
+    // Two oversized services, so every row is observed on more than one recommendation.
+    let services = ["alpha", "bravo"];
+    for service in services {
+        let family = format!("{service}family");
+        register_task_definition(&router, &family, "2048", "4096", service).await;
+        create_service(&router, cluster, service, &family, "FARGATE", 2, service).await;
+        for metric in [CPU_METRIC, MEMORY_METRIC] {
+            publish(
+                &router,
+                cluster,
+                service,
+                metric,
+                &[10.0, 20.0],
+                published_at,
+                service,
+            )
+            .await;
+        }
+    }
+
+    // Before the preference is set, neither service carries an after-discount saving.
+    for service in services {
+        let arn = service_arn(cluster, service);
+        let found = only_recommendation(&router, &arn, "the preference unset").await;
+        let option = list(&found, "serviceRecommendationOptions", service)[0].clone();
+        assert!(
+            option["savingsOpportunityAfterDiscounts"].is_null(),
+            "case {service:?}: the preference is unset, so no after-discount saving is \
+             reported, got {option}"
+        );
+    }
+
+    // The rows are the states the preference can be put in, applied in order: one set for
+    // ANOTHER resource type (which this resource type's recommendation does not read), the
+    // deactivating value, and the activating one.
+    let rows: [(&str, Value, bool); 3] = [
+        (
+            "the preference of another resource type",
+            json!({
+                "resourceType": "LambdaFunction",
+                "savingsEstimationMode": "AfterDiscounts",
+            }),
+            false,
+        ),
+        (
+            "BeforeDiscounts deactivates the preference",
+            json!({
+                "resourceType": "EcsService",
+                "savingsEstimationMode": "BeforeDiscounts",
+            }),
+            false,
+        ),
+        (
+            "AfterDiscounts activates the preference",
+            json!({
+                "resourceType": "EcsService",
+                "savingsEstimationMode": "AfterDiscounts",
+            }),
+            true,
+        ),
+    ];
+    for (case, request, activated) in rows {
+        let (status, body) = call(&router, "PutRecommendationPreferences", request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected {request} to answer 200, got {status}: {body}"
+        );
+
+        for service in services {
+            let arn = service_arn(cluster, service);
+            let found = only_recommendation(&router, &arn, case).await;
+            let options = list(&found, "serviceRecommendationOptions", case);
+            let option = &options[0];
+            let on_demand = &option["savingsOpportunity"];
+            let after = &option["savingsOpportunityAfterDiscounts"];
+            assert!(
+                on_demand["estimatedMonthlySavings"]["value"]
+                    .as_f64()
+                    .is_some_and(|value| value > 0.0),
+                "case {case:?} service {service:?}: an oversized service saves money, got {option}"
+            );
+            if activated {
+                // No discount is recorded against Fargate spend, so the after-discount
+                // saving is the on-demand one, in the same currency.
+                assert_eq!(
+                    after, on_demand,
+                    "case {case:?} service {service:?}: with no recorded discount the \
+                     after-discount saving is the on-demand one, got {option}"
+                );
+            } else {
+                assert!(
+                    after.is_null(),
+                    "case {case:?} service {service:?}: the preference does not activate an \
+                     after-discount saving here, got {option}"
+                );
+            }
+        }
+    }
 }
 
 /// One row of the no-analysis table: which analysis input is missing, and the error code
@@ -484,7 +702,7 @@ async fn a_service_with_no_analysis_input_is_reported_as_an_error() {
         let family = format!("{}family", test.service);
         if let Some(launch_type) = test.launch_type {
             register_task_definition(&router, &family, "512", "1024", case).await;
-            create_service(&router, cluster, test.service, &family, launch_type, case).await;
+            create_service(&router, cluster, test.service, &family, launch_type, 1, case).await;
         }
         for metric in test.publish {
             publish(
@@ -700,7 +918,7 @@ async fn recommendations_are_paged_in_arn_order_and_filtered_by_finding() {
     for (service, cpu_values) in services {
         let family = format!("{service}family");
         register_task_definition(&router, &family, "1024", "2048", service).await;
-        create_service(&router, cluster, service, &family, "FARGATE", service).await;
+        create_service(&router, cluster, service, &family, "FARGATE", 1, service).await;
         publish(
             &router,
             cluster,
@@ -812,7 +1030,7 @@ async fn only_the_services_of_the_requested_region_are_analysed() {
     create_cluster(&router, cluster, "setup").await;
     let family = "regionalfamily";
     register_task_definition(&router, family, "512", "1024", "setup").await;
-    let arn = create_service(&router, cluster, "checkout", family, "FARGATE", "setup").await;
+    let arn = create_service(&router, cluster, "checkout", family, "FARGATE", 1, "setup").await;
     let published_at = now_secs() - 3_600;
     for metric in [CPU_METRIC, MEMORY_METRIC] {
         publish(
@@ -981,6 +1199,7 @@ async fn create_service(
     service: &str,
     family: &str,
     launch_type: &str,
+    desired_count: i64,
     case: &str,
 ) -> String {
     let body = ecs_ok(
@@ -990,7 +1209,7 @@ async fn create_service(
             "cluster": cluster,
             "serviceName": service,
             "taskDefinition": family,
-            "desiredCount": 1,
+            "desiredCount": desired_count,
             "launchType": launch_type,
             // The revision above is in the `awsvpc` network mode, whose tasks each get
             // their own elastic network interface, so the launch says which subnets and
@@ -1108,4 +1327,23 @@ fn assert_close(actual: f64, expected: f64, case: &str, what: &str) {
         (actual - expected).abs() < 1e-9,
         "case {case:?}: expected {what} to be {expected}, got {actual}"
     );
+}
+
+/// What a month of `tasks` tasks of a `cpu`/`memory` Fargate task size costs, at the public
+/// per-vCPU-hour and per-GB-hour prices: 1024 CPU units is one vCPU and 1024 MiB is one GB.
+fn monthly_cost(cpu: f64, memory: f64, tasks: i64) -> f64 {
+    let per_task_hour =
+        cpu / 1024.0 * PRICE_PER_VCPU_HOUR + memory / 1024.0 * PRICE_PER_GB_HOUR;
+    round2(tasks as f64 * per_task_hour * HOURS_PER_MONTH)
+}
+
+/// A money figure or a percentage, to whole cents.
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// A container reservation of `reserved` out of a task of `current` capacity, at a task of
+/// `recommended` capacity: the same share of the task in whole units, and never nothing.
+fn scaled(reserved: f64, current: f64, recommended: f64) -> i64 {
+    ((reserved * recommended / current).round() as i64).max(1)
 }

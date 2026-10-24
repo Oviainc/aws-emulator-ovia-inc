@@ -25,10 +25,17 @@
 //! An ECS service the analysis has no input for is NOT given an invented recommendation:
 //! when the request named it, it is reported in `errors` (the modelled channel for "an
 //! error is returned if you request recommendations for an unsupported resource"), and
-//! when the request named no ARNs at all it is simply not an analysed resource. Members
-//! whose inputs this emulator does not hold at all — the savings opportunity (pricing) and
-//! the per-container recommendations (per-container utilization is not published) — are
-//! omitted rather than fabricated.
+//! when the request named no ARNs at all it is simply not an analysed resource.
+//!
+//! ## What the recommendation option costs
+//!
+//! A task on Fargate is billed per vCPU-hour and per GB-hour, so the monthly cost of BOTH
+//! the current task size and the recommended one follows from the sizes above, the
+//! service's own task count and the public Fargate price table ([`FARGATE_PRICE_PER_VCPU_HOUR`]) —
+//! which is what the option's savings opportunity, and the pricing source the
+//! recommendation names, are computed from. The per-container recommendations are the
+//! task definition's OWN container reservations carried to the recommended task size, in
+//! the proportion of the task they reserve today.
 //!
 //! ## Shape of an operation
 //!
@@ -293,6 +300,23 @@ const FARGATE_TASK_SIZES: &[(i32, &[i32])] = &[
 /// How many seconds one day of a look-back period is.
 const SECONDS_PER_DAY: f64 = 86_400.0;
 
+/// The public on-demand price of ONE vCPU-hour and ONE GB-hour of AWS Fargate compute, in
+/// [`crate::state::CURRENCY_USD`] — the two figures AWS Fargate's own pricing is published
+/// as ("you pay for the amount of vCPU and memory resources that your containerized
+/// application requests", charged per vCPU per hour and per GB per hour).
+///
+/// Every money figure an ECS service recommendation reports is computed from these two
+/// prices, exactly as the EBS and Lambda analyses of this service compute theirs from their
+/// own price tables, so the recommendation's figures agree with each other and with the
+/// [`crate::state::SAVINGS_ESTIMATION_SOURCE`] it names.
+const FARGATE_PRICE_PER_VCPU_HOUR: f64 = 0.040_48;
+/// See [`FARGATE_PRICE_PER_VCPU_HOUR`].
+const FARGATE_PRICE_PER_GB_HOUR: f64 = 0.004_445;
+
+/// CPU units in one vCPU, the unit the Fargate vCPU-hour price is charged in: "1024 CPU
+/// units is the equivalent of 1 vCPU" (the ECS model's `RegisterTaskDefinitionRequest$cpu`).
+const CPU_UNITS_PER_VCPU: f64 = 1024.0;
+
 /// The `GetECSServiceRecommendations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -439,6 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .flatten(),
                         reference,
                         look_back_period: String::new(),
+                        after_discounts: false,
                     })
                     .collect()
             } else {
@@ -455,6 +480,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             config: service_config(&inventory, &reference),
                             reference,
                             look_back_period: String::new(),
+                            after_discounts: false,
                         })
                     })
                     .collect()
@@ -472,16 +498,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             accounts.is_empty() || accounts.contains(&candidate.reference.account_id)
         });
 
-        // The look-back period in force for each service, resolved from this service's own
+        // The preferences in force for each service, resolved from this service's own
         // preference store by the scope precedence every preference read uses.
         {
             let preferences = state.lock();
             for candidate in &mut candidates {
-                candidate.look_back_period = effective_look_back_period(
+                let effective = effective_preferences(
                     &preferences,
                     &candidate.reference.arn,
                     &candidate.reference.account_id,
                 );
+                candidate.after_discounts = effective.after_discounts();
+                candidate.look_back_period = effective.look_back_period;
             }
         }
 
@@ -630,6 +658,9 @@ struct ServiceConfig {
     cpu_units: Option<i32>,
     /// That task definition's task-level `memory`, in MiB.
     memory_mib: Option<i32>,
+    /// How many tasks the service keeps running (`Service$desiredCount`): the multiplier
+    /// between what ONE task of the size above costs per month and what the SERVICE does.
+    desired_tasks: i32,
     /// Its container definitions, as the modelled `ContainerConfiguration` list.
     containers: Vec<ContainerConfiguration>,
     /// The service's tags.
@@ -645,6 +676,9 @@ struct Candidate {
     /// The `LookBackPeriodPreference` in force for it, resolved from this service's own
     /// preference store once every candidate is known.
     look_back_period: String,
+    /// Whether the `SavingsEstimationMode` preference in force for it activates reporting
+    /// savings net of Savings Plans discounts, from the same resolution.
+    after_discounts: bool,
 }
 
 /// What the ECS store holds for one service, or `None` when it holds no ACTIVE record for
@@ -678,6 +712,7 @@ fn service_config(
         memory_mib: definition
             .and_then(|definition| definition.memory.as_deref())
             .and_then(memory_mib),
+        desired_tasks: record.desired_count,
         containers: definition
             .map(|definition| {
                 definition
@@ -758,23 +793,21 @@ fn ceiled_units(value: f64) -> i32 {
     value.ceil().clamp(0.0, f64::from(i32::MAX)) as i32
 }
 
-/// The `LookBackPeriodPreference` in force for one service: the value from the most
-/// specific scope that sets one for the `EcsService` resource type, and the service's
-/// documented default (`DAYS_14`) when no record sets it.
+/// The preferences in force for one service: the value from the most specific scope that
+/// sets one for the `EcsService` resource type, and the service's documented defaults for
+/// every preference no record sets.
 ///
 /// The resolution is the preference store's OWN
 /// ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::effective_preferences_for`]) —
 /// "the ONE resolution in this service", which `GetEffectiveRecommendationPreferences` and
 /// every other recommendation reader state their preferences from — so this read cannot
-/// drift from them on the precedence or on the default.
-fn effective_look_back_period(
+/// drift from them on the precedence or on the defaults.
+fn effective_preferences(
     preferences: &crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState,
     arn: &str,
     account_id: &str,
-) -> String {
-    preferences
-        .effective_preferences_for(arn, crate::state::RESOURCE_TYPE_ECS_SERVICE, account_id)
-        .look_back_period
+) -> crate::state::EffectivePreferences {
+    preferences.effective_preferences_for(arn, crate::state::RESOURCE_TYPE_ECS_SERVICE, account_id)
 }
 
 /// The `Finding` / `FindingReasonCode` values one request filters on.
@@ -1063,6 +1096,18 @@ fn analyse(
         _ => crate::state::PERFORMANCE_RISK_HIGH,
     };
 
+    // What moving the service to the recommended task size saves per month, on the public
+    // Fargate prices: the difference between what the two sizes cost for the tasks this
+    // service keeps running, and that saving "as a percentage of monthly cost"
+    // (`SavingsOpportunity$savingsOpportunityPercentage`). A recommendation that costs the
+    // same or MORE saves nothing rather than a negative amount — an under-provisioned
+    // service is recommended a bigger task — which is the arithmetic every other analysis
+    // of this service reports a saving with.
+    let current_cost = fargate_monthly_cost(current_cpu, current_memory, config.desired_tasks);
+    let option_cost = fargate_monthly_cost(option_cpu, option_memory, config.desired_tasks);
+    let saved = crate::state::round_hundredths((current_cost - option_cost).max(0.0));
+    let saved_percentage = crate::state::percentage_of(saved, current_cost);
+
     Ok(ECSServiceRecommendation {
         service_arn: Some(arn.to_string()),
         account_id: Some(candidate.reference.account_id.clone()),
@@ -1096,10 +1141,30 @@ fn analyse(
         service_recommendation_options: Some(vec![ECSServiceRecommendationOption {
             memory: Some(option_memory),
             cpu: Some(option_cpu),
-            // A savings opportunity is a price difference, and this emulator holds no
-            // pricing, so both savings members are omitted rather than invented.
-            savings_opportunity: None,
-            savings_opportunity_after_discounts: None,
+            // The money the recommendation is for, computed from the two task sizes above
+            // and the public Fargate price table.
+            savings_opportunity: Some(SavingsOpportunity {
+                savings_opportunity_percentage: saved_percentage,
+                estimated_monthly_savings: Some(EstimatedMonthlySavings {
+                    currency: Some(crate::state::CURRENCY_USD.to_string()),
+                    value: saved,
+                }),
+            }),
+            // The saving net of Savings Plans discounts is reported only once the account
+            // activates the savings-estimation-mode preference — "specify the
+            // `AfterDiscounts` status to activate the preference". This emulator records no
+            // Savings Plans commitment against a service's Fargate spend, so the
+            // after-discount figures are the on-demand ones, which is exactly what the
+            // reported [`crate::state::SAVINGS_ESTIMATION_SOURCE`] says they came from.
+            savings_opportunity_after_discounts: candidate.after_discounts.then(|| {
+                ECSSavingsOpportunityAfterDiscounts {
+                    savings_opportunity_percentage: saved_percentage,
+                    estimated_monthly_savings: Some(ECSEstimatedMonthlySavings {
+                        currency: Some(crate::state::CURRENCY_USD.to_string()),
+                        value: saved,
+                    }),
+                }
+            }),
             projected_utilization_metrics: Some(vec![
                 projected_metric(
                     METRIC_NAME_CPU,
@@ -1122,19 +1187,99 @@ fn analyse(
                     projected(memory.average, current_memory, option_memory),
                 ),
             ]),
-            // Per-container utilization is not published for an ECS service, so there is
-            // nothing to size a container recommendation from.
-            container_recommendations: None,
+            // "The CPU and memory size recommendations for the containers within the task":
+            // each container's OWN reservation, carried to the recommended task size in the
+            // proportion of the task it reserves today. A task definition that reserves
+            // nothing per container has no container recommendation to report.
+            container_recommendations: (!config.containers.is_empty()).then(|| {
+                config
+                    .containers
+                    .iter()
+                    .map(|container| {
+                        container_recommendation(
+                            container,
+                            (current_cpu, option_cpu),
+                            (current_memory, option_memory),
+                        )
+                    })
+                    .collect()
+            }),
         }]),
         current_performance_risk: Some(current_performance_risk.to_string()),
         effective_recommendation_preferences: Some(ECSEffectiveRecommendationPreferences {
-            // The savings estimation mode names the PRICING source an estimate came from
-            // (`ECSSavingsEstimationModeSource`); no estimate is reported, so no source is.
-            savings_estimation_mode: None,
+            // The savings estimation mode names the PRICING source the estimate above came
+            // from (`ECSSavingsEstimationModeSource`): the public Fargate prices this
+            // analysis holds, never an account's own Cost Explorer or Cost Optimization Hub
+            // data — the one source constant this service reports every money figure from.
+            savings_estimation_mode: Some(ECSSavingsEstimationMode {
+                source: Some(crate::state::SAVINGS_ESTIMATION_SOURCE.to_string()),
+            }),
             look_back_period: Some(candidate.look_back_period.clone()),
         }),
         tags: Some(config.tags.clone()),
     })
+}
+
+/// What a month of one Amazon ECS service on Fargate costs: the vCPU-hours and GB-hours
+/// `tasks` tasks of a `cpu_units`/`memory_mib` task size bill over a month, at
+/// [`FARGATE_PRICE_PER_VCPU_HOUR`] and [`FARGATE_PRICE_PER_GB_HOUR`].
+///
+/// The month is the crate's one [`crate::state::HOURS_PER_MONTH`] and the GB the crate's
+/// one [`crate::state::MB_PER_GB`] (a task-level `memory` of `1024` MiB is "`1GB`", per the
+/// ECS model's `RegisterTaskDefinitionRequest$memory`), so this cost and every other
+/// monthly figure this service reports are months of the same length in the same units. A
+/// service that keeps no task running costs nothing, which is what its stored task count
+/// says.
+fn fargate_monthly_cost(cpu_units: i32, memory_mib: i32, tasks: i32) -> f64 {
+    let tasks = f64::from(tasks.max(0));
+    let vcpus = f64::from(cpu_units.max(0)) / CPU_UNITS_PER_VCPU;
+    let gigabytes = f64::from(memory_mib.max(0)) / crate::state::MB_PER_GB;
+    crate::state::round_hundredths(
+        tasks
+            * (vcpus * FARGATE_PRICE_PER_VCPU_HOUR + gigabytes * FARGATE_PRICE_PER_GB_HOUR)
+            * crate::state::HOURS_PER_MONTH,
+    )
+}
+
+/// One `ContainerRecommendation`: the container's reservations at the recommended task
+/// size. `cpu` is carried on the CPU sizes and both memory members on the memory sizes,
+/// each as the pair `(current, recommended)`, so a container keeps the share of the task it
+/// reserves today; a member the task definition sets no reservation for is recommended
+/// none, because there is no reservation to resize.
+fn container_recommendation(
+    container: &ContainerConfiguration,
+    cpu: (i32, i32),
+    memory: (i32, i32),
+) -> ContainerRecommendation {
+    ContainerRecommendation {
+        container_name: container.container_name.clone(),
+        cpu: container
+            .cpu
+            .map(|reserved| scaled_reservation(reserved, cpu.0, cpu.1)),
+        memory_size_configuration: container.memory_size_configuration.as_ref().map(
+            |configuration| MemorySizeConfiguration {
+                memory: configuration
+                    .memory
+                    .map(|reserved| scaled_reservation(reserved, memory.0, memory.1)),
+                memory_reservation: configuration
+                    .memory_reservation
+                    .map(|reserved| scaled_reservation(reserved, memory.0, memory.1)),
+            },
+        ),
+    }
+}
+
+/// A container reservation of `reserved` out of a task of `current` capacity, at a task of
+/// `recommended` capacity: the same share of the task, in whole units.
+///
+/// A positive reservation stays positive however far the task shrinks — a container that
+/// reserves capacity today cannot be recommended a reservation of nothing, which would be a
+/// container definition that reserves nothing rather than a smaller one.
+fn scaled_reservation(reserved: i32, current: i32, recommended: i32) -> i32 {
+    if reserved <= 0 || current <= 0 {
+        return reserved;
+    }
+    rounded_units(f64::from(reserved) * f64::from(recommended) / f64::from(current)).max(1)
 }
 
 /// The Compute Optimizer `ECSServiceLaunchType` one service runs with, or `None` for a
