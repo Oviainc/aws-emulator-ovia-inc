@@ -29,3 +29,5 @@ mod region_isolation;
 mod resource_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_sync_tasks.rs"]
+mod tag_sync_tasks;

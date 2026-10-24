@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTagSyncTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTagSyncTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTagSyncTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new tag-sync task in [`crate::state`] and reports it back. A task syncs
+//! EITHER a tag key-value pair OR a resource query into one stored group, so a request
+//! that names both, half a pair, or neither is refused and stores nothing.
+//!
+//! The task's ARN is minted once here, nested inside the group's own application-group
+//! ARN (see [`crate::state::GroupRecord::application_group_arn`]), so every later read —
+//! `GetTagSyncTask` and `ListTagSyncTasks` — resolves the same task and reports the same
+//! ARN beside the group's own stored ARN and name.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +214,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTagSyncTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTagSyncTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTagSyncTask"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here, the `RoleArn` is
+        // stored rather than assumed, and a success says nothing about the caller's
+        // permissions. `ctx` is read below for the audit record.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartTagSyncTaskErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Modelled on `TagKey`/`TagValue`: "When using the TagKey parameter, you
+        // must also specify the TagValue parameter", and the same the other way
+        // round — the pair is what a resource is matched on, so half of it matches
+        // nothing.
+        let tag_pair = match (input.tag_key.as_deref(), input.tag_value.as_deref()) {
+            (Some(key), Some(value)) => Some((key, value)),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(bad_request(
+                    "TagKey and TagValue are specified together: a tag-sync task \
+                     matches resources on the pair, so TagValue is required beside TagKey",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(bad_request(
+                    "TagKey and TagValue are specified together: a tag-sync task \
+                     matches resources on the pair, so TagKey is required beside TagValue",
+                ))
+            }
+        };
+        // Modelled on `ResourceQuery`: "When using the ResourceQuery parameter, you
+        // cannot use the TagKey and TagValue parameters."
+        if tag_pair.is_some() && input.resource_query.is_some() {
+            return Err(bad_request(
+                "a tag-sync task syncs either a TagKey and TagValue pair or a \
+                 ResourceQuery, but not both",
+            ));
+        }
+        // A task that names neither syncs nothing, so there is no task to start.
+        if tag_pair.is_none() && input.resource_query.is_none() {
+            return Err(bad_request(
+                "the request must name what the tag-sync task syncs, in a TagKey and \
+                 TagValue pair or in ResourceQuery",
+            ));
+        }
+        // The resource-query rules this service decides in one place, so every
+        // operation that takes a `ResourceQuery` refuses the same documents.
+        if let Some(query) = &input.resource_query {
+            crate::state::check_resource_query(query).map_err(bad_request)?;
+        }
+
+        // A group lives in the region whose endpoint created it, so the request's
+        // own region is where the identifier is resolved: a task cannot be started
+        // on another region's group.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The task is started on a group that EXISTS, resolved by ARN or by name the
+        // one way this service resolves a group identifier.
+        let not_found = || {
+            StartTagSyncTaskError::from(StartTagSyncTaskErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            ))
+        };
+        let key = store.lookup(&region, &input.group).ok_or_else(not_found)?;
+        // The emulator's own ceiling on stored state (see `MAX_TAG_SYNC_TASKS`), so a
+        // client looping on this operation is refused instead of growing the store
+        // without end.
+        if store.tag_sync_tasks.len() >= crate::state::MAX_TAG_SYNC_TASKS {
+            return Err(bad_request(format!(
+                "this emulator holds at most {} tag-sync tasks; cancel one before \
+                 starting another",
+                crate::state::MAX_TAG_SYNC_TASKS,
+            )));
+        }
+        let group = store.groups.get_mut(&key).ok_or_else(not_found)?;
+        // The modelled `TagSyncTaskArn` writes the group-name segment narrower than
+        // a group name may be, so a group whose name does not fit it cannot host a
+        // task the caller could address afterwards.
+        if !crate::state::is_tag_sync_task_group_name(&group.name) {
+            return Err(bad_request(format!(
+                "the group's name is not one a tag-sync task's ARN can carry: that \
+                 ARN writes it as at most {} of the letters, digits and `_ . -` a \
+                 task ARN admits",
+                crate::state::MAX_TAG_SYNC_TASK_GROUP_NAME_LENGTH,
+            )));
+        }
+        let group_name = group.name.clone();
+        let group_arn = group.group_arn.clone();
+        let application_group_arn = group.application_group_arn();
+        // An id already in use would address two tasks, so the draw is repeated until
+        // it names a task ARN the store does not hold.
+        let mut task_arn = crate::state::tag_sync_task_arn(
+            &application_group_arn,
+            &crate::state::new_qualifying_id(),
+        );
+        while store.tag_sync_tasks.contains_key(&task_arn) {
+            task_arn = crate::state::tag_sync_task_arn(
+                &application_group_arn,
+                &crate::state::new_qualifying_id(),
+            );
+        }
+        let record = crate::state::TagSyncTaskRecord {
+            task_arn,
+            region: key.region.clone(),
+            group_arn,
+            group_name,
+            tag_key: tag_pair.map(|(key, _)| key.to_string()),
+            tag_value: tag_pair.map(|(_, value)| value.to_string()),
+            resource_query: input
+                .resource_query
+                .map(|query| crate::state::ResourceQueryRecord {
+                    query_type: query.r#type,
+                    query: query.query,
+                }),
+            role_arn: input.role_arn,
+            // A task this emulator stores is managing its group from the moment it is
+            // stored, and nothing here fails one later.
+            status: crate::state::TAG_SYNC_TASK_ACTIVE.to_string(),
+            error_message: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        // Reported from the record that is about to be stored, so the response and
+        // the store cannot disagree.
+        let output = StartTagSyncTaskOutput {
+            group_arn: Some(record.group_arn.clone()),
+            group_name: Some(record.group_name.clone()),
+            task_arn: Some(record.task_arn.clone()),
+            tag_key: record.tag_key.clone(),
+            tag_value: record.tag_value.clone(),
+            resource_query: record.to_resource_query(),
+            role_arn: Some(record.role_arn.clone()),
+        };
+        store.tag_sync_tasks.insert(record.task_arn.clone(), record);
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and the
+        // outcome. Metadata only — no tag values, no query body, no role — and
+        // request-derived values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?region,
+            group = ?key.name,
+            outcome = "started",
+            "tag-sync task started",
+        );
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose
+/// parameters violate this operation's validation rules.
+fn bad_request(message: impl Into<String>) -> StartTagSyncTaskError {
+    StartTagSyncTaskErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

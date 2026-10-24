@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# ULIDs: the 26-character lowercase ids this service's modelled ARNs qualify a
+# group's name and a tag-sync task with.
+ulid = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
