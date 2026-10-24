@@ -204,13 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `assetId` and `propertyId` are `CustomID`s: a raw id, or
         // `externalId:<externalId>`. Both forms name the one stored property, resolved
         // the way every other handler in this crate resolves them.
-        let asset_id = store
-            .resolve_asset_id(&input.asset_id)
-            .ok_or_else(|| not_found(format!("The asset {} could not be found.", input.asset_id)))?;
-        let asset = store
-            .assets
-            .get(&asset_id)
-            .ok_or_else(|| not_found(format!("The asset {} could not be found.", input.asset_id)))?;
+        let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
+        })?;
+        let asset = store.assets.get(&asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
+        })?;
         let property = asset.property(&input.property_id).ok_or_else(|| {
             not_found(format!(
                 "The asset {} has no property {}.",

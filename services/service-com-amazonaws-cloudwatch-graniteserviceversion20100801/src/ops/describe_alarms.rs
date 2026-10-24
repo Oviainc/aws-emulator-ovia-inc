@@ -324,8 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DescribeAlarmsOutput {
                 composite_alarms: Some(composite_alarms),
                 metric_alarms: Some(metric_alarms),
-                // No log alarm can exist yet: `PutLogAlarm` is still scaffolded, so nothing
-                // has created one.
+                // Both relationship members describe composite-alarm relationships, and "the
+                // alarms specified in a composite alarm's rule expression can include metric
+                // alarms and other composite alarms" (`PutCompositeAlarm`) — so no log alarm
+                // is a child or a parent, whichever alarm was named.
                 log_alarms: Some(Vec::new()),
                 next_token,
             });
@@ -358,6 +360,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .composite_alarms
                     .iter()
                     .map(|(name, stored)| (name, Reported::Composite(&stored.alarm))),
+            );
+        }
+        if wants(crate::state::ALARM_TYPE_LOG) {
+            matching.extend(
+                store
+                    .log_alarms
+                    .iter()
+                    .map(|(name, stored)| (name, Reported::Log(&stored.alarm))),
             );
         }
         matching.retain(|(name, alarm)| {
@@ -406,19 +416,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut metric_alarms: Vec<MetricAlarm> = Vec::new();
         let mut composite_alarms: Vec<CompositeAlarm> = Vec::new();
+        let mut log_alarms: Vec<LogAlarm> = Vec::new();
         for (_, alarm) in page.iter().take(limit) {
             match alarm {
                 Reported::Metric(alarm) => metric_alarms.push((*alarm).clone()),
                 Reported::Composite(alarm) => composite_alarms.push((*alarm).clone()),
+                Reported::Log(alarm) => log_alarms.push((*alarm).clone()),
             }
         }
 
         Ok(DescribeAlarmsOutput {
             composite_alarms: Some(composite_alarms),
             metric_alarms: Some(metric_alarms),
-            // No log alarm can exist yet: `PutLogAlarm` is still scaffolded, so nothing has
-            // created one.
-            log_alarms: Some(Vec::new()),
+            log_alarms: Some(log_alarms),
             next_token,
         })
     }
@@ -434,6 +444,8 @@ enum Reported<'a> {
     Metric(&'a MetricAlarm),
     /// A composite alarm, reported under `CompositeAlarms`.
     Composite(&'a CompositeAlarm),
+    /// A log alarm, reported under `LogAlarms`.
+    Log(&'a LogAlarm),
 }
 
 impl Reported<'_> {
@@ -442,6 +454,7 @@ impl Reported<'_> {
         match self {
             Self::Metric(alarm) => alarm.state_value.as_deref(),
             Self::Composite(alarm) => alarm.state_value.as_deref(),
+            Self::Log(alarm) => alarm.state_value.as_deref(),
         }
     }
 
@@ -456,6 +469,11 @@ impl Reported<'_> {
                 &alarm.insufficient_data_actions,
             ],
             Self::Composite(alarm) => [
+                &alarm.ok_actions,
+                &alarm.alarm_actions,
+                &alarm.insufficient_data_actions,
+            ],
+            Self::Log(alarm) => [
                 &alarm.ok_actions,
                 &alarm.alarm_actions,
                 &alarm.insufficient_data_actions,

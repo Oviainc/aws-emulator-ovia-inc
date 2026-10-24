@@ -262,6 +262,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The tag rules this service decides in one place, so a create that carries
+        // tags stores exactly the pairs a later `Tag` call could write. Judged
+        // before anything is stored, so a refused create creates nothing.
+        if let Some(tags) = input.tags.as_ref() {
+            crate::state::check_tags(
+                tags.iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
+            .map_err(bad_request)?;
+            if tags.len() > crate::state::MAX_TAGS_PER_GROUP {
+                return Err(bad_request(format!(
+                    "this emulator holds at most {} tags per resource group",
+                    crate::state::MAX_TAGS_PER_GROUP,
+                )));
+            }
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // A group name is unique within an account and region, so a second create

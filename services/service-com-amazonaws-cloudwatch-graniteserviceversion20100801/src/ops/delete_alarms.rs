@@ -197,6 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 composites.len()
             )));
         }
+        // "Log alarms cannot be batch deleted." — a call that deletes a log alarm deletes that
+        // alarm and nothing else, so one naming a log alarm beside any other alarm is refused
+        // before anything is removed.
+        let mut named: Vec<&String> = input.alarm_names.iter().collect();
+        named.sort_unstable();
+        named.dedup();
+        let log_alarms = named
+            .iter()
+            .filter(|name| store.log_alarms.contains_key(name.as_str()))
+            .count();
+        if log_alarms > 0 && named.len() > 1 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AlarmNames names {} alarms including a log alarm, and a log alarm cannot be \
+                 deleted in a batch",
+                named.len()
+            )));
+        }
         // "you can't delete any composite alarm that is part of [a cycle] because there is
         // always still a composite alarm that depends on that alarm that you want to delete"
         // — generally: a composite alarm another composite alarm's `AlarmRule` references
@@ -223,10 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The alarm's HISTORY is deliberately left in place: "CloudWatch retains the
         // history of an alarm even if you delete the alarm" (`DescribeAlarmHistory`
         // documentation), so only the 14-day retention window ever removes it.
+        // A name the request repeats names ONE alarm, so the deduplicated list is what is
+        // walked: deleting from the raw list would find the second mention of a name already
+        // removed by the first and report an alarm that did exist as missing.
         let mut missing: Vec<&str> = Vec::new();
-        for name in &input.alarm_names {
-            let removed = store.alarms.remove(name).is_some()
-                || store.composite_alarms.remove(name).is_some();
+        for name in &named {
+            let removed = store.alarms.remove(name.as_str()).is_some()
+                || store.composite_alarms.remove(name.as_str()).is_some()
+                || store.log_alarms.remove(name.as_str()).is_some();
             if !removed {
                 missing.push(name.as_str());
             }

@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateGraphErrorModeled::InternalServerException(
                 InternalServerException {
@@ -177,9 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A graph lives in exactly one Region, so the Region this request was signed
+        // for is part of the lookup: a graph of another Region is not reconfigurable
+        // through this endpoint.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
-        let Some(graph) = store.settled_graph_mut(&input.graph_identifier, now) else {
+        let Some(graph) = store.settled_graph_mut(&input.graph_identifier, &region, now) else {
             return Err(UpdateGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )

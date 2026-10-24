@@ -316,7 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             (Some(asset_label), Some(property_label), None) => {
                 let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
-                    not_found(format!("The asset {asset_label} could not be found."))
+                    not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        asset_label,
+                    ))
                 })?;
                 let resolved = store.assets.get(&asset_id).and_then(|asset| {
                     asset
@@ -334,7 +337,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // with it or not: the shared resolver reaches the property's stream, or
             // the disassociated one standing under that alias.
             (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
-                not_found(format!("The property alias {alias} could not be found."))
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_TIME_SERIES,
+                    alias,
+                ))
             })?,
             _ => {
                 return Err(invalid_request(

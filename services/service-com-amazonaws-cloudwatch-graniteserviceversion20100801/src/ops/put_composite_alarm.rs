@@ -302,11 +302,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "The name for the composite alarm. This name must be unique within the Region."
-        // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name a metric
-        // alarm already holds cannot also name a composite alarm.
-        if store.alarms.contains_key(&input.alarm_name) {
+        // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name another
+        // kind of alarm already holds cannot also name a composite alarm.
+        if let Some(kind) = store
+            .alarm_kind(&input.alarm_name)
+            .filter(|kind| *kind != crate::state::ALARM_TYPE_COMPOSITE)
+        {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "a metric alarm named {} already exists in this Region",
+                "a {kind} named {} already exists in this Region",
                 input.alarm_name
             )));
         }
@@ -324,9 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The quota for alarms for this customer has already been reached." — CloudWatch's
         // published quota is 5,000 alarms per Region per account, counted over every kind of
         // alarm. Replacing an alarm that already exists adds none, so it is never refused.
-        if !is_update
-            && store.alarms.len() + store.composite_alarms.len() >= crate::state::MAX_ALARMS
-        {
+        if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
             return Err(PutCompositeAlarmErrorModeled::LimitExceededFault(
                 LimitExceededFault {
                     message: Some(format!(
@@ -412,6 +413,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 alarm,
                 // Parsed ONCE, here: every later evaluation and relationship read walks this
                 // tree rather than parsing the rule text again.
+                // How many nodes it carries, and the child names it resolves to, are derived
+                // ONCE here too, so no later pass re-walks the tree to obtain them.
+                rule_nodes: rule.node_count(),
+                child_names: children,
                 rule,
                 tags,
                 // The evaluation this write owes is due a span after it, so the alarm a

@@ -115,7 +115,10 @@ impl From<ListMonitorsErrorModeled> for ListMonitorsError {
 ///
 /// `state` is modelled as a plain `string`, so the framework cannot refuse a
 /// value outside the `MonitorState` enum, and `nextToken` as a length-bounded
-/// one, so it cannot refuse a cursor this service never vended.
+/// one, so it cannot refuse a cursor this service never vended. Both refusals
+/// are therefore stated by this handler, in AWS's own constraint-violation
+/// construction (`crate::state`'s shared message construction) rather than in
+/// wording of this handler's own.
 fn validation(message: String) -> ListMonitorsError {
     ListMonitorsErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -169,11 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `state` targets a plain `string`, so the framework admits any text;
         // the service filters on `MonitorState`, so anything outside that enum
-        // names no state a monitor can be in.
+        // names no state a monitor can be in. The refusal is stated the way AWS
+        // states a value outside an enumerated value set
+        // (`crate::state::enum_value_refusal`): the member, the submitted value
+        // and the admissible set, in AWS's constraint-violation construction.
         if let Some(requested) = input.state.as_deref() {
             if !MONITOR_STATE_VALUES.contains(&requested) {
-                return Err(validation(format!(
-                    "state must be one of {MONITOR_STATE_VALUES:?}, got {requested:?}"
+                return Err(validation(crate::state::enum_value_refusal(
+                    "state",
+                    MONITOR_STATE_VALUES,
+                    requested,
                 )));
             }
         }
@@ -208,11 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of the `state` filter, since the page that vended it — the
                 // monitors after it are still owed to the caller, so it drops
                 // out of the results rather than refusing the call. Only a
-                // token this service never produced names no position at all.
+                // token this service never produced names no position at all,
+                // and the rule a caller has to satisfy — a token a previous
+                // call of THIS listing handed back — is what the refusal states.
                 let Some(key) = crate::state::decode_page_token(token) else {
-                    return Err(validation(
-                        "nextToken does not name a page of this result set".to_string(),
-                    ));
+                    return Err(validation(crate::state::unknown_page_token_refusal(
+                        "nextToken",
+                        Self::NAME,
+                        token,
+                    )));
                 };
                 crate::state::resume_index(&matching, &key, |monitor| {
                     monitor.monitor_name.as_str()

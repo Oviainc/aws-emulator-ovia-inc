@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLogAlarm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLogAlarm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates or updates a log alarm. Implemented here — this is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutLogAlarm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The alarm a call stores is the modelled [`LogAlarm`] shape itself, in
+//! [`crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State::log_alarms`], so
+//! every member this operation accepts round-trips through `DescribeAlarms`. A log alarm's
+//! STATE is what its scheduled query's results make it: nothing has evaluated a newly
+//! configured alarm, so it is stored in `INSUFFICIENT_DATA` and a call that replaces an
+//! existing alarm leaves the state it had alone.
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +152,33 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The most query results a log alarm may evaluate: "Valid range is 1 through 100."
+/// (`PutLogAlarmInput$QueryResultsToEvaluate`) — the model bounds the member below at 1 and
+/// states the upper bound in prose only, so it is enforced here.
+const MAX_QUERY_RESULTS_TO_EVALUATE: i32 = 100;
+
+/// The most log lines an alarm action notification may carry: "Valid range is 0 through 50."
+/// (`PutLogAlarmInput$ActionLogLineCount`) — the member is an unbounded integer in the model,
+/// so the range is enforced here.
+const MAX_ACTION_LOG_LINE_COUNT: i32 = 50;
+
+/// The comparison operators a LOG alarm accepts.
+///
+/// `ComparisonOperator` models seven values, but a log alarm compares one aggregated query
+/// result against one threshold: "Valid values are GreaterThanThreshold,
+/// GreaterThanOrEqualToThreshold, LessThanThreshold, and LessThanOrEqualToThreshold."
+/// (`PutLogAlarmInput$ComparisonOperator`) — the other three are the anomaly-detection band
+/// operators, which name no band here.
+const LOG_ALARM_COMPARISON_OPERATORS: [&str; 4] = [
+    "GreaterThanOrEqualToThreshold",
+    "GreaterThanThreshold",
+    "LessThanOrEqualToThreshold",
+    "LessThanThreshold",
+];
+
+/// The `StateReason` of an alarm nothing has evaluated yet.
+const INITIAL_STATE_REASON: &str = "Unchecked: initial alarm creation";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,11 +209,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutLogAlarmOutput {
 // here — hence the `PutLogAlarmError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#PutLogAlarm")]
+//
+// `InternalServiceFault` is widened in: it is THIS service's own server fault (every
+// metric operation declares it), and it is the only honest answer when the shared store
+// cannot be reached. Reporting that as a 4xx would tell the caller to fix its request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#PutLogAlarm",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum PutLogAlarmErrorModeled {
     LimitExceededFault(LimitExceededFault),
     ResourceConflict(ResourceConflict),
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -240,18 +275,293 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLogAlarm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLogAlarmErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLogAlarm"))
+        // Every precondition the model cannot express is checked BEFORE the store is touched,
+        // so a refused request leaves it exactly as it was.
+        validate(&input)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutLogAlarmErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_secs();
+        let mut store = state.lock();
+
+        // "This name must be unique within the Amazon Web Services account and Region."
+        // (`PutLogAlarmInput$AlarmName`) — one name names ONE alarm, so a name a metric or
+        // composite alarm already holds is a conflict with the current state of that alarm
+        // rather than a second alarm under the same name.
+        if let Some(kind) = store
+            .alarm_kind(&input.alarm_name)
+            .filter(|kind| *kind != crate::state::ALARM_TYPE_LOG)
+        {
+            return Err(PutLogAlarmErrorModeled::ResourceConflict(ResourceConflict {
+                message: Some(format!(
+                    "a {kind} named {} already exists in this Region",
+                    input.alarm_name
+                )),
+            })
+            .into());
+        }
+
+        // "If you call this operation with the name of an existing log alarm, the operation
+        // replaces the previous configuration of that alarm." — the alarm this call replaces,
+        // when it replaces one: its STATE carries over (the write configures the alarm, it
+        // does not evaluate it) and its configuration is what the history document records as
+        // the configuration replaced.
+        let previous = store
+            .log_alarms
+            .get(&input.alarm_name)
+            .map(|stored| stored.alarm.clone());
+        let is_update = previous.is_some();
+
+        // "The quota for alarms for this customer has already been reached."
+        // (`LimitExceededFault`) — CloudWatch's published quota is 5,000 alarms per Region per
+        // account, counted over every kind of alarm. Replacing an alarm that already exists
+        // adds none, so it is never refused.
+        if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
+            return Err(PutLogAlarmErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "the quota of {} alarms has already been reached",
+                        crate::state::MAX_ALARMS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A new alarm has been configured but not yet evaluated: no scheduled query execution
+        // has produced a result for it, which is `INSUFFICIENT_DATA` and not a breach of the
+        // threshold — and "During the warm-up period, the alarm stays in INSUFFICIENT_DATA"
+        // (`WarmUpConfiguration`) makes the same state the configured one for a warm-up.
+        let carried = previous.as_ref().map(|alarm| {
+            (
+                alarm.state_value.clone(),
+                alarm.state_reason.clone(),
+                alarm.state_reason_data.clone(),
+                alarm.state_updated_timestamp,
+                alarm.state_transitioned_timestamp,
+                alarm.evaluation_state.clone(),
+            )
+        });
+        let (
+            state_value,
+            state_reason,
+            state_reason_data,
+            state_updated,
+            state_transitioned,
+            evaluation_state,
+        ) = carried.unwrap_or_else(|| {
+            (
+                Some(crate::state::ALARM_STATE_INSUFFICIENT_DATA.to_string()),
+                Some(INITIAL_STATE_REASON.to_string()),
+                None,
+                Some(crate::state::to_timestamp(now)),
+                Some(crate::state::to_timestamp(now)),
+                None,
+            )
+        });
+
+        // "When you create a log alarm, the operation creates a service-managed CloudWatch
+        // Logs scheduled query that runs the query string you provide on the schedule you
+        // configure." — the alarm's configuration therefore names that managed query, and
+        // `QueryARN` "is populated in DescribeAlarms responses"
+        // (`ScheduledQueryConfiguration$QueryARN`). The ARN is the service's to mint, so
+        // whatever the request carried in that member is replaced.
+        let scheduled_query_configuration = ScheduledQueryConfiguration {
+            query_arn: Some(crate::state::scheduled_query_arn(&region, &input.alarm_name)),
+            ..input.scheduled_query_configuration.clone()
+        };
+
+        let alarm = LogAlarm {
+            alarm_name: Some(input.alarm_name.clone()),
+            alarm_arn: Some(crate::state::alarm_arn(&region, &input.alarm_name)),
+            alarm_description: input.alarm_description.clone(),
+            alarm_configuration_updated_timestamp: Some(crate::state::to_timestamp(now)),
+            // "Indicates whether actions should be executed during any changes to the alarm
+            // state. The default is true." (`PutLogAlarmInput$ActionsEnabled`)
+            actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
+            ok_actions: input.ok_actions.clone(),
+            alarm_actions: input.alarm_actions.clone(),
+            insufficient_data_actions: input.insufficient_data_actions.clone(),
+            state_value,
+            state_reason,
+            state_reason_data,
+            state_updated_timestamp: state_updated,
+            scheduled_query_configuration: Some(scheduled_query_configuration),
+            query_results_to_evaluate: Some(input.query_results_to_evaluate),
+            query_results_to_alarm: Some(input.query_results_to_alarm),
+            threshold: Some(input.threshold),
+            comparison_operator: Some(input.comparison_operator.clone()),
+            // "If this parameter is omitted, the default behavior of missing is used."
+            // (`PutLogAlarmInput$TreatMissingData`)
+            treat_missing_data: Some(
+                input
+                    .treat_missing_data
+                    .clone()
+                    .unwrap_or_else(|| TREAT_MISSING_DATA_DEFAULT.to_string()),
+            ),
+            state_transitioned_timestamp: state_transitioned,
+            // An evaluation state reports what an EVALUATION found ("it indicates
+            // configuration errors in the alarm setup", `LogAlarm$EvaluationState`), so this
+            // write neither sets nor clears it: a new alarm has none, and one that replaces an
+            // alarm keeps the state value and evaluation state it carried.
+            evaluation_state,
+            // "The default is 0, which means no log lines are included."
+            // (`PutLogAlarmInput$ActionLogLineCount`)
+            action_log_line_count: Some(input.action_log_line_count.unwrap_or(0)),
+            action_log_line_role_arn: input.action_log_line_role_arn.clone(),
+            warm_up_configuration: input.warm_up_configuration.clone(),
+            action_configuration: input.action_configuration.clone(),
+        };
+
+        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — the
+        // configuration this call stored, and the one it replaced when it replaced an alarm.
+        let history_data = crate::state::log_configuration_update_history_data(
+            previous.as_ref(),
+            &alarm,
+        );
+
+        // "If you are using this operation to update an existing alarm, any tags you specify
+        // in this parameter are ignored. To change the tags of an existing alarm, use
+        // TagResource or UntagResource." — the rule this service's other alarm writers follow
+        // (`PutMetricAlarmInput$Tags`, `PutCompositeAlarmInput$Tags`).
+        let tags = match is_update {
+            true => store
+                .log_alarms
+                .get(&input.alarm_name)
+                .map(|stored| stored.tags.clone())
+                .unwrap_or_default(),
+            false => input.tags.clone().unwrap_or_default(),
+        };
+
+        store.log_alarms.insert(
+            input.alarm_name.clone(),
+            crate::state::StoredLogAlarm { alarm, tags },
+        );
+        store.record_history(
+            &input.alarm_name,
+            now,
+            AlarmHistoryItem {
+                alarm_name: Some(input.alarm_name.clone()),
+                alarm_contributor_id: None,
+                alarm_type: Some(crate::state::ALARM_TYPE_LOG.to_string()),
+                timestamp: Some(crate::state::to_timestamp(now)),
+                history_item_type: Some("ConfigurationUpdate".to_string()),
+                history_summary: Some(if is_update {
+                    "Alarm updated from configuration".to_string()
+                } else {
+                    "Alarm created".to_string()
+                }),
+                history_data: Some(history_data),
+                alarm_contributor_attributes: None,
+            },
+        );
+
+        Ok(PutLogAlarmOutput)
     }
+}
+
+/// The default `TreatMissingData`: "If this parameter is omitted, the default behavior of
+/// missing is used." (`PutLogAlarmInput$TreatMissingData`).
+const TREAT_MISSING_DATA_DEFAULT: &str = "missing";
+
+/// Refuse a request that satisfies every modelled constraint but breaks a rule the model
+/// states in prose only, or one that holds BETWEEN members.
+///
+/// Every check reads the documented rule for the member it names, so the same refusal is
+/// given whatever order a caller supplies the members in.
+fn validate(input: &PutLogAlarmInput) -> Result<(), PutLogAlarmError> {
+    let refuse = |message: String| Err(crate::scaffolded::Scaffolded::validation_error(message));
+
+    // "Valid range is 1 through 100." (`QueryResultsToEvaluate`)
+    if input.query_results_to_evaluate > MAX_QUERY_RESULTS_TO_EVALUATE {
+        return refuse(format!(
+            "QueryResultsToEvaluate is {}, and the most query results an alarm can evaluate is \
+             {MAX_QUERY_RESULTS_TO_EVALUATE}",
+            input.query_results_to_evaluate
+        ));
+    }
+    // "Must be less than or equal to QueryResultsToEvaluate." (`QueryResultsToAlarm`) — the M
+    // of an M-of-N evaluation cannot ask for more breaches than there are results to evaluate.
+    if input.query_results_to_alarm > input.query_results_to_evaluate {
+        return refuse(format!(
+            "QueryResultsToAlarm is {} and QueryResultsToEvaluate is {}, so the alarm could \
+             never see enough breaching results",
+            input.query_results_to_alarm, input.query_results_to_evaluate
+        ));
+    }
+    // "Valid values are GreaterThanThreshold, GreaterThanOrEqualToThreshold,
+    // LessThanThreshold, and LessThanOrEqualToThreshold." (`ComparisonOperator`)
+    if !LOG_ALARM_COMPARISON_OPERATORS.contains(&input.comparison_operator.as_str()) {
+        return refuse(format!(
+            "ComparisonOperator {} is not one a log alarm can use; valid values are {}",
+            input.comparison_operator,
+            LOG_ALARM_COMPARISON_OPERATORS.join(", ")
+        ));
+    }
+    // "Valid values are breaching, notBreaching, ignore, and missing." (`TreatMissingData`)
+    if let Some(treat_missing_data) = input.treat_missing_data.as_deref() {
+        if !crate::state::TREAT_MISSING_DATA_VALUES.contains(&treat_missing_data) {
+            return refuse(format!(
+                "TreatMissingData {treat_missing_data} is not a value this alarm can handle \
+                 missing data with; valid values are {}",
+                crate::state::TREAT_MISSING_DATA_VALUES.join(", ")
+            ));
+        }
+    }
+    // "Valid range is 0 through 50." (`ActionLogLineCount`)
+    let log_lines = input.action_log_line_count.unwrap_or(0);
+    if !(0..=MAX_ACTION_LOG_LINE_COUNT).contains(&log_lines) {
+        return refuse(format!(
+            "ActionLogLineCount is {log_lines}, and the number of log lines an action \
+             notification can carry is 0 through {MAX_ACTION_LOG_LINE_COUNT}"
+        ));
+    }
+    // "Required when ActionLogLineCount is greater than 0." (`ActionLogLineRoleArn`) — without
+    // the role there is nothing CloudWatch could assume to retrieve those log events.
+    match (log_lines > 0, input.action_log_line_role_arn.as_deref()) {
+        (true, None) => {
+            return refuse(
+                "ActionLogLineRoleArn is required when ActionLogLineCount is greater than 0"
+                    .to_string(),
+            )
+        }
+        (_, Some(role_arn)) => {
+            if let Some(message) = crate::state::role_arn_error("ActionLogLineRoleArn", role_arn) {
+                return refuse(message);
+            }
+        }
+        (false, None) => {}
+    }
+
+    let query = &input.scheduled_query_configuration;
+    if let Some(message) =
+        crate::state::role_arn_error("ScheduledQueryRoleARN", &query.scheduled_query_role_arn)
+    {
+        return refuse(message);
+    }
+    let schedule = &query.schedule_configuration;
+    if let Some(message) = crate::state::schedule_expression_error(&schedule.schedule_expression) {
+        return refuse(message);
+    }
+    // "Must be non-negative and less than StartTimeOffset." (`EndTimeOffset`) — the model
+    // bounds both offsets at or above zero (`StartTimeOffset` range 1..2592000,
+    // `EndTimeOffset` range 0..2592000), so the boundary validator has already refused a
+    // negative one and what is left to check here is the ORDER: a query time range that ends
+    // before it begins covers nothing.
+    if let Some(end_time_offset) = schedule.end_time_offset {
+        if end_time_offset >= schedule.start_time_offset {
+            return refuse(format!(
+                "EndTimeOffset is {end_time_offset} and StartTimeOffset is {}, so the query time \
+                 range would cover no time at all",
+                schedule.start_time_offset
+            ));
+        }
+    }
+
+    Ok(())
 }

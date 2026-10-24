@@ -119,7 +119,7 @@ pub(crate) fn error_code(body: &Value) -> &str {
 }
 
 /// The `message` of an error body, or `""`.
-fn error_message(body: &Value) -> &str {
+pub(crate) fn error_message(body: &Value) -> &str {
     body.get("message").and_then(Value::as_str).unwrap_or("")
 }
 

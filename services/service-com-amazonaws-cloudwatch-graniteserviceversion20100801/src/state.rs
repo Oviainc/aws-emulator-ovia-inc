@@ -15,6 +15,9 @@
 //!   composite alarms written by `PutCompositeAlarm`, whose state is EVALUATED from their
 //!   `AlarmRule` over the alarms the rule references
 //!   ([`ComAmazonawsCloudwatchGraniteserviceversion20100801State::evaluate_composite_alarms`]).
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::log_alarms`] — the log
+//!   alarms written by `PutLogAlarm` and read back by `DescribeAlarms`, each carrying the
+//!   configuration of the CloudWatch Logs scheduled query it evaluates.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metric_streams`] — the
 //!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
 //!
@@ -23,14 +26,15 @@
 //! without a field-by-field copy that can silently drop one. A metric stream is stored the
 //! same way, as the modelled [`GetMetricStreamOutput`] its reader returns.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::serde_json::{Map, Value};
 
 use crate::ops::types::{
     ActionConfiguration, AlarmHistoryItem, CompositeAlarm, Dimension, EvaluationCriteria,
-    EvaluationWindow, GetMetricStreamOutput, MetricAlarm, MetricDataQuery, Tag,
+    EvaluationWindow, GetMetricStreamOutput, LogAlarm, MetricAlarm, MetricDataQuery,
+    ScheduledQueryConfiguration, Tag, WarmUpConfiguration,
 };
 
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
@@ -202,6 +206,19 @@ pub struct StoredCompositeAlarm {
     pub rule: AlarmRule,
     /// The tags `PutCompositeAlarm` was given for this alarm.
     pub tags: Vec<Tag>,
+    /// The alarm NAMES this alarm's rule references, resolved once by the write that stored
+    /// it, in the order the rule names them and without repeats.
+    ///
+    /// Derived from [`Self::rule`] and kept beside it for the same reason the parsed rule is
+    /// kept: every evaluation pass and every relationship read needs this list, and walking
+    /// the rule again for each of them would make one call's work grow with the rule's size
+    /// times the alarms the store holds.
+    pub child_names: Vec<String>,
+    /// How many nodes this alarm's rule carries, counted once by the write that stored it.
+    ///
+    /// What one evaluation of this alarm COSTS, which is what the per-call evaluation budget
+    /// ([`MAX_COMPOSITE_EVALUATION_NODES`]) is spent in.
+    pub rule_nodes: usize,
     /// The instant, in epoch seconds, from which this alarm's rule evaluation is owed.
     ///
     /// "When this operation creates an alarm, the alarm state is immediately set to
@@ -218,6 +235,16 @@ pub struct StoredCompositeAlarm {
     /// children alarms change state." (`SetAlarmState`) — comparing this snapshot against
     /// the children's current states is what detects that change.
     pub forced_child_states: Option<Vec<(String, Option<String>)>>,
+}
+
+/// A stored log alarm: the modelled shape `DescribeAlarms` returns, plus the tags
+/// `PutLogAlarm` accepted (no `LogAlarm` member carries them).
+#[derive(Debug, Clone, Default)]
+pub struct StoredLogAlarm {
+    /// The alarm as `DescribeAlarms` reports it.
+    pub alarm: LogAlarm,
+    /// The tags `PutLogAlarm` was given for this alarm.
+    pub tags: Vec<Tag>,
 }
 
 /// A stored alarm history item: the modelled shape `DescribeAlarmHistory` returns, plus the
@@ -256,6 +283,8 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub alarms: HashMap<String, StoredAlarm>,
     /// Composite alarms by alarm name.
     pub composite_alarms: HashMap<String, StoredCompositeAlarm>,
+    /// Log alarms by alarm name.
+    pub log_alarms: HashMap<String, StoredLogAlarm>,
     /// Alarm history by alarm name, in append order.
     pub alarm_history: HashMap<String, Vec<StoredHistoryItem>>,
     /// The sequence number the next recorded history item takes.
@@ -328,9 +357,87 @@ pub fn alarm_arn(region: &str, alarm_name: &str) -> String {
     ::engine::emulator_arn("cloudwatch", region, &format!("alarm:{alarm_name}"))
 }
 
+/// The ARN of the CloudWatch Logs scheduled query a log alarm's configuration names:
+/// `arn:aws:logs:<region>:<account>:scheduled-query:<AlarmName>`.
+///
+/// "When you create a log alarm, the operation creates a service-managed CloudWatch Logs
+/// scheduled query" (`PutLogAlarm`), whose ARN `DescribeAlarms` reports back
+/// (`ScheduledQueryConfiguration$QueryARN`). It is derived from the alarm's own name, so it
+/// is stable across reads and names the same managed query for the life of the alarm.
+pub fn scheduled_query_arn(region: &str, alarm_name: &str) -> String {
+    ::engine::emulator_arn("logs", region, &format!("scheduled-query:{alarm_name}"))
+}
+
 /// A metric stream's ARN: `arn:aws:cloudwatch:<region>:<account>:metric-stream/<Name>`.
 pub fn metric_stream_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("cloudwatch", region, &format!("metric-stream/{name}"))
+}
+
+/// Why `value` is not the ARN of an IAM role, or `None` when it is one.
+///
+/// A member that carries "the Amazon Resource Name (ARN) of an IAM role that CloudWatch
+/// assumes" (`PutLogAlarmInput$ActionLogLineRoleArn`,
+/// `ScheduledQueryConfiguration$ScheduledQueryRoleARN`) names an IAM role, so a value that is
+/// not a role ARN at all could never be assumed by anything. Whether the role EXISTS, and
+/// whether CloudWatch may assume it, is not decided here: that is settled when the query runs
+/// and is reported on the alarm, not refused at configuration time.
+pub fn role_arn_error(member: &str, value: &str) -> Option<String> {
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    let is_role_arn = matches!(fields.as_slice(), ["arn", partition, "iam", "", account, resource]
+        if !partition.is_empty()
+            && !account.is_empty()
+            && resource.strip_prefix("role/").is_some_and(|name| !name.is_empty()));
+    (!is_role_arn).then(|| format!("{member} is not the ARN of an IAM role: {value}"))
+}
+
+/// The time units a `rate()` schedule expression accepts, each in its singular and plural
+/// form: "Specify a `rate()` expression, for example `rate(5 minutes)`."
+/// (`ScheduleConfiguration$ScheduleExpression`).
+const RATE_UNITS: [&str; 6] = ["minute", "minutes", "hour", "hours", "day", "days"];
+
+/// How many whitespace-separated fields a `cron()` schedule expression carries.
+///
+/// Five is the standard cron syntax the underlying scheduled query documents ("The expression
+/// uses standard cron syntax and supports minute-level precision" — CloudWatch Logs
+/// `CreateScheduledQuery$scheduleExpression`); six is that syntax with the year field AWS
+/// schedule expressions add.
+const CRON_FIELDS: [usize; 2] = [5, 6];
+
+/// Why `expression` is not a schedule expression the underlying scheduled query can run on,
+/// or `None` when it is one.
+///
+/// "The schedule expression that defines how often the underlying CloudWatch Logs scheduled
+/// query runs. Specify a `rate()` expression, for example `rate(5 minutes)`."
+/// (`ScheduleConfiguration$ScheduleExpression`), and the scheduled query itself takes a cron
+/// expression (CloudWatch Logs `CreateScheduledQuery$scheduleExpression`) — so a schedule is
+/// either a rate of a positive number of a documented time unit, or a cron expression.
+pub fn schedule_expression_error(expression: &str) -> Option<String> {
+    let trimmed = expression.trim();
+    let inside = trimmed.strip_suffix(')');
+    if let Some(rate) = inside.and_then(|head| head.strip_prefix("rate(")) {
+        let fields: Vec<&str> = rate.split_whitespace().collect();
+        let valid = matches!(fields.as_slice(), [value, unit]
+            if value.parse::<u64>().is_ok_and(|value| value >= 1) && RATE_UNITS.contains(unit));
+        return (!valid).then(|| {
+            format!(
+                "ScheduleExpression must be a rate of a positive number of {}: {expression}",
+                RATE_UNITS.join(", ")
+            )
+        });
+    }
+    if let Some(cron) = inside.and_then(|head| head.strip_prefix("cron(")) {
+        let fields = cron.split_whitespace().count();
+        return (!CRON_FIELDS.contains(&fields)).then(|| {
+            format!(
+                "ScheduleExpression carries {fields} cron fields, and a cron expression has {} \
+                 or {}: {expression}",
+                CRON_FIELDS[0], CRON_FIELDS[1]
+            )
+        });
+    }
+    Some(format!(
+        "ScheduleExpression is neither a rate() nor a cron() expression: {expression}"
+    ))
 }
 
 /// A running metric stream: "The state of the metric stream. The possible values are
@@ -403,6 +510,17 @@ pub const ALARM_HISTORY_RETENTION_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;
 /// each following call carries it one more level, and the evaluation is idempotent.
 const MAX_COMPOSITE_EVALUATION_PASSES: usize = 8;
 
+/// The most rule NODES one call may evaluate, across every composite alarm and every pass.
+///
+/// The pass bound alone does not bound the work: without this, one call's evaluation grows
+/// with the composite alarms the store holds ([`MAX_ALARMS`]) times the nodes each rule may
+/// carry, which a caller controls. This is the ceiling on that product, chosen three orders
+/// of magnitude above what a realistic store needs (a thousand composite alarms whose rules
+/// name a handful of children each settle in a few thousand nodes per pass). An evaluation
+/// the budget stops stays DUE, so the next call carries it and the outcome is the same — only
+/// later.
+const MAX_COMPOSITE_EVALUATION_NODES: usize = 1_000_000;
+
 /// `OK`, one of the three modelled `StateValue` values (`STATE_VALUE_VALUES`).
 pub const ALARM_STATE_OK: &str = "OK";
 
@@ -421,6 +539,15 @@ pub const ALARM_TYPE_METRIC: &str = "MetricAlarm";
 /// `CompositeAlarm`, one of the modelled `AlarmType` values (`ALARM_TYPE_VALUES`): the kind
 /// of alarm `PutCompositeAlarm` creates.
 pub const ALARM_TYPE_COMPOSITE: &str = "CompositeAlarm";
+
+/// `LogAlarm`, one of the modelled `AlarmType` values (`ALARM_TYPE_VALUES`): the kind of
+/// alarm `PutLogAlarm` creates.
+pub const ALARM_TYPE_LOG: &str = "LogAlarm";
+
+/// The values `TreatMissingData` accepts: "Valid values are breaching, notBreaching, ignore,
+/// and missing." (`smithy_query(query="doc",shape="PutLogAlarmInput",member="TreatMissingData")`)
+/// — the member is a plain string in the model, so the value list is enforced here.
+pub const TREAT_MISSING_DATA_VALUES: [&str; 4] = ["breaching", "notBreaching", "ignore", "missing"];
 
 /// `Alarm`, one of the modelled `ActionsSuppressedBy` values
 /// (`ACTIONS_SUPPRESSED_BY_VALUES`): "When the value is `ALARM`, it means that the actions
@@ -526,6 +653,34 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         });
     }
 
+    /// The kind of alarm `name` already names, as one of the modelled `AlarmType` values;
+    /// `None` when no alarm of that name exists.
+    ///
+    /// "This name must be unique within the Amazon Web Services account and Region."
+    /// (`PutLogAlarmInput$AlarmName`, and the same sentence on the other alarm writers) \u2014 one
+    /// name names ONE alarm whatever kind it is, so every writer asks this before it stores an
+    /// alarm and refuses a name another kind already holds.
+    pub fn alarm_kind(&self, name: &str) -> Option<&'static str> {
+        if self.alarms.contains_key(name) {
+            Some(ALARM_TYPE_METRIC)
+        } else if self.composite_alarms.contains_key(name) {
+            Some(ALARM_TYPE_COMPOSITE)
+        } else if self.log_alarms.contains_key(name) {
+            Some(ALARM_TYPE_LOG)
+        } else {
+            None
+        }
+    }
+
+    /// How many alarms this store holds, counting every kind.
+    ///
+    /// "The quota for alarms for this customer has already been reached."
+    /// (`LimitExceededFault`) \u2014 CloudWatch's alarm quota is per Region per account over every
+    /// kind of alarm, so the count every writer checks against [`MAX_ALARMS`] is this one.
+    pub fn alarm_count(&self) -> usize {
+        self.alarms.len() + self.composite_alarms.len() + self.log_alarms.len()
+    }
+
     /// The current `StateValue` of the alarm a rule reference names, whichever kind of alarm
     /// it is; `None` when the store holds no alarm of that name.
     ///
@@ -545,12 +700,15 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
 
     /// The names and current states of the alarms one composite-alarm rule references, in the
     /// order the rule names them.
-    pub fn child_states(&self, rule: &AlarmRule) -> Vec<(String, Option<String>)> {
-        alarm_rule_child_names(rule)
-            .into_iter()
+    ///
+    /// Takes the resolved child names ([`StoredCompositeAlarm::child_names`]) rather than the
+    /// rule, so a caller on a hot path never re-walks the rule to obtain them.
+    pub fn child_states_of(&self, names: &[String]) -> Vec<(String, Option<String>)> {
+        names
+            .iter()
             .map(|name| {
-                let state = self.alarm_state_value(&name);
-                (name, state)
+                let state = self.alarm_state_value(name);
+                (name.clone(), state)
             })
             .collect()
     }
@@ -562,7 +720,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub fn composite_alarm_children(&self, name: &str) -> Vec<String> {
         self.composite_alarms
             .get(name)
-            .map(|stored| alarm_rule_child_names(&stored.rule))
+            .map(|stored| stored.child_names.clone())
             .unwrap_or_default()
     }
 
@@ -575,9 +733,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             .iter()
             .filter(|(parent, stored)| {
                 parent.as_str() != name
-                    && alarm_rule_child_names(&stored.rule)
-                        .iter()
-                        .any(|child| child == name)
+                    && stored.child_names.iter().any(|child| child == name)
             })
             .map(|(parent, _)| parent.clone())
             .collect();
@@ -598,35 +754,52 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         // A composite alarm's rule can reference another composite alarm, so one alarm's new
         // state can change its parent's outcome too; one pass settles one level of that
         // chain. The number of passes is bounded by [`MAX_COMPOSITE_EVALUATION_PASSES`] as
-        // well as by the number of composite alarms, so the work ONE call can do is bounded
-        // by that constant times the alarms the store holds times the nodes a rule may
-        // carry. The bound is also what stops a CYCLE of composite alarms: "the evaluation
-        // of composite alarms stops if CloudWatch detects a cycle in the evaluation path."
+        // well as by the number of composite alarms, and the NODES one call may evaluate are
+        // bounded by [`MAX_COMPOSITE_EVALUATION_NODES`] — so the work ONE call can do is
+        // bounded whatever the store holds, rather than growing with the alarms times the size
+        // of their rules. An evaluation the budget stops is not answered wrongly, only
+        // settled later: it stays due, and the next call carries it (the evaluation is
+        // idempotent). The pass bound is also what stops a CYCLE of composite alarms: "the
+        // evaluation of composite alarms stops if CloudWatch detects a cycle in the
+        // evaluation path."
         let passes = self
             .composite_alarms
             .len()
             .min(MAX_COMPOSITE_EVALUATION_PASSES);
+        let mut budget = MAX_COMPOSITE_EVALUATION_NODES;
         for _ in 0..passes {
-            if !self.evaluate_composite_alarms_once(now_secs) {
+            if !self.evaluate_composite_alarms_once(now_secs, &mut budget) || budget == 0 {
                 break;
             }
         }
     }
 
     /// One evaluation pass over every composite alarm, reporting whether any alarm's state
-    /// value changed. Alarms are visited in name order, so the pass is deterministic.
-    fn evaluate_composite_alarms_once(&mut self, now_secs: f64) -> bool {
+    /// value changed. Alarms are visited in name order, so the pass is deterministic, and the
+    /// pass stops as soon as `budget` is spent.
+    fn evaluate_composite_alarms_once(&mut self, now_secs: f64, budget: &mut usize) -> bool {
         let mut names: Vec<String> = self.composite_alarms.keys().cloned().collect();
         names.sort();
         let mut changed = false;
         for name in names {
-            changed |= self.evaluate_composite_alarm(&name, now_secs);
+            if *budget == 0 {
+                break;
+            }
+            changed |= self.evaluate_composite_alarm(&name, now_secs, budget);
         }
         changed
     }
 
     /// Evaluate ONE composite alarm, reporting whether its state value changed.
-    fn evaluate_composite_alarm(&mut self, name: &str, now_secs: f64) -> bool {
+    ///
+    /// The alarm's rule nodes are charged to `budget`, and an alarm whose evaluation the
+    /// remaining budget cannot pay for is left for a later call.
+    fn evaluate_composite_alarm(
+        &mut self,
+        name: &str,
+        now_secs: f64,
+        budget: &mut usize,
+    ) -> bool {
         // Everything this evaluation reads is read before anything is written.
         let Some(stored) = self.composite_alarms.get(name) else {
             return false;
@@ -634,11 +807,18 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         if now_secs < stored.evaluation_due_secs {
             return false;
         }
+        // A rule carries at least one node, so every evaluation costs something and the
+        // budget always advances.
+        let cost = stored.rule_nodes.max(1);
+        if cost > *budget {
+            return false;
+        }
+        *budget -= cost;
         let rule = &stored.rule;
         let previous = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
         let forced = stored.forced_child_states.clone();
         let suppressor = stored.alarm.actions_suppressor.clone();
-        let children = self.child_states(rule);
+        let children = self.child_states_of(&stored.child_names);
         // "It returns to its actual state only once any of its children alarms change state."
         // (`SetAlarmState`) — until then the state a caller forced stands.
         let forced_stands = forced.is_some_and(|snapshot| snapshot == children);
@@ -925,6 +1105,167 @@ pub fn composite_configuration_update_history_data(
     )
 }
 
+/// The JSON record of a LOG alarm's configuration write.
+pub fn log_configuration_update_history_data(
+    previous: Option<&LogAlarm>,
+    updated: &LogAlarm,
+) -> String {
+    configuration_history_data(
+        previous.map(log_alarm_configuration_document),
+        log_alarm_configuration_document(updated),
+        updated.alarm_name.as_deref(),
+    )
+}
+
+/// A log alarm's configuration as a history document records it: every configuration member
+/// the alarm carries, under the model's member name in lower camel case, and only those it
+/// carries. The state members are NOT part of it, for the same reason they are not part of a
+/// metric alarm's: "If you call this operation with the name of an existing log alarm, the
+/// operation replaces the previous configuration of that alarm." (`PutLogAlarm`), so a
+/// configuration write records configuration only.
+fn log_alarm_configuration_document(alarm: &LogAlarm) -> Value {
+    let mut config = Map::new();
+    insert_member(&mut config, "alarmName", json_text(&alarm.alarm_name));
+    insert_member(&mut config, "alarmArn", json_text(&alarm.alarm_arn));
+    insert_member(
+        &mut config,
+        "alarmDescription",
+        json_text(&alarm.alarm_description),
+    );
+    insert_member(
+        &mut config,
+        "actionsEnabled",
+        alarm.actions_enabled.map(Value::from),
+    );
+    insert_member(&mut config, "okActions", json_strings(&alarm.ok_actions));
+    insert_member(
+        &mut config,
+        "alarmActions",
+        json_strings(&alarm.alarm_actions),
+    );
+    insert_member(
+        &mut config,
+        "insufficientDataActions",
+        json_strings(&alarm.insufficient_data_actions),
+    );
+    insert_member(
+        &mut config,
+        "scheduledQueryConfiguration",
+        alarm
+            .scheduled_query_configuration
+            .as_ref()
+            .map(scheduled_query_configuration_document),
+    );
+    insert_member(
+        &mut config,
+        "queryResultsToEvaluate",
+        alarm.query_results_to_evaluate.map(Value::from),
+    );
+    insert_member(
+        &mut config,
+        "queryResultsToAlarm",
+        alarm.query_results_to_alarm.map(Value::from),
+    );
+    insert_member(&mut config, "threshold", alarm.threshold.map(Value::from));
+    insert_member(
+        &mut config,
+        "comparisonOperator",
+        json_text(&alarm.comparison_operator),
+    );
+    insert_member(
+        &mut config,
+        "treatMissingData",
+        json_text(&alarm.treat_missing_data),
+    );
+    insert_member(
+        &mut config,
+        "actionLogLineCount",
+        alarm.action_log_line_count.map(Value::from),
+    );
+    insert_member(
+        &mut config,
+        "actionLogLineRoleArn",
+        json_text(&alarm.action_log_line_role_arn),
+    );
+    insert_member(
+        &mut config,
+        "warmUpConfiguration",
+        alarm
+            .warm_up_configuration
+            .as_ref()
+            .map(warm_up_configuration_document),
+    );
+    insert_member(
+        &mut config,
+        "actionConfiguration",
+        alarm
+            .action_configuration
+            .as_ref()
+            .map(action_configuration_document),
+    );
+    Value::Object(config)
+}
+
+/// A log alarm's `ScheduledQueryConfiguration` as a history document records it.
+fn scheduled_query_configuration_document(configuration: &ScheduledQueryConfiguration) -> Value {
+    let mut document = Map::new();
+    document.insert(
+        "queryString".to_string(),
+        Value::from(configuration.query_string.clone()),
+    );
+    insert_member(
+        &mut document,
+        "logGroupIdentifiers",
+        json_strings(&configuration.log_group_identifiers),
+    );
+    insert_member(&mut document, "queryARN", json_text(&configuration.query_arn));
+    document.insert(
+        "scheduledQueryRoleARN".to_string(),
+        Value::from(configuration.scheduled_query_role_arn.clone()),
+    );
+    let schedule = &configuration.schedule_configuration;
+    let mut schedule_document = Map::new();
+    schedule_document.insert(
+        "scheduleExpression".to_string(),
+        Value::from(schedule.schedule_expression.clone()),
+    );
+    schedule_document.insert(
+        "startTimeOffset".to_string(),
+        Value::from(schedule.start_time_offset),
+    );
+    insert_member(
+        &mut schedule_document,
+        "endTimeOffset",
+        schedule.end_time_offset.map(Value::from),
+    );
+    document.insert(
+        "scheduleConfiguration".to_string(),
+        Value::Object(schedule_document),
+    );
+    document.insert(
+        "aggregationExpression".to_string(),
+        Value::from(configuration.aggregation_expression.clone()),
+    );
+    Value::Object(document)
+}
+
+/// A `WarmUpConfiguration` as a history document records it.
+fn warm_up_configuration_document(warm_up: &WarmUpConfiguration) -> Value {
+    let mut document = Map::new();
+    document.insert(
+        "warmUpPeriodDurationInMinutes".to_string(),
+        Value::from(warm_up.warm_up_period_duration_in_minutes),
+    );
+    insert_member(
+        &mut document,
+        "onlyStartEvaluatingAfterWarmUpPeriodEnds",
+        warm_up
+            .only_start_evaluating_after_warm_up_period_ends
+            .map(Value::from),
+    );
+    Value::Object(document)
+}
+
 /// A composite alarm's configuration as a history document records it: every configuration
 /// member the alarm carries, under the model's member name in lower camel case, and only
 /// those it carries. The state members are NOT part of it, for the same reason they are not
@@ -1116,21 +1457,10 @@ fn alarm_configuration_document(alarm: &MetricAlarm) -> Value {
     insert_member(
         &mut config,
         "warmUpConfiguration",
-        alarm.warm_up_configuration.as_ref().map(|warm_up| {
-            let mut document = Map::new();
-            document.insert(
-                "warmUpPeriodDurationInMinutes".to_string(),
-                Value::from(warm_up.warm_up_period_duration_in_minutes),
-            );
-            insert_member(
-                &mut document,
-                "onlyStartEvaluatingAfterWarmUpPeriodEnds",
-                warm_up
-                    .only_start_evaluating_after_warm_up_period_ends
-                    .map(Value::from),
-            );
-            Value::Object(document)
-        }),
+        alarm
+            .warm_up_configuration
+            .as_ref()
+            .map(warm_up_configuration_document),
     );
     insert_member(
         &mut config,
@@ -1436,22 +1766,39 @@ impl AlarmRule {
     /// repeats.
     pub fn references(&self) -> Vec<String> {
         let mut references = Vec::new();
-        self.collect_references(&mut references);
+        let mut seen = HashSet::new();
+        self.collect_references(&mut references, &mut seen);
         references
     }
 
-    fn collect_references(&self, into: &mut Vec<String>) {
+    /// How many nodes this rule carries — what evaluating it once costs.
+    ///
+    /// Bounded by the node count the parser accepted, which is what bounds this walk as it
+    /// bounds [`Self::evaluate`] and [`Self::references`].
+    pub fn node_count(&self) -> usize {
+        match self {
+            Self::Literal(_) | Self::InState { .. } => 1,
+            Self::Not(inner) => 1 + inner.node_count(),
+            Self::And(left, right) | Self::Or(left, right) => {
+                1 + left.node_count() + right.node_count()
+            }
+        }
+    }
+
+    /// Collect this rule's references in order, using `seen` to skip repeats — a SET, so the
+    /// walk costs one step per node rather than one scan of everything collected so far.
+    fn collect_references(&self, into: &mut Vec<String>, seen: &mut HashSet<String>) {
         match self {
             Self::Literal(_) => {}
             Self::InState { reference, .. } => {
-                if !into.iter().any(|seen| seen == reference) {
+                if seen.insert(reference.clone()) {
                     into.push(reference.clone());
                 }
             }
-            Self::Not(inner) => inner.collect_references(into),
+            Self::Not(inner) => inner.collect_references(into, seen),
             Self::And(left, right) | Self::Or(left, right) => {
-                left.collect_references(into);
-                right.collect_references(into);
+                left.collect_references(into, seen);
+                right.collect_references(into, seen);
             }
         }
     }
@@ -1475,9 +1822,10 @@ pub fn alarm_rule_reference_name(reference: &str) -> &str {
 /// used, in the order the rule names them and without repeats.
 pub fn alarm_rule_child_names(rule: &AlarmRule) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for reference in rule.references() {
         let name = alarm_rule_reference_name(&reference).to_string();
-        if !names.contains(&name) {
+        if seen.insert(name.clone()) {
             names.push(name);
         }
     }

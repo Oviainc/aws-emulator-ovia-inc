@@ -208,10 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
-        // A snapshot is taken OF a graph, so the graph has to exist. The lookup
-        // settles the transitions the clock already made due first, so a graph whose
-        // provisioning has come due is snapshottable.
-        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+        // A snapshot is taken OF a graph, so the graph has to exist IN THE REGION this
+        // request was signed for — a graph of another Region is not visible here. The
+        // lookup settles the transitions the clock already made due first, so a graph
+        // whose provisioning has come due is snapshottable.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(CreateGraphSnapshotErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
@@ -224,11 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries no key member at all.
         let kms_key_identifier = graph.kms_key_identifier.clone();
 
-        // `snapshotName` is unique within the account: a second snapshot by the same
-        // name conflicts with the stored one. Checked before the source graph's status
-        // so a duplicate name is reported as the name conflict it is, whatever the
-        // graph is doing.
-        if let Some(existing) = store.snapshot_names.get(&input.snapshot_name) {
+        // `snapshotName` is unique within the account PER REGION: a second snapshot by
+        // the same name conflicts with a stored snapshot of the same Region, while the
+        // same name in another Region is another snapshot. Checked before the source
+        // graph's status so a duplicate name is reported as the name conflict it is,
+        // whatever the graph is doing.
+        if let Some(existing) = store.snapshot_id_named(&input.snapshot_name, &region) {
             return Err(CreateGraphSnapshotErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
@@ -286,6 +288,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &format!("graph-snapshot/{id}"),
             ),
+            // The Region this snapshot exists in — the Region of the graph it was taken
+            // from, and the only one it is visible from.
+            region,
             id,
             name: input.snapshot_name,
             source_graph_id: source_graph_id.clone(),

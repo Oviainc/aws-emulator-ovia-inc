@@ -142,8 +142,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: it reports the stored record and `ctx` carries nothing it needs.
-        let _ = ctx;
+        // A read: it reports the stored record, resolved through the GRAPH the request
+        // names, which lives in exactly one Region.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPrivateGraphEndpointErrorModeled::InternalServerException(
                 InternalServerException {
@@ -153,13 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
         // An endpoint is addressed as the endpoint of one graph, so a request naming no
-        // stored graph is reported as the missing GRAPH rather than as a missing
-        // endpoint.
-        if store.settled_graph(&input.graph_identifier, now).is_none() {
+        // stored graph IN THIS REGION is reported as the missing GRAPH rather than as a
+        // missing endpoint.
+        if store
+            .settled_graph(&input.graph_identifier, &region, now)
+            .is_none()
+        {
             return Err(
                 GetPrivateGraphEndpointErrorModeled::ResourceNotFoundException(
                     crate::state::graph_not_found(&input.graph_identifier),

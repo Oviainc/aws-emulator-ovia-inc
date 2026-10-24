@@ -281,7 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let probe_id = store.next_probe_id(now);
-        let probe = crate::state::build_probe(spec, probe_id, &region, now).map_err(validation)?;
+        // The probe this request describes sits at its `probe` member, which is
+        // what a refusal's clause names (`probe.destination`).
+        let probe = crate::state::build_probe(
+            spec,
+            probe_id,
+            &region,
+            now,
+            &crate::state::member_path("probe"),
+        )
+        .map_err(validation)?;
         let probe_id = probe.probe_id.clone();
         let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
             CreateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

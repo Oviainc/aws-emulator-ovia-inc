@@ -7,7 +7,9 @@
 //! `crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_policies`. A
 //! read: it writes nothing, and an ARN carrying no policy is answered with no
 //! `PolicyDocument` member rather than with an error — this operation models no
-//! not-found failure.
+//! not-found failure. A resource that cannot carry a policy at all (this service's own
+//! resources, see [`crate::state::parse_policy_attachable_arn`]) is therefore answered as
+//! holding none, not refused.
 //!
 //! ## Shape of an operation
 //!
@@ -149,11 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A string that is not an ARN of this service names no resource at all, which is a
-        // bad request rather than a resource that carries no policy.
-        if crate::state::parse_resource_arn(&input.resource_arn).is_none() {
+        // A string that names no resource these operations address at all is a bad request
+        // rather than a resource that carries no policy.
+        if crate::state::parse_policy_resource_arn(&input.resource_arn).is_none() {
             return Err(GetResourcePolicyErrorModeled::ValidationException(
-                crate::state::malformed_resource_arn(crate::state::FIELD_RESOURCE_ARN),
+                crate::state::malformed_policy_resource_arn(crate::state::FIELD_RESOURCE_ARN),
             )
             .into());
         }

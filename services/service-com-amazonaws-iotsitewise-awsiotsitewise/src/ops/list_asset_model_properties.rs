@@ -336,7 +336,10 @@ fn not_found(label: &str) -> ListAssetModelPropertiesError {
     ListAssetModelPropertiesError::Modeled(
         ListAssetModelPropertiesErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
-                message: format!("The asset model {label} could not be found."),
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET_MODEL,
+                    label,
+                ),
             },
         ),
     )

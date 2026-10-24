@@ -216,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let snapshot = store
                 .composite_alarms
                 .get(&input.alarm_name)
-                .map(|stored| store.child_states(&stored.rule))
+                .map(|stored| store.child_states_of(&stored.child_names))
                 .unwrap_or_default();
             if let Some(stored) = store.composite_alarms.get_mut(&input.alarm_name) {
                 let previous =

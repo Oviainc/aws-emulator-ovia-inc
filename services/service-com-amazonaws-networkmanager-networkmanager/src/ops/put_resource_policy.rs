@@ -5,8 +5,13 @@
 //! Creates or updates the resource policy of the resource the ARN names: the accepted
 //! document is stored verbatim in
 //! `crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_policies`, under
-//! that ARN, replacing whatever was there, and `GetResourcePolicy` reports it back. A
-//! document that is not an IAM policy document, or that is longer than
+//! that ARN, replacing whatever was there, and `GetResourcePolicy` reports it back.
+//!
+//! Only a resource that may CARRY a resource policy is accepted
+//! ([`crate::state::parse_policy_attachable_arn`]): an ARN naming any other resource —
+//! this service's own resources among them — is refused with the modelled
+//! `ValidationException` (HTTP 400) and stores nothing, so the resource keeps reporting no
+//! policy. A document that is not an IAM policy document, or that is longer than
 //! `crate::state::MAX_RESOURCE_POLICY_CHARS`, is refused before anything is stored (see
 //! [`crate::state::validate_resource_policy_document`]), and a policy for one more ARN
 //! than `crate::state::MAX_RESOURCE_POLICIES` is refused with the modelled
@@ -154,13 +159,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A string that is not an ARN of this service names no resource to attach a policy
-        // to, which is a bad request.
-        let parts = crate::state::parse_resource_arn(&input.resource_arn).ok_or_else(|| {
-            PutResourcePolicyErrorModeled::ValidationException(
-                crate::state::malformed_resource_arn(crate::state::FIELD_RESOURCE_ARN),
+        // A string that names no resource these operations address at all is a bad request.
+        if crate::state::parse_policy_resource_arn(&input.resource_arn).is_none() {
+            return Err(PutResourcePolicyErrorModeled::ValidationException(
+                crate::state::malformed_policy_resource_arn(crate::state::FIELD_RESOURCE_ARN),
             )
-        })?;
+            .into());
+        }
+
+        // A policy is attached only to a resource that may CARRY one; an ARN naming a
+        // resource type that may not — every resource this service owns included — is
+        // refused before anything is stored, so that resource keeps reporting no policy.
+        let parts =
+            crate::state::parse_policy_attachable_arn(&input.resource_arn).ok_or_else(|| {
+                PutResourcePolicyErrorModeled::ValidationException(
+                    crate::state::resource_not_policy_attachable(crate::state::FIELD_RESOURCE_ARN),
+                )
+            })?;
         let (kind, id) = (parts.kind.to_string(), parts.id.to_string());
 
         // The document's size and grammar are judged BEFORE anything is stored, so a

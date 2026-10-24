@@ -190,7 +190,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartImportTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -238,13 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
-        // Data is imported INTO a graph, so the graph has to exist. The lookup settles
-        // the transitions the clock already made due first, so a graph whose
-        // provisioning has come due can accept an import.
-        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+        // Data is imported INTO a graph, so the graph has to exist IN THE REGION this
+        // request was signed for — a graph of another Region is not visible here. The
+        // lookup settles the transitions the clock already made due first, so a graph
+        // whose provisioning has come due can accept an import.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(StartImportTaskErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
@@ -292,6 +293,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.next_import_task_id();
         let mut task = crate::state::ImportTask {
             id,
+            // The Region this task exists in — the Region of the graph it loads into,
+            // and the only one it is visible from.
+            region,
             graph_id: graph_id.clone(),
             source: input.source,
             format: input.format,

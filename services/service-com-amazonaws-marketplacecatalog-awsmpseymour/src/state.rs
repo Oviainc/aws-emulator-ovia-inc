@@ -1396,6 +1396,27 @@ pub fn cannot_parse(field: &str, message: impl Into<String>) -> ValidationExcept
     validation(field, message)
 }
 
+/// The modelled `ValidationException` payload for a `Policy` that is not a
+/// resource-based policy document.
+///
+/// `ResourcePolicyJson` bounds only the length and the characters of the text, so
+/// what makes it a POLICY is the IAM JSON policy grammar
+/// ([`service_common::iam_policy::resource_policy_defect`]), and a document
+/// outside it is refused rather than stored as a policy no reader could evaluate.
+/// The refusal is built from the request: it names the member and the clause of
+/// that grammar the submitted document broke.
+pub fn invalid_resource_policy(
+    field: &str,
+    defect: ::service_common::iam_policy::PolicyDefect,
+) -> ValidationException {
+    validation(
+        field,
+        format!(
+            "{field} must be a resource-based policy document formatted in JSON: {defect}"
+        ),
+    )
+}
+
 /// The modelled `ValidationException` payload for a change set that contradicts
 /// itself: two of its changes carry the same change type against the same
 /// entity.

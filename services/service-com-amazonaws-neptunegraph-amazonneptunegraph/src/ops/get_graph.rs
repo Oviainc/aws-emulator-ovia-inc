@@ -158,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetGraphErrorModeled::InternalServerException(InternalServerException {
                 message: "the neptune-graph store is not mounted on this engine".to_string(),
@@ -166,12 +165,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A graph lives in exactly one Region, so the Region this request was signed
+        // for is part of the lookup: a graph of another Region is not found here.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         // Reporting only: the sole write is materialising the CREATING/UPDATING ->
         // AVAILABLE transition the clock already made due, which was owed at this
         // instant whether or not anybody read the graph.
-        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(GetGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )

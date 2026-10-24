@@ -228,10 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
-        // An export reads a graph, so the graph has to exist. The lookup settles the
-        // transitions the clock already made due first, so a graph whose provisioning
-        // has come due is exportable.
-        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+        // An export reads a graph, so the graph has to exist IN THE REGION this request
+        // was signed for — a graph of another Region is not visible here. The lookup
+        // settles the transitions the clock already made due first, so a graph whose
+        // provisioning has come due is exportable.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
             return Err(StartExportTaskErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
@@ -282,6 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &format!("export-task/{id}"),
             ),
+            // The Region this task exists in: it names the ARN above and is the
+            // predicate every later lookup applies, so the task is reachable only
+            // through the Region it was started in.
+            region,
             id,
             source_graph_id,
             role_arn: input.role_arn,

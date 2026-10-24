@@ -203,7 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // associated with it or not: the shared resolver reaches the property's
             // stream, or the disassociated one standing under that alias.
             (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
-                not_found(format!("The property alias {alias} could not be found."))
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_TIME_SERIES,
+                    alias,
+                ))
             })?,
             _ => {
                 return Err(GetAssetPropertyValueError::Modeled(

@@ -178,8 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // workspace exists for a request to name and the one it names is absent — the
         // same answer `DescribeTimeSeries` gives a workspace-scoped lookup.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            return Err(not_found(format!(
-                "The workspace {workspace} could not be found."
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                workspace,
             )));
         }
 

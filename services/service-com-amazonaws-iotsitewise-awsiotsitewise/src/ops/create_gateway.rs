@@ -301,18 +301,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 409 `ResourceAlreadyExistsException` naming the gateway the create collided
-/// with: its own stored id and the ARN it was minted with, never one rebuilt from
-/// this request's region.
+/// HTTP 409 `ResourceAlreadyExistsException` for a collision on the gateway's own
+/// IDENTITY — the unique `gatewayName` a create claims. The message names the
+/// DIMENSION of the request that collided, by this service's one uniqueness rule,
+/// while `resourceId`/`resourceArn` point at the gateway the create collided with:
+/// its own stored id and the ARN it was minted with, never one rebuilt from this
+/// request's region.
 ///
-/// Reserved for a collision on the gateway's own IDENTITY — the unique
-/// `gatewayName` a create claims. A collision on some OTHER attribute of the
-/// request (the platform device, say) is not this error: see the device check in
-/// the handler.
+/// A collision on some OTHER attribute of the request (the platform device, say) is
+/// not this error: see the device check in the handler.
 fn already_exists(existing: &crate::state::GatewayRecord) -> CreateGatewayError {
     CreateGatewayError::Modeled(CreateGatewayErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
-            message: format!("The gateway {} already exists.", existing.id),
+            message: crate::state::already_using_message("gateway", "name"),
             resource_id: existing.id.clone(),
             resource_arn: existing.arn.clone(),
         },

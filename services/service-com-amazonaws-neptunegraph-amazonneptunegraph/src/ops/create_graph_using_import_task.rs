@@ -298,9 +298,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
-        // `graphName` is unique: a second graph by the same name conflicts with the
-        // stored one, exactly as it does for `CreateGraph`.
-        if let Some(existing) = store.graph_names.get(&input.graph_name) {
+        // The names a graph reserves are released when its deletion completes, so the
+        // deletions the clock has already made due are materialised before the name is
+        // looked up.
+        store.reap_deleted_graphs(now);
+
+        // `graphName` is unique per account PER REGION, exactly as it is for
+        // `CreateGraph`: a second graph by the same name conflicts only with a stored
+        // graph of the SAME Region.
+        if let Some(existing) = store.graph_id_named(&input.graph_name, &region) {
             return Err(CreateGraphUsingImportTaskErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
@@ -363,6 +369,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "{graph_id}.{region}.{}.amazonaws.com",
                 crate::state::ARN_NAMESPACE
             ),
+            // The Region this graph exists in: it names the ARN and the endpoint above
+            // and is the predicate every later lookup and listing applies.
+            region: region.clone(),
             id: graph_id.clone(),
             name: input.graph_name,
             // The graph is provisioned AND loaded by this one call, so it reports the
@@ -408,6 +417,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let task_id = store.next_import_task_id();
         let mut task = crate::state::ImportTask {
             id: task_id,
+            // The task exists in the Region of the graph it loads into.
+            region,
             graph_id,
             role_arn: input.role_arn,
             source: input.source,

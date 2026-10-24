@@ -1959,7 +1959,31 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 
 /// The ARN of a workspace.
 pub fn workspace_arn(region: &str, workspace_id: &str) -> String {
-    ::engine::emulator_arn("iottwinmaker", region, &format!("workspace/{workspace_id}"))
+    ::engine::emulator_arn(
+        "iottwinmaker",
+        region,
+        &format!("{WORKSPACE_ARN_RESOURCE_PREFIX}{workspace_id}"),
+    )
+}
+
+/// The resource prefix of a workspace's ARN, shared by the ARN [`workspace_arn`]
+/// mints and the id [`workspace_id_in_arn`] reads back out of it, so one
+/// definition says what the shape is.
+const WORKSPACE_ARN_RESOURCE_PREFIX: &str = "workspace/";
+
+/// The `workspaceId` inside a workspace ARN, or `None` when the value is not
+/// one: the inverse of [`workspace_arn`], for a caller holding a stored ARN and
+/// comparing it against an id.
+///
+/// Unlike
+/// [`resolve_workspace_id`](ComAmazonawsIottwinmakerAwsiottwinmakerState::resolve_workspace_id),
+/// this reads the id out of the ARN rather than resolving it against the stored
+/// workspaces, so it still names the workspace of an ARN whose workspace has
+/// been deleted. An ARN's resource portion is its sixth colon-separated field.
+pub fn workspace_id_in_arn(arn: &str) -> Option<&str> {
+    arn.splitn(6, ':')
+        .nth(5)?
+        .strip_prefix(WORKSPACE_ARN_RESOURCE_PREFIX)
 }
 
 /// The ARN of an entity, nested under its workspace's resource path.

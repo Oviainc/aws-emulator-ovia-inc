@@ -292,10 +292,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut probes = ::std::collections::BTreeMap::new();
-        for spec in specs {
+        for (position, spec) in specs.into_iter().enumerate() {
             let probe_id = store.next_probe_id(now);
-            let probe =
-                crate::state::build_probe(spec, probe_id, &region, now).map_err(validation)?;
+            // A refusal names the member the CALLER sent, so the clause carries
+            // this probe's position in the request's own `probes` list
+            // (`probes.1.member.destination`), 1-based as a validation path is.
+            let probe = crate::state::build_probe(
+                spec,
+                probe_id,
+                &region,
+                now,
+                &crate::state::element_path("probes", position + 1),
+            )
+            .map_err(validation)?;
             probes.insert(probe.probe_id.clone(), probe);
         }
 

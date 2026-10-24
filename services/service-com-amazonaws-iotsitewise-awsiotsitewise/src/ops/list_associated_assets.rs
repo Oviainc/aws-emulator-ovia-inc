@@ -394,7 +394,7 @@ fn resolve_hierarchy_label<'a>(
 fn asset_not_found(label: &str) -> ListAssociatedAssetsError {
     ListAssociatedAssetsError::Modeled(
         ListAssociatedAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-            message: format!("Asset with ID {label} not found"),
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
         }),
     )
 }
@@ -405,7 +405,7 @@ fn asset_not_found(label: &str) -> ListAssociatedAssetsError {
 fn hierarchy_not_found(label: &str) -> ListAssociatedAssetsError {
     ListAssociatedAssetsError::Modeled(
         ListAssociatedAssetsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-            message: format!("A hierarchy with ID {label} doesn't exist"),
+            message: crate::state::hierarchy_not_found_message(label),
         }),
     )
 }

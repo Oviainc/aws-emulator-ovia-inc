@@ -209,12 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `externalId:<externalId>` alias form. A label that names no stored resource
         // is a modelled refusal, never an unwind.
         let parent_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
-            not_found(format!("The asset {} could not be found.", input.asset_id))
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
         })?;
         let child_id = store.resolve_asset_id(&input.child_asset_id).ok_or_else(|| {
-            not_found(format!(
-                "The asset {} could not be found.",
-                input.child_asset_id
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.child_asset_id,
             ))
         })?;
 
@@ -224,22 +227,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .assets
             .get(&parent_id)
             .map(|asset| asset.asset_model_id.clone())
-            .ok_or_else(|| not_found(format!("The asset {parent_id} could not be found.")))?;
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET,
+                    &input.asset_id,
+                ))
+            })?;
         let hierarchy = store
             .asset_models
             .get(&parent_model_id)
             .ok_or_else(|| {
-                not_found(format!(
-                    "The asset model {parent_model_id} could not be found."
+                // The request names no asset model, so this one absence can only echo
+                // the id the parent asset resolved to; every other path in this
+                // handler echoes the label the request supplied.
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET_MODEL,
+                    &parent_model_id,
                 ))
             })?
             .hierarchies
             .iter()
             .find(|hierarchy| matches_label(hierarchy, &input.hierarchy_id))
             .ok_or_else(|| {
-                not_found(format!(
-                    "The hierarchy {} could not be found in the asset model {parent_model_id}.",
-                    input.hierarchy_id
+                not_found(crate::state::hierarchy_not_found_message(
+                    &input.hierarchy_id,
                 ))
             })?;
         // `childAssetModelId` is stored resolved to the actual asset model id, so the
@@ -247,9 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hierarchy with no id is not addressable, so it is no hierarchy this call can
         // associate under.
         let hierarchy_id = hierarchy.id.clone().ok_or_else(|| {
-            not_found(format!(
-                "The hierarchy {} could not be found in the asset model {parent_model_id}.",
-                input.hierarchy_id
+            not_found(crate::state::hierarchy_not_found_message(
+                &input.hierarchy_id,
             ))
         })?;
         let child_asset_model_id = hierarchy.child_asset_model_id.clone();
@@ -260,7 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .assets
             .get(&child_id)
             .map(|asset| asset.asset_model_id.clone())
-            .ok_or_else(|| not_found(format!("The asset {child_id} could not be found.")))?;
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET,
+                    &input.child_asset_id,
+                ))
+            })?;
         if child_model_id != child_asset_model_id {
             return Err(invalid_request(format!(
                 "The asset {child_id} is an instance of the asset model {child_model_id}, \

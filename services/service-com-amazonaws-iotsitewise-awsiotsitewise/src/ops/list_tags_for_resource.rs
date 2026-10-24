@@ -183,10 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = store.tags_for_resource(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Resource with ARN {} not found",
-                        input.resource_arn
-                    ),
+                    message: crate::state::not_found_arn_message(&input.resource_arn),
                 },
             )
             .into());

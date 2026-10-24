@@ -53,11 +53,13 @@ const RESOURCE_ARN_PATTERN: &str =
 /// The restJson1 document media type: `application/json`, for both answers and refusals.
 const JSON: &str = "application/json";
 
-/// The smallest document `PutResourcePolicy` accepts: a JSON document (the member is
-/// documented as "the policy document to set; formatted in JSON") inside
-/// `ResourcePolicyJson`'s `@length(min: 1, max: 10240)`. It is a policy a case ATTACHES,
-/// never one the service invents for a resource that carries none.
-const MINIMAL_POLICY_DOCUMENT: &str = "{}";
+/// The smallest document `PutResourcePolicy` accepts: a resource-based policy document
+/// (the member is documented as "the policy document to set; formatted in JSON") inside
+/// `ResourcePolicyJson`'s `@length(min: 1, max: 10240)` — one statement stating its effect,
+/// its action and the principal it is granted to. It is a policy a case ATTACHES, never one
+/// the service invents for a resource that carries none.
+const MINIMAL_POLICY_DOCUMENT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":\
+     [{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"aws-marketplace:DescribeEntity\"}]}";
 
 /// How long after the start a change set has certainly reached `SUCCEEDED`: the two spans
 /// the implementation publishes, plus a margin for a slow machine.
@@ -537,7 +539,7 @@ async fn tags_are_reported_from_the_stored_record() {
 async fn a_resource_policy_is_reported_from_what_was_attached() {
     let policies: [(&str, String); 4] = [
         (
-            "a document with no statements",
+            "the smallest policy document",
             MINIMAL_POLICY_DOCUMENT.to_string(),
         ),
         (
@@ -557,8 +559,16 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
             json!({
                 "Version": "2012-10-17",
                 "Statement": [
-                    {"Effect": "Allow", "Action": ["aws-marketplace:DescribeEntity"]},
-                    {"Effect": "Deny", "Action": ["aws-marketplace:StartChangeSet"]},
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": ["aws-marketplace:DescribeEntity"],
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT}:root")},
+                        "Action": ["aws-marketplace:StartChangeSet"],
+                    },
                 ],
             })
             .to_string(),
@@ -572,6 +582,7 @@ async fn a_resource_policy_is_reported_from_what_was_attached() {
                     .map(|index| json!({
                         "Sid": format!("s{index}"),
                         "Effect": "Allow",
+                        "Principal": "*",
                         "Action": ["aws-marketplace:DescribeEntity"],
                     }))
                     .collect::<Vec<Value>>(),
