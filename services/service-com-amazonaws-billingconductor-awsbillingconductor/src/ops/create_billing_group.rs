@@ -296,6 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             linked_account_ids: linked_account_ids.clone(),
             auto_associate: input.account_grouping.auto_associate,
             responsibility_transfer_arn: input.account_grouping.responsibility_transfer_arn.clone(),
+            // `CreateBillingGroup` takes no `Status`: a created group holds the status
+            // its billing owner implies until an `UpdateBillingGroup` asks for one.
+            requested_status: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_time_millis: now,
             last_modified_time_millis: now,
