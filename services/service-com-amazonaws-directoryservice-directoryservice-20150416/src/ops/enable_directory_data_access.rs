@@ -171,10 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.directory_id)
             .ok_or_else(|| {
                 EnableDirectoryDataAccessErrorModeled::DirectoryDoesNotExistException(
-                    DirectoryDoesNotExistException {
-                        message: Some(crate::state::no_such_directory(&input.directory_id)),
-                        request_id: None,
-                    },
+                    crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
                 )
             })?;
 
@@ -185,15 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(
                 EnableDirectoryDataAccessErrorModeled::DirectoryUnavailableException(
-                    DirectoryUnavailableException {
-                        message: Some(format!(
-                            "Directory {id} is in stage {stage} and is not available for \
-                             directory data access changes",
-                            id = directory.directory_id,
-                            stage = directory.stage
-                        )),
-                        request_id: None,
-                    },
+                    crate::state::refusal(format!(
+                        "Directory {id} is in stage {stage} and is not available for \
+                         directory data access changes",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    )),
                 )
                 .into(),
             );
@@ -207,14 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 EnableDirectoryDataAccessErrorModeled::DirectoryInDesiredStateException(
-                    DirectoryInDesiredStateException {
-                        message: Some(format!(
-                            "Directory {id} data access is already {status}",
-                            id = directory.directory_id,
-                            status = directory.data_access_status
-                        )),
-                        request_id: None,
-                    },
+                    crate::state::refusal(format!(
+                        "Directory {id} data access is already {status}",
+                        id = directory.directory_id,
+                        status = directory.data_access_status
+                    )),
                 )
                 .into(),
             );
