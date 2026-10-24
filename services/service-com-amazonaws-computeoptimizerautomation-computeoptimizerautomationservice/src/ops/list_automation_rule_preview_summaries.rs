@@ -296,43 +296,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One group per `recommendedActionType` the selection holds, in the
         // order the store first holds an action of that type: the selected
         // actions are what gets summarised, never the request's action-type
-        // list, so a type nothing matched is no group.
-        //
-        // The groups are kept as a SEQUENCE keyed by the action type, so a
-        // group's key and its tally are one value: there is no second lookup
-        // that could miss and report a plausible zero total. The number of
-        // groups is bounded by the `RecommendedActionType` value set, so finding
-        // one by key is a walk over a handful of entries.
-        let mut grouped: Vec<(String, Group)> = Vec::new();
-        for action in crate::state::previewed_actions(
-            &guard.recommended_actions,
-            scope.as_deref(),
-            &input.recommended_action_types,
-            &criteria,
-        ) {
-            // `previewed_actions` keeps only an action whose type is one of the
-            // requested ones, so every action reaching here carries one.
-            let Some(action_type) = action.recommended_action_type.as_deref() else {
-                continue;
-            };
-            let index = match grouped.iter().position(|(key, _)| key == action_type) {
-                Some(index) => index,
-                None => {
-                    grouped.push((action_type.to_string(), Group::default()));
-                    grouped.len().saturating_sub(1)
-                }
-            };
-            if let Some((_, group)) = grouped.get_mut(index) {
-                group.count = group.count.saturating_add(1);
-                if let Some(savings) = action.estimated_monthly_savings.as_ref() {
-                    group.estimates.push(savings.clone());
-                }
-            }
-        }
+        // list, so a type nothing matched is no group. The grouping is the one
+        // every summaries list of this service performs, so it lives in
+        // [`crate::state::group_by_recommended_action_type`].
+        let grouped = crate::state::group_by_recommended_action_type(
+            crate::state::previewed_actions(
+                &guard.recommended_actions,
+                scope.as_deref(),
+                &input.recommended_action_types,
+                &criteria,
+            ),
+        );
 
         // One extra group is taken: its presence is what says another page
         // exists, and the token resumes exactly where this page stopped.
-        let taken: Vec<(String, Group)> = grouped
+        let taken: Vec<crate::state::ActionGroup> = grouped
             .into_iter()
             .skip(offset)
             .take(page_size.saturating_add(1))
@@ -341,8 +319,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page: Vec<PreviewResultSummary> = taken
             .into_iter()
             .take(page_size)
-            .map(|(key, group)| PreviewResultSummary {
-                key,
+            .map(|group| PreviewResultSummary {
+                key: group.key,
                 total: RulePreviewTotal {
                     recommended_action_count: group.count,
                     estimated_monthly_savings: crate::state::total_savings(group.estimates.iter()),
@@ -361,17 +339,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
-}
-
-/// What one group of selected actions accumulates while the inventory is walked:
-/// how many actions it holds and the estimates among them, which
-/// [`crate::state::total_savings`] reduces to the group's
-/// `estimatedMonthlySavings`. An action Compute Optimizer has not estimated
-/// savings for is still one action of the group.
-#[derive(Debug, Default)]
-struct Group {
-    count: i32,
-    estimates: Vec<EstimatedMonthlySavings>,
 }
 
 fn invalid_parameter(message: String) -> ListAutomationRulePreviewSummariesError {

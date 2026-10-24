@@ -2,19 +2,21 @@
 
 //! @op ListRecommendedActionSummaries
 //!
-//! IMPLEMENTED. Aggregates the recommended actions the store holds — the same
+//! IMPLEMENTED. Summarises the recommended actions the store holds — the same
 //! [`crate::state::RecommendedActionStore`] `ListRecommendedActions` reports —
-//! into the account-wide summary keyed
-//! [`ALL_RECOMMENDED_ACTION_SUMMARY_KEY`], narrowed by `filters` exactly as that
-//! operation narrows its list, and paged by `maxResults` with an opaque
-//! `nextToken` that resumes where the previous page stopped.
+//! GROUPED by `recommendedActionType` (see
+//! [`crate::state::group_by_recommended_action_type`]), narrowed by `filters`
+//! exactly as that operation narrows its list, and paged by `maxResults` with an
+//! opaque `nextToken` that resumes where the previous page stopped.
 //! `@paginated(inputToken: nextToken, outputToken: nextToken,
 //! items: recommendedActionSummaries)`.
 //!
-//! The summary is reported whether or not any action matched: an account whose
-//! resources have not been analysed yet is summarised as zero actions and zero
-//! savings, not as no summary at all. `total` holds how many actions matched and
-//! the sum of their `estimatedMonthlySavings`.
+//! One summary per group the matched actions hold: its `key` is the group's
+//! `recommendedActionType` and its `total` holds how many of the matched actions
+//! are of that type and the sum of their `estimatedMonthlySavings`. A type
+//! nothing matched is no summary, so a request nothing matched — an account
+//! whose resources have not been analysed yet — is summarised as no summaries at
+//! all.
 //!
 //! A recommended action is produced by Compute Optimizer's own analysis of a
 //! resource, so no operation of THIS API creates one: this handler only reads
@@ -230,16 +232,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `maxResults` carries a member `@range` of min 1 / max 100
         // (`smithy_query(query="shape",shape="ListRecommendedActionSummariesRequest")`),
         // enforced by the generated request walk BEFORE this handler runs — so
-        // the page size is only defaulted here, never validated, and the
-        // `.max(1)` is a floor against a zero page, which would return nothing
-        // while carrying a token whose offset never advances.
+        // the page size is only defaulted here, never validated, and the clamp is
+        // a floor against a zero page, which would return nothing while carrying
+        // a token whose offset never advances.
+        let max_page_size = usize::try_from(crate::state::DEFAULT_MAX_RESULTS).unwrap_or(1);
         let page_size = usize::try_from(
             input
                 .max_results
                 .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
         )
         .unwrap_or(1)
-        .max(1);
+        .clamp(1, max_page_size);
 
         let guard = state.lock();
         // The service-wide enrollment gate, AHEAD of filter evaluation: an
@@ -252,37 +255,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Every matching action is counted into the ONE account-wide aggregate
-        // (see [`ALL_RECOMMENDED_ACTION_SUMMARY_KEY`]), so the summary exists
-        // whether or not anything matched: a store nothing has been analysed
-        // into is summarised as zero actions and zero savings, never as no
-        // summary at all.
-        let mut aggregate = Aggregate::default();
-        for action in guard
-            .recommended_actions
-            .iter_in_order()
-            .filter(|action| crate::state::recommended_action_matches_filters(action, &filters))
-        {
-            aggregate.add(action.estimated_monthly_savings.as_ref());
-        }
-        let summaries = vec![RecommendedActionSummary {
-            key: ALL_RECOMMENDED_ACTION_SUMMARY_KEY.to_string(),
-            total: aggregate.into_total(),
-        }];
+        // The matching actions, grouped by `recommendedActionType`: the matched
+        // actions are what gets grouped, so a type nothing matched is no group,
+        // and the groups come back in the order the store first holds an action
+        // of each type — the same order `ListRecommendedActions` walks.
+        let grouped = crate::state::group_by_recommended_action_type(
+            guard
+                .recommended_actions
+                .iter_in_order()
+                .filter(|action| crate::state::recommended_action_matches_filters(action, &filters)),
+        );
 
         // The page walk is the same one every paginated list of this service
-        // performs — one summary beyond the page is what says another page
-        // exists, and the token resumes exactly where this page stopped. There
-        // is one summary, so a first page always ends the walk; the walk is
-        // written over the sequence rather than around that single row, so it
-        // stays correct for a key set the service may report more of.
-        let total_summaries = summaries.len();
-        let page: Vec<RecommendedActionSummary> = summaries
+        // performs — one group beyond the page is what says another page exists,
+        // and the token resumes exactly where this page stopped.
+        let taken: Vec<crate::state::ActionGroup> = grouped
             .into_iter()
             .skip(offset)
-            .take(page_size)
+            .take(page_size.saturating_add(1))
             .collect();
-        let has_more = offset.saturating_add(page.len()) < total_summaries;
+        let has_more = taken.len() > page_size;
+        let page: Vec<RecommendedActionSummary> = taken
+            .into_iter()
+            .take(page_size)
+            .map(|group| RecommendedActionSummary {
+                key: group.key,
+                total: RecommendedActionTotal {
+                    recommended_action_count: group.count,
+                    estimated_monthly_savings: crate::state::total_savings(group.estimates.iter()),
+                },
+            })
+            .collect();
         let next_token = has_more.then(|| {
             crate::state::encode_page_token(&crate::state::PageCursor {
                 offset: offset + page.len(),
@@ -294,94 +297,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             recommended_action_summaries: Some(page),
             next_token,
         })
-    }
-}
-
-/// The `key` of the summary that covers EVERY recommended action the call
-/// matched, rather than one slice of them.
-///
-/// `RecommendedActionSummary$key` is "the grouping key used to categorize the
-/// recommended actions in this summary"
-/// (`smithy_query(query="shape",shape="RecommendedActionSummary")`), and the
-/// model enumerates no key set for it — unlike `AutomationEventSummary`, which
-/// carries its grouping as a `SummaryDimension` list keyed by the modelled
-/// `SummaryDimensionKey`. The one key the service's own responses show is this
-/// aggregate over all of them, so it is the one this emulator reports: a key for
-/// a dimension no response groups by would be invented vocabulary, and a client
-/// reads these keys off the wire.
-const ALL_RECOMMENDED_ACTION_SUMMARY_KEY: &str = "ALL_Recommended_Action_Summary";
-
-/// The `savingsEstimationMode` an aggregate reports when the estimates it summed
-/// do not agree on one, and when it summed none at all.
-///
-/// Both figures of [`EstimatedMonthlySavings`] are summed either way, so the mode
-/// only says which of them the estimate was computed for; before discounts is
-/// the conservative reading, exactly as it is for an `estimatedMonthlySavings`
-/// criterion whose estimate names a mode this model does not declare.
-const CONSERVATIVE_SAVINGS_ESTIMATION_MODE: &str = "BeforeDiscount";
-
-/// The totals accumulated over a set of recommended actions.
-#[derive(Debug, Clone, Default)]
-struct Aggregate {
-    /// How many actions were summarised, whether or not they carry an estimate.
-    count: i32,
-    before_discount_savings: f64,
-    after_discount_savings: f64,
-    /// The currency of the FIRST estimate summed, in record order, or `None`
-    /// when no action summarised carries an estimate. Compute Optimizer
-    /// denominates an account's estimates in one currency, so a set that
-    /// mixes currencies is not something its analysis produces; the emulator
-    /// converts nothing, so the sum is reported in that first currency.
-    currency: Option<String>,
-    /// The `savingsEstimationMode` every estimate summed so far agrees on, or
-    /// `None` once two of them disagree (or before any was summed).
-    savings_estimation_mode: Option<String>,
-    /// Whether two summed estimates disagreed on the mode, so that a later
-    /// agreeing one cannot restore it.
-    mixed_savings_estimation_mode: bool,
-}
-
-impl Aggregate {
-    /// Count one more action, adding its estimate when it has one.
-    fn add(&mut self, savings: Option<&EstimatedMonthlySavings>) {
-        self.count = self.count.saturating_add(1);
-        let Some(savings) = savings else {
-            return;
-        };
-        self.before_discount_savings += savings.before_discount_savings;
-        self.after_discount_savings += savings.after_discount_savings;
-        if self.currency.is_none() {
-            self.currency = Some(savings.currency.clone());
-        }
-        match &self.savings_estimation_mode {
-            Some(mode) if mode != &savings.savings_estimation_mode => {
-                self.savings_estimation_mode = None;
-                self.mixed_savings_estimation_mode = true;
-            }
-            Some(_) => {}
-            None if !self.mixed_savings_estimation_mode => {
-                self.savings_estimation_mode = Some(savings.savings_estimation_mode.clone());
-            }
-            None => {}
-        }
-    }
-
-    /// These totals as the modelled `RecommendedActionTotal`.
-    fn into_total(self) -> RecommendedActionTotal {
-        RecommendedActionTotal {
-            recommended_action_count: self.count,
-            estimated_monthly_savings: EstimatedMonthlySavings {
-                // `currency` is a free-form string, so a total no estimate named
-                // a currency for names none rather than one the emulator made
-                // up; its two sums are zero.
-                currency: self.currency.unwrap_or_default(),
-                before_discount_savings: self.before_discount_savings,
-                after_discount_savings: self.after_discount_savings,
-                savings_estimation_mode: self
-                    .savings_estimation_mode
-                    .unwrap_or_else(|| CONSERVATIVE_SAVINGS_ESTIMATION_MODE.to_string()),
-            },
-        }
     }
 }
 
