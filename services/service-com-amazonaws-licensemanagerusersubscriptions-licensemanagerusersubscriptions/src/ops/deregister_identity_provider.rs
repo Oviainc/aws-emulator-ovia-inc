@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .arn
             .clone();
 
-        let mut removed = state.remove_identity_provider(&arn).ok_or_else(|| {
+        let mut removed = state.remove_identity_provider(&arn, now).ok_or_else(|| {
             into_error(crate::state::StateError::ProviderNotRegistered)
         })?;
         removed.status = crate::state::STATUS_DEREGISTERING.to_string();

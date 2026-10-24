@@ -199,16 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The in-memory store is bounded, and AWS bounds these resources per account
         // too: the modelled quota error is what a caller at the limit is told.
+        // An endpoint whose deletion was accepted is still REPORTED, in `DELETING` or
+        // `DELETED`, but it no longer occupies a slot: only live endpoints count.
+        let live = state.live_license_server_endpoint_count();
         if crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::at_resource_limit(
-            state.license_server_endpoints.len(),
+            live,
         ) {
             return Err(
                 CreateLicenseServerEndpointErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
                         message: Some(format!(
-                            "the account already has {} license server endpoints, the most \
-                             this service holds",
-                            state.license_server_endpoints.len()
+                            "the account already has {live} license server endpoints, the most \
+                             this service holds"
                         )),
                     },
                 )
@@ -230,6 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_message: None,
             created_at: now,
             provisioned_due_at: crate::state::endpoint_provisioned_due_at(now),
+            deletion_started_at: None,
+            deleted_due_at: None,
         };
 
         if let Some(tags) = input.tags.as_ref() {

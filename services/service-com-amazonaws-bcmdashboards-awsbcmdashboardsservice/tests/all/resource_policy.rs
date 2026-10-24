@@ -299,10 +299,12 @@ async fn documents_are_reported_per_dashboard() {
     let (router, engine) = router_with_engine();
 
     let mut stored: Vec<(&str, String, String)> = Vec::new();
-    for case in policy_cases() {
+    for (index, case) in policy_cases().into_iter().enumerate() {
+        // A distinct name per row: a dashboard's name is unique within the account
+        // (pinned by `dashboard_name_uniqueness`), and these rows share one router.
         let arn = create_dashboard(
             &router,
-            &json!({"name": "Shared Router Dashboard", "widgets": []}),
+            &json!({"name": format!("Shared Router Dashboard {index}"), "widgets": []}),
         )
         .await;
         attach_policy(&engine, &arn, case.stored.as_deref());
