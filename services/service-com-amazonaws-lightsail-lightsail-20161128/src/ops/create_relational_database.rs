@@ -398,6 +398,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 state: crate::state::RELATIONAL_DATABASE_STATE_CREATING,
                 due: Some(due),
+                // A new database runs the engine's own defaults: nothing has
+                // modified a parameter of it yet, which is why it reports
+                // `in-sync` until `UpdateRelationalDatabaseParameters` sets one.
+                parameter_overrides: Default::default(),
             });
             // `operations` is a list because other Lightsail creates act on
             // several resources at once; `CreateRelationalDatabase` creates
