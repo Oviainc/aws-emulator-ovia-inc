@@ -366,7 +366,7 @@ async fn every_optional_filter_selects_on_the_stored_member() {
             selects: vec![0, 1, 2],
         },
         FilterCase {
-            case: "another agreement type selects nothing",
+            case: "the other agreement type the member admits selects nothing",
             filters: json!({"agreementType": "VendorInsightsAgreement"}),
             selects: vec![],
         },
