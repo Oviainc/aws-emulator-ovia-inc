@@ -187,10 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(directory_id) => {
                 let directory = store.directories.get(directory_id).ok_or_else(|| {
                     DescribeEventTopicsErrorModeled::EntityDoesNotExistException(
-                        EntityDoesNotExistException {
-                            message: Some(crate::state::no_such_directory(directory_id)),
-                            request_id: None,
-                        },
+                        crate::state::refusal(crate::state::no_such_directory(directory_id)),
                     )
                 })?;
                 directory.event_topic_list(wanted.as_ref())
@@ -213,9 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member
 /// and the rule it broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: String) -> DescribeEventTopicsError {
-    DescribeEventTopicsErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    DescribeEventTopicsErrorModeled::InvalidParameterException(crate::state::refusal(message))
+        .into()
 }

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUsageStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUsageStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the cost of the GuardDuty work this service has RECORDED for
+//! the detector's accounts inside the 30-day window, aggregated the ONE way
+//! `usageStatisticsType` names — every other `UsageStatistics` member stays absent,
+//! "if a UsageStatisticType is provided the result for other types will be null"
+//! (`smithy_query(query="doc",shape="UsageStatistics")`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUsageStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What usage this service can MEASURE is the work it has itself recorded: the
+//! occurrences of the activity behind each stored finding, attributed to the feature
+//! whose data source generates findings of that type, and each malware scan it ran,
+//! attributed to Malware Protection and to the resource the scan named. Nothing is
+//! ingested, so there is no analysed volume beyond those records — see
+//! [`CENTS_PER_OBSERVATION`] for the rate that turns them into an amount, and
+//! [`feature_for_finding`] for the attribution.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +93,8 @@
 //! * `BadRequestException` (HTTP 400) — A bad request exception object.
 //! * `InternalServerErrorException` (HTTP 500) — An internal server error exception object.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -159,18 +167,755 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUsageStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUsageStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUsageStatistics"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetUsageStatisticsErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // Decided from the REQUEST alone, before the store is looked at: the currency
+        // the amounts are reported in, and what the criteria restrict them to.
+        let unit = reported_unit(input.unit.as_deref())?;
+        let selected_accounts = exact_values(input.usage_criteria.account_ids.as_deref());
+        let selected_resources = exact_values(input.usage_criteria.resources.as_deref());
+        let selected_features = selected_features(&input.usage_criteria);
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST: a value that cannot be a detector id is a
+            // parameter failure, a well-formed one this account does not hold an
+            // ownership failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        // The window is READ off the clock, never advanced: a report materialises
+        // nothing, and usage older than the window is simply not reported.
+        let window_start_millis = crate::state::now_millis().saturating_sub(USAGE_WINDOW_MILLIS);
+        let usage: Vec<UsageRecord> =
+            recorded_usage(&state, detector, &region, window_start_millis)
+                .into_iter()
+                .filter(|record| {
+                    selected_accounts
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(record.account_id.as_str()))
+                })
+                .filter(|record| {
+                    selected_features
+                        .as_ref()
+                        .is_none_or(|features| features.contains(record.feature))
+                })
+                .filter(|record| match (&selected_resources, &record.resource) {
+                    (None, _) => true,
+                    (Some(names), Some(resource)) => names.contains(resource.as_str()),
+                    // `Resources` selects the usage done ON a named resource ("the
+                    // resources to aggregate usage statistics from. Only accepts exact
+                    // resource names" —
+                    // `smithy_query(query="doc",shape="UsageCriteria",member="Resources")`),
+                    // so a record the store identifies no resource for cannot satisfy
+                    // it.
+                    (Some(_), None) => false,
+                })
+                .collect();
+
+        let (usage_statistics, next_token) = aggregated(
+            &input.usage_statistic_type,
+            &usage,
+            &unit,
+            input.max_results,
+            input.next_token.as_deref(),
+        )?;
+
+        Ok(GetUsageStatisticsOutput {
+            usage_statistics: Some(usage_statistics),
+            next_token,
+        })
     }
+}
+
+/// The window the statistics cover: "Lists Amazon GuardDuty usage statistics over the
+/// last 30 days for the specified detector ID"
+/// (`smithy_query(query="doc",shape="GetUsageStatistics")`).
+///
+/// It is a window over the RECORDS and not a projection, which is the same doc's
+/// "for newly enabled detectors or data sources, the cost returned will include only
+/// the usage so far under 30 days. This may differ from the cost metrics in the
+/// console, which project usage over 30 days".
+const USAGE_WINDOW_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// What one recorded observation of analysed activity costs, in hundredths of the
+/// reported currency unit.
+///
+/// GuardDuty prices each data source by the VOLUME it analysed (per million events,
+/// per GB), and this emulator analyses no customer data: the only usage it can measure
+/// is the work it has itself RECORDED — the occurrences of the activity behind each
+/// stored finding, and each malware scan it ran. The rate that turns those records into
+/// an amount is therefore this emulator's own, stated here once rather than copied from
+/// a price list that differs by Region and changes over time. Nothing reports the rate;
+/// all it does is make every amount a function of the records the store holds.
+const CENTS_PER_OBSERVATION: i64 = 1;
+
+/// How many observations one malware scan is: a scan is one recorded piece of work,
+/// whatever the resource it ran over, because the store records no scanned volume.
+const SCAN_OBSERVATIONS: i64 = 1;
+
+/// Hundredths of a currency unit in one unit — the divisor [`amount`] renders with.
+const CENTS_PER_UNIT: i64 = 100;
+
+/// The one currency this operation reports in: "the currency unit you would like to
+/// view your usage statistics in. Current valid values are USD"
+/// (`smithy_query(query="doc",shape="GetUsageStatisticsRequest",member="Unit")`).
+const USD: &str = "USD";
+
+/// The input members a refusal names, spelled as the wire spells them
+/// (`smithy_query(operation="GetUsageStatistics")`).
+const UNIT_MEMBER: &str = "unit";
+/// See [`UNIT_MEMBER`].
+const USAGE_STATISTIC_TYPE_MEMBER: &str = "usageStatisticsType";
+
+/// The most rows one page carries: "lists the top 50 accounts by feature" and "lists
+/// the top 50 resources"
+/// (`smithy_query(query="doc",shape="UsageStatistics",member="TopAccountsByFeature")`
+/// and `…member="TopResources"`), which is also the ceiling the modelled `MaxResults`
+/// `@range` 1..50 lets a caller ask for.
+const TOP_ROWS: usize = 50;
+
+/// The `UsageStatisticType` members (`smithy_query(shape="UsageStatisticType")`); each
+/// fills the `UsageStatistics` member of its own name
+/// (`smithy_query(shape="UsageStatistics")`) and leaves every other one absent.
+const SUM_BY_ACCOUNT: &str = "SUM_BY_ACCOUNT";
+/// See [`SUM_BY_ACCOUNT`].
+const SUM_BY_DATA_SOURCE: &str = "SUM_BY_DATA_SOURCE";
+/// See [`SUM_BY_ACCOUNT`].
+const SUM_BY_FEATURES: &str = "SUM_BY_FEATURES";
+/// See [`SUM_BY_ACCOUNT`].
+const SUM_BY_RESOURCE: &str = "SUM_BY_RESOURCE";
+/// See [`SUM_BY_ACCOUNT`].
+const TOP_ACCOUNTS_BY_FEATURE: &str = "TOP_ACCOUNTS_BY_FEATURE";
+/// See [`SUM_BY_ACCOUNT`].
+const TOP_RESOURCES: &str = "TOP_RESOURCES";
+
+// Named, not taken by position out of the generated enum list: these assertions fail
+// the BUILD if the model stops carrying a member this file switches on, where an index
+// would instead have silently matched some other member.
+const _: () = {
+    let members = [
+        SUM_BY_ACCOUNT,
+        SUM_BY_DATA_SOURCE,
+        SUM_BY_FEATURES,
+        SUM_BY_RESOURCE,
+        TOP_ACCOUNTS_BY_FEATURE,
+        TOP_RESOURCES,
+    ];
+    let mut index = 0;
+    while index < members.len() {
+        assert!(crate::state::enum_carries(
+            crate::ops::types::shared_types::USAGE_STATISTIC_TYPE_VALUES,
+            members[index]
+        ));
+        index += 1;
+    }
+};
+
+/// The `UsageFeature` members this file names that [`crate::state`] does not already
+/// carry a constant for.
+///
+/// The ones it does carry are reused from there (`FEATURE_FLOW_LOGS`,
+/// `FEATURE_CLOUD_TRAIL`, `FEATURE_DNS_LOGS`, `FEATURE_S3_DATA_EVENTS`,
+/// `FEATURE_EKS_AUDIT_LOGS`, `FEATURE_EBS_MALWARE_PROTECTION`,
+/// `FEATURE_RDS_LOGIN_EVENTS`, `FEATURE_EKS_RUNTIME_MONITORING`): a feature is one
+/// name, whether a detector configures it or a usage report bills it.
+const FEATURE_LAMBDA_NETWORK_LOGS: &str = "LAMBDA_NETWORK_LOGS";
+/// See [`FEATURE_LAMBDA_NETWORK_LOGS`].
+const FEATURE_EC2_RUNTIME_MONITORING: &str = "EC2_RUNTIME_MONITORING";
+/// See [`FEATURE_LAMBDA_NETWORK_LOGS`].
+const FEATURE_FARGATE_RUNTIME_MONITORING: &str = "FARGATE_RUNTIME_MONITORING";
+
+const _: () = {
+    let features = [
+        FEATURE_LAMBDA_NETWORK_LOGS,
+        FEATURE_EC2_RUNTIME_MONITORING,
+        FEATURE_FARGATE_RUNTIME_MONITORING,
+        crate::state::FEATURE_FLOW_LOGS,
+        crate::state::FEATURE_CLOUD_TRAIL,
+        crate::state::FEATURE_DNS_LOGS,
+        crate::state::FEATURE_S3_DATA_EVENTS,
+        crate::state::FEATURE_EKS_AUDIT_LOGS,
+        crate::state::FEATURE_EKS_RUNTIME_MONITORING,
+        crate::state::FEATURE_EBS_MALWARE_PROTECTION,
+        crate::state::FEATURE_RDS_LOGIN_EVENTS,
+    ];
+    let mut index = 0;
+    while index < features.len() {
+        assert!(crate::state::enum_carries(
+            crate::ops::types::shared_types::USAGE_FEATURE_VALUES,
+            features[index]
+        ));
+        index += 1;
+    }
+};
+
+/// Every `UsageFeature` the deprecated `DataSource` view has a member for, paired with
+/// that member.
+///
+/// `DataSources` "is deprecated, use Features instead"
+/// (`smithy_query(shape="UsageCriteria")`) and `DataSource` carries six members
+/// (`smithy_query(shape="DataSource")`) against `UsageFeature`'s eighteen
+/// (`smithy_query(shape="UsageFeature")`): the three foundational sources under their
+/// own names, S3 data events under their log name, the EKS audit logs under the
+/// Kubernetes name, and the EC2 malware scan. A feature with no member here has no
+/// data-source name at all, so `SUM_BY_DATA_SOURCE` leaves it out rather than inventing
+/// one.
+const FEATURE_DATA_SOURCES: &[(&str, &str)] = &[
+    (crate::state::FEATURE_FLOW_LOGS, "FLOW_LOGS"),
+    (crate::state::FEATURE_CLOUD_TRAIL, "CLOUD_TRAIL"),
+    (crate::state::FEATURE_DNS_LOGS, "DNS_LOGS"),
+    (crate::state::FEATURE_S3_DATA_EVENTS, "S3_LOGS"),
+    (crate::state::FEATURE_EKS_AUDIT_LOGS, "KUBERNETES_AUDIT_LOGS"),
+    (
+        crate::state::FEATURE_EBS_MALWARE_PROTECTION,
+        "EC2_MALWARE_SCAN",
+    ),
+];
+
+const _: () = {
+    let mut index = 0;
+    while index < FEATURE_DATA_SOURCES.len() {
+        assert!(crate::state::enum_carries(
+            crate::ops::types::shared_types::USAGE_FEATURE_VALUES,
+            FEATURE_DATA_SOURCES[index].0
+        ));
+        assert!(crate::state::enum_carries(
+            crate::ops::types::shared_types::DATA_SOURCE_VALUES,
+            FEATURE_DATA_SOURCES[index].1
+        ));
+        index += 1;
+    }
+};
+
+/// The affected-resource segments of a finding type this file attributes to a feature,
+/// in GuardDuty's own abbreviations. See [`feature_for_finding`] for the source.
+const AFFECTED_EC2: &str = "EC2";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_RUNTIME: &str = "Runtime";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_IAM_USER: &str = "IAMUser";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_IAM: &str = "IAM";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_S3: &str = "S3";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_KUBERNETES: &str = "Kubernetes";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_EKS: &str = "EKS";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_RDS: &str = "RDS";
+/// See [`AFFECTED_EC2`].
+const AFFECTED_LAMBDA: &str = "Lambda";
+
+/// The threat-family suffixes that name the DATA the finding came from: a malware scan
+/// of a file, and a DNS query. See [`feature_for_finding`].
+const MALICIOUS_FILE: &str = "MaliciousFile";
+/// See [`MALICIOUS_FILE`].
+const SUSPICIOUS_FILE: &str = "SuspiciousFile";
+/// See [`MALICIOUS_FILE`].
+const DNS_SUFFIX: &str = "!DNS";
+
+/// The `Resource.ResourceType` values a RUNTIME finding carries that make its usage one
+/// of the non-EC2 runtime features, as this service's finding records spell them (the
+/// values `Resource.ResourceType` reports — `smithy_query(shape="Resource")`).
+const RESOURCE_ECS_CLUSTER: &str = "ECSCluster";
+/// See [`RESOURCE_ECS_CLUSTER`].
+const RESOURCE_EKS_CLUSTER: &str = "EKSCluster";
+/// See [`RESOURCE_ECS_CLUSTER`].
+const RESOURCE_CONTAINER: &str = "Container";
+
+/// The `MalwareProtectionResourceType` prefixes Malware Protection for EC2 scans, and
+/// the one it does not. See [`feature_for_scan`].
+const SCAN_RESOURCE_EC2_PREFIX: &str = "EC2_";
+/// See [`SCAN_RESOURCE_EC2_PREFIX`].
+const SCAN_RESOURCE_EBS_PREFIX: &str = "EBS_";
+
+/// One piece of recorded GuardDuty work inside the window: the account it is billed to,
+/// the feature that did it, the resource it was done on where the store identifies one,
+/// and what it costs in hundredths of the reported unit.
+///
+/// Every statistic is an aggregation of these records, so two statistic types can never
+/// disagree about the same work: a `SUM_BY_ACCOUNT` total is the sum of that account's
+/// `SUM_BY_FEATURES` rows.
+#[derive(Debug, Clone)]
+struct UsageRecord {
+    account_id: String,
+    feature: &'static str,
+    /// `None` for work the store identifies no resource INSTANCE for — a finding, whose
+    /// `Resource` this service reports with its type and nothing else, exactly as
+    /// `GetFindingsStatistics` reports no `ResourceId`.
+    resource: Option<String>,
+    cents: i64,
+}
+
+/// Every piece of recorded work this detector's accounts owe usage for inside the
+/// window.
+///
+/// Both sources are RECORDS, not states: a feature's current switch is not consulted,
+/// because work the service recorded was done when the feature was on and is billed
+/// whether or not it is on now.
+fn recorded_usage(
+    state: &crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState,
+    detector: &crate::state::Detector,
+    region: &str,
+    window_start_millis: i64,
+) -> Vec<UsageRecord> {
+    let mut usage: Vec<UsageRecord> = Vec::new();
+
+    for finding in detector.findings.values() {
+        // `Service.EventLastSeen` is when the activity this finding reports was last
+        // observed, which is the instant the ANALYSIS happened; the record's own
+        // `UpdatedAt` moves for metadata changes (an archive, a feedback) that analysed
+        // nothing.
+        if finding.event_last_seen_millis < window_start_millis {
+            continue;
+        }
+        let Some(feature) = feature_for_finding(finding) else {
+            continue;
+        };
+        usage.push(UsageRecord {
+            account_id: finding.account_id.clone(),
+            feature,
+            resource: None,
+            // `Service.Count` is "the total count of the occurrences of this finding
+            // type" (`smithy_query(shape="Service")`): each occurrence is one
+            // observation of analysed activity, so a finding seen ten times is ten.
+            cents: cost_of(i64::from(finding.count)),
+        });
+    }
+
+    for scan in state.malware_scans_in(region) {
+        if scan.detector_id.as_deref() != Some(detector.id.as_str()) {
+            continue;
+        }
+        if scan.started_at_millis < window_start_millis {
+            continue;
+        }
+        let Some(feature) = feature_for_scan(&scan.resource_type) else {
+            continue;
+        };
+        usage.push(UsageRecord {
+            // A scan is started through this emulator's own endpoint, so it is the
+            // account this emulator serves that owes its usage — the same account a
+            // member's `AdministratorId` names.
+            account_id: crate::state::administrator_account_id(),
+            feature,
+            // The scan names the resource it ran over, so this is work the store DOES
+            // identify a resource for: its ARN, which is an exact resource name.
+            resource: Some(scan.resource_arn.clone()),
+            cents: cost_of(SCAN_OBSERVATIONS),
+        });
+    }
+
+    usage
+}
+
+/// What `observations` of analysed activity cost, in hundredths of the reported unit.
+fn cost_of(observations: i64) -> i64 {
+    observations.saturating_mul(CENTS_PER_OBSERVATION)
+}
+
+/// The `UsageFeature` whose data source generated this finding, or `None` when no
+/// feature's own finding table carries a finding of that shape.
+///
+/// Source: the GuardDuty finding-types reference, which groups the finding types into
+/// one table per feature — the EC2 table (VPC flow logs, with the `!DNS` suffix marking
+/// the types generated from DNS query data), the IAM table (CloudTrail management
+/// events), the S3 table (S3 data events), the Kubernetes/EKS audit-log table, the
+/// Malware Protection table (the `…/MaliciousFile` and `…/SuspiciousFile` types a
+/// malware scan produces), the RDS table, the Lambda table and the Runtime Monitoring
+/// table (the `…:Runtime/…` types). The model carries no such mapping — `UsageFeature`
+/// is an enum of names and `FindingType` a length-constrained string
+/// (`smithy_query(shape="FindingType")`) — so the attribution is the service's own, like
+/// the sample-finding catalogue it reads the segments of.
+///
+/// Work this cannot attribute is counted in NO statistic rather than in a default
+/// feature, which is what keeps the aggregations consistent with each other.
+fn feature_for_finding(finding: &crate::state::FindingRecord) -> Option<&'static str> {
+    // The two segments of the finding-type convention, read through the one shared
+    // parser `crate::state` holds, so this attribution and the sample-finding generator
+    // cannot disagree about what a finding type says.
+    let affected = crate::state::finding_type_affected_resource(&finding.r#type);
+    let family = crate::state::finding_type_threat_family(&finding.r#type);
+
+    // Malware Protection: a file verdict comes from a malware SCAN, whatever resource
+    // the finding is about.
+    if family.ends_with(MALICIOUS_FILE) || family.ends_with(SUSPICIOUS_FILE) {
+        // Malware Protection for S3 is a feature of its own, and `UsageFeature` carries
+        // NO member for it (`smithy_query(shape="UsageFeature")`), so an S3 object
+        // verdict is attributed to no feature rather than to the EC2 one.
+        return (affected != AFFECTED_S3).then_some(crate::state::FEATURE_EBS_MALWARE_PROTECTION);
+    }
+
+    let feature = match affected {
+        // The EC2 table's two sources: a `!DNS` type was generated from DNS query data,
+        // every other one from network flows.
+        AFFECTED_EC2 => {
+            if family.ends_with(DNS_SUFFIX) {
+                crate::state::FEATURE_DNS_LOGS
+            } else {
+                crate::state::FEATURE_FLOW_LOGS
+            }
+        }
+        // A runtime finding's data comes from the GuardDuty agent on the resource, not
+        // from a log source, so which runtime feature it is follows the resource.
+        AFFECTED_RUNTIME => runtime_feature(&finding.resource_type),
+        AFFECTED_IAM_USER | AFFECTED_IAM => crate::state::FEATURE_CLOUD_TRAIL,
+        AFFECTED_S3 => crate::state::FEATURE_S3_DATA_EVENTS,
+        AFFECTED_KUBERNETES | AFFECTED_EKS => crate::state::FEATURE_EKS_AUDIT_LOGS,
+        AFFECTED_RDS => crate::state::FEATURE_RDS_LOGIN_EVENTS,
+        AFFECTED_LAMBDA => FEATURE_LAMBDA_NETWORK_LOGS,
+        _ => return None,
+    };
+    Some(feature)
+}
+
+/// Which Runtime Monitoring feature a runtime finding's usage is, from the resource the
+/// finding is about: the three runtime members `UsageFeature` carries are per resource
+/// kind (`smithy_query(shape="UsageFeature")`).
+fn runtime_feature(resource_type: &str) -> &'static str {
+    match resource_type {
+        RESOURCE_ECS_CLUSTER => FEATURE_FARGATE_RUNTIME_MONITORING,
+        RESOURCE_EKS_CLUSTER | RESOURCE_CONTAINER => crate::state::FEATURE_EKS_RUNTIME_MONITORING,
+        _ => FEATURE_EC2_RUNTIME_MONITORING,
+    }
+}
+
+/// The `UsageFeature` a recorded malware scan's usage belongs to, from the
+/// `MalwareProtectionResourceType` the scan carries.
+///
+/// Malware Protection for EC2 is what scans the EC2 and EBS resources
+/// (`smithy_query(shape="MalwareProtectionResourceType")` lists them beside the S3
+/// ones), and it is the `EBS_MALWARE_PROTECTION` feature. Malware Protection for S3 is a
+/// separate feature `UsageFeature` carries no member for, so a scan of an S3 resource is
+/// attributed to none — the same split [`feature_for_finding`] makes for a file verdict.
+fn feature_for_scan(resource_type: &str) -> Option<&'static str> {
+    let scanned_by_ec2_malware_protection = resource_type.starts_with(SCAN_RESOURCE_EC2_PREFIX)
+        || resource_type.starts_with(SCAN_RESOURCE_EBS_PREFIX);
+    scanned_by_ec2_malware_protection.then_some(crate::state::FEATURE_EBS_MALWARE_PROTECTION)
+}
+
+/// The currency the amounts are reported in: the one the request asked for, or [`USD`]
+/// when it named none.
+///
+/// "Current valid values are USD"
+/// (`smithy_query(query="doc",shape="GetUsageStatisticsRequest",member="Unit")`), so a
+/// request naming another currency is REFUSED rather than answered in a currency this
+/// service does not report. The comparison ignores case — a currency code is a code, not
+/// text — and the reported unit is the canonical form either way.
+fn reported_unit(requested: Option<&str>) -> Result<String, GetUsageStatisticsError> {
+    // A member the request left EMPTY names no currency, the way this crate's other
+    // handlers read an empty optional (`.filter(|value| !value.is_empty())`): there is
+    // no currency code of length zero to refuse.
+    match requested.filter(|unit| !unit.is_empty()) {
+        None => Ok(USD.to_string()),
+        Some(unit) if unit.eq_ignore_ascii_case(USD) => Ok(USD.to_string()),
+        Some(_) => Err(bad_request(crate::state::invalid_parameter_message(
+            UNIT_MEMBER,
+        ))),
+    }
+}
+
+/// The values one `UsageCriteria` list restricts the statistics to, or `None` when the
+/// request names none.
+///
+/// A list the request left EMPTY restricts nothing, the way this service's other
+/// criteria treat an empty list: it names no value to aggregate FROM.
+fn exact_values(values: Option<&[String]>) -> Option<BTreeSet<String>> {
+    let values = values.filter(|values| !values.is_empty())?;
+    Some(values.iter().cloned().collect())
+}
+
+/// The features the criteria restrict the statistics to, or `None` when they name none.
+///
+/// `Features` and the deprecated `DataSources` are two views of the same thing
+/// (`DataSources` "is deprecated, use Features instead" —
+/// `smithy_query(shape="UsageCriteria")`), so a data source the request names selects
+/// the feature behind it and the two lists together select the union: each entry names
+/// usage the caller asked to aggregate from.
+fn selected_features(criteria: &UsageCriteria) -> Option<BTreeSet<String>> {
+    let named = criteria.features.iter().flatten().cloned();
+    let behind_data_sources = criteria
+        .data_sources
+        .iter()
+        .flatten()
+        .filter_map(|data_source| feature_for_data_source(data_source))
+        .map(str::to_string);
+    let selected: BTreeSet<String> = named.chain(behind_data_sources).collect();
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// The `DataSource` name `feature` is reported under, or `None` when the deprecated enum
+/// has no member for it. See [`FEATURE_DATA_SOURCES`].
+fn data_source_for(feature: &str) -> Option<&'static str> {
+    FEATURE_DATA_SOURCES
+        .iter()
+        .find(|(candidate, _)| *candidate == feature)
+        .map(|(_, data_source)| *data_source)
+}
+
+/// The `UsageFeature` behind one `DataSource` name — the inverse of [`data_source_for`],
+/// read off the same table so the two cannot disagree.
+fn feature_for_data_source(data_source: &str) -> Option<&'static str> {
+    FEATURE_DATA_SOURCES
+        .iter()
+        .find(|(_, candidate)| *candidate == data_source)
+        .map(|(feature, _)| *feature)
+}
+
+/// How a statistic orders its rows.
+#[derive(Debug, Clone, Copy)]
+enum Order {
+    /// By the key the rows are aggregated under: a `SUM_BY_*` statistic reports every
+    /// key it holds, and the key order is a TOTAL order, so the prefix a page takes is
+    /// well defined.
+    ByKey,
+    /// Most expensive first: "lists the top 50 … in the order from most to least
+    /// expensive"
+    /// (`smithy_query(query="doc",shape="UsageStatistics",member="TopResources")`). The
+    /// key breaks a tie, ascending, so this order is total too.
+    MostExpensiveFirst,
+}
+
+/// Sum the cost of every record under the key `key_of` names it by, dropping the records
+/// it names no key for.
+fn totals_by<'a>(
+    usage: impl IntoIterator<Item = &'a UsageRecord>,
+    key_of: impl Fn(&UsageRecord) -> Option<String>,
+) -> BTreeMap<String, i64> {
+    let mut totals: BTreeMap<String, i64> = BTreeMap::new();
+    for record in usage {
+        let Some(key) = key_of(record) else {
+            continue;
+        };
+        let total = totals.entry(key).or_insert(0);
+        *total = total.saturating_add(record.cents);
+    }
+    totals
+}
+
+/// What one key totals, or nothing at all when the key is not in the map.
+fn cents_of(totals: &BTreeMap<String, i64>, key: &str) -> i64 {
+    totals.get(key).copied().unwrap_or_default()
+}
+
+/// The keys of `totals`, in `order` — at most [`TOP_ROWS`] of them for a `TOP_*`
+/// statistic, which is the whole statistic and not one page of it: those members report
+/// "the top 50" (their own docs), so row 51 is not reachable by paging either.
+fn ordered(totals: &BTreeMap<String, i64>, order: Order) -> Vec<String> {
+    let mut keys: Vec<String> = totals.keys().cloned().collect();
+    if matches!(order, Order::MostExpensiveFirst) {
+        keys.sort_by(|left, right| {
+            cents_of(totals, right)
+                .cmp(&cents_of(totals, left))
+                .then_with(|| left.cmp(right))
+        });
+        keys.truncate(TOP_ROWS);
+    }
+    keys
+}
+
+/// The page of ordered keys `maxResults` / `nextToken` asks for.
+///
+/// The token is the one this service's other listings issue — an offset into the ordered
+/// keys — so a token from another listing, or one past the end, is refused rather than
+/// silently answered with the first page.
+fn page(
+    totals: &BTreeMap<String, i64>,
+    order: Order,
+    max_results: Option<i32>,
+    token: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), GetUsageStatisticsError> {
+    let keys = ordered(totals, order);
+    crate::state::paginate(&keys, max_results, token, TOP_ROWS).map_err(|_| {
+        bad_request(crate::state::invalid_parameter_message(
+            crate::state::NEXT_TOKEN_MEMBER,
+        ))
+    })
+}
+
+/// One row's `Total`: the amount and the currency it is given in.
+fn total(cents: i64, unit: &str) -> Total {
+    Total {
+        amount: Some(amount(cents)),
+        unit: Some(unit.to_string()),
+    }
+}
+
+/// Render a cost as the decimal `Total.Amount` carries — "the total usage"
+/// (`smithy_query(query="doc",shape="Total",member="Amount")`), a string on the wire.
+///
+/// The cost is accumulated in whole hundredths so the aggregations are EXACT: a
+/// `SUM_BY_ACCOUNT` row is the sum of that account's per-feature rows to the last
+/// hundredth, which no float accumulation would guarantee.
+fn amount(cents: i64) -> String {
+    format!("{}.{:02}", cents / CENTS_PER_UNIT, cents % CENTS_PER_UNIT)
+}
+
+/// The statistics for ONE `usageStatisticsType`, computed over the records the criteria
+/// selected, plus the token for the page after this one.
+fn aggregated(
+    statistic_type: &str,
+    usage: &[UsageRecord],
+    unit: &str,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Result<(UsageStatistics, Option<String>), GetUsageStatisticsError> {
+    match statistic_type {
+        SUM_BY_ACCOUNT => {
+            let totals = totals_by(usage, |record| Some(record.account_id.clone()));
+            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token)?;
+            Ok((
+                UsageStatistics {
+                    sum_by_account: Some(
+                        keys.iter()
+                            .map(|account| UsageAccountResult {
+                                account_id: Some(account.clone()),
+                                total: Some(total(cents_of(&totals, account), unit)),
+                            })
+                            .collect(),
+                    ),
+                    ..UsageStatistics::default()
+                },
+                token,
+            ))
+        }
+        SUM_BY_DATA_SOURCE => {
+            let totals = totals_by(usage, |record| {
+                data_source_for(record.feature).map(str::to_string)
+            });
+            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token)?;
+            Ok((
+                UsageStatistics {
+                    sum_by_data_source: Some(
+                        keys.iter()
+                            .map(|data_source| UsageDataSourceResult {
+                                data_source: Some(data_source.clone()),
+                                total: Some(total(cents_of(&totals, data_source), unit)),
+                            })
+                            .collect(),
+                    ),
+                    ..UsageStatistics::default()
+                },
+                token,
+            ))
+        }
+        SUM_BY_FEATURES => {
+            let totals = totals_by(usage, |record| Some(record.feature.to_string()));
+            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token)?;
+            Ok((
+                UsageStatistics {
+                    sum_by_feature: Some(
+                        keys.iter()
+                            .map(|feature| UsageFeatureResult {
+                                feature: Some(feature.clone()),
+                                total: Some(total(cents_of(&totals, feature), unit)),
+                            })
+                            .collect(),
+                    ),
+                    ..UsageStatistics::default()
+                },
+                token,
+            ))
+        }
+        SUM_BY_RESOURCE | TOP_RESOURCES => {
+            let totals = totals_by(usage, |record| record.resource.clone());
+            // The two statistics report the SAME rows; `TOP_RESOURCES` is the expensive
+            // ones first, and `SUM_BY_RESOURCE` every resource in its own order.
+            let order = if statistic_type == TOP_RESOURCES {
+                Order::MostExpensiveFirst
+            } else {
+                Order::ByKey
+            };
+            let (keys, token) = page(&totals, order, max_results, next_token)?;
+            let rows: Vec<UsageResourceResult> = keys
+                .iter()
+                .map(|resource| UsageResourceResult {
+                    resource: Some(resource.clone()),
+                    total: Some(total(cents_of(&totals, resource), unit)),
+                })
+                .collect();
+            let statistics = if statistic_type == TOP_RESOURCES {
+                UsageStatistics {
+                    top_resources: Some(rows),
+                    ..UsageStatistics::default()
+                }
+            } else {
+                UsageStatistics {
+                    sum_by_resource: Some(rows),
+                    ..UsageStatistics::default()
+                }
+            };
+            Ok((statistics, token))
+        }
+        TOP_ACCOUNTS_BY_FEATURE => {
+            // "Currently, this doesn't support RDS_LOGIN_EVENTS"
+            // (`smithy_query(query="doc",shape="UsageStatistics",member="TopAccountsByFeature")`),
+            // so that feature's usage is left out of THIS statistic and of no other.
+            let reported: Vec<&UsageRecord> = usage
+                .iter()
+                .filter(|record| record.feature != crate::state::FEATURE_RDS_LOGIN_EVENTS)
+                .collect();
+            let totals = totals_by(reported.iter().copied(), |record| {
+                Some(record.feature.to_string())
+            });
+            let (keys, token) = page(&totals, Order::MostExpensiveFirst, max_results, next_token)?;
+            let rows: Vec<UsageTopAccountsResult> = keys
+                .iter()
+                .map(|feature| {
+                    let per_account = totals_by(
+                        reported
+                            .iter()
+                            .copied()
+                            .filter(|record| record.feature == feature.as_str()),
+                        |record| Some(record.account_id.clone()),
+                    );
+                    UsageTopAccountsResult {
+                        feature: Some(feature.clone()),
+                        accounts: Some(
+                            ordered(&per_account, Order::MostExpensiveFirst)
+                                .iter()
+                                .map(|account| UsageTopAccountResult {
+                                    account_id: Some(account.clone()),
+                                    total: Some(total(cents_of(&per_account, account), unit)),
+                                })
+                                .collect(),
+                        ),
+                    }
+                })
+                .collect();
+            Ok((
+                UsageStatistics {
+                    top_accounts_by_feature: Some(rows),
+                    ..UsageStatistics::default()
+                },
+                token,
+            ))
+        }
+        // The boundary validator refuses a value outside `UsageStatisticType` before the
+        // handler runs, so this is unreachable through the wire; it stays a REFUSAL
+        // rather than a default aggregation, because answering some other statistic
+        // would report usage the caller did not ask for.
+        _ => Err(bad_request(crate::state::invalid_parameter_message(
+            USAGE_STATISTIC_TYPE_MEMBER,
+        ))),
+    }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the `InvalidInputException`
+/// class, in both the body's `__type` and its `type` member.
+fn bad_request(message: impl Into<String>) -> GetUsageStatisticsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

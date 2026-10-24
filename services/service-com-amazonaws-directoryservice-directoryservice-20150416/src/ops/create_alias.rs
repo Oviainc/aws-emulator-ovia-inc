@@ -7,6 +7,12 @@
 //! been created, it cannot be deleted or reused" — is what makes both an alias already
 //! taken and a directory that already has one an `EntityAlreadyExistsException`.
 //!
+//! The `Alias` member's modelled `@pattern` is checked FIRST, before the directory is
+//! resolved, and a value outside it is the framework's `ValidationException` rather than
+//! one of this operation's resolution errors — see [`alias_pattern_violation`], which is
+//! also where the reason this one constraint cannot be left to the boundary validator is
+//! written down.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -149,6 +155,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // The modelled constraint on `Alias` is checked BEFORE anything is resolved: a
+        // member that does not satisfy its own `@pattern` is a request the service never
+        // gets to act on, so it is refused with the framework's validation envelope
+        // (HTTP 400, `ValidationException`, a lowercase `message` naming the member and
+        // the constraint) rather than with one of this operation's own resolution
+        // errors. See [`alias_pattern_violation`] for why this one constraint is checked
+        // here rather than at the boundary with every other.
+        if let Some(message) = alias_pattern_violation(&input.alias) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
 
@@ -157,10 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.directories.contains_key(&input.directory_id) {
             return Err(CreateAliasErrorModeled::EntityDoesNotExistException(
-                EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                },
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )
             .into());
         }
@@ -191,14 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documented maximum and the call is refused once the index is full. Checked
         // BEFORE the insert below, so a refused call stores nothing.
         if store.aliases.len() >= crate::state::MAX_RESERVED_ALIASES {
-            return Err(CreateAliasErrorModeled::ClientException(ClientException {
-                message: Some(format!(
+            return Err(
+                CreateAliasErrorModeled::ClientException(crate::state::refusal(format!(
                     "This emulator keeps at most {max} alias reservations; no further alias can be created",
                     max = crate::state::MAX_RESERVED_ALIASES
-                )),
-                request_id: None,
-            })
-            .into());
+                )))
+                .into(),
+            );
         }
 
         store
@@ -222,9 +236,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with the modelled `EntityAlreadyExistsException`, naming what
 /// already holds the alias.
 fn already_exists(message: String) -> CreateAliasError {
-    CreateAliasErrorModeled::EntityAlreadyExistsException(EntityAlreadyExistsException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    CreateAliasErrorModeled::EntityAlreadyExistsException(crate::state::refusal(message)).into()
+}
+
+/// `AliasName`'s modelled `@pattern`
+/// (`smithy_query(query="shape",shape="AliasName")`): the expression an `Alias` has to
+/// satisfy. It opens with the negative lookahead `(?!D-|d-)` — an alias may not be
+/// spelled like a directory id — and admits only alphanumerics separated by hyphens.
+const ALIAS_PATTERN: &str = r"^(?!D-|d-)([\da-zA-Z]+)([-]*[\da-zA-Z])*$";
+
+/// Why the modelled `@pattern` on `Alias` rejects `alias`, worded as the framework's own
+/// validation envelope — or `None` when the alias satisfies it.
+///
+/// This check belongs in the handler rather than at the boundary: the vendored boundary
+/// validator compiles a `@pattern` with the `regex` crate, which has no look-around, and
+/// it treats a pattern it cannot compile as MATCHING (`pattern_matches` in
+/// `vendor/smithy-schema-server/src/constraints.rs`). `AliasName`'s pattern opens with a
+/// negative lookahead, so the constraint the model declares would otherwise never be
+/// applied to this member at all, and a malformed alias would reach the directory lookup
+/// and be reported as a missing entity.
+///
+/// The clause's sentence, its violation count and its member path are the framework's own
+/// ([`::aws_smithy_schema_server::envelope`], [`::smithy_server_runtime::ViolationKind`],
+/// `constraints::path::member`), so a refusal worded here reads exactly like one the
+/// boundary words.
+fn alias_pattern_violation(alias: &str) -> Option<String> {
+    if alias_matches(alias) {
+        return None;
+    }
+    ::aws_smithy_schema_server::envelope(&[::smithy_server_runtime::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(ALIAS_MEMBER),
+        kind: ::smithy_server_runtime::ViolationKind::Pattern(stated_alias_pattern().to_string()),
+        // The whole value, not an elision: `Alias` carries `@length` max 62, which the
+        // boundary validator enforces before this handler runs, so the echo is bounded
+        // by the model rather than by the request.
+        value: Some(alias.to_string()),
+    }])
+}
+
+/// The member a clause names, as the model spells it; the framework lower-camels it for
+/// the path (`Alias` -> `alias`).
+const ALIAS_MEMBER: &str = "Alias";
+
+/// Whether `alias` satisfies [`ALIAS_PATTERN`].
+///
+/// The expression is applied clause by clause rather than handed to a regex engine: no
+/// engine this crate can reach evaluates it (the `regex` crate behind `@pattern` has no
+/// look-around), and the expression is a bounded ASCII grammar whose clauses map one to
+/// one onto the predicates below —
+///
+/// * `(?!D-|d-)` — the value does not begin with `D-` or `d-`;
+/// * `([\da-zA-Z]+)` — it is non-empty and begins with an ASCII alphanumeric (`\d` is
+///   read as the ASCII digits, the semantics a Smithy `@pattern` is validated with);
+/// * `([-]*[\da-zA-Z])*` — every remaining character is an ASCII alphanumeric or a
+///   hyphen, and the value ENDS on an alphanumeric: each repetition of the group may
+///   carry any number of hyphens but always closes on one alphanumeric, so a trailing
+///   hyphen is outside the expression while a run of hyphens between two alphanumerics
+///   is inside it.
+///
+/// Together: non-empty, ASCII alphanumerics and hyphens only, first and last character
+/// alphanumeric, and never the directory-id prefix. `tests/all/error_envelopes.rs` pins
+/// the equivalence over a table that breaks each of those clauses in turn and satisfies
+/// each of them in every way the expression admits.
+fn alias_matches(alias: &str) -> bool {
+    if alias.starts_with("D-") || alias.starts_with("d-") {
+        return false;
+    }
+    let bytes = alias.as_bytes();
+    let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
+/// [`ALIAS_PATTERN`] as a refusal STATES it: the expression without the whole-value end
+/// anchor.
+///
+/// A `@pattern` is quoted in a validation clause as the expression a value has to
+/// satisfy, and the `^`/`$` a model writes around it are how Smithy turns a find into a
+/// whole-string match rather than part of the character grammar (the rule
+/// `services/common/src/validation.rs` documents and renders for the services that share
+/// it). Which end anchors a service drops is part of its validation-message dialect, and
+/// a recorded Directory Service refusal of a malformed alias quotes this pattern with its
+/// leading `^` and WITHOUT the trailing `$`. Derived from the one pattern constant, so
+/// the text a clause quotes cannot drift from the expression the check runs.
+fn stated_alias_pattern() -> &'static str {
+    ALIAS_PATTERN.strip_suffix('$').unwrap_or(ALIAS_PATTERN)
 }

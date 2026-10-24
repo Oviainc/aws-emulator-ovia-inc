@@ -207,16 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.customer_assessment_count() >= crate::state::MAX_CUSTOMER_ASSESSMENTS {
             return Err(
                 StartADAssessmentErrorModeled::ADAssessmentLimitExceededException(
-                    ADAssessmentLimitExceededException {
-                        message: Some(format!(
-                            "Maximum number of {report_type} directory assessments has been \
-                             reached: {max}. Delete assessments to free up capacity before \
-                             trying again.",
-                            report_type = crate::state::ASSESSMENT_REPORT_TYPE_CUSTOMER,
-                            max = crate::state::MAX_CUSTOMER_ASSESSMENTS
-                        )),
-                        request_id: None,
-                    },
+                    crate::state::refusal(format!(
+                        "Maximum number of {report_type} directory assessments has been \
+                         reached: {max}. Delete assessments to free up capacity before \
+                         trying again.",
+                        report_type = crate::state::ASSESSMENT_REPORT_TYPE_CUSTOMER,
+                        max = crate::state::MAX_CUSTOMER_ASSESSMENTS
+                    )),
                 )
                 .into(),
             );
@@ -230,10 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SubjectRequest::Directory(directory_id) => {
                 let directory = store.directories.get(&directory_id).ok_or_else(|| {
                     StartADAssessmentErrorModeled::DirectoryDoesNotExistException(
-                        DirectoryDoesNotExistException {
-                            message: Some(crate::state::no_such_directory(&directory_id)),
-                            request_id: None,
-                        },
+                        crate::state::refusal(crate::state::no_such_directory(&directory_id)),
                     )
                 })?;
                 let vpc_settings = directory.vpc_settings.clone();
@@ -343,9 +337,5 @@ struct Subject {
 /// Refuse the request with the modelled `InvalidParameterException`, naming the members
 /// and the rule they broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: &str) -> StartADAssessmentError {
-    StartADAssessmentErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message.to_string()),
-        request_id: None,
-    })
-    .into()
+    StartADAssessmentErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }

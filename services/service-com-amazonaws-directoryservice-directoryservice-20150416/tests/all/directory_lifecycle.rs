@@ -42,9 +42,19 @@ pub(crate) const STAGE_ACTIVE: &str = "Active";
 /// AD directory admits: "Simple AD supports IPv4 and Dual-stack only."
 const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = ["IPv4", "Dual-stack"];
 
-/// Directory Service's default quota of 10 directories per account per Region, which
-/// every create counts against.
-pub(crate) const DIRECTORY_QUOTA: usize = 10;
+/// Directory Service's published Region quota of Simple AD directories, which every
+/// `CreateDirectory` counts against: "Simple AD directories: 10" per Region.
+pub(crate) const CLOUD_ONLY_QUOTA: usize = 10;
+
+/// Directory Service's published Region quota of AWS Managed Microsoft AD directories,
+/// which every `CreateMicrosoftAD` counts against: "AWS Managed Microsoft AD
+/// directories: 20" per Region — its own allowance, double the Simple AD one.
+pub(crate) const MICROSOFT_AD_QUOTA: usize = 20;
+
+/// Directory Service's published Region quota of AD Connector directories:
+/// "AD Connector directories: 10" per Region. Nothing persists one yet
+/// (`ConnectDirectory` is still a scaffold stub), so it is only ever reported.
+pub(crate) const CONNECTED_QUOTA: usize = 10;
 
 /// AWS's tagging limit of 50 tags per resource.
 pub(crate) const TAG_QUOTA: usize = 50;
@@ -1136,10 +1146,11 @@ async fn the_alias_reservation_index_is_bounded() {
     let router = service();
     let case = "alias reservations";
 
-    // Each pass reserves one alias and then deletes the directory, so the directory
-    // quota is never reached but the reservation index grows by one — the only store
+    // Each pass reserves one alias and then deletes the directory, so no directory
+    // quota is ever reached but the reservation index grows by one — the only store
     // in this slice a caller can grow without deleting anything. The guard mirrors
-    // `state::MAX_RESERVED_ALIASES` (ten times the 10-directory quota).
+    // `state::MAX_RESERVED_ALIASES`, which is stated as its own figure rather than
+    // derived from a directory quota.
     const ALIAS_RESERVATION_GUARD: usize = 100;
     for index in 0..ALIAS_RESERVATION_GUARD {
         let id = create_directory(
@@ -1186,7 +1197,7 @@ async fn the_alias_reservation_index_is_bounded() {
 async fn the_directory_and_tag_quotas_are_enforced() {
     let router = service();
 
-    for index in 0..DIRECTORY_QUOTA {
+    for index in 0..CLOUD_ONLY_QUOTA {
         create_directory(
             &router,
             minimal_create(&format!("quota{index}.example.com")),
