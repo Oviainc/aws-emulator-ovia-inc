@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataIntegrationAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataIntegrationAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataIntegrationAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the `ExecutionConfiguration` of one stored DataIntegrationAssociation, so
+//! `ListDataIntegrationAssociations` reports the configuration this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataIntegrationAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataIntegrationAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDataIntegrationAssociationErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: Some("the AppIntegrations store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Both identifiers are resolved before anything is written, and the association
+        // only within the integration the request named: an association of another
+        // integration is not reachable through this one.
+        let integration_id = state
+            .data_integration_id(&input.data_integration_identifier)
+            .ok_or_else(|| {
+                UpdateDataIntegrationAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_integration_not_found(
+                            &input.data_integration_identifier,
+                        )),
+                    },
+                )
+            })?;
+        let association_id = state
+            .data_integration_association_id(
+                &integration_id,
+                &input.data_integration_association_identifier,
+            )
+            .ok_or_else(|| {
+                UpdateDataIntegrationAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_integration_association_not_found(
+                            &input.data_integration_association_identifier,
+                        )),
+                    },
+                )
+            })?;
+
+        // The same rule the create applies, so the two cannot disagree about what a
+        // usable `ExecutionConfiguration` is.
+        if let Some(problem) =
+            crate::state::execution_configuration_problem(&input.execution_configuration)
+        {
+            return Err(
+                UpdateDataIntegrationAssociationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(problem),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = state
+            .data_integration_associations
+            .get_mut(&association_id)
+            .ok_or_else(|| {
+                UpdateDataIntegrationAssociationErrorModeled::InternalServiceError(
+                    InternalServiceError {
+                        message: Some(format!(
+                            "the association {association_id} vanished while being updated"
+                        )),
+                    },
+                )
+            })?;
+        // `ExecutionConfiguration` is required on this request, so the update REPLACES
+        // the stored one whole rather than merging into it.
+        record.execution_configuration = Some(input.execution_configuration);
+        record.last_modified_time = ::std::time::SystemTime::now();
+        // An operator's record that this call changed state: the operation, the resources
+        // it touched (the ids this service minted, never a value the request supplied)
+        // and its outcome. No credential is logged.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataIntegrationAssociation"))
+        // AWS additionally reruns the association's on-demand job on this call. This
+        // emulator runs no import/export job at all — no job runs here to be rerun, and
+        // reporting one that nothing performed would be a fabrication — so the stored
+        // configuration is what this operation changes, and no execution status is
+        // invented for it (`LastExecutionStatus` stays absent).
+        ::tracing::info!(
+            operation = Self::NAME,
+            data_integration_id = %integration_id,
+            data_integration_association_id = %association_id,
+            outcome = "execution-configuration-replaced",
+            "applied an UpdateDataIntegrationAssociation"
+        );
+
+        Ok(UpdateDataIntegrationAssociationOutput {})
     }
 }

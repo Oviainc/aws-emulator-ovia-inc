@@ -794,3 +794,236 @@ async fn a_next_token_this_service_did_not_mint_is_refused() {
         );
     }
 }
+
+/// Send one `UpdateDataIntegration` (`PATCH /dataIntegrations/{Identifier}`).
+async fn update(emulator: &Emulator, identifier: &str, body: Value) -> Reply {
+    emulator
+        .send(
+            "PATCH",
+            &format!("/dataIntegrations/{}", encode_label(identifier)),
+            REGION,
+            Some(body),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn update_applies_the_members_it_carries_and_leaves_the_others_alone() {
+    let emulator = Emulator::new();
+    let kms_key = emulator.create_kms_key(REGION).await;
+
+    // Rows differ in WHICH members the PATCH carries and in their form: one member, the
+    // other, both, a description at its published upper bound, a description cleared to
+    // the empty string (`Description` is `len 0..1000`, so "" is a value), and a PATCH
+    // that carries neither member.
+    let rows: Vec<(&str, Value, Option<&str>, Option<String>)> = vec![
+        (
+            "only a description",
+            json!({ "Description": "pulls the nightly feed" }),
+            None,
+            Some("pulls the nightly feed".to_string()),
+        ),
+        (
+            "only a name",
+            json!({ "Name": "renamed.integration" }),
+            Some("renamed.integration"),
+            Some("the original description".to_string()),
+        ),
+        (
+            "both members",
+            json!({ "Name": "renamed_both", "Description": "both changed" }),
+            Some("renamed_both"),
+            Some("both changed".to_string()),
+        ),
+        (
+            "a description at its published upper bound",
+            json!({ "Description": "d".repeat(DESCRIPTION_MAX) }),
+            None,
+            Some("d".repeat(DESCRIPTION_MAX)),
+        ),
+        (
+            "an empty description",
+            json!({ "Description": "" }),
+            None,
+            Some(String::new()),
+        ),
+        (
+            "neither member",
+            json!({}),
+            None,
+            Some("the original description".to_string()),
+        ),
+    ];
+
+    for (index, (label, patch, expected_name, expected_description)) in rows.iter().enumerate() {
+        // Both identifier forms the service hands out address the resource.
+        for form in ["by id", "by arn"] {
+            let original_name = format!("patched-{index}-{}", form.replace(' ', "-"));
+            let created = create(
+                &emulator,
+                json!({
+                    "Name": original_name,
+                    "KmsKey": kms_key,
+                    "Description": "the original description",
+                    "SourceURI": "s3://feed-bucket/accounts",
+                }),
+            )
+            .await;
+            let id = created.string("Id").expect("the create reported an Id");
+            let arn = created.string("Arn").expect("the create reported an ARN");
+            let identifier = if form == "by id" { id.clone() } else { arn.clone() };
+
+            let patched = update(&emulator, &identifier, patch.clone()).await;
+            assert_eq!(
+                patched.status, 200,
+                "case {label:?} {form}: expected HTTP 200 from UpdateDataIntegration, got {} / {}",
+                patched.status, patched.body
+            );
+
+            let fetched = get(&emulator, &identifier).await;
+            assert_eq!(
+                fetched.string("Name").as_deref(),
+                Some(expected_name.unwrap_or(original_name.as_str())),
+                "case {label:?} {form}: expected the Name the update left stored, got {:?}",
+                fetched.field("Name")
+            );
+            assert_eq!(
+                fetched.string("Description"),
+                *expected_description,
+                "case {label:?} {form}: expected the Description the update left stored, got {:?}",
+                fetched.field("Description")
+            );
+            // The members the PATCH does not model are untouched, and so is identity.
+            assert_eq!(
+                fetched.string("SourceURI").as_deref(),
+                Some("s3://feed-bucket/accounts"),
+                "case {label:?} {form}: an update must not change SourceURI, got {:?}",
+                fetched.field("SourceURI")
+            );
+            assert_eq!(
+                fetched.string("KmsKey").as_deref(),
+                Some(kms_key.as_str()),
+                "case {label:?} {form}: an update must not change KmsKey, got {:?}",
+                fetched.field("KmsKey")
+            );
+            assert_eq!(
+                (fetched.string("Id"), fetched.string("Arn")),
+                (Some(id.clone()), Some(arn.clone())),
+                "case {label:?} {form}: an update must not change Id or Arn, got {}",
+                fetched.body
+            );
+
+            delete(&emulator, &id).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn update_refuses_an_identifier_this_service_did_not_mint() {
+    let emulator = Emulator::new();
+    let kms_key = emulator.create_kms_key(REGION).await;
+    let created = create(
+        &emulator,
+        json!({ "Name": "update-target", "KmsKey": kms_key }),
+    )
+    .await;
+    let id = created.string("Id").expect("the create reported an Id");
+
+    // Rows differ in why the identifier names nothing: a UUID never minted, a foreign
+    // account, region, vendor and resource type on an otherwise real id, and a value
+    // that is no identifier form at all.
+    let unknown: Vec<(&str, String)> = vec![
+        (
+            "a UUID this service never minted",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        ),
+        (
+            "another account",
+            format!("arn:aws:app-integrations:{REGION}:111122223333:data-integration/{id}"),
+        ),
+        (
+            "another region",
+            format!("arn:aws:app-integrations:eu-west-1:{ACCOUNT}:data-integration/{id}"),
+        ),
+        (
+            "another vendor",
+            format!("arn:aws:s3:{REGION}:{ACCOUNT}:data-integration/{id}"),
+        ),
+        (
+            "another resource type",
+            format!("arn:aws:app-integrations:{REGION}:{ACCOUNT}:event-integration/{id}"),
+        ),
+        ("a name rather than an identifier", "update-target".to_string()),
+    ];
+
+    for (label, identifier) in &unknown {
+        let reply = update(&emulator, identifier, json!({ "Description": "no such thing" })).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {label:?}: expected HTTP 404 from UpdateDataIntegration, got {} / {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type, "ResourceNotFoundException",
+            "case {label:?}: expected ResourceNotFoundException, got {:?}",
+            reply.error_type
+        );
+    }
+
+    // And none of those calls changed the resource that does exist.
+    let fetched = get(&emulator, &id).await;
+    assert_eq!(
+        fetched.field("Description"),
+        None,
+        "a refused update must persist nothing, got {}",
+        fetched.body
+    );
+}
+
+#[tokio::test]
+async fn update_refuses_a_rename_onto_a_name_another_integration_holds() {
+    let emulator = Emulator::new();
+    let kms_key = emulator.create_kms_key(REGION).await;
+
+    // Rows differ in the name's form and length, including the published bounds of
+    // `Name` (len 1..255).
+    for taken in ["held.one", "h", &"h".repeat(255)] {
+        let holder = create(&emulator, json!({ "Name": taken, "KmsKey": kms_key })).await;
+        let mover = create(
+            &emulator,
+            json!({ "Name": format!("mover-{}", taken.len()), "KmsKey": kms_key }),
+        )
+        .await;
+        let holder_id = holder.string("Id").expect("the create reported an Id");
+        let mover_id = mover.string("Id").expect("the create reported an Id");
+
+        let refused = update(&emulator, &mover_id, json!({ "Name": taken })).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {taken:?}: expected HTTP 400 for a rename onto a held name, got {} / {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type, "InvalidRequestException",
+            "case {taken:?}: expected InvalidRequestException, got {:?}",
+            refused.error_type
+        );
+        // Neither resource moved.
+        assert_eq!(
+            get(&emulator, &mover_id).await.string("Name"),
+            Some(format!("mover-{}", taken.len())),
+            "case {taken:?}: the refused rename must leave the name it had"
+        );
+
+        // Renaming a resource onto the name it already holds is not a duplicate.
+        let kept = update(&emulator, &holder_id, json!({ "Name": taken })).await;
+        assert_eq!(
+            kept.status, 200,
+            "case {taken:?}: a resource may keep its own name, got {} / {}",
+            kept.status, kept.body
+        );
+
+        delete(&emulator, &holder_id).await;
+        delete(&emulator, &mover_id).await;
+    }
+}

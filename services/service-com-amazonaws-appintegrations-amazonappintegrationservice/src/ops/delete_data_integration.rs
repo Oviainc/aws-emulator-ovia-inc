@@ -163,14 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Only DataIntegrations that don't have any DataIntegrationAssociations can be
         // deleted" (this operation's own documentation). The association store is
-        // written by `CreateDataIntegrationAssociation`, which is still a scaffold stub,
-        // so nothing can hold an association yet — the rule is read from state here so
-        // that implementing that operation needs no change to this one.
-        if state
-            .data_integration_associations
-            .get(&id)
-            .is_some_and(|associations| !associations.is_empty())
-        {
+        // written by `CreateDataIntegrationAssociation`, and the rule is read from state
+        // here so both operations share one notion of "has associations".
+        if state.has_data_integration_associations(&id) {
             return Err(DeleteDataIntegrationErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(format!(
@@ -182,13 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let removed = state.data_integrations.remove(&id);
-        state.data_integration_associations.remove(&id);
+        // No association survives the refusal above, so there is none to drop here.
         // The idempotency record of the create that minted it goes with it, so a retry
         // of that create after the delete creates the resource again rather than
         // reporting one that no longer exists.
         if let Some(token) = removed.and_then(|record| record.client_token) {
             state.data_integration_idempotency.remove(&token);
         }
+        // An operator's record that this call changed state: the operation, the resource
+        // it touched (the id this service minted, never a value the request supplied) and
+        // its outcome. No credential or token is logged.
+        ::tracing::info!(
+            operation = Self::NAME,
+            data_integration_id = %id,
+            outcome = "deleted",
+            "deleted a DataIntegration"
+        );
 
         Ok(DeleteDataIntegrationOutput {})
     }

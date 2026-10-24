@@ -9,13 +9,13 @@
 //! operation files agree on one implementation of each instead of carrying a copy
 //! apiece that can drift apart.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ApplicationConfig, ApplicationSourceConfig, AuthConfig, DataIntegrationSummary, EventFilter,
-    EventIntegration, FileConfiguration, IframeConfig, Publication, ScheduleConfiguration,
-    Subscription,
+    ApplicationConfig, ApplicationSourceConfig, AuthConfig, DataIntegrationAssociationSummary,
+    DataIntegrationSummary, EventFilter, EventIntegration, ExecutionConfiguration,
+    FileConfiguration, IframeConfig, Publication, ScheduleConfiguration, Subscription,
 };
 
 /// The region an emulated request is treated as having been made in when its
@@ -62,6 +62,15 @@ pub const MAX_STORED_APPLICATIONS: usize = 1_000;
 /// client script creates.
 pub const MAX_STORED_DATA_INTEGRATIONS: usize = 1_000;
 
+/// The most data integration associations this emulator stores at once.
+///
+/// AWS caps DataIntegrationAssociations with a service quota and reports an exceeded cap
+/// as `ResourceQuotaExceededException`, which `CreateDataIntegrationAssociation` models.
+/// The NUMBER here is this emulator's own bound, for the same reason as
+/// [`MAX_STORED_DATA_INTEGRATIONS`]: an in-memory store a caller must not be able to
+/// grow without end.
+pub const MAX_STORED_DATA_INTEGRATION_ASSOCIATIONS: usize = 1_000;
+
 /// The most `ClientToken` -> data integration entries this emulator remembers at once.
 ///
 /// The create writes one per stored integration and the delete drops the one that
@@ -85,6 +94,13 @@ pub const MAX_REMEMBERED_EVENT_CLIENT_TOKENS: usize = MAX_STORED_EVENT_INTEGRATI
 /// by [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::remember_application_client_token`].
 pub const MAX_REMEMBERED_APPLICATION_CLIENT_TOKENS: usize = MAX_STORED_APPLICATIONS;
 
+/// The most `ClientToken` -> data integration association entries this emulator
+/// remembers at once, the [`MAX_REMEMBERED_CLIENT_TOKENS`] of the association index and
+/// enforced the same way, by
+/// [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::remember_association_client_token`].
+pub const MAX_REMEMBERED_ASSOCIATION_CLIENT_TOKENS: usize =
+    MAX_STORED_DATA_INTEGRATION_ASSOCIATIONS;
+
 /// The resource type name AppIntegrations calls an event integration in the text of a
 /// `ResourceNotFoundException` — the Smithy shape name of the resource
 /// (`smithy_query(query="operation", operation="GetEventIntegration")`: the resource is
@@ -98,6 +114,10 @@ pub const DATA_INTEGRATION_RESOURCE: &str = "DataIntegration";
 /// The same, for an application, which is addressed by an `ArnOrUUID` identifier
 /// (`GetApplication`'s `Arn` label).
 pub const APPLICATION_RESOURCE: &str = "Application";
+
+/// The same, for a data integration association, addressed by an opaque identifier
+/// (`UpdateDataIntegrationAssociation`'s `DataIntegrationAssociationIdentifier` label).
+pub const DATA_INTEGRATION_ASSOCIATION_RESOURCE: &str = "DataIntegrationAssociation";
 
 /// What a resource addressed by its `Name` member is called in a not-found message.
 pub const ADDRESSED_BY_NAME: &str = "name";
@@ -130,6 +150,16 @@ pub fn data_integration_not_found(identifier: &str) -> String {
 /// [`not_found_message`] for the application `identifier` the request named.
 pub fn application_not_found(identifier: &str) -> String {
     not_found_message(APPLICATION_RESOURCE, ADDRESSED_BY_IDENTIFIER, identifier)
+}
+
+/// [`not_found_message`] for the data integration association `identifier` the request
+/// named.
+pub fn data_integration_association_not_found(identifier: &str) -> String {
+    not_found_message(
+        DATA_INTEGRATION_ASSOCIATION_RESOURCE,
+        ADDRESSED_BY_IDENTIFIER,
+        identifier,
+    )
 }
 
 /// The persisted tags as the modelled `TagMap`, or `None` when the resource carries
@@ -272,6 +302,137 @@ impl DataIntegrationRecord {
     }
 }
 
+/// One stored data integration association: the client the data integration was
+/// associated for, where it writes to, and how its execution is configured, plus the id
+/// and ARN the service minted — so `ListDataIntegrationAssociations` reports what
+/// `CreateDataIntegrationAssociation` persisted rather than echoing a request.
+#[derive(Debug, Clone)]
+pub struct DataIntegrationAssociationRecord {
+    /// The `UUID` this service minted for the association: its identity, and the last
+    /// segment of [`DataIntegrationAssociationRecord::arn`].
+    pub id: String,
+    pub arn: String,
+    /// The id of the data integration this association belongs to, which is how the
+    /// associations of one integration are found (see
+    /// [`ComAmazonawsAppintegrationsAmazonappintegrationserviceState::associations_of`]).
+    pub data_integration_id: String,
+    pub data_integration_arn: String,
+    pub client_id: Option<String>,
+    pub destination_uri: Option<String>,
+    pub object_configuration: Option<HashMap<String, HashMap<String, Vec<String>>>>,
+    pub client_association_metadata: Option<HashMap<String, String>>,
+    pub execution_configuration: Option<ExecutionConfiguration>,
+    pub client_token: Option<String>,
+    /// When this record was created, and when its `ExecutionConfiguration` was last
+    /// changed by `UpdateDataIntegrationAssociation`. No output of this service models a
+    /// timestamp, so neither is reported; they are part of the record rather than of one
+    /// operation's response.
+    pub created_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl DataIntegrationAssociationRecord {
+    /// This record as a `ListDataIntegrationAssociations` summary — the members that
+    /// shape carries (`smithy_query(query="shape",
+    /// shape="DataIntegrationAssociationSummary")`).
+    ///
+    /// `LastExecutionStatus` is "the execution status of the last job": this emulator
+    /// runs no import/export job, so no job has ever run for this association and the
+    /// member is absent rather than carrying a status for work nothing performed.
+    pub fn to_summary(&self) -> DataIntegrationAssociationSummary {
+        DataIntegrationAssociationSummary {
+            data_integration_association_arn: Some(self.arn.clone()),
+            data_integration_arn: Some(self.data_integration_arn.clone()),
+            client_id: self.client_id.clone(),
+            destination_uri: self.destination_uri.clone(),
+            last_execution_status: None,
+            execution_configuration: self.execution_configuration.clone(),
+        }
+    }
+}
+
+/// Why `config` is not a valid `ExecutionConfiguration`, or `None` when it is.
+///
+/// ONE rule, shared by the create and the update of an association so the two cannot
+/// disagree: `ExecutionMode` ("the mode for data import/export execution") selects which
+/// nested configuration the association runs on, so exactly the block belonging to the
+/// named mode has to be there — `ON_DEMAND` runs on an `OnDemandConfiguration`,
+/// `SCHEDULED` on a `ScheduleConfiguration` — and the block belonging to the other mode
+/// is never part of a configuration this service could act on. On top of that an
+/// `OnDemandConfiguration`'s `StartTime` and `EndTime` are documented as "an Unix/epoch
+/// string in milliseconds", so a value that is not one names no instant, and a window
+/// whose end precedes its start names no window.
+///
+/// The returned sentence is built from the request (the member and the constraint it
+/// broke), which is what the caller needs to fix it; the operations report it as the
+/// `InvalidRequestException` ("the request is not valid") they model.
+pub fn execution_configuration_problem(config: &ExecutionConfiguration) -> Option<String> {
+    let on_demand_present = config.on_demand_configuration.is_some();
+    let scheduled_present = config.schedule_configuration.is_some();
+    let (expected, unexpected, required_block, other_block) = match config.execution_mode.as_str() {
+        EXECUTION_MODE_ON_DEMAND => (
+            on_demand_present,
+            scheduled_present,
+            "OnDemandConfiguration",
+            "ScheduleConfiguration",
+        ),
+        EXECUTION_MODE_SCHEDULED => (
+            scheduled_present,
+            on_demand_present,
+            "ScheduleConfiguration",
+            "OnDemandConfiguration",
+        ),
+        // The boundary refuses a value outside the `ExecutionMode` enum before a handler
+        // runs, so every mode reaching here is one of the two above.
+        other => return Some(format!("ExecutionMode {other} is not supported.")),
+    };
+    if !expected {
+        return Some(format!(
+            "ExecutionConfiguration with ExecutionMode {} requires {required_block}.",
+            config.execution_mode
+        ));
+    }
+    if unexpected {
+        return Some(format!(
+            "ExecutionConfiguration with ExecutionMode {} does not accept {other_block}.",
+            config.execution_mode
+        ));
+    }
+    let on_demand = config.on_demand_configuration.as_ref()?;
+    let start = epoch_millis(&on_demand.start_time).ok_or_else(|| {
+        format!(
+            "OnDemandConfiguration.StartTime must be a Unix/epoch time in milliseconds, got {}.",
+            on_demand.start_time
+        )
+    });
+    let start = match start {
+        Ok(start) => start,
+        Err(problem) => return Some(problem),
+    };
+    let end = on_demand.end_time.as_deref()?;
+    match epoch_millis(end) {
+        None => Some(format!(
+            "OnDemandConfiguration.EndTime must be a Unix/epoch time in milliseconds, got {end}."
+        )),
+        Some(end_millis) if end_millis < start => Some(format!(
+            "OnDemandConfiguration.EndTime {end} must not precede StartTime {}.",
+            on_demand.start_time
+        )),
+        Some(_) => None,
+    }
+}
+
+/// The two values `ExecutionMode` accepts, from the model's enum
+/// (`smithy_query(query="shape", shape="ExecutionMode")`).
+pub const EXECUTION_MODE_ON_DEMAND: &str = "ON_DEMAND";
+pub const EXECUTION_MODE_SCHEDULED: &str = "SCHEDULED";
+
+/// `value` read as the "Unix/epoch string in milliseconds" an `OnDemandConfiguration`
+/// time is documented to be, or `None` when it is not one.
+fn epoch_millis(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
 /// Per-service state for com-amazonaws-appintegrations-amazonappintegrationservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
@@ -315,14 +476,23 @@ pub struct ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
     /// `CreateEventIntegration` cannot resolve to a data integration. Bounded at
     /// [`MAX_REMEMBERED_CLIENT_TOKENS`] by [`Self::remember_client_token`].
     pub data_integration_idempotency: BTreeMap<String, String>,
-    /// The association ids a data integration has, keyed by the integration's id —
-    /// the association store `CreateDataIntegrationAssociation` writes into once it
-    /// is implemented (it answers HTTP 501 today, so nothing can add an entry yet).
-    /// `DeleteDataIntegration` reads it, and drops the entry with the integration, so
-    /// it holds at most one entry per stored integration and is bounded by the same
-    /// ceiling. AWS deletes only a DataIntegration that has no
+    /// Every stored data integration association, keyed by the id the service minted for
+    /// it — this resource's identity, which `UpdateDataIntegrationAssociation` addresses
+    /// it by. One map for every integration's associations rather than one per
+    /// integration, so an association is stored exactly once and
+    /// [`Self::associations_of`] is the one way to find the ones a given integration has.
+    /// A `BTreeMap` so list order, and therefore pagination, is deterministic, and
+    /// bounded at [`MAX_STORED_DATA_INTEGRATION_ASSOCIATIONS`] entries by the create that
+    /// writes it ([`Self::has_room_for_another_data_integration_association`]).
+    /// `DeleteDataIntegration` reads it: AWS deletes only a DataIntegration that has no
     /// DataIntegrationAssociations.
-    pub data_integration_associations: BTreeMap<String, BTreeSet<String>>,
+    pub data_integration_associations: BTreeMap<String, DataIntegrationAssociationRecord>,
+    /// `ClientToken` -> data integration association id, the association counterpart of
+    /// [`Self::data_integration_idempotency`] and a separate map for the same reason:
+    /// one token namespace per resource type. Bounded at
+    /// [`MAX_REMEMBERED_ASSOCIATION_CLIENT_TOKENS`] by
+    /// [`Self::remember_association_client_token`].
+    pub data_integration_association_idempotency: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
@@ -424,6 +594,75 @@ impl ComAmazonawsAppintegrationsAmazonappintegrationserviceState {
         self.data_integrations.len() < MAX_STORED_DATA_INTEGRATIONS
     }
 
+    /// Whether the store can hold another data integration association, which is what
+    /// `CreateDataIntegrationAssociation` checks BEFORE it mints one: past
+    /// [`MAX_STORED_DATA_INTEGRATION_ASSOCIATIONS`] it refuses with the quota error that
+    /// operation models, for the same reason as
+    /// [`Self::has_room_for_another_data_integration`].
+    pub fn has_room_for_another_data_integration_association(&self) -> bool {
+        self.data_integration_associations.len() < MAX_STORED_DATA_INTEGRATION_ASSOCIATIONS
+    }
+
+    /// The associations the data integration `integration_id` has, in the deterministic
+    /// order of the ids this service minted for them.
+    pub fn associations_of<'a>(
+        &'a self,
+        integration_id: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a DataIntegrationAssociationRecord)> {
+        self.data_integration_associations
+            .iter()
+            .filter(move |(_, record)| record.data_integration_id == integration_id)
+    }
+
+    /// Whether the data integration `integration_id` has ever been associated, which is
+    /// what `CreateDataIntegrationAssociation` refuses a second association on and
+    /// `DeleteDataIntegration` refuses a delete on.
+    pub fn has_data_integration_associations(&self, integration_id: &str) -> bool {
+        self.associations_of(integration_id).next().is_some()
+    }
+
+    /// The id of the association `identifier` names WITHIN the data integration
+    /// `integration_id`, or `None` when that integration has none.
+    ///
+    /// Both forms this service hands out resolve — the minted `Id` and the `Arn` built
+    /// from it — and both are matched only against the associations of this integration,
+    /// so an association of another integration is not reachable through it.
+    pub fn data_integration_association_id(
+        &self,
+        integration_id: &str,
+        identifier: &str,
+    ) -> Option<String> {
+        self.associations_of(integration_id)
+            .find(|(id, record)| id.as_str() == identifier || record.arn == identifier)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Remember that the create carrying `token` minted the association `id`, so a retry
+    /// under that token answers with the association it already made.
+    ///
+    /// Bounded exactly as [`Self::remember_client_token`] is, and for the same reason:
+    /// the key is caller-supplied, so the index it is written into cannot be allowed to
+    /// grow one request at a time.
+    pub fn remember_association_client_token(&mut self, token: String, id: String) {
+        if self.data_integration_association_idempotency.len()
+            >= MAX_REMEMBERED_ASSOCIATION_CLIENT_TOKENS
+        {
+            let Self {
+                data_integration_associations,
+                data_integration_association_idempotency,
+                ..
+            } = self;
+            data_integration_association_idempotency
+                .retain(|_, minted| data_integration_associations.contains_key(minted));
+        }
+        if self.data_integration_association_idempotency.len()
+            < MAX_REMEMBERED_ASSOCIATION_CLIENT_TOKENS
+        {
+            self.data_integration_association_idempotency
+                .insert(token, id);
+        }
+    }
+
     /// Remember that the create carrying `token` minted the data integration `id`, so a
     /// retry under that token answers with the resource it already made.
     ///
@@ -499,6 +738,24 @@ pub fn event_integration_arn(region: &str, name: &str) -> String {
 /// resource's identity is, and the ARN is the other form of it.
 pub fn data_integration_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("data-integration/{id}"))
+}
+
+/// The ARN of a data integration association in `region`:
+/// `arn:aws:app-integrations:<region>:<account>:data-integration-association/<integration-id>/<association-id>`.
+///
+/// Nested under the integration it belongs to, because an association exists only as
+/// part of one (its operations address it by both identifiers), and built from the
+/// minted ids rather than from anything the caller sent.
+pub fn data_integration_association_arn(
+    region: &str,
+    integration_id: &str,
+    association_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("data-integration-association/{integration_id}/{association_id}"),
+    )
 }
 
 /// The pagination cursor for a page that starts at the store key `name` (an event

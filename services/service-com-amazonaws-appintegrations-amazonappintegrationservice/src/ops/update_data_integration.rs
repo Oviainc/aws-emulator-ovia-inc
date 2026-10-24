@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members this `PATCH` carries to one stored DataIntegration and leaves the
+//! ones it omits as they were, so `GetDataIntegration` reports the updated resource.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDataIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataIntegration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDataIntegrationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let id = state
+            .data_integration_id(&input.identifier)
+            .ok_or_else(|| {
+                UpdateDataIntegrationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_integration_not_found(&input.identifier)),
+                    },
+                )
+            })?;
+
+        // A name names at most one DataIntegration in this account — the invariant
+        // `CreateDataIntegration` keeps with its `DuplicateResourceException` — so a
+        // rename onto a name another resource holds is refused rather than breaking it.
+        // This operation models no duplicate error, so it is reported as the
+        // `InvalidRequestException` ("the request is not valid") it does model.
+        if let Some(name) = input.name.as_deref() {
+            if state
+                .data_integrations
+                .values()
+                .any(|record| record.name == name && record.id != id)
+            {
+                return Err(UpdateDataIntegrationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!("A data integration named {name} already exists.")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let record = state
+            .data_integrations
+            .get_mut(&id)
+            .ok_or_else(|| {
+                UpdateDataIntegrationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_integration_not_found(&input.identifier)),
+                    },
+                )
+            })?;
+
+        // Only the members the request carried are applied: an absent member leaves the
+        // stored value alone, which is what makes this a PATCH rather than a replace. A
+        // `Description` sent as the empty string IS a value (the member is `len 0..1000`),
+        // so it clears the description.
+        let mut changed = false;
+        let applied_name = input.name.is_some();
+        let applied_description = input.description.is_some();
+        if let Some(name) = input.name {
+            changed |= record.name != name;
+            record.name = name;
+        }
+        if let Some(description) = input.description {
+            changed |= record.description.as_deref() != Some(description.as_str());
+            record.description = Some(description);
+        }
+        // The resource's own clock moves only when the resource did: a request that
+        // changes nothing is accepted and leaves the record, timestamp included, as it was.
+        if changed {
+            record.last_modified_time = ::std::time::SystemTime::now();
+        }
+        // An operator's record that this call changed state: the operation, the resource
+        // it touched (the id this service minted, never a value the request supplied),
+        // which members were applied and whether anything moved. No credential is logged.
+        ::tracing::info!(
+            operation = Self::NAME,
+            data_integration_id = %id,
+            applied_name,
+            applied_description,
+            outcome = if changed { "updated" } else { "unchanged" },
+            "applied an UpdateDataIntegration"
+        );
+
+        Ok(UpdateDataIntegrationOutput {})
     }
 }

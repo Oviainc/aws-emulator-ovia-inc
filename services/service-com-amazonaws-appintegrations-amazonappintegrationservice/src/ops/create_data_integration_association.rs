@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataIntegrationAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataIntegrationAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataIntegrationAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and persists one DataIntegrationAssociation of a stored DataIntegration: the
+//! service mints its `Id` and `Arn` and stores everything the request carried, so
+//! `ListDataIntegrationAssociations` reports what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataIntegrationAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataIntegrationAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataIntegrationAssociation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDataIntegrationAssociationErrorModeled::InternalServiceError(
+                InternalServiceError {
+                    message: Some("the AppIntegrations store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        let integration = state
+            .data_integration_id(&input.data_integration_identifier)
+            .and_then(|id| state.data_integrations.get(&id))
+            .ok_or_else(|| {
+                CreateDataIntegrationAssociationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_integration_not_found(
+                            &input.data_integration_identifier,
+                        )),
+                    },
+                )
+            })?;
+        let integration_id = integration.id.clone();
+        let integration_arn = integration.arn.clone();
+
+        // A retry carrying the `ClientToken` of an association this service already
+        // created answers with that association rather than making a second one
+        // (`ClientToken` is an `@idempotencyToken`). The token is resolved only AFTER the
+        // integration it is replayed against, and the replay is scoped to it: a token
+        // that minted another integration's association is not a retry of this request,
+        // so it is refused rather than answered with a resource the caller did not ask
+        // about.
+        if let Some(minted) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.data_integration_association_idempotency.get(token))
+            .and_then(|id| state.data_integration_associations.get(id))
+        {
+            if minted.data_integration_id != integration_id {
+                return Err(
+                    CreateDataIntegrationAssociationErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "The ClientToken of this request already created an \
+                                 association of another DataIntegration than \
+                                 {integration_id}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(created_response(minted));
+        }
+
+        // "You cannot create a DataIntegration association for a DataIntegration that has
+        // been previously associated. Use a different DataIntegration, or recreate the
+        // DataIntegration using the CreateDataIntegration API." (the documentation of
+        // this service's DataIntegration operations). This API has no delete for an
+        // association, so an integration that has one has been associated.
+        if state.has_data_integration_associations(&integration_id) {
+            return Err(
+                CreateDataIntegrationAssociationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "The data integration {integration_id} has been previously \
+                             associated. Use a different DataIntegration, or recreate the \
+                             DataIntegration using the CreateDataIntegration API."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // How the association executes is checked before anything is written, so a
+        // configuration this service could not act on leaves no association behind.
+        if let Some(problem) = input
+            .execution_configuration
+            .as_ref()
+            .and_then(crate::state::execution_configuration_problem)
+        {
+            return Err(
+                CreateDataIntegrationAssociationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(problem),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        if !state.has_room_for_another_data_integration_association() {
+            return Err(
+                CreateDataIntegrationAssociationErrorModeled::ResourceQuotaExceededException(
+                    ResourceQuotaExceededException {
+                        message: Some(format!(
+                            "The allowed quota for the resource has been exceeded: at most {} \
+                             DataIntegrationAssociations can exist.",
+                            crate::state::MAX_STORED_DATA_INTEGRATION_ASSOCIATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let id = ::uuid::Uuid::new_v4().to_string();
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::DataIntegrationAssociationRecord {
+            arn: crate::state::data_integration_association_arn(&region, &integration_id, &id),
+            id: id.clone(),
+            data_integration_id: integration_id.clone(),
+            data_integration_arn: integration_arn,
+            client_id: input.client_id,
+            destination_uri: input.destination_uri,
+            object_configuration: input.object_configuration,
+            client_association_metadata: input.client_association_metadata,
+            execution_configuration: input.execution_configuration,
+            client_token: input.client_token.clone(),
+            created_time: now,
+            last_modified_time: now,
+        };
+        if let Some(token) = input.client_token {
+            state.remember_association_client_token(token, id.clone());
+        }
+        // The response is built from the RECORD, before it is handed to the store, so the
+        // create reports exactly what `ListDataIntegrationAssociations` will read back.
+        let response = created_response(&record);
+        state.data_integration_associations.insert(id.clone(), record);
+        // An operator's record that this call changed state: the operation, the resources
+        // it touched (the ids this service minted, never a value the request supplied)
+        // and its outcome. No credential or token is logged.
+        ::tracing::info!(
+            operation = Self::NAME,
+            data_integration_id = %integration_id,
+            data_integration_association_id = %id,
+            outcome = "created",
+            "created a DataIntegrationAssociation"
+        );
+
+        Ok(response)
+    }
+}
+
+/// The response a `CreateDataIntegrationAssociation` answers with for the record it
+/// stored: the id it minted and the ARN of the DataIntegration it belongs to, the two
+/// members the output shape carries.
+fn created_response(
+    record: &crate::state::DataIntegrationAssociationRecord,
+) -> CreateDataIntegrationAssociationOutput {
+    CreateDataIntegrationAssociationOutput {
+        data_integration_association_id: Some(record.id.clone()),
+        data_integration_arn: Some(record.data_integration_arn.clone()),
     }
 }
