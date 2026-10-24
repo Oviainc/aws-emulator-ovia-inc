@@ -17,6 +17,8 @@ mod assessments;
 mod change_set_failures;
 #[path = "all/change_set_lifecycle.rs"]
 mod change_set_lifecycle;
+#[path = "all/delete_resource_policy_existence.rs"]
+mod delete_resource_policy_existence;
 #[path = "all/entity_reads.rs"]
 mod entity_reads;
 #[path = "all/request_validation.rs"]
