@@ -1875,6 +1875,16 @@ pub const EPHEMERIS_INVALID: &str = "INVALID";
 /// shape="CreateEphemerisRequest", member="expirationTime")`).
 pub const EPHEMERIS_EXPIRED: &str = "EXPIRED";
 
+/// What this service answers when an ephemeris a request addresses by its `{ephemerisId}`
+/// does not exist: a fixed literal that discloses neither the id nor the ARN that was
+/// asked for, spelled the way this service already answers for a missing mission profile
+/// or dataflow endpoint group (see [`MISSION_PROFILE_NOT_FOUND`],
+/// [`DATAFLOW_ENDPOINT_GROUP_NOT_FOUND`]).
+///
+/// It lives here rather than in one handler because every operation addressed at an
+/// ephemeris by that label answers it, so it is one text of the service.
+pub const EPHEMERIS_NOT_FOUND: &str = "Ephemeris not found";
+
 /// Why an ephemeris whose supplied data describes a backwards-running validity range did
 /// not validate: a value of the model's `EphemerisInvalidReason` enum, whose members are
 /// `METADATA_INVALID`, `TIME_RANGE_INVALID`, `TRAJECTORY_INVALID`, `KMS_KEY_INVALID` and
