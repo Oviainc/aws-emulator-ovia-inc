@@ -9,10 +9,12 @@
 //! terminated with a period, and `FileSystemAlreadyExists` names BOTH the id of the file
 //! system that already holds the token and the `CreationToken` the request carried.
 //!
-//! The other half of the rule: a refusal gets the optional `Message` member ONLY where a
-//! rule produces its sentence. `AccessPointAlreadyExists` has none — AWS neither
-//! documents nor models one and its recorded refusal carries no `Message` member at all
-//! — so that error is serialized with its required members only.
+//! The other half of the rule: a refusal gets a SENTENCE in its `Message` member only
+//! where a rule produces one. `AccessPointAlreadyExists` has none — AWS neither
+//! documents nor models one — so its `Message` member is rendered as JSON `null`
+//! (present, carrying no sentence; see `crate::error_document_message` for that rule and
+//! why an omitted member would read as the empty string to an SDK), and the actionable
+//! datum travels in its required `AccessPointId`.
 //!
 //! The tables below vary what the rule generalises over — the id's hex length at both
 //! modelled bounds (`^(fs|fsmt|fsap)-[0-9a-f]{8,40}$`), the digits themselves, the id's
@@ -305,16 +307,15 @@ async fn access_point_not_found_is_built_from_the_requested_id() {
 }
 
 #[tokio::test]
-async fn access_point_already_exists_carries_its_required_members_and_no_message() {
+async fn access_point_already_exists_carries_its_required_members_and_a_null_message() {
     let efs = Emulator::new();
     let file_system_id = efs.available_file_system("construction-access-point-1").await;
 
     // The OPPOSITE of `FileSystemAlreadyExists` above: no rule produces a sentence for
-    // this error class — AWS neither documents nor models one, and its recorded refusal
-    // carries no `Message` member at all — so the refusal is serialized with the two
-    // members the model marks required (`ErrorCode` and `AccessPointId`) and nothing
-    // else. The actionable datum, WHICH access point already holds the token, travels in
-    // `AccessPointId`.
+    // this error class — AWS neither documents nor models one — so the refusal carries
+    // the two members the model marks required (`ErrorCode` and `AccessPointId`) and a
+    // `Message` member with NO sentence in it, rendered as JSON null. The actionable
+    // datum, WHICH access point already holds the token, travels in `AccessPointId`.
     for token in creation_tokens() {
         let created = efs
             .create_access_point(json!({
@@ -346,7 +347,7 @@ async fn access_point_already_exists_carries_its_required_members_and_no_message
             "case {token:?}: unexpected error type, got {:?}",
             repeat.error_type
         );
-        assert_no_message_member(&format!("{token:?}"), &repeat);
+        crate::error_document_message::assert_null_message_member(&format!("{token:?}"), &repeat);
         assert_eq!(
             repeat.string("AccessPointId"),
             access_point_id,
@@ -384,26 +385,6 @@ async fn access_point_already_exists_carries_its_required_members_and_no_message
             listed[0]
         );
     }
-}
-
-/// Assert an error body carries NO message member: neither the modelled `Message` nor any
-/// spelling of it a client could read a sentence out of.
-pub(crate) fn assert_no_message_member(case: &str, reply: &Reply) {
-    let present: Vec<&String> = reply
-        .body
-        .as_object()
-        .map(|members| {
-            members
-                .keys()
-                .filter(|key| key.eq_ignore_ascii_case("message"))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(
-        present.is_empty(),
-        "case {case}: the refusal must carry no message member, got {present:?} in {:?}",
-        reply.body
-    );
 }
 
 /// The `CreationToken` values the already-exists rule is asserted over: the modelled

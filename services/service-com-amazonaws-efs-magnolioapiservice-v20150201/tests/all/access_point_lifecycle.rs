@@ -413,8 +413,9 @@ async fn a_reused_client_token_never_mints_a_second_access_point() {
             repeat.get("AccessPointId")
         );
         // Whatever the rest of the request said, the refusal carries the error's required
-        // members only: AWS sends no `Message` member on this error class.
-        crate::error_message_construction::assert_no_message_member(
+        // members and a `Message` member with no sentence in it: AWS states no rule that
+        // would produce one for this error class.
+        crate::error_document_message::assert_null_message_member(
             &format!("reuse with {case}"),
             &repeat,
         );
