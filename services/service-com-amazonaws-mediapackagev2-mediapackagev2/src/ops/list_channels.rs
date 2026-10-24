@@ -123,7 +123,7 @@ fn list_configuration(
         created_at: channel.created_at,
         modified_at: channel.modified_at,
         description: channel.description.clone(),
-        input_type: channel.input_type.clone(),
+        input_type: Some(channel.input_type.clone()),
         output_locking_mode: channel.output_locking_mode.clone(),
         multiview_configuration: channel.multiview_configuration.clone(),
         // Read-only and derived on every read, never stored on the channel.

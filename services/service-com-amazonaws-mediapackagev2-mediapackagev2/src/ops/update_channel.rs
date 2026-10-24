@@ -308,11 +308,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .is_some_and(|header| header.publish_mqcs.is_some()),
             multiview_configuration: input.multiview_configuration.is_some(),
         };
-        let input_type = channel
-            .input_type
-            .as_deref()
-            .unwrap_or(crate::state::DEFAULT_INPUT_TYPE);
-        if let Some(violation) = crate::state::channel_input_type_violation(submitted, input_type) {
+        if let Some(violation) =
+            crate::state::channel_input_type_violation(submitted, &channel.input_type)
+        {
             return Err(UpdateChannelErrorModeled::ValidationException(violation).into());
         }
 
@@ -354,7 +352,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: channel.modified_at,
             description: channel.description.clone(),
             ingest_endpoints: Some(channel.ingest_endpoints.clone()),
-            input_type: channel.input_type.clone(),
+            input_type: Some(channel.input_type.clone()),
             e_tag: Some(channel.etag.clone()),
             tags: Some(channel.tags.clone()),
             input_switch_configuration: Some(channel.input_switch_configuration.clone()),

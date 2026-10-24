@@ -4,7 +4,9 @@
 //! IMPLEMENTED. Creates a channel under an existing channel group and persists it in
 //! [`crate::state`], including the pair of ingest endpoints derived from the parent
 //! group's egress domain and the input-switch / output-header configuration blocks the
-//! service materialises for every channel. An unknown parent is a
+//! service materialises for every channel, alongside the two members whose default the
+//! model documents (`InputType`, and `OutputLockingMode` on a channel whose input type
+//! may carry it). An unknown parent is a
 //! `ResourceNotFoundException`; a channel name already used in that group is a
 //! `ConflictException`.
 //!
@@ -284,7 +286,7 @@ fn channel_output(
         modified_at: channel.modified_at,
         description: channel.description.clone(),
         ingest_endpoints: Some(channel.ingest_endpoints.clone()),
-        input_type: channel.input_type.clone(),
+        input_type: Some(channel.input_type.clone()),
         e_tag: Some(channel.etag.clone()),
         tags: Some(channel.tags.clone()),
         input_switch_configuration: Some(channel.input_switch_configuration.clone()),
@@ -444,18 +446,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output_header_configuration = crate::state::materialized_output_header_configuration(
             input.output_header_configuration,
         );
+        // The same materialisation for the two members whose DEFAULT the model documents:
+        // the input type the service applies when the request names none, and - on a
+        // channel whose input type may carry it - the output locking mode. Both are stored
+        // concrete, so no projection of this channel has to decide what an absent value
+        // means.
+        let input_type = crate::state::materialized_input_type(input.input_type);
+        let output_locking_mode = crate::state::materialized_output_locking_mode(
+            input.output_locking_mode,
+            &input_type,
+        );
 
         let mut channel = crate::state::Channel {
             name: name.clone(),
             group_name: group.name.clone(),
             arn,
             description: input.description,
-            input_type: input.input_type,
+            input_type,
             ingest_endpoints,
             input_switch_configuration,
             output_header_configuration,
             multiview_configuration: input.multiview_configuration,
-            output_locking_mode: input.output_locking_mode,
+            output_locking_mode,
             created_at,
             modified_at: created_at,
             // Nothing has reset this channel yet, so it reports no reset instant.
