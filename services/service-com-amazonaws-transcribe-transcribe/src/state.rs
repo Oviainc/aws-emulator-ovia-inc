@@ -2,12 +2,14 @@
 
 //! Engine state for the com-amazonaws-transcribe-transcribe service.
 //!
-//! Two resource families live here: the transcription-job lifecycle — the stored
+//! Three resource families live here: the transcription-job lifecycle — the stored
 //! record, the clock-owed status transitions, and the projections of a record onto
-//! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — and the
+//! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — the
 //! custom-vocabulary family (vocabularies and vocabulary filters), with its own
 //! records, its `PENDING` -> `READY` transition and its projections onto
-//! `VocabularyInfo` / `VocabularyFilterInfo`. Several operations read each record, so
+//! `VocabularyInfo` / `VocabularyFilterInfo`, and the Call Analytics categories, each
+//! a record of the rules and input type it was created with and its projection onto
+//! `CategoryProperties`. Several operations read each record, so
 //! the projections are single-homed here rather than copied into each handler; the
 //! three tagging operations reach every family's tag set through one lookup
 //! ([`ComAmazonawsTranscribeTranscribeState::tags_mut`]).
@@ -27,15 +29,19 @@
 //! themselves — none of their output shapes has a member for them. A vocabulary whose
 //! content would have to be READ from a file URI is refused at the create rather than
 //! recorded: this emulator reads no object store and makes no outbound request, so it
-//! would have nothing to build the vocabulary from.
+//! would have nothing to build the vocabulary from. A Call Analytics category is the
+//! same kind of record: its rules are held here, where a Call Analytics job that
+//! applies the category would read them from, and nothing evaluates a rule against a
+//! call, because no audio is analysed.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ContentRedaction, EncryptionConfiguration, JobExecutionSettings, LanguageIdSettings, Media,
-    ModelSettings, Settings, SubtitlesOutput, Tag, ToxicityDetectionSettings, Transcript,
-    TranscriptionJob, TranscriptionJobSummary, VocabularyFilterInfo, VocabularyInfo,
+    CategoryProperties, ContentRedaction, EncryptionConfiguration, JobExecutionSettings,
+    LanguageIdSettings, Media, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
+    ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
+    VocabularyFilterInfo, VocabularyInfo,
 };
 
 /// `TranscriptionJobStatus` values, from the model's enum
@@ -137,6 +143,31 @@ pub const MAX_VOCABULARIES: usize = 100;
 /// `ListVocabularyFiltersRequest$MaxResults`).
 pub const DEFAULT_VOCABULARY_LIST_MAX_RESULTS: i32 = 5;
 
+/// `InputType` values, from the model's enum
+/// (`smithy_query(query="shape", shape="InputType")`, also
+/// [`crate::ops::types::INPUT_TYPE_VALUES`]): a Call Analytics category applies
+/// either to post-call transcriptions or to streaming ones.
+pub const INPUT_TYPE_POST_CALL: &str = "POST_CALL";
+/// See [`INPUT_TYPE_POST_CALL`].
+pub const INPUT_TYPE_REAL_TIME: &str = "REAL_TIME";
+
+/// The `InputType` a Call Analytics category created without one gets: "If you do not
+/// include InputType, your category is created as a post-call category by default"
+/// (model doc for `CreateCallAnalyticsCategoryRequest$InputType`). The default is
+/// RECORDED on the category, so every operation that reports it reports the same
+/// value rather than each one re-defaulting.
+pub const DEFAULT_INPUT_TYPE: &str = INPUT_TYPE_POST_CALL;
+
+/// The most Call Analytics categories this emulator holds for an account.
+///
+/// A CHOSEN ceiling, not a published one: AWS gives no per-account figure for Call
+/// Analytics categories in the model, and the only count the model bounds is the
+/// RULES of one category (`RuleList` is `length {min 1, max 20}`, which the boundary
+/// validator already enforces). Applying the same figure the other families use keeps
+/// the store bounded — a caller that never deletes cannot grow it without end, and
+/// `DeleteCallAnalyticsCategory` is what makes room again.
+pub const MAX_CALL_ANALYTICS_CATEGORIES: usize = 100;
+
 /// The ARN resource type of a transcription job, as the `TranscribeArn` pattern's
 /// `<type>/<name>` resource segment spells it
 /// (`^arn:aws(-[^:]+)?:transcribe:[a-zA-Z0-9-]*:[0-9]{12}:[a-zA-Z-]*/[0-9a-zA-Z._-]+$`),
@@ -161,6 +192,10 @@ pub const KIND_JOB: &str = "job";
 pub const KIND_VOCABULARY: &str = "vocabulary";
 /// See [`KIND_JOB`].
 pub const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
+/// See [`KIND_JOB`]: the word the recorded Call Analytics category responses name
+/// that family by ("The category that you've specified couldn't be found. Check the
+/// category name and try your request again.").
+pub const KIND_CATEGORY: &str = "category";
 /// See [`KIND_JOB`].
 pub const KIND_RESOURCE: &str = "resource";
 
@@ -226,6 +261,10 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// Every custom vocabulary filter this account holds, keyed by its name (which
     /// `CreateVocabularyFilter` requires to be unique within an account).
     pub vocabulary_filters: BTreeMap<String, VocabularyFilterRecord>,
+    /// Every Call Analytics category this account holds, keyed by its name ("Category
+    /// names are case sensitive and must be unique within an Amazon Web Services
+    /// account" — model doc for `CategoryProperties$CategoryName`).
+    pub call_analytics_categories: BTreeMap<String, CallAnalyticsCategoryRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
     next_sequence: u64,
@@ -316,8 +355,10 @@ impl ComAmazonawsTranscribeTranscribeState {
     ///
     /// One lookup for the two tagging operations that WRITE, so `TagResource` and
     /// `UntagResource` cannot disagree about which ARN names which stored record. A
-    /// resource type this emulator records nothing for (a language model, a Call
-    /// Analytics category) answers `None`, which the caller renders as the modelled
+    /// resource type this lookup does not map (a language model, or a Call Analytics
+    /// category — whose tag set is written by its own create and reported by its own
+    /// operations, since this emulator has no recorded spelling for that family's ARN
+    /// `<type>` segment) answers `None`, which the caller renders as the modelled
     /// not-found error — never as an empty tag set.
     pub fn tags_mut(&mut self, resource: &ResourceRef) -> Option<&mut Vec<Tag>> {
         match resource.resource_type.as_str() {
@@ -485,6 +526,55 @@ impl VocabularyFilterRecord {
     /// [`vocabulary_download_uri`].
     pub fn download_uri(&self) -> String {
         vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY_FILTER, &self.name, &self.region)
+    }
+}
+
+/// One stored Call Analytics category: the rules and input type the request asked
+/// for, plus the two lifecycle facts the service itself owns (when it was created and
+/// when it was last updated).
+///
+/// A category has no status member in the model
+/// (`smithy_query(query="shape", shape="CategoryProperties")`), so it is usable from
+/// the moment it is created and has no clock-owed transition. WHAT IT EMULATES is the
+/// category RECORD: nothing here evaluates a rule against a call, because this
+/// emulator transcribes no audio (see the module header) — a stored category is what a
+/// Call Analytics job would be matched against, never a match.
+#[derive(Debug, Clone)]
+pub struct CallAnalyticsCategoryRecord {
+    /// `CategoryName`, also this record's key in the store.
+    pub name: String,
+    /// The rules that define the category, as the request listed them. `RuleList` is
+    /// modelled `length {min 1, max 20}`, so the boundary validator has already
+    /// refused an empty or over-long list before a handler stores one.
+    pub rules: Vec<Rule>,
+    /// `POST_CALL` or `REAL_TIME` — [`DEFAULT_INPUT_TYPE`] when the create named
+    /// neither.
+    pub input_type: String,
+    /// When this category was created; never changed afterwards.
+    pub create_time: SystemTime,
+    /// When this category's rules were last written: its creation instant until an
+    /// update rewrites them.
+    pub last_update_time: SystemTime,
+    /// The tags this category carries, empty when it carries none.
+    pub tags: Vec<Tag>,
+}
+
+impl CallAnalyticsCategoryRecord {
+    /// This record as the modelled `CategoryProperties` shape, which is the whole
+    /// answer of every operation that reports a category.
+    ///
+    /// `Tags` is left ABSENT for a category carrying none rather than reported as an
+    /// empty list: `TagList` is modelled `length {min 1, max 200}`, so an empty list
+    /// is not a value of that shape.
+    pub fn to_properties(&self) -> CategoryProperties {
+        CategoryProperties {
+            category_name: Some(self.name.clone()),
+            rules: Some(self.rules.clone()),
+            create_time: Some(to_date_time(self.create_time)),
+            last_update_time: Some(to_date_time(self.last_update_time)),
+            tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
+            input_type: Some(self.input_type.clone()),
+        }
     }
 }
 

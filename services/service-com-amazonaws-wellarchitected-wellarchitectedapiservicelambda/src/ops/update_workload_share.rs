@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkloadShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkloadShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkloadShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: changes the permission one existing share of one workload grants and
+//! persists it in [`crate::state`], so `ListWorkloadShares` reads the new permission
+//! back. The share is resolved by the `(WorkloadId, ShareId)` pair the path carries —
+//! an id that resolves no workload, or a share id that workload does not hold, is
+//! `ResourceNotFoundException` (404) and changes nothing. Nothing else about the share
+//! moves: the principal it was offered to, the principal that shared it and the status
+//! it waits on its invitation in are the share's own state, and only the operations
+//! that own them change them.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkloadShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkloadShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkloadShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWorkloadShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `PermissionType` is a modelled enum, so the boundary validator refuses an
+        // out-of-set value before this handler runs and this branch is unreachable over
+        // HTTP (the enum rows in `tests/all/workload_share_permissions.rs` are refused
+        // there, with the same 400 `ValidationException`). It is kept as defence in depth
+        // for a caller that constructs the input directly, so a share is never left
+        // holding a permission the enum does not publish.
+        if !PERMISSION_TYPE_VALUES.contains(&input.permission_type.as_str()) {
+            return Err(field_validation(
+                "PermissionType",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    PERMISSION_TYPE_VALUES.join(", ")
+                ),
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The share belongs to the workload it shares, so the workload is resolved first:
+        // an id no workload carries is that lookup's 404 whatever its syntax. Its name is
+        // read here because the `WorkloadShare` shape reports it and the workload — not
+        // the share — owns it.
+        let Some(workload_name) = store
+            .workloads
+            .get(&input.workload_id)
+            .map(|workload| workload.workload_name.clone())
+        else {
+            return Err(UpdateWorkloadShareErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        };
+
+        // The share is resolved WITHIN that workload, so a `ShareId` that names a share
+        // of another workload is a 404 here rather than an update of that other
+        // workload's share.
+        let Some(share) = store.workload_share_mut(&input.workload_id, &input.share_id) else {
+            return Err(UpdateWorkloadShareErrorModeled::ResourceNotFoundException(
+                crate::state::workload_share_not_found(&input.workload_id, &input.share_id),
+            )
+            .into());
+        };
+
+        // "Update a workload share": `PermissionType` is the one member this operation
+        // takes beside the pair that identifies the share, so the permission the share
+        // grants is the whole of what it changes. Assigning the requested permission makes
+        // the update idempotent — asking for the permission the share already grants is a
+        // success that leaves it exactly as it was.
+        share.permission_type = input.permission_type;
+        let updated = share.to_share(&workload_name);
+
+        Ok(UpdateWorkloadShareOutput {
+            workload_id: Some(input.workload_id),
+            workload_share: Some(updated),
+        })
     }
+}
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> UpdateWorkloadShareError {
+    UpdateWorkloadShareErrorModeled::ValidationException(
+        crate::state::member_constraint_exception(member, constraint),
+    )
+    .into()
 }
