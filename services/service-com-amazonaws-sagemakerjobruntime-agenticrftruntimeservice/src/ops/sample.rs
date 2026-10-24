@@ -162,16 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A rollout belongs to a job, so resolving the `JobArn` comes first: a call for
-        // a job this runtime does not hold is refused as that, whatever else the request
-        // carries. The modelled errors list both `ValidationException` (400) and
-        // `ResourceNotFoundException` (404); the recorded service answers the 400 for a
-        // well-formed ARN naming no job, so that is what this refuses with.
-        if !state.lock().knows_job(&input.job_arn) {
-            return Err(validation(crate::state::job_not_found_message(
-                &input.job_arn,
-            )));
-        }
+        // `JobArn` names the job the caller's own execution is running under; this
+        // service's model binds no operation that creates, lists or deletes a job, so
+        // there is no registry to resolve it against and nothing to refuse it on. The
+        // member's modelled constraints (`@length` 1..256 and the ARN `@pattern`) are
+        // the whole restriction, and the framework has already enforced them by the
+        // time `handle` runs: whatever ARN reaches here is the job this turn belongs to.
 
         // `Body` is `@required` and `@httpPayload`, so a request without one is
         // already refused at the boundary; a request WITH an empty payload gets
@@ -218,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .map_err(|refusal| {
-                let message = refusal.message(&job_arn, &trajectory_id);
+                let message = refusal.message(&trajectory_id);
                 if refusal.is_quota() {
                     SampleErrorModeled::ServiceQuotaExceededException(
                         ServiceQuotaExceededException { message },

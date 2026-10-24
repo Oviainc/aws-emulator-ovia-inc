@@ -4,7 +4,9 @@
 //! Removes the tag keys the request names from the investigation group
 //! `{resourceArn}` names, leaving every other stored tag in place;
 //! the tagging frontend's 404 `NotFoundException` when nothing matches
-//! ([`crate::state::TAGGING_RESOURCE_NOT_FOUND`]). Idempotent: a key the resource
+//! ([`crate::state::TAGGING_RESOURCE_NOT_FOUND`]) and its 400 `BadRequestException`
+//! for a key in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace, which
+//! a caller may not delete. Idempotent: a key the resource
 //! does not carry is nothing to remove, not a failure.
 //!
 //! ## Shape of an operation
@@ -147,11 +149,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `tagKeys` carries a modelled 0..50 length and each key its own length and
         // pattern, so the centralized walk has already refused anything outside them.
+        // What no modelled constraint excludes is the reserved `aws:` key namespace, so
+        // that rule is applied here.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
+
+        // A system tag is Amazon Web Services' own: a caller may not delete one any more
+        // than it may create one, so a request naming such a key removes nothing. The
+        // rule is about the REQUEST alone, so it is applied before the store is consulted.
+        if let Some(why) = crate::state::reserved_tag_key_rejection(
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::bad_request(why));
+        }
 
         // This service is regional: the endpoint this request reached holds only the
         // groups of the Region it was signed for, so another Region's group is absent

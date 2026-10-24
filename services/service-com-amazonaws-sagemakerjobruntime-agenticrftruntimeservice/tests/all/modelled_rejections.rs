@@ -12,9 +12,11 @@
 //!    signing name is shared with every other SageMaker-family service, so a claim on
 //!    the signing name alone makes every sibling claim every request and the router
 //!    answers `500 AmbiguousService` for all of it.
-//! 2. JOB RESOLUTION — a sampling call for a `JobArn` this runtime holds no job for is
-//!    refused `400 ValidationException`, with a message naming the job ARN that was
-//!    looked up.
+//! 2. JOB RESOLUTION — this data plane holds no job registry: the `JobArn` a call
+//!    carries is the one the caller's own job execution was handed, so every value the
+//!    member's modelled constraints admit is served. That rule has its own suite in
+//!    `job_arn_is_the_callers_job.rs`; what this one pins is the refusal a value
+//!    OUTSIDE those constraints gets.
 //! 3. TRAJECTORY RESOLUTION — `CompleteRollout` and `UpdateReward` answer
 //!    `404 ResourceNotFoundException` for a `(JobArn, TrajectoryId)` pair the store
 //!    holds no trajectory for, with a message naming the trajectory and the account.
@@ -122,10 +124,10 @@ fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     (engine, router)
 }
 
-/// Record `job_arn` as a job this runtime serves rollouts for — what the control plane's
-/// job creation does, which this service models no operation for.
-fn register_job(engine: &engine::InMemoryEngine, job_arn: &str) {
-    engine.state::<ServiceState>().lock().register_job(job_arn);
+/// A `JobArn` satisfying every modelled constraint, in the emulator's own region and
+/// account.
+fn emulator_job(run: &str) -> String {
+    job_arn("us-east-1", "000000000000", "AgentRFT", run)
 }
 
 async fn send(
@@ -282,100 +284,6 @@ async fn the_service_claims_its_own_path_space_under_the_shared_signing_name() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Job resolution
-// ---------------------------------------------------------------------------
-
-/// RULE: a sampling call whose `JobArn` names no job this runtime holds is refused
-/// `400 ValidationException`, in a restJson1 error document whose `Message` names the
-/// job ARN that was looked up; a job the store does hold is sampled.
-#[tokio::test]
-async fn a_sampling_call_for_an_unknown_job_is_refused_as_invalid() {
-    // Rows differ along the ARN's region, account and job/run names — every one is
-    // well-formed and none of them is in the store.
-    let unknown = [
-        (
-            "ghost job in us-west-2",
-            job_arn("us-west-2", "000000000000", "AgentRFT", "probe-ghost-cdf5a33f"),
-        ),
-        (
-            "ghost job in another region",
-            job_arn("eu-central-1", "000000000000", "AgentRFT", "another-ghost"),
-        ),
-        (
-            "ghost job under another account",
-            job_arn("us-east-1", "123456789012", "rft_job-2", "run-1"),
-        ),
-        (
-            "ghost job whose run name is one character",
-            job_arn("us-east-1", "000000000000", "AgentRFT", "r"),
-        ),
-    ];
-
-    for (case, arn) in unknown {
-        for path in [SAMPLE_PATH, SAMPLE_STREAM_PATH] {
-            let (engine, router) = mounted_service();
-            let reply = sample(&router, path, &arn, "traj-1", &chat_payload("go")).await;
-            assert_eq!(
-                (reply.status, reply.error_code().as_str()),
-                (400, "ValidationException"),
-                "case {case:?} on {path}: expected 400 ValidationException, got {} {:?} / {}",
-                reply.status,
-                reply.error_type,
-                reply.text()
-            );
-            assert_eq!(
-                reply.content_type.as_deref(),
-                Some("application/json"),
-                "case {case:?} on {path}: expected a restJson1 error document, got {:?}",
-                reply.content_type
-            );
-            assert_eq!(
-                reply.message(),
-                format!("Could not find job with jobArn {arn}"),
-                "case {case:?} on {path}: expected the job-not-found message, got {:?}",
-                reply.message()
-            );
-            let held = engine.state::<ServiceState>().lock().trajectories.len();
-            assert_eq!(
-                held, 0,
-                "case {case:?} on {path}: expected a refused call to write nothing, got {held} \
-                 trajectory/ies"
-            );
-        }
-    }
-
-    // The same calls against jobs the store DOES hold: the two it is seeded with (for a
-    // caller that creates no job of its own) and one registered here.
-    let registered = job_arn("us-east-1", "000000000000", "AgentRFT", "registered-job");
-    let mut known = state::seed_job_arns();
-    known.push(registered.clone());
-    for arn in known {
-        for path in [SAMPLE_PATH, SAMPLE_STREAM_PATH] {
-            let (engine, router) = mounted_service();
-            register_job(&engine, &registered);
-            let reply = sample(&router, path, &arn, "traj-1", &chat_payload("go")).await;
-            assert_eq!(
-                reply.status,
-                200,
-                "case {arn:?} on {path}: expected a known job to be sampled, got {} / {}",
-                reply.status,
-                reply.text()
-            );
-            // The turn came from, and is readable in, the store the next call reads.
-            let store = engine.state::<ServiceState>();
-            let guard = store.lock();
-            let turns = guard
-                .trajectory(&arn, "traj-1")
-                .map_or(0, |trajectory| trajectory.turns.len());
-            assert_eq!(
-                turns, 1,
-                "case {arn:?} on {path}: expected one captured turn in state, got {turns}"
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 3. Trajectory resolution
 // ---------------------------------------------------------------------------
 
@@ -386,26 +294,19 @@ async fn a_sampling_call_for_an_unknown_job_is_refused_as_invalid() {
 async fn an_unknown_trajectory_is_reported_as_not_found() {
     // Rows differ along WHY the pair is unknown: nothing was ever sampled, the id
     // differs in case, the id differs in length, the job differs — and along the job
-    // ARN, which is a job the runtime does not hold in the last row (a trajectory
-    // lookup, unlike a sampling call, does not resolve the job first).
-    let seeded_job = state::seed_job_arns()
-        .first()
-        .cloned()
-        .expect("the store seeds at least one job");
-    let second_job = state::seed_job_arns()
-        .get(1)
-        .cloned()
-        .expect("the store seeds two jobs");
+    // ARN, whose rows span two runs of the same job and a job in another region.
+    let job = emulator_job("agentic-rft-rollout-1");
+    let second_job = emulator_job("agentic-rft-rollout-2");
     let rows: [(&str, String, String); 5] = [
-        ("never sampled", seeded_job.clone(), "never-sampled".to_string()),
+        ("never sampled", job.clone(), "never-sampled".to_string()),
         (
             "trajectory id differing by case",
-            seeded_job.clone(),
+            job.clone(),
             "TRAJ-1".to_string(),
         ),
         (
             "trajectory id at the modelled 256 maximum",
-            seeded_job.clone(),
+            job.clone(),
             "t".repeat(256),
         ),
         (
@@ -414,7 +315,7 @@ async fn an_unknown_trajectory_is_reported_as_not_found() {
             "traj-1".to_string(),
         ),
         (
-            "a job the runtime does not hold",
+            "a job in another region",
             job_arn("us-west-2", "000000000000", "AgentRFT", "wire-sjr-traj-778a2a85"),
             "traj-1".to_string(),
         ),
@@ -422,9 +323,9 @@ async fn an_unknown_trajectory_is_reported_as_not_found() {
 
     for (case, arn, trajectory_id) in rows {
         let (engine, router) = mounted_service();
-        // One trajectory exists, under the first seeded job and the id `traj-1`, so a
+        // One trajectory exists, under the first job and the id `traj-1`, so a
         // row that is not found is not found because of its own pair.
-        let seeded = sample(&router, SAMPLE_PATH, &seeded_job, "traj-1", &chat_payload("go")).await;
+        let seeded = sample(&router, SAMPLE_PATH, &job, "traj-1", &chat_payload("go")).await;
         assert_eq!(
             seeded.status,
             200,
@@ -486,10 +387,7 @@ async fn an_unknown_trajectory_is_reported_as_not_found() {
 /// retained-byte total.
 #[tokio::test]
 async fn a_payload_too_large_to_retain_is_refused_and_captured_bytes_are_counted() {
-    let seeded_job = state::seed_job_arns()
-        .first()
-        .cloned()
-        .expect("the store seeds at least one job");
+    let job = emulator_job("payload-bound-run");
 
     // Rows differ along the size relative to the bound: just over it, far over it, and
     // AT it (which must be accepted, so the refusals above are about the bound and not
@@ -504,7 +402,7 @@ async fn a_payload_too_large_to_retain_is_refused_and_captured_bytes_are_counted
         for path in [SAMPLE_PATH, SAMPLE_STREAM_PATH] {
             let (engine, router) = mounted_service();
             let payload = vec![b'x'; size];
-            let reply = sample(&router, path, &seeded_job, "traj-1", &payload).await;
+            let reply = sample(&router, path, &job, "traj-1", &payload).await;
             let store = engine.state::<ServiceState>();
             let guard = store.lock();
             if accepted {
@@ -660,7 +558,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     let over_max_257 = "t".repeat(257);
     let over_max_280 = "t".repeat(280);
     let at_max = "t".repeat(256);
-    let unknown_job = job_arn("us-west-2", "000000000000", "AgentRFT", "ghost-run");
+    let other_region_job = job_arn("us-west-2", "000000000000", "AgentRFT", "other-region-run");
 
     // Each row names the fragments the refusal's `Message` must state: the member path
     // and the requirement it failed.
@@ -691,10 +589,17 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
         ),
     ] {
         let (engine, router) = mounted_service();
-        // The job is one the runtime does not hold: a modelled-constraint violation is
-        // refused before the job is resolved, so the message must still be about the
-        // constraint.
-        let reply = sample(&router, path, &unknown_job, &trajectory_id, &chat_payload("go")).await;
+        // The job ARN is in another region and names a job nothing has ever sampled: a
+        // modelled-constraint violation is refused before any state is touched, so the
+        // message must still be about the constraint.
+        let reply = sample(
+            &router,
+            path,
+            &other_region_job,
+            &trajectory_id,
+            &chat_payload("go"),
+        )
+        .await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
             (400, "ValidationException"),
@@ -726,11 +631,8 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     // A trajectory id AT the maximum is accepted, which is what makes the rows above
     // about the bound and not about length in general.
     let (engine, router) = mounted_service();
-    let seeded_job = state::seed_job_arns()
-        .first()
-        .cloned()
-        .expect("the store seeds at least one job");
-    let accepted = sample(&router, SAMPLE_PATH, &seeded_job, &at_max, &chat_payload("go")).await;
+    let job = emulator_job("modelled-values-run");
+    let accepted = sample(&router, SAMPLE_PATH, &job, &at_max, &chat_payload("go")).await;
     assert_eq!(
         accepted.status,
         200,
@@ -757,7 +659,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     ] {
         let (engine, router) = mounted_service();
         // A trajectory that does NOT exist: the enum check comes first.
-        let reply = complete_rollout(&router, &seeded_job, "no-such-trajectory", Some(value)).await;
+        let reply = complete_rollout(&router, &job, "no-such-trajectory", Some(value)).await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
             (400, "ValidationException"),
@@ -778,7 +680,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
         let sealed = engine
             .state::<ServiceState>()
             .lock()
-            .trajectory(&seeded_job, "no-such-trajectory")
+            .trajectory(&job, "no-such-trajectory")
             .is_some();
         assert!(
             !sealed,
@@ -790,13 +692,13 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     for value in ["ready", "failed"] {
         let (engine, router) = mounted_service();
         assert_eq!(
-            sample(&router, SAMPLE_PATH, &seeded_job, "traj-1", &chat_payload("go"))
+            sample(&router, SAMPLE_PATH, &job, "traj-1", &chat_payload("go"))
                 .await
                 .status,
             200,
             "case {value:?}: expected the seeding Sample to answer 200"
         );
-        let sealed = complete_rollout(&router, &seeded_job, "traj-1", Some(value)).await;
+        let sealed = complete_rollout(&router, &job, "traj-1", Some(value)).await;
         assert_eq!(
             sealed.status,
             200,
@@ -807,7 +709,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
         let store = engine.state::<ServiceState>();
         let guard = store.lock();
         let recorded = guard
-            .trajectory(&seeded_job, "traj-1")
+            .trajectory(&job, "traj-1")
             .and_then(|trajectory| trajectory.completion_status)
             .map(state::CompletionStatus::as_str);
         assert_eq!(
@@ -826,13 +728,13 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
     ] {
         let (engine, router) = mounted_service();
         assert_eq!(
-            sample(&router, SAMPLE_PATH, &seeded_job, "traj-1", &chat_payload("go"))
+            sample(&router, SAMPLE_PATH, &job, "traj-1", &chat_payload("go"))
                 .await
                 .status,
             200,
             "case {case:?}: expected the seeding Sample to answer 200"
         );
-        let reply = update_reward(&router, &seeded_job, trajectory_id, &[]).await;
+        let reply = update_reward(&router, &job, trajectory_id, &[]).await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
             (400, "ValidationException"),
@@ -850,7 +752,7 @@ async fn a_value_outside_the_model_is_refused_as_invalid() {
         let store = engine.state::<ServiceState>();
         let guard = store.lock();
         let rewards = guard
-            .trajectory(&seeded_job, "traj-1")
+            .trajectory(&job, "traj-1")
             .and_then(|trajectory| trajectory.rewards.clone());
         assert!(
             rewards.is_none(),

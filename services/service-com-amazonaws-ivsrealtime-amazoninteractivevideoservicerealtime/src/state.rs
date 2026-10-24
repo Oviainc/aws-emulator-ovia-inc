@@ -2200,6 +2200,69 @@ pub fn check_tag_count(operation: &str, found: usize) -> Result<(), String> {
     ))
 }
 
+/// The tag-key prefix Amazon Web Services reserves for its OWN tags, on every resource
+/// of every service.
+///
+/// Every `Tags`/`TagKeyList` member of this model defers to the AWS-wide tagging rules
+/// ("See Best practices and strategies in Tagging AWS Resources and Tag Editor for
+/// details, including restrictions that apply to tags and 'Tag naming limits and
+/// requirements'; Amazon IVS has no constraints on tags beyond what is documented
+/// there." — `smithy_query(query="doc", shape="TagResourceRequest", member="tags")`, and
+/// the same sentence on `UntagResourceRequest$tagKeys`, `Stage$tags` and the create
+/// requests). One of those restrictions is this prefix: it is reserved for AWS use, and a
+/// caller can neither create, edit nor delete a tag key that claims it. `TagKey` carries
+/// only `@length(1..128)`, so the rule is documented-but-unmodelled and belongs to the
+/// handlers, exactly like the 1 KB `attributes` limit ([`MAX_ATTRIBUTES_BYTES`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` claims the reserved namespace.
+///
+/// Compared case-INSENSITIVELY: what AWS reserves is the namespace, not one spelling of
+/// it, so `AWS:` and `Aws:` claim it as much as `aws:` does.
+///
+/// The comparison is over BYTES, because a tag key is modelled `@length(1..128)` with no
+/// `@pattern` and so may be any UTF-8 text: slicing it at a byte offset could fall inside
+/// a multi-byte character and panic, while taking the bytes answers `false` for such a
+/// key — which is correct, since a key whose first four bytes are not `aws:` does not
+/// claim the namespace.
+fn claims_reserved_tag_namespace(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+}
+
+/// Refuse a request that names a tag key in the reserved [`RESERVED_TAG_KEY_PREFIX`]
+/// namespace. `Err` is the sentence to put on the `ValidationException`.
+///
+/// `member` is the dotted path of the member the keys arrived in (`tags` for a tagging or
+/// create call, `tagKeys` for a removal), so the refusal reads in the construction every
+/// other refusal of this service uses (`<Operation>.<member> …`, see
+/// [`violation_clause`]). Called before anything is minted or written, so a refused call
+/// leaves the store exactly as it was.
+///
+/// Every offending key is named, in sorted order: the keys of a `Tags` map have no request
+/// order to report them in, so one refusal is worded one way whichever member carried them.
+pub fn check_tag_keys_unreserved<'a>(
+    operation: &str,
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut reserved: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| claims_reserved_tag_namespace(key))
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+    Err(format!(
+        "{operation}.{member} is required to name no key in the reserved \
+         {RESERVED_TAG_KEY_PREFIX} namespace, found {}",
+        reserved.join(", "),
+    ))
+}
+
 /// The resource type an IVS ARN names (`stage`, `encoder-configuration`, …), or `None`
 /// when the string carries no sixth `:`-field at all.
 ///
@@ -2343,6 +2406,84 @@ mod tests {
             let actual = violation_clause("CreateParticipantToken", &violation);
             assert_eq!(
                 actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The reserved namespace is the NAMESPACE, not one spelling of it, and a key that
+    /// merely starts with the same letters is not in it. A key whose bytes straddle the
+    /// four the comparison reads is not a special case: it simply does not claim the
+    /// namespace.
+    #[test]
+    fn only_a_key_claiming_the_reserved_namespace_is_recognised() {
+        let cases = [
+            ("the reserved prefix in lower case", "aws:owner", true),
+            (
+                "a reserved key with a qualifier, as AWS's own tags carry",
+                "aws:cloudformation:stack-name",
+                true,
+            ),
+            ("the reserved prefix in upper case", "AWS:owner", true),
+            ("the reserved prefix in mixed case", "Aws:owner", true),
+            ("the prefix and nothing after it", "aws:", true),
+            ("the same letters without the colon", "awsome", false),
+            ("the letters as a whole key", "aws", false),
+            ("the prefix in the middle of a key", "team-aws:owner", false),
+            ("an ordinary key", "team", false),
+            ("a key whose first bytes are multi-byte", "ä-aws:owner", false),
+            ("a reserved key with a multi-byte tail", "aws:ö", true),
+        ];
+        for (case, key, expected) in cases {
+            let actual = claims_reserved_tag_namespace(key);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A refusal names the operation, the member the keys arrived in and every offending
+    /// key, in sorted order; a request naming none is accepted.
+    #[test]
+    fn a_reserved_key_refusal_names_the_operation_the_member_and_every_offending_key() {
+        let accepted = check_tag_keys_unreserved("TagResource", "tags", ["team", "env"]);
+        assert!(
+            accepted.is_ok(),
+            "case \"no reserved key\": expected acceptance, got {accepted:?}"
+        );
+
+        let cases: [(&str, &str, &str, Vec<&str>, &str); 3] = [
+            (
+                "one reserved key on TagResource",
+                "TagResource",
+                "tags",
+                vec!["aws:owner"],
+                "TagResource.tags is required to name no key in the reserved aws: namespace, \
+                 found aws:owner",
+            ),
+            (
+                "two reserved keys beside an ordinary one",
+                "CreateStage",
+                "tags",
+                vec!["AWS:b", "team", "aws:a"],
+                "CreateStage.tags is required to name no key in the reserved aws: namespace, \
+                 found AWS:b, aws:a",
+            ),
+            (
+                "a reserved key on UntagResource",
+                "UntagResource",
+                "tagKeys",
+                vec!["aws:owner", "aws:owner"],
+                "UntagResource.tagKeys is required to name no key in the reserved aws: \
+                 namespace, found aws:owner",
+            ),
+        ];
+        for (case, operation, member, keys, expected) in cases {
+            let actual = check_tag_keys_unreserved(operation, member, keys);
+            assert_eq!(
+                actual.as_ref().err().map(String::as_str),
+                Some(expected),
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }

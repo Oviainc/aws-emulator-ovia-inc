@@ -552,26 +552,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::parse_task_definition_reference(reference)
                 else {
                     return Err(CreateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(format!(
-                            "taskDefinition must be a family, family:revision or \
-                             task-definition ARN; got {reference:?}"
-                        )),
+                        message: Some(crate::state::task_definition_reference_message(reference)),
                     })
                     .into());
                 };
-                let found = match revision {
-                    Some(revision) => guard.task_definitions.get(&(family.clone(), revision)),
-                    None => guard.latest_active_revision(&family),
+                let definition = match guard.usable_revision(&family, revision) {
+                    Ok(definition) => definition.clone(),
+                    Err(message) => {
+                        // "You can't use an INACTIVE task definition to ... create new
+                        // services", and a reference that resolves to nothing is the
+                        // same refusal it always is.
+                        return Err(CreateServiceErrorModeled::ClientException(
+                            ClientException {
+                                message: Some(message.to_string()),
+                            },
+                        )
+                        .into());
+                    }
                 };
-                let Some(found) = found.cloned() else {
-                    return Err(CreateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(
-                            crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string(),
-                        ),
-                    })
-                    .into());
-                };
-                Some(found)
+                Some(definition)
             }
         };
 

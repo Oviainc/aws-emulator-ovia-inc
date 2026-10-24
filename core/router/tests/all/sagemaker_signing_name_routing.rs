@@ -482,14 +482,14 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = build_router(&engine);
 
-    let ghost_job = "arn:aws:sagemaker:us-west-2:000000000000:job/AgentRFT/wire-sjr-ghost";
+    let malformed_job = "a-job-of-my-own";
     let long_trajectory_id = "t".repeat(280);
     let job_arn_header = "x-amzn-sagemaker-job-arn";
     let trajectory_id_header = "x-amzn-sagemaker-trajectory-id";
-    let seeded_job = service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state::seed_job_arns()
-        .first()
-        .cloned()
-        .expect("the job runtime seeds at least one job");
+    // Any ARN the modelled `JobArn` constraints admit names the job the caller's own job
+    // execution was handed: this data plane models no job creation and holds no registry
+    // to resolve one against.
+    let job = "arn:aws:sagemaker:us-west-2:000000000000:job/AgentRFT/wire-sjr-rollout-1";
 
     // One row: a request to one of the job runtime's paths, and the answer the one
     // service that owns that path must give.
@@ -506,22 +506,22 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
 
     let rows = [
         Row {
-            case: "Sample for a job the runtime does not hold",
+            case: "Sample with a JobArn that misses the modelled pattern",
             path: "/sample",
             headers: vec![
-                (job_arn_header, ghost_job.to_string()),
+                (job_arn_header, malformed_job.to_string()),
                 (trajectory_id_header, "traj-1".to_string()),
             ],
             body: r#"{"messages":[{"role":"user","content":"go"}]}"#,
             status: 400,
             error_code: "ValidationException",
-            fragment: format!("Could not find job with jobArn {ghost_job}"),
+            fragment: format!("Input arn {malformed_job} is malformed"),
         },
         Row {
             case: "SampleWithResponseStream with a TrajectoryId past the modelled maximum",
             path: "/sample-with-response-stream",
             headers: vec![
-                (job_arn_header, ghost_job.to_string()),
+                (job_arn_header, job.to_string()),
                 (trajectory_id_header, long_trajectory_id.clone()),
             ],
             body: r#"{"messages":[{"role":"user","content":"go"}]}"#,
@@ -534,7 +534,7 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
         Row {
             case: "CompleteRollout against a trajectory that does not exist",
             path: "/complete-rollout",
-            headers: vec![(job_arn_header, seeded_job.clone())],
+            headers: vec![(job_arn_header, job.to_string())],
             body: r#"{"TrajectoryId":"wire-sjr-traj-778a2a85","Status":"ready"}"#,
             status: 404,
             error_code: "ResourceNotFoundException",
@@ -544,7 +544,7 @@ async fn the_job_runtime_answers_its_own_modelled_rejections_through_the_whole_r
         Row {
             case: "UpdateReward against a trajectory that does not exist",
             path: "/update-reward",
-            headers: vec![(job_arn_header, seeded_job.clone())],
+            headers: vec![(job_arn_header, job.to_string())],
             body: r#"{"TrajectoryId":"wire-sjr-traj-8bca0ce6","Rewards":[1.0]}"#,
             status: 404,
             error_code: "ResourceNotFoundException",

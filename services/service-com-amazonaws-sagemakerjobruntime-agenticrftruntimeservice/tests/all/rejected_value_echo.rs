@@ -35,7 +35,6 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -132,12 +131,12 @@ fn mounted_service() -> MultiServiceRouter {
     router
 }
 
-/// A job ARN this runtime holds, so a refusal is about the constraint and not the job.
-fn seeded_job() -> String {
-    state::seed_job_arns()
-        .first()
-        .cloned()
-        .expect("the store seeds at least one job")
+/// A `JobArn` satisfying every modelled constraint, so a refusal is about the member
+/// under test and not about the job ARN. The runtime holds no job registry — a job is
+/// created in the SageMaker control plane and this data plane serves the ARN its caller
+/// was handed — so nothing has to be registered for this ARN to name a job.
+fn well_formed_job() -> String {
+    "arn:aws:sagemaker:us-east-1:123456789012:job/AgentRFT/echo-run-1".to_string()
 }
 
 /// An OpenAI-compatible chat-completions request body.
@@ -277,7 +276,7 @@ fn assert_refused(case: &str, reply: &Reply, expected: &str) {
 /// size, encoding or binding.
 #[tokio::test]
 async fn an_over_long_value_is_echoed_in_full() {
-    let job_arn = seeded_job();
+    let job_arn = well_formed_job();
     let requirement = format!("Member must have length less than or equal to {TRAJECTORY_ID_MAX}");
 
     // Rows differ along the value's size (one past the bound, the recorded 300-character
@@ -344,7 +343,7 @@ async fn an_over_long_value_is_echoed_in_full() {
 /// a malformed ARN — and a value short enough to need no shortening is echoed identically.
 #[tokio::test]
 async fn every_constraint_class_echoes_the_submitted_value() {
-    let job_arn = seeded_job();
+    let job_arn = well_formed_job();
 
     // The `@length` MINIMUM: an empty value, on both bindings. Nothing is shortened here,
     // so these rows pin that the fix did not change a message that was already right.
@@ -416,7 +415,7 @@ async fn every_constraint_class_echoes_the_submitted_value() {
 async fn a_value_at_the_maximum_is_not_refused() {
     let router = mounted_service();
     let at_max = "t".repeat(TRAJECTORY_ID_MAX);
-    let reply = call(&router, Op::Sample, &seeded_job(), &at_max, "ready").await;
+    let reply = call(&router, Op::Sample, &well_formed_job(), &at_max, "ready").await;
     assert_eq!(
         reply.status,
         200,
@@ -437,7 +436,7 @@ async fn the_echo_is_restored_up_to_the_stated_bound_and_bounded_past_it() {
     /// `services/common/src/validation.rs`, where it is stated with its rationale.
     const MAX_RESTORED_ECHO: usize = 16 * 1024;
 
-    let job_arn = seeded_job();
+    let job_arn = well_formed_job();
     let requirement = format!("Member must have length less than or equal to {TRAJECTORY_ID_MAX}");
 
     // AT the bound: restored in full. Carried in the JSON body, the binding with no

@@ -15,8 +15,19 @@
 //!   eligible for reward submission via the UpdateReward operation".
 //! * `UpdateReward` records the reward scores and "transitions it to
 //!   reward-received status".
+//!
+//! The job itself is NOT a resource of this store. This service is the data plane
+//! of a job that is already running: the `JobArn` every operation carries is the
+//! one the caller's own job execution was handed, and this model binds no
+//! operation that creates, lists or deletes a job. So the runtime keeps no
+//! registry of jobs to resolve a call against — every `JobArn` the member's own
+//! modelled constraints admit (`@length` 1..256 and the ARN `@pattern`, which
+//! allow any partition, region, account and job name) names the job the call is
+//! served for, and a trajectory is keyed by it. What a sampling call IS refused
+//! on is state this service owns: a trajectory `CompleteRollout` has sealed, and
+//! the emulator bounds below.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use sha2::Digest;
@@ -205,42 +216,6 @@ impl Trajectory {
 /// The key a trajectory is stored under: the job it belongs to and its id.
 pub type TrajectoryKey = (String, String);
 
-/// The region this emulator presents in the ARNs and endpoints it hands clients
-/// (`vendor/server/src/lib.rs` writes `region = us-east-1` into the shared config).
-const SEED_REGION: &str = "us-east-1";
-
-/// The AgenticRFT jobs this runtime starts with.
-///
-/// This service models no operation that creates a job: a job is created in the
-/// SageMaker control plane and this runtime only serves rollouts of one that already
-/// exists, which is why `Sample` answers "Could not find job with jobArn …" for a job
-/// ARN it does not hold. Without a seed the registry would be empty, so the runtime
-/// could not decide that ANY job exists and no rollout would be reachable at all. The
-/// ARNs below are therefore a fixture standing in for that control-plane creation — two
-/// of them, so a caller can keep two rollouts apart — built through
-/// [`::engine::emulator_arn`] so they carry this emulator's canonical account. A test
-/// registers its own job with
-/// [`ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState::register_job`], and
-/// when the SageMaker emulator grows an AgentRFT job store this seed is what it
-/// replaces.
-#[must_use]
-pub fn seed_job_arns() -> Vec<String> {
-    vec![
-        ::engine::emulator_arn("sagemaker", SEED_REGION, "job/AgentRFT/agentic-rft-rollout-1"),
-        ::engine::emulator_arn("sagemaker", SEED_REGION, "job/AgentRFT/agentic-rft-rollout-2"),
-    ]
-}
-
-/// How this service reports a `Sample` or `SampleWithResponseStream` whose `JobArn`
-/// names no job this runtime holds.
-///
-/// Built from the request's own `JobArn`, so the caller can see which job was looked
-/// up.
-#[must_use]
-pub fn job_not_found_message(job_arn: &str) -> String {
-    format!("Could not find job with jobArn {job_arn}")
-}
-
 /// How this service reports a `(JobArn, TrajectoryId)` pair it holds no trajectory for.
 ///
 /// Built from the request's own trajectory id and the account the call is served for —
@@ -257,9 +232,6 @@ pub fn trajectory_not_found_message(trajectory_id: &str) -> String {
 /// Per-service state for com-amazonaws-sagemakerjobruntime-agenticrftruntimeservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
-    /// The ARNs of the jobs this runtime serves rollouts for. A sampling call for an
-    /// ARN that is not here is refused: the job does not exist.
-    pub jobs: BTreeSet<String>,
     /// Every trajectory this emulator has served a turn for, keyed by
     /// `(JobArn, TrajectoryId)`.
     pub trajectories: HashMap<TrajectoryKey, Trajectory>,
@@ -275,7 +247,6 @@ pub struct ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
 impl Default for ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
     fn default() -> Self {
         Self {
-            jobs: seed_job_arns().into_iter().collect(),
             trajectories: HashMap::new(),
             retained_body_bytes: 0,
         }
@@ -283,19 +254,6 @@ impl Default for ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
 }
 
 impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
-    /// Whether this runtime holds the job `job_arn` names.
-    #[must_use]
-    pub fn knows_job(&self, job_arn: &str) -> bool {
-        self.jobs.contains(job_arn)
-    }
-
-    /// Record `job_arn` as a job this runtime serves rollouts for, answering whether it
-    /// was newly added. Stands in for the control-plane creation this service models no
-    /// operation for (see [`seed_job_arns`]).
-    pub fn register_job(&mut self, job_arn: &str) -> bool {
-        self.jobs.insert(job_arn.to_string())
-    }
-
     /// The trajectory `job_arn` / `trajectory_id` names, if this emulator has
     /// one.
     #[must_use]
@@ -343,11 +301,10 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
     where
         F: FnOnce(usize) -> (Vec<u8>, String),
     {
-        // A rollout belongs to a job: the trajectory of a job this runtime does not
-        // hold cannot be sampled, whether or not a turn was ever captured for it.
-        if !self.knows_job(request.job_arn) {
-            return Err(AppendRefusal::UnknownJob);
-        }
+        // The job a call names is the job its caller is running under, and this service
+        // holds no job registry to resolve it against (see the module docs): the
+        // trajectory is keyed by the `(JobArn, TrajectoryId)` pair the request carries,
+        // and created on that pair's first turn.
         let key = (
             request.job_arn.to_string(),
             request.trajectory_id.to_string(),
@@ -450,8 +407,6 @@ pub struct ServedTurn {
 /// OWN modelled errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendRefusal {
-    /// The `JobArn` names no job this runtime holds.
-    UnknownJob,
     /// `CompleteRollout` has already sealed the trajectory.
     Sealed {
         /// The lifecycle status it is sealed in.
@@ -478,9 +433,8 @@ impl AppendRefusal {
     /// The sentence this refusal is reported with, naming the trajectory and
     /// what about its state stops the turn being captured.
     #[must_use]
-    pub fn message(self, job_arn: &str, trajectory_id: &str) -> String {
+    pub fn message(self, trajectory_id: &str) -> String {
         match self {
-            Self::UnknownJob => job_not_found_message(job_arn),
             Self::Sealed {
                 status,
                 completion_status,

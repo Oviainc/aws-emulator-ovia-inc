@@ -169,10 +169,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeTaskDefinitionErrorModeled::ClientException(
                 ClientException {
-                    message: Some(format!(
-                        "taskDefinition must be a family, family:revision or \
-                         task-definition ARN; got {:?}",
-                        input.task_definition
+                    message: Some(crate::state::task_definition_reference_message(
+                        &input.task_definition,
                     )),
                 },
             )
