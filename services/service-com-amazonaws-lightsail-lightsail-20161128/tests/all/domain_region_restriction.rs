@@ -109,8 +109,9 @@ struct Row {
 
 /// Every implemented domain operation. `GetDomains` and `DeleteDomain` are not
 /// here because they are still scaffold stubs answering 501 — their own issues
-/// own them — and the distribution operations the same documentation covers are
-/// stubs as well.
+/// own them. The distribution operations the same documentation covers are
+/// pinned where they live: `CreateDistribution` and `GetDistributions` in
+/// `distribution_cdn.rs`, and the rest are stubs under their own issues.
 const ROWS: &[Row] = &[
     Row {
         case: "creating a zone",

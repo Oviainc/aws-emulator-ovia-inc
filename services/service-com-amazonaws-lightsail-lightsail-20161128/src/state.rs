@@ -20,7 +20,9 @@
 //! runs for the account) together with the **database snapshot** (a point-in-time
 //! copy of one), the **load balancer** (a regional resource that spreads
 //! HTTP traffic across the instances attached to it), the **static IP** (a public
-//! IPv4 address the account reserves and attaches to an instance), the append-only
+//! IPv4 address the account reserves and attaches to an instance), the **CDN
+//! distribution** (a global resource that caches and serves the content of an
+//! origin resource), the append-only
 //! **operation log** every mutating call
 //! writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
@@ -54,16 +56,19 @@ pub use ::service_com_amazonaws_s3_amazons3::state::BucketCreation;
 use crate::ops::types::{
     AccessKey, AccessKeyLastUsed, AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest, Alarm,
     AvailabilityZone, Blueprint, Bucket, BucketAccessLogConfig, BucketBundle, BucketCorsConfig,
-    BucketCorsRule, BucketState, Bundle, Container,
+    BucketCorsRule, BucketState, Bundle, CacheBehavior, CacheBehaviorPerPath, CacheSettings,
+    Container,
     ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, DestinationInfo,
+    DistributionBundle, DistributionCustomErrorResponse,
     Domain, DomainEntry, ExportSnapshotRecord, ExportSnapshotRecordSourceInfo,
     Instance,
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
-    InstancePortInfo, InstanceState, LoadBalancer, LoadBalancerTlsCertificateSummary,
-    MonitoredResourceInfo, MonthlyTransfer, Operation, PrivateRegistryAccess, Region,
+    InstancePortInfo, InstanceState, LightsailDistribution, LoadBalancer,
+    LoadBalancerTlsCertificateSummary,
+    MonitoredResourceInfo, MonthlyTransfer, Operation, Origin, PrivateRegistryAccess, Region,
     RelationalDatabaseBundle, RelationalDatabaseParameter,
     ResourceLocation, ResourceReceivingAccess, StaticIp, Tag, REGION_NAME_VALUES,
 };
@@ -478,6 +483,8 @@ pub const OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT: &str = "CreateDiskFromSnapsh
 pub const OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY: &str = "CreateBucketAccessKey";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY: &str = "DeleteBucketAccessKey";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_DISTRIBUTION: &str = "CreateDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ALLOCATE_STATIC_IP: &str = "AllocateStaticIp";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -7124,6 +7131,339 @@ pub const INSTANCE_HEALTH_INITIAL: &str = "initial";
 pub const INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS: &str = "Lb.RegistrationInProgress";
 
 // ---------------------------------------------------------------------------
+// CDN distributions
+// ---------------------------------------------------------------------------
+
+/// The `resourceType` a content delivery network distribution reports, from the
+/// modelled `ResourceType` enum — the value the
+/// `LightsailDistribution$resourceType` documentation names ("The Lightsail
+/// resource type (`Distribution`)").
+pub const RESOURCE_TYPE_DISTRIBUTION: &str = "Distribution";
+
+/// The resource portion a distribution ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const DISTRIBUTION_ARN_RESOURCE_PREFIX: &str = "Distribution/";
+
+/// The Region every distribution is located in, whichever Region its origin is
+/// in and whichever Region a request is made from.
+///
+/// From the modelled `LightsailDistribution$location` documentation: "Lightsail
+/// distributions are global resources that can reference an origin in any
+/// Amazon Web Services Region, and distribute its content globally. However,
+/// all distributions are located in the `us-east-1` Region."
+pub const DISTRIBUTION_REGION_NAME: &str = "us-east-1";
+
+/// `LightsailDistribution$status` while the configuration a call stored is
+/// still being deployed to the CDN, and once it has been.
+///
+/// The member is a plain string in the model ("The status of the
+/// distribution"). A Lightsail distribution IS an Amazon CloudFront
+/// distribution, and it carries CloudFront's own distribution status values:
+/// `InProgress` while a change propagates and `Deployed` once, as the
+/// CloudFront API documents for `Distribution$Status`, "the distribution's
+/// information is fully propagated to all CloudFront edge locations".
+pub const DISTRIBUTION_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`DISTRIBUTION_STATUS_IN_PROGRESS`].
+pub const DISTRIBUTION_STATUS_DEPLOYED: &str = "Deployed";
+
+/// The most distributions this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota. A create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_DISTRIBUTIONS: usize = 100;
+
+/// The most per-path cache behaviours one distribution may carry.
+///
+/// Emulator resource guard: the modelled `CacheBehaviorList` declares no length,
+/// so this is where the bound on a caller-sized list lives.
+pub const MAX_CACHE_BEHAVIORS_PER_DISTRIBUTION: usize = 25;
+
+/// The most custom error responses one distribution may carry.
+///
+/// Emulator resource guard, for the same reason as
+/// [`MAX_CACHE_BEHAVIORS_PER_DISTRIBUTION`]: the modelled
+/// `DistributionCustomErrorResponseList` declares no length.
+pub const MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION: usize = 25;
+
+/// How many distributions one `GetDistributions` page carries.
+///
+/// The operation is paginated — its `pageToken` is "The token to advance to the
+/// next page of results from your request" — but the model states no page size,
+/// so this is the store's own, small enough that a modest number of
+/// distributions already exercises the paging.
+pub const DISTRIBUTION_PAGE_SIZE: usize = 10;
+
+/// The smallest and largest `responseTimeout`, in seconds, an origin may be
+/// given, and the one an origin that names none gets.
+///
+/// From the modelled `InputOrigin$responseTimeout` documentation: "The minimum
+/// timeout is 1 second, the maximum is 60 seconds, and the default (if you
+/// don't specify otherwise) is 30 seconds."
+pub const ORIGIN_RESPONSE_TIMEOUT_SECONDS_RANGE: (i32, i32) = (1, 60);
+/// See [`ORIGIN_RESPONSE_TIMEOUT_SECONDS_RANGE`].
+pub const DEFAULT_ORIGIN_RESPONSE_TIMEOUT_SECONDS: i32 = 30;
+
+/// The DNS suffix a distribution's `domainName` is published under.
+///
+/// AWS publishes it in CloudFront's own `cloudfront.net` zone. That HOSTNAME is
+/// environment-specific and no caller may assume it, while the promise
+/// `LightsailDistribution$domainName` makes — "The domain name of the
+/// distribution" — is not: it must never be a name that sends the next client
+/// OUT of the emulator. This emulator owns no DNS zone, so the name keeps the
+/// CloudFront SHAPE (`d<token>`) under a suffix that belongs to the emulator and
+/// cannot resolve off-machine, exactly as a load balancer's `dnsName` does (see
+/// [`LOAD_BALANCER_DNS_SUFFIX`]): `.local` is reserved for link-local multicast
+/// name resolution (RFC 6762 §3).
+///
+/// This emulator serves no CDN data plane on it: a distribution caches and
+/// serves nothing. Everything the control plane owns — the record, its status,
+/// its bundle, its origin, its cache configuration and its operation log entry
+/// — is real.
+const DISTRIBUTION_DOMAIN_SUFFIX: &str = "cdn.lightsail.local";
+
+/// How many characters of the distribution's own id go into its `domainName`:
+/// the 13 CloudFront puts after the leading `d` of a distribution domain name
+/// (`d111111abcdef8.cloudfront.net`).
+const DISTRIBUTION_DOMAIN_ID_LEN: usize = 13;
+
+/// One Lightsail **distribution** bundle: the monthly cost and monthly network
+/// transfer quota a distribution gets from that plan.
+///
+/// This is the service's published price list for CDN distributions, so it is
+/// the same for every caller and no call changes it — `GetDistributionBundles`
+/// reports it, and `CreateDistribution`/`UpdateDistributionBundle` name an entry
+/// of it by `bundle_id`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistributionBundleSpec {
+    /// The id a caller sends for this plan. A distribution bundle id is
+    /// `<size>_<major>_<minor>`, the same form a bucket bundle id carries.
+    pub bundle_id: &'static str,
+    /// `DistributionBundle$transferPerMonthInGb` — "The monthly network transfer
+    /// quota of the bundle", in GB.
+    pub transfer_per_month_in_gb: i32,
+    /// `DistributionBundle$price` — "The monthly price, in US dollars, of the
+    /// bundle."
+    pub price_usd_per_month: f32,
+    /// `DistributionBundle$isActive` — "Indicates whether the bundle is active,
+    /// and can be specified for a new or existing distribution."
+    pub is_active: bool,
+}
+
+/// Every distribution bundle this service publishes, cheapest first: the
+/// Lightsail pricing page's CDN distribution table — 50 GB of data transfer for
+/// $2.50 a month, 200 GB for $5 and 500 GB for $10 — each the first (`_1_0`)
+/// generation of its size.
+///
+/// Lightsail has retired no distribution plan, so every published plan is
+/// active. A retired generation belongs in this table with `is_active: false`:
+/// that is what makes it unavailable to a new distribution while one already
+/// running on it still resolves.
+pub const DISTRIBUTION_BUNDLE_SPECS: &[DistributionBundleSpec] = &[
+    DistributionBundleSpec {
+        bundle_id: "small_1_0",
+        transfer_per_month_in_gb: 50,
+        price_usd_per_month: 2.5,
+        is_active: true,
+    },
+    DistributionBundleSpec {
+        bundle_id: "medium_1_0",
+        transfer_per_month_in_gb: 200,
+        price_usd_per_month: 5.0,
+        is_active: true,
+    },
+    DistributionBundleSpec {
+        bundle_id: "large_1_0",
+        transfer_per_month_in_gb: 500,
+        price_usd_per_month: 10.0,
+        is_active: true,
+    },
+];
+
+/// The label Lightsail gives a CDN plan, with `transfer` the plan's monthly
+/// network transfer quota in GB.
+///
+/// SOURCE: the `DistributionBundle$name` values Lightsail reports, which name
+/// the plan's transfer quota (`50GB`). The label is therefore DERIVED from the
+/// quota rather than carried per entry: a plan added to
+/// [`DISTRIBUTION_BUNDLE_SPECS`] is labelled the same way.
+pub fn distribution_bundle_name(transfer_per_month_in_gb: i32) -> String {
+    format!("{transfer_per_month_in_gb}GB")
+}
+
+impl DistributionBundleSpec {
+    /// This plan as the modelled `DistributionBundle`.
+    ///
+    /// `name` is "The name of the distribution bundle", so it is DERIVED from
+    /// [`Self::transfer_per_month_in_gb`] by [`distribution_bundle_name`] rather
+    /// than carried a second time.
+    pub fn view(&self) -> DistributionBundle {
+        DistributionBundle {
+            bundle_id: Some(self.bundle_id.to_string()),
+            name: Some(distribution_bundle_name(self.transfer_per_month_in_gb)),
+            price: Some(self.price_usd_per_month),
+            transfer_per_month_in_gb: Some(self.transfer_per_month_in_gb),
+            is_active: Some(self.is_active),
+        }
+    }
+}
+
+/// The distribution bundle `bundle_id` names — active or not, since a
+/// distribution already running on a retired plan still has to resolve — or
+/// `None` when this service publishes no such plan.
+pub fn distribution_bundle_spec(bundle_id: &str) -> Option<DistributionBundleSpec> {
+    DISTRIBUTION_BUNDLE_SPECS
+        .iter()
+        .find(|spec| spec.bundle_id == bundle_id)
+        .copied()
+}
+
+/// Whether a NEW distribution may be created on the plan `bundle_id` names: the
+/// plan has to be one this service publishes AND still active, because
+/// `DistributionBundle$isActive` is what says a bundle "can be specified for a
+/// new or existing distribution".
+pub fn distribution_bundle_is_creatable(bundle_id: &str) -> bool {
+    distribution_bundle_spec(bundle_id).is_some_and(|spec| spec.is_active)
+}
+
+/// The ARN of the distribution `id`. Every distribution is located in
+/// [`DISTRIBUTION_REGION_NAME`], so that is the Region its ARN carries.
+pub fn distribution_arn(id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        DISTRIBUTION_REGION_NAME,
+        &format!("{DISTRIBUTION_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The `domainName` of the distribution minted as `id`. See
+/// [`DISTRIBUTION_DOMAIN_SUFFIX`].
+pub fn distribution_domain_name(id: &str) -> String {
+    let token: String = id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(DISTRIBUTION_DOMAIN_ID_LEN)
+        .collect();
+    format!("d{token}.{DISTRIBUTION_DOMAIN_SUFFIX}")
+}
+
+/// What an origin name resolves to: the kind of resource it addresses, and the
+/// public DNS name this store publishes for that resource, if it publishes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedOrigin {
+    /// The resolved resource's own `ResourceType` value, which is what
+    /// `Origin$resourceType` reports.
+    pub resource_type: &'static str,
+    /// `Origin$originPublicDNS`, "The public DNS of the origin" — filled only
+    /// for a resource this store publishes a public DNS NAME for (a load
+    /// balancer's `dnsName`). An instance is published at an IP address and a
+    /// bucket and a container service at an address under the endpoint the
+    /// request arrived at, so neither has a public DNS name to report and the
+    /// optional member is left out rather than guessed at.
+    pub public_dns: Option<String>,
+}
+
+/// One stored distribution: the CDN distribution `CreateDistribution` created.
+///
+/// What the caller asked for — name, bundle, origin, cache behaviour and
+/// settings, custom error responses, IP address type, certificate name, minimum
+/// viewer TLS version, default root object and tags — is kept verbatim; the ARN,
+/// support code, creation time, domain name, status and the origin's resolved
+/// resource type are assigned by this store from the request plus its own
+/// allocators.
+#[derive(Debug, Clone)]
+pub struct StoredDistribution {
+    /// The distribution name the request named, kept verbatim — it is this
+    /// record's store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    /// Where the distribution lives: [`DISTRIBUTION_REGION_NAME`], and no
+    /// availability zone, because a distribution is a global resource rather
+    /// than a zonal one.
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The address this distribution is published at, minted by
+    /// [`distribution_domain_name`].
+    pub domain_name: String,
+    /// One of [`DISTRIBUTION_STATUS_IN_PROGRESS`] /
+    /// [`DISTRIBUTION_STATUS_DEPLOYED`].
+    pub status: &'static str,
+    /// The status the clock owes this distribution, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// Whether the distribution is enabled. `CreateDistribution` exposes no
+    /// `isEnabled` parameter and `UpdateDistribution`'s documentation gives it
+    /// as the way to "enable the distribution", so a created distribution is
+    /// enabled and that operation is what turns it off.
+    pub is_enabled: bool,
+    /// The bundle currently applied, an id of [`DISTRIBUTION_BUNDLE_SPECS`].
+    pub bundle_id: String,
+    /// Whether the applied bundle may still be changed. A distribution's bundle
+    /// can be updated "only one time within your monthly Amazon Web Services
+    /// billing cycle" (`UpdateDistributionBundle`), so one that has not been
+    /// moved yet can be.
+    pub able_to_update_bundle: bool,
+    /// The SSL/TLS certificate attached to the distribution, if the request
+    /// named one.
+    pub certificate_name: Option<String>,
+    /// The alternate domain names of the distribution, which come from the
+    /// domains of an attached certificate: a distribution this call created has
+    /// none of its own.
+    pub alternative_domain_names: Vec<String>,
+    /// The origin the distribution pulls content from: what the request asked
+    /// for, plus the resource type this store resolved the origin name to.
+    pub origin: Origin,
+    /// See [`ResolvedOrigin::public_dns`].
+    pub origin_public_dns: Option<String>,
+    pub default_cache_behavior: CacheBehavior,
+    /// The cache behaviour settings the request carried, or `None` when it
+    /// carried none — the model documents no default for any member of
+    /// `CacheSettings`, so nothing is invented for a request that set none.
+    pub cache_behavior_settings: Option<CacheSettings>,
+    pub cache_behaviors: Vec<CacheBehaviorPerPath>,
+    pub ip_address_type: String,
+    pub viewer_minimum_tls_protocol_version: Option<String>,
+    pub default_root_object: Option<String>,
+    pub custom_error_responses: Vec<DistributionCustomErrorResponse>,
+}
+
+impl StoredDistribution {
+    /// This record as the modelled `LightsailDistribution`.
+    pub fn view(&self) -> LightsailDistribution {
+        LightsailDistribution {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_DISTRIBUTION.to_string()),
+            // A list member is reported EMPTY rather than left out: an absent
+            // member hands a typed caller a null where it iterates.
+            alternative_domain_names: Some(self.alternative_domain_names.clone()),
+            status: Some(self.status.to_string()),
+            is_enabled: Some(self.is_enabled),
+            domain_name: Some(self.domain_name.clone()),
+            bundle_id: Some(self.bundle_id.clone()),
+            certificate_name: self.certificate_name.clone(),
+            origin: Some(self.origin.clone()),
+            origin_public_dns: self.origin_public_dns.clone(),
+            default_cache_behavior: Some(self.default_cache_behavior.clone()),
+            cache_behavior_settings: self.cache_behavior_settings.clone(),
+            cache_behaviors: Some(self.cache_behaviors.clone()),
+            able_to_update_bundle: Some(self.able_to_update_bundle),
+            ip_address_type: Some(self.ip_address_type.clone()),
+            tags: Some(self.tags.clone()),
+            viewer_minimum_tls_protocol_version: self
+                .viewer_minimum_tls_protocol_version
+                .clone(),
+            default_root_object: self.default_root_object.clone(),
+            custom_error_responses: Some(self.custom_error_responses.clone()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Released attachments
 // ---------------------------------------------------------------------------
 
@@ -7240,6 +7580,16 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// container service and a bucket. A `BTreeMap` so a listing walks a stable,
     /// total order and a page token can name the next load balancer.
     pub load_balancers: BTreeMap<(String, String), StoredLoadBalancer>,
+    /// Every CDN distribution, keyed by its name — the identifier every
+    /// distribution operation takes.
+    ///
+    /// NOT keyed by region, unlike a bucket or a load balancer: a distribution
+    /// is a global resource and "all distributions are located in the
+    /// `us-east-1` Region" (`LightsailDistribution$location`), so one name
+    /// addresses one distribution of the account whichever Region a request is
+    /// made from. A `BTreeMap` so `GetDistributions` walks a stable, total order
+    /// and a page token can name the next distribution.
+    pub distributions: BTreeMap<String, StoredDistribution>,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,
@@ -7505,6 +7855,56 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The bucket `name` names in `region`, for a reporting operation.
     pub fn bucket(&self, region: &str, name: &str) -> Option<&StoredBucket> {
         self.buckets.get(&(region.to_string(), name.to_string()))
+    }
+
+    /// The CDN distribution `name` names, for a reporting operation.
+    pub fn distribution(&self, name: &str) -> Option<&StoredDistribution> {
+        self.distributions.get(name)
+    }
+
+    /// Store a newly created CDN distribution.
+    pub fn insert_distribution(&mut self, distribution: StoredDistribution) {
+        self.distributions
+            .insert(distribution.name.clone(), distribution);
+    }
+
+    /// What the origin name `name` addresses in `region`, or `None` when this
+    /// account holds no resource of that name there.
+    ///
+    /// An origin "can be a Lightsail instance, bucket, container service, or
+    /// load balancer" (`InputOrigin`), and those are looked up in exactly that
+    /// order — a name can only be taken by one of them, since each kind refuses
+    /// a create whose name is already its own. An instance is held by name
+    /// alone, so its own `location` is what decides whether it is in `region`.
+    pub fn resolve_origin(&self, region: &str, name: &str) -> Option<ResolvedOrigin> {
+        if self
+            .instance(name)
+            .is_some_and(|instance| instance.location.region_name == region)
+        {
+            return Some(ResolvedOrigin {
+                resource_type: RESOURCE_TYPE_INSTANCE,
+                public_dns: None,
+            });
+        }
+        if self.bucket(region, name).is_some() {
+            return Some(ResolvedOrigin {
+                resource_type: RESOURCE_TYPE_BUCKET,
+                public_dns: None,
+            });
+        }
+        if self.container_service(region, name).is_some() {
+            return Some(ResolvedOrigin {
+                resource_type: RESOURCE_TYPE_CONTAINER_SERVICE,
+                public_dns: None,
+            });
+        }
+        if let Some(balancer) = self.load_balancer(region, name) {
+            return Some(ResolvedOrigin {
+                resource_type: RESOURCE_TYPE_LOAD_BALANCER,
+                public_dns: Some(balancer.dns_name.clone()),
+            });
+        }
+        None
     }
 
     /// The managed relational database `name` names, for a reporting operation.
@@ -7850,6 +8250,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// relational database, one of its snapshots, or a load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
+    /// a CDN distribution settles into the status it was owed,
     /// and an operation whose work is done settles into `Succeeded`.
     ///
     /// This is the one write a reporting operation performs. Each transition was
@@ -7861,7 +8262,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// [`MAX_EXPORT_SNAPSHOT_RECORDS`],
     /// [`MAX_CONTAINER_SERVICES`],
     /// [`MAX_RELATIONAL_DATABASES`],
-    /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`], [`MAX_LOAD_BALANCERS_PER_REGION`] and
+    /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`], [`MAX_LOAD_BALANCERS_PER_REGION`],
+    /// [`MAX_DISTRIBUTIONS`] and
     /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
     /// it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
@@ -7944,6 +8346,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 balancer.state = due.state;
                 balancer.due = None;
+            }
+        }
+        for distribution in self.distributions.values_mut() {
+            let Some(due) = distribution.due else { continue };
+            if due.at_ms <= now_ms {
+                distribution.status = due.state;
+                distribution.due = None;
             }
         }
         for operation in &mut self.operations {
@@ -8415,9 +8824,9 @@ fn signed_region(parts: &::http::request::Parts) -> Option<String> {
 /// rather than refused.
 ///
 /// The same documented restriction covers the distribution (and distribution
-/// certificate) operations, which are still scaffold stubs answering 501: when
-/// one of them is implemented it must call THIS helper rather than re-deriving
-/// the rule, so the restriction stays in one place.
+/// certificate) operations: `CreateDistribution` and `GetDistributions` call
+/// THIS helper, and so must any other one of them when it is implemented,
+/// rather than re-deriving the rule — so the restriction stays in one place.
 pub fn domain_region_refusal(parts: &::http::request::Parts) -> Option<String> {
     let signed = signed_region(parts)?;
     (signed != DOMAIN_REGION_NAME).then(|| DOMAIN_REGION_ONLY_MESSAGE.to_string())

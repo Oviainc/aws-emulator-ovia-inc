@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDistribution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDistribution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDistribution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A content delivery network (CDN) distribution: ONE record per distribution name,
+//! built from the request plus this store's own allocators, answered as the modelled
+//! `LightsailDistribution` together with the log entry the create wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +193,275 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDistribution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDistributionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDistribution"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE — the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together — so the Region the request
+        // was signed for decides whether this call is served at all. Checked
+        // BEFORE anything is read or written, so a refused request creates
+        // nothing, and through the crate's one owner of that rule rather than
+        // re-deriving it here.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // A distribution is a GLOBAL resource — "all distributions are located
+        // in the `us-east-1` Region" — so the Region the request is signed for
+        // is NOT part of the record's identity. It is only the Region an origin
+        // that names none of its own is looked for in: a distribution "can
+        // reference an origin in any Amazon Web Services Region", and
+        // `InputOrigin$regionName` is how the request says which. Past the
+        // guard above that fallback is the distribution Region itself, whether
+        // the request named it or carried no scope at all.
+        let request_region = crate::state::request_region(ctx.parts());
+        let origin_region = input
+            .origin
+            .region_name
+            .clone()
+            .unwrap_or(request_region);
+
+        // `distributionName`, `origin`, `defaultCacheBehavior` and `bundleId`
+        // are modelled `@required` members, the names carry the modelled
+        // `ResourceName` pattern and `ipAddressType`,
+        // `viewerMinimumTlsProtocolVersion`, `origin.regionName`,
+        // `origin.protocolPolicy`, `origin.ipAddressType` and
+        // `defaultCacheBehavior.behavior` each target a modelled enum, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: the origin has to name
+        // a resource, its response timeout has to be within the documented
+        // range, a default cache behaviour has to say what it is, the bundle
+        // has to be a plan a new distribution may use, the caller-sized lists
+        // have to be within their bounds, private origin access is only for a
+        // bucket origin, and the name must still be free. Each is checked
+        // BEFORE the first write, so a refused request creates nothing.
+        let Some(origin_name) = input.origin.name.clone() else {
+            return Err(invalid(
+                "origin.name must name the Lightsail instance, bucket, container service or \
+                 load balancer the distribution pulls content from"
+                    .to_string(),
+            ));
+        };
+        // "The minimum timeout is 1 second, the maximum is 60 seconds, and the
+        // default (if you don't specify otherwise) is 30 seconds."
+        let (min_timeout, max_timeout) = crate::state::ORIGIN_RESPONSE_TIMEOUT_SECONDS_RANGE;
+        let response_timeout = match input.origin.response_timeout {
+            None => crate::state::DEFAULT_ORIGIN_RESPONSE_TIMEOUT_SECONDS,
+            Some(seconds) if (min_timeout..=max_timeout).contains(&seconds) => seconds,
+            Some(seconds) => {
+                return Err(invalid(format!(
+                    "origin.responseTimeout is {seconds} seconds, outside the \
+                     {min_timeout}..{max_timeout} seconds a distribution waits for its origin"
+                )))
+            }
+        };
+        if input.default_cache_behavior.behavior.is_none() {
+            return Err(invalid(
+                "defaultCacheBehavior.behavior must say how the distribution caches content: \
+                 'cache' to serve the whole origin as static content, or 'dont-cache' to \
+                 serve only the paths cacheBehaviors names"
+                    .to_string(),
+            ));
+        }
+        if !crate::state::distribution_bundle_is_creatable(&input.bundle_id) {
+            return Err(invalid(format!(
+                "bundleId '{}' is not an active distribution bundle this service offers; use \
+                 GetDistributionBundles to list the bundle IDs you can specify",
+                input.bundle_id
+            )));
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        let cache_behaviors = input.cache_behaviors.clone().unwrap_or_default();
+        if cache_behaviors.len() > crate::state::MAX_CACHE_BEHAVIORS_PER_DISTRIBUTION {
+            return Err(invalid(format!(
+                "cacheBehaviors carries {} entries, more than the {} one distribution holds",
+                cache_behaviors.len(),
+                crate::state::MAX_CACHE_BEHAVIORS_PER_DISTRIBUTION
+            )));
+        }
+        let custom_error_responses = input.custom_error_responses.clone().unwrap_or_default();
+        if custom_error_responses.len()
+            > crate::state::MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
+        {
+            return Err(invalid(format!(
+                "customErrorResponses carries {} entries, more than the {} one distribution \
+                 holds",
+                custom_error_responses.len(),
+                crate::state::MAX_CUSTOM_ERROR_RESPONSES_PER_DISTRIBUTION
+            )));
+        }
+        // "The IP address type for the distribution. [...] The default value is
+        // dualstack."
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+        let private_origin_access = input.enable_private_origin_access.unwrap_or(false);
+
+        let name = input.distribution_name.clone();
+        let location = crate::state::StoredLocation::regional(crate::state::DISTRIBUTION_REGION_NAME);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The remaining checks are the ones that need the STORE — what the
+            // origin name addresses, whether the distribution name is free, and
+            // whether this emulator has room — so they run here rather than
+            // above. Like the others they all run BEFORE the first write, which
+            // is what keeps "a refused request creates nothing" true.
+            //
+            // "An origin can be a Lightsail instance, bucket, container
+            // service, or load balancer" — a name that addresses none of them
+            // is a resource this account does not have, which is what the
+            // modelled `NotFoundException` says.
+            let resolved = store
+                .resolve_origin(&origin_region, &origin_name)
+                .ok_or_else(|| {
+                    not_found(format!(
+                        "The origin does not exist: {origin_name} is not an instance, bucket, \
+                         container service or load balancer of this account in {origin_region}"
+                    ))
+                })?;
+            // "You can enable private origin access only when the
+            // distribution's origin is a Lightsail bucket. If the origin is
+            // another resource type, the request fails."
+            if private_origin_access && resolved.resource_type != crate::state::RESOURCE_TYPE_BUCKET
+            {
+                return Err(invalid(format!(
+                    "enablePrivateOriginAccess is only available for a Lightsail bucket origin, \
+                     and origin.name '{origin_name}' names a {} in {origin_region}",
+                    resolved.resource_type
+                )));
+            }
+            // A distribution name addresses one distribution of the account, so
+            // creating one that is already there is refused rather than
+            // silently replacing the record a caller may already be serving
+            // content through.
+            if store.distribution(&name).is_some() {
+                return Err(invalid(format!(
+                    "distributionName '{name}' already names a distribution of this account"
+                )));
+            }
+            if store.distributions.len() >= crate::state::MAX_DISTRIBUTIONS {
+                return Err(invalid(format!(
+                    "creating a distribution would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_DISTRIBUTIONS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // A new distribution is not serving yet: the clock owes it
+            // `Deployed`, which is why a read straight after this call still
+            // reports `InProgress`, exactly as it does against AWS.
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::DISTRIBUTION_STATUS_DEPLOYED,
+            );
+            store.insert_distribution(crate::state::StoredDistribution {
+                name: name.clone(),
+                arn: crate::state::distribution_arn(&id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                domain_name: crate::state::distribution_domain_name(&id),
+                status: crate::state::DISTRIBUTION_STATUS_IN_PROGRESS,
+                due: Some(due),
+                // `CreateDistribution` carries no `isEnabled` parameter;
+                // `UpdateDistribution`'s is what disables a distribution later.
+                is_enabled: true,
+                bundle_id: input.bundle_id.clone(),
+                // Nothing has moved this distribution between bundles yet, so
+                // its one monthly bundle change is still available.
+                able_to_update_bundle: true,
+                // The certificate the request named is recorded as asked for.
+                // `AttachCertificateToDistribution` /
+                // `DetachCertificateFromDistribution` are what change it later.
+                certificate_name: input.certificate_name.clone(),
+                // The alternate domain names of a distribution are the domains
+                // of its attached certificate, and this slice holds no
+                // certificate records to read them from, so a created
+                // distribution reports none of its own.
+                alternative_domain_names: Vec::new(),
+                origin: Origin {
+                    name: Some(origin_name.clone()),
+                    // The one member of the origin the SERVICE fills: the
+                    // caller names a resource, and what kind of resource that
+                    // name addresses is what this store resolved it to.
+                    resource_type: Some(resolved.resource_type.to_string()),
+                    region_name: Some(origin_region.clone()),
+                    protocol_policy: input.origin.protocol_policy.clone(),
+                    response_timeout: Some(response_timeout),
+                    ip_address_type: input.origin.ip_address_type.clone(),
+                    is_private_origin_access_enabled: Some(private_origin_access),
+                },
+                origin_public_dns: resolved.public_dns,
+                default_cache_behavior: input.default_cache_behavior.clone(),
+                cache_behavior_settings: input.cache_behavior_settings.clone(),
+                cache_behaviors,
+                ip_address_type,
+                viewer_minimum_tls_protocol_version: input
+                    .viewer_minimum_tls_protocol_version
+                    .clone(),
+                default_root_object: input.default_root_object.clone(),
+                custom_error_responses,
+            });
+            let view = store
+                .distribution(&name)
+                .expect("the distribution this call just stored is in the store")
+                .view();
+            // The log entry stays non-terminal until the deployment the clock
+            // owes the distribution is due, which is the same instant its
+            // status settles.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_DISTRIBUTION,
+                crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateDistributionOutput {
+                distribution: Some(view),
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateDistributionError {
+    CreateDistributionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// This operation's refusal for an origin name this account holds no resource
+/// under: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message built from the
+/// request. The message names no resource TYPE, unlike the
+/// `resource_does_not_exist` wording: which of the four kinds of resource the
+/// origin was meant to be is exactly what could not be established.
+fn not_found(message: String) -> CreateDistributionError {
+    crate::scaffolded::Scaffolded::does_not_exist(message)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateDistributionError {
+    CreateDistributionErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

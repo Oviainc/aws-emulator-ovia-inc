@@ -23,3 +23,15 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the lightsail emulator
 2. Call GetDistributions and observe HTTP 501 with no state persisted
+
+## Note from the CreateDistribution fix
+
+`GetDistributions` was implemented, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` header
+line deleted, as the round-trip reader for the `CreateDistribution` fix
+(`issues/things-that-now-work/20261024T010505Z-lightsail-createdistribution-stub.md`): it
+answers the stored distribution a `distributionName` names (or Lightsail's `DoesNotExist`
+envelope), pages every stored distribution when no name is given, and refuses a request
+signed for a Region other than `us-east-1`. The behaviour is pinned end-to-end by
+`services/service-com-amazonaws-lightsail-lightsail-20161128/tests/all/distribution_cdn.rs`.
+This report is left filed because that session could only resolve the report it was
+dispatched for; whoever picks this one up should find nothing left to implement.
