@@ -1487,6 +1487,40 @@ pub fn decode_page_token(marker: &str, token: &str) -> Option<PageCursor> {
     })
 }
 
+/// Encode the ORDINAL the next page starts at as an opaque `nextToken`, for a collection
+/// whose records are totally ordered by a NUMBER rather than by an instant — an image
+/// set's versions, which are numbered from [`FIRST_IMAGE_SET_VERSION_ID`] and never
+/// renumbered or reused, so the number alone is the whole sort key.
+///
+/// A sibling of [`encode_page_token`] rather than a use of it: an ordinal compares
+/// numerically (version 10 sorts after version 9), which the instant-plus-identifier key
+/// that one carries cannot express. Both spell a token the same way — hex, so it stays
+/// inside `NextToken`'s `^\p{ASCII}{0,8192}$` pattern and is plainly not a resource
+/// identifier — and both take the COLLECTION's `marker`, so a token minted for one
+/// collection is refused rather than honoured as a position in another.
+pub fn encode_ordinal_page_token(marker: &str, ordinal: u32) -> String {
+    ::hex::encode(format!("{marker}{ordinal}").as_bytes())
+}
+
+/// Decode a token [`encode_ordinal_page_token`] produced for the collection `marker`
+/// names, or `None` when it was not one — a string that is not hex, does not decode to
+/// UTF-8, carries another collection's marker (or none), or holds a payload that is not
+/// an ordinal this service would mint.
+pub fn decode_ordinal_page_token(marker: &str, token: &str) -> Option<u32> {
+    let bytes = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(bytes).ok()?;
+    let payload = decoded.strip_prefix(marker)?;
+    // Spelled exactly as this service spells an ordinal: ASCII digits only, so a signed
+    // or space-padded payload `str::parse` would otherwise accept is not honoured as a
+    // position. Every ordinal this service mints is numbered from one, so zero is not one
+    // either.
+    if payload.is_empty() || !payload.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let ordinal: u32 = payload.parse().ok()?;
+    (ordinal > 0).then_some(ordinal)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
