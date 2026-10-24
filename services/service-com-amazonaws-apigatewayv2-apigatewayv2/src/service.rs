@@ -39,6 +39,18 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## This service's other edited seam: the `execute-api` WebSocket data plane
+//!
+//! Beside its modelled `/v2/…` control plane, this service is addressed on the invoke
+//! endpoint of every WebSocket api it mints — `wss://{api-id}.execute-api.{region}.
+//! amazonaws.com/{stage}`, the URI `Api$ApiEndpoint` reports — where a client's FIRST
+//! request is the RFC 6455 opening handshake and not a modelled operation. [`websocket`]
+//! owns that half: which handshakes this service claims ([`websocket::claims_parts`], read
+//! by [`Service::can_handle`]) and what each is answered with
+//! ([`websocket::serve`], reached from [`Service::override_routing_error`]).
+
+mod websocket;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -82,6 +94,10 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The one shared engine, held here because the WebSocket data plane ([`websocket`])
+    /// is decided and served from seams the generated entry does not reach: a claim and a
+    /// routing-error answer, both of which read this service's own records.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -90,7 +106,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -121,7 +138,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // model-derived path space — see [`can_handle_parts`], which for this model is the
         // single segment `v2`. None of the control plane's segments is `v2`, so it alone
         // claims its traffic and each service answers only its own.
-        can_handle_parts(parts)
+        if can_handle_parts(parts) {
+            return true;
+        }
+        // And the WEBSOCKET DATA plane: an RFC 6455 opening handshake addressed to a stage
+        // of a WebSocket api THIS service holds. Such a request carries no credential
+        // scope and its path is no `/v2/…` route, so the front door could resolve no
+        // target service for it and answered `404 UnknownService` — for the endpoint this
+        // service itself reported in `ApiEndpoint`. The claim is narrowed to an api this
+        // service HOLDS, read from the one shared store, so exactly one service claims the
+        // request; see [`websocket`] for the whole rule and for what each handshake is
+        // answered with.
+        websocket::claims_parts(&*self.engine, parts)
     }
 
     fn override_operation(
@@ -160,7 +188,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
+        //
+        // A WebSocket opening handshake IS such a request: it names no modelled operation
+        // (its path is a stage's, not a `/v2/…` route's), so this pre-authentication seam
+        // is where this service's WebSocket data plane answers it. It is served here
+        // rather than named as an operation because a handshake carries no credential
+        // whose verification could change the answer — the refusals below are computed
+        // from the api's and the stage's stored state alone.
+        if websocket::claims_request(&*self.engine, req) {
+            return Some(websocket::serve(&*self.engine, req));
+        }
         None
     }
 
