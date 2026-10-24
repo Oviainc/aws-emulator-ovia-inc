@@ -23,6 +23,8 @@ mod entity_events;
 mod entity_identity;
 #[path = "all/error_identity.rs"]
 mod error_identity;
+#[path = "all/exclusion_window_reads.rs"]
+mod exclusion_window_reads;
 #[path = "all/exclusion_windows.rs"]
 mod exclusion_windows;
 #[path = "all/get_instrumentation_configuration.rs"]

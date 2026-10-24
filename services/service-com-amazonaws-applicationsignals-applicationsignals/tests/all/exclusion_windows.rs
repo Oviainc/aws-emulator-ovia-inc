@@ -26,11 +26,11 @@ use crate::slo_lifecycle::{
 /// Every value of the modelled `DurationUnit` enum
 /// (`smithy_query(shape="DurationUnit")` -> `["MINUTE", "HOUR", "DAY", "MONTH"]`), which is
 /// `Window.DurationUnit`'s target.
-const DURATION_UNITS: [&str; 4] = ["MINUTE", "HOUR", "DAY", "MONTH"];
+pub(crate) const DURATION_UNITS: [&str; 4] = ["MINUTE", "HOUR", "DAY", "MONTH"];
 
 /// The most exclusion windows one SLO holds: `AddExclusionWindows`'s doc ("You can add up to
 /// 10 exclusion windows per SLO") and the modelled `ExclusionWindows` length maximum.
-const MAX_WINDOWS_PER_SLO: usize = 10;
+pub(crate) const MAX_WINDOWS_PER_SLO: usize = 10;
 
 /// The `ResourceType` every SLO failure reports.
 const SLO_RESOURCE_TYPE: &str = "Slo";
@@ -40,7 +40,7 @@ const SLO_RESOURCE_TYPE: &str = "Slo";
 /// `Window` is the shape's only `@required` member; `StartTime`, `RecurrenceRule` and
 /// `Reason` are optional, and a row that omits one sends no such key at all
 /// (`smithy_query(shape="ExclusionWindow")`).
-fn window(
+pub(crate) fn window(
     duration_unit: &str,
     duration: i64,
     start_time: Option<i64>,
@@ -67,7 +67,7 @@ fn window(
 /// an integer where the response renders it as a float; it is compared as a number to three
 /// decimal places rather than as JSON, which would make `1` and `1.0` different windows.
 #[derive(Debug, PartialEq, Eq)]
-struct WindowKey {
+pub(crate) struct WindowKey {
     duration_unit: Option<String>,
     duration: Option<i64>,
     start_time: Option<String>,
@@ -92,7 +92,7 @@ fn key_of(window: &Value) -> WindowKey {
 }
 
 /// The configurations a list page reports, in order.
-fn keys_of(page: &Value) -> Vec<WindowKey> {
+pub(crate) fn keys_of(page: &Value) -> Vec<WindowKey> {
     page["ExclusionWindows"]
         .as_array()
         .map(|windows| windows.iter().map(key_of).collect())
@@ -100,13 +100,13 @@ fn keys_of(page: &Value) -> Vec<WindowKey> {
 }
 
 /// The configurations `windows` states, in order.
-fn keys_sent(windows: &[Value]) -> Vec<WindowKey> {
+pub(crate) fn keys_sent(windows: &[Value]) -> Vec<WindowKey> {
     windows.iter().map(key_of).collect()
 }
 
 /// One `BatchUpdateExclusionWindows` call. A list the row leaves empty is omitted from the
 /// body, since both are optional members.
-async fn batch(
+pub(crate) async fn batch(
     router: &MultiServiceRouter,
     slo_ids: &[String],
     add: &[Value],
@@ -124,7 +124,7 @@ async fn batch(
 
 /// One `ListServiceLevelObjectiveExclusionWindows` call on the SLO called `name`, with the
 /// query string `query` (`""` for none).
-async fn list(router: &MultiServiceRouter, name: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn list(router: &MultiServiceRouter, name: &str, query: &str) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -137,13 +137,67 @@ async fn list(router: &MultiServiceRouter, name: &str, query: &str) -> (u16, Val
     .await
 }
 
+/// The query string of a read bounded by `max_results` and resuming from `token`, each
+/// omitted when the caller states none.
+///
+/// The ONE place this test target spells this read's query string, so two suites cannot send
+/// a page request differently.
+pub(crate) fn query(max_results: Option<usize>, token: Option<&str>) -> String {
+    match (max_results, token) {
+        (None, None) => String::new(),
+        (Some(size), None) => format!("?MaxResults={size}"),
+        (None, Some(token)) => format!("?NextToken={token}"),
+        (Some(size), Some(token)) => format!("?MaxResults={size}&NextToken={token}"),
+    }
+}
+
+/// Every window the SLO called `name` reports when the caller follows `NextToken` from the
+/// first page at a bound of `max_results`, and how many pages that took.
+///
+/// Each page must succeed and must hold at most the bound the caller stated; paging that does
+/// not terminate within one page per window the SLO can hold fails here rather than looping.
+pub(crate) async fn paged(
+    router: &MultiServiceRouter,
+    name: &str,
+    max_results: Option<usize>,
+) -> (Vec<WindowKey>, usize) {
+    let mut collected: Vec<WindowKey> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let (status, page) = list(router, name, &query(max_results, token.as_deref())).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}/{max_results:?}/page {pages}: expected the read to succeed, got {status} with {page}"
+        );
+        let keys = keys_of(&page);
+        if let Some(size) = max_results {
+            assert!(
+                keys.len() <= size,
+                "case {name:?}/{max_results:?}/page {pages}: expected at most {size} windows, got {}",
+                keys.len()
+            );
+        }
+        collected.extend(keys);
+        token = page["NextToken"].as_str().map(ToString::to_string);
+        pages += 1;
+        if token.is_none() {
+            return (collected, pages);
+        }
+        assert!(
+            pages <= MAX_WINDOWS_PER_SLO + 1,
+            "case {name:?}/{max_results:?}: paging did not terminate after {pages} pages"
+        );
+    }
+}
+
 /// The ARN of the SLO called `name` in this account and region.
 fn slo_arn(name: &str) -> String {
     format!("arn:aws:application-signals:{REGION}:{ACCOUNT}:slo/{name}")
 }
 
 /// Create the SLO called `name`, failing the test if the setup create does not succeed.
-async fn create_slo(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_slo(router: &MultiServiceRouter, name: &str) {
     let (status, created) = create(
         router,
         json!({ "Name": name, "SliConfig": sli_config("checkout", "GET /cart", 100.0) }),
@@ -618,44 +672,17 @@ async fn a_read_pages_over_the_window_set_for_every_page_size_the_model_admits()
     // "ListServiceLevelObjectiveExclusionWindows")`): both published bounds and the sizes
     // between, plus the omitted bound, which reports the whole set.
     for max_results in [Some(1), Some(2), Some(3), Some(5), Some(10), None] {
-        let mut collected: Vec<WindowKey> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            let query = match (max_results, token.as_deref()) {
-                (Some(size), None) => format!("?MaxResults={size}"),
-                (Some(size), Some(token)) => format!("?MaxResults={size}&NextToken={token}"),
-                (None, None) => String::new(),
-                (None, Some(token)) => format!("?NextToken={token}"),
-            };
-            let (status, page) = list(&router, name, &query).await;
-            assert_eq!(
-                status, 200,
-                "case {max_results:?}/page {pages}: expected the read to succeed, got {status} with {page}"
-            );
-            let keys = keys_of(&page);
-            if let Some(size) = max_results {
-                assert!(
-                    keys.len() <= size,
-                    "case {max_results:?}/page {pages}: expected at most {size} windows, got {}",
-                    keys.len()
-                );
-            }
-            collected.extend(keys);
-            token = page["NextToken"].as_str().map(ToString::to_string);
-            pages += 1;
-            if token.is_none() {
-                break;
-            }
-            assert!(
-                pages <= sent.len() + 1,
-                "case {max_results:?}: paging did not terminate after {pages} pages"
-            );
-        }
+        let (collected, pages) = paged(&router, name, max_results).await;
         assert_eq!(
             collected,
             keys_sent(&sent),
             "case {max_results:?}: expected every window exactly once in the stored order"
+        );
+        let expected_pages = max_results.map_or(1, |size| sent.len().div_ceil(size).max(1));
+        assert_eq!(
+            pages, expected_pages,
+            "case {max_results:?}: expected {expected_pages} page(s) for {} windows, got {pages}",
+            sent.len()
         );
     }
 
