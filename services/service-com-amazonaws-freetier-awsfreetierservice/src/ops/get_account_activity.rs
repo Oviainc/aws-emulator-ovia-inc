@@ -185,10 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        if let Some(language_code) = input.language_code.as_deref() {
-            // As on `ListAccountActivities`: the code selects the language of
-            // the title and description AWS returns, and this emulator stores
-            // one language, so an accepted code reports the stored text.
+        // As on `ListAccountActivities`: the code selects the language of the
+        // title and description this operation reports ("The language code used
+        // to return translated title and description fields"), and a value
+        // outside the enum names no language the catalog could be read in.
+        let language_code = input.language_code.as_deref();
+        if let Some(language_code) = language_code {
             if !LANGUAGE_CODE_VALUES.contains(&language_code) {
                 return Err(validation(format!(
                     "languageCode: {language_code} is not a language code; expected one of {}",
@@ -222,8 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetAccountActivityOutput {
             activity_id: activity.activity_id.clone(),
-            title: activity.title.clone(),
-            description: activity.description.clone(),
+            // The stored row's text in the requested language; a request that
+            // named none is answered in the catalog's base language.
+            title: activity.title.in_language(language_code).to_string(),
+            description: activity.description.in_language(language_code).to_string(),
             status: activity.status.clone(),
             instructions_url: activity.instructions_url.clone(),
             reward: activity.reward_union(),
