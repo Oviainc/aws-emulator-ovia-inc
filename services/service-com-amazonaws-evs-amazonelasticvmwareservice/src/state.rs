@@ -965,14 +965,6 @@ pub struct StoredEnvironment {
     pub tags: BTreeMap<String, String>,
     /// The VLAN subnets materialised from `initialVlans`.
     pub vlans: Vec<StoredVlan>,
-    /// The ESX hosts the create request asked for, kept as supplied.
-    ///
-    /// `CreateEnvironment` accepts them, so losing them would discard caller input.
-    /// They are not materialised into `Host` records of their own \u2014 `CreateEnvironmentHost`
-    /// is what adds a reportable host to [`Self::hosts`] \u2014 but they ARE hosts the
-    /// environment is deployed with, so the environment health checks count them
-    /// ([`Self::deployed_hosts`]).
-    pub requested_hosts: Vec<crate::ops::types::HostInfoForCreate>,
     /// The environment health checks, as [`Self::refresh_checks`] last ran them, and
     /// the roll-up [`Self::environment_status`] reports.
     ///
@@ -1009,6 +1001,11 @@ pub struct StoredEnvironment {
     /// `ListEnvironmentHosts` has one stable order to page over; bounded by the usable
     /// addresses of the environment's own `vmkManagement` VLAN subnet
     /// ([`Self::next_host_ip`]).
+    ///
+    /// Written by the two operations that ADD a host: `CreateEnvironment`, for the hosts
+    /// its `hosts` member asked Amazon EVS to add while installing VCF, and
+    /// `CreateEnvironmentHost` for one added afterwards. They are one population: a name
+    /// either of them took is taken for the other.
     pub hosts: BTreeMap<String, StoredHost>,
     /// The lifecycle transition the clock owes this environment, if any.
     pub pending: Option<PendingTransition>,
@@ -1183,25 +1180,19 @@ impl StoredEnvironment {
             .collect()
     }
 
-    /// The hosts this environment is DEPLOYED with, as `hostName -> instanceType`: the
-    /// ESX hosts added through `CreateEnvironmentHost` that still occupy it
-    /// ([`Self::live_hosts`]), together with the hosts the create request asked Amazon
-    /// EVS to deploy the environment with (`CreateEnvironmentRequest$hosts`, kept on
-    /// [`Self::requested_hosts`]).
+    /// The hosts this environment is DEPLOYED with, as `hostName -> instanceType`: every
+    /// ESX host of the environment that still occupies it ([`Self::live_hosts`]) — the
+    /// hosts `CreateEnvironment` added while installing VCF and the hosts
+    /// `CreateEnvironmentHost` added afterwards, which are one population held in
+    /// [`Self::hosts`].
     ///
     /// Keyed by `hostName` because that is what identifies a host ("DNS hostnames for
     /// hosts must be unique across Amazon EVS environments and within VCF",
-    /// `HostInfoForCreate$hostName` doc), so a name that appears in both is one host and
-    /// counts once — and the added record wins, since it is the one the service built.
-    /// This is the host population the `HOST_COUNT` and `KEY_COVERAGE` checks read.
+    /// `HostInfoForCreate$hostName` doc). This is the host population the `HOST_COUNT`
+    /// and `KEY_COVERAGE` checks read.
     pub fn deployed_hosts(&self) -> BTreeMap<&str, &str> {
-        self.requested_hosts
-            .iter()
+        self.live_hosts()
             .map(|host| (host.host_name.as_str(), host.instance_type.as_str()))
-            .chain(
-                self.live_hosts()
-                    .map(|host| (host.host_name.as_str(), host.instance_type.as_str())),
-            )
             .collect()
     }
 

@@ -13,6 +13,20 @@
 //! ([`crate::state::ec2_resources::provision_vlan_subnets`]), and the `Vlan` reports
 //! the `subnetId` and `availabilityZone` of the subnet EC2 holds.
 //!
+//! The `hosts` the request carries are MATERIALISED the same way, not merely recorded:
+//! they are "The ESX hosts to add to the environment" (`hosts` doc) and "When you
+//! specify any other VCF version, Amazon EVS installs and configures VCF for you" (this
+//! operation's doc), so each entry becomes a host of the environment exactly as
+//! `CreateEnvironmentHost` adds one — a `Host` record `ListEnvironmentHosts` reports,
+//! `HostState` `CREATING` with the move to `CREATED` the clock owes it, a management
+//! address out of the environment's own `vmkManagement` VLAN subnet, the EC2 bare metal
+//! instance an ESX host IS ([`crate::state::ec2_resources::launch_host_instance`]), and
+//! the default ESX version of the environment's VCF version ("When Amazon EVS installs
+//! VCF, the default ESX version for the selected VCF version will be used"), since no
+//! member of this request names one. `SELF_DEPLOYED` is the one mode that adds none:
+//! "no hosts are added and no VCF installation is performed. After the environment is
+//! created, you can add hosts with CreateEnvironmentHost".
+//!
 //! The request-level rules it enforces beyond the modelled constraints, each from the
 //! documentation quoted under "Modeled contract" below:
 //!
@@ -41,6 +55,14 @@
 //!    neither, so they are the caller's own, judged exactly as rule 7 judges the
 //!    network ([`crate::state::ec2_resources::host_placement_failures`]). An entry
 //!    refused by rule 1 names both mechanisms, so neither of its references is resolved.
+//! 10. A `hostName` an entry of `hosts` names is free: "DNS hostnames for hosts must be
+//!    unique across Amazon EVS environments and within VCF"
+//!    (`HostInfoForCreate$hostName` doc), and the hosts this create adds TAKE their
+//!    names — so a name a host of some environment already carries, or a name the
+//!    request gives twice, names a host that cannot be added. The rule
+//!    `CreateEnvironmentHost` applies to its single `host`, at the scope the doc states
+//!    it, and judged only where the request's VCF version adds the hosts at all, because
+//!    a mode that adds none takes no name.
 //!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
@@ -322,6 +344,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are all collected rather than short-circuited: AWS reports a request's
         // failed preconditions together, so a caller can correct them in one round
         // trip instead of one refusal at a time.
+        // Whether this environment's VCF version is one Amazon EVS INSTALLS, which is
+        // what decides whether the request's `hosts` are added to the environment: "When
+        // you specify SELF_DEPLOYED for vcfVersion, Amazon EVS provisions only the VLAN
+        // subnets; no hosts are added and no VCF installation is performed", and "When
+        // you specify any other VCF version, Amazon EVS installs and configures VCF for
+        // you" (this operation's doc).
+        let installs_vcf = input.vcf_version != crate::state::VCF_VERSION_SELF_DEPLOYED;
+
         let mut failures: Vec<ValidationExceptionField> = Vec::new();
         failures.extend(terms_accepted_failure(&input));
         failures.extend(host_failures(input.hosts.as_deref().unwrap_or_default()));
@@ -390,6 +420,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "is already used by another deployed Amazon EVS environment, which Amazon EVS \
                  does not support",
             ));
+        }
+        // "DNS hostnames for hosts must be unique across Amazon EVS environments and
+        // within VCF" (`HostInfoForCreate$hostName` doc): the hosts this create adds take
+        // their names, so a name a host of some environment already carries — or a name
+        // this one request gives twice — names a host that cannot be added, and the entry
+        // that named it is refused. Asked only where the hosts ARE added, because a mode
+        // that adds none takes no name.
+        if installs_vcf {
+            let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            for (host, member_prefix) in input
+                .hosts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .zip(host_member_prefixes.iter())
+            {
+                let host_name = host.host_name.as_str();
+                let clause = if state.host_name_is_taken(host_name) {
+                    "is already used by a host of an Amazon EVS environment; host DNS \
+                     hostnames must be unique across environments"
+                } else if !named.insert(host_name) {
+                    "is used by another host of this request; host DNS hostnames must be \
+                     unique across environments"
+                } else {
+                    continue;
+                };
+                failures.push(crate::state::field_failure(
+                    &format!("{member_prefix}.hostName"),
+                    clause,
+                ));
+            }
         }
 
         // The VLAN subnets are provisioned INSIDE that VPC, so each block must be a
@@ -592,7 +653,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service_access_security_groups: input.service_access_security_groups,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             vlans,
-            requested_hosts,
             // Health is DERIVED from the record: nothing is checked on an environment
             // that is still CREATING, and every reporting operation recomputes the
             // checks from the store
@@ -601,6 +661,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             impaired_since_ms: std::collections::BTreeMap::new(),
             entitlements: std::collections::BTreeMap::new(),
             connectors: std::collections::BTreeMap::new(),
+            // The hosts the request asked for are added to this map below, once the
+            // record they belong to is stored.
             hosts: std::collections::BTreeMap::new(),
             pending: Some(crate::state::PendingTransition::starting_now(
                 crate::state::STATE_CREATED,
@@ -612,8 +674,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);
-        let created = match state.environments.entry(environment_id) {
-            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(environment).to_wire(),
+        let stored = match state.environments.entry(environment_id) {
+            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(environment),
             // Unreachable: ids are minted from a strictly increasing seed. Answering
             // honestly beats reporting some other environment as the created one.
             std::collections::btree_map::Entry::Occupied(taken) => {
@@ -629,7 +691,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
+        // The ESX hosts the request asked Amazon EVS to ADD to the environment, added to
+        // the record just stored: each one a host of this environment, which is what
+        // `ListEnvironmentHosts` reports and what the next `CreateEnvironmentHost` finds
+        // the name of. Done after the record is stored so the hosts, and the EC2
+        // instances they run on, belong to an environment that exists.
+        let host_transitions_due =
+            add_requested_hosts(&*self.engine, stored, &requested_hosts, installs_vcf);
+        let created = stored.to_wire();
         if let Some(due_at) = transition_due_at {
+            state.note_transition_due(due_at);
+        }
+        // Each host runs on its own clock, so each owed move to CREATED is noted.
+        for due_at in host_transitions_due {
             state.note_transition_due(due_at);
         }
         Ok(CreateEnvironmentOutput {
@@ -641,6 +715,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The first 802.1Q VLAN tag this service assigns. VLAN 1 is the reserved default
 /// VLAN of an 802.1Q trunk, so an environment's own VLANs start clear of it.
 const FIRST_VLAN_ID: i32 = 100;
+
+/// Add the ESX hosts `requested` names to the stored `environment`, and answer the
+/// instant each one's owed move to `CREATED` comes due.
+///
+/// `hosts` is "The ESX hosts to add to the environment", and Amazon EVS adds them while
+/// it installs VCF, so each entry becomes a host of the environment and not a note about
+/// one: the record `ListEnvironmentHosts` reports, carrying the values the entry supplied,
+/// `CREATING` until the build the clock owes it, a management address out of the
+/// environment's own `vmkManagement` VLAN subnet, and the EC2 bare metal instance an ESX
+/// host IS. Every part of that is the rule `CreateEnvironmentHost` follows for the single
+/// host it adds, through the same state constructor and the same EC2 writer, so a host of
+/// a created environment and a host added afterwards are one kind of record.
+///
+/// `installs_vcf` false adds NOTHING: "When you specify SELF_DEPLOYED for vcfVersion,
+/// Amazon EVS provisions only the VLAN subnets; no hosts are added and no VCF installation
+/// is performed. After the environment is created, you can add hosts with
+/// CreateEnvironmentHost" — in that mode the member is accepted and does nothing, exactly
+/// as `clientToken` is.
+fn add_requested_hosts<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    environment: &mut crate::state::StoredEnvironment,
+    requested: &[HostInfoForCreate],
+    installs_vcf: bool,
+) -> Vec<::std::time::Instant> {
+    if !installs_vcf {
+        return Vec::new();
+    }
+    // The Region and the service access subnet the launch reads are the environment's
+    // own, cloned so the hosts can be written into the same record.
+    let region = environment.region.clone();
+    let service_access_subnet_id = environment.service_access_subnet_id.clone();
+    // "When Amazon EVS installs VCF, the default ESX version for the selected VCF version
+    // will be used" (this operation's doc): no member of this request names a version for
+    // the hosts it adds, so each runs the default its VCF version's Bill Of Materials
+    // names — the same catalogue `CreateEnvironmentHost` defaults from.
+    let esx_version = crate::state::default_esx_version(&environment.vcf_version).map(str::to_string);
+    let created_at_ms = environment.created_at_ms;
+    let mut transitions_due = Vec::with_capacity(requested.len());
+    for host in requested {
+        // Defensive: the names are unique by the precondition above, so no entry can
+        // displace a host already added.
+        if environment.hosts.contains_key(&host.host_name) {
+            continue;
+        }
+        // The host's management address, out of the environment's own `vmkManagement`
+        // VLAN subnet ([`crate::state::StoredEnvironment::next_host_ip`]) — the rule that
+        // also bounds how many hosts one environment holds. No address left, or no such
+        // VLAN, leaves the host unaddressable, so it is not added rather than stored with
+        // an address no subnet of the environment covers.
+        let Some(ip_address) = environment.next_host_ip() else {
+            break;
+        };
+        let Some(management_subnet_id) = environment
+            .vmk_management_vlan()
+            .map(|vlan| vlan.subnet_id.clone())
+        else {
+            break;
+        };
+        // "An ESX host that runs on an Amazon EC2 bare metal instance" (`Host` doc): the
+        // instance IS the host, so it is launched into the account's own Amazon EC2 store.
+        // An EC2 store this emulator cannot reach leaves the host reporting neither
+        // `ec2InstanceId` nor `networkInterfaces`.
+        let ec2 = crate::state::ec2_resources::launch_host_instance(
+            engine,
+            crate::state::ec2_resources::HostLaunch {
+                region: &region,
+                instance_type: &host.instance_type,
+                key_name: &host.key_name,
+                management_ip: &ip_address,
+                management_subnet_id: &management_subnet_id,
+                service_access_subnet_id: &service_access_subnet_id,
+            },
+        );
+        // The host is CREATING until it has been built and joined the environment, which
+        // is the move to CREATED the clock owes it.
+        let pending = crate::state::PendingStatus::starting_now(crate::state::HOST_CREATED);
+        transitions_due.push(pending.due_at);
+        environment.hosts.insert(
+            host.host_name.clone(),
+            crate::state::StoredHost::creating(
+                host,
+                ip_address,
+                esx_version.clone(),
+                created_at_ms,
+                ec2,
+                pending,
+            ),
+        );
+    }
+    transitions_due
+}
 
 /// The refusal for an account whose Amazon EC2 store cannot take the environment's ten
 /// VLAN subnets: a quota condition, not a defect in the request, so it is the
