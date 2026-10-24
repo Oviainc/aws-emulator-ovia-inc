@@ -19,6 +19,8 @@ mod connection_lifecycle;
 mod git_sync;
 #[path = "all/host_association.rs"]
 mod host_association;
+#[path = "all/host_deletion.rs"]
+mod host_deletion;
 #[path = "all/list_hosts.rs"]
 mod list_hosts;
 #[path = "all/list_repository_sync_definitions.rs"]

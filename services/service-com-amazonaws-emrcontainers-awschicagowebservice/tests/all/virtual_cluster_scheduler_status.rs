@@ -25,6 +25,10 @@
 //!    `ValidationException`", and the submission that was refused is not in the queue.
 //! 4. Each limit's published `@range` is honoured at both bounds, and a value one past
 //!    either bound is refused.
+//!
+//! The helpers below are `pub(crate)` because the scoping suite beside this one
+//! ([`crate::virtual_cluster_scheduler`]) drives the same endpoints: one definition of
+//! each call, so two suites cannot disagree about what a request looks like.
 
 use std::time::Duration;
 
@@ -36,7 +40,7 @@ use crate::virtual_cluster_job_run_loop::{field, text, Answer, Emr};
 /// Wait until a status transition the service owes has come due, with margin, so the next
 /// call materialises it. The service stores the due instant and never sleeps; this is the
 /// test's own clock.
-fn wait_for_the_clock() {
+pub(crate) fn wait_for_the_clock() {
     std::thread::sleep(state::TRANSITION_SPAN + Duration::from_millis(250));
 }
 
@@ -59,7 +63,7 @@ async fn create_cluster(emr: &Emr, name: &str, token: &str, scheduler: Option<Va
 }
 
 /// The id of a cluster the create must have accepted.
-async fn cluster_id(
+pub(crate) async fn cluster_id(
     emr: &Emr,
     case: &str,
     name: &str,
@@ -85,13 +89,13 @@ async fn start_run(emr: &Emr, cluster: &str, token: &str) -> Answer {
 }
 
 /// The id of a job run the submission must have accepted.
-async fn run_id(emr: &Emr, case: &str, cluster: &str, token: &str) -> String {
+pub(crate) async fn run_id(emr: &Emr, case: &str, cluster: &str, token: &str) -> String {
     let started = start_run(emr, cluster, token).await;
     text(started.ok(case), "/id", case)
 }
 
 /// `DELETE /virtualclusters/{cluster}/jobruns/{run}`.
-async fn cancel_run(emr: &Emr, cluster: &str, run: &str) -> Answer {
+pub(crate) async fn cancel_run(emr: &Emr, cluster: &str, run: &str) -> Answer {
     emr.send(
         "DELETE",
         &format!("/virtualclusters/{cluster}/jobruns/{run}"),
@@ -101,7 +105,7 @@ async fn cancel_run(emr: &Emr, cluster: &str, run: &str) -> Answer {
 }
 
 /// The `state` `DescribeJobRun` reports for one run.
-async fn run_state(emr: &Emr, case: &str, cluster: &str, run: &str) -> String {
+pub(crate) async fn run_state(emr: &Emr, case: &str, cluster: &str, run: &str) -> String {
     let described = emr
         .send(
             "GET",
@@ -114,7 +118,7 @@ async fn run_state(emr: &Emr, case: &str, cluster: &str, run: &str) -> String {
 
 /// The `(currentInQueueJobRuns, currentConcurrentJobRuns)` `DescribeVirtualCluster`
 /// reports for this cluster.
-async fn scheduler_status(emr: &Emr, case: &str, cluster: &str) -> (i64, i64) {
+pub(crate) async fn scheduler_status(emr: &Emr, case: &str, cluster: &str) -> (i64, i64) {
     let described = emr
         .send("GET", &format!("/virtualclusters/{cluster}"), None)
         .await;
@@ -175,6 +179,13 @@ async fn scheduler_status_counts_the_clusters_stored_job_runs() {
             label: "both limits, well above the runs submitted",
             scheduler: Some(json!({"maxInQueueJobRuns": 10000, "maxConcurrentJobRuns": 10})),
             runs: 5,
+        },
+        StatusCase {
+            // `JobLimitInteger`'s published maximum, exercised with runs under it: the
+            // size of the limit may not change that every run starts.
+            label: "the published maximum concurrency, with fewer runs than slots",
+            scheduler: Some(json!({"maxConcurrentJobRuns": 10000})),
+            runs: 2,
         },
     ];
 

@@ -154,7 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "The export store is unavailable.".to_string(),
             })
         })?;
-        let updated_at = crate::state::now();
+        // ONE instant answers the whole request: the `LastUpdatedAt` this update reports,
+        // the instant it materialises what the clock already owed, and the instant the
+        // delivery it owes is scheduled from are all this one, so the stored schedule
+        // cannot disagree with the reported status.
+        let at = ::std::time::SystemTime::now();
+        let updated_at = crate::state::timestamp(at);
 
         // FIRST critical section: resolve the export and read the one stored value this
         // request is checked against. The lock is released before the submitted
@@ -234,6 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // SECOND critical section: the mutation. The export is resolved again, because a
         // `DeleteExport` may have removed it while the definition above was being read.
         let mut store = state.lock();
+        // Whatever the clock already owes is materialised BEFORE the definition is
+        // replaced, so a delivery that fell due while this request was being validated
+        // records the definition it was owed for rather than the one replacing it.
+        store.materialize_due(at);
         let stored = store.exports.get_mut(&input.export_arn).ok_or_else(|| {
             crate::state::export_not_found_error(
                 &input.export_arn,
@@ -252,6 +261,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stored.export.destination_configurations = input.export.destination_configurations;
         stored.export.refresh_cadence = input.export.refresh_cadence;
         stored.status.last_updated_at = Some(updated_at);
+        // The definition changed, so the service owes this export a delivery OF THE NEW
+        // definition: the export is refreshed in the caller's bucket from what it now
+        // says, not from what it said before. It supersedes a delivery that was owed and
+        // has not been initiated yet — that one would have delivered a definition this
+        // call has just replaced — and it carries the definition as it stands now, which
+        // is the snapshot the execution it records reports.
+        stored.pending_delivery = Some(crate::state::delivery_owed_at(
+            at,
+            &stored.export,
+            stored.deliveries_owed,
+        ));
+        stored.deliveries_owed += 1;
         drop(store);
 
         Ok(UpdateExportOutput {

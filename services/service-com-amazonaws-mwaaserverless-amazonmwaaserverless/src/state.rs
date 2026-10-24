@@ -47,10 +47,16 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `awsService.arnNamespace`.
 pub const ARN_NAMESPACE: &str = "airflow-serverless";
 
-/// How long after `StartWorkflowRun` the run leaves its initial non-terminal
-/// status. The span is deliberately non-zero so a caller that reads the run
-/// straight back still observes `QUEUED`.
-pub const RUN_SETTLE_AFTER: Duration = Duration::from_millis(500);
+/// How long after `StartWorkflowRun` the run leaves `STARTING` for `QUEUED`: the
+/// span the control plane's own admission of the run occupies. Deliberately
+/// non-zero so a caller that reads the run straight back still observes the
+/// `STARTING` its start reported.
+pub const RUN_ADMITTED_AFTER: Duration = Duration::from_millis(400);
+
+/// How long after a run is `QUEUED` it reaches its terminal status. The span is
+/// deliberately non-zero so a caller that polls immediately still observes
+/// `QUEUED`.
+pub const RUN_SETTLE_AFTER: Duration = Duration::from_millis(300);
 
 /// Why a run that was accepted never executes here. This emulator serves the
 /// workflow control plane faithfully but has no Apache Airflow engine to run a
@@ -64,6 +70,12 @@ pub const NO_AIRFLOW_ENGINE: &str =
 pub const WORKFLOW_STATUS_READY: &str = "READY";
 
 /// `WorkflowRunStatus` values this slice uses.
+///
+/// The status a just-started run carries: "This is typically STARTING when you
+/// first create the run" (`smithy_query(query="operation",
+/// operation="StartWorkflowRun")`, `Status`).
+pub const RUN_STATUS_STARTING: &str = "STARTING";
+/// The status an admitted run waits in for an executor.
 pub const RUN_STATUS_QUEUED: &str = "QUEUED";
 /// The modelled failure state a run that could not execute ends in.
 pub const RUN_STATUS_FAILED: &str = "FAILED";
@@ -155,9 +167,9 @@ pub struct WorkflowRun {
     /// so `GetTaskInstance` answers the modelled `ResourceNotFoundException`
     /// rather than reporting a task nothing ran.
     pub task_instances: BTreeMap<String, TaskInstance>,
-    /// The instant the clock owes this run's exit from its initial non-terminal
-    /// status. Stored, never slept on.
-    pub settles_at: SystemTime,
+    /// The instant the clock owes this run's NEXT status change. Stored, never
+    /// slept on, and advanced by [`WorkflowRun::settle`] as each change lands.
+    pub next_status_at: SystemTime,
 }
 
 impl WorkflowRun {
@@ -167,25 +179,56 @@ impl WorkflowRun {
         self.task_instances.keys().cloned().collect()
     }
 
-    /// Apply the status change the clock already made due, and report whether
-    /// anything changed.
+    /// Apply EVERY status change the clock has already made due, and report
+    /// whether anything changed.
     ///
-    /// This is the ONLY write a reporting operation may make: at `now` the
-    /// transition was owed whether or not anybody called.
+    /// This is the ONLY write a reporting operation may make: at `now` each
+    /// transition below was owed whether or not anybody called, so the status a
+    /// reader reports is the one the run would have reached unpolled. Every
+    /// timestamp it writes comes from the DUE instant, never from `now`, so two
+    /// reads after the same deadline answer identically.
+    ///
+    /// The schedule is the lifecycle the control plane itself drives:
+    ///
+    /// * `STARTING` -> `QUEUED` after [`RUN_ADMITTED_AFTER`]: the run has been
+    ///   admitted and is waiting for an executor. Both are modelled
+    ///   `WorkflowRunStatus` values and both are the control plane's own work,
+    ///   which this emulator really does.
+    /// * `QUEUED` -> `FAILED` after [`RUN_SETTLE_AFTER`], with
+    ///   [`NO_AIRFLOW_ENGINE`] as `ErrorMessage`: nothing dequeues the run,
+    ///   because executing an Apache Airflow workflow definition needs an
+    ///   Airflow engine this emulator does not have. A run that nothing executed
+    ///   never reaches `RUNNING` or `SUCCESS` here — those would be a status for
+    ///   work nothing ran — so it ends in the service's modelled failure state
+    ///   with a reason that says exactly that, and holds no task instance.
+    ///
+    /// A terminal status is never left: the loop stops at any status no
+    /// transition is owed from, which is what makes a settled run stable across
+    /// reads.
     pub fn settle(&mut self, now: SystemTime) -> bool {
-        if self.status != RUN_STATUS_QUEUED || now < self.settles_at {
-            return false;
+        let mut changed = false;
+        while now >= self.next_status_at {
+            let due = self.next_status_at;
+            match self.status.as_str() {
+                RUN_STATUS_STARTING => {
+                    self.status = RUN_STATUS_QUEUED.to_string();
+                    self.modified_at = due;
+                    self.next_status_at = due + RUN_SETTLE_AFTER;
+                }
+                RUN_STATUS_QUEUED => {
+                    let elapsed = due.duration_since(self.started_on).unwrap_or_default();
+                    self.status = RUN_STATUS_FAILED.to_string();
+                    self.completed_on = Some(due);
+                    self.modified_at = due;
+                    self.duration = Some(duration_in_seconds(elapsed));
+                    self.error_message = Some(NO_AIRFLOW_ENGINE.to_string());
+                }
+                // Terminal, or a status whose exit no clock owes.
+                _ => break,
+            }
+            changed = true;
         }
-        let elapsed = self
-            .settles_at
-            .duration_since(self.started_on)
-            .unwrap_or_default();
-        self.status = RUN_STATUS_FAILED.to_string();
-        self.completed_on = Some(self.settles_at);
-        self.modified_at = self.settles_at;
-        self.duration = Some(duration_in_seconds(elapsed));
-        self.error_message = Some(NO_AIRFLOW_ENGINE.to_string());
-        true
+        changed
     }
 }
 
