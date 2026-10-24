@@ -757,7 +757,7 @@ use crate::ops::types::{
     EbsBlockDevice,
     EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, Instance, InstanceApplicationStatus, InstanceStorageInfo, InstanceTypeInfo,
-    IpamInternetRegistryAssociation, IpamPool, IpamRoutingPolicyRegistration,
+    IpamInternetRegistryAssociation, IpamPolicy, IpamPool, IpamRoutingPolicyRegistration,
     IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange,
@@ -1980,6 +1980,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
+    /// Every IPAM policy the account holds, by `IpamPolicyId` — see [`IpamPolicyRecord`].
+    /// Ordered by id, the stable order every reader of them reports in.
+    ///
+    /// `CreateIpamPolicy` is the operation that adds one and `DeleteIpamPolicy` the one
+    /// that starts removing it; the create is still a scaffold, so a fresh account holds
+    /// none — which is why `DeleteIpamPolicy` answers `InvalidIpamPolicyId.NotFound` for
+    /// every well-formed id until it is written, exactly as the real service does for a
+    /// policy that does not exist.
+    pub ipam_policies: BTreeMap<String, IpamPolicyRecord>,
     /// Every IPAM scope the account holds, by `IpamScopeId`, as the modelled [`IpamScope`]
     /// shape itself — "the highest-level container within IPAM" (`IpamScope`), which is what
     /// `CreateIpamPool` resolves its `IpamScopeId` against and takes the pool's IPAM, Region
@@ -2195,6 +2204,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
+            ipam_policies: BTreeMap::new(),
             ipam_scopes: BTreeMap::new(),
             ipam_pool_create_complete_at: BTreeMap::new(),
             ipam_pool_client_tokens: HashMap::new(),
@@ -3731,6 +3741,51 @@ impl ComAmazonawsEc2Amazonec2State {
                     registration.pending = None;
                 }
             }
+        }
+        // One IPAM policy a delete left transient: it reaches the terminal state that
+        // delete recorded for it at the instant it was owed, whether or not anybody called,
+        // and "a message about the state of the IPAM policy" (`IpamPolicy$StateMessage`)
+        // moves with the state rather than keeping the in-progress wording.
+        //
+        // The due policies are collected first, the way the BYOIP block above collects its
+        // due ranges, so each swap of the stored message can be charged against the store's
+        // byte budget exactly as the write that started the deletion charged it
+        // ([`Self::begin_ipam_policy_deletion`]) — the budget cannot drift by the length
+        // difference between the two messages.
+        let due_policies: Vec<String> = self
+            .ipam_policies
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.due_by(now).is_some())
+            })
+            .map(|(policy_id, _)| policy_id.clone())
+            .collect();
+        for policy_id in due_policies {
+            let Some(record) = self.ipam_policies.get_mut(&policy_id) else {
+                continue;
+            };
+            let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let mut released = 0usize;
+            let mut charged = 0usize;
+            if state == IPAM_POLICY_STATE_DELETE_COMPLETE {
+                released = record.view.state_message.as_deref().map_or(0, str::len);
+                charged = IPAM_POLICY_DELETE_COMPLETE_MESSAGE.len();
+                record.view.state_message = Some(IPAM_POLICY_DELETE_COMPLETE_MESSAGE.to_string());
+            }
+            record.view.state = Some(state);
+            record.pending = None;
+            self.release_stored_bytes(released);
+            self.add_stored_bytes(charged);
         }
         for record in self.ipam_routing_policy_registration_deltas.values_mut() {
             if let Some(state) = record
@@ -20982,6 +21037,274 @@ impl ComAmazonawsEc2Amazonec2State {
         delta_id: &str,
     ) -> Option<&IpamRoutingPolicyRegistrationDeltaRecord> {
         self.ipam_routing_policy_registration_deltas.get(delta_id)
+    }
+}
+
+// =============================================================================
+// IPAM policies
+// =============================================================================
+
+/// The id prefix this service mints an IPAM policy with.
+///
+/// NOT `ipam-pol`, and the recorded wire corpus is why. AWS answers
+/// `ipam-pol-0000000000000000f` — a seventeen-hexadecimal-digit suffix, the long EC2
+/// resource id form — with `InvalidIpamPolicyId.Malformed` ("The ipam-policy ID '…' is
+/// malformed"), while the SAME suffix under the prefixes AWS does issue is resolved and only
+/// then reported missing: `ipam-pool-0000000000000000f` ("The ipam-pool ID '…' does not
+/// exist"), `ipam-scope-0000000000000000f` and `ipam-0000000000000000f` each come back as a
+/// NotFound (the probes recorded on [`IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX`], from
+/// the same corpus). The suffix is therefore well formed and it is the PREFIX that EC2 does
+/// not know: `ipam-pol` is not a resource-id prefix of this API, which is what makes an id
+/// carrying it malformed rather than missing.
+///
+/// Which prefix AWS does issue for this resource is published nowhere the model carries
+/// (`smithy_query(query="shape",shape="IpamPolicyId")` is a plain `String` with no
+/// `@pattern`), so this one is CHOSEN: the resource kind as EC2's own refusal spells it
+/// ([`RESOURCE_TYPE_IPAM_POLICY`]), in the style of the IPAM resources whose prefixes the
+/// corpus does show (`ipam-pool`, `ipam-scope`).
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] appends the seventeen lowercase hexadecimal
+/// digits every long EC2 id carries, so every id this store mints is one
+/// [`ipam_policy_id_is_well_formed`] accepts. It is DEFINED as
+/// [`RESOURCE_TYPE_IPAM_POLICY`] rather than spelled again, so the prefix the ids carry and
+/// the resource type the ARNs name cannot drift apart.
+pub const IPAM_POLICY_ID_PREFIX: &str = RESOURCE_TYPE_IPAM_POLICY;
+
+/// The `ResourceType` an IPAM policy's own ARN names, which is also how EC2's refusals spell
+/// this resource kind ("The ipam-policy ID '…' is malformed").
+pub const RESOURCE_TYPE_IPAM_POLICY: &str = "ipam-policy";
+
+/// An IPAM policy in service: the `IpamPolicyState` catalog's `create-complete` member (the
+/// generated catalog is `crate::ops::types::IPAM_POLICY_STATE_VALUES`).
+pub const IPAM_POLICY_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// A policy whose deletion has been asked for and is not finished: that catalog's
+/// `delete-in-progress` member, the TRANSIENT state a delete answers with.
+pub const IPAM_POLICY_STATE_DELETE_IN_PROGRESS: &str = "delete-in-progress";
+
+/// A policy whose deletion is finished: that catalog's `delete-complete` member, which the
+/// clock owes every policy a delete has started on.
+pub const IPAM_POLICY_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
+/// The `StateMessage` a policy carries while its deletion is under way — "a message about the
+/// state of the IPAM policy" (`IpamPolicy$StateMessage`), in this crate's own words rather
+/// than a recording's.
+pub const IPAM_POLICY_DELETE_IN_PROGRESS_MESSAGE: &str = "The IPAM policy is being deleted.";
+
+/// The `StateMessage` a policy carries once its deletion is finished, written by the clock
+/// that owed it ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
+pub const IPAM_POLICY_DELETE_COMPLETE_MESSAGE: &str = "The IPAM policy has been deleted.";
+
+/// `InvalidIpamPolicyId.Malformed` (HTTP 400): the request named something that is not an
+/// IPAM policy id at all, so there is nothing to look up. The code AWS answers, as the
+/// recorded wire corpus behind this resource's stub issue shows
+/// (`ipam-pol-0000000000000000f` -> `InvalidIpamPolicyId.Malformed`).
+pub const INVALID_IPAM_POLICY_ID_MALFORMED: &str = "InvalidIpamPolicyId.Malformed";
+
+/// `InvalidIpamPolicyId.NotFound` (HTTP 400): the request named a well-formed IPAM policy id
+/// this account holds no policy for.
+///
+/// The `.NotFound` counterpart of the `.Malformed` code above, which is how every EC2
+/// resource spells the second of those two questions ([`INVALID_IPAM_POOL_ID_NOT_FOUND`],
+/// [`INVALID_IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_NOT_FOUND`], …).
+pub const INVALID_IPAM_POLICY_ID_NOT_FOUND: &str = "InvalidIpamPolicyId.NotFound";
+
+/// Whether `id` is a well-formed IPAM policy id — one this service could have ISSUED.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`IPAM_POLICY_ID_PREFIX`], whose doc carries the recorded evidence for it). Anything else
+/// is `.Malformed` BEFORE any lookup, so a caller can tell "not an id of this kind" from "no
+/// such policy".
+pub fn ipam_policy_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(IPAM_POLICY_ID_PREFIX, id)
+}
+
+/// Refuse something that is not an IPAM policy id at all: HTTP 400
+/// `InvalidIpamPolicyId.Malformed`, worded the way AWS words a malformed id of this resource
+/// and built from the request's own value.
+pub fn invalid_ipam_policy_id_malformed<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IPAM_POLICY_ID_MALFORMED,
+        400,
+        format!("The {RESOURCE_TYPE_IPAM_POLICY} ID '{id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed IPAM policy id this account holds no policy for: HTTP 400
+/// `InvalidIpamPolicyId.NotFound`, worded by the one writer of that refusal
+/// ([`id_not_found`]).
+pub fn invalid_ipam_policy_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_IPAM_POLICY_ID_NOT_FOUND,
+        &format!("{RESOURCE_TYPE_IPAM_POLICY} ID"),
+        id,
+    )
+}
+
+/// Refuse an `IpamPolicyId` whose FORM is not one this service issues: HTTP 400
+/// `InvalidIpamPolicyId.Malformed`.
+///
+/// The first of the two questions an operation taking a policy id asks, and the one that is
+/// asked BEFORE `DryRun`: "not an id of this kind" is a fact about the request itself, while
+/// "no such policy" is a fact about the account. The two are deliberately separate helpers —
+/// this one and [`lookup_ipam_policy`] — so that order is expressed by the helpers an
+/// operation calls rather than by a check it has to remember to repeat.
+pub fn require_well_formed_ipam_policy_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
+    if ipam_policy_id_is_well_formed(id) {
+        return Ok(());
+    }
+    Err(invalid_ipam_policy_id_malformed(id))
+}
+
+/// Resolve a well-formed `IpamPolicyId` against the account's policies, refusing one it holds
+/// no policy for with HTTP 400 `InvalidIpamPolicyId.NotFound`.
+///
+/// The second of those two questions, asked after `DryRun` because it is about the account
+/// rather than the request. Call [`require_well_formed_ipam_policy_id`] first: an id of no
+/// known form must be answered `.Malformed` before any lookup, the order
+/// [`require_well_formed_id`] documents for every other resource of this module.
+pub fn lookup_ipam_policy<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    id: &str,
+) -> Result<&'store IpamPolicyRecord, Scaffolded<E>> {
+    store
+        .ipam_policies
+        .get(id)
+        .ok_or_else(|| invalid_ipam_policy_id_not_found(id))
+}
+
+/// One stored IPAM policy: the modelled [`IpamPolicy`] every operation that reports one
+/// answers with, plus the move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason every other store
+/// here holds one: a member a writer sets round-trips through `DescribeIpamPolicies` without
+/// a field-by-field copy that can silently drop one.
+#[derive(Debug, Clone)]
+pub struct IpamPolicyRecord {
+    /// The policy as the model shapes it, carrying the state reached so far.
+    pub view: IpamPolicy,
+    /// The terminal state the clock owes this policy while it is still transient
+    /// (`delete-in-progress` -> `delete-complete`); `None` for one that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl IpamPolicyRecord {
+    /// A policy sitting in `state`, with nothing owed to it by the clock.
+    pub fn in_state(view: IpamPolicy, state: &str) -> Self {
+        Self {
+            view: IpamPolicy {
+                state: Some(state.to_string()),
+                ..view
+            },
+            pending: None,
+        }
+    }
+
+    /// The policy's current `IpamPolicyState`.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// Whether a deletion of this policy has already been asked for: it is either still
+    /// `delete-in-progress` or already `delete-complete`, and in neither state is there a
+    /// policy left to delete.
+    pub fn is_deleting(&self) -> bool {
+        self.state() == IPAM_POLICY_STATE_DELETE_IN_PROGRESS
+            || self.state() == IPAM_POLICY_STATE_DELETE_COMPLETE
+    }
+}
+
+/// The bytes one stored IPAM policy holds: the tags assigned to it and the message about its
+/// state, on top of the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+///
+/// The ONE definition of that charge, the way
+/// [`ipam_routing_policy_registration_payload_bytes`] is for a registration: a writer charges
+/// exactly it.
+pub fn ipam_policy_payload_bytes(view: &IpamPolicy) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
+        .saturating_add(view.state_message.as_deref().map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another IPAM policy fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_ipam_internet_registry_association_capacity`].
+    pub fn has_ipam_policy_capacity(&self) -> bool {
+        self.ipam_policies.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store an IPAM policy and answer the `IpamPolicyId` it was given — or `None` when the
+    /// store is at one of its ceilings and NOTHING was stored.
+    ///
+    /// The id, the ARN and the owning account are minted here rather than taken from the
+    /// record, exactly as [`Self::insert_ipam_internet_registry_association`] mints an
+    /// association's, so no path can store a policy under an id this service could not have
+    /// issued.
+    pub fn insert_ipam_policy(&mut self, mut record: IpamPolicyRecord) -> Option<String> {
+        let charge = ipam_policy_payload_bytes(&record.view);
+        if !self.has_ipam_policy_capacity() || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        let policy_id = self.next_id(IPAM_POLICY_ID_PREFIX);
+        let region = record
+            .view
+            .ipam_policy_region
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        record.view.ipam_policy_id = Some(policy_id.clone());
+        // "The Amazon Resource Name (ARN) of the IPAM policy" (`IpamPolicy$IpamPolicyArn`):
+        // an EC2 ARN in the policy's own Region, under this resource's type.
+        record.view.ipam_policy_arn = Some(::engine::emulator_arn(
+            "ec2",
+            &region,
+            &format!("{RESOURCE_TYPE_IPAM_POLICY}/{policy_id}"),
+        ));
+        record.view.ipam_policy_region = Some(region);
+        // "The account ID that owns the IPAM policy" (`IpamPolicy$OwnerId`): this emulator
+        // serves one account, so the policy is owned by it rather than by anything a request
+        // says.
+        record.view.owner_id = Some(::engine::emulator_account_id().to_string());
+        self.add_stored_bytes(charge);
+        self.ipam_policies.insert(policy_id.clone(), record);
+        Some(policy_id)
+    }
+
+    /// The IPAM policy `policy_id` names, as it now stands.
+    pub fn ipam_policy(&self, policy_id: &str) -> Option<&IpamPolicyRecord> {
+        self.ipam_policies.get(policy_id)
+    }
+
+    /// Start deleting the IPAM policy `policy_id` names, and answer it as the store then
+    /// holds it — `None` when the account holds no such policy.
+    ///
+    /// "Deletes an IPAM policy" is work AWS reports as under way: the `IpamPolicyState`
+    /// catalog carries both `delete-in-progress` and `delete-complete`, so the policy is left
+    /// in the TRANSIENT state with the clock owing it the terminal one
+    /// ([`PendingStateMove`], materialised by [`Self::materialize_due_transitions`]). The
+    /// span is never zero, so a caller acting straight after this call still sees
+    /// `delete-in-progress`.
+    ///
+    /// The record STAYS in the store, because a policy in either delete state still has a
+    /// state to report ([`IPAM_POLICY_STATE_DELETE_COMPLETE`]) — so its caller-chosen bytes
+    /// stay charged to the store's budget, which still holds them, the same arrangement as
+    /// [`Self::begin_secondary_network_deletion`].
+    pub fn begin_ipam_policy_deletion(&mut self, policy_id: &str) -> Option<IpamPolicy> {
+        let record = self.ipam_policies.get_mut(policy_id)?;
+        let message = IPAM_POLICY_DELETE_IN_PROGRESS_MESSAGE.to_string();
+        let charged = message.len();
+        let released = record.view.state_message.as_deref().map_or(0, str::len);
+        record.view.state = Some(IPAM_POLICY_STATE_DELETE_IN_PROGRESS.to_string());
+        record.view.state_message = Some(message);
+        record.pending = Some(PendingStateMove::starting_now(
+            IPAM_POLICY_STATE_DELETE_COMPLETE,
+        ));
+        let view = record.view.clone();
+        // The state message is stored text, charged like every other byte this store
+        // retains; the message it replaces goes back to the budget.
+        self.release_stored_bytes(released);
+        self.add_stored_bytes(charged);
+        Some(view)
     }
 }
 

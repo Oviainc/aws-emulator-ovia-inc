@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIpamPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIpamPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the IPAM policy the request names by moving it into the transient
+//! `delete-in-progress` state with the clock owing it `delete-complete`, and answers the
+//! policy as the store then holds it. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIpamPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: something that is not an
+//! `IpamPolicyId` at all is `InvalidIpamPolicyId.Malformed`, before there is anything to look
+//! up; a `DryRun` request a caller holds the permissions for is `DryRunOperation` and writes
+//! nothing, because the flag asks whether the CALLER MAY make the request ("without actually
+//! making the request", `DryRun`) rather than anything about the named policy; then a
+//! well-formed id this account holds no policy for is `InvalidIpamPolicyId.NotFound`, and a
+//! policy whose deletion has already been asked for is `IncorrectState`.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +80,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +149,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIpamPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIpamPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIpamPolicy"))
+        // `ctx` carries request metadata only; this operation reads none of it — the policy
+        // is named in the request and carries its own Region. The store is reached through
+        // the engine held on `self`.
+        let _ = ctx;
+
+        let policy_id = input.ipam_policy_id.as_str();
+        // The request's own FORM first, before anything is resolved: "not an id of this kind"
+        // is a malformed request rather than a missing resource, and it is not answered by
+        // the DryRun arm below.
+        state::require_well_formed_ipam_policy_id(policy_id)?;
+
+        // "A check for whether you have the required permissions for the action without
+        // actually making the request" (`DryRun`): a question about the CALLER, answered once
+        // the request's own form has been checked and before anything is resolved or written;
+        // every caller of this emulator is permitted.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // The clock first: a policy whose `delete-complete` has fallen due is already there,
+        // so every question below is asked of the state the store is ACTUALLY in. That move
+        // was owed at this instant whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // The policy the request names, resolved against the account's policies now that the
+        // request's own form has been accepted and the DryRun question answered: an id this
+        // account holds no policy for is `.NotFound`.
+        let record = state::lookup_ipam_policy(&store, policy_id)?;
+        // A policy a delete has already been asked for has nothing left to delete, so a
+        // second delete is refused rather than restarting the clock on it.
+        if record.is_deleting() {
+            let current = record.state().to_string();
+            return Err(state::incorrect_state(format!(
+                "The IPAM policy '{policy_id}' is in state '{current}', which is not a state \
+                 it can be deleted from"
+            )));
+        }
+
+        // "Information about the deleted IPAM policy" (`IpamPolicy`): the policy as it was
+        // STORED by the move this delete started, so the caller sees what a later report of
+        // the policies will see rather than a value built here.
+        let view = store.begin_ipam_policy_deletion(policy_id).ok_or_else(|| {
+            state::internal_error(format!(
+                "the IPAM policy '{policy_id}' resolved a moment ago is not in the store any \
+                 more"
+            ))
+        })?;
+
+        Ok(DeleteIpamPolicyOutput {
+            ipam_policy: Some(view),
+        })
     }
 }
