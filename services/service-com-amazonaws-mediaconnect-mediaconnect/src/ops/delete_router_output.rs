@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRouterOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRouterOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRouterOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the stored router output the request's `Arn` addresses and answers with that
+//! ARN, the router output's name and the state its deletion is in, or
+//! `NotFoundException` (404) when the store holds no router output with that ARN.
+//!
+//! The delete is a HARD delete, because `RouterOutputState` carries NO terminal deleted
+//! value (`smithy_query(query="shape",shape="RouterOutputState")`): the call puts the
+//! router output into `DELETING` — which is what
+//! `DeleteRouterOutputResponse$State` reports, "the current state of the deleted router
+//! output, indicating where it is in the deletion process" — and the clock completes the
+//! deletion one [`crate::state::TRANSITION_SPAN`] later, when the record leaves the store.
+//! Until then GetRouterOutput still answers 200 with the router output in `DELETING`, and a
+//! repeated delete answers the same ARN, name and state rather than restarting the
+//! deletion, as the model's `@idempotent` on this operation requires. After it, both answer
+//! `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +169,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRouterOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRouterOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRouterOutput"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRouterOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router output store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The state changes the clock already owes are materialised first — including the
+        // completion of an earlier delete, which is what makes a router output whose
+        // deletion has finished a not-found rather than a second delete.
+        store.settle_due_transitions(now);
+
+        let Some(router_output) = store.router_outputs.get_mut(&input.arn) else {
+            return Err(DeleteRouterOutputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // Deleting a router output is not instantaneous: it reports `DELETING` and the
+        // clock owes the record's removal one transition span later. A router output whose
+        // delete was already accepted keeps the deletion it is in, so a repeat of this
+        // `@idempotent` call answers the same thing rather than restarting it.
+        if !router_output.is_deleting() {
+            router_output.state = crate::state::ROUTER_OUTPUT_STATE_DELETING.to_string();
+            // The delete supersedes whatever state change was owed before it: a router
+            // output on its way out does not settle into `STANDBY` on the way.
+            router_output.pending = None;
+            router_output.removal_due_at = Some(now + crate::state::TRANSITION_SPAN);
+            router_output.updated_at = now;
+        }
+
+        Ok(DeleteRouterOutputOutput {
+            arn: router_output.arn.clone(),
+            name: router_output.name.clone(),
+            state: router_output.state.clone(),
+        })
     }
 }
