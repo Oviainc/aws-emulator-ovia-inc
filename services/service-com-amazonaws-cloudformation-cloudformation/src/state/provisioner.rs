@@ -129,6 +129,14 @@
 //!   CloudFormation decides set on the way out and the declared tag MAP sent as the
 //!   `[{Key, Value}]` list that request takes. That one call is "Create or update a
 //!   parameter in Parameter Store", so `Overwrite` makes it this type's update too.
+//! * `AWS::Cognito::UserPoolGroup`'s are `CreateGroup`'s own members, spelled identically on
+//!   both sides (`UserPoolId`, `GroupName`, `Description`, `Precedence`, `RoleArn`), so the
+//!   evaluated properties are the request with the one member CloudFormation decides (the
+//!   group's name, which is this resource's physical id) set on the way out. A group's
+//!   identity is a PAIR — the pool that holds it and its name — so every call of its arm
+//!   carries the declared `UserPoolId` beside that name, and a declaration that moves the
+//!   group to another pool is no in-place change: `UpdateGroup` changes only the three
+//!   configuration members, so such a deployment reports the change as not applied.
 //! * the two `AWS::S3Vectors::*` types' properties are their creates' own members with a
 //!   lower-case initial, and each type's IDENTITY is its own ARN rather than a name: `Ref`
 //!   returns the vector bucket's `bucket/<name>` ARN and the index's
@@ -173,9 +181,10 @@ use super::provisioning::{
     Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY,
-    ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
+    AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, COGNITO_USER_POOL_GROUP,
+    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM,
+    FIS_EXPERIMENT_TEMPLATE, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT,
+    S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER,
     STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
 };
@@ -233,6 +242,7 @@ pub(super) enum Provisioner {
     EventsRule,
     SsmParameter,
     StepFunctionsActivity,
+    CognitoUserPoolGroup,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -263,6 +273,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
+        COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
         _ => None,
     }
 }
@@ -351,6 +362,10 @@ impl Provisioner {
             Self::StepFunctionsActivity => {
                 create_activity(ctx, region, resource, propagated).await
             }
+            // `AWS::Cognito::UserPoolGroup` publishes `Description`, `GroupName`,
+            // `Precedence`, `RoleArn` and `UserPoolId` and no `Tags`: the type is not
+            // taggable, so no tags are propagated to a group.
+            Self::CognitoUserPoolGroup => create_group(ctx, region, resource).await,
         }
     }
 
@@ -430,6 +445,11 @@ impl Provisioner {
             Self::SsmParameter => update_parameter(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateGroup` "updates any of the properties for precedence, IAM role, or
+            // description" of a group the pool already holds, so a changed declaration of
+            // those reaches Amazon Cognito through it — while the two members that make the
+            // group's identity are not members of that call at all.
+            Self::CognitoUserPoolGroup => update_group(ctx, region, resource, declared).await,
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -508,6 +528,9 @@ impl Provisioner {
             Self::StepFunctionsActivity => {
                 delete_activity(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the group by the PAIR that identifies it, and the pool
+            // half of that pair is on the resource's own declaration.
+            Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
         }
     }
 
@@ -581,6 +604,9 @@ impl Provisioner {
             Self::StepFunctionsActivity => {
                 describe_activity(ctx, region, physical_resource_id).await
             }
+            // The read is addressed by the group's name AND the pool that holds it, which
+            // only the resource's own record carries.
+            Self::CognitoUserPoolGroup => describe_group(ctx, region, resource).await,
         }
     }
 }
@@ -5804,6 +5830,207 @@ async fn call_sfn(
         region,
         AWS_JSON_1_0,
         &format!("{SFN_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Cognito user pools: AWS::Cognito::UserPoolGroup
+// ---------------------------------------------------------------------------
+
+/// Amazon Cognito user pools' signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: cognito-idp`, service shape `AWSCognitoIdentityProviderService`), which
+/// speaks `awsJson1_1`.
+const COGNITO_IDP_SIGNING_NAME: &str = "cognito-idp";
+const COGNITO_IDP_TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
+
+/// The members a group's CONFIGURATION is, as `CreateGroup` and `UpdateGroup` both name
+/// them — the type's properties beside the two that make the group's identity, spelled
+/// identically on both sides.
+const GROUP_CONFIGURATION_MEMBERS: &[&str] = &["Description", "Precedence", "RoleArn"];
+
+/// Create the group an `AWS::Cognito::UserPoolGroup` declares, so a client that deployed
+/// the stack and then calls `cognito-idp GetGroup` with the pool it declared and the name
+/// the stack publishes reads the group back rather than a `ResourceNotFoundException`.
+///
+/// The type's properties ARE `CreateGroup`'s own members, so they are passed through with
+/// the one member CloudFormation decides — the group's NAME, which is this resource's
+/// physical id — set to it. A group is addressed by the pair `(UserPoolId, GroupName)`, and
+/// the pool half is a required property of the type: a declaration carrying none describes
+/// no group that could be created, so it is refused here rather than with a request Amazon
+/// Cognito would have to reject.
+async fn create_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = group_configuration(&resource.properties);
+    request.insert("UserPoolId".to_string(), Value::String(group_pool(resource)?));
+    request.insert(
+        "GroupName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    call_cognito_idp(ctx, region, "CreateGroup", &Value::Object(request)).await?;
+    // The type publishes no `Fn::GetAtt` return value of its own: what identifies the
+    // group is the pair the stack already records (its physical id and its declared
+    // `UserPoolId`), so there is no attribute to adopt from the answer.
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Apply a CHANGED `AWS::Cognito::UserPoolGroup` declaration to the group the stack already
+/// has, through Amazon Cognito's own `UpdateGroup` — which "updates any of the properties
+/// for precedence, IAM role, or description" of the named group.
+///
+/// `Ok(None)` is a change that call cannot make, so the deployment reports it as not
+/// applied rather than as a success that dropped it:
+///
+/// * a declaration that moves the group to a DIFFERENT user pool — a group belongs to one
+///   pool, and `UpdateGroup` takes the pool only to address the group;
+/// * a declaration that no longer states a `Precedence` or a `RoleArn` the group was
+///   created with: a member `UpdateGroup` leaves out keeps its stored value, and neither
+///   can be sent empty (`RoleArn` is `@length(min: 20)`, `Precedence` an integer), so
+///   nothing in that call unsets them. A dropped `Description` IS sent, as the empty string
+///   its own `@length(min: 0)` admits.
+async fn update_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let pool = group_pool(resource)?;
+    if declared.get("UserPoolId").and_then(scalar_text) != Some(pool.clone()) {
+        return Ok(None);
+    }
+    let mut request = group_configuration(declared);
+    for member in GROUP_CONFIGURATION_MEMBERS {
+        if request.contains_key(*member) || resource.properties.get(*member).is_none() {
+            continue;
+        }
+        // A member the declaration DROPPED. Only a description can be emptied through
+        // this call.
+        if *member == "Description" {
+            request.insert((*member).to_string(), Value::String(String::new()));
+        } else {
+            return Ok(None);
+        }
+    }
+    request.insert("UserPoolId".to_string(), Value::String(pool));
+    request.insert(
+        "GroupName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    call_cognito_idp(ctx, region, "UpdateGroup", &Value::Object(request)).await?;
+    Ok(Some(Created::attributes(BTreeMap::new())))
+}
+
+/// Delete the group a stack created, addressed by the pair that identifies it: the pool its
+/// declaration names and its name, which is this resource's physical id.
+///
+/// A group Amazon Cognito no longer holds — and a pool it no longer holds, which cannot
+/// hold the group either — is already in the state the delete asks for; both are that
+/// service's `ResourceNotFoundException`, judged on the CODE and never on a message.
+async fn delete_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({
+        "UserPoolId": group_pool(resource)?,
+        "GroupName": resource.physical_resource_id.clone(),
+    });
+    match call_cognito_idp(ctx, region, "DeleteGroup", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The group's configuration as Amazon Cognito reports it, for drift detection. One it no
+/// longer holds (`ResourceNotFoundException`) was deleted.
+///
+/// `GetGroup` answers a `GroupType` whose members carry the very names this type declares
+/// its properties with, so the answer maps onto the property vocabulary one for one.
+async fn describe_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({
+        "UserPoolId": group_pool(resource)?,
+        "GroupName": resource.physical_resource_id.clone(),
+    });
+    match call_cognito_idp(ctx, region, "GetGroup", &request).await {
+        Ok(answer) => {
+            let Some(group) = answer.get("Group") else {
+                return Ok(None);
+            };
+            Ok(Some(reported_as_properties(
+                group,
+                &[
+                    ("GroupName", "GroupName"),
+                    ("UserPoolId", "UserPoolId"),
+                    ("Description", "Description"),
+                    ("Precedence", "Precedence"),
+                    ("RoleArn", "RoleArn"),
+                ],
+            )))
+        }
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The three configuration members a declaration states, as the request carries them. The
+/// type and the API spell them identically, so each value goes through as the template wrote
+/// it — except `Precedence`, which `PrecedenceType` models as an INTEGER while a template may
+/// write it as a quoted YAML scalar or feed it through a `Ref` to a `String` parameter: it is
+/// read through [`whole_number`], this module's one spelling rule for a property carrying a
+/// whole number. A property the declaration leaves out is absent from the request; a
+/// `Precedence` that is no whole number at all is left as written, so the owning service
+/// refuses the value the template really declared rather than a silently changed one.
+fn group_configuration(properties: &Value) -> Map<String, Value> {
+    let mut request = Map::new();
+    for member in GROUP_CONFIGURATION_MEMBERS {
+        let Some(value) = properties.get(*member) else {
+            continue;
+        };
+        let carried = match *member {
+            "Precedence" => {
+                whole_number(Some(value)).map_or_else(|| value.clone(), Value::from)
+            }
+            _ => value.clone(),
+        };
+        request.insert((*member).to_string(), carried);
+    }
+    request
+}
+
+/// The user pool a group's declaration names — the other half of the group's identity.
+///
+/// `UserPoolId` is a required property of the type, so a declaration carrying none is
+/// refused here, naming that property, rather than sent as a request the owning service
+/// would reject.
+fn group_pool(resource: &StoredResource) -> Result<String, Refusal> {
+    property(resource, "UserPoolId").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!("{} declares no UserPoolId", resource.resource_type),
+    })
+}
+
+/// Call one Amazon Cognito user-pools operation on the awsJson1_1 wire its model declares.
+async fn call_cognito_idp(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        COGNITO_IDP_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{COGNITO_IDP_TARGET_PREFIX}.{operation}"),
         request,
     )
     .await

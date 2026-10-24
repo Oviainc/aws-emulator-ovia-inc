@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_supportapp_supportapp::state::{
-    ACCOUNT_TYPE, MAX_SLACK_WORKSPACE_CONFIGURATIONS,
+    derived_slack_workspace_name, ACCOUNT_TYPE, MAX_SLACK_WORKSPACE_CONFIGURATIONS,
 };
 
 use crate::slack_channel_configurations::{role_arn, Emulator};
@@ -290,11 +290,13 @@ async fn registering_a_workspace_reports_it_and_is_bounded_by_the_documented_quo
                 "the reported accountType must be one the model declares, got \
                  {ACCOUNT_TYPE:?} outside {ACCOUNT_TYPE_VALUES:?}"
             );
-            // The workspace's Slack name is not in the request and the emulator has no
-            // Slack to ask, so the optional member is absent rather than invented.
-            assert!(
-                reply.string("teamName").is_none(),
-                "case {label:?} attempt {attempt}: expected no teamName, got {}",
+            // A registered workspace has a name, which this operation reports, and the
+            // registration recorded it, so both attempts report the same one. The rule
+            // itself is covered in [`crate::slack_workspace_team_name`].
+            assert_eq!(
+                reply.string("teamName").as_deref(),
+                Some(derived_slack_workspace_name(team).as_str()),
+                "case {label:?} attempt {attempt}: expected the recorded teamName, got {}",
                 reply.body
             );
         }

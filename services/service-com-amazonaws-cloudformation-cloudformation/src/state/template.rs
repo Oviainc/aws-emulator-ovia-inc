@@ -1980,6 +1980,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Systems Manager `PutParameter.Name`: `PSParameterName`,
         // `@length(min: 1, max: 2048)` (the SSM model's own bound).
         SSM_PARAMETER => rules(2048, Characters::AsGenerated),
+        // Amazon Cognito `CreateGroup.GroupName`: `GroupNameType`,
+        // `@length(min: 1, max: 128)` with pattern `^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`
+        // (cognito-idp's own Smithy model), which a generated name is already inside —
+        // letters, digits and the hyphen are all admitted — but may be longer than.
+        COGNITO_USER_POOL_GROUP => rules(128, Characters::AsGenerated),
         _ => None,
     }
 }
@@ -2251,6 +2256,10 @@ fn declared_name_property(resource_type: &str) -> Option<&'static str> {
     match resource_type {
         "AWS::BedrockAgentCore::Runtime" => Some("AgentRuntimeName"),
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
+        // Amazon Cognito's `CreateGroup` takes `GroupName`, so the type publishes
+        // `GroupName` — the type's last segment is `UserPoolGroup`, so neither
+        // `UserPoolGroupName` nor `Name` finds it.
+        COGNITO_USER_POOL_GROUP => Some("GroupName"),
         _ => None,
     }
 }
@@ -3410,6 +3419,17 @@ pub const ECR_PUBLIC_REPOSITORY: &str = "AWS::ECR::PublicRepository";
 
 /// An Amazon ECR repository's resource type (ECR's model: `cloudFormationName: ECR`).
 pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
+
+/// The type of an Amazon Cognito user-pool group: the cognito-idp model carries
+/// `awsService.cloudFormationName: Cognito`.
+///
+/// This type deliberately carries NO [`return_values`] arm, so the default applies and its
+/// physical resource id is the group's NAME — the identifier every operation of the owning
+/// service addresses a group by (`GetGroup`, `UpdateGroup` and `DeleteGroup` each take a
+/// `GroupName` beside the `UserPoolId` of the pool that holds it), and the one a template
+/// declares through [`declared_name_property`]. Its `UserPoolId` is the other half of that
+/// identity and stays a declared PROPERTY, which is what the provisioner's calls carry.
+pub const COGNITO_USER_POOL_GROUP: &str = "AWS::Cognito::UserPoolGroup";
 
 /// An Amazon ECS cluster's resource type (ECS's model: `cloudFormationName: ECS`). This
 /// is the type `super::provisioning` creates in Amazon ECS itself.

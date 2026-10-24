@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountAssignmentDeletionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountAssignmentDeletionStatus`'s real behaviour —
-//! EXCEPT on an account instance of IAM Identity Center, where account assignments do
-//! not exist at all and the handler answers the modelled `ValidationException` (400)
-//! that AWS refuses the whole permission-set / account-assignment surface with.
-//! Implement the rest here — this is
+//! Reports the stored status of one assignment deletion, read by the `RequestId` the
+//! `DeleteAccountAssignment` that ran it answered with
+//! ([`crate::ops::delete_account_assignment`]). On an account instance of IAM Identity
+//! Center, where account assignments do not exist at all, the handler answers the
+//! modelled `ValidationException` (400) that AWS refuses the whole permission-set /
+//! account-assignment surface with. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountAssignmentDeletionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,13 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ONE answer of this operation is real: the ACCOUNT-INSTANCE restriction. Account
-        // assignments are a feature of an organization instance, so on an account
-        // instance no assignment operation can ever have run and AWS refuses this call
-        // with the modelled `ValidationException` (400) — a 501 would claim "nobody has
-        // written this yet" about a request that is permanently refused. Everything else
-        // about `DescribeAccountAssignmentDeletionStatus` IS still unwritten, so it keeps
-        // the SCAFFOLDED marker and its 501 below.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeAccountAssignmentDeletionStatusErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,18 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let withdrawn = {
-            let mut store = state.lock();
-            // The account's ambient instance if nothing has enabled one yet, and what the
-            // clock already owes, so this call resolves the same instance a read at this
-            // instant would resolve.
-            store.on_request(
-                &crate::state::request_region(ctx.parts()),
-                ::std::time::SystemTime::now(),
-            );
-            store.permission_set_surface_withdrawn(&input.instance_arn)
-        };
-        if withdrawn {
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes the instances themselves, and
+        // the account's ambient instance if nothing has enabled one yet (`on_request`):
+        // reporting a tracked operation's status neither advances it nor creates one, and
+        // the status itself is derived from the due instant the delete stored.
+        store.on_request(&region, now);
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
+        // assignments are a feature of an organization instance, so on an account
+        // instance no assignment deletion can ever have run and the refusal does not
+        // depend on whether this request's id names one. An ARN this account holds no
+        // instance for is NOT this refusal — it falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
             return Err(
                 DescribeAccountAssignmentDeletionStatusErrorModeled::ValidationException(
                     ValidationException {
@@ -199,15 +188,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // Implement `DescribeAccountAssignmentDeletionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountAssignmentDeletionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountAssignmentDeletionStatus"))
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(
+                DescribeAccountAssignmentDeletionStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        // Answered from the STORED record the deletion wrote: a `RequestId` no deletion
+        // of this instance ran under names no operation, which is the same 404 an id
+        // belonging to another instance gets.
+        let stored = store
+            .assignment_deletion(
+                &input.instance_arn,
+                &input.account_assignment_deletion_request_id,
+            )
+            .ok_or_else(|| {
+                DescribeAccountAssignmentDeletionStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::assignment_operation_not_found_message(
+                                &input.account_assignment_deletion_request_id,
+                            ),
+                        ),
+                        reason: None,
+                    },
+                )
+            })?;
+        Ok(DescribeAccountAssignmentDeletionStatusOutput {
+            account_assignment_deletion_status: Some(stored.to_shape(now)),
+        })
     }
 }

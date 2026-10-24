@@ -23,5 +23,7 @@ mod resource_preconditions;
 mod slack_channel_configurations;
 #[path = "all/slack_workspace_configurations.rs"]
 mod slack_workspace_configurations;
+#[path = "all/slack_workspace_team_name.rs"]
+mod slack_workspace_team_name;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

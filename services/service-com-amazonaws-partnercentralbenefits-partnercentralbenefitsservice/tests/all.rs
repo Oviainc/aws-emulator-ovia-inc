@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/amend_benefit_application.rs"]
 mod amend_benefit_application;
+#[path = "all/amend_terminal_refusal.rs"]
+mod amend_terminal_refusal;
 #[path = "all/application_status_gates.rs"]
 mod application_status_gates;
 #[path = "all/benefit_allocations.rs"]

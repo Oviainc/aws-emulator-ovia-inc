@@ -49,6 +49,8 @@ mod orderable_cluster_options;
 mod qev2_idc_applications;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/reserved_node_offerings.rs"]
+mod reserved_node_offerings;
 #[path = "all/reset_cluster_parameter_group.rs"]
 mod reset_cluster_parameter_group;
 #[path = "all/snapshot_access.rs"]

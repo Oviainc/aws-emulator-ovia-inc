@@ -48,13 +48,20 @@
 //! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
 //! written, because no operation of this service creates a foundation model.
 //!
+//! Tagging adds NO store of its own: `ops/tag_resource.rs` writes, and
+//! `ops/list_tags_for_resource.rs` reports, the `tags` list of the record that already
+//! holds the resource a `resourceARN` names — the same list the create that minted the
+//! resource filled — so there is only ever one copy of a resource's tags, whichever
+//! operation reads them. [`TaggedResource`] is what a `resourceARN` resolves to, and
+//! resolving it is what keeps every tagging operation addressing the same record.
+//!
 //! The record shapes, and the conversions between the `*PolicyConfig` shapes a
 //! request carries and the `*Policy` shapes a response carries, live here rather
 //! than in one operation's file because six operations share them (a file under
 //! `src/ops/` is claimed by the build as an operation, so a shared helper cannot
 //! live there).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -1416,6 +1423,231 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         self.provisioned_model_create_tokens
             .retain(|_, minted| minted != arn);
         Some(record)
+    }
+
+    /// The resource a tagging call's `resourceARN` names, with every status transition the
+    /// clock has made due at `now` materialised first — so a resource is tagged, and its
+    /// tags reported, as it stands at `now`, exactly as a read of that one resource sees
+    /// it.
+    ///
+    /// The ONE resolution of a tagging ARN, so every tagging operation reaches the same
+    /// resource for the same value. A `TaggableResourcesArn` is the ARN of a resource of
+    /// one of this service's families, or a bare resource NAME
+    /// (`smithy_query(query="operation",operation="TagResource")`), and the resource TYPE
+    /// inside the ARN picks the family; each family then resolves the value through the
+    /// very index its own read operations resolve an identifier through, so tagging
+    /// reaches exactly the resources those reads report. A value naming nothing this store
+    /// holds resolves to `None`, whichever family it names.
+    ///
+    /// Two families are addressable under two ARN spellings, and both spellings name the
+    /// same resource: a prompt router is `default-prompt-router/<id>` to `PromptRouterArn`
+    /// and `prompt-router/<id>` here, and an imported model is `imported-model/<id>` to
+    /// `ImportedModelArn` and `custom-model/imported/<id>` here. The second spelling is
+    /// read back to the first — the one the store is keyed by — in the region the ARN
+    /// itself carries, so neither spelling reaches another region's resource.
+    ///
+    /// The families this service holds no record of (a custom model, an inference profile,
+    /// an automated reasoning policy, a model invocation job, an async invoke, a custom
+    /// model deployment) resolve to `None`: nothing creates one yet, so this account holds
+    /// no such resource to tag.
+    pub fn tagged_resource(
+        &mut self,
+        resource_arn: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<TaggedResource> {
+        if resource_arn.contains(":guardrail/") {
+            let id = guardrail_id_of(resource_arn).to_string();
+            return self
+                .guardrails
+                .contains_key(&id)
+                .then_some(TaggedResource::Guardrail(id));
+        }
+        if resource_arn.contains(":default-prompt-router/") {
+            return self
+                .prompt_routers
+                .contains_key(resource_arn)
+                .then(|| TaggedResource::PromptRouter(resource_arn.to_string()));
+        }
+        if let Some((_, id)) = resource_arn.rsplit_once(":prompt-router/") {
+            let arn = prompt_router_arn(arn_region(resource_arn).unwrap_or(region), id);
+            return self
+                .prompt_routers
+                .contains_key(&arn)
+                .then_some(TaggedResource::PromptRouter(arn));
+        }
+        if resource_arn.contains(":model-import-job/") {
+            let job = self.model_import_job(resource_arn, region, now)?;
+            return Some(TaggedResource::ModelImportJob(job.arn.clone()));
+        }
+        if resource_arn.contains(":imported-model/") {
+            let (job, _) = self.imported_model(resource_arn, region, now)?;
+            return Some(TaggedResource::ImportedModel(job.arn.clone()));
+        }
+        if let Some((_, id)) = resource_arn.rsplit_once(":custom-model/imported/") {
+            let spelled = imported_model_arn(arn_region(resource_arn).unwrap_or(region), id);
+            let (job, _) = self.imported_model(&spelled, region, now)?;
+            return Some(TaggedResource::ImportedModel(job.arn.clone()));
+        }
+        if resource_arn.contains(":evaluation-job/") {
+            let job = self.evaluation_job(resource_arn, now)?;
+            return Some(TaggedResource::EvaluationJob(job.arn.clone()));
+        }
+        if resource_arn.contains(":provisioned-model/") {
+            let record = self.provisioned_model_throughput(resource_arn, region, now)?;
+            return Some(TaggedResource::ProvisionedModelThroughput(
+                record.arn.clone(),
+            ));
+        }
+        if !resource_arn.starts_with("arn:") {
+            // A bare resource NAME, which `TaggableResourcesArn` admits beside an ARN: it
+            // names at most one resource of a family whose own identifier admits a name,
+            // in this account and region, so each of those families is asked in turn.
+            if let Some(job) = self.model_import_job(resource_arn, region, now) {
+                return Some(TaggedResource::ModelImportJob(job.arn.clone()));
+            }
+            if let Some((job, _)) = self.imported_model(resource_arn, region, now) {
+                return Some(TaggedResource::ImportedModel(job.arn.clone()));
+            }
+            if let Some(record) = self.provisioned_model_throughput(resource_arn, region, now) {
+                return Some(TaggedResource::ProvisionedModelThroughput(
+                    record.arn.clone(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// The tags a resolved resource carries, read off the record that holds the resource —
+    /// the same list the create that minted it filled and its own read reports, never a
+    /// second copy.
+    #[must_use]
+    pub fn tags_of(&self, resource: &TaggedResource) -> Option<&[Tag]> {
+        match resource {
+            TaggedResource::Guardrail(id) => {
+                self.guardrails.get(id).map(|guardrail| &guardrail.tags)
+            }
+            TaggedResource::PromptRouter(arn) => {
+                self.prompt_routers.get(arn).map(|router| &router.tags)
+            }
+            TaggedResource::ModelImportJob(arn) => {
+                self.model_import_jobs.get(arn).map(|job| &job.job_tags)
+            }
+            TaggedResource::ImportedModel(arn) => self
+                .model_import_jobs
+                .get(arn)
+                .map(|job| &job.imported_model_tags),
+            TaggedResource::EvaluationJob(arn) => self.evaluation_jobs.get(arn).map(|job| &job.tags),
+            TaggedResource::ProvisionedModelThroughput(arn) => self
+                .provisioned_model_throughputs
+                .get(arn)
+                .map(|record| &record.tags),
+        }
+        .map(Vec::as_slice)
+    }
+
+    /// The tags a resolved resource carries, for a tagging call to rewrite in place.
+    pub fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut Vec<Tag>> {
+        match resource {
+            TaggedResource::Guardrail(id) => self
+                .guardrails
+                .get_mut(id)
+                .map(|guardrail| &mut guardrail.tags),
+            TaggedResource::PromptRouter(arn) => self
+                .prompt_routers
+                .get_mut(arn)
+                .map(|router| &mut router.tags),
+            TaggedResource::ModelImportJob(arn) => self
+                .model_import_jobs
+                .get_mut(arn)
+                .map(|job| &mut job.job_tags),
+            TaggedResource::ImportedModel(arn) => self
+                .model_import_jobs
+                .get_mut(arn)
+                .map(|job| &mut job.imported_model_tags),
+            TaggedResource::EvaluationJob(arn) => {
+                self.evaluation_jobs.get_mut(arn).map(|job| &mut job.tags)
+            }
+            TaggedResource::ProvisionedModelThroughput(arn) => self
+                .provisioned_model_throughputs
+                .get_mut(arn)
+                .map(|record| &mut record.tags),
+        }
+    }
+
+    /// The tags the resource a tagging call's `resourceARN` names carries, for REPORTING.
+    pub fn resource_tags(
+        &mut self,
+        resource_arn: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&[Tag]> {
+        let resource = self.tagged_resource(resource_arn, region, now)?;
+        self.tags_of(&resource)
+    }
+
+    /// The tags the resource a tagging call's `resourceARN` names carries, for WRITING.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut Vec<Tag>> {
+        let resource = self.tagged_resource(resource_arn, region, now)?;
+        self.tags_of_mut(&resource)
+    }
+}
+
+/// A resource of this service that carries tags, as the record holding those tags is
+/// keyed.
+///
+/// What [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::tagged_resource`]
+/// resolves a tagging call's `resourceARN` to, so the ARN is read ONCE and every tagging
+/// operation then reaches the same record. Each variant carries the key its family's store
+/// is keyed by, which is why an imported model carries the ARN of the JOB that imports it:
+/// that job is where the model's tags live, as [`ModelImportJobRecord`] states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// A guardrail, by its `guardrailId`.
+    Guardrail(String),
+    /// A prompt router, by its `PromptRouterArn`.
+    PromptRouter(String),
+    /// A model import job, by its `ModelImportJobArn`.
+    ModelImportJob(String),
+    /// The model an import job imports, by that JOB's `ModelImportJobArn`.
+    ImportedModel(String),
+    /// An evaluation job, by its `EvaluationJobArn`.
+    EvaluationJob(String),
+    /// A Provisioned Throughput, by its `ProvisionedModelArn`.
+    ProvisionedModelThroughput(String),
+}
+
+/// The region field of an ARN (`arn:<partition>:<service>:<region>:<account>:<resource>`),
+/// or `None` when the value carries no such field.
+fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3)
+}
+
+/// How many tags a resource holding `held` carries once `applied` has been associated with
+/// it: the size of the UNION of their keys, because a key the resource already holds takes
+/// the new value rather than becoming a second entry.
+#[must_use]
+pub fn tag_count_after(held: &[Tag], applied: &[Tag]) -> usize {
+    let mut keys: BTreeSet<&str> = held.iter().map(|tag| tag.key.as_str()).collect();
+    keys.extend(applied.iter().map(|tag| tag.key.as_str()));
+    keys.len()
+}
+
+/// Associate `applied` with the tags a resource `held`, keyed by `key`: a key the resource
+/// already carries takes the new value in place and a key it does not carry is appended,
+/// so a resource carries one value per key and the order its keys were first associated in
+/// is the order a read reports them.
+pub fn apply_tags(held: &mut Vec<Tag>, applied: Vec<Tag>) {
+    for tag in applied {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => held.push(tag),
+        }
     }
 }
 

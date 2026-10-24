@@ -783,7 +783,7 @@ async fn an_assessment_completes_when_the_clock_owes_it() {
 // `assessment_error_paths.rs`, over both operations that take one.
 
 /// `GetLatestAssessmentId` reports the most recently started assessment, and before any
-/// assessment exists it reports the absent resource rather than an id nothing minted.
+/// assessment exists it refuses rather than naming an id nothing minted.
 /// Which status and error code each error path answers is tabled in
 /// `assessment_error_paths.rs`; this case only pins that the empty state is an error and
 /// that the happy path follows the last start.
@@ -793,14 +793,14 @@ async fn the_latest_assessment_id_follows_the_most_recent_start() {
 
     let empty = get_latest_assessment_id(&router).await;
     assert_eq!(
-        empty.status, 404,
+        empty.status, 400,
         "with no assessment started there is no latest id to report, got {} with {:?}",
         empty.status, empty.body
     );
     assert_eq!(
         empty.error_code(),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException before any assessment exists, got {:?}",
+        "ValidationException",
+        "expected ValidationException before any assessment exists, got {:?}",
         empty.body
     );
 
