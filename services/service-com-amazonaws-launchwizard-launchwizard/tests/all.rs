@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/create_deployment_validation.rs"]
 mod create_deployment_validation;
+#[path = "all/delete_deployment_status_sequence.rs"]
+mod delete_deployment_status_sequence;
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
 #[path = "all/deployment_update.rs"]

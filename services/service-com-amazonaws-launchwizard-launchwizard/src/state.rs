@@ -50,6 +50,10 @@ pub const STATUS_UPDATE_COMPLETED: &str = "UPDATE_COMPLETED";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 /// See [`STATUS_CREATING`].
+///
+/// The status a delete that has only just been accepted is in, and so the one
+/// `DeleteDeployment` reports synchronously; the deployment then advances on the
+/// clock to [`STATUS_DELETE_IN_PROGRESS`] and finally [`STATUS_DELETED`].
 pub const STATUS_DELETE_INITIATING: &str = "DELETE_INITIATING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETED: &str = "DELETED";
@@ -61,6 +65,11 @@ pub const EVENT_CREATED: &str = "CREATED";
 pub const EVENT_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`EVENT_CREATED`].
 pub const EVENT_COMPLETED: &str = "COMPLETED";
+/// See [`EVENT_CREATED`].
+///
+/// The step a request has been accepted for but not started yet — what a delete that
+/// has only reached [`STATUS_DELETE_INITIATING`] has done so far.
+pub const EVENT_PENDING: &str = "PENDING";
 
 /// `WorkloadStatus` member the seeded catalogue entries carry, from
 /// `WORKLOAD_STATUS_VALUES`.
@@ -438,7 +447,7 @@ impl DeploymentEvent {
 /// It is materialised by the first request at or after `due_at` — never by a sleep,
 /// and never early: a caller acting immediately after `CreateDeployment` still sees
 /// `CREATING` and a caller acting immediately after `DeleteDeployment` still sees
-/// `DELETE_IN_PROGRESS`.
+/// `DELETE_INITIATING`.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// The instant this step became owed.
