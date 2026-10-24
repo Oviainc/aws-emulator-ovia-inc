@@ -756,6 +756,28 @@ pub const IMPORT_STATUS_FAILED: &str = "FAILED";
 pub const RUNNING_IMPORT_STATUSES: [&str; 2] =
     [IMPORT_STATUS_INITIALIZING, IMPORT_STATUS_IN_PROGRESS];
 
+/// How long after `StartImport` the clock owes an import its `INITIALIZING` ->
+/// `IN_PROGRESS` transition.
+///
+/// CloudTrail starts an import asynchronously — `StartImport` answers
+/// `INITIALIZING` — so the move to `IN_PROGRESS` is a transition the clock makes
+/// due rather than one a later call performs. The span is the emulator's OWN
+/// choice (CloudTrail documents no time for it), and it is deliberately non-zero so
+/// a caller reading the import straight after starting it still sees
+/// `INITIALIZING`.
+pub const IMPORT_INGESTION_STARTS_AFTER: Duration = Duration::from_millis(500);
+
+/// How many import jobs the registry holds before `StartImport` refuses.
+///
+/// It bounds the WHOLE registry, not one Region's share of it, for the reason
+/// [`TRAIL_QUOTA`] states: the Region an import is created in comes from the
+/// request, so a per-Region bound would still let a caller grow the store without
+/// end. `StartImport` models no quota error, so the refusal is the modelled
+/// `OperationNotPermittedException` ("this exception is thrown when the requested
+/// operation is not permitted"), and the bound sits far above any workflow an
+/// emulator serves.
+pub const IMPORT_QUOTA: usize = 1_000;
+
 /// The HTTP status this service answers `ImportNotFoundException` with.
 ///
 /// The model annotates the shape `@httpError(404)`
@@ -793,6 +815,9 @@ pub struct ImportRecord {
     pub status: String,
     pub created_timestamp: SystemTime,
     pub updated_timestamp: SystemTime,
+    /// When `INITIALIZING` is due to become `IN_PROGRESS`; see
+    /// [`ImportRecord::settle`].
+    pub ingests_at: SystemTime,
     pub statistics: Option<ImportStatistics>,
 }
 
@@ -800,6 +825,25 @@ impl ImportRecord {
     /// Whether this import is still running, so a stop has something to stop.
     pub fn is_running(&self) -> bool {
         RUNNING_IMPORT_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Materialise the `INITIALIZING` -> `IN_PROGRESS` transition the clock already
+    /// owes.
+    ///
+    /// A reporting operation may call this: the transition was due at `ingests_at`
+    /// whether or not anybody read the import, so applying it changes nothing a
+    /// later caller would otherwise have seen — which is also why the stamped
+    /// `UpdatedTimestamp` is the instant the move was DUE, not the instant it was
+    /// observed.
+    ///
+    /// Nothing moves an import out of `IN_PROGRESS` on its own: this emulator reads
+    /// no S3 bucket, so no events are imported and no status may claim the import
+    /// finished importing them. A caller ends a running import with `StopImport`.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == IMPORT_STATUS_INITIALIZING && now >= self.ingests_at {
+            self.status = IMPORT_STATUS_IN_PROGRESS.to_string();
+            self.updated_timestamp = self.ingests_at;
+        }
     }
 
     /// Project onto the modelled `ImportsListItem` shape, as `ListImports` reports
@@ -856,6 +900,20 @@ pub fn first_duplicate_tag_key(tags: &[Tag]) -> Option<&str> {
 /// `ListTrails` report and the order `ListTrails` pages through.
 pub type TrailKey = (String, String);
 
+/// The HTTP status this service answers `EventDataStoreNotFoundException` with.
+///
+/// The model annotates the shape `@httpError(404)`
+/// (`smithy_query(query="shape",shape="EventDataStoreNotFoundException")`), but
+/// `@httpError` is an HTTP-BINDING trait and the recorded CloudTrail responses to a
+/// call addressing an unknown event data store carry HTTP **400** with
+/// `__type: EventDataStoreNotFoundException` — the status a client's retry classifier
+/// sees is the service's, not the model's. It lives here, beside the refusal text, so
+/// every handler that answers this error answers it with one status rather than a
+/// hand-copied constant per operation; a handler applies it through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`], which keeps the modelled
+/// shape's body and changes only the status line.
+pub const EVENT_DATA_STORE_NOT_FOUND_STATUS: u16 = 400;
+
 /// The refusal text for `EventDataStoreNotFoundException`.
 ///
 /// It names no value from the request because the service's own text does not: the
@@ -907,15 +965,21 @@ impl EventDataStoreState {
         }
     }
 
-    /// Whether a query operation may name this store.
+    /// Whether the store is still an active lake at all.
     ///
-    /// A store awaiting deletion holds no queryable lake any more, which is what
-    /// the modelled `InactiveEventDataStoreException` ("The event data store is
-    /// inactive") reports. A store that has stopped ingesting new events still
-    /// serves queries over what it already holds, so only `PENDING_DELETION` is
-    /// inactive for this purpose.
-    pub fn is_queryable(self) -> bool {
+    /// A store awaiting deletion is not, which is what the modelled
+    /// `InactiveEventDataStoreException` ("The event data store is inactive")
+    /// reports. A store that has stopped ingesting new events is still active: it
+    /// serves queries over what it already holds, and ingestion is restarted with
+    /// `StartEventDataStoreIngestion` — so only `PENDING_DELETION` is inactive.
+    pub fn is_active(self) -> bool {
         !matches!(self, Self::PendingDeletion)
+    }
+
+    /// Whether a query operation may name this store — exactly the stores that are
+    /// still active ([`EventDataStoreState::is_active`]).
+    pub fn is_queryable(self) -> bool {
+        self.is_active()
     }
 
     /// The status an in-flight ingestion transition settles into once the clock
@@ -1634,10 +1698,9 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     /// Every import job in the account, keyed by [`ImportKey`]. `StartImport` adds a
     /// record; `StopImport` moves a running one to `STOPPED`.
     ///
-    /// Unbounded here on purpose: `StartImport` is the only operation that adds a
-    /// record and it is still a scaffold stub, so the bound belongs with it — on the
-    /// terms [`TRAIL_QUOTA`] and [`DASHBOARD_QUOTA`] state, a whole-registry cap
-    /// refused with that operation's own modelled error.
+    /// Bounded by [`IMPORT_QUOTA`], which `StartImport` — the only operation that
+    /// adds a record — refuses past, on the terms [`TRAIL_QUOTA`] and
+    /// [`DASHBOARD_QUOTA`] state.
     pub imports: BTreeMap<ImportKey, ImportRecord>,
     /// Every CloudTrail Lake event data store, keyed by its id (the resource
     /// suffix of its ARN), which is unique across Regions.
@@ -1837,6 +1900,23 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     pub fn import_mut(&mut self, import_id: &str, region: &str) -> Option<&mut ImportRecord> {
         self.imports
             .get_mut(&(import_id.to_string(), region.to_string()))
+    }
+
+    /// The import still running in `region`, if there is one — what a NEW import
+    /// is refused for ("This exception is thrown when you start a new import and a
+    /// previous import is still in progress", the model doc for
+    /// `AccountHasOngoingImportException`).
+    ///
+    /// Scoped to one Region because an import belongs to the Region it was created
+    /// in ([`ImportKey`]): a job in another Region is not in progress here. Only
+    /// `INITIALIZING` and `IN_PROGRESS` count, so a stopped or finished import
+    /// blocks nothing.
+    pub fn ongoing_import_in(&self, region: &str) -> Option<&ImportRecord> {
+        self.imports
+            .iter()
+            .filter(|((_, import_region), _)| import_region.as_str() == region)
+            .map(|(_, record)| record)
+            .find(|record| record.is_running())
     }
 
     /// Whether this Region holds any event data store at all — what a request

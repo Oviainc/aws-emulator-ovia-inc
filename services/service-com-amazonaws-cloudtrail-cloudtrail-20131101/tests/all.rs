@@ -59,6 +59,8 @@ mod generate_query;
 mod import_list;
 #[path = "all/import_reads.rs"]
 mod import_reads;
+#[path = "all/import_start.rs"]
+mod import_start;
 #[path = "all/import_stop.rs"]
 mod import_stop;
 #[path = "all/insight_selectors.rs"]

@@ -102,70 +102,35 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::headers::{encode_json, member_schema};
+// `asks_for_speech` and `TEXT_CONTENT_TYPE` are `crate::state`'s, because the
+// two operations that take a `responseContentType` must answer the same way for
+// the same value.
 use crate::state::{
-    check_attribute_bytes, check_request_attributes, AttributesRefused, SessionKey,
-    SessionStoreFull,
+    asks_for_speech, check_attribute_bytes, check_request_attributes, AttributesRefused,
+    SessionKey, SessionStoreFull, TEXT_CONTENT_TYPE,
 };
-use aws_smithy_schema::codec::FinishSerializer;
 use aws_smithy_schema::serde::ShapeSerializer;
-use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::json::JsonShapeSerializer;
 use std::time::SystemTime;
 
-/// The response content type a caller gets when it asks for none.
+/// Encode one modelled value for a response header, in this operation's own
+/// error channel.
 ///
-/// `responseContentType` decides whether Amazon Lex V2 answers with text or
-/// speech (see `RecognizeUtterance$responseContentType`, which lists the
-/// accepted values); `text/plain;charset=utf-8` is the text form.
-const TEXT_CONTENT_TYPE: &str = "text/plain;charset=utf-8";
-
-/// Does this `responseContentType` ask for synthesized speech?
-///
-/// "If the value begins with `audio/`, Amazon Lex V2 returns speech in the
-/// response" — which it synthesizes with Amazon Polly.
-fn asks_for_speech(response_content_type: &str) -> bool {
-    response_content_type
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("audio/")
-}
-
-/// The member of `schema` named `member`, as the model declares it.
+/// The encoding is the service-wide one in [`crate::state::headers`]: the
+/// value's JSON, gzip-compressed and then base64 encoded, which is what each of
+/// this operation's header members documents ("the `sessionState` field is
+/// compressed with gzip and then base64 encoded"). A failure to write it is the
+/// emulator's own, never the caller's, so it is reported as the modelled server
+/// error.
 ///
 /// The header payloads below are the input's own `sessionState`, `messages` and
 /// `requestAttributes` shapes, so their schemas are read off the generated input
-/// schema rather than re-declared here.
-fn member_schema<'a>(schema: &'a Schema, member: &str) -> Option<&'a Schema> {
-    schema
-        .members()
-        .iter()
-        .copied()
-        .find(|candidate| candidate.member_name() == Some(member))
-}
-
-/// Serialize one modelled value to JSON with the service's own restJson1 codec
-/// and base64 encode it, which is how a structured value travels on a header.
-///
-/// `PutSessionResponse$sessionState` and `$requestAttributes` are each "a
-/// base-64-encoded gzipped field", and `RecognizeUtterance` states the rule for
-/// the whole family: "the following response fields are compressed using gzip
-/// and then base64 encoded by Amazon Lex V2" — `inputTranscript`,
-/// `interpretations`, `messages`, `requestAttributes`, `sessionState`. This
-/// emulator writes the base64 of the JSON WITHOUT the gzip layer: the value
-/// reported is the stored session, serialized with the model's own schemas, so a
-/// caller that base64-decodes a header reads the session state, but it must not
-/// inflate it first. The missing gzip layer is a declared gap of this slice,
-/// recorded with `RecognizeUtterance` and `StartConversation`; base64 itself is
-/// not optional, since a session attribute may hold any UTF-8 text and a header
-/// value may not.
+/// schema with [`member_schema`] rather than re-declared here.
 fn header_value(
     write: impl FnOnce(&mut JsonShapeSerializer) -> Result<(), aws_smithy_schema::serde::SerdeError>,
 ) -> Result<String, PutSessionError> {
-    // `true`: restJson1 honours `@jsonName`, so the keys are the wire names a
-    // client decoding the header expects.
-    let mut serializer = JsonShapeSerializer::new_with_config(true);
-    write(&mut serializer).map_err(|e| internal(format!("serializing a response header: {e}")))?;
-    Ok(aws_smithy_types::base64::encode(serializer.finish()))
+    encode_json(write).map_err(internal)
 }
 
 /// A server fault this operation declares, for a failure that is the emulator's

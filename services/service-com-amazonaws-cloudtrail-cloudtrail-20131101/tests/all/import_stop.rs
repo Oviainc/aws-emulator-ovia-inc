@@ -32,10 +32,11 @@
 //! `tests/all/target_prefix_dispatch.rs`, so it is not re-asserted here.
 //!
 //! The registry is seeded directly here, through the crate's public `state` module,
-//! because `StartImport` — the operation that creates an import — is still a scaffold
-//! stub with its own issue (`20261022T230533Z-cloudtrail-startimport-stub.md`). A
-//! seeded record is exactly what that handler will insert: the same registry, the
-//! same key.
+//! rather than by calling `StartImport`: a seeded record is exactly what that
+//! handler inserts — the same registry, the same key — and seeding is what lets one
+//! case per `ImportStatus` value start from a status no sequence of calls can
+//! reach (`COMPLETED`, `FAILED`). `StartImport`'s own rules are covered by
+//! `tests/all/import_start.rs`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -214,6 +215,10 @@ fn import_record(import_id: &str, status: &str) -> ImportRecord {
         status: status.to_string(),
         created_timestamp: created,
         updated_timestamp: created,
+        // The `INITIALIZING` -> `IN_PROGRESS` move is due at this instant, which is
+        // immaterial here: `StopImport` does not materialise it, and a stop moves
+        // either running status to `STOPPED` the same way.
+        ingests_at: created,
         statistics: None,
     }
 }

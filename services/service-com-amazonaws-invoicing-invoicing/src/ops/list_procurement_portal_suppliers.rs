@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProcurementPortalSuppliers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProcurementPortalSuppliers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProcurementPortalSuppliers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the suppliers configured for ONE procurement portal, one page at a time:
+//! every supplier is computed from what an earlier `CreateProcurementPortalPreference` /
+//! `PutProcurementPortalPreference` persisted against that portal (see
+//! [`crate::state::ComAmazonawsInvoicingInvoicingState::procurement_portal_suppliers`]
+//! for which supplier identity a stored preference configures), and this operation
+//! writes NOTHING — it is a `@readonly`, `@paginated` read.
+//!
+//! A `PortalIdentifier` that names no portal this service serves is the modelled
+//! `ResourceNotFoundException` (HTTP 404) rather than an empty listing: the model
+//! declares that error for this operation and not for `ListProcurementPortals`, whose
+//! `PortalIdentifier` this one's input documents itself as taking.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +124,20 @@ impl From<ListProcurementPortalSuppliersErrorModeled> for ListProcurementPortalS
     }
 }
 
+/// `MaxResults` carries `@range(min: 1, max: 100)` and `@default: 100`
+/// (`smithy_query(query="operation", operation="ListProcurementPortalSuppliers")`), so a
+/// page never holds more than this many suppliers and an omitted `MaxResults` asks for
+/// this many.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// What an opaque `NextToken` this operation minted decodes to, before the portal it was
+/// minted for and the position the next page resumes at. Its own prefix, so a token
+/// minted for another paginated walk of this service — or for another PORTAL's walk,
+/// whose order is its own — is not accepted here. The portal is named by its
+/// `ProcurementPortalName`, one of the enum's values, so no caller-supplied text reaches
+/// the prefix and no portal's namespace can be a prefix of another's.
+const NEXT_TOKEN_PREFIX: &str = "procurement-portal-suppliers:";
+
 /// The `ListProcurementPortalSuppliers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +174,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProcurementPortalSuppliers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProcurementPortalSuppliersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // WHICH portal is asked about decides both the suppliers reported and the order
+        // a token resumes in, so it is resolved first: an identifier naming no portal
+        // this service serves is the modelled 404.
+        let portal_name =
+            crate::state::procurement_portal_name_for_identifier(&input.portal_identifier)
+                .ok_or_else(|| {
+                    ListProcurementPortalSuppliersErrorModeled::ResourceNotFoundException(
+                        crate::state::no_such_procurement_portal(&input.portal_identifier),
+                    )
+                })?;
+
+        // A token is scoped to the portal it was minted for: the walk's order is that
+        // portal's suppliers, so a token from another portal's walk would otherwise
+        // resume at a position in an order it was never minted against. The RESOLVED
+        // portal name namespaces it rather than the request's identifier, so the prefix
+        // is one of the enum's values and cannot be made ambiguous by what was asked.
+        let token_prefix = format!("{NEXT_TOKEN_PREFIX}{portal_name}:");
+        let resume_at = crate::state::decode_page_token(&token_prefix, input.next_token.as_deref())
+            .map_err(|_| {
+                ListProcurementPortalSuppliersErrorModeled::ValidationException(
+                    // This plane keys the refusal's text as `Message` (see
+                    // `crate::ops::types::MessageKey`).
+                    crate::state::invalid_next_token(MessageKey::Capitalised),
+                )
+            })?;
+        // The boundary validator already refused a `MaxResults` outside `@range(1..100)`
+        // and the deserializer filled the `@default: 100` in, so this only guards the
+        // conversion.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProcurementPortalSuppliersErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let store = state.lock();
+
+        // One stable, deterministic order (the `BTreeMap` key
+        // `crate::state::procurement_portal_supplier_key` builds), so a token — a
+        // POSITION in that order — stays meaningful across calls and the resumed page
+        // seeks straight to it rather than re-walking what the earlier pages reported.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProcurementPortalSuppliers"))
+        // The derived set is bounded by the registry and the model, not by the request:
+        // at most `crate::state::MAX_PROCUREMENT_PORTAL_PREFERENCES` preferences, each
+        // contributing at most two environments times `SellerOfRecords`' modelled
+        // `@length(min: 0, max: 100)` (see `procurement_portal_suppliers`). Deriving it
+        // per call is what keeps this read from caching — and so from writing — anything.
+        let configured = store.procurement_portal_suppliers(portal_name);
+        let mut procurement_portal_suppliers = Vec::new();
+        let mut next_token = None;
+        let page = match resume_at.as_deref() {
+            Some(from) => configured.range(from.to_string()..),
+            None => configured.range::<String, _>(..),
+        };
+        for (key, supplier) in page {
+            if procurement_portal_suppliers.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(&token_prefix, key));
+                break;
+            }
+            procurement_portal_suppliers.push(supplier.clone());
+        }
+
+        Ok(ListProcurementPortalSuppliersOutput {
+            procurement_portal_suppliers,
+            next_token,
+        })
     }
 }
