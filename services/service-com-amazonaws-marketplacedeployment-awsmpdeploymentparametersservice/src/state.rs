@@ -13,19 +13,23 @@
 //! made due ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
 //! so no caller ever sees a parameter past its expiration date.
 //!
-//! The AGREEMENTS a deployment parameter can be written against are held here
-//! too ([`ProvisionedAgreement`]). This API models no operation that creates a
+//! The AGREEMENTS a deployment parameter is written against are held here too
+//! ([`ProvisionedAgreement`]). This API models no operation that creates a
 //! product or an agreement — in AWS an agreement appears when a buyer accepts a
-//! seller's offer, entirely out of band of this service — so that store is
-//! populated through [`seed_agreements`], the emulator's fixture/admin seam
-//! standing in for that out-of-band creation, and `PutDeploymentParameter` only
-//! ever reads it.
+//! seller's offer, entirely out of band of this service — and this emulator
+//! serves that API alone, so no caller of it can put a target in that store. The
+//! store is therefore filled by the write itself: a deployment-parameter write
+//! RECORDS the target it names
+//! ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::provision_target`]),
+//! so the target a request names is held from the moment it is written against,
+//! and every later call reads it back out of state. [`seed_agreements`] records
+//! targets ahead of any request, for a caller that wants them there first.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ConflictException, ResourceNotFoundException, ServiceQuotaExceededException, ValidationException,
+    ConflictException, ServiceQuotaExceededException, ValidationException,
 };
 
 /// This service's ARN namespace and sigv4 signing name
@@ -225,6 +229,26 @@ pub const SERVICE_CODE: &str = "aws-marketplace";
 /// a token the service never saw.
 pub const MAX_CLIENT_TOKENS: usize = 1024;
 
+/// How many write targets the target ledger
+/// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::agreements`])
+/// holds at once, counted as `(catalog, agreementId, productId)` triples.
+///
+/// The ledger grows by one per `PutDeploymentParameter` that names a target not
+/// recorded yet, and `catalog`/`agreementId`/`productId` are request-supplied, so
+/// it needs a ceiling of its own exactly as the `clientToken` ledger does: a
+/// parameter whose `expirationDate` has come is purged and gives its slot under
+/// [`MAX_DEPLOYMENT_PARAMETERS`] back, which without this bound would leave the
+/// targets those writes named resident for the life of the process. It is capped
+/// here with FIFO eviction of the oldest target
+/// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::provision_target`]).
+///
+/// The figure is the deployment-parameter ceiling itself, not a second number: one
+/// stored parameter names one target, so a ledger this size holds the target of
+/// every parameter the store can hold at once. Evicting a target changes no answer
+/// this service gives — a write resolves nothing against the ledger — and the next
+/// write that names the evicted target records it again.
+pub const MAX_PROVISIONED_TARGETS: usize = MAX_DEPLOYMENT_PARAMETERS;
+
 /// A modelled timestamp as whole nanoseconds since the Unix epoch, so a stored
 /// wire instant and an instant of the system clock compare at the full precision
 /// the wire carries.
@@ -330,9 +354,11 @@ impl DeploymentParameterRecord {
 ///
 /// `PutDeploymentParameter` "creates or updates a deployment parameter and is
 /// targeted by `catalog` and `agreementId`" for the product the request
-/// addresses, and models `ResourceNotFoundException` (HTTP 404) for a target the
-/// account does not hold. Nothing in THIS model creates an agreement or a
-/// product, so a record gets here through [`seed_agreements`].
+/// addresses, so every write names one of these. Nothing in THIS model creates an
+/// agreement or a product — and no other API is emulated here that could — so a
+/// record gets here either from the write that names it
+/// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::provision_target`])
+/// or from [`seed_agreements`] ahead of any request.
 #[derive(Debug, Clone, Default)]
 pub struct ProvisionedAgreement {
     /// The catalog the agreement lives in; a request naming another catalog does
@@ -378,28 +404,6 @@ impl ProvisionedAgreement {
 /// How a provisioned agreement is keyed: `(catalog, agreementId)`.
 pub type AgreementKey = (String, String);
 
-/// Which half of a write target the account does not hold.
-///
-/// Both answers are the one modelled `ResourceNotFoundException` (HTTP 404); the
-/// member named is which of the two the request got wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissingTarget {
-    /// No agreement in the named catalog covers the named product.
-    Product,
-    /// The product is covered in that catalog, but not by the named agreement.
-    Agreement,
-}
-
-impl MissingTarget {
-    /// The input member this missing target names, as AWS reports it.
-    pub fn member(self) -> &'static str {
-        match self {
-            Self::Product => "ProductId",
-            Self::Agreement => "AgreementId",
-        }
-    }
-}
-
 /// The identity a deployment parameter is keyed on: the catalog, the product,
 /// the agreement and the parameter name.
 ///
@@ -421,10 +425,19 @@ pub struct ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceStat
     /// [`MAX_CLIENT_TOKENS`]; write it only through [`Self::remember_client_token`],
     /// which keeps [`Self::client_token_order`] in step.
     pub client_tokens: BTreeMap<String, String>,
-    /// The agreements this account holds, keyed by [`AgreementKey`]. Created out
-    /// of band of this API — see [`seed_agreements`] — and only ever READ by
-    /// `PutDeploymentParameter`, which refuses a target that is not in here.
+    /// The agreements this account holds, keyed by [`AgreementKey`], each with the
+    /// products it covers. Created out of band of this API in AWS, and here by the
+    /// write that names one ([`Self::provision_target`]) or by [`seed_agreements`]
+    /// ahead of any request. Bounded by [`MAX_PROVISIONED_TARGETS`]; write it only
+    /// through [`Self::provision_target`], which keeps [`Self::target_order`] in
+    /// step.
     pub agreements: BTreeMap<AgreementKey, ProvisionedAgreement>,
+    /// The recorded targets as `(agreement key, productId)` in insertion order, so
+    /// the ledger evicts the oldest target first once it is at
+    /// [`MAX_PROVISIONED_TARGETS`]. One entry per covered product, so both the
+    /// number of agreements and the products one agreement covers are bounded by
+    /// that one ceiling.
+    pub target_order: VecDeque<(AgreementKey, String)>,
     /// The `client_tokens` keys in insertion order, so the ledger evicts the oldest
     /// token first once it is at [`MAX_CLIENT_TOKENS`].
     pub client_token_order: VecDeque<String>,
@@ -448,39 +461,68 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
         self.parameters.len() < MAX_DEPLOYMENT_PARAMETERS
     }
 
-    /// Which half of the target `(catalog, product_id, agreement_id)` this
-    /// account does not hold, or `None` when it holds the whole target.
+    /// Record that this account holds `agreement_id` in `catalog`, covering
+    /// `product_id` — the target a deployment-parameter write is aimed at.
     ///
-    /// A deployment parameter is written against an agreement of the account,
-    /// for a product that agreement covers, inside one catalog; a target the
-    /// store does not hold is not a parameter that can be written, however
-    /// well-formed its identifiers are. The PRODUCT is reported when no
-    /// agreement of that catalog covers it — it is the parent resource of the
-    /// URI the write is addressed to
-    /// (`/catalogs/{catalog}/products/{productId}/deployment-parameters`) — and
-    /// the AGREEMENT when the product is covered there but not by this
-    /// agreement.
-    pub fn missing_target(
-        &self,
-        catalog: &str,
-        product_id: &str,
-        agreement_id: &str,
-    ) -> Option<MissingTarget> {
-        if !self.catalog_covers_product(catalog, product_id) {
-            return Some(MissingTarget::Product);
-        }
-        let holds_pair = self
+    /// An agreement exists in AWS because a buyer accepted a seller's offer and a
+    /// product exists because a seller published it, both out of band of this
+    /// API, which declares no operation that does either. So the target a write
+    /// names is established BY that write: this is what makes the operation's own
+    /// documented create path ("creates or updates a deployment parameter")
+    /// reachable by an ordinary signed request instead of resolving against a
+    /// store no caller of this API can fill.
+    ///
+    /// Idempotent, and ADDITIVE on an agreement already stored: one agreement can
+    /// cover several products, so a second write naming another product under the
+    /// same agreement widens the record rather than replacing it, and a repeat of
+    /// the same target changes nothing (not even its place in the ledger's
+    /// order).
+    ///
+    /// BOUNDED, because the triple is request-supplied: the ledger holds at most
+    /// [`MAX_PROVISIONED_TARGETS`] targets and evicts the oldest first, so neither
+    /// the number of agreements nor the products one agreement covers can grow
+    /// with the number of distinct identifiers a caller sends.
+    pub fn provision_target(&mut self, catalog: &str, product_id: &str, agreement_id: &str) {
+        let key: AgreementKey = (catalog.to_string(), agreement_id.to_string());
+        let recorded = self
             .agreements
-            .get(&(catalog.to_string(), agreement_id.to_string()))
-            .is_some_and(|agreement| agreement.covers(product_id));
-        (!holds_pair).then_some(MissingTarget::Agreement)
+            .entry(key.clone())
+            .or_insert_with(|| ProvisionedAgreement::new(catalog, agreement_id))
+            .product_ids
+            .insert(product_id.to_string());
+        if !recorded {
+            return;
+        }
+        self.target_order.push_back((key, product_id.to_string()));
+        while self.target_order.len() > MAX_PROVISIONED_TARGETS {
+            match self.target_order.pop_front() {
+                Some((oldest_key, oldest_product)) => {
+                    self.forget_target(&oldest_key, &oldest_product);
+                }
+                None => break,
+            }
+        }
     }
 
-    /// Whether any agreement of `catalog` covers `product_id`.
-    fn catalog_covers_product(&self, catalog: &str, product_id: &str) -> bool {
+    /// Drop one recorded target, and the agreement with it once that agreement
+    /// covers no product at all: an agreement covering nothing is no target.
+    fn forget_target(&mut self, key: &AgreementKey, product_id: &str) {
+        let Some(agreement) = self.agreements.get_mut(key) else {
+            return;
+        };
+        agreement.product_ids.remove(product_id);
+        if agreement.product_ids.is_empty() {
+            self.agreements.remove(key);
+        }
+    }
+
+    /// Whether this account holds `agreement_id` in `catalog` covering
+    /// `product_id`: the target of a deployment-parameter write, once some write
+    /// or [`seed_agreements`] has recorded it.
+    pub fn holds_target(&self, catalog: &str, product_id: &str, agreement_id: &str) -> bool {
         self.agreements
-            .values()
-            .any(|agreement| agreement.catalog == catalog && agreement.covers(product_id))
+            .get(&(catalog.to_string(), agreement_id.to_string()))
+            .is_some_and(|agreement| agreement.covers(product_id))
     }
 
     /// Materialise the expiry the clock has already made due at `now`: drop every
@@ -711,20 +753,6 @@ pub fn parameter_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::not_found()
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for a write aimed at a
-/// product/agreement target the account does not hold.
-///
-/// The status and the code are what the model fixes; the sentence names which of
-/// the two members the request got wrong, the way AWS's own report does.
-pub fn target_not_found(missing: MissingTarget) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!(
-            "{}: Request references a resource which does not exist.",
-            missing.member()
-        ),
-    }
-}
-
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a write that
 /// would pass [`MAX_DEPLOYMENT_PARAMETERS`].
 pub fn parameter_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
@@ -767,16 +795,23 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState>)
 }
 
-/// Record the agreements this account holds, so `PutDeploymentParameter` can be
-/// written against them.
+/// Record the agreements this account holds ahead of any request.
 ///
 /// This is the out-of-band creation seam: an AWS Marketplace agreement exists
 /// when a buyer accepts a seller's offer and a product exists when a seller
-/// publishes it, and THIS API models no operation that does either — it only
-/// writes deployment parameters against an agreement that is already there — so
-/// a fixture (or an admin path) hands the records to the emulator here instead.
-/// A record for an agreement already stored REPLACES it, so seeding the same
-/// agreement twice holds one agreement, not two.
+/// publishes it, and THIS API models no operation that does either. A fixture
+/// that wants a particular target in the store before the first call hands the
+/// records to the emulator here; a write that names a target the store does not
+/// hold records it itself
+/// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::provision_target`]),
+/// so seeding is never a PRECONDITION of a write.
+/// A record for a target already stored changes nothing, so seeding the same
+/// agreement twice holds one agreement, not two. Every seeded target goes through
+/// the same bounded ledger a write uses
+/// ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::provision_target`]),
+/// so this seam cannot grow the store past [`MAX_PROVISIONED_TARGETS`] either. A
+/// record naming no product covers nothing and is therefore no target: it records
+/// nothing.
 ///
 /// Answers `None` when `engine` is not the shared [`::engine::InMemoryEngine`] (so
 /// there is no store to seed), otherwise the number of agreements the store holds
@@ -789,7 +824,9 @@ where
     let state = service_state(engine)?;
     let mut store = state.lock();
     for record in records {
-        store.agreements.insert(record.key(), record);
+        for product_id in &record.product_ids {
+            store.provision_target(&record.catalog, product_id, &record.agreement_id);
+        }
     }
     Some(store.agreements.len())
 }

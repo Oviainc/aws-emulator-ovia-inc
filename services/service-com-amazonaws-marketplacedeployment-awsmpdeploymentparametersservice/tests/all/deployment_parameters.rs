@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
-    seed_agreements, ProvisionedAgreement, MAX_CLIENT_TOKENS, MAX_TAGS_PER_RESOURCE,
-    TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
+    seed_agreements, service_state, ProvisionedAgreement, MAX_CLIENT_TOKENS,
+    MAX_TAGS_PER_RESOURCE, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -96,6 +96,40 @@ pub(crate) fn provision(
         seed_agreements(engine, [agreement]).is_some(),
         "the shared engine must hold this service's store"
     );
+}
+
+/// Whether this service's store holds the target `(catalog, product_id,
+/// agreement_id)`: the agreement the account holds, covering that product.
+pub(crate) fn holds_target(
+    engine: &engine::InMemoryEngine,
+    catalog: &str,
+    product_id: &str,
+    agreement_id: &str,
+) -> bool {
+    service_state(engine)
+        .expect("the shared engine holds this service's store")
+        .lock()
+        .holds_target(catalog, product_id, agreement_id)
+}
+
+/// How many deployment parameters the store holds.
+pub(crate) fn stored_parameters(engine: &engine::InMemoryEngine) -> usize {
+    service_state(engine)
+        .expect("the shared engine holds this service's store")
+        .lock()
+        .parameters
+        .len()
+}
+
+/// How many targets the store has recorded: one per product an agreement covers.
+pub(crate) fn recorded_targets(engine: &engine::InMemoryEngine) -> usize {
+    service_state(engine)
+        .expect("the shared engine holds this service's store")
+        .lock()
+        .agreements
+        .values()
+        .map(|agreement| agreement.product_ids.len())
+        .sum()
 }
 
 /// A request signed for `aws-marketplace` in [`REGION`]: the signal the router

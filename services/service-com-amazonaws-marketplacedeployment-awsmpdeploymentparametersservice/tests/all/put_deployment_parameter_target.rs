@@ -1,31 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `PutDeploymentParameter` is TARGETED: it writes against an agreement of the
-//! account, for a product that agreement covers, inside one catalog.
+//! account, for the product its URI names, inside one catalog.
 //!
-//! The rule under test: a request whose `(catalog, productId, agreementId)` target
-//! the account does not hold is refused with the modelled
-//! `ResourceNotFoundException` (HTTP 404) and stores nothing, however well-formed
-//! its identifiers are and whatever else the request carries; the same request
-//! against a target the account DOES hold is the ordinary create, readable back
-//! through `ListTagsForResource`.
+//! The rule under test: that target is created out of band of this API — AWS
+//! models no operation here that creates a product or an agreement — so it is not
+//! a precondition a caller can be asked to satisfy: a well-formed request is
+//! served as the create-or-update the operation documents, and the write records
+//! the target it named as held, whether or not anything had recorded it before the
+//! call. The target is the whole triple `(catalog, productId, agreementId)`, so
+//! two requests differing in any one of them are two resources.
 //!
-//! The modelled input constraints are refused BEFORE the target is looked at, so a
-//! request that breaks one is a `ValidationException` (HTTP 400) whether or not the
-//! target exists.
+//! The modelled input constraints are refused BEFORE anything is written or
+//! recorded, so a request that breaks one is a `ValidationException` (HTTP 400)
+//! and leaves no trace.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`,
 //! restJson1 routing and serialization, the modelled-constraint walk and the
 //! handlers — through the harness the `deployment_parameters` suite owns.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::{
-    service_state, MAX_TAGS_PER_RESOURCE,
-};
+use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::MAX_TAGS_PER_RESOURCE;
 
 use crate::deployment_parameters::{
-    emulator, error_code, is_parameter_id, list_tags, message, provision, put, tags_of, CATALOG,
-    SECRET_MAX_LEN,
+    emulator, error_code, holds_target, is_parameter_id, list_tags, provision, put,
+    stored_parameters, tags_of, CATALOG, SECRET_MAX_LEN,
 };
 
 /// One target row: a product and an agreement, in the forms their own modelled
@@ -77,7 +76,11 @@ fn target_table() -> Vec<Target> {
 
 /// The request bodies one target is written with: the rule holds whatever else the
 /// request carries, so each row is tried in every one of these shapes.
-fn request_shapes(agreement_id: &str) -> Vec<(&'static str, Value)> {
+///
+/// `token` is the row's own `clientToken`: the member is the request's
+/// `@idempotencyToken`, so one token identifies one write and a shared one across
+/// rows would be the modelled conflict rather than this rule.
+fn request_shapes(agreement_id: &str, token: &str) -> Vec<(&'static str, Value)> {
     let many_tags: serde_json::Map<String, Value> = (0..MAX_TAGS_PER_RESOURCE)
         .map(|i| (format!("key-{i:02}"), json!("v")))
         .collect();
@@ -93,7 +96,7 @@ fn request_shapes(agreement_id: &str) -> Vec<(&'static str, Value)> {
             "a body carrying tags exactly at the modelled cap",
             json!({
                 "agreementId": agreement_id,
-                "deploymentParameter": { "name": "DbPassword", "secretString": "s3cr3t-value-1" },
+                "deploymentParameter": { "name": "TaggedToTheCap", "secretString": "s3cr3t-value-1" },
                 "tags": many_tags,
             }),
         ),
@@ -102,7 +105,7 @@ fn request_shapes(agreement_id: &str) -> Vec<(&'static str, Value)> {
             json!({
                 "agreementId": agreement_id,
                 "deploymentParameter": { "name": "Other.Name+1", "secretString": "s" },
-                "clientToken": "0123456789abcdef0123456789abcdef0123",
+                "clientToken": token,
                 "expirationDate": 1_893_456_000_i64,
             }),
         ),
@@ -119,41 +122,57 @@ fn request_shapes(agreement_id: &str) -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// A `clientToken` of this row's own: 34 characters of
+/// `^[a-zA-Z0-9/_+=.:@-]+$`, inside `ClientToken`'s modelled `length 32..64`.
+fn row_token(row: usize) -> String {
+    format!("idempotency-token-for-row-{row:03}-0000")
+}
+
+// Whether this service's store holds one target, and how much it holds, are read
+// through the `deployment_parameters` harness's own accessors (`holds_target`,
+// `stored_parameters`), which every suite of this test target shares.
+
 #[tokio::test]
-async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores_nothing() {
+async fn a_put_against_an_out_of_band_target_is_served_and_holds_that_target_afterwards() {
     let (router, engine) = emulator();
 
-    // --- nothing is provisioned: every well-formed write is a 404 -------------
-    for row in target_table() {
+    // --- nothing was recorded ahead of the call ------------------------------
+    for (index, row) in target_table().into_iter().enumerate() {
         let case = row.case;
-        for (shape, body) in request_shapes(row.agreement_id) {
+        let token = row_token(index);
+        for (shape, body) in request_shapes(row.agreement_id, &token) {
             let (status, answer) = put(&router, CATALOG, row.product_id, &body).await;
             assert_eq!(
-                status, 404,
-                "case {case:?} with {shape:?}: a target the account does not hold must be 404, \
-                 got {status} {answer:?}"
+                status, 200,
+                "case {case:?} with {shape:?}: a target created out of band of this API must \
+                 still be written, got {status} {answer:?}"
+            );
+            let id = answer
+                .get("deploymentParameterId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                is_parameter_id(&id),
+                "case {case:?} with {shape:?}: expected a minted ^dp-[a-zA-Z0-9]+$ id, \
+                 got {answer:?}"
             );
             assert_eq!(
-                error_code(&answer),
-                "ResourceNotFoundException",
-                "case {case:?} with {shape:?}: expected ResourceNotFoundException, got {answer:?}"
+                answer.get("agreementId").and_then(Value::as_str),
+                Some(row.agreement_id),
+                "case {case:?} with {shape:?}: expected the stored agreementId, got {answer:?}"
+            );
+            // The write recorded its own target, so the account holds it from here
+            // on: no caller of this API could have put it there.
+            assert!(
+                holds_target(&engine, CATALOG, row.product_id, row.agreement_id),
+                "case {case:?} with {shape:?}: the write must record the target it named"
             );
         }
     }
 
-    // Not one of those calls wrote a record: the refusal happens before anything
-    // is minted.
-    let held = service_state(&*engine)
-        .expect("the shared engine holds this service's store")
-        .lock()
-        .parameters
-        .len();
-    assert_eq!(
-        held, 0,
-        "a refused write must store nothing, got {held} stored deployment parameters"
-    );
-
-    // --- the same requests against a target the account holds ----------------
+    // --- a target recorded BEFORE the call is answered identically ------------
+    let (router, engine) = emulator();
     for row in target_table() {
         let case = row.case;
         provision(&engine, CATALOG, row.agreement_id, &[row.product_id]);
@@ -170,7 +189,7 @@ async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: a provisioned target must be written, got {status} {created:?}"
+            "case {case:?}: a pre-recorded target must be written, got {status} {created:?}"
         );
         let id = created
             .get("deploymentParameterId")
@@ -180,11 +199,6 @@ async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores
         assert!(
             is_parameter_id(&id),
             "case {case:?}: expected a minted ^dp-[a-zA-Z0-9]+$ id, got {created:?}"
-        );
-        assert_eq!(
-            created.get("agreementId").and_then(Value::as_str),
-            Some(row.agreement_id),
-            "case {case:?}: expected the stored agreementId, got {created:?}"
         );
 
         // The round trip: the record is readable back through an implemented read.
@@ -207,108 +221,90 @@ async fn a_put_aimed_at_a_target_the_account_does_not_hold_is_refused_and_stores
 }
 
 #[tokio::test]
-async fn a_target_the_account_holds_only_partly_is_refused_on_the_member_it_got_wrong() {
+async fn targets_differing_in_one_segment_are_different_resources() {
     let (router, engine) = emulator();
-    // Two agreements of one catalog, each covering its own product.
-    provision(&engine, "AWSMarketplace", "agmt-live", &["prod-live"]);
-    provision(&engine, "AWSMarketplace", "agmt-second", &["prod-second"]);
-    // The same identifiers in another catalog name nothing: a catalog is part of
-    // the target. (Such an agreement is seeded, not reachable through this API: a
-    // request naming another catalog is refused before any lookup — see the
-    // `catalog_allowed_values` suite — so what this proves is that the stored
-    // target is scoped by its catalog.)
-    provision(&engine, "PrivateMarketplace", "agmt-private", &["prod-private"]);
 
-    // (case, catalog, productId, agreementId, the member the refusal names)
-    let near_misses: Vec<(&str, &str, &str, &str, &str)> = vec![
-        (
-            "a product no agreement of this catalog covers",
-            "AWSMarketplace",
-            "prod-never-published",
-            "agmt-live",
-            "ProductId",
-        ),
-        (
-            "a held product under an agreement that does not exist",
-            "AWSMarketplace",
-            "prod-live",
-            "agmt-never-accepted",
-            "AgreementId",
-        ),
-        (
-            "a held product under an agreement that covers another product",
-            "AWSMarketplace",
-            "prod-live",
-            "agmt-second",
-            "AgreementId",
-        ),
-        (
-            "a pair held in a DIFFERENT catalog",
-            "AWSMarketplace",
-            "prod-private",
-            "agmt-private",
-            "ProductId",
-        ),
-        (
-            "a product id differing only in case",
-            "AWSMarketplace",
-            "PROD-LIVE",
-            "agmt-live",
-            "ProductId",
-        ),
-        (
-            "an agreement id differing only in case",
-            "AWSMarketplace",
-            "prod-live",
-            "AGMT-LIVE",
-            "AgreementId",
-        ),
-    ];
-
-    for (case, catalog, product_id, agreement_id, member) in near_misses {
-        let body = json!({
-            "agreementId": agreement_id,
-            "deploymentParameter": { "name": "DbPassword", "secretString": "s" },
-        });
-        let (status, answer) = put(&router, catalog, product_id, &body).await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected a 404, got {status} {answer:?}"
-        );
-        assert_eq!(
-            error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
-        );
-        // The status and the code are what the model fixes; this service's own
-        // sentence names which half of the target the request got wrong.
-        let reported = message(&answer);
-        assert!(
-            reported.starts_with(member),
-            "case {case:?}: expected the refusal to name {member}, got {reported:?}"
-        );
-    }
-
-    // The target that IS held is still writable, so none of the above refusals is
-    // about an empty store.
-    let (status, created) = put(
+    // The target every row below is a near miss of.
+    let (status, first) = put(
         &router,
         "AWSMarketplace",
         "prod-live",
         &json!({
             "agreementId": "agmt-live",
             "deploymentParameter": { "name": "DbPassword", "secretString": "s" },
+            "tags": { "env": "live" },
         }),
     )
     .await;
+    assert_eq!(status, 200, "the first write must be served, got {first:?}");
+    let first_id = first
+        .get("deploymentParameterId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let first_arn = first
+        .get("resourceArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    // (case, productId, agreementId): each differs from the first target in ONE
+    // segment — including by case alone, since neither identifier's modelled
+    // pattern makes them case-insensitive.
+    let near_misses: Vec<(&str, &str, &str)> = vec![
+        ("another product under the same agreement", "prod-second", "agmt-live"),
+        ("the same product under another agreement", "prod-live", "agmt-second"),
+        ("a product id differing only in case", "PROD-LIVE", "agmt-live"),
+        ("an agreement id differing only in case", "prod-live", "AGMT-LIVE"),
+    ];
+
+    for (case, product_id, agreement_id) in near_misses {
+        let (status, answer) = put(
+            &router,
+            "AWSMarketplace",
+            product_id,
+            &json!({
+                "agreementId": agreement_id,
+                "deploymentParameter": { "name": "DbPassword", "secretString": "s" },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the write to be served, got {status} {answer:?}"
+        );
+        let id = answer
+            .get("deploymentParameterId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert_ne!(
+            id, first_id,
+            "case {case:?}: a target differing in one segment must be its own resource, \
+             got the first target's id {id:?}"
+        );
+        assert!(
+            holds_target(&engine, "AWSMarketplace", product_id, agreement_id),
+            "case {case:?}: the write must record the target it named"
+        );
+    }
+
+    // None of those writes touched the first record: its own tags are still what
+    // its create left.
+    let (status, listed) = list_tags(&router, &first_arn).await;
     assert_eq!(
         status, 200,
-        "the held target must still be writable, got {status} {created:?}"
+        "the first record must still be readable, got {status} {listed:?}"
+    );
+    assert_eq!(
+        tags_of(&listed),
+        crate::deployment_parameters::tag_map(&[("env", "live")]),
+        "the first record's tags must be untouched by the near misses, got {listed:?}"
     );
 }
 
 #[tokio::test]
-async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
+async fn a_modelled_constraint_is_refused_before_anything_is_written() {
     let (router, engine) = emulator();
     provision(&engine, "AWSMarketplace", "agmt-held", &["prod-held"]);
 
@@ -317,12 +313,13 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
         .collect();
 
     // Each row breaks one modelled constraint of the input. The pairs cover both
-    // sides of the target check: a target the account holds, and one it does not.
-    // An oversized `@sensitive` payload is NOT here: it is refused one layer
-    // earlier, with the front door's 403 (`front_door_forbidden`).
+    // sides of the target store: a target recorded ahead of the call, and one
+    // nothing has recorded. An oversized `@sensitive` payload is NOT here: it is
+    // refused one layer earlier, with the front door's 403
+    // (`front_door_forbidden`).
     let rows: Vec<(&str, &str, &str, Value)> = vec![
         (
-            "tags one past the modelled cap, target held",
+            "tags one past the modelled cap, target recorded",
             "AWSMarketplace",
             "prod-held",
             json!({
@@ -332,7 +329,7 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
             }),
         ),
         (
-            "tags one past the modelled cap, target not held",
+            "tags one past the modelled cap, target not recorded",
             "AWSMarketplace",
             "prod-unknown",
             json!({
@@ -342,7 +339,7 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
             }),
         ),
         (
-            "catalog outside its pattern, target not held",
+            "catalog outside its pattern, target not recorded",
             "Not-A-Real-Catalog!",
             "prod-unknown",
             json!({
@@ -351,7 +348,7 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
             }),
         ),
         (
-            "agreementId outside its pattern, target not held",
+            "agreementId outside its pattern, target not recorded",
             "AWSMarketplace",
             "prod-unknown",
             json!({
@@ -373,6 +370,16 @@ async fn a_modelled_constraint_is_refused_before_the_target_is_looked_at() {
             "case {case:?}: expected ValidationException, got {answer:?}"
         );
     }
+
+    let held = stored_parameters(&engine);
+    assert_eq!(
+        held, 0,
+        "a refused write must store nothing, got {held} stored deployment parameters"
+    );
+    assert!(
+        !holds_target(&engine, "AWSMarketplace", "prod-unknown", "agmt-unknown"),
+        "a refused write must record no target"
+    );
 }
 
 #[tokio::test]
@@ -380,21 +387,38 @@ async fn a_refused_write_consumes_no_idempotency_token() {
     let (router, engine) = emulator();
     // 36 characters of `^[a-zA-Z0-9/_+=.:@-]+$`, inside `ClientToken`'s len 32..64.
     let token = "0123456789abcdef0123456789abcdef0123";
+    let parameter = json!({ "name": "DbPassword", "secretString": "s" });
+
+    // Refused on its tags — a key in the namespace AWS reserves — so the write
+    // never happens and the token is never bound to one.
+    let (status, answer) = put(
+        &router,
+        "AWSMarketplace",
+        "prod-later",
+        &json!({
+            "agreementId": "agmt-later",
+            "deploymentParameter": parameter,
+            "clientToken": token,
+            "tags": { "aws:created-by": "someone" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a reserved tag key must be refused, got {status} {answer:?}"
+    );
+    assert!(
+        !holds_target(&engine, "AWSMarketplace", "prod-later", "agmt-later"),
+        "a refused write must record no target"
+    );
+
+    // The token was never bound, so the same token now performs the write rather
+    // than replaying or conflicting with it.
     let body = json!({
         "agreementId": "agmt-later",
         "deploymentParameter": { "name": "DbPassword", "secretString": "s" },
         "clientToken": token,
     });
-
-    let (status, answer) = put(&router, "AWSMarketplace", "prod-later", &body).await;
-    assert_eq!(
-        status, 404,
-        "a write at a target the account does not hold must be 404, got {status} {answer:?}"
-    );
-
-    // The token was never bound, so once the target is provisioned the SAME token
-    // performs the write rather than replaying or conflicting with it.
-    provision(&engine, "AWSMarketplace", "agmt-later", &["prod-later"]);
     let (status, created) = put(&router, "AWSMarketplace", "prod-later", &body).await;
     assert_eq!(
         status, 200,
