@@ -138,3 +138,5 @@ mod execution_logging_prerequisites;
 mod usage_plan_creation_bounds;
 #[path = "all/control_plane_deletes.rs"]
 mod control_plane_deletes;
+#[path = "all/delete_deployment.rs"]
+mod delete_deployment;

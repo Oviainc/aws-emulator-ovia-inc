@@ -23,14 +23,18 @@ use crate::rest_api_lifecycle::{
 use crate::stage_lifecycle::create_deployment;
 
 /// `GetDeployments` for `api`, with `query` appended verbatim (`""` for no paging).
-async fn get_deployments(gateway: &Gateway, api: &str, query: &str) -> Answer {
+/// Shared with the `delete_deployment` suite, which reads the collection back to show
+/// which records a delete left alone.
+pub(crate) async fn get_deployments(gateway: &Gateway, api: &str, query: &str) -> Answer {
     gateway
         .call("GET", &format!("/restapis/{api}/deployments{query}"), None)
         .await
 }
 
-/// `GetDeployment` for one deployment of `api`.
-async fn get_deployment(gateway: &Gateway, api: &str, deployment: &str) -> Answer {
+/// `GetDeployment` for one deployment of `api`. Shared with the `delete_deployment`
+/// suite, which needs the raw answer (a deleted deployment is read back as a modelled
+/// failure, not a 200).
+pub(crate) async fn get_deployment(gateway: &Gateway, api: &str, deployment: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -41,8 +45,9 @@ async fn get_deployment(gateway: &Gateway, api: &str, deployment: &str) -> Answe
 }
 
 /// The deployment ids of a `GetDeployments` answer, in the order the answer lists them —
-/// the order is itself part of the rule, so it is NOT sorted away here.
-fn reported_ids(body: &Value, case: &str) -> Vec<String> {
+/// the order is itself part of the rule, so it is NOT sorted away here. Shared with the
+/// `delete_deployment` suite.
+pub(crate) fn reported_ids(body: &Value, case: &str) -> Vec<String> {
     page_items(body, case)
         .iter()
         .map(|item| string_member(item, "id", case))

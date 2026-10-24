@@ -38,12 +38,16 @@ fn op(kind: &str, path: &str, value: Option<&str>) -> Value {
 }
 
 /// A `replace` entry, the op a client issues most.
-fn replace(path: &str, value: &str) -> Value {
+///
+/// `pub(crate)` for the same reason [`patch_ok`] is: a sibling suite spells a patch entry
+/// the one way rather than keeping its own copy (the `delete_deployment` suite does).
+pub(crate) fn replace(path: &str, value: &str) -> Value {
     op("replace", path, Some(value))
 }
 
-/// Send `operations` as a PATCH to `uri`.
-async fn patch(gateway: &Gateway, uri: &str, operations: Vec<Value>) -> Answer {
+/// Send `operations` as a PATCH to `uri`, answering whatever the service said — the raw
+/// form of [`patch_ok`], for a sibling suite that expects a modelled failure.
+pub(crate) async fn patch(gateway: &Gateway, uri: &str, operations: Vec<Value>) -> Answer {
     gateway
         .call(
             "PATCH",

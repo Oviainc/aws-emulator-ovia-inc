@@ -253,6 +253,29 @@ impl RestApiEntry {
             .map(|deployment| deployment.id.clone())
             .collect()
     }
+
+    /// The names of this API's stages ASSOCIATED with `deployment_id`, in stage-name
+    /// order: the one record that decides whether a deployment is still in use.
+    ///
+    /// A stage is associated with a deployment when it names it — as the deployment it
+    /// serves, or as the deployment its canary serves. Both references are the SAME
+    /// reference as far as stored state is concerned: `CreateStage` and `UpdateStage`
+    /// resolve each one against this API's deployments before storing it, so a deployment
+    /// either reference names is a record the API must still hold.
+    pub fn stage_names_using_deployment(&self, deployment_id: &str) -> Vec<String> {
+        self.stages
+            .values()
+            .filter(|stage| {
+                stage.deployment_id == deployment_id
+                    || stage
+                        .canary_settings
+                        .as_ref()
+                        .and_then(|canary| canary.deployment_id.as_deref())
+                        == Some(deployment_id)
+            })
+            .map(|stage| stage.stage_name.clone())
+            .collect()
+    }
 }
 
 /// One stored `Resource`: a node of an API's path tree.
@@ -2525,7 +2548,11 @@ pub const NO_SUCH_METHOD_RESPONSE: &str = "Invalid Response status code specifie
 pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";
 
 /// The `NotFoundException` message for a `deploymentId` that names no stored deployment.
-pub const NO_SUCH_DEPLOYMENT: &str = "Invalid deployment identifier specified";
+/// The resource type is CAPITALISED here, as it is in the `Resource` / `Method` /
+/// `Integration` siblings above and unlike the `stage` one below: that is the spelling the
+/// service answers for a deployment, and one sentence serves every operation that resolves
+/// one, so all of them say the same thing about the same failure.
+pub const NO_SUCH_DEPLOYMENT: &str = "Invalid Deployment identifier specified";
 
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";

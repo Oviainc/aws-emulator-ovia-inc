@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored `Deployment` of `restApiId` named by `deploymentId`,
+//! so every later read of it answers the modelled `NotFoundException` — and refuses the
+//! delete while any `Stage` of that API is still associated with it, because "Deleting a
+//! deployment will only succeed if there are no Stage resources associated with it".
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +70,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `BadRequestException` message for a delete of a deployment a stage of the API is
+/// still associated with. API Gateway documents the refusal itself — "Deleting a
+/// deployment will only succeed if there are no Stage resources associated with it" — and
+/// this is the sentence it states for it, which names the two ways a caller clears the
+/// association: re-point the stage at another deployment, or delete the stage.
+pub const DEPLOYMENT_IN_USE: &str =
+    "Active stages pointing to this deployment must be moved or deleted";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +176,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDeployment"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Both identifiers are resolved against stored state before anything is removed,
+        // each naming its own record so the refusal says which one was not found — the
+        // same order `GetDeployment` and `UpdateDeployment` resolve them in.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            DeleteDeploymentErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        if !api.deployments.contains_key(&input.deployment_id) {
+            return Err(DeleteDeploymentErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DEPLOYMENT.to_string()),
+            })
+            .into());
+        }
+        // "Deleting a deployment will only succeed if there are no Stage resources
+        // associated with it" (this operation's own documentation): a stage serves the
+        // deployment it names, and `CreateStage` / `UpdateStage` refuse a deployment id
+        // this API does not hold, so removing a deployment a stage still names would leave
+        // that stage pointing at a record no read of the API can resolve. Which stages are
+        // associated is read from stored stages through the one helper that decides it,
+        // `RestApiEntry::stage_names_using_deployment`.
+        if !api
+            .stage_names_using_deployment(&input.deployment_id)
+            .is_empty()
+        {
+            return Err(DeleteDeploymentErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(DEPLOYMENT_IN_USE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A deployment id names one deployment of one API, so removing that key removes
+        // the record — and only it. A deployment owns the SNAPSHOT on its own record (its
+        // `apiSummary` and the resource tree the data plane serves), so nothing else of
+        // the API goes with it: the live resources and methods it was taken from, and the
+        // API's other deployments, are records in their own right and stay as they were.
+        api.deployments.remove(&input.deployment_id);
+        // The store lock is released before the record is formatted: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome —
+        // the one record `crate::state::AUDIT_TARGET` documents, as the sibling
+        // `DeleteStage` handler emits it. Metadata only; a deployment's description and
+        // its snapshot are the caller's data and are never fields.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            deployment_id = ?input.deployment_id,
+            outcome = "deleted",
+            "deployment deleted",
+        );
+        Ok(DeleteDeploymentOutput)
     }
 }
