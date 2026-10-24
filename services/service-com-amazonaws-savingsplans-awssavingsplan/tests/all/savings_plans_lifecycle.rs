@@ -1196,7 +1196,8 @@ async fn tagging_an_arn_that_names_no_plan_is_refused() {
 
 /// The per-plan tag store is bounded the way the plan store is: a write that
 /// would take the plan past the service's tag limit, or that carries an
-/// over-long key or value, is refused whole and leaves the stored tags alone.
+/// over-long key or value, is refused whole and leaves the stored tags alone —
+/// the first as the quota failure it is, the second as a constraint failure.
 #[tokio::test]
 async fn tag_writes_stop_at_the_tag_limit() {
     let emulator = Emulator::new();
@@ -1237,30 +1238,46 @@ async fn tag_writes_stop_at_the_tag_limit() {
         state::MAX_TAGS_PER_PLAN
     );
 
-    // (case, tags) — each refused, and each leaving the stored set untouched.
+    // (case, tags, expected status and error code) — each refused, and each
+    // leaving the stored set untouched. Growing past the tag allowance is a
+    // QUOTA failure (402), an over-long key or value a constraint one (400);
+    // `crate::tag_quota_errors` pins that split over the whole class.
     let long_key = "k".repeat(state::MAX_TAG_KEY_CHARS + 1);
     let long_value = "v".repeat(state::MAX_TAG_VALUE_CHARS + 1);
     let mut one_too_many = serde_json::Map::new();
     for tag in 0..=state::MAX_TAGS_PER_PLAN {
         one_too_many.insert(format!("fresh{tag}"), json!("v"));
     }
-    let cases: [(&str, Value); 4] = [
-        ("one more key than the limit allows", json!({ "one-more": "v" })),
+    let cases: [(&str, Value, (u16, &str)); 4] = [
+        (
+            "one more key than the limit allows",
+            json!({ "one-more": "v" }),
+            (402, "ServiceQuotaExceededException"),
+        ),
         (
             "a whole request over the limit at once",
             Value::Object(one_too_many),
+            (402, "ServiceQuotaExceededException"),
         ),
-        ("an over-long key", json!({ long_key.clone(): "v" })),
-        ("an over-long value", json!({ "short": long_value.clone() })),
+        (
+            "an over-long key",
+            json!({ long_key.clone(): "v" }),
+            (400, "ValidationException"),
+        ),
+        (
+            "an over-long value",
+            json!({ "short": long_value.clone() }),
+            (400, "ValidationException"),
+        ),
     ];
-    for (case, tags) in cases {
+    for (case, tags, expected) in cases {
         let answer = emulator
             .call("TagResource", json!({ "resourceArn": arn, "tags": tags }))
             .await;
         assert_eq!(
             (answer.status, answer.code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: expected a 400 ValidationException, got {} {:?}",
+            expected,
+            "case {case:?}: expected {expected:?}, got {} {:?}",
             answer.status,
             answer.body
         );
