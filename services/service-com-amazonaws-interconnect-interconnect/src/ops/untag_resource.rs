@@ -154,32 +154,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // allows: the ARN carries the `ConnectionId` of the connection whose tags
         // these are. An ARN the boundary validator let through that still does not
         // parse as one is refused as invalid INPUT, never with a 501.
-        let Some(connection_id) = crate::state::connection_id_from_arn(&input.arn) else {
+        if crate::state::connection_id_from_arn(&input.arn).is_none() {
             return Err(UntagResourceErrorModeled::InterconnectValidationException(
                 InterconnectValidationException {
                     message: crate::state::not_a_connection_arn_message(&input.arn),
                 },
             )
             .into());
-        };
+        }
 
         let mut guard = state.lock();
         // The one clock-driven write every connection operation makes first: it
         // settles transitions that were already due at this instant, so a connection
         // whose delete has completed is seen as `deleted` here.
         guard.materialise_due_transitions(::std::time::Instant::now());
-        let store = &mut *guard;
 
-        // The ARN identifies the resource in full — partition, region and account
-        // included — so an ARN that differs from the stored one names a resource
-        // this store does not hold, exactly as an unknown id does. A connection that
-        // has reached the terminal `deleted` state is gone too: the store keeps it
-        // readable so a caller polling a delete sees the terminal state, but it no
-        // longer has a tag set to change.
-        let resolved = store.connections.get_mut(connection_id).filter(|stored| {
-            stored.connection.arn == input.arn && stored.connection.state != "deleted"
-        });
-        let Some(stored) = resolved else {
+        // The same ARN resolution every tagging operation uses: full-ARN match, and
+        // a connection in the terminal deleted state no longer has a tag set.
+        let Some(stored) = guard.connection_by_arn_mut(&input.arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::connection_not_retrievable_message(&input.arn)),
