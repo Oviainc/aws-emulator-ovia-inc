@@ -163,6 +163,21 @@ pub const ANY_TAG_STATUS: &str = "ANY";
 /// count is a number of days.
 pub const COUNT_UNIT_DAYS: &str = "days";
 
+/// The `selection.countType` that counts IMAGES, keeping the newest `countNumber` of
+/// them. The policy format names its count types in lower camel case and the Smithy
+/// model has no enum for them, so the two live here, as the one source both the parser
+/// and the refusal it words read.
+pub const IMAGE_COUNT_MORE_THAN_COUNT_TYPE: &str = "imageCountMoreThan";
+
+/// The `selection.countType` that counts TIME since an image was pushed.
+pub const SINCE_IMAGE_PUSHED_COUNT_TYPE: &str = "sinceImagePushed";
+
+/// Every `selection.countType` the lifecycle policy format defines.
+pub const LIFECYCLE_COUNT_TYPES: [&str; 2] = [
+    IMAGE_COUNT_MORE_THAN_COUNT_TYPE,
+    SINCE_IMAGE_PUSHED_COUNT_TYPE,
+];
+
 /// The unit a `sinceImagePushed` rule counts in, in seconds.
 const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -766,8 +781,161 @@ impl LifecyclePreview {
     }
 }
 
+/// ECR's refusal of a document it will not accept, worded to the template it states
+/// every such refusal with: `Invalid parameter at '<Parameter>' failed to satisfy
+/// constraint: '<constraint>'`.
+///
+/// `parameter` is the API-DOCUMENTED label of the request parameter carrying the
+/// document ([`POLICY_TEXT_PARAMETER`], [`LIFECYCLE_POLICY_TEXT_PARAMETER`]), which the
+/// API reference capitalises — not the lower-camel wire member the request spells.
+/// `constraint` is a stable phrase naming the constraint the document failed; neither
+/// half ever carries a parser position or any other detail of how this emulator read the
+/// document.
+pub fn invalid_document(parameter: &str, constraint: &str) -> Fault {
+    Fault::InvalidParameter(format!(
+        "Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'"
+    ))
+}
+
+/// The API-documented label of the `policyText` parameter, as a resource-policy refusal
+/// names it.
+pub const POLICY_TEXT_PARAMETER: &str = "PolicyText";
+
+/// The API-documented label of the `lifecyclePolicyText` parameter, as a lifecycle
+/// policy refusal names it.
+pub const LIFECYCLE_POLICY_TEXT_PARAMETER: &str = "LifecyclePolicyText";
+
+/// The constraint a lifecycle document that cannot be MAPPED onto the lifecycle policy
+/// shape fails: JSON that does not parse, or a member whose JSON type the shape cannot
+/// hold. One phrase covers the class, because nothing of the document was read.
+pub const LIFECYCLE_POLICY_PARSING_CONSTRAINT: &str =
+    "Lifecycle policy parsing failure: Could not map policyString into LifecyclePolicy.";
+
+/// A lifecycle document that maps onto the shape but breaks one of the policy format's
+/// own constraints, which `detail` states.
+pub const LIFECYCLE_POLICY_VALIDATION_CONSTRAINT_PREFIX: &str =
+    "Lifecycle policy validation failure: ";
+
+/// [`invalid_document`] for a lifecycle document that cannot be mapped onto the shape.
+fn lifecycle_unmappable() -> Fault {
+    invalid_document(
+        LIFECYCLE_POLICY_TEXT_PARAMETER,
+        LIFECYCLE_POLICY_PARSING_CONSTRAINT,
+    )
+}
+
+/// [`invalid_document`] for a lifecycle document that breaks the constraint `detail`
+/// states.
+fn lifecycle_invalid(detail: String) -> Fault {
+    invalid_document(
+        LIFECYCLE_POLICY_TEXT_PARAMETER,
+        &format!("{LIFECYCLE_POLICY_VALIDATION_CONSTRAINT_PREFIX}{detail}"),
+    )
+}
+
+/// The constraint phrase for a member the document leaves out.
+fn missing_required(member: &str) -> String {
+    format!("object has missing required properties ([\"{member}\"])")
+}
+
+/// The constraint phrase for a number below the minimum its member declares, naming
+/// both the bound and the value the request carried.
+fn below_minimum(minimum: i64, found: i64) -> String {
+    format!(
+        "numeric instance is lower than the required minimum (minimum: {minimum}, \
+         found: {found})"
+    )
+}
+
+/// The constraint phrase for a value outside the set its member admits, naming the
+/// value the request carried and every value the format defines for it.
+fn not_in_enum<S: AsRef<str>>(value: &str, allowed: &[S]) -> String {
+    let values: Vec<String> = allowed
+        .iter()
+        .map(|value| format!("\"{}\"", value.as_ref()))
+        .collect();
+    format!(
+        "instance value (\"{value}\") not found in enum (possible values: [{}])",
+        values.join(",")
+    )
+}
+
+/// The constraint phrase for an array holding fewer entries than its member requires.
+fn array_too_short(minimum: usize, found: usize) -> String {
+    format!(
+        "array is too short: must have at least {minimum} elements but instance has \
+         {found} elements"
+    )
+}
+
+/// `values` as a lifecycle policy DOCUMENT spells them: the modelled enums
+/// (`TagStatus`, `ImageActionType`) are upper case, and a policy document writes them in
+/// the lower case ECR's published lifecycle policy examples use — so a refusal that
+/// lists the values a member admits lists them the way the document would have had to
+/// write one.
+fn document_spellings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_lowercase()).collect()
+}
+
+/// The member `name` of a lifecycle document object, or `None` when the document leaves
+/// it out — an absent member and an explicit `null` are the same absence to a shape the
+/// document is mapped onto.
+fn document_member<'a>(object: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    object.get(name).filter(|value| !value.is_null())
+}
+
+/// `name` read as a string. A member present with another JSON type cannot be mapped
+/// onto the shape, which is a PARSING failure rather than a constraint one.
+fn lifecycle_str<'a>(
+    object: &'a serde_json::Value,
+    name: &str,
+) -> Result<Option<&'a str>, Fault> {
+    match document_member(object, name) {
+        None => Ok(None),
+        Some(value) => value.as_str().map(Some).ok_or_else(lifecycle_unmappable),
+    }
+}
+
+/// `name` read as an integer. See [`lifecycle_str`] for the type-mismatch rule; a
+/// fractional number is not an integer the shape holds either.
+fn lifecycle_i64(object: &serde_json::Value, name: &str) -> Result<Option<i64>, Fault> {
+    match document_member(object, name) {
+        None => Ok(None),
+        Some(value) => value.as_i64().map(Some).ok_or_else(lifecycle_unmappable),
+    }
+}
+
+/// `name` read as an array. See [`lifecycle_str`] for the type-mismatch rule.
+fn lifecycle_array<'a>(
+    object: &'a serde_json::Value,
+    name: &str,
+) -> Result<Option<&'a Vec<serde_json::Value>>, Fault> {
+    match document_member(object, name) {
+        None => Ok(None),
+        Some(value) => value.as_array().map(Some).ok_or_else(lifecycle_unmappable),
+    }
+}
+
+/// `name` read as a nested object. See [`lifecycle_str`] for the type-mismatch rule.
+fn lifecycle_object<'a>(
+    object: &'a serde_json::Value,
+    name: &str,
+) -> Result<Option<&'a serde_json::Value>, Fault> {
+    match document_member(object, name) {
+        None => Ok(None),
+        Some(value) if value.is_object() => Ok(Some(value)),
+        Some(_) => Err(lifecycle_unmappable()),
+    }
+}
+
+/// A member the policy format requires, or the refusal for a document that leaves it
+/// out.
+fn lifecycle_required<T>(member: Option<T>, name: &str) -> Result<T, Fault> {
+    member.ok_or_else(|| lifecycle_invalid(missing_required(name)))
+}
+
 /// The rules a lifecycle policy document declares, in the order they are applied, or
-/// [`Fault::InvalidParameter`] naming what the document got wrong.
+/// [`Fault::InvalidParameter`] stating the constraint the document failed.
 ///
 /// Every check below is a documented requirement of the policy format: a `rules` array;
 /// a unique `rulePriority` of 1 or more per rule; a `selection` naming a `TagStatus`, a
@@ -777,46 +945,51 @@ impl LifecyclePreview {
 /// and neither anywhere else; `countUnit` on `sinceImagePushed` and only there; and an
 /// `action` naming an `ImageActionType`, with a target storage class on a transition and
 /// only there.
+///
+/// A refusal is worded by [`lifecycle_unmappable`] when the document cannot be mapped
+/// onto the policy shape at all, and by [`lifecycle_invalid`] when it maps but breaks
+/// one of those constraints — so no refusal carries a position in this emulator's parse
+/// of the document.
 pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
-    fn bad(detail: impl ::std::fmt::Display) -> Fault {
-        Fault::InvalidParameter(format!(
-            "lifecyclePolicyText is not a valid lifecycle policy: {detail}"
-        ))
+    let document: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| lifecycle_unmappable())?;
+    // The document maps onto the LifecyclePolicy shape, which is an object; anything
+    // else cannot be mapped at all.
+    if !document.is_object() {
+        return Err(lifecycle_unmappable());
     }
-
-    let document: serde_json::Value = serde_json::from_str(text).map_err(bad)?;
-    let rules = document
-        .get("rules")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| bad("it carries no 'rules' array"))?;
+    let rules = lifecycle_required(lifecycle_array(&document, "rules")?, "rules")?;
     if rules.is_empty() {
-        return Err(bad("'rules' carries no rule"));
+        return Err(lifecycle_invalid(array_too_short(1, rules.len())));
     }
 
     let mut parsed: Vec<LifecycleRule> = Vec::new();
     // A rule priority is unique within a policy, so each one is recorded as it is read.
     let mut seen_priorities: BTreeSet<i32> = BTreeSet::new();
     for rule in rules {
-        let priority = rule
-            .get("rulePriority")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|priority| i32::try_from(priority).ok())
-            .filter(|priority| *priority >= 1)
-            .ok_or_else(|| bad("every rule needs a 'rulePriority' integer of 1 or more"))?;
+        if !rule.is_object() {
+            return Err(lifecycle_unmappable());
+        }
+        let priority_number =
+            lifecycle_required(lifecycle_i64(rule, "rulePriority")?, "rulePriority")?;
+        let priority = match i32::try_from(priority_number) {
+            // "rulePriority … The priority must be a positive value".
+            Ok(priority) if priority >= 1 => priority,
+            Ok(priority) => return Err(lifecycle_invalid(below_minimum(1, i64::from(priority)))),
+            // Outside the range the shape's integer member holds at all, so the document
+            // does not map onto it.
+            Err(_) => return Err(lifecycle_unmappable()),
+        };
         if !seen_priorities.insert(priority) {
-            return Err(bad(format!(
-                "two rules carry rulePriority {priority}; a rule priority is unique \
-                 within a policy"
+            return Err(lifecycle_invalid(format!(
+                "Duplicate rulePriority {priority}; a rulePriority is unique within a \
+                 policy."
             )));
         }
 
-        let selection = rule
-            .get("selection")
-            .ok_or_else(|| bad(format!("rule {priority} carries no 'selection'")))?;
-        let tag_status_text = selection
-            .get("tagStatus")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| bad(format!("rule {priority} carries no 'selection.tagStatus'")))?;
+        let selection = lifecycle_required(lifecycle_object(rule, "selection")?, "selection")?;
+        let tag_status_text =
+            lifecycle_required(lifecycle_str(selection, "tagStatus")?, "tagStatus")?;
         // A policy document writes `tagStatus`, `countType` and `action.type` in lower
         // camel case; the modelled enums are what they mean, so they are matched against
         // those case-insensitively and stored in the modelled spelling.
@@ -824,34 +997,22 @@ pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
             .iter()
             .find(|value| value.eq_ignore_ascii_case(tag_status_text))
             .ok_or_else(|| {
-                bad(format!(
-                    "rule {priority} carries 'selection.tagStatus' {tag_status_text:?}, \
-                     which is not one of {TAG_STATUS_VALUES:?}"
+                lifecycle_invalid(not_in_enum(
+                    tag_status_text,
+                    &document_spellings(TAG_STATUS_VALUES),
                 ))
             })?;
 
         let string_list = |member: &str| -> Result<Vec<String>, Fault> {
-            match selection.get(member) {
-                None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-                Some(value) => value
-                    .as_array()
-                    .ok_or_else(|| {
-                        bad(format!(
-                            "rule {priority} carries a 'selection.{member}' that is not \
-                             an array"
-                        ))
-                    })?
+            match lifecycle_array(selection, member)? {
+                None => Ok(Vec::new()),
+                Some(entries) => entries
                     .iter()
                     .map(|entry| {
                         entry
                             .as_str()
                             .map(ToString::to_string)
-                            .ok_or_else(|| {
-                                bad(format!(
-                                    "rule {priority} carries a non-string entry in \
-                                     'selection.{member}'"
-                                ))
-                            })
+                            .ok_or_else(lifecycle_unmappable)
                     })
                     .collect(),
             }
@@ -861,114 +1022,89 @@ pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
         let tagged = *tag_status == "TAGGED";
         let names_tags = !tag_prefixes.is_empty() || !tag_patterns.is_empty();
         if tagged && !names_tags {
-            return Err(bad(format!(
-                "rule {priority} selects tagged images but carries neither \
-                 'selection.tagPrefixList' nor 'selection.tagPatternList'"
+            return Err(lifecycle_invalid(format!(
+                "Must specify tagPrefixList or tagPatternList when tagStatus={tag_status}."
             )));
         }
         if !tag_prefixes.is_empty() && !tag_patterns.is_empty() {
-            return Err(bad(format!(
-                "rule {priority} carries both 'selection.tagPrefixList' and \
-                 'selection.tagPatternList'; a rule selects tagged images by one of the \
-                 two"
+            return Err(lifecycle_invalid(format!(
+                "Must specify only one of tagPrefixList or tagPatternList when \
+                 tagStatus={tag_status}."
             )));
         }
         if !tagged && names_tags {
-            return Err(bad(format!(
-                "rule {priority} carries a tag list with 'selection.tagStatus' \
-                 {tag_status_text:?}; a tag list belongs to a rule selecting tagged images"
+            return Err(lifecycle_invalid(format!(
+                "Must not specify tagPrefixList or tagPatternList when \
+                 tagStatus={tag_status}."
             )));
         }
 
-        let count_type = selection
-            .get("countType")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| bad(format!("rule {priority} carries no 'selection.countType'")))?;
-        let count_number = selection
-            .get("countNumber")
-            .and_then(serde_json::Value::as_i64)
-            .filter(|number| *number >= 1)
+        let count_type_text =
+            lifecycle_required(lifecycle_str(selection, "countType")?, "countType")?;
+        let count_type = LIFECYCLE_COUNT_TYPES
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(count_type_text))
             .ok_or_else(|| {
-                bad(format!(
-                    "rule {priority} carries no 'selection.countNumber' integer of 1 or \
-                     more"
-                ))
+                lifecycle_invalid(not_in_enum(count_type_text, &LIFECYCLE_COUNT_TYPES))
             })?;
-        let count_unit = selection
-            .get("countUnit")
-            .and_then(serde_json::Value::as_str);
-        let count = if count_type.eq_ignore_ascii_case("imageCountMoreThan") {
+        let count_number =
+            lifecycle_required(lifecycle_i64(selection, "countNumber")?, "countNumber")?;
+        // The format's own minimum: an `imageCountMoreThan` keeps at least one image,
+        // and a `sinceImagePushed` counts at least one day.
+        if count_number < 1 {
+            return Err(lifecycle_invalid(below_minimum(1, count_number)));
+        }
+        let count_unit = lifecycle_str(selection, "countUnit")?;
+        let count = if *count_type == IMAGE_COUNT_MORE_THAN_COUNT_TYPE {
             if count_unit.is_some() {
-                return Err(bad(format!(
-                    "rule {priority} carries a 'selection.countUnit' with the \
-                     {count_type:?} count type, which counts images rather than time"
+                return Err(lifecycle_invalid(format!(
+                    "Must not specify countUnit when countType={count_type}."
                 )));
             }
             LifecycleCount::ImageCountMoreThan {
                 keep: usize::try_from(count_number).unwrap_or(usize::MAX),
             }
-        } else if count_type.eq_ignore_ascii_case("sinceImagePushed") {
-            if !count_unit.is_some_and(|unit| unit.eq_ignore_ascii_case(COUNT_UNIT_DAYS)) {
-                return Err(bad(format!(
-                    "rule {priority} carries the {count_type:?} count type, which needs \
-                     'selection.countUnit' {COUNT_UNIT_DAYS:?}, and carries \
-                     {count_unit:?}"
-                )));
+        } else {
+            let unit = lifecycle_required(count_unit, "countUnit")?;
+            if !unit.eq_ignore_ascii_case(COUNT_UNIT_DAYS) {
+                return Err(lifecycle_invalid(not_in_enum(unit, &[COUNT_UNIT_DAYS])));
             }
             LifecycleCount::SinceImagePushed {
                 days: u64::try_from(count_number).unwrap_or(u64::MAX),
             }
-        } else {
-            return Err(bad(format!(
-                "rule {priority} carries 'selection.countType' {count_type:?}, which is \
-                 neither \"imageCountMoreThan\" nor \"sinceImagePushed\""
-            )));
         };
 
-        let action = rule
-            .get("action")
-            .ok_or_else(|| bad(format!("rule {priority} carries no 'action'")))?;
-        let action_text = action
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| bad(format!("rule {priority} carries no 'action.type'")))?;
+        let action = lifecycle_required(lifecycle_object(rule, "action")?, "action")?;
+        let action_text = lifecycle_required(lifecycle_str(action, "type")?, "type")?;
         let action_type: &str = IMAGE_ACTION_TYPE_VALUES
             .iter()
             .find(|value| value.eq_ignore_ascii_case(action_text))
             .ok_or_else(|| {
-                bad(format!(
-                    "rule {priority} carries 'action.type' {action_text:?}, which is not \
-                     one of {IMAGE_ACTION_TYPE_VALUES:?}"
+                lifecycle_invalid(not_in_enum(
+                    action_text,
+                    &document_spellings(IMAGE_ACTION_TYPE_VALUES),
                 ))
             })?;
-        let target_text = action
-            .get("targetStorageClass")
-            .and_then(serde_json::Value::as_str);
+        let target_text = lifecycle_str(action, "targetStorageClass")?;
         let target_storage_class = match (action_type, target_text) {
             (TRANSITION_ACTION_TYPE, Some(target)) => Some(
                 LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES
                     .iter()
                     .find(|value| value.eq_ignore_ascii_case(target))
                     .ok_or_else(|| {
-                        bad(format!(
-                            "rule {priority} carries 'action.targetStorageClass' \
-                             {target:?}, which is not one of \
-                             {LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES:?}"
+                        lifecycle_invalid(not_in_enum(
+                            target,
+                            LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES,
                         ))
                     })?
                     .to_string(),
             ),
             (TRANSITION_ACTION_TYPE, None) => {
-                return Err(bad(format!(
-                    "rule {priority} transitions images but carries no \
-                     'action.targetStorageClass'"
-                )))
+                return Err(lifecycle_invalid(missing_required("targetStorageClass")))
             }
-            (_, Some(target)) => {
-                return Err(bad(format!(
-                    "rule {priority} carries 'action.targetStorageClass' {target:?} with \
-                     the {action_text:?} action, which moves no image between storage \
-                     classes"
+            (_, Some(_)) => {
+                return Err(lifecycle_invalid(format!(
+                    "Must not specify targetStorageClass when action type={action_type}."
                 )))
             }
             (_, None) => None,
@@ -998,9 +1134,10 @@ pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
             .iter()
             .find(|rule| rule.tag_status == ANY_TAG_STATUS && rule.priority < last.priority)
         {
-            return Err(bad(format!(
-                "rule {} selects every image but is evaluated before rule {}; a rule \
-                 selecting every image carries the highest rulePriority in the policy",
+            return Err(lifecycle_invalid(format!(
+                "Must specify the highest rulePriority for the rule with \
+                 tagStatus={ANY_TAG_STATUS}; rulePriority {} is evaluated before \
+                 rulePriority {}.",
                 catch_all.priority, last.priority
             )));
         }
@@ -2096,15 +2233,18 @@ pub fn lifecycle_policy_not_found_message(name: &str) -> String {
     )
 }
 
-/// `member` of the request does not hold a usable policy document, because `detail`.
-fn bad_policy(member: &str, detail: impl std::fmt::Display) -> Fault {
-    Fault::InvalidParameter(format!(
-        "Invalid parameter at '{member}' failed to satisfy constraint: {detail}"
-    ))
-}
+/// The constraint a REGISTRY permissions policy document ECR will not accept fails.
+/// Whatever the document got wrong, the refusal states the one phrase: the registry
+/// policy as a whole is what was rejected, and nothing of how it was read is reported.
+pub const REGISTRY_POLICY_CONSTRAINT: &str = "Invalid registry policy provided";
+
+/// The same phrase for a REPOSITORY policy document. See [`REGISTRY_POLICY_CONSTRAINT`].
+pub const REPOSITORY_POLICY_CONSTRAINT: &str = "Invalid repository policy provided";
 
 /// Validate `text` as a resource-based IAM policy document, or report
-/// [`Fault::InvalidParameter`] naming what the document gets wrong.
+/// [`Fault::InvalidParameter`] worded by [`invalid_document`] with `constraint` — the
+/// stable phrase the service naming this document uses for a document it will not
+/// accept ([`REGISTRY_POLICY_CONSTRAINT`], [`REPOSITORY_POLICY_CONSTRAINT`]).
 ///
 /// The grammar enforced here is the IAM JSON policy language's own: the document is a
 /// JSON object; a `Version` it declares is one of [`POLICY_VERSIONS`]; `Statement` is
@@ -2119,81 +2259,55 @@ fn bad_policy(member: &str, detail: impl std::fmt::Display) -> Fault {
 /// `ops::set_repository_policy`) does not have to parse the document a second time; a
 /// service with no such rule passes `|_| Ok(())`.
 ///
-/// Parsing is `serde_json`'s; only the policy grammar on top of it is ours.
+/// Parsing is `serde_json`'s; only the policy grammar on top of it is ours — and neither
+/// the parser's own diagnostics nor which clause of the grammar failed reaches the
+/// refusal, which states the parameter and the one constraint phrase.
 pub fn validate_resource_policy(
-    member: &str,
+    constraint: &str,
     text: &str,
     mut check_statement: impl FnMut(&serde_json::Map<String, serde_json::Value>) -> Result<(), Fault>,
 ) -> Result<(), Fault> {
-    let document: serde_json::Value = serde_json::from_str(text)
-        .map_err(|error| bad_policy(member, format!("the policy is not valid JSON: {error}")))?;
-    let document = document
-        .as_object()
-        .ok_or_else(|| bad_policy(member, "the policy must be a JSON object"))?;
+    let refuse = || invalid_document(POLICY_TEXT_PARAMETER, constraint);
+
+    let document: serde_json::Value = serde_json::from_str(text).map_err(|_| refuse())?;
+    let document = document.as_object().ok_or_else(refuse)?;
 
     if let Some(version) = document.get("Version") {
-        let declared = version.as_str().ok_or_else(|| {
-            bad_policy(member, "the policy's Version element must be a string")
-        })?;
+        let declared = version.as_str().ok_or_else(refuse)?;
         if !POLICY_VERSIONS.contains(&declared) {
-            return Err(bad_policy(
-                member,
-                format!(
-                    "the policy declares Version '{declared}', which is not one of {}",
-                    POLICY_VERSIONS.join(", ")
-                ),
-            ));
+            return Err(refuse());
         }
     }
 
-    let statement = document
-        .get("Statement")
-        .ok_or_else(|| bad_policy(member, "the policy must carry a Statement element"))?;
+    let statement = document.get("Statement").ok_or_else(refuse)?;
     let statements: Vec<&serde_json::Value> = match statement {
         serde_json::Value::Array(entries) => entries.iter().collect(),
         single => vec![single],
     };
     if statements.is_empty() {
-        return Err(bad_policy(
-            member,
-            "the policy's Statement element must carry at least one statement",
-        ));
+        return Err(refuse());
     }
 
     for entry in statements {
-        let entry = entry
-            .as_object()
-            .ok_or_else(|| bad_policy(member, "every policy statement must be a JSON object"))?;
+        let entry = entry.as_object().ok_or_else(refuse)?;
         let effect = entry
             .get("Effect")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                bad_policy(member, "every policy statement must carry a string Effect")
-            })?;
+            .ok_or_else(refuse)?;
         if !POLICY_EFFECTS.contains(&effect) {
-            return Err(bad_policy(
-                member,
-                format!(
-                    "a policy statement's Effect is '{effect}', which is not one of {}",
-                    POLICY_EFFECTS.join(", ")
-                ),
-            ));
+            return Err(refuse());
         }
+        // At least one action, named by `Action` or by `NotAction`.
         if !["Action", "NotAction"]
             .iter()
             .any(|key| entry.get(*key).is_some_and(names_values))
         {
-            return Err(bad_policy(
-                member,
-                "every policy statement must carry at least one Action or NotAction",
-            ));
+            return Err(refuse());
         }
-        entry.get("Principal").filter(|p| names_values(p)).ok_or_else(|| {
-            bad_policy(
-                member,
-                "every statement of a resource-based policy must carry a Principal",
-            )
-        })?;
+        entry
+            .get("Principal")
+            .filter(|principal| names_values(principal))
+            .ok_or_else(refuse)?;
         check_statement(entry)?;
     }
     Ok(())
@@ -2472,18 +2586,19 @@ pub fn policy_values(element: &serde_json::Value) -> Vec<&str> {
 /// Validate a registry permissions policy document: the resource-policy grammar of
 /// [`validate_resource_policy`], plus the one rule a REGISTRY policy adds — it grants to
 /// other accounts, so every statement must name the identities it grants to and may not
-/// open the registry to every principal with the `*` wildcard.
-pub fn validate_registry_policy(member: &str, text: &str) -> Result<(), Fault> {
-    validate_resource_policy(member, text, |statement| {
+/// open the registry to every principal with the `*` wildcard. Either way the refusal
+/// states [`REGISTRY_POLICY_CONSTRAINT`]: both are documents ECR will not accept as this
+/// registry's policy.
+pub fn validate_registry_policy(text: &str) -> Result<(), Fault> {
+    validate_resource_policy(REGISTRY_POLICY_CONSTRAINT, text, |statement| {
         // The grammar above guarantees the statement carries a `Principal`.
         let grants_to_everyone = statement
             .get("Principal")
             .is_some_and(|principal| policy_values(principal).contains(&"*"));
         if grants_to_everyone {
-            return Err(bad_policy(
-                member,
-                "a registry policy statement cannot grant to every principal ('*'); \
-                 name the accounts or roles the registry is shared with",
+            return Err(invalid_document(
+                POLICY_TEXT_PARAMETER,
+                REGISTRY_POLICY_CONSTRAINT,
             ));
         }
         Ok(())

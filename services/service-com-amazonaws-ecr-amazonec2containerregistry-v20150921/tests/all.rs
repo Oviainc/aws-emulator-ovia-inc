@@ -35,6 +35,8 @@ mod lifecycle_policy;
 mod lifecycle_policy_preview;
 #[path = "all/policy_document_canonical_form.rs"]
 mod policy_document_canonical_form;
+#[path = "all/policy_document_refusal_messages.rs"]
+mod policy_document_refusal_messages;
 #[path = "all/pull_through_cache_rule_deletion.rs"]
 mod pull_through_cache_rule_deletion;
 #[path = "all/pull_through_cache_rule_validation.rs"]

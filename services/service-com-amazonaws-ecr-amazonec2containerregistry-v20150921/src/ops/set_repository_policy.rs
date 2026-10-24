@@ -245,21 +245,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .repository(&input.repository_name)
             .map_err(fault_error)?;
 
-        crate::state::validate_resource_policy("policyText", &input.policy_text, |statement| {
-            // "If the policy you are attempting to set on a repository policy would
-            // prevent you from setting another policy in the future, you must force
-            // the SetRepositoryPolicy operation. This is intended to prevent
-            // accidental repository lock outs."
-            if input.force || !denies_setting_policy(statement) {
-                return Ok(());
-            }
-            Err(crate::state::Fault::InvalidParameter(format!(
-                "the policy denies 'ecr:SetRepositoryPolicy' to every principal, which \
-                 would prevent another policy from being set on repository '{}'; set \
-                 force to true to apply it anyway",
-                input.repository_name
-            )))
-        })
+        crate::state::validate_resource_policy(
+            crate::state::REPOSITORY_POLICY_CONSTRAINT,
+            &input.policy_text,
+            |statement| {
+                // "If the policy you are attempting to set on a repository policy would
+                // prevent you from setting another policy in the future, you must force
+                // the SetRepositoryPolicy operation. This is intended to prevent
+                // accidental repository lock outs."
+                if input.force || !denies_setting_policy(statement) {
+                    return Ok(());
+                }
+                Err(crate::state::Fault::InvalidParameter(format!(
+                    "the policy denies 'ecr:SetRepositoryPolicy' to every principal, \
+                     which would prevent another policy from being set on repository \
+                     '{}'; set force to true to apply it anyway",
+                    input.repository_name
+                )))
+            },
+        )
         .map_err(fault_error)?;
 
         let repo = store

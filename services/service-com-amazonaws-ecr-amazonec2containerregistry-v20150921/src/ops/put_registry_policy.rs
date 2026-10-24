@@ -167,8 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The modelled length bound is already enforced at the boundary; what the model
         // cannot express is that the text has to be a usable registry policy document.
-        crate::state::validate_registry_policy("policyText", &input.policy_text)
-            .map_err(invalid_parameter)?;
+        crate::state::validate_registry_policy(&input.policy_text).map_err(invalid_parameter)?;
 
         // Stored — and answered with — in the canonical IAM-policy rendering ECR echoes
         // an attached policy in: the caller's own tokens, in the caller's own order,
