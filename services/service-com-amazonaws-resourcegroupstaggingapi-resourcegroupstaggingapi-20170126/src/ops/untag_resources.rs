@@ -2,14 +2,20 @@
 
 //! @op UntagResources
 //! Removes exactly the requested tag keys from every ARN in `ResourceARNList`,
-//! leaving every other key on those resources intact. A resource keeps its entry
-//! in the store once its last key is removed, so it is still reported by
-//! `GetResources` with an empty tag set; a key no resource carries any more
-//! disappears from `GetTagKeys` and `GetTagValues`.
+//! leaving every other key on those resources intact. The tag map is the OWNING
+//! service's own (`crate::state::owners`) wherever this emulator models it. A
+//! resource keeps its entry in this service's own store once its last key is
+//! removed, so it is still reported by `GetResources` with an empty tag set; a
+//! key no resource carries any more disappears from `GetTagKeys` and
+//! `GetTagValues`.
 //!
-//! A well-formed ARN that was never tagged is a no-op success — there is nothing
-//! to remove — matching the service's treatment of an unknown ARN elsewhere. An
-//! ARN that cannot be parsed is reported in `FailedResourcesMap`.
+//! "The operation succeeds even if you attempt to remove tags from a resource
+//! that were already removed", so a key the resource does not carry is a no-op.
+//! The two failure levels are `TagResources`': a request-level parameter fault
+//! (a value that is not an ARN, an ARN outside this endpoint's partition or
+//! Region, a reserved `aws:` key) refuses the whole call with
+//! `InvalidParameterException`, while a well-formed ARN the owning service holds
+//! no resource for is that ARN's own `FailedResourcesMap` entry.
 //!
 //! ## Shape of an operation
 //!
@@ -171,29 +177,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(UntagResourcesErrorModeled::InternalServiceException(
-                InternalServiceException {
-                    message: Some("the tagging store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
-        let mut state = state.lock();
+        use crate::state::owners;
+
+        /// A request-level parameter fault: the error the service declares for
+        /// it, refusing the WHOLE call.
+        fn invalid(message: String) -> UntagResourcesError {
+            UntagResourcesErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let region = crate::state::request_region(ctx.parts());
 
         // The modelled bounds (1..20 ARNs, 1..50 keys, each 1..128 characters)
-        // are refused at the boundary before this runs.
+        // are refused at the boundary before this runs. These are the
+        // request-level faults the model cannot express, each refusing the WHOLE
+        // call before anything is written.
+        let mut addressed: Vec<crate::state::ParsedArn> =
+            Vec::with_capacity(input.resource_arn_list.len());
+        for arn in &input.resource_arn_list {
+            addressed.push(crate::state::addressable_arn(arn, &region).map_err(invalid)?);
+        }
+        if input
+            .tag_keys
+            .iter()
+            .any(|key| crate::state::is_reserved_tag_key(key))
+        {
+            return Err(invalid(crate::state::SYSTEM_TAGS_MESSAGE.to_string()));
+        }
+
+        let change = owners::Change::Remove(&input.tag_keys);
+
         let mut failed: std::collections::HashMap<String, FailureInfo> =
             std::collections::HashMap::new();
-        for arn in &input.resource_arn_list {
-            if crate::state::parse_arn(arn).is_none() {
-                failed.insert(arn.clone(), crate::state::malformed_arn_failure(arn));
-                continue;
+        // The ARNs whose tags this service is the home for, changed below under
+        // the store's own lock — never while an owning service's lock is held.
+        let mut ours: Vec<&crate::state::ParsedArn> = Vec::new();
+        for parsed in &addressed {
+            match owners::visit(&*self.engine, parsed, Some(&change)) {
+                owners::Resolution::Absent(failure) => {
+                    failed.insert(parsed.arn.clone(), failure);
+                }
+                owners::Resolution::Present { tags: Some(_) } => {}
+                // A removal can never pass a tag limit; the arm is here so a
+                // new `Resolution` cannot be dropped silently.
+                owners::Resolution::TooManyTags(would_hold) => {
+                    failed.insert(
+                        parsed.arn.clone(),
+                        crate::state::too_many_tags_failure(&parsed.arn, would_hold),
+                    );
+                }
+                owners::Resolution::Present { tags: None } | owners::Resolution::Unowned => {
+                    ours.push(parsed);
+                }
             }
-            if let Some(entry) = state.resources.get_mut(arn) {
-                for key in &input.tag_keys {
-                    entry.tags.remove(key);
+        }
+
+        if !ours.is_empty() {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(UntagResourcesErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the tagging store is unavailable".to_string()),
+                    },
+                )
+                .into());
+            };
+            let mut state = state.lock();
+            for parsed in ours {
+                if let Some(entry) = state.resources.get_mut(&parsed.arn) {
+                    if let Err(would_hold) = change.apply(&mut entry.tags) {
+                        failed.insert(
+                            parsed.arn.clone(),
+                            crate::state::too_many_tags_failure(&parsed.arn, would_hold),
+                        );
+                    }
                 }
             }
         }

@@ -3,20 +3,31 @@
 //! Engine state for the com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126 service, and the pure
 //! projections over it that the tag read/write loop is built from.
 //!
-//! The service is a single store — ARN -> tag map — that `TagResources` and
-//! `UntagResources` write and `GetResources`, `GetTagKeys` and `GetTagValues`
-//! read. Everything the readers need (ARN parsing, filter matching, paging) lives
-//! here so the five handlers share ONE implementation of each rule rather than
-//! five copies.
+//! The tagging API is a VIEW, not a second copy: for every service [`owners`]
+//! links against, a resource's tags live in that service's own state — which is
+//! why `TagResources` can only tag an ARN the owning service really holds, and
+//! why a resource tagged through the owning service's own API (or deleted
+//! through it) appears in, and disappears from, this API's answers. For a
+//! service this crate does not link against, the ARN -> tag map below IS the tag
+//! home.
+//!
+//! Everything the readers need (ARN parsing, filter matching, paging) lives here
+//! so the five handlers share ONE implementation of each rule rather than five
+//! copies.
+
+pub mod owners;
 
 use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{FailureInfo, ResourceTagMapping, Tag, TagFilter};
 
 /// Per-service state for com-amazonaws-resourcegroupstaggingapi-resourcegroupstaggingapi-20170126. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResourcegroupstaggingapiResourcegroupstaggingapi20170126State {
-    /// Every resource this account has tagged through the API, keyed by ARN.
+    /// The tagged resources whose tags this service is the HOME for: the ones
+    /// whose owning service this crate does not link against, or links against
+    /// without that service modelling the resource's own tag set. Keyed by ARN.
     ///
     /// A `BTreeMap` rather than a `HashMap` so ARN order — and therefore every
     /// page boundary and every resumed cursor — is the same on every call.
@@ -45,6 +56,26 @@ pub const MAX_TAGGED_RESOURCES: usize = 1_000;
 /// requests can accumulate on one resource.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The partition this emulator serves, as `::engine::emulator_arn` mints it
+/// (`arn:aws:…`). An ARN parameter naming any other partition is refused: "The
+/// partition specified in an ARN parameter in the request doesn't match the
+/// partition where you invoked the operation" (`InvalidParameterException`
+/// documentation).
+pub const PARTITION: &str = "aws";
+
+/// The region a request is scoped to when it carries no SigV4 credential scope
+/// (an unsigned call). Matches the region the emulator's own generated config
+/// defaults to.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The reserved tag-key namespace: keys in it are SYSTEM tags that AWS itself
+/// writes (`aws:cloudformation:stack-name`, …) and a caller may not.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// What `TagResources`/`UntagResources` answer when a request names a key in
+/// [`RESERVED_TAG_KEY_PREFIX`].
+pub const SYSTEM_TAGS_MESSAGE: &str = "The caller isn't allowed to modify system tags.";
+
 impl ComAmazonawsResourcegroupstaggingapiResourcegroupstaggingapi20170126State {
     /// How many tags `arn` would carry after `keys` were merged into it, so a
     /// write can be refused BEFORE it grows the store past
@@ -54,12 +85,8 @@ impl ComAmazonawsResourcegroupstaggingapiResourcegroupstaggingapi20170126State {
         arn: &str,
         keys: impl IntoIterator<Item = &'k String>,
     ) -> usize {
-        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        if let Some(entry) = self.resources.get(arn) {
-            merged.extend(entry.tags.keys().cloned());
-        }
-        merged.extend(keys.into_iter().cloned());
-        merged.len()
+        let held = self.resources.get(arn).map(|entry| &entry.tags);
+        tag_count_after_merging(held, keys)
     }
 
     /// The entry for `arn`, created with an empty tag map when this is the first
@@ -83,6 +110,55 @@ impl ComAmazonawsResourcegroupstaggingapiResourcegroupstaggingapi20170126State {
                 }),
         )
     }
+
+    /// Every resource the tagging API reports for `region`: the ones the owning
+    /// services themselves hold tags for (`owned`, from
+    /// [`owners::tagged_resources`]) plus this store's own entries, in ARN
+    /// order.
+    ///
+    /// The owning service WINS where both name one ARN, because where a service
+    /// models a resource's tag set that set is the resource's tags; this store
+    /// only ever holds an ARN the owning services do not answer for.
+    ///
+    /// Resources outside `region` are left out: "Returns all the tagged or
+    /// previously tagged resources that are located in the specified Amazon Web
+    /// Services Region for the account" (`GetResources` documentation). An ARN
+    /// with an empty region segment names a global resource, which every
+    /// regional endpoint reports.
+    pub fn resources_in_region(
+        &self,
+        owned: Vec<(String, owners::Tags)>,
+        region: &str,
+    ) -> Vec<ResourceEntry> {
+        let mut rows: BTreeMap<String, ResourceEntry> = BTreeMap::new();
+        for entry in self.resources.values() {
+            rows.insert(entry.arn.clone(), entry.clone());
+        }
+        for (arn, tags) in owned {
+            if let Some(parsed) = parse_arn(&arn) {
+                rows.insert(arn, ResourceEntry::new(&parsed, tags));
+            }
+        }
+        rows.into_values()
+            .filter(|entry| {
+                parse_arn(&entry.arn).is_some_and(|parsed| parsed.is_served_by(region))
+            })
+            .collect()
+    }
+}
+
+/// How many tags a resource already holding `held` would carry after `keys` were
+/// merged into it.
+pub fn tag_count_after_merging<'k>(
+    held: Option<&BTreeMap<String, String>>,
+    keys: impl IntoIterator<Item = &'k String>,
+) -> usize {
+    let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(held) = held {
+        merged.extend(held.keys().cloned());
+    }
+    merged.extend(keys.into_iter().cloned());
+    merged.len()
 }
 
 /// One tagged resource: its ARN, its current tags, and the
@@ -96,12 +172,21 @@ pub struct ResourceEntry {
     pub arn: String,
     /// The resource's tags, key -> value. Ordered, so `Tags` is stable per read.
     pub tags: BTreeMap<String, String>,
-    /// `service` for an ARN with no resource-type segment, else
-    /// `service:resource-type`.
+    /// The `service:resource-type` key this resource answers to, or just
+    /// `service` for an ARN whose type this emulator cannot name.
     pub resource_type: String,
 }
 
 impl ResourceEntry {
+    /// One row of the projection: an ARN and the tags it carries.
+    pub fn new(arn: &ParsedArn, tags: BTreeMap<String, String>) -> Self {
+        Self {
+            arn: arn.arn.clone(),
+            tags,
+            resource_type: arn.resource_type(),
+        }
+    }
+
     /// This resource's tags as the modelled `Tag` list, in key order.
     pub fn tag_list(&self) -> Vec<Tag> {
         self.tags
@@ -121,9 +206,8 @@ impl ResourceEntry {
         self.tags.len().max(1)
     }
 
-    /// [`Self::tags_per_page_cost`] as the cost function [`page`] takes over
-    /// BORROWED rows, so paging never has to clone a row to weigh it.
-    pub fn tags_per_page_cost_of(entry: &&Self) -> usize {
+    /// [`Self::tags_per_page_cost`] as the cost function [`page`] takes.
+    pub fn tags_per_page_cost_of(entry: &Self) -> usize {
         entry.tags_per_page_cost()
     }
 
@@ -166,9 +250,15 @@ impl ResourceEntry {
 
     /// Whether this resource's type is selected by `filters`.
     ///
-    /// Each filter is `service[:resourceType]`: a bare service selects every
-    /// resource of that service, and `service:resourceType` only that type. An
-    /// empty filter list selects every resource.
+    /// "The format of each resource type is `service[:resourceType]`. For
+    /// example, specifying a service of `ec2` returns all Amazon EC2 resources
+    /// (which includes EC2 instances). Specifying a resource type of
+    /// `ec2:instance` returns only EC2 instances" (`GetResources`'
+    /// `ResourceTypeFilters` documentation): a BARE service token selects every
+    /// resource of that service and the QUALIFIED token only that one type, so
+    /// both halves of this resource's own `service:resourceType` key are
+    /// compared. Several filters select the union of what each selects, and an
+    /// empty list selects every resource.
     pub fn matches_resource_type_filters(&self, filters: &[String]) -> bool {
         filters.is_empty()
             || filters.iter().any(|filter| {
@@ -202,16 +292,49 @@ pub struct ParsedArn {
 impl ParsedArn {
     /// The `service[:resource-type]` key `ResourceTypeFilters` matches against.
     ///
-    /// "The format of each resource type is `service[:resourceType]` … The string
-    /// for each service name and resource type is the same as that embedded in a
-    /// resource's ARN" (`GetResources`' `ResourceTypeFilters` documentation). An
-    /// ARN whose resource field carries no type segment (`arn:aws:s3:::bucket`)
-    /// therefore has only a service key.
+    /// "The string for each service name and resource type is the same as that
+    /// embedded in a resource's ARN" (`GetResources`' `ResourceTypeFilters`
+    /// documentation), so the type is the resource field's leading segment where
+    /// it has one — and, only where it has none, the single resource type
+    /// [`implicit_resource_type`] names for that service.
     pub fn resource_type(&self) -> String {
         match self.resource.split_once(['/', ':']) {
-            Some((kind, _)) if !kind.is_empty() => format!("{}:{}", self.service, kind),
-            _ => self.service.clone(),
+            Some((kind, _)) if !kind.is_empty() => format!("{}:{kind}", self.service),
+            _ => match implicit_resource_type(&self.service) {
+                Some(kind) => format!("{}:{kind}", self.service),
+                None => self.service.clone(),
+            },
         }
+    }
+
+    /// Whether a regional endpoint serving `region` answers for this ARN: the
+    /// partition must be the one this emulator serves, and the region must be
+    /// that one or empty (a global resource, which every regional endpoint
+    /// reports).
+    pub fn is_served_by(&self, region: &str) -> bool {
+        self.partition == PARTITION && (self.region.is_empty() || self.region == region)
+    }
+}
+
+/// The single resource type of a service whose ARN format embeds NO resource-type
+/// segment, so `service:resourceType` cannot be read off the ARN.
+///
+/// Source: each service's documented ARN format in the "Amazon Resource Names"
+/// reference — `arn:aws:s3:::bucket_name`, `arn:aws:sqs:region:account:queue_name`
+/// and `arn:aws:sns:region:account:topic_name` carry the resource id alone, while
+/// the resource type the tagging API names them by is `s3:bucket`, `sqs:queue`
+/// and `sns:topic`. It is a FALLBACK: one of these services' ARNs that does
+/// carry a type segment (`arn:aws:s3:…:accesspoint/ap-a`) keeps the type its ARN
+/// states. A service absent from this table has its type read off the ARN, so an
+/// ARN of a type-less form this table does not name answers only to its bare
+/// service token: a qualified filter for it selects nothing (an empty page, not
+/// an error), and the fix is a row here.
+pub fn implicit_resource_type(service: &str) -> Option<&'static str> {
+    match service {
+        "s3" => Some("bucket"),
+        "sqs" => Some("queue"),
+        "sns" => Some("topic"),
+        _ => None,
     }
 }
 
@@ -243,21 +366,56 @@ pub fn parse_arn(arn: &str) -> Option<ParsedArn> {
     })
 }
 
-/// The per-resource failure `TagResources`/`UntagResources` report for an ARN
-/// they could not parse.
+/// The ARN `value` names, or the `InvalidParameterException` message for a value
+/// no regional endpoint in `region` may be asked to tag.
 ///
-/// A resource-level failure is reported in `FailedResourcesMap` with HTTP 200
-/// overall, never as a top-level error: the other ARNs in the same request were
-/// tagged. `ErrorCode` is one of the values the `ErrorCode` enum lists, and the
-/// message names the member and what was wrong with it.
-pub fn malformed_arn_failure(arn: &str) -> FailureInfo {
-    FailureInfo {
-        status_code: 400,
-        error_code: Some("InvalidParameterException".to_string()),
-        error_message: Some(format!(
-            "ResourceARNList contains a value that is not an Amazon Resource Name: {arn}"
-        )),
+/// Three request-level faults, each refusing the WHOLE call before any state is
+/// written (the batch is atomic), as distinct from a well-formed ARN that names
+/// nothing — which is a per-resource `FailedResourcesMap` entry:
+///
+/// * the value is not an ARN at all ("A provided string parameter is
+///   malformed");
+/// * its partition is not the one the operation was invoked in ("The partition
+///   specified in an ARN parameter in the request doesn't match the partition
+///   where you invoked the operation");
+/// * its region is another one: "You can only tag resources that are located in
+///   the specified Amazon Web Services Region" (`TagResources` documentation),
+///   and this endpoint serves exactly one.
+pub fn addressable_arn(value: &str, region: &str) -> Result<ParsedArn, String> {
+    let Some(parsed) = parse_arn(value) else {
+        return Err(not_an_arn_message(value));
+    };
+    if parsed.partition != PARTITION {
+        return Err(format!(
+            "The partition specified in an ARN parameter in the request doesn't match the \
+             partition where you invoked the operation: {value}"
+        ));
     }
+    if !parsed.region.is_empty() && parsed.region != region {
+        return Err(format!(
+            "ResourceARNList contains an ARN in a Region other than {region}, which this \
+             request was made in: {value}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// The `InvalidParameterException` message for a `ResourceARNList` value that is
+/// not an ARN: it names the member and what was wrong with it.
+pub fn not_an_arn_message(value: &str) -> String {
+    format!("ResourceARNList contains a value that is not an Amazon Resource Name: {value}")
+}
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// Compared without case, as AWS reserves the prefix rather than one spelling of
+/// it, and over BYTES rather than a `&str` slice: a tag key is caller-supplied
+/// text whose 4th byte may fall inside a multi-byte character (`awsé`, `日本`),
+/// and slicing a `&str` there would panic instead of answering.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.as_bytes()
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
 }
 
 /// The per-resource failure `TagResources` reports for a write that would push
@@ -306,6 +464,16 @@ pub const MIN_TAGS_PER_PAGE: i32 = 100;
 /// The documented maximum of `GetResources`' `TagsPerPage`.
 pub const MAX_TAGS_PER_PAGE: i32 = 500;
 
+/// The `InvalidParameterException` message for a page-size member outside its
+/// documented window.
+///
+/// The window is a fixed API constant, not an account quota, so the text is the
+/// member's name and that constant window — the SAME text for every value
+/// outside it, with the submitted value not echoed.
+pub fn out_of_range_message(member: &str, min: i32, max: i32) -> String {
+    format!("{member} is not in the valid range of {min} and {max}")
+}
+
 /// The page size `GetTagKeys` and `GetTagValues` serve.
 ///
 /// Neither operation exposes a page-size member, so the page size is the
@@ -313,39 +481,93 @@ pub const MAX_TAGS_PER_PAGE: i32 = 500;
 /// `GetResources` documents as its `ResourcesPerPage` maximum.
 pub const KEYS_PER_PAGE: usize = 100;
 
-/// A stable, short digest of the request members a page is scoped to.
+/// How long a minted `PaginationToken` resumes a scan: "A `PaginationToken` is
+/// valid for a maximum of 15 minutes" (`PaginationTokenExpiredException`
+/// documentation).
+pub const PAGINATION_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Why a `PaginationToken` cannot be resumed — two DIFFERENT answers the service
+/// models separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRejection {
+    /// Not a token this service minted for this query at all: a malformed
+    /// parameter, answered with `InvalidParameterException`, which tells the
+    /// client the call will never succeed.
+    NotMinted,
+    /// A token this service DID mint, past its [`PAGINATION_TOKEN_TTL`] window:
+    /// answered with `PaginationTokenExpiredException`, which tells the client
+    /// to restart the scan.
+    Expired,
+}
+
+/// The `InvalidParameterException` message for a token this service never
+/// minted.
+pub fn invalid_token_message(token: &str) -> String {
+    format!("Pagination token is invalid={token}")
+}
+
+/// A stable, short digest over the request members a page is scoped to, the
+/// instant the token was minted and the item it resumes after.
 ///
-/// It goes into the pagination token so a token minted for one projection —
-/// another operation, or another filter set — is refused instead of resuming
-/// against a list it was never cut from. Lengths are hashed alongside the parts
-/// so two different scopes cannot collide by re-splitting the same bytes.
-pub fn page_fingerprint(scope: &[&str]) -> String {
+/// Covering the scope is what makes a token minted for one projection — another
+/// operation, or another filter set — unusable against a list it was never cut
+/// from; covering the whole token body is what tells a token this service minted
+/// from a string a caller made up. Lengths are hashed alongside the parts so two
+/// different scopes cannot collide by re-splitting the same bytes.
+fn token_digest(scope: &[&str], issued: &str, after: &str) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-    for part in scope {
+    for part in scope.iter().copied().chain([issued, after]) {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
     hex::encode(&hasher.finalize()[..8])
 }
 
-/// The opaque token that resumes a page after the item keyed `after`.
-///
-/// `fingerprint` is hex, so the first `:` always separates the two halves even
-/// when `after` is an ARN full of them. The longest token this can build is 16
-/// hex digits, a separator and a 1011-character `ResourceARN`, well inside the
-/// modelled 2048-character `PaginationToken` bound.
-pub fn encode_pagination_token(fingerprint: &str, after: &str) -> String {
-    format!("{fingerprint}:{after}")
+/// Seconds since the Unix epoch, the unit a token records its mint instant in.
+fn epoch_seconds(at: SystemTime) -> u64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
-/// The resume point a token carries, or `None` when the token was not minted for
-/// this projection (which the caller answers with
-/// `PaginationTokenExpiredException`).
-pub fn decode_pagination_token(token: &str, fingerprint: &str) -> Option<String> {
-    let (minted_for, after) = token.split_once(':')?;
-    (minted_for == fingerprint && !after.is_empty()).then(|| after.to_string())
+/// The opaque token that resumes a page of `scope` after the item keyed `after`.
+pub fn encode_pagination_token(scope: &[&str], after: &str) -> String {
+    encode_pagination_token_at(scope, after, SystemTime::now())
+}
+
+/// [`encode_pagination_token`] with the mint instant supplied, which is the seam
+/// a test mints an aged token through.
+///
+/// `digest` is hex and `issued` is digits, so the first two `:` always separate
+/// the three parts even when `after` is an ARN full of them. The longest token
+/// this builds is 16 hex digits, a 10-digit second count, two separators and a
+/// 1011-character `ResourceARN`: well inside the modelled 2048-character
+/// `PaginationToken` bound.
+pub fn encode_pagination_token_at(scope: &[&str], after: &str, issued: SystemTime) -> String {
+    let issued = epoch_seconds(issued).to_string();
+    let digest = token_digest(scope, &issued, after);
+    format!("{digest}:{issued}:{after}")
+}
+
+/// The resume point `token` carries, or why it cannot be resumed.
+pub fn decode_pagination_token(token: &str, scope: &[&str]) -> Result<String, TokenRejection> {
+    let mut parts = token.splitn(3, ':');
+    let (Some(digest), Some(issued), Some(after)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(TokenRejection::NotMinted);
+    };
+    if after.is_empty() || digest != token_digest(scope, issued, after) {
+        return Err(TokenRejection::NotMinted);
+    }
+    let Ok(issued) = issued.parse::<u64>() else {
+        return Err(TokenRejection::NotMinted);
+    };
+    if epoch_seconds(SystemTime::now()).saturating_sub(issued) > PAGINATION_TOKEN_TTL.as_secs() {
+        return Err(TokenRejection::Expired);
+    }
+    Ok(after.to_string())
 }
 
 /// One page of a key-ordered projection, plus the token that resumes after it.
@@ -363,7 +585,7 @@ pub fn page<T>(
     max_items: usize,
     max_cost: Option<usize>,
     cost: impl Fn(&T) -> usize,
-    fingerprint: &str,
+    scope: &[&str],
 ) -> (Vec<T>, Option<String>) {
     let max_items = max_items.max(1);
     let mut rest: Vec<(String, T)> = items
@@ -390,11 +612,20 @@ pub fn page<T>(
     let next = truncated
         .then(|| {
             rest.last()
-                .map(|(key, _)| encode_pagination_token(fingerprint, key))
+                .map(|(key, _)| encode_pagination_token(scope, key))
         })
         .flatten();
 
     (rest.into_iter().map(|(_, item)| item).collect(), next)
+}
+
+/// The region a request is scoped to: the one its SigV4 credential scope names,
+/// or [`DEFAULT_REGION`] when the request carries no scope (an unsigned call).
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -141,19 +141,25 @@ fn page_tags(body: &serde_json::Value, arn: &str) -> BTreeMap<String, String> {
 /// resource's ARN" (`smithy_query(query="doc", shape="GetResourcesInput",
 /// member="ResourceTypeFilters")`). The forms are the three AWS ARN resource
 /// layouts: bare `resource-id`, `resource-type/resource-id` and
-/// `resource-type:resource-id`.
+/// `resource-type:resource-id`; the bare ones take their type from
+/// `crate::state::implicit_resource_type`.
+///
+/// Every ARN is in the partition and Region this endpoint serves — the test
+/// signs for `us-east-1` — because an ARN outside either is refused; that rule
+/// has its own rows in `tagging_api_fidelity.rs`. The services named here are
+/// the ones `state::owners` does NOT resolve against, so the ARNs need no live
+/// resource behind them.
 ///
 /// Columns: the ARN, the filter that selects it by service, and the filter that
-/// selects it by `service:resourceType` (`None` where the ARN carries no type
-/// segment, so no such filter exists).
+/// selects it by `service:resourceType`.
 const ARN_FORMS: &[(&str, &str, Option<&str>)] = &[
     // Bare resource id, no region, no account (the issue's first row).
-    ("arn:aws:s3:::bucket-a", "s3", None),
+    ("arn:aws:s3:::bucket-a", "s3", Some("s3:bucket")),
     // Bare resource id with region and account.
     (
-        "arn:aws:sqs:us-east-1:123456789012:queue-a",
-        "sqs",
-        None,
+        "arn:aws:sns:us-east-1:123456789012:topic-a",
+        "sns",
+        Some("sns:topic"),
     ),
     // `resource-type/resource-id`.
     (
@@ -163,21 +169,28 @@ const ARN_FORMS: &[(&str, &str, Option<&str>)] = &[
     ),
     // `resource-type/resource-id` with a multi-segment id.
     (
-        "arn:aws:dynamodb:eu-west-1:123456789012:table/orders/stream/2026",
+        "arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2026",
         "dynamodb",
         Some("dynamodb:table"),
     ),
     // `resource-type:resource-id`.
     (
-        "arn:aws:lambda:us-west-2:123456789012:function:packer",
+        "arn:aws:lambda:us-east-1:123456789012:function:packer",
         "lambda",
         Some("lambda:function"),
     ),
-    // A non-`aws` partition.
+    // A global resource: no region segment at all.
     (
-        "arn:aws-cn:iam::123456789012:user/zoe",
+        "arn:aws:iam::123456789012:user/zoe",
         "iam",
         Some("iam:user"),
+    ),
+    // A type segment the ARN DOES carry, under a service whose primary resource
+    // has an implicit type: the ARN's own type wins over the implicit one.
+    (
+        "arn:aws:s3:us-east-1:123456789012:accesspoint/ap-a",
+        "s3",
+        Some("s3:accesspoint"),
     ),
 ];
 
@@ -236,10 +249,25 @@ async fn resource_type_filters_match_the_service_and_resource_type_of_the_arn() 
     let arns: Vec<&str> = ARN_FORMS.iter().map(|(arn, ..)| *arn).collect();
     tag(&router, &arns, &[("Env", "prod")]).await;
 
-    // Every row of the catalog: the service filter selects exactly its own ARN,
-    // and so does the `service:resourceType` filter where the ARN has one.
+    // Every row of the catalog: the `service:resourceType` filter selects
+    // exactly its own ARN, and the bare service filter selects every ARN of
+    // that service.
     for (arn, service_filter, type_filter) in ARN_FORMS {
-        for filter in [Some(*service_filter), *type_filter].into_iter().flatten() {
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            (
+                *service_filter,
+                ARN_FORMS
+                    .iter()
+                    .filter(|(_, service, _)| service == service_filter)
+                    .map(|(other, ..)| (*other).to_string())
+                    .collect(),
+            ),
+            (
+                type_filter.expect("every row names its qualified filter"),
+                vec![(*arn).to_string()],
+            ),
+        ];
+        for (filter, expected) in cases {
             let (status, body) = call(
                 &router,
                 "GetResources",
@@ -247,18 +275,20 @@ async fn resource_type_filters_match_the_service_and_resource_type_of_the_arn() 
             )
             .await;
             assert_eq!(status, 200, "case ResourceTypeFilters=[{filter}]: body {body}");
+            let mut want = expected;
+            want.sort();
             assert_eq!(
                 page_arns(&body),
-                vec![(*arn).to_string()],
-                "case ResourceTypeFilters=[{filter}]: expected only {arn}, got {}",
+                want,
+                "case ResourceTypeFilters=[{filter}]: expected {want:?}, got {}",
                 body["ResourceTagMappingList"]
             );
         }
     }
 
-    // A `service:resourceType` filter does not match an ARN whose resource field
-    // carries no type segment, and an unknown filter matches nothing.
-    for filter in ["s3:bucket", "sqs:queue", "nosuchservice", "ec2:volume"] {
+    // A `service:resourceType` filter whose type no ARN carries matches nothing,
+    // and neither does an unknown service.
+    for filter in ["s3:object", "sns:subscription", "nosuchservice", "ec2:volume"] {
         let (status, body) = call(
             &router,
             "GetResources",
@@ -277,17 +307,20 @@ async fn resource_type_filters_match_the_service_and_resource_type_of_the_arn() 
     let (status, body) = call(
         &router,
         "GetResources",
-        serde_json::json!({ "ResourceTypeFilters": ["s3", "ec2:instance"] }),
+        serde_json::json!({ "ResourceTypeFilters": ["s3:bucket", "ec2:instance"] }),
     )
     .await;
-    assert_eq!(status, 200, "case ResourceTypeFilters=[s3, ec2:instance]: body {body}");
+    assert_eq!(
+        status, 200,
+        "case ResourceTypeFilters=[s3:bucket, ec2:instance]: body {body}"
+    );
     assert_eq!(
         page_arns(&body),
         vec![
             "arn:aws:ec2:us-east-1:123456789012:instance/i-0abc".to_string(),
             "arn:aws:s3:::bucket-a".to_string(),
         ],
-        "case ResourceTypeFilters=[s3, ec2:instance]: got {}",
+        "case ResourceTypeFilters=[s3:bucket, ec2:instance]: got {}",
         body["ResourceTagMappingList"]
     );
 }
@@ -297,7 +330,7 @@ async fn tag_filters_and_across_keys_and_or_within_one_filters_values() {
     let router = emulator();
     // Three resources whose tag sets differ in value, in key set, and in count.
     let alpha = "arn:aws:s3:::alpha";
-    let beta = "arn:aws:sqs:us-east-1:123456789012:beta";
+    let beta = "arn:aws:sns:us-east-1:123456789012:beta";
     let gamma = "arn:aws:ec2:us-east-1:123456789012:instance/gamma";
     tag(&router, &[alpha], &[("Env", "prod"), ("Team", "core")]).await;
     tag(&router, &[beta], &[("Env", "dev"), ("Team", "core")]).await;
@@ -357,7 +390,7 @@ async fn tag_filters_and_across_keys_and_or_within_one_filters_values() {
 async fn tag_resources_upserts_and_untag_resources_removes_only_the_named_keys() {
     let router = emulator();
     let arn = "arn:aws:s3:::bucket-a";
-    let other = "arn:aws:sqs:us-east-1:123456789012:queue-a";
+    let other = "arn:aws:sns:us-east-1:123456789012:topic-a";
     tag(&router, &[arn, other], &[("Env", "prod"), ("Team", "core")]).await;
 
     // Rows differ in what the second write does to the stored map: overwrite one
@@ -482,7 +515,7 @@ async fn tag_resources_upserts_and_untag_resources_removes_only_the_named_keys()
 async fn get_tag_keys_and_values_are_projections_of_the_store() {
     let router = emulator();
     let alpha = "arn:aws:s3:::alpha";
-    let beta = "arn:aws:sqs:us-east-1:123456789012:beta";
+    let beta = "arn:aws:sns:us-east-1:123456789012:beta";
     tag(&router, &[alpha], &[("Env", "prod"), ("Team", "core")]).await;
     tag(&router, &[beta], &[("Env", "dev"), ("Zone", "a")]).await;
 
@@ -711,7 +744,7 @@ async fn get_tag_keys_and_values_resume_from_their_own_token() {
 }
 
 #[tokio::test]
-async fn a_token_not_minted_for_this_projection_is_refused() {
+async fn a_token_this_service_never_minted_is_a_malformed_parameter() {
     let router = emulator();
     let arns: Vec<String> = (0..3).map(|n| format!("arn:aws:s3:::bucket-{n}")).collect();
     let borrowed: Vec<&str> = arns.iter().map(String::as_str).collect();
@@ -737,17 +770,19 @@ async fn a_token_not_minted_for_this_projection_is_refused() {
         "three keys fit one page; got a token: {keys_page}"
     );
 
-    // Rows: unparseable, empty cursor, wrong fingerprint, and a valid token
+    // Rows: unparseable, empty cursor, a made-up digest, and a valid token
     // replayed against a different filter set.
     let cases: Vec<(&str, serde_json::Value)> = vec![
         ("bogus", serde_json::json!({ "PaginationToken": "bogus" })),
         (
             "no cursor",
-            serde_json::json!({ "PaginationToken": "0123456789abcdef:" }),
+            serde_json::json!({ "PaginationToken": "0123456789abcdef:0:" }),
         ),
         (
-            "wrong fingerprint",
-            serde_json::json!({ "PaginationToken": "deadbeefdeadbeef:arn:aws:s3:::bucket-0" }),
+            "made-up digest",
+            serde_json::json!({
+                "PaginationToken": "deadbeefdeadbeef:4000000000:arn:aws:s3:::bucket-0"
+            }),
         ),
         (
             "replayed against other filters",
@@ -765,7 +800,7 @@ async fn a_token_not_minted_for_this_projection_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "PaginationTokenExpiredException",
+            "InvalidParameterException",
             "case {case}: got {body}"
         );
     }
@@ -783,91 +818,8 @@ async fn a_token_not_minted_for_this_projection_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "PaginationTokenExpiredException",
+            "InvalidParameterException",
             "case {operation} with a bogus token: got {body}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn a_malformed_arn_is_reported_per_resource_not_as_a_top_level_error() {
-    let router = emulator();
-    let good = "arn:aws:s3:::bucket-a";
-
-    // Rows: not an ARN at all, too few fields, empty partition, empty service,
-    // empty resource, and the wrong scheme.
-    let malformed = [
-        "bucket-a",
-        "arn:aws:s3:::",
-        "arn:aws:s3:us-east-1",
-        "arn::s3:::bucket-a",
-        "arn:aws::::bucket-a",
-        "urn:aws:s3:::bucket-a",
-    ];
-
-    for bad in malformed {
-        let (status, body) = call(
-            &router,
-            "TagResources",
-            serde_json::json!({
-                "ResourceARNList": [good, bad],
-                "Tags": { "Env": "prod" }
-            }),
-        )
-        .await;
-        assert_eq!(status, 200, "case {bad:?}: expected HTTP 200, got {status} with {body}");
-        let failure = &body["FailedResourcesMap"][bad];
-        assert_eq!(
-            failure["StatusCode"],
-            serde_json::json!(400),
-            "case {bad:?}: expected StatusCode 400, got {body}"
-        );
-        assert_eq!(
-            failure["ErrorCode"],
-            serde_json::json!("InvalidParameterException"),
-            "case {bad:?}: expected ErrorCode InvalidParameterException, got {body}"
-        );
-        assert!(
-            failure["ErrorMessage"]
-                .as_str()
-                .is_some_and(|message| message.contains(bad)),
-            "case {bad:?}: the failure message must name the offending value, got {body}"
-        );
-        assert!(
-            body["FailedResourcesMap"][good].is_null(),
-            "case {bad:?}: the well-formed ARN must not be reported as failed, got {body}"
-        );
-
-        // UntagResources reports the same per-resource failure.
-        let (status, untag) = call(
-            &router,
-            "UntagResources",
-            serde_json::json!({
-                "ResourceARNList": [good, bad],
-                "TagKeys": ["Env"]
-            }),
-        )
-        .await;
-        assert_eq!(status, 200, "case untag {bad:?}: expected HTTP 200, got {untag}");
-        assert_eq!(
-            untag["FailedResourcesMap"][bad]["ErrorCode"],
-            serde_json::json!("InvalidParameterException"),
-            "case untag {bad:?}: got {untag}"
-        );
-    }
-
-    // The well-formed ARN of every one of those calls was really tagged.
-    let (_, body) = call(&router, "GetResources", serde_json::json!({})).await;
-    assert_eq!(
-        page_arns(&body),
-        vec![good.to_string()],
-        "only the well-formed ARN must be in the store, got {body}"
-    );
-    // None of the malformed ARNs leaked into the store.
-    for bad in malformed {
-        assert!(
-            !page_arns(&body).iter().any(|arn| arn == bad),
-            "case {bad:?}: a malformed ARN must not be stored, got {body}"
         );
     }
 }
@@ -1089,7 +1041,7 @@ async fn the_store_refuses_to_grow_without_bound() {
     // Emulator bound: the store holds at most MAX_TAGGED_RESOURCES resources, so
     // a client looping with fresh ARNs is refused rather than growing it for ever.
     // 1 resource is already stored, so 999 more fill it.
-    let filler: Vec<String> = (0..999).map(|n| format!("arn:aws:sqs:us-east-1:123456789012:q{n:04}")).collect();
+    let filler: Vec<String> = (0..999).map(|n| format!("arn:aws:s3:::q{n:04}")).collect();
     for chunk in filler.chunks(20) {
         let arns: Vec<&str> = chunk.iter().map(String::as_str).collect();
         tag(&router, &arns, &[("Env", "prod")]).await;

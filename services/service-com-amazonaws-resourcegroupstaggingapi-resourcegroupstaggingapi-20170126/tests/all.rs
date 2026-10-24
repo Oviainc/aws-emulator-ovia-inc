@@ -16,3 +16,6 @@ mod state_roundtrip;
 
 #[path = "all/tag_read_write_loop.rs"]
 mod tag_read_write_loop;
+
+#[path = "all/tagging_api_fidelity.rs"]
+mod tagging_api_fidelity;
