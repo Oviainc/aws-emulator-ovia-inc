@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Create one MediaLive Anywhere `Cluster` in this service's store and report it
+//! back out of that store.
+//!
+//! The cluster slice owns the documented rules (`Name` "unique in the AWS
+//! account", the store's cap, the mint and the `CREATING` -> `ACTIVE`
+//! transition the clock owes a created cluster): see
+//! [`crate::state::ComAmazonawsMedialiveMedialiveState::insert_cluster`]. This
+//! handler validates the request's lengths, honours the `@idempotencyToken`
+//! retry and turns a [`crate::state::ClusterRefusal`] into this operation's own
+//! modelled error.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +178,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The bounds every named MediaLive resource is held to. They are named
+        // here because both members target bare `__string`, so the request
+        // boundary refuses nothing for them; the message names the member, the
+        // bound and the length that broke it, all read off the request.
+        bounded(
+            "name",
+            input.name.as_deref(),
+            1,
+            crate::state::MAX_RESOURCE_NAME_LEN,
+        )?;
+        bounded(
+            "requestId",
+            input.request_id.as_deref(),
+            1,
+            crate::state::MAX_REQUEST_ID_LEN,
+        )?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // `settle` first, as every operation does: it materialises only what the
+        // clock had already made due, so it never changes what a later caller
+        // would otherwise have seen.
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must return the
+        // cluster the first one created, not a second cluster.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.cluster_for_token(token))
+            .map(str::to_string)
+        {
+            let cluster = state
+                .cluster_description(&existing)
+                .ok_or_else(unavailable)?;
+            return Ok(crate::state::cluster_description_output!(
+                CreateClusterOutput,
+                cluster
+            ));
+        }
+
+        let new = crate::state::NewCluster {
+            name: input.name,
+            cluster_type: input.cluster_type,
+            // Stored verbatim: this emulator runs no IAM, so the role is neither
+            // resolved nor assumed, and a value it did not supply stays absent
+            // rather than being invented.
+            instance_role_arn: input.instance_role_arn,
+            // Kept in the response shape the request's create shape maps onto,
+            // so every later read projects the stored settings instead of
+            // rebuilding them from a request.
+            network_settings: input
+                .network_settings
+                .as_ref()
+                .map(crate::state::described_cluster_network_settings),
+            tags: input.tags.unwrap_or_default(),
+        };
+        let id = match state.insert_cluster(&region, new, now) {
+            Ok(id) => id,
+            // "Specify a name that is unique in the AWS account" — a second
+            // cluster under a name the account already holds is refused rather
+            // than created, with the fixed message every name collision in this
+            // service carries.
+            Err(crate::state::ClusterRefusal::NameAlreadyInUse) => {
+                return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+                })
+                .into());
+            }
+            // The store is bounded, so a create loop cannot grow the emulator's
+            // heap without limit: once it is full the operation's own modelled
+            // throttle is the answer, not another cluster.
+            Err(crate::state::ClusterRefusal::StoreFull) => {
+                return Err(CreateClusterErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "This emulator stores at most {} clusters; delete one before creating another",
+                            crate::state::MAX_CLUSTERS
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the cluster it created.
+            state.record_cluster_token(token, &id);
+        }
+
+        // The response is read back out of the stored record, never from
+        // `input`: `Id`, `Arn`, `State` and `ChannelIds` are all the store's.
+        let cluster = state.cluster_description(&id).ok_or_else(unavailable)?;
+        Ok(crate::state::cluster_description_output!(
+            CreateClusterOutput,
+            cluster
+        ))
     }
+}
+
+/// Refuse a member whose length is outside the bounds every named MediaLive
+/// resource holds it to, with this operation's own modelled client error.
+fn bounded(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), CreateClusterError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(
+        CreateClusterErrorModeled::BadRequestException(BadRequestException {
+            message: Some(format!(
+                "{member} must be between {min} and {max} characters long, but was {len}"
+            )),
+        })
+        .into(),
+    )
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the cluster in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateClusterError {
+    CreateClusterErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

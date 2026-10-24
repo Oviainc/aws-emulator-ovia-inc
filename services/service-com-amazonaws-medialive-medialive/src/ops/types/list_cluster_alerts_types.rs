@@ -27,7 +27,15 @@ pub struct ListClusterAlertsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#ClusterAlert")]
+/// `ClusterAlert`, with its schema written out instead of derived because
+/// `ClearedTimestamp` and `SetTimestamp` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices, and every member is optional exactly as the derive has them.
+///
+/// Like `SignalMapSummary` it DOES carry a deserializer: it is the element of
+/// `ListClusterAlertsResponse$Alerts`, and the derive on that shape reads each element
+/// through `DeserializableStruct`.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterAlert {
     pub alert_type: Option<String>,
@@ -38,5 +46,108 @@ pub struct ClusterAlert {
     pub node_id: Option<String>,
     pub set_timestamp: Option<::aws_smithy_types::DateTime>,
     pub state: Option<String>,
+}
+
+impl ClusterAlert {
+    const M_ALERT_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ClusterAlert", "AlertType", "alertType", String, 0);
+    const M_CHANNEL_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ClusterAlert", "ChannelId", "channelId", String, 1);
+    const M_CLEARED_TIMESTAMP: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("ClusterAlert", "ClearedTimestamp", "clearedTimestamp", 2);
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ClusterAlert", "Id", "id", String, 3);
+    const M_MESSAGE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ClusterAlert", "Message", "message", String, 4);
+    const M_NODE_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ClusterAlert", "NodeId", "nodeId", String, 5);
+    const M_SET_TIMESTAMP: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("ClusterAlert", "SetTimestamp", "setTimestamp", 6);
+    // `ClusterAlertState` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_STATE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("ClusterAlert", "State", "state", String, 7);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#ClusterAlert",
+            shared_types::NAMESPACE,
+            "ClusterAlert",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ALERT_TYPE,
+            &Self::M_CHANNEL_ID,
+            &Self::M_CLEARED_TIMESTAMP,
+            &Self::M_ID,
+            &Self::M_MESSAGE,
+            &Self::M_NODE_ID,
+            &Self::M_SET_TIMESTAMP,
+            &Self::M_STATE,
+        ],
+    );
+}
+
+pub static CLUSTER_ALERT_SCHEMA: &::aws_smithy_schema::Schema = &ClusterAlert::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ClusterAlert {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.alert_type.as_ref() {
+            serializer.write_string(&Self::M_ALERT_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.channel_id.as_ref() {
+            serializer.write_string(&Self::M_CHANNEL_ID, value.as_str())?;
+        }
+        if let Some(value) = self.cleared_timestamp.as_ref() {
+            serializer.write_timestamp(&Self::M_CLEARED_TIMESTAMP, value)?;
+        }
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.message.as_ref() {
+            serializer.write_string(&Self::M_MESSAGE, value.as_str())?;
+        }
+        if let Some(value) = self.node_id.as_ref() {
+            serializer.write_string(&Self::M_NODE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.set_timestamp.as_ref() {
+            serializer.write_timestamp(&Self::M_SET_TIMESTAMP, value)?;
+        }
+        if let Some(value) = self.state.as_ref() {
+            serializer.write_string(&Self::M_STATE, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ClusterAlert {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut alert = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => alert.alert_type = Some(reader.read_string(&Self::M_ALERT_TYPE)?),
+                Some(1) => alert.channel_id = Some(reader.read_string(&Self::M_CHANNEL_ID)?),
+                Some(2) => {
+                    alert.cleared_timestamp =
+                        Some(reader.read_timestamp(&Self::M_CLEARED_TIMESTAMP)?);
+                }
+                Some(3) => alert.id = Some(reader.read_string(&Self::M_ID)?),
+                Some(4) => alert.message = Some(reader.read_string(&Self::M_MESSAGE)?),
+                Some(5) => alert.node_id = Some(reader.read_string(&Self::M_NODE_ID)?),
+                Some(6) => {
+                    alert.set_timestamp = Some(reader.read_timestamp(&Self::M_SET_TIMESTAMP)?);
+                }
+                Some(7) => alert.state = Some(reader.read_string(&Self::M_STATE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(alert)
+    }
 }
 
