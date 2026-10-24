@@ -163,7 +163,7 @@ use super::template::{
     AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY,
     ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER,
-    WAF_REGIONAL_IP_SET,
+    STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -215,6 +215,7 @@ pub(super) enum Provisioner {
     RdsDbSubnetGroup,
     EventsRule,
     SsmParameter,
+    StepFunctionsActivity,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -241,6 +242,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
+        STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
         _ => None,
     }
 }
@@ -319,6 +321,9 @@ impl Provisioner {
             // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::EventsRule => put_rule(ctx, region, resource).await,
             Self::SsmParameter => put_parameter(ctx, region, resource, propagated).await,
+            Self::StepFunctionsActivity => {
+                create_activity(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -460,6 +465,9 @@ impl Provisioner {
             // record says which bus it is on, so the delete takes the record.
             Self::EventsRule => delete_rule(ctx, region, resource).await,
             Self::SsmParameter => delete_parameter(ctx, region, physical_resource_id).await,
+            Self::StepFunctionsActivity => {
+                delete_activity(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -523,6 +531,9 @@ impl Provisioner {
             // only the resource's own record carries.
             Self::EventsRule => describe_rule(ctx, region, resource).await,
             Self::SsmParameter => describe_parameter(ctx, region, physical_resource_id).await,
+            Self::StepFunctionsActivity => {
+                describe_activity(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -5391,6 +5402,146 @@ async fn call_ssm(
         region,
         AWS_JSON_1_1,
         &format!("{SSM_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// AWS Step Functions: AWS::StepFunctions::Activity
+// ---------------------------------------------------------------------------
+
+/// AWS Step Functions' signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: states`, service shape `AWSStepFunctions`), which speaks `awsJson1_0`.
+const SFN_SIGNING_NAME: &str = "states";
+const SFN_TARGET_PREFIX: &str = "AWSStepFunctions";
+
+/// The error code Step Functions answers for an activity ARN no activity answers to
+/// (`ActivityDoesNotExist`: "The specified activity does not exist").
+const ACTIVITY_DOES_NOT_EXIST: &str = "ActivityDoesNotExist";
+
+/// Create the activity an `AWS::StepFunctions::Activity` declares, so a client that
+/// deployed the stack and then calls `sfn DescribeActivity` with the ARN the stack
+/// publishes reads the activity back rather than an `ActivityDoesNotExist`.
+///
+/// `Ref` of this type returns the activity's ARN, which is this resource's physical id, and
+/// an activity ARN is a total function of the Region and the NAME — so the activity is
+/// created under the name CloudFormation decided and the ARN Step Functions answers with is
+/// the one the stack already computed. It is reported back as the resource's `Arn`
+/// attribute all the same, so the handle the stack publishes is the one that service really
+/// minted.
+///
+/// The type's two remaining properties are `CreateActivity`'s own members: the
+/// `EncryptionConfiguration`, whose members Step Functions spells in lower camel case, and
+/// the `Tags` list — carrying the tags the declaration asks for plus the ones
+/// CloudFormation gives the resource ([`tags_of`]), as the list that model's own `Tag` shape
+/// spells, so `sfn ListTagsForResource` on the ARN the stack publishes answers with the
+/// stack's tags and the `aws:cloudformation:*` ones.
+async fn create_activity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "name".to_string(),
+        Value::String(activity_name(resource)),
+    );
+    if let Some(configuration) = resource.properties.get("EncryptionConfiguration") {
+        request.insert(
+            "encryptionConfiguration".to_string(),
+            lower_camel_members(configuration, 0)?,
+        );
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
+    }
+    let answered = call_sfn(ctx, region, "CreateActivity", &Value::Object(request)).await?;
+    let arn = answered
+        .get("activityArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "AWS Step Functions answered CreateActivity without an activityArn"
+                .to_string(),
+        })?;
+
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn.to_string());
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the activity a stack created, addressed by its ARN — this resource's physical id,
+/// which is what `Ref` returns for the type.
+///
+/// `DeleteActivity` models no does-not-exist error at all: an activity Step Functions no
+/// longer holds is already in the state the delete asks for, and the call says so itself.
+async fn delete_activity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "activityArn": physical_resource_id });
+    call_sfn(ctx, region, "DeleteActivity", &request).await?;
+    Ok(())
+}
+
+/// The activity's configuration as Step Functions reports it, for drift detection. One it
+/// no longer holds (`ActivityDoesNotExist`, judged on the CODE and never on a message that
+/// carries the request's own ARN) was deleted.
+///
+/// The one property its read reports is the activity's `Name`; an activity holds no other
+/// configuration that `DescribeActivity` answers under a name this type declares — the
+/// encryption settings it reports are spelled in that service's own member names, and a
+/// property the read does not report is not evidence of anything ([`super::drift`]).
+async fn describe_activity(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "activityArn": physical_resource_id });
+    match call_sfn(ctx, region, "DescribeActivity", &request).await {
+        Ok(answer) => Ok(Some(reported_as_properties(&answer, &[("Name", "name")]))),
+        Err(refusal) if refusal.code == ACTIVITY_DOES_NOT_EXIST => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The NAME of the activity a resource record describes: the `Name` its type's published
+/// return values carry, which is the name the template asked for or the
+/// `<stack>-<logical id>-<suffix>` name CloudFormation generated — never the physical id,
+/// which for this type is the activity's ARN.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to the
+/// last segment of that ARN, which is the activity's name.
+fn activity_name(resource: &StoredResource) -> String {
+    if let Some(name) = resource.attributes.get("Name") {
+        return name.clone();
+    }
+    resource
+        .physical_resource_id
+        .rsplit(':')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Call one AWS Step Functions operation on the awsJson1_0 wire its model declares.
+async fn call_sfn(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        SFN_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{SFN_TARGET_PREFIX}.{operation}"),
         request,
     )
     .await

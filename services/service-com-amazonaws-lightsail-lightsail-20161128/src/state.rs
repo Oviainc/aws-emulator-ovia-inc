@@ -407,14 +407,31 @@ impl DueNamedState {
 ///
 /// A Lightsail managed database is an Amazon RDS DB instance, and the member
 /// carries RDS's own DB instance status values: `creating` while the instance is
-/// being provisioned, `available` once it accepts connections, and `rebooting`
-/// while its engine is being restarted (Amazon RDS User Guide, "Viewing DB
+/// being provisioned, `available` once it accepts connections, `rebooting`
+/// while its engine is being restarted, `stopping` while it is being shut down,
+/// `stopped` once it is shut down and accepts no connection, and `starting`
+/// while it is being brought back up (Amazon RDS User Guide, "Viewing DB
 /// instance status").
 pub const RELATIONAL_DATABASE_STATE_CREATING: &str = "creating";
 /// See [`RELATIONAL_DATABASE_STATE_CREATING`].
 pub const RELATIONAL_DATABASE_STATE_AVAILABLE: &str = "available";
 /// See [`RELATIONAL_DATABASE_STATE_CREATING`].
 pub const RELATIONAL_DATABASE_STATE_REBOOTING: &str = "rebooting";
+/// See [`RELATIONAL_DATABASE_STATE_CREATING`].
+pub const RELATIONAL_DATABASE_STATE_STOPPING: &str = "stopping";
+/// See [`RELATIONAL_DATABASE_STATE_CREATING`].
+pub const RELATIONAL_DATABASE_STATE_STOPPED: &str = "stopped";
+/// See [`RELATIONAL_DATABASE_STATE_CREATING`].
+pub const RELATIONAL_DATABASE_STATE_STARTING: &str = "starting";
+
+/// How long a managed relational database may stay stopped before the service
+/// starts it again on its own.
+///
+/// An AWS DURATION, kept at the published value rather than chosen: "If you
+/// don't manually start your database instance after it has been stopped for
+/// seven consecutive days, Amazon Lightsail automatically starts it for you"
+/// (the modelled `StopRelationalDatabase` documentation).
+pub const RELATIONAL_DATABASE_AUTO_START_AFTER_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// `RelationalDatabaseSnapshot$state` values this slice uses — "The state of the
 /// database snapshot", a plain string in the model with no enum behind it.
@@ -485,6 +502,10 @@ pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
     "UpdateRelationalDatabaseParameters";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_REBOOT_RELATIONAL_DATABASE: &str = "RebootRelationalDatabase";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_START_RELATIONAL_DATABASE: &str = "StartRelationalDatabase";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_STOP_RELATIONAL_DATABASE: &str = "StopRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -5502,8 +5523,11 @@ pub struct StoredRelationalDatabase {
     /// reports the same one. See [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
     pub endpoint_address: String,
     /// The current state: [`RELATIONAL_DATABASE_STATE_CREATING`],
-    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`] or
-    /// [`RELATIONAL_DATABASE_STATE_REBOOTING`].
+    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`],
+    /// [`RELATIONAL_DATABASE_STATE_REBOOTING`],
+    /// [`RELATIONAL_DATABASE_STATE_STOPPING`],
+    /// [`RELATIONAL_DATABASE_STATE_STOPPED`] or
+    /// [`RELATIONAL_DATABASE_STATE_STARTING`].
     pub state: &'static str,
     /// The state the clock owes this database, while one is outstanding.
     pub due: Option<DueNamedState>,
@@ -5588,7 +5612,47 @@ impl StoredRelationalDatabase {
         ));
     }
 
-    /// The engine has (re)started after a `RebootRelationalDatabase` call, so
+    /// Start shutting this database's engine down: the database reports
+    /// [`RELATIONAL_DATABASE_STATE_STOPPING`] and the clock owes it
+    /// [`RELATIONAL_DATABASE_STATE_STOPPED`].
+    ///
+    /// Stopping happens INSIDE the database, exactly as a restart does: nothing
+    /// else on the record is rewritten, the master endpoint included — an RDS DB
+    /// instance keeps its endpoint while it is stopped, which is what lets the
+    /// same address serve again once it is started.
+    ///
+    /// PRECONDITION: the database has no transition outstanding. A stop is
+    /// accepted only in [`RELATIONAL_DATABASE_STATE_AVAILABLE`], the one state
+    /// where nothing is owed, so the `due` written here replaces none.
+    pub fn begin_stop(&mut self, now_ms: i64) {
+        self.state = RELATIONAL_DATABASE_STATE_STOPPING;
+        self.due = Some(DueNamedState::after(
+            now_ms,
+            RELATIONAL_DATABASE_STATE_STOPPED,
+        ));
+    }
+
+    /// Start this database's engine back up: the database reports
+    /// [`RELATIONAL_DATABASE_STATE_STARTING`] and the clock owes it
+    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`].
+    ///
+    /// Starting re-provisions nothing — the record is the one the database had
+    /// while it was stopped, the master endpoint a client connects to above all.
+    ///
+    /// The `due` written here REPLACES the one a stopped database carries: the
+    /// service's own seven-day automatic start
+    /// ([`RELATIONAL_DATABASE_AUTO_START_AFTER_MILLIS`]) is what this call does
+    /// by hand, so it is no longer owed once the caller has asked for it.
+    pub fn begin_start(&mut self, now_ms: i64) {
+        self.state = RELATIONAL_DATABASE_STATE_STARTING;
+        self.due = Some(DueNamedState::after(
+            now_ms,
+            RELATIONAL_DATABASE_STATE_AVAILABLE,
+        ));
+    }
+
+    /// The engine has (re)started — after a `RebootRelationalDatabase` call, or
+    /// after a `StartRelationalDatabase` brought a stopped database back up — so
     /// every parameter value that was waiting for a restart is now loaded by it:
     /// "Parameters marked with a pending-reboot apply type are applied only
     /// after the database is rebooted using the reboot relational database
@@ -8306,6 +8370,25 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.relational_database_snapshots.get(name)
     }
 
+    /// The message a request that would take this store past
+    /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`] is refused with, or `None` when
+    /// there is room for one more snapshot.
+    ///
+    /// The ONE place that bound is checked, so every operation that creates a
+    /// managed relational database snapshot — `CreateRelationalDatabaseSnapshot`,
+    /// `StopRelationalDatabase`'s pre-stop snapshot and
+    /// `DeleteRelationalDatabase`'s final one — refuses at the same count with
+    /// the same wording. Each lifts it into its own modelled
+    /// `InvalidInputException`.
+    pub fn relational_database_snapshot_capacity_refusal(&self) -> Option<String> {
+        (self.relational_database_snapshots.len() >= MAX_RELATIONAL_DATABASE_SNAPSHOTS).then(|| {
+            format!(
+                "creating a relational database snapshot would take this account past \
+                 the {MAX_RELATIONAL_DATABASE_SNAPSHOTS} this emulator holds"
+            )
+        })
+    }
+
     /// Store a newly created managed relational database snapshot.
     pub fn insert_relational_database_snapshot(
         &mut self,
@@ -8319,9 +8402,10 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// store it and answer the record that was stored.
     ///
     /// The ONE place a database snapshot is built, whichever call asks for it —
-    /// `CreateRelationalDatabaseSnapshot` on its own, or the final snapshot a
-    /// `DeleteRelationalDatabase` takes before it removes the database — so both
-    /// report the same copy of the same source.
+    /// `CreateRelationalDatabaseSnapshot` on its own, the pre-stop snapshot a
+    /// `StopRelationalDatabase` takes before it shuts the engine down, or the
+    /// final snapshot a `DeleteRelationalDatabase` takes before it removes the
+    /// database — so all of them report the same copy of the same source.
     ///
     /// Everything the snapshot says about its SOURCE — and the master database
     /// name and credentials a later `CreateRelationalDatabaseFromSnapshot`
@@ -8846,15 +8930,43 @@ impl ComAmazonawsLightsailLightsail20161128State {
         for database in self.relational_databases.values_mut() {
             let Some(due) = database.due else { continue };
             if due.at_ms <= now_ms {
-                let restarting = database.state == RELATIONAL_DATABASE_STATE_REBOOTING;
+                // The states whose engine is DOWN and coming back up: one being
+                // restarted, and one being started again after a stop.
+                let engine_coming_up = database.state == RELATIONAL_DATABASE_STATE_REBOOTING
+                    || database.state == RELATIONAL_DATABASE_STATE_STARTING;
                 database.state = due.state;
                 database.due = None;
-                // A database that has come back up from a restart has an engine
-                // that read its whole parameter group as it started, so this is
-                // the instant a value applied `pending-reboot` is loaded — the
-                // one thing a reboot changes about the record.
-                if restarting && database.state == RELATIONAL_DATABASE_STATE_AVAILABLE {
+                // A database that has come back up has an engine that read its
+                // whole parameter group as it started, so this is the instant a
+                // value applied `pending-reboot` is loaded — the one thing a
+                // reboot changes about the record.
+                if engine_coming_up && database.state == RELATIONAL_DATABASE_STATE_AVAILABLE {
                     database.load_pending_parameters();
+                }
+                // A database that has finished shutting down is owed one more
+                // transition, the service's own: "If you don't manually start
+                // your database instance after it has been stopped for seven
+                // consecutive days, Amazon Lightsail automatically starts it for
+                // you" (the modelled `StopRelationalDatabase` documentation).
+                // It takes the same two steps a caller's `StartRelationalDatabase`
+                // takes — `starting`, then serving — and
+                // `StartRelationalDatabase` replaces this `due` when a caller
+                // starts the database first.
+                if database.state == RELATIONAL_DATABASE_STATE_STOPPED {
+                    database.due = Some(DueNamedState {
+                        at_ms: due
+                            .at_ms
+                            .saturating_add(RELATIONAL_DATABASE_AUTO_START_AFTER_MILLIS),
+                        state: RELATIONAL_DATABASE_STATE_STARTING,
+                    });
+                } else if database.state == RELATIONAL_DATABASE_STATE_STARTING {
+                    // The automatic start's second step: a start a CALLER made
+                    // owes `available` from the handler, so the only database
+                    // that settles INTO `starting` is one the clock started.
+                    database.due = Some(DueNamedState::after(
+                        due.at_ms,
+                        RELATIONAL_DATABASE_STATE_AVAILABLE,
+                    ));
                 }
             }
         }

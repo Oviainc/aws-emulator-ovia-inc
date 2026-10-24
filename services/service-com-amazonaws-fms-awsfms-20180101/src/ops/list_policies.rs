@@ -6,6 +6,11 @@
 //! stable `PolicyId` order the store keeps them in. A REPORTING operation: it
 //! writes nothing.
 //!
+//! Policy management is organisation-scoped, so with no Firewall Manager
+//! administrator association in the account/Region the read is refused by
+//! [`crate::state::require_administrator`] before the store's contents are
+//! reported and before the request's `NextToken` is examined.
+//!
 //! Paging follows the model's `@paginated(inputToken: NextToken, outputToken:
 //! NextToken, items: PolicyList, pageSize: MaxResults)`: at most `MaxResults`
 //! summaries per page, and a `NextToken` ONLY when policies remain after the
@@ -171,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListPoliciesErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -180,6 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        let store = state.lock();
+        // The authorization gate, BEFORE any member of the request is examined
+        // and before any of the store's contents is reported, so a bad
+        // `NextToken` and a well-formed request get the same refusal from an
+        // unauthorized caller — and an empty page cannot be mistaken for "you are
+        // not the administrator".
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
 
         // A token this service did not mint names no page boundary. The model
         // declares no client-input error for ListPolicies, so refuse it as a bad
@@ -196,7 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let store = state.lock();
         // `policies` is ordered by PolicyId, so the boundary is a key: resume at
         // the first id at or after the token's. With no token the lower bound is
         // the empty id, which sorts before every PolicyId.

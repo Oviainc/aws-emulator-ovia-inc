@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceServer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceServer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceServer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores an OAuth 2.0 resource server in a stored user pool, keyed by its
+//! `Identifier`, and returns the STORED resource server, so a later
+//! `DescribeResourceServer` renders the same resource. An identifier the pool
+//! already holds is refused with `InvalidParameterException`; an unknown
+//! `UserPoolId` with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +170,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceServer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceServerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceServer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let pool_id = pool.id.clone();
+        // This emulator holds a pool's resource servers in memory, so the store
+        // is bounded; read before the slot is borrowed below.
+        let stored_count = pool.resource_servers.len();
+
+        match pool.resource_servers.entry(input.identifier.clone()) {
+            // "A unique resource server identifier for the resource server"
+            // (`CreateResourceServer.Identifier`) — an identifier the pool
+            // already holds is refused, and the stored resource server is left
+            // exactly as it was. The model declares no "already exists" error
+            // for this operation, so a taken identifier is an invalid parameter.
+            ::std::collections::btree_map::Entry::Occupied(_) => Err(invalid_parameter(format!(
+                "{} already exists in user pool {}.",
+                input.identifier, input.user_pool_id
+            ))),
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                if stored_count >= crate::state::MAX_RESOURCE_SERVERS_PER_POOL {
+                    return Err(limit_exceeded(format!(
+                        "User pool {} holds at most {} resource servers.",
+                        input.user_pool_id,
+                        crate::state::MAX_RESOURCE_SERVERS_PER_POOL
+                    )));
+                }
+
+                // Stored first, then rendered from the stored record, so the
+                // response is exactly what a later read sees.
+                let stored = slot.insert(crate::state::ResourceServer {
+                    user_pool_id: pool_id,
+                    identifier: input.identifier.clone(),
+                    name: input.name.clone(),
+                    // A request that sets no `Scopes` creates a resource server
+                    // with no custom scopes: an empty scope list, not an absent
+                    // one.
+                    scopes: input.scopes.clone().unwrap_or_default(),
+                });
+                Ok(CreateResourceServerOutput {
+                    resource_server: stored.to_resource_server_type(),
+                })
+            }
+        }
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateResourceServerError {
+    CreateResourceServerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for an identifier the pool holds.
+fn invalid_parameter(message: String) -> CreateResourceServerError {
+    CreateResourceServerErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a store at its bound.
+fn limit_exceeded(message: String) -> CreateResourceServerError {
+    CreateResourceServerErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateResourceServerError {
+    CreateResourceServerErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

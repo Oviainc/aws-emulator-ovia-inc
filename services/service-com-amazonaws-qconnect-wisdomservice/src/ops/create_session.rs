@@ -433,6 +433,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A session runs inside its assistant, so it starts from the assistant's own
+        // configuration: the AI agent bound per `AIAgentType` and the topic the assistant
+        // streams chat messages through. What the create names for the session itself
+        // overlays that, per AI agent type, and is stored exactly as given — a caller
+        // that pinned a version keeps the id it pinned.
+        let mut ai_agent_configuration = assistant.ai_agent_configuration.clone();
+        if let Some(configured) = input.ai_agent_configuration.clone() {
+            ai_agent_configuration.extend(configured);
+        }
+        let topic_integration_arn = assistant.topic_integration_arn.clone();
+
         let Some(session_id) = assistant.mint_session_id(seq) else {
             return Err(CreateSessionErrorModeled::ValidationException(
                 ValidationException {
@@ -451,7 +462,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             tag_filter: input.tag_filter.clone(),
-            ai_agent_configuration: input.ai_agent_configuration.clone().unwrap_or_default(),
+            ai_agent_configuration,
+            topic_integration_arn,
+            orchestrator_configuration_list: input
+                .orchestrator_configuration_list
+                .clone()
+                .unwrap_or_default(),
             contact_arn: input.contact_arn.clone(),
             origin: crate::state::SESSION_ORIGIN_CUSTOMER.to_string(),
             created_at: now,

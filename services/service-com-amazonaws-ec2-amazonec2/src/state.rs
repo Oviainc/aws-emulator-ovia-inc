@@ -15741,13 +15741,7 @@ pub fn decide_transit_gateway_route_table_propagation<E>(
     let attachment = store
         .transit_gateway_attachments
         .get(&attachment_id)
-        .ok_or_else(|| {
-            id_not_found(
-                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
-                "transit gateway attachment ID",
-                &attachment_id,
-            )
-        })?;
+        .ok_or_else(|| invalid_transit_gateway_attachment_id_not_found(&attachment_id))?;
     let resource_id = attachment.view.resource_id().map(str::to_string);
     let resource_type = attachment.view.resource_type();
     let key = (route_table_id.to_string(), attachment_id.clone());
@@ -17311,11 +17305,7 @@ pub fn associate_transit_gateway_policy_table<E>(
         .transit_gateway_attachments
         .get(transit_gateway_attachment_id)
         .ok_or_else(|| {
-            id_not_found(
-                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
-                "transit gateway attachment ID",
-                transit_gateway_attachment_id,
-            )
+            invalid_transit_gateway_attachment_id_not_found(transit_gateway_attachment_id)
         })?;
     let resource_id = attachment.view.resource_id().map(str::to_string);
     let resource_type = attachment.view.resource_type().to_string();
@@ -17618,13 +17608,7 @@ pub fn decide_transit_gateway_attachment<E>(
         .transit_gateway_attachments
         .get_mut(attachment_id)
         .filter(|record| record.view.resource_type() == resource_type)
-        .ok_or_else(|| {
-            id_not_found(
-                INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
-                "transit gateway attachment ID",
-                attachment_id,
-            )
-        })?;
+        .ok_or_else(|| invalid_transit_gateway_attachment_id_not_found(attachment_id))?;
     let states = record.view.states();
     if record.view.state() != Some(states.pending_acceptance) {
         return Err(incorrect_state(format!(
@@ -17651,6 +17635,29 @@ pub fn unexpected_attachment_kind<E>(attachment_id: &str) -> Scaffolded<E> {
         "the attachment '{attachment_id}' resolved a moment ago is not of the kind this \
          operation acts on"
     ))
+}
+
+/// The `ResourceType` an attachment is tagged and ARN'd under — the `transit-gateway-attachment`
+/// member of that enum (`smithy_query(query="shape",shape="ResourceType")`) — which is also how
+/// EC2's refusal below spells this resource kind, exactly as
+/// [`RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION`] does for its own resource. A PER-RESOURCE
+/// spelling, not a blanket one: other resources of this service word the same refusal in prose
+/// ("The security group '…' does not exist", "The launch template ID '…' does not exist"), so each
+/// keeps the wording its own evidence shows.
+pub const RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT: &str = "transit-gateway-attachment";
+
+/// Refuse a well-formed transit gateway attachment id this account holds no attachment for:
+/// HTTP 400 [`INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND`], worded by the one writer of
+/// that refusal ([`id_not_found`]).
+///
+/// The ONE place this refusal is built, so every operation that resolves an attachment id —
+/// whichever kind of attachment it acts on — answers an unknown id identically.
+pub fn invalid_transit_gateway_attachment_id_not_found<E>(attachment_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
+        &format!("{RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT} ID"),
+        attachment_id,
+    )
 }
 
 // =============================================================================

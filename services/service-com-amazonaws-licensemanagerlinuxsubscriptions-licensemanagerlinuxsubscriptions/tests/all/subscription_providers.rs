@@ -18,17 +18,18 @@
 //!
 //! The registrations these tests read are seeded into the store directly
 //! ([`harness::seed_provider`]) because their rules are about the read, list, page and
-//! deregister side of registrations in an ACCEPTED (`ACTIVE`) state, which
-//! `RegisterSubscriptionProvider` cannot produce in this emulator: validating a provider
-//! access token needs trust material it does not hold, so a registration it creates
-//! settles `INVALID`. The create path itself — and the statuses it does report — is
-//! covered by `tests/all/subscription_provider_registration.rs`.
+//! deregister side of registrations that are already usable (`ACTIVE`):
+//! `RegisterSubscriptionProvider` creates one over the wire and it becomes `ACTIVE` on the
+//! clock, so a suite about paging would otherwise wait out that span. The create path
+//! itself — and the statuses it reports — is covered by
+//! `tests/all/subscription_provider_registration.rs` and
+//! `tests/all/provider_status_transition.rs`.
 
 use serde_json::{json, Value};
 
 use crate::harness::{
-    call_in_region, deregister, get_provider, get_settings, harness, list_providers, listed,
-    seed_provider, update_settings, ACTIVE, RED_HAT, REGION,
+    call_in_region, deregister, get_provider, get_settings, harness, is_iso8601_utc,
+    list_providers, listed, seed_provider, update_settings, ACTIVE, RED_HAT, REGION,
 };
 
 /// Secret ARNs spanning the modelled `SecretArn` grammar
@@ -87,17 +88,26 @@ async fn every_stored_registration_is_read_back_by_get_and_list() {
                 "case {case:?}: expected {member} {want:?}, got {body:?}"
             );
         }
-        // Nothing was retrieved from the third-party provider and nothing is wrong with
-        // the token, so neither member is invented.
-        for absent in [
-            "SubscriptionProviderStatusMessage",
-            "LastSuccessfulDataRetrievalTime",
-        ] {
-            assert!(
-                body.get(absent).is_none_or(Value::is_null),
-                "case {case:?}: expected no {absent}, got {body:?}"
-            );
-        }
+        // A usable registration has nothing to report about its token, and reports the
+        // subscription data retrieval its status is about.
+        assert!(
+            body.get("SubscriptionProviderStatusMessage")
+                .is_none_or(Value::is_null),
+            "case {case:?}: expected no SubscriptionProviderStatusMessage, got {body:?}"
+        );
+        let retrieved = body
+            .get("LastSuccessfulDataRetrievalTime")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: an {ACTIVE} registration must report a \
+                     LastSuccessfulDataRetrievalTime, got {body:?}"
+                )
+            });
+        assert!(
+            is_iso8601_utc(retrieved),
+            "case {case:?}: expected an ISO-8601 UTC retrieval time, got {retrieved:?}"
+        );
     }
 
     // The list reports every registration, only those, in registration order.

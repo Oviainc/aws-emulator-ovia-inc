@@ -279,8 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             account_id: detail.account_id.clone(),
                             email: detail.email.clone(),
                             // No invitation has been sent yet: `InviteMembers` is
-                            // what moves the relationship on from here.
+                            // what moves the relationship on from here, and what
+                            // records the instant it sent one.
                             relationship_status: crate::state::RELATIONSHIP_CREATED.to_string(),
+                            invited_at_millis: None,
                             updated_at_millis: now,
                         },
                     );

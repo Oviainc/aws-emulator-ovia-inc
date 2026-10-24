@@ -21,6 +21,12 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Writes the PDF report documents this service's data plane serves, so a report
+# document is produced by a PDF writer rather than hand-assembled bytes.
+pdf-writer = "0.13"
+# RFC 3986 percent-encoding for the `termToken` the announced document URL carries, so the
+# URL is well formed for every token the model's `TermToken` admits.
+percent-encoding = "2"
 # Digests the `clientToken` idempotency record fingerprints a create request with, and
 # seals the opaque `nextToken` pagination cursors in `src/state.rs`.
 sha2 = { workspace = true }

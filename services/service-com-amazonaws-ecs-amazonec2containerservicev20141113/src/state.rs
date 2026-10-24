@@ -2826,6 +2826,93 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 .is_some_and(|cluster| cluster.status != CLUSTER_INACTIVE),
         )
     }
+
+    /// The tag set stored on the resource `resource_arn` names, or `None` when this store
+    /// holds no resource of that kind with that ARN.
+    ///
+    /// The resource's OWN `tags` — the list its create was given and its describe reports
+    /// — is the one tag set this service holds, so whoever writes it (this service's own
+    /// create, or a cross-service tagging call reaching into these records) and whoever
+    /// reads it see the same list, with no second copy to drift from it.
+    ///
+    /// Each kind is keyed by something other than its ARN, so the scan is over the ONE
+    /// map that kind lives in rather than over every map.
+    pub fn resource_tags(&self, kind: TaggedResourceKind, resource_arn: &str) -> Option<&[Tag]> {
+        match kind {
+            TaggedResourceKind::CapacityProvider => self
+                .capacity_providers
+                .values()
+                .find(|provider| provider.arn == resource_arn)
+                .map(|provider| provider.tags.as_slice()),
+            TaggedResourceKind::Cluster => self
+                .clusters
+                .values()
+                .find(|cluster| cluster.arn == resource_arn)
+                .map(|cluster| cluster.tags.as_slice()),
+            TaggedResourceKind::ContainerInstance => self
+                .container_instances
+                .values()
+                .find(|instance| instance.arn == resource_arn)
+                .map(|instance| instance.tags.as_slice()),
+            TaggedResourceKind::Service => self
+                .services
+                .values()
+                .find(|service| service.arn == resource_arn)
+                .map(|service| service.tags.as_slice()),
+            TaggedResourceKind::Task => self
+                .tasks
+                .values()
+                .find(|task| task.task_arn == resource_arn)
+                .map(|task| task.tags.as_slice()),
+            TaggedResourceKind::TaskDefinition => self
+                .task_definitions
+                .values()
+                .find(|definition| definition.arn == resource_arn)
+                .map(|definition| definition.tags.as_slice()),
+        }
+    }
+
+    /// The tag set stored on the resource `resource_arn` names, for a caller that is
+    /// about to CHANGE it — the same resolution as [`Self::resource_tags`], so a write
+    /// and a read of one resource's tags reach the same list.
+    pub fn resource_tags_mut(
+        &mut self,
+        kind: TaggedResourceKind,
+        resource_arn: &str,
+    ) -> Option<&mut Vec<Tag>> {
+        match kind {
+            TaggedResourceKind::CapacityProvider => self
+                .capacity_providers
+                .values_mut()
+                .find(|provider| provider.arn == resource_arn)
+                .map(|provider| &mut provider.tags),
+            TaggedResourceKind::Cluster => self
+                .clusters
+                .values_mut()
+                .find(|cluster| cluster.arn == resource_arn)
+                .map(|cluster| &mut cluster.tags),
+            TaggedResourceKind::ContainerInstance => self
+                .container_instances
+                .values_mut()
+                .find(|instance| instance.arn == resource_arn)
+                .map(|instance| &mut instance.tags),
+            TaggedResourceKind::Service => self
+                .services
+                .values_mut()
+                .find(|service| service.arn == resource_arn)
+                .map(|service| &mut service.tags),
+            TaggedResourceKind::Task => self
+                .tasks
+                .values_mut()
+                .find(|task| task.task_arn == resource_arn)
+                .map(|task| &mut task.tags),
+            TaggedResourceKind::TaskDefinition => self
+                .task_definitions
+                .values_mut()
+                .find(|definition| definition.arn == resource_arn)
+                .map(|definition| &mut definition.tags),
+        }
+    }
 }
 
 /// What one pass over the task map and one over the service map count for a cluster:
@@ -3551,6 +3638,144 @@ pub fn validate_capacity_provider_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// One kind of Amazon ECS resource that carries its OWN tag set, and so can be named by
+/// a tagging operation's `resourceArn`.
+///
+/// The kinds are the ones those members document — `ListTagsForResource$resourceArn`:
+/// "the supported resources are Amazon ECS tasks, services, task definitions, clusters,
+/// and container instances", and `TagResource$resourceArn`, which adds the capacity
+/// provider — and each one's ARN form is the one the builder named on its variant emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResourceKind {
+    /// [`capacity_provider_arn`].
+    CapacityProvider,
+    /// [`cluster_arn`].
+    Cluster,
+    /// [`container_instance_arn`].
+    ContainerInstance,
+    /// [`service_arn`].
+    Service,
+    /// [`task_arn`].
+    Task,
+    /// [`task_definition_arn`].
+    TaskDefinition,
+}
+
+/// The ARN resource-type segment each taggable kind carries, as that kind's ARN builder
+/// in this module spells it. The segments are the catalog [`TaggedResourceKind::from_arn`]
+/// resolves an ARN against, and the list a refusal names.
+pub const TAGGED_RESOURCE_TYPES: [(&str, TaggedResourceKind); 6] = [
+    ("capacity-provider", TaggedResourceKind::CapacityProvider),
+    ("cluster", TaggedResourceKind::Cluster),
+    ("container-instance", TaggedResourceKind::ContainerInstance),
+    ("service", TaggedResourceKind::Service),
+    ("task", TaggedResourceKind::Task),
+    ("task-definition", TaggedResourceKind::TaskDefinition),
+];
+
+/// Which MODELLED error a "this `resourceArn` names no such resource" refusal takes.
+///
+/// Spelled as a kind rather than as one operation's error enum, so every operation that
+/// resolves a `resourceArn` refuses the same ARN with the same error code and the same
+/// sentence, whichever of them the client called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRefusal {
+    /// `ClusterNotFoundException` — the refusal ECS models for a cluster that is not
+    /// there, and the one every operation in this crate answers for that condition.
+    ClusterNotFound,
+    /// `ClientException`.
+    Client,
+    /// `InvalidParameterException`.
+    InvalidParameter,
+}
+
+impl TaggedResourceKind {
+    /// The kind `resource_arn` names, or `None` when it is not the ARN of a taggable
+    /// Amazon ECS resource at all — a value in another service's namespace, a malformed
+    /// ARN, or an ECS resource that carries no tag set of its own.
+    ///
+    /// The KIND is read from the resource type alone. The partition, Region and account
+    /// are part of the resource's IDENTITY, not of its kind, and the lookups above
+    /// compare a whole ARN against the whole ARN the record stores (which carries the
+    /// serving Region and account) — so an ECS ARN of another partition, Region or
+    /// account names a resource of a known kind that this store does not hold, and earns
+    /// that kind's own not-found refusal rather than being called a malformed parameter.
+    pub fn from_arn(resource_arn: &str) -> Option<Self> {
+        // `arn:<partition>:ecs:<region>:<account>:<resource>`. The resource is the LAST
+        // field, so it keeps any colon of its own (a task definition's revision).
+        let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
+        if fields.len() != 6 || fields[0] != "arn" || fields[2] != ARN_NAMESPACE {
+            return None;
+        }
+        let resource_type = fields[5].split('/').next().unwrap_or_default();
+        TAGGED_RESOURCE_TYPES
+            .iter()
+            .find(|(segment, _)| *segment == resource_type)
+            .map(|(_, kind)| *kind)
+    }
+
+    /// The refusal a `resourceArn` of this kind earns when the store holds no such
+    /// resource: the modelled error it takes and the sentence that error carries.
+    ///
+    /// Each sentence is the one this crate already answers wherever that kind fails to
+    /// resolve, so "this ARN names no cluster" reads the same from a tagging operation as
+    /// from a describe.
+    pub fn not_found_refusal(self, resource_arn: &str) -> (ResourceRefusal, String) {
+        match self {
+            Self::Cluster => (
+                ResourceRefusal::ClusterNotFound,
+                CLUSTER_NOT_FOUND_MESSAGE.to_string(),
+            ),
+            Self::TaskDefinition => (
+                ResourceRefusal::Client,
+                TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string(),
+            ),
+            Self::Service => (
+                ResourceRefusal::InvalidParameter,
+                SERVICE_NOT_FOUND_MESSAGE.to_string(),
+            ),
+            Self::Task => (
+                ResourceRefusal::InvalidParameter,
+                TASK_NOT_FOUND_MESSAGE.to_string(),
+            ),
+            Self::ContainerInstance => (
+                ResourceRefusal::InvalidParameter,
+                container_instance_not_found_message(resource_arn),
+            ),
+            Self::CapacityProvider => (
+                ResourceRefusal::InvalidParameter,
+                resource_not_found_message(resource_arn),
+            ),
+        }
+    }
+}
+
+/// The `message` a refusal carries for a `resourceArn` that names no resource of a kind
+/// this crate holds no sentence of its own for: the `ResourceNotFoundException` doc
+/// sentence ("The specified resource wasn't found.") with the ARN the request named, so
+/// a caller can tell which ARN was rejected.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("The specified resource wasn't found: {resource_arn}")
+}
+
+/// `InvalidParameterException$message` for a `resourceArn` that is not the ARN of a
+/// taggable Amazon ECS resource ([`TaggedResourceKind::from_arn`] answers `None`).
+///
+/// DERIVED from the request, like the other reference refusals in this module: it names
+/// the member, the resource types the member accepts ([`TAGGED_RESOURCE_TYPES`]) and the
+/// value that is none of them.
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
+    let kinds: Vec<&str> = TAGGED_RESOURCE_TYPES
+        .iter()
+        .map(|(segment, _)| *segment)
+        .collect();
+    format!(
+        "resourceArn must be an Amazon ECS resource ARN naming one of {}; got \
+         {resource_arn:?}",
+        kinds.join(", ")
+    )
 }
 
 /// The refusal a launch earns when its `networkConfiguration` does not agree with the

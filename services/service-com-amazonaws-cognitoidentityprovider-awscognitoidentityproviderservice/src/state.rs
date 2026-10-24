@@ -19,7 +19,8 @@ use crate::ops::types::{
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType, CustomDomainConfigType,
     DeviceConfigurationType, DomainDescriptionType, EmailConfigurationType, GroupType,
     IssuerConfigurationType, KeyConfigurationType, LambdaConfigType, MFAOptionType,
-    NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType, RoutingType,
+    NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
+    ResourceServerScopeType, ResourceServerType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
     TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserPoolAddOnsType,
     UserPoolClientType, UserPoolPolicyType, UserPoolType, UserType, UsernameConfigurationType,
@@ -244,6 +245,9 @@ pub const MAX_USERS_PER_POOL: usize = 10_000;
 
 /// The most groups one user pool holds.
 pub const MAX_GROUPS_PER_POOL: usize = 1_000;
+
+/// The most resource servers one user pool holds.
+pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
 
 /// The most unexpired challenge sessions this emulator holds; the oldest are
 /// evicted past it.
@@ -592,6 +596,11 @@ pub struct UserPool {
     /// stable. `GroupNameType` carries no case-insensitivity trait, so a name is
     /// matched exactly as it was created.
     pub groups: BTreeMap<String, Group>,
+    /// This pool's OAuth 2.0 resource servers keyed by their `Identifier`,
+    /// ordered so a read of several is stable. `ResourceServerIdentifierType`
+    /// carries no case-insensitivity trait, so an identifier is matched exactly
+    /// as it was created.
+    pub resource_servers: BTreeMap<String, ResourceServer>,
     /// The key pair this pool's tokens are signed with and whose public half
     /// its key set publishes, minted with the pool and kept for its lifetime,
     /// so every token the pool ever issued stays verifiable against the key set
@@ -1198,6 +1207,30 @@ impl Group {
     }
 }
 
+/// One stored OAuth 2.0 resource server of a user pool: what
+/// `CreateResourceServer` stored and every later read of it renders.
+#[derive(Debug, Clone)]
+pub struct ResourceServer {
+    pub user_pool_id: String,
+    pub identifier: String,
+    pub name: String,
+    /// The custom scopes of this resource server, in the order they were
+    /// submitted. A resource server created with no `Scopes` holds none.
+    pub scopes: Vec<ResourceServerScopeType>,
+}
+
+impl ResourceServer {
+    /// The modelled view of this resource server, rendered from what is stored.
+    pub fn to_resource_server_type(&self) -> ResourceServerType {
+        ResourceServerType {
+            user_pool_id: Some(self.user_pool_id.clone()),
+            identifier: Some(self.identifier.clone()),
+            name: Some(self.name.clone()),
+            scopes: Some(self.scopes.clone()),
+        }
+    }
+}
+
 /// A challenge session: what a `RespondToAuthChallenge` for this session resumes.
 #[derive(Debug, Clone)]
 pub struct AuthSession {
@@ -1511,6 +1544,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         clients: HashMap::new(),
         users: HashMap::new(),
         groups: BTreeMap::new(),
+        resource_servers: BTreeMap::new(),
         // A pool's token-signing key exists from the moment the pool does, as
         // on AWS, so its key set is publishable before anything signs in. One
         // scalar multiplication, so creating a pool waits on nothing.

@@ -35,6 +35,8 @@ mod error_messages;
 mod list_services;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/service_lifecycle.rs"]
 mod service_lifecycle;
 #[path = "all/service_projection.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJobUnlockCode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJobUnlockCode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJobUnlockCode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The unlock code of one job: the credential `GetJobUnlockCode` reports, read out of the
+//! record this service minted when the job was created — this is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +145,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJobUnlockCode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobUnlockCodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJobUnlockCode"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // A pure read: the unlock code was minted with the job, so reporting it moves
+        // nothing a later caller sees.
+        let store = state.lock();
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(GetJobUnlockCodeErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job ID {} can't be found. Check the information you provided in \
+                         your last request, and try again.",
+                        input.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The unlock code is what "is used to decrypt the manifest file when it is passed
+        // along with the manifest to the Snow device", so it belongs to a job that HAS a
+        // device. "Main jobs aren't associated with any Snowballs. Instead, each main job
+        // will have at least one job part, and each job part is associated with a Snowball"
+        // (`JobListEntry$IsMaster`): the unlock code of an export order's main job is a
+        // resource no record answers to, which is what `InvalidResourceException` states,
+        // and its job parts are what carry one.
+        if job.is_master() {
+            return Err(GetJobUnlockCodeErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The job {} is the main job of an export order and is associated with \
+                         no Snowball, so it has no unlock code. Request the unlock code of one \
+                         of its job parts instead.",
+                        job.job_id
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The only valid status for calling this API is WithCustomer as the manifest and
+        // Unlock code values are used for securing your device and should only be used when
+        // you have the device": from any other state the job's device is not in the
+        // caller's hands, which is a property of where the job GOT TO and so is what
+        // `InvalidJobStateException` states.
+        if !job.job_state.releases_device_credentials() {
+            return Err(GetJobUnlockCodeErrorModeled::InvalidJobStateException(
+                InvalidJobStateException {
+                    message: Some(format!(
+                        "The job {} is in state {}, and its unlock code can only be requested \
+                         while the job is in state {}.",
+                        job.job_id,
+                        job.job_state.as_wire(),
+                        crate::state::JobState::WithCustomer.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A particular UnlockCode value can be accessed for up to 360 days after the
+        // associated job has been created": past that window the job's credentials have
+        // expired, so there is no code left to report — a resource no record answers to,
+        // rather than a state the job is in, since the job itself is unchanged and the
+        // window is fixed by its creation instant.
+        if !job.unlock_code_is_readable(::std::time::SystemTime::now()) {
+            return Err(GetJobUnlockCodeErrorModeled::InvalidResourceException(
+                InvalidResourceException {
+                    message: Some(format!(
+                        "The unlock code of job {} can't be found: a job's unlock code can be \
+                         accessed for up to {} days after the job was created, and that window \
+                         has closed.",
+                        job.job_id,
+                        crate::state::UNLOCK_CODE_VALIDITY.as_secs() / (24 * 60 * 60)
+                    )),
+                    resource_type: Some("job".to_string()),
+                },
+            )
+            .into());
+        }
+
+        Ok(GetJobUnlockCodeOutput {
+            unlock_code: Some(job.unlock_code.clone()),
+        })
     }
 }

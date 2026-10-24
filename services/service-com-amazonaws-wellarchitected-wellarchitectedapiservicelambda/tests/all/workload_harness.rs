@@ -102,6 +102,7 @@ impl Client {
                     discovery_config: None,
                     jira_configuration: None,
                     answers: std::collections::BTreeMap::new(),
+                    profiles: Vec::new(),
                 },
             );
         }

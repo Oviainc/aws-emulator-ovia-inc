@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeActivity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeActivity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the activity the request's ARN names from the stored record
+//! `CreateActivity` wrote — its ARN, its name, the instant it was created and its
+//! effective encryption settings. A read: nothing here changes what a later caller
+//! sees. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeActivity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of its own modelled
+//! errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +145,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeActivity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeActivityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeActivity"))
+        // `activityArn`'s length (1..256) is modelled, so the centralized walk has
+        // already refused anything outside it; whether that text is an ARN of THIS
+        // service, in the region this endpoint serves, naming an activity is read
+        // here, BEFORE the store is consulted, so a defect in the ARN is reported as
+        // `InvalidArn` and never as a resource that is absent.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_activity_arn(&input.activity_arn, &endpoint_region)
+        {
+            return Err(DescribeActivityErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The one write a report makes, and it is owed to the clock rather than to
+        // this call: whatever a transition had already made due was due at the same
+        // instant whether or not anybody called. An activity has no such transition —
+        // the service reports one usable from the moment it exists — so this settles
+        // only what the executions and the deletions of the same store owe.
+        store.settle(crate::state::now());
+
+        let Some(activity) = store.activities.get(&input.activity_arn) else {
+            return Err(DescribeActivityErrorModeled::ActivityDoesNotExist(
+                ActivityDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::ACTIVITY_DOES_NOT_EXIST,
+                        &input.activity_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeActivityOutput {
+            activity_arn: activity.arn.clone(),
+            name: activity.name.clone(),
+            creation_date: crate::state::to_date_time(activity.creation_date),
+            // Reported at its EFFECTIVE value, as a state machine's is: an activity
+            // created without an encryption configuration is encrypted under the
+            // Amazon-Web-Services-owned key, which is a configuration to report
+            // rather than a member to omit.
+            encryption_configuration: Some(crate::state::reported_encryption_configuration(
+                activity.encryption_configuration.as_ref(),
+            )),
+        })
     }
 }

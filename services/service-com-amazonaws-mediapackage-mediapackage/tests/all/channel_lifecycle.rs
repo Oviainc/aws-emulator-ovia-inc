@@ -132,22 +132,24 @@ fn looks_iso8601(text: &str) -> bool {
     date_ok && time_ok
 }
 
-/// A deterministic, reproducible generator for the property test below: a SHA-256
-/// counter stream (the `sha2` crate, already this crate's dependency) over a named seed.
-/// A failing case reproduces from the seed printed in its assertion message, and nothing
-/// is written outside the in-memory engine.
-struct SeededGenerator {
+/// A deterministic, reproducible generator for the property tests in this target: a
+/// SHA-256 counter stream (the `sha2` crate, already this crate's dependency) over a named
+/// seed. A failing case reproduces from the seed printed in its assertion message, and
+/// nothing is written outside the in-memory engine.
+///
+/// Shared with the sibling suites, so no suite writes a second generator.
+pub(crate) struct SeededGenerator {
     seed: u64,
     counter: u64,
 }
 
 impl SeededGenerator {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { seed, counter: 0 }
     }
 
     /// The next 64 bits of the stream.
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         use sha2::Digest;
         self.counter += 1;
         let digest = sha2::Sha256::digest(format!("{}|{}", self.seed, self.counter).as_bytes());
@@ -157,7 +159,7 @@ impl SeededGenerator {
     }
 
     /// The next value of the stream in `1..=max`.
-    fn next_in(&mut self, max: u64) -> usize {
+    pub(crate) fn next_in(&mut self, max: u64) -> usize {
         usize::try_from(self.next_u64() % max).unwrap_or(0) + 1
     }
 }

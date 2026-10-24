@@ -2335,6 +2335,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
     SSM_PARAMETER,
+    STEP_FUNCTIONS_ACTIVITY,
     "AWS::Transfer::Server",
     "AWS::Transfer::Workflow",
 ];
@@ -2397,6 +2398,22 @@ fn return_values(
             attributes.insert("QueueName".to_string(), name.to_string());
             attributes.insert("QueueUrl".to_string(), url.clone());
             (url, attributes)
+        }
+        // "Ref returns the ARN of the activity"; Fn::GetAtt: Arn, Name. This is the type
+        // `super::provisioning` creates in AWS Step Functions itself, which then answers
+        // with the activity's own ARN — the same ARN this computes, since both are built
+        // from the one account id this emulator mints and the activity's name, which is how
+        // Step Functions keys an activity (`activity_arn` in its own state module). The ARN
+        // namespace is that model's `arnNamespace`, `states`, not its CloudFormation name.
+        STEP_FUNCTIONS_ACTIVITY => {
+            let arn = ::emulator_server::emulator_arn(
+                STEP_FUNCTIONS_ARN_NAMESPACE,
+                region,
+                &format!("activity:{name}"),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert("Name".to_string(), name.to_string());
+            (arn, attributes)
         }
         // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName,
         // DualStackDomainName, RegionalDomainName, WebsiteURL — each one a DNS name S3
@@ -3189,6 +3206,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         GUARDDUTY_DETECTOR => &["Id"],
         EVENTS_RULE => &["Arn"],
         SSM_PARAMETER => &["Type", "Value"],
+        STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
         _ => &[],
     }
 }
@@ -3336,6 +3354,18 @@ fn event_bus_name(declared: &str) -> String {
         None => declared.to_string(),
     }
 }
+
+/// The ARN namespace AWS Step Functions mints its resources under: that model's
+/// `awsService.arnNamespace`, which is `states` rather than the `StepFunctions` its
+/// resource types are spelled with.
+pub const STEP_FUNCTIONS_ARN_NAMESPACE: &str = "states";
+
+/// An AWS Step Functions activity's resource type (the Step Functions model:
+/// `cloudFormationName: StepFunctions`, `arnNamespace: states`). This is a type
+/// `super::provisioning` creates in Step Functions itself, and "Ref returns the ARN of the
+/// activity", so the handle a stack publishes for one is the ARN `sfn DescribeActivity`
+/// answers with.
+pub const STEP_FUNCTIONS_ACTIVITY: &str = "AWS::StepFunctions::Activity";
 
 /// A Systems Manager Parameter Store parameter's resource type (the SSM model:
 /// `cloudFormationName: SSM`). This is a type `super::provisioning` creates in Systems

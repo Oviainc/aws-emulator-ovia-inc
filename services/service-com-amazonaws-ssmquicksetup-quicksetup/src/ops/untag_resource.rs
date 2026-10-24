@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the tags persisted with the one configuration
+//! manager `ResourceArn` names, so a later `GetConfigurationManager` reports what is
+//! left. `@idempotent`: a key the resource does not carry is removed by doing nothing,
+//! so repeating a request answers the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +130,25 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// Why this request's `TagKeys` list cannot be served, or `None` when it can.
+///
+/// The list carries no modelled length, so its only bound is the store's own
+/// (`crate::state::MAX_TAGS`, the most tags one configuration manager may carry): a
+/// longer list cannot name a key any resource holds, and is refused before the store
+/// lock is taken rather than walked under it. An EMPTY list needs no refusal — the
+/// route matches only a request carrying the `@required` `tagKeys` parameter, and
+/// removing no key would be the same no-op as removing a key the resource does not
+/// carry.
+fn tag_keys_rejection(tag_keys: &[String]) -> Option<String> {
+    (tag_keys.len() > crate::state::MAX_TAGS).then(|| {
+        format!(
+            "TagKeys carries {} entries, more than the {} this service accepts",
+            tag_keys.len(),
+            crate::state::MAX_TAGS
+        )
+    })
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +185,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Nothing the model says about `TagKeys`' elements constrains them, so every
+        // key the walk admits reaches here; what is checked below is only what the
+        // model cannot say (see `tag_keys_rejection`).
+        let _ = ctx;
+        if let Some(why) = tag_keys_rejection(&input.tag_keys) {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the configuration manager store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The configuration manager is this service's only ARN-addressable resource, so
+        // an ARN naming no stored manager names no taggable resource at all.
+        let Some(manager) = store.managers.get_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no configuration manager with ARN {} exists",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Removing a key the resource does not carry is a no-op success: that is what
+        // makes this `@idempotent` operation answer the same way however often the same
+        // request is repeated. Only the named keys go; every other tag stays stored.
+        let removed = input
+            .tag_keys
+            .iter()
+            .filter(|key| manager.tags.remove(*key).is_some())
+            .count();
+
+        // The stamp moves only when the stored record actually changed, so a repeat of
+        // an already-served removal leaves every reported value as it was. Monotonic:
+        // it never moves backwards, whatever the host clock does.
+        if removed > 0 {
+            manager.last_modified_at = now.max(manager.last_modified_at);
+        }
+
+        Ok(UntagResourceOutput)
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopRelationalDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopRelationalDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Shuts a serving managed relational database's engine down: the record — the
+//! master endpoint a client reconnects to above all — is left exactly as it is,
+//! the database reports `stopping` until the clock has it `stopped`, a pre-stop
+//! snapshot is taken first when the request names one, and the call is recorded
+//! in the operation log.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopRelationalDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +167,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopRelationalDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopRelationalDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopRelationalDatabase"))
+        // A database is addressed by name alone — nothing about the request
+        // metadata takes part. A pre-stop snapshot is located where the database
+        // it is taken of is located, which the stored record already names.
+        let _ = ctx;
+
+        // Both members are modelled `ResourceName`s and `relationalDatabaseName`
+        // is `@required`, so the centralized walk refused anything outside those
+        // constraints before this body ran. What is left is what the model cannot
+        // express, checked in the order the resources are addressed in: the
+        // database must exist, it must have a serving engine to shut down, and a
+        // pre-stop snapshot's name must not already be taken. Each is checked
+        // BEFORE the first write, so a refused request stops nothing and creates
+        // nothing.
+        let name = input.relational_database_name;
+        let snapshot_name = input.relational_database_snapshot_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The source record as it stands at this instant: the pre-stop
+            // snapshot is a point-in-time copy of it, so everything the snapshot
+            // reports about its source is read here and never followed
+            // afterwards.
+            //
+            // `relationalDatabaseName` is resolved FIRST: it names the resource
+            // this call is about, so a name the account holds no database for is
+            // answered the primary resource's `DoesNotExist` envelope whatever
+            // else the request carries.
+            let database = store
+                .relational_database(&name)
+                .cloned()
+                .ok_or_else(|| not_found(&name))?;
+
+            // "Stops a specific database that is currently running" (the modelled
+            // documentation): there has to be a serving engine to shut down, so a
+            // database still being provisioned, one whose engine is restarting,
+            // and one that is already stopping or stopped are all refused. Amazon
+            // RDS refuses the same stop — `StopDBInstance` acts on an `available`
+            // DB instance ("Stopping an Amazon RDS DB instance temporarily",
+            // Amazon RDS User Guide) — and Lightsail's modelled counterpart for a
+            // call its resource's state does not allow is
+            // `OperationFailureException`.
+            if database.state != crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE {
+                return Err(operation_failure(format!(
+                    "The relational database {name} is {}: a database can be stopped \
+                     only while it is {}.",
+                    database.state,
+                    crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE,
+                )));
+            }
+            let location = database.location.clone();
+
+            // A snapshot name addresses one snapshot, so a pre-stop snapshot
+            // whose name this account already holds is refused rather than
+            // silently replacing a record a restore may already be using. Both
+            // this and the store's own bound are checked BEFORE the first write,
+            // so a refused request stops nothing and creates nothing.
+            if let Some(snapshot_name) = &snapshot_name {
+                if store.relational_database_snapshot(snapshot_name).is_some() {
+                    return Err(invalid(format!(
+                        "a relational database snapshot named '{snapshot_name}' already exists"
+                    )));
+                }
+                if let Some(message) = store.relational_database_snapshot_capacity_refusal() {
+                    return Err(invalid(message));
+                }
+            }
+
+            // "The name of your new database snapshot to be created BEFORE
+            // stopping your database": the copy is taken of the database as it is
+            // still serving, and the snapshot is not restorable the instant the
+            // call returns — the clock owes it `available` — exactly as a
+            // `CreateRelationalDatabaseSnapshot` call's is.
+            let mut operations = Vec::new();
+            if let Some(snapshot_name) = snapshot_name {
+                // Built by the one store helper every database snapshot is built
+                // through, so a pre-stop copy is the same copy of the same source
+                // a `CreateRelationalDatabaseSnapshot` call would have stored —
+                // the master credentials a later restore needs included.
+                let snapshot =
+                    store.snapshot_relational_database(&database, snapshot_name, Vec::new(), now);
+                // One entry per resource the call acted on, each located where
+                // that resource is: the snapshot this call created is a resource
+                // of its own, with its own name and type, so the log says so
+                // rather than folding it into the database's entry.
+                operations.push(
+                    store
+                        .start_operation(
+                            now,
+                            crate::state::OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT,
+                            crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT,
+                            &snapshot.name,
+                            &snapshot.location,
+                            snapshot.due.map(|due| due.at_ms),
+                        )
+                        .view(),
+                );
+            }
+
+            // The stop itself. Nothing else on the record is rewritten — the
+            // engine is shut down inside the database — so the ARN, the hardware,
+            // the credentials, the windows and the master endpoint a client
+            // reconnects to once it is started again all stay as they are; the
+            // database reports `stopping` until the clock has it `stopped`.
+            //
+            // The record is still there: this is the same name the owned read
+            // above resolved, under the one lock this closure holds, so the
+            // refusal is unreachable and only the type asks for it.
+            let database = store
+                .relational_database_mut(&name)
+                .ok_or_else(|| not_found(&name))?;
+            database.begin_stop(now);
+            let settles_at_ms = database.due.map(|due| due.at_ms);
+            operations.push(
+                store
+                    .start_operation(
+                        now,
+                        crate::state::OPERATION_TYPE_STOP_RELATIONAL_DATABASE,
+                        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                        &name,
+                        &location,
+                        settles_at_ms,
+                    )
+                    .view(),
+            );
+            Ok(StopRelationalDatabaseOutput {
+                operations: Some(operations),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No managed relational database of that name is stored: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> StopRelationalDatabaseError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> StopRelationalDatabaseError {
+    StopRelationalDatabaseErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Lightsail's refusal of a well-formed request the database's state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// database and the state it is in.
+fn operation_failure(message: String) -> StopRelationalDatabaseError {
+    StopRelationalDatabaseErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> StopRelationalDatabaseError {
+    StopRelationalDatabaseErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -290,6 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The quote: the terms asked for, priced from the published rates
+        // (`crate::state::RATE_CARD`).
         let charge_summary = store.charge_summary(
             &input.requested_terms,
             &input.intent,

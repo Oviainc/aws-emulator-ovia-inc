@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the Amazon EC2 instances recorded as running on the Outpost the
+//! `OutpostIdentifier` names — resolved from either the bare id or the full ARN the
+//! modelled label pattern accepts — belonging to ALL accounts, narrowed to the ones
+//! every `*Filter` the caller sent accepts, in the Outpost's own recorded order, cut
+//! into pages of at most `MaxResults` with the modelled `NextToken` the next page
+//! resumes from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read, and one that writes NOTHING: it answers from
+//! [`crate::state::OutpostRecord::instances`], so a caller that lists an Outpost's asset
+//! instances sees exactly what the next caller does. An instance is launched through
+//! Amazon EC2 against the Outpost and by no call in THIS API, so this operation invents
+//! none: an Outpost nobody has launched an instance on is answered with no instance,
+//! exactly as `ListAssets` answers an Outpost with no installed hardware.
+//!
+//! "Does not include Amazon EBS or Amazon S3 instances" needs no exclusion of its own:
+//! the modelled `AWSServiceName` enum an instance's owning service is drawn from
+//! declares no Amazon EBS and no Amazon S3 value, so no instance this store can hold is
+//! one of them.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +162,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetInstances"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAssetInstancesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                ListAssetInstancesErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?;
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::ASSET_INSTANCE_PAGE, token)
+                    .ok_or_else(|| {
+                        ListAssetInstancesErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::page_token_report(Self::NAME)),
+                        })
+                    })?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        // A read, so the guard is taken immutably: which instances are running on the
+        // Outpost is a fact already recorded rather than a transition the clock owes, so
+        // there is nothing here for this call to materialise and nothing for it to
+        // write.
+        let store = state.lock();
+        // The list is nested under an Outpost
+        // (`/outposts/{OutpostIdentifier}/assetInstances`), so the parent is resolved
+        // first: an Outpost the store does not hold cannot be asked about the instances
+        // running on it. The refusal is the identifier echo of the value AS SUPPLIED —
+        // not of the bare id an ARN resolved to.
+        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+            ListAssetInstancesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        })?;
+        // The boundary this list pages on is an instance's POSITION in the Outpost's
+        // recorded order: an instance carries no creation sequence of its own, and that
+        // order is the one stable order the whole list is reported in — the same rule
+        // `ListAssets` pages an Outpost's assets by.
+        let (asset_instances, next_token) = crate::state::page(
+            crate::state::ASSET_INSTANCE_PAGE,
+            record
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, instance)| matches_filters(instance, &input))
+                .map(|(position, instance)| (position as u64, instance.clone())),
+            after,
+            size,
+        );
+
+        Ok(ListAssetInstancesOutput {
+            // "List of instances owned by all accounts on the Outpost": the ones
+            // recorded for this Outpost that match every filter, which may be none at
+            // all.
+            asset_instances: Some(asset_instances),
+            next_token,
+        })
     }
+}
+
+/// Whether a recorded instance satisfies every `*Filter` member the caller sent.
+///
+/// Each filter is a LIST of accepted values for ONE member of the instance, so an
+/// instance matches when its value for that member is one of them, and several filters
+/// together narrow rather than widen — the rule `ListAssets` and `ListOutposts` apply to
+/// their own filters — while an absent (or empty) filter matches everything. An instance
+/// whose value for a filtered member was never recorded matches no value, so it is
+/// narrowed out, exactly as those lists narrow out a record with no value for a filtered
+/// member.
+///
+/// The members the model binds the four filters to: `AssetIdFilter` selects on the
+/// instance's `AssetId` (the asset it runs on), `InstanceTypeFilter` on its
+/// `InstanceType`, `AccountIdFilter` on the `AccountId` that owns it, and
+/// `AwsServiceFilter` on the `AwsServiceName` of the Amazon Web Services service that
+/// owns it — the one member of this output each filtered value appears in.
+fn matches_filters(instance: &AssetInstance, input: &ListAssetInstancesInput) -> bool {
+    let matches = |filter: Option<&Vec<String>>, value: Option<&String>| match filter {
+        Some(accepted) if !accepted.is_empty() => {
+            value.is_some_and(|value| accepted.contains(value))
+        }
+        _ => true,
+    };
+    matches(input.asset_id_filter.as_ref(), instance.asset_id.as_ref())
+        && matches(
+            input.instance_type_filter.as_ref(),
+            instance.instance_type.as_ref(),
+        )
+        && matches(
+            input.account_id_filter.as_ref(),
+            instance.account_id.as_ref(),
+        )
+        && matches(
+            input.aws_service_filter.as_ref(),
+            instance.aws_service_name.as_ref(),
+        )
 }

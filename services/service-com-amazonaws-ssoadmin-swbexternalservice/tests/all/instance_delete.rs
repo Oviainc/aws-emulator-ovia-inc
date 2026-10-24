@@ -36,7 +36,8 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, router_over, seeded_instance_arn, with_store, UNKNOWN_INSTANCE_ARN,
+    call, error_code, hold_deletion, router_over, seeded_instance_arn, with_store,
+    UNKNOWN_INSTANCE_ARN,
 };
 
 /// The only value the model's `TrustedTokenIssuerType` enum admits
@@ -118,18 +119,6 @@ async fn listed_arns(router: &MultiServiceRouter) -> Vec<String> {
                 .to_string()
         })
         .collect()
-}
-
-/// Move the stored deletion instant of every instance to `due_at`, so both sides of it can
-/// be observed without the test sleeping.
-fn hold_deletion(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
-    with_store(engine, |store| {
-        for instance in store.instances.values_mut() {
-            if instance.deleted_due.is_some() {
-                instance.deleted_due = Some(due_at);
-            }
-        }
-    });
 }
 
 /// RULE 1 — a delete removes exactly the issuer it names, and the ARN stops resolving:

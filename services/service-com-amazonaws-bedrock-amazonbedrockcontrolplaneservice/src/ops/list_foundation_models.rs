@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFoundationModels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFoundationModels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFoundationModels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the foundation models this service offers: one `FoundationModelSummary` per row
+//! of the published catalog this service's store is seeded with
+//! ([`crate::state::FoundationModelCatalog`]), in `modelId` order, narrowed to the rows
+//! that satisfy EVERY `by*` filter the request carries.
+//!
+//! A pure read: the catalog is published rather than created, so no call of this operation
+//! writes anything, and two listings of the same filters answer alike.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFoundationModels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFoundationModelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFoundationModels"))
+        // The ARN of a foundation model carries the region the request addresses rather
+        // than an account, so that region is the one request-scoped value a summary needs.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFoundationModelsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the foundation model catalog is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        // Every catalog row the request's filters admit, in the `modelId` order the catalog
+        // is keyed in, so two listings agree on it.
+        let model_summaries = store
+            .foundation_models
+            .models()
+            .filter(|model| admitted(model, &input))
+            .map(|model| summary(model, &region))
+            .collect();
+
+        Ok(ListFoundationModelsOutput {
+            model_summaries: Some(model_summaries),
+        })
     }
 }
+
+/// Whether `model` satisfies every filter `input` carries.
+///
+/// Each `by*` member narrows the listing on ONE published attribute of a model, and a
+/// member the request omits narrows nothing — so an unfiltered request lists the whole
+/// catalog, and the filters a request does carry combine by conjunction. The three
+/// enum-valued filters are satisfied by a model whose own list CONTAINS the value asked
+/// for, because each one names a capability a model may have alongside others;
+/// `byProvider` is [`crate::state::provider_matches`].
+///
+/// A value none of these members admits is refused ahead of this handler by the constraints
+/// the model declares for them (the three enums, and `byProvider`'s pattern), so a filter
+/// reaching here is one the catalog can be read against.
+fn admitted(model: &crate::state::FoundationModel, input: &ListFoundationModelsInput) -> bool {
+    let carries = |values: &[&str], wanted: &str| values.contains(&wanted);
+    input
+        .by_provider
+        .as_deref()
+        .is_none_or(|provider| crate::state::provider_matches(model, provider))
+        && input
+            .by_output_modality
+            .as_deref()
+            .is_none_or(|modality| carries(model.output_modalities, modality))
+        && input
+            .by_customization_type
+            .as_deref()
+            .is_none_or(|customization| carries(model.customizations_supported, customization))
+        && input
+            .by_inference_type
+            .as_deref()
+            .is_none_or(|inference_type| carries(model.inference_types_supported, inference_type))
+}
+
+/// One catalog row as the `FoundationModelSummary` a response for `region` carries.
+///
+/// `modelLifecycle` reports the row's `status` and none of the four lifecycle instants:
+/// nothing publishes a launch, legacy or end-of-life date per model, and a date is not
+/// something to invent.
+fn summary(model: &crate::state::FoundationModel, region: &str) -> FoundationModelSummary {
+    let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
+    FoundationModelSummary {
+        model_arn: crate::state::foundation_model_arn(region, model.model_id),
+        model_id: model.model_id.to_string(),
+        model_name: Some(model.model_name.to_string()),
+        provider_name: Some(model.provider_name.to_string()),
+        input_modalities: Some(list(model.input_modalities)),
+        output_modalities: Some(list(model.output_modalities)),
+        response_streaming_supported: Some(model.response_streaming_supported),
+        customizations_supported: Some(list(model.customizations_supported)),
+        inference_types_supported: Some(list(model.inference_types_supported)),
+        model_lifecycle: Some(FoundationModelLifecycle {
+            status: model.lifecycle_status.to_string(),
+            start_of_life_time: None,
+            end_of_life_time: None,
+            legacy_time: None,
+            public_extended_access_time: None,
+        }),
+    }
+}
+

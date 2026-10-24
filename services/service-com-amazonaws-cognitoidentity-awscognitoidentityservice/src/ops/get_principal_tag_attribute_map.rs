@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPrincipalTagAttributeMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPrincipalTagAttributeMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the principal-tag attribute map `SetPrincipalTagAttributeMap` stored for ONE
+//! identity provider of a pool: the pool, the provider, whether the mapping uses the
+//! default (username and clientID) attribute mappings, and which principal tag is taken
+//! from which user attribute.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPrincipalTagAttributeMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pool this service does not store, and a provider of a stored pool nobody has set a
+//! mapping for, are both `ResourceNotFoundException` (HTTP 404): the mapping is a resource
+//! of the `(IdentityPoolId, IdentityProviderName)` pair, and until a call writes one there
+//! is no mapping to list.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +157,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPrincipalTagAttributeMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPrincipalTagAttributeMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPrincipalTagAttributeMap"))
+        // A read of one named provider's mapping: `ctx` carries only request metadata, and
+        // both the pool and the provider are named by the request itself.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetPrincipalTagAttributeMapErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the identity-pool store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+            return Err(not_found(format!(
+                "IdentityPool '{}' not found.",
+                input.identity_pool_id
+            )));
+        }
+
+        let key = (
+            input.identity_pool_id.clone(),
+            input.identity_provider_name.clone(),
+        );
+        let Some(mapping) = store.principal_tag_attribute_maps.get(&key) else {
+            return Err(not_found(format!(
+                "No Principal Tags configured for Provider {}",
+                input.identity_provider_name
+            )));
+        };
+
+        Ok(GetPrincipalTagAttributeMapOutput {
+            identity_pool_id: Some(input.identity_pool_id),
+            identity_provider_name: Some(input.identity_provider_name),
+            use_defaults: Some(mapping.use_defaults),
+            principal_tags: Some(mapping.principal_tags.clone().into_iter().collect()),
+        })
     }
+}
+
+/// The modelled refusal for a resource this service does not hold (HTTP 404), naming what
+/// was not found.
+fn not_found(message: String) -> GetPrincipalTagAttributeMapError {
+    GetPrincipalTagAttributeMapErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

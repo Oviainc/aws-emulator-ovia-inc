@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetPrincipalTagAttributeMap
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetPrincipalTagAttributeMap`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REPLACES the principal-tag attribute map of ONE identity provider of a stored identity
+//! pool — whether the provider uses the default (username and clientID) mappings, and
+//! which principal tag is taken from which user attribute — so
+//! `GetPrincipalTagAttributeMap` reports back exactly what was set and the provider's
+//! previous mapping is gone rather than merged into. The mapping belongs to the
+//! `(IdentityPoolId, IdentityProviderName)` pair, so setting one provider's mapping leaves
+//! every other provider's where it was.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetPrincipalTagAttributeMap::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UseDefaults` is a choice INSTEAD of a custom map: a call asking for the default
+//! (username and clientID) attribute mappings configures THOSE, and a custom map the same
+//! call carried is not applied — so carrying both is accepted rather than refused.
+//!
+//! A pool this service does not store is a `ResourceNotFoundException` (HTTP 404). A
+//! principal tag key that no IAM policy could reference as a session tag of the federated
+//! principal — one in the Amazon Web Services reserved namespace, or spelled with
+//! characters a tag key does not admit — is an `InvalidParameterException` (HTTP 400), and
+//! a key outside the modelled bounds of `PrincipalTagID` is the protocol's own HTTP 400.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +169,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetPrincipalTagAttributeMap` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetPrincipalTagAttributeMapErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetPrincipalTagAttributeMap"))
+        // A write to one named provider of one named pool: `ctx` carries only request
+        // metadata, and both are named by the request itself.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SetPrincipalTagAttributeMapErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the identity-pool store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every refusal is decided BEFORE anything is written, so a rejected call leaves
+        // the provider's previous mapping exactly as it was.
+        let requested = validated_principal_tags(input.principal_tags.as_ref())?;
+        // `UseDefaults` is a plain modelled boolean with no default trait: a call that does
+        // not ask for the default mappings is a mapping that does not use them.
+        let use_defaults = input.use_defaults.unwrap_or(false);
+        // Asking for the default mappings is a choice INSTEAD of a custom one: the
+        // provider is mapped by the defaults, and a custom mapping the same call carried is
+        // not applied — which is why carrying both is accepted rather than refused.
+        let principal_tags = if use_defaults {
+            crate::state::default_principal_tags()
+        } else {
+            requested
+        };
+
+        let mut store = state.lock();
+        if !store.identity_pools.contains_key(&input.identity_pool_id) {
+            return Err(
+                SetPrincipalTagAttributeMapErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "IdentityPool '{}' not found.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The provider's whole mapping is replaced: whatever a previous call stored for
+        // this pair is no longer configured.
+        let key = (
+            input.identity_pool_id.clone(),
+            input.identity_provider_name.clone(),
+        );
+        // A mapping for a provider this pool has none for yet is a new record, so it is
+        // refused once the pool holds as many as this emulator keeps; replacing a mapping
+        // the pool already holds grows nothing and is always allowed.
+        if !store.principal_tag_attribute_maps.contains_key(&key)
+            && store.principal_tag_attribute_map_store_is_full(&input.identity_pool_id)
+        {
+            return Err(invalid_parameter(format!(
+                "Identity pool '{}' already has principal tag attribute maps for {} identity \
+                 providers, which is as many as this emulator holds.",
+                input.identity_pool_id,
+                crate::state::MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL
+            )));
+        }
+        store.principal_tag_attribute_maps.insert(
+            key,
+            crate::state::PrincipalTagAttributeMap {
+                use_defaults,
+                principal_tags: principal_tags.clone(),
+            },
+        );
+
+        Ok(SetPrincipalTagAttributeMapOutput {
+            identity_pool_id: Some(input.identity_pool_id),
+            identity_provider_name: Some(input.identity_provider_name),
+            use_defaults: Some(use_defaults),
+            principal_tags: Some(principal_tags.into_iter().collect()),
+        })
     }
+}
+
+/// The MODELLED bounds of a `PrincipalTags` key, from `PrincipalTagID`'s own
+/// `length 1..128` (`smithy_query(query="shape",shape="PrincipalTags")`). Counted in
+/// CHARACTERS, the unit a Smithy length constraint is measured in.
+const PRINCIPAL_TAG_KEY_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
+
+/// The most entries a `PrincipalTags` map carries, from the modelled `PrincipalTags`'s own
+/// `length 0..50` (the same query).
+const MAX_PRINCIPAL_TAGS: usize = 50;
+
+/// The `PrincipalTags` map as it will be stored, or the refusal for the first key that is
+/// not a tag key an IAM policy could reference. Values are user attribute (claim) names and
+/// are stored exactly as sent, whatever characters they are spelled with.
+///
+/// Iterated in key order, so which entry a multi-entry map is refused for does not depend
+/// on the iteration order of the request's map.
+fn validated_principal_tags(
+    principal_tags: Option<&::std::collections::HashMap<String, String>>,
+) -> Result<::std::collections::BTreeMap<String, String>, SetPrincipalTagAttributeMapError> {
+    let stored: ::std::collections::BTreeMap<String, String> = principal_tags
+        .map(|principal_tags| {
+            principal_tags
+                .iter()
+                .map(|(tag_key, attribute)| (tag_key.clone(), attribute.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The MODELLED bounds the protocol's boundary walk does not reach. It checks a map's
+    // VALUES against `PrincipalTagValue` before this handler runs, but neither the map's
+    // keys nor the map's own size, so both reach here: a constraint the model states is a
+    // protocol-level refusal — HTTP 400 `ValidationException` naming the member and the
+    // constraint it failed — which is what `Scaffolded::validation` answers.
+    //
+    // The map's SIZE is checked FIRST and its refusal names no value: the request's own map
+    // is what a refusal would otherwise render, and nothing bounds how large a map a caller
+    // sends, so rendering it before this check is how a request grows an error message
+    // without limit. Past this check the map is at most
+    // `MAX_PRINCIPAL_TAGS` entries of modelled length, so what follows may name it.
+    if stored.len() > MAX_PRINCIPAL_TAGS {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "1 validation error detected: Value at 'principalTags' failed to satisfy \
+             constraint: Member must have length less than or equal to {MAX_PRINCIPAL_TAGS}"
+        )));
+    }
+
+    // The value named is the MEMBER's own, and a member fails one constraint once, so a map
+    // with several keys outside the bound is refused for that one failure rather than once
+    // per key.
+    if stored
+        .keys()
+        .any(|tag_key| !PRINCIPAL_TAG_KEY_LENGTH.contains(&tag_key.chars().count()))
+    {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "1 validation error detected: Value '{}' at 'principalTags' failed to satisfy \
+             constraint: Map keys must satisfy constraint: [Member must have length less than \
+             or equal to {}, Member must have length greater than or equal to {}]",
+            rendered_map(&stored),
+            PRINCIPAL_TAG_KEY_LENGTH.end(),
+            PRINCIPAL_TAG_KEY_LENGTH.start()
+        )));
+    }
+
+    for tag_key in stored.keys() {
+        if crate::state::is_reserved_tag_key(tag_key) {
+            return Err(invalid_parameter(format!(
+                "PrincipalTags key '{tag_key}' is not valid: the '{}' prefix is reserved for \
+                 Amazon Web Services use.",
+                crate::state::RESERVED_TAG_KEY_PREFIX
+            )));
+        }
+        if !crate::state::is_well_formed_tag_key(tag_key) {
+            return Err(invalid_parameter(format!(
+                "PrincipalTags key '{tag_key}' is not valid: a tag key is spelled with \
+                 letters, numbers, spaces and the characters {}.",
+                crate::state::TAG_KEY_PUNCTUATION
+            )));
+        }
+    }
+    Ok(stored)
+}
+
+/// A map as a constraint refusal names the value it was given: `{key=value}` entries,
+/// separated by `, `, in key order so the same request is named the same way twice.
+fn rendered_map(principal_tags: &::std::collections::BTreeMap<String, String>) -> String {
+    let entries: Vec<String> = principal_tags
+        .iter()
+        .map(|(tag_key, attribute)| format!("{tag_key}={attribute}"))
+        .collect();
+    format!("{{{}}}", entries.join(", "))
+}
+
+/// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong with
+/// the request.
+fn invalid_parameter(message: String) -> SetPrincipalTagAttributeMapError {
+    SetPrincipalTagAttributeMapErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }
