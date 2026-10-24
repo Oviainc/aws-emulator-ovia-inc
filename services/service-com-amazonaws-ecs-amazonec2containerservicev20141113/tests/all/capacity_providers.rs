@@ -11,8 +11,12 @@
 //!   its name, status, ARN, binding, type and tags;
 //! * the NAME identifies the provider and an Auto Scaling group backs exactly one, so a
 //!   create that reuses either is refused and stores nothing;
-//! * a name outside the documented character set, or carrying one of the prefixes AWS
-//!   reserves, is refused; and so is a request that names neither binding, or both.
+//! * the create is `@idempotent`, so REPEATING it for the provider that is already stored
+//!   — the same name over the same binding — reports that provider unchanged and writes
+//!   nothing, while a repeat that would have to change the stored binding is refused;
+//! * a name outside the documented character set is refused as a malformed parameter, and
+//!   one carrying a prefix AWS reserves as an identifier that is not the caller's; and so
+//!   is a request that names neither binding, or both.
 //!
 //! Every case goes through the shared wire harness in [`crate::ecs_wire`], the same front
 //! door a client uses, so nothing reaches into the state struct and a response that is not
@@ -294,7 +298,10 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
     // One row per rule the handler enforces, each with the modelled error it answers.
     // The name rows span the reserved prefixes (`CreateCapacityProvider$name`: "The name
     // can't be prefixed with \"aws\", \"ecs\", or \"fargate\"") in both spellings, the
-    // character set and the documented length.
+    // character set and the documented length. The name is the provider's IDENTIFIER, so
+    // every value outside that one rule earns the `ClientException` modelled for an
+    // identifier that isn't valid; the rows about other members earn the
+    // malformed-parameter refusal.
     let cases: [(&str, Value, &str); 12] = [
         (
             "a name prefixed with aws",
@@ -302,7 +309,7 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
                 "name": "aws-provider",
                 "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-1" },
             }),
-            "InvalidParameterException",
+            "ClientException",
         ),
         (
             "a name prefixed with ecs",
@@ -310,7 +317,7 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
                 "name": "ecsprovider",
                 "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-1" },
             }),
-            "InvalidParameterException",
+            "ClientException",
         ),
         (
             "a name prefixed with fargate",
@@ -318,7 +325,7 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
                 "name": "fargate_spot_clone",
                 "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-1" },
             }),
-            "InvalidParameterException",
+            "ClientException",
         ),
         (
             "a reserved prefix in upper case",
@@ -326,7 +333,7 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
                 "name": "AWSProvider",
                 "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-1" },
             }),
-            "InvalidParameterException",
+            "ClientException",
         ),
         (
             "a name outside the documented character set",
@@ -334,7 +341,7 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
                 "name": "not a provider name",
                 "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-1" },
             }),
-            "InvalidParameterException",
+            "ClientException",
         ),
         (
             "a name longer than 255 characters",
@@ -342,7 +349,7 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
                 "name": "p".repeat(256),
                 "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-1" },
             }),
-            "InvalidParameterException",
+            "ClientException",
         ),
         (
             "neither an Auto Scaling group nor managed instances",
@@ -411,9 +418,42 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
         "case {case:?}: a refused create must store nothing, got {body}"
     );
 
-    // The group-reuse refusal names the provider that already backs the group, so the
-    // caller can find it.
-    let case = "the reuse refusal names the holder";
+    // Every refusal of the NAME carries the one sentence that states the whole name rule,
+    // whichever half of it the value broke: the rows differ along which half that is.
+    let name_rule = "The specified capacity provider name is invalid. Up to 255 characters \
+                     are allowed, including letters (upper and lowercase), numbers, \
+                     underscores, and hyphens. The name cannot be prefixed with \"aws\", \
+                     \"ecs\", or \"fargate\". Specify a valid name and try again.";
+    let name_rows: [(&str, String); 3] = [
+        ("a reserved prefix", "ecs-mine".to_string()),
+        ("a character the member does not allow", "not a name".to_string()),
+        ("a name past the documented length", "p".repeat(256)),
+    ];
+    for (case, provider_name) in name_rows {
+        let (code, message) = refusal(
+            &router,
+            "CreateCapacityProvider",
+            json!({
+                "name": provider_name,
+                "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-unused" },
+            }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            code, "ClientException",
+            "case {case:?}: the name is the provider's identifier, got {code:?} with \
+             {message:?}"
+        );
+        assert_eq!(
+            message, name_rule,
+            "case {case:?}: unexpected refusal message"
+        );
+    }
+
+    // The group-reuse refusal names the MEMBER at fault and what a retry has to carry:
+    // the Auto Scaling group ARN has to be one no other provider is using.
+    let case = "the reuse refusal names the member at fault";
     let (code, message) = refusal(
         &router,
         "CreateCapacityProvider",
@@ -428,10 +468,208 @@ async fn a_capacity_provider_request_that_cannot_be_satisfied_is_refused() {
         code, "ClientException",
         "case {case:?}: expected a ClientException, got {code:?} with {message:?}"
     );
-    assert!(
-        message.contains("taken"),
-        "case {case:?}: expected the refusal to name the provider holding the group, \
-         got {message:?}"
+    assert_eq!(
+        message,
+        "The specified Auto Scaling group ARN is already being used by another capacity \
+         provider. Specify a unique Auto Scaling group ARN and try again.",
+        "case {case:?}: unexpected refusal message"
+    );
+}
+
+/// One row of the repeat table: how the provider is first created, how the create is
+/// REPEATED, and whether that repeat is the same provider (an idempotent no-op) or a
+/// request that conflicts with what is stored.
+struct RepeatCase {
+    name: &'static str,
+    /// The members the first create carries beside `name`.
+    create: fn() -> Value,
+    /// The members the repeat carries beside `name`.
+    repeat: fn() -> Value,
+    /// Whether the repeat asks for the provider that is already stored.
+    idempotent: bool,
+}
+
+#[tokio::test]
+async fn repeating_a_capacity_provider_create_reports_the_stored_provider() {
+    let router = service();
+    create_cluster(&router, "capacity", "setup").await;
+    create_cluster(&router, "elsewhere", "setup").await;
+
+    // `CreateCapacityProvider` carries the `@idempotent` trait
+    // (`smithy_query(query="operation",operation="CreateCapacityProvider")` reports
+    // `idempotent: true`), so the rows below span the repeats a caller makes: the same
+    // binding spelled the same way and spelled the other way, each kind of binding, a
+    // repeat differing only in metadata, and the repeats that would have to CHANGE the
+    // stored binding.
+    let cases = [
+        RepeatCase {
+            name: "the same Auto Scaling group, named the same way",
+            create: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r0") } }),
+            repeat: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r0") } }),
+            idempotent: true,
+        },
+        RepeatCase {
+            name: "the same Auto Scaling group, named by its bare name on the repeat",
+            create: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r1") } }),
+            repeat: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-r1" } }),
+            idempotent: true,
+        },
+        RepeatCase {
+            name: "the same group with the same managed scaling configuration",
+            create: || {
+                json!({
+                    "autoScalingGroupProvider": {
+                        "autoScalingGroupArn": group_arn("asg-r2"),
+                        "managedScaling": {
+                            "status": "ENABLED",
+                            "targetCapacity": 75,
+                            "minimumScalingStepSize": 1,
+                            "maximumScalingStepSize": 10,
+                            "instanceWarmupPeriod": 60,
+                        },
+                        "managedTerminationProtection": "DISABLED",
+                        "managedDraining": "ENABLED",
+                    },
+                })
+            },
+            repeat: || {
+                json!({
+                    "autoScalingGroupProvider": {
+                        "autoScalingGroupArn": group_arn("asg-r2"),
+                        "managedScaling": {
+                            "status": "ENABLED",
+                            "targetCapacity": 75,
+                            "minimumScalingStepSize": 1,
+                            "maximumScalingStepSize": 10,
+                            "instanceWarmupPeriod": 60,
+                        },
+                        "managedTerminationProtection": "DISABLED",
+                        "managedDraining": "ENABLED",
+                    },
+                })
+            },
+            idempotent: true,
+        },
+        RepeatCase {
+            name: "the same managed-instances configuration in the same cluster",
+            create: || json!({ "cluster": "capacity", "managedInstancesProvider": managed_instances() }),
+            repeat: || json!({ "cluster": "capacity", "managedInstancesProvider": managed_instances() }),
+            idempotent: true,
+        },
+        RepeatCase {
+            name: "the same binding with other tags, which are not what it binds onto",
+            create: || {
+                json!({
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r4") },
+                    "tags": [{ "key": "team", "value": "platform" }],
+                })
+            },
+            repeat: || {
+                json!({
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r4") },
+                    "tags": [{ "key": "team", "value": "other" }],
+                })
+            },
+            idempotent: true,
+        },
+        RepeatCase {
+            name: "a different Auto Scaling group under the name already taken",
+            create: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r5") } }),
+            repeat: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-other5") } }),
+            idempotent: false,
+        },
+        RepeatCase {
+            name: "the same group with managed scaling turned on by the repeat",
+            create: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r6") } }),
+            repeat: || {
+                json!({
+                    "autoScalingGroupProvider": {
+                        "autoScalingGroupArn": group_arn("asg-r6"),
+                        "managedScaling": { "status": "ENABLED", "targetCapacity": 100 },
+                    },
+                })
+            },
+            idempotent: false,
+        },
+        RepeatCase {
+            name: "managed instances under a name an Auto Scaling group holds",
+            create: || json!({ "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r7") } }),
+            repeat: || json!({ "cluster": "capacity", "managedInstancesProvider": managed_instances() }),
+            idempotent: false,
+        },
+        RepeatCase {
+            name: "the same managed-instances configuration scoped to another cluster",
+            create: || json!({ "cluster": "capacity", "managedInstancesProvider": managed_instances() }),
+            repeat: || json!({ "cluster": "elsewhere", "managedInstancesProvider": managed_instances() }),
+            idempotent: false,
+        },
+    ];
+
+    for (index, test) in cases.iter().enumerate() {
+        let case = test.name;
+        let provider_name = format!("repeat{index}");
+
+        let mut create = (test.create)();
+        create["name"] = json!(provider_name);
+        let created = ok(&router, "CreateCapacityProvider", create, case).await;
+        let created = created["capacityProvider"].clone();
+        let stored = describe(&router, &provider_name, true, case).await;
+
+        let mut repeat = (test.repeat)();
+        repeat["name"] = json!(provider_name);
+        if test.idempotent {
+            let again = ok(&router, "CreateCapacityProvider", repeat, case).await;
+            assert_eq!(
+                again["capacityProvider"], created,
+                "case {case:?}: a repeat of the same create reports the stored provider \
+                 unchanged, got {again}"
+            );
+        } else {
+            let (code, message) = refusal(&router, "CreateCapacityProvider", repeat, case).await;
+            assert_eq!(
+                code, "ClientException",
+                "case {case:?}: expected a ClientException, got {code:?} with {message:?}"
+            );
+            assert_eq!(
+                message,
+                "The specified capacity provider already exists. To change the \
+                 configuration of an existing capacity provider, update the capacity \
+                 provider.",
+                "case {case:?}: unexpected refusal message"
+            );
+        }
+
+        // Either way the stored record is the one the FIRST create wrote: an idempotent
+        // repeat writes nothing, and a refused one changes nothing.
+        assert_eq!(
+            describe(&router, &provider_name, true, case).await,
+            stored,
+            "case {case:?}: the stored provider must be untouched by the repeat"
+        );
+    }
+
+    // The name is what is repeated: the same binding under a DIFFERENT name is a second
+    // provider on one Auto Scaling group, which is still refused.
+    let case = "the same group under another name";
+    let (code, message) = refusal(
+        &router,
+        "CreateCapacityProvider",
+        json!({
+            "name": "renamed",
+            "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-r0") },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        code, "ClientException",
+        "case {case:?}: expected a ClientException, got {code:?} with {message:?}"
+    );
+    assert_eq!(
+        message,
+        "The specified Auto Scaling group ARN is already being used by another capacity \
+         provider. Specify a unique Auto Scaling group ARN and try again.",
+        "case {case:?}: a repeat under another name is a second provider on one group"
     );
 }
 

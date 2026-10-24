@@ -355,6 +355,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user_create_date: now,
             user_last_modified_date: now,
             groups: ::std::collections::BTreeSet::new(),
+            // A created user has no remembered device: a device is known only
+            // once a sign-in has minted a key for one.
+            devices: ::std::collections::BTreeMap::new(),
         };
         pool.users.insert(key.clone(), user);
 

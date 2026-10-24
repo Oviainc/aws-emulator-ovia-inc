@@ -49,6 +49,8 @@ mod disk_detach;
 mod disk_restore_from_snapshot;
 #[path = "all/disk_snapshot.rs"]
 mod disk_snapshot;
+#[path = "all/disk_snapshot_delete.rs"]
+mod disk_snapshot_delete;
 #[path = "all/distribution_cdn.rs"]
 mod distribution_cdn;
 #[path = "all/distribution_metric_data.rs"]

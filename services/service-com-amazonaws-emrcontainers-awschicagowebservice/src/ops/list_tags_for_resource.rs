@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags held by the resource its `resourceArn` names.
+//!
+//! The ARN is read with [`crate::state::parse_tagged_resource_arn`] — an `RsiArn` names a
+//! virtual cluster or a resource under one — and the answer is the ONE tag set that
+//! resource's own record holds: the same copy `UntagResource` edits and the same one
+//! `DescribeVirtualCluster`, `DescribeJobRun` and `DescribeManagedEndpoint` report. A
+//! resource carrying no tags answers an empty `tags` map, which is a different answer
+//! from a resource that is not there. An ARN whose resource path is not one the model
+//! declares is refused with the modelled `ValidationException`; a well-formed one naming
+//! no stored resource with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +142,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| -> Self::Error {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the virtual cluster store is unavailable".to_string()),
+            })
+            .into()
+        })?;
+        // Nothing about this read depends on request metadata: the ARN the operation
+        // reports on is a modelled member, not a header.
+        let _ = ctx;
+
+        // `resourceArn`'s length and pattern are refused at the boundary BEFORE this
+        // handler runs. What is left to judge about the ARN is whether its resource path
+        // names a resource this service models at all: `RsiArn`'s pattern ends in
+        // `/virtualclusters/.+`, which admits paths no resource of this service ever has.
+        let Some(resource) = crate::state::parse_tagged_resource_arn(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "{} is not the ARN of an EMR on EKS resource",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut state = store.lock();
+        // Reporting, but it materialises what the clock already owed: a TERMINATING
+        // cluster reaches TERMINATED at its due instant whether or not anybody looked, so
+        // the record this call reads is the settled one. Nothing else here writes.
+        state.settle();
+
+        let Some(tags) = state.resource_tags(&resource, &input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Resource {} was not found", input.resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // Always a map, empty for a resource that holds no tags: an absent `tags` would
+        // say "nothing is known" where the resource is known to carry nothing.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(tags.clone()),
+        })
     }
 }

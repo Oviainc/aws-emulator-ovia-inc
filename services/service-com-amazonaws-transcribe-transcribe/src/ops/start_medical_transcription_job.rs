@@ -331,18 +331,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MedicalTranscriptionSetting$VocabularyName`): a job may only apply a custom
         // medical vocabulary this account holds, so a name no `CreateMedicalVocabulary`
         // ever recorded is refused here rather than stored on a job that would report
-        // it back. The name belongs to the MEDICAL vocabulary family, which is a family
-        // of its own: a custom vocabulary of the same name is a different resource.
-        if let Some(vocabulary) = input
-            .settings
-            .as_ref()
-            .and_then(|settings| settings.vocabulary_name.as_deref())
-        {
-            if !store.medical_vocabularies.contains_key(vocabulary) {
-                return Err(bad_request(&crate::state::not_found_message(
-                    crate::state::KIND_MEDICAL_VOCABULARY,
-                )));
-            }
+        // it back — the rule every job family's settings follow, see
+        // [`crate::state::unheld_reference_error`]. The name belongs to the MEDICAL
+        // vocabulary family, which is a family of its own: a custom vocabulary of the
+        // same name is a different resource.
+        if let Some(message) = store.unheld_reference_error(&[(
+            crate::state::ResourceFamily::MedicalVocabulary,
+            input
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.vocabulary_name.as_deref()),
+        )]) {
+            return Err(bad_request(&message));
         }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique

@@ -26,17 +26,12 @@
 //! carries, whether a role and tags are supplied, how many outputs the association
 //! appends, and how many callers race), never over one recorded request.
 
-use crate::harness::{call, output_config, past_the_transition_span, router};
+use crate::harness::{call, enabled_output, past_the_transition_span, router};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     FEED_ALREADY_ASSOCIATED_MESSAGE, TRANSITION_SPAN,
 };
 use smithy_server_runtime::MultiServiceRouter;
-
-/// One output, named `name`, carrying the `kind` config.
-fn output(name: &str, kind: &str) -> Value {
-    json!({"name": name, "outputConfig": output_config(kind), "status": "ENABLED"})
-}
 
 /// `POST /v1/feed/{id}/associate`, with `dryRun` when asked for.
 async fn associate(
@@ -88,7 +83,7 @@ fn lifecycle_cases() -> Vec<LifecycleCase> {
             label: "one cropping output, nothing appended",
             create: json!({
                 "name": "usable-one",
-                "outputs": [output("crop1", "cropping")]
+                "outputs": [enabled_output("crop1", "cropping")]
             }),
             appended: json!([]),
         },
@@ -96,19 +91,25 @@ fn lifecycle_cases() -> Vec<LifecycleCase> {
             label: "a single-character name, one output appended",
             create: json!({
                 "name": "a",
-                "outputs": [output("subs1", "subtitling")]
+                "outputs": [enabled_output("subs1", "subtitling")]
             }),
-            appended: json!([output("clip1", "clipping")]),
+            appended: json!([enabled_output("clip1", "clipping")]),
         },
         LifecycleCase {
             label: "two outputs with a role and tags, two appended",
             create: json!({
                 "name": "Usable_Feed-3",
                 "accessRoleArn": "arn:aws:iam::000000000000:role/elemental-inference-feed",
-                "outputs": [output("crop1", "cropping"), output("meta1", "contextualMetadata")],
+                "outputs": [
+                    enabled_output("crop1", "cropping"),
+                    enabled_output("meta1", "contextualMetadata"),
+                ],
                 "tags": {"env": "test"}
             }),
-            appended: json!([output("clip1", "clipping"), output("subs1", "subtitling")]),
+            appended: json!([
+                enabled_output("clip1", "clipping"),
+                enabled_output("subs1", "subtitling"),
+            ]),
         },
     ]
 }
@@ -279,7 +280,7 @@ async fn concurrent_claims_on_a_fresh_feed_leave_exactly_one_winner() {
             &router,
             "POST",
             "/v1/feed",
-            Some(json!({"name": "raced-feed", "outputs": [output("crop1", "cropping")]})),
+            Some(json!({"name": "raced-feed", "outputs": [enabled_output("crop1", "cropping")]})),
         )
         .await;
         let id = created["id"]

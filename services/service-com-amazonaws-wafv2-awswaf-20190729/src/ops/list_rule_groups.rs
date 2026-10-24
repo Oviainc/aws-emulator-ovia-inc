@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRuleGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRuleGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRuleGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the RuleGroups stored under the requested `Scope`, ordered by name,
+//! one page at a time: at most `Limit` summaries, resuming after `NextMarker`.
+//! EVERY non-empty page answers a `NextMarker` — the name of its LAST summary,
+//! whether or not the page is full — and only the empty page that follows the last
+//! one carries none (`ListRuleGroupsResponse$NextMarker` is `length 1..256`, and a
+//! page with no last name has no marker), which is what ends a paginator's loop.
+//! This is the same pagination contract the sibling `ListWebACLs` handler serves:
+//! the two operations enumerate different resource kinds under one rule.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +125,10 @@ impl From<ListRuleGroupsErrorModeled> for ListRuleGroupsError {
     }
 }
 
+/// The largest page `ListRuleGroups` answers with when the request names no
+/// `Limit`: the upper bound of the model's `PaginationLimit` (`range 1..100`).
+const MAX_PAGE_SIZE: i32 = 100;
+
 /// The `ListRuleGroups` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +165,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRuleGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRuleGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRuleGroups"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(ListRuleGroupsErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the rule groups live in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRuleGroupsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Only this scope's rule groups, in a stable order so a marker names the
+        // same position on every call.
+        let mut entries: Vec<&crate::state::RuleGroupEntry> = state
+            .rule_groups
+            .values()
+            .filter(|entry| entry.scope == input.scope)
+            .collect();
+        entries.sort_by(|left, right| left.rule_group.name.cmp(&right.rule_group.name));
+
+        // `NextMarker` is the name of the last summary of the previous page, so this
+        // page starts at the first name after it.
+        if let Some(marker) = input.next_marker.as_deref() {
+            entries.retain(|entry| entry.rule_group.name.as_str() > marker);
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows (`range 1..100`); a `Limit` outside that range is refused rather
+        // than clamped, so no caller gets a silently empty terminal page.
+        let page_size = match input.limit {
+            None => MAX_PAGE_SIZE,
+            Some(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
+            Some(limit) => {
+                return Err(ListRuleGroupsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_ENTITY_LIMIT,
+                        &limit.to_string(),
+                        &format!("a page holds between 1 and {MAX_PAGE_SIZE} summaries"),
+                    ),
+                )
+                .into());
+            }
+        };
+        let page_size = usize::try_from(page_size).unwrap_or(0);
+        entries.truncate(page_size);
+
+        // WAF answers every non-empty page with a `NextMarker`: the name of the LAST
+        // summary on the page even when the page is not full, so a client resumes
+        // from it and learns it reached the end from the empty page that follows.
+        // `ListRuleGroupsResponse$NextMarker` is `length 1..256`, so a page with no
+        // last name — an empty one — carries no marker, which is also what ends the
+        // paginator's loop.
+        let next_marker = entries.last().map(|entry| entry.rule_group.name.clone());
+        let rule_groups = entries
+            .into_iter()
+            .map(|entry| RuleGroupSummary {
+                name: Some(entry.rule_group.name.clone()),
+                id: Some(entry.rule_group.id.clone()),
+                description: entry.rule_group.description.clone(),
+                lock_token: Some(entry.lock_token.clone()),
+                arn: Some(entry.rule_group.arn.clone()),
+            })
+            .collect();
+
+        Ok(ListRuleGroupsOutput {
+            next_marker,
+            rule_groups: Some(rule_groups),
+        })
     }
 }

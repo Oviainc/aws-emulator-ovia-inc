@@ -64,6 +64,8 @@ mod byoip_cidrs;
 mod capacity_block_offerings;
 #[path = "all/capacity_blocks.rs"]
 mod capacity_blocks;
+#[path = "all/capacity_reservation_billing_requests.rs"]
+mod capacity_reservation_billing_requests;
 #[path = "all/capacity_reservation_fleets.rs"]
 mod capacity_reservation_fleets;
 #[path = "all/coip_pools.rs"]

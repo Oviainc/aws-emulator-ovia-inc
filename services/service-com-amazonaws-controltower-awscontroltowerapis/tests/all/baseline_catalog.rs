@@ -352,8 +352,7 @@ async fn an_id_the_catalog_does_not_hold_is_not_found() {
 
 /// RULE (the stability side of it): the catalog is service-managed, so the answer does not
 /// depend on what the account holds — a repeated read reports the same baseline, and a
-/// baseline identifier a caller merely passed to `EnableBaseline` is still not in the
-/// catalog.
+/// baseline identifier the catalog does not hold is not enabled into it.
 #[tokio::test]
 async fn the_answer_is_stable_and_no_call_adds_a_baseline() {
     let router = emulator();
@@ -372,8 +371,8 @@ async fn the_answer_is_stable_and_no_call_adds_a_baseline() {
         first.status, first.body
     );
 
-    // An identifier that satisfies `BaselineArn` but names no catalog baseline: enabling
-    // it persists an `EnabledBaseline`, which is a different resource...
+    // An identifier that satisfies `BaselineArn` but names no catalog baseline cannot be
+    // enabled either: the enablement is refused, so no call can make the catalog hold it...
     let uncatalogued = "arn:aws:controltower:us-west-2::baseline/QQ1234567890ABCD";
     let enabled = call(
         &router,
@@ -386,24 +385,47 @@ async fn the_answer_is_stable_and_no_call_adds_a_baseline() {
     )
     .await;
     assert_eq!(
-        enabled.status, 200,
-        "enabling an uncatalogued baseline: expected 200, got {} body {:?}",
-        enabled.status, enabled.body
+        (enabled.status, enabled.error_code.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "enabling an uncatalogued baseline: expected 404 ResourceNotFoundException, got \
+         {:?} body {:?}",
+        (enabled.status, enabled.error_code.as_deref()),
+        enabled.body
     );
 
-    // ...so the catalog still does not hold it.
+    // ...and the catalog still does not hold it.
     let still_absent = get_baseline(&router, uncatalogued).await;
     assert_eq!(
         (still_absent.status, still_absent.error_code.as_deref()),
         (404, Some("ResourceNotFoundException")),
-        "an enabled but uncatalogued baseline: expected 404 ResourceNotFoundException, \
-         got {:?} body {:?}",
+        "an uncatalogued baseline after the refused enablement: expected 404 \
+         ResourceNotFoundException, got {:?} body {:?}",
         (still_absent.status, still_absent.error_code.as_deref()),
         still_absent.body
     );
 
-    // And the catalog read is unchanged by the enablement: a read reports the same
-    // baseline however often it is taken and whatever the account holds.
+    // A call that DOES enable a catalog baseline changes the catalog no more than the
+    // refusal did: a read reports the same baseline however often it is taken and whatever
+    // the account holds.
+    let accepted = call(
+        &router,
+        "/enable-baseline",
+        serde_json::json!({
+            "baselineIdentifier": identifier,
+            "baselineVersion": catalog_baseline
+                .versions
+                .last()
+                .expect("a catalog baseline offers at least one version"),
+            "targetIdentifier": "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ct11-2c",
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "enabling a catalogued baseline: expected 200, got {} body {:?}",
+        accepted.status, accepted.body
+    );
+
     let reread = get_baseline(&router, &identifier).await;
     assert_eq!(
         (

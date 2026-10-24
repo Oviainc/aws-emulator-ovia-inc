@@ -85,11 +85,19 @@ pub const TYPE_STATUS_CREATING: &str = "CREATING";
 /// one in which the type can be used (`ResourceNotFoundException`: "The resource
 /// might not be specified correctly, or its status might not be ACTIVE").
 pub const TYPE_STATUS_ACTIVE: &str = "ACTIVE";
+/// `TypeStatus` = `DELETING`: what `DeleteType` puts a type in until the deletion
+/// completes, after which the type is no longer a resource of its keyspace.
+///
+/// A member of the model's `TypeStatus` value set
+/// (`crate::ops::types::TYPE_STATUS_VALUES`), which the service reports for a type
+/// through `GetType`: the deletion the model gives a status to is one a caller can
+/// still observe, so it is not instantaneous.
+pub const TYPE_STATUS_DELETING: &str = "DELETING";
 
 /// How long a resource stays in a transient status before the clock owes it the
 /// next one: `CREATING` -> `ACTIVE` after `CreateTable`, `CreateKeyspace` or
 /// `CreateType`, `UPDATING` -> `ACTIVE` after `UpdateTable` or `UpdateKeyspace`,
-/// and `DELETING` -> gone after `DeleteTable`.
+/// and `DELETING` -> gone after `DeleteTable` or `DeleteType`.
 ///
 /// CHOSEN, not documented: Amazon Keyspaces publishes no duration for any of
 /// these transitions, only that they happen (`CreateTable`: "the status of the
@@ -1346,7 +1354,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     /// whose `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
     /// `UPDATING` span has elapsed becomes `ACTIVE`, a table's warm throughput
     /// configuration whose span has elapsed becomes `AVAILABLE`, a type whose `CREATING` span has
-    /// elapsed becomes `ACTIVE`, and a table whose
+    /// elapsed becomes `ACTIVE`, and a table or type whose
     /// `DELETING` span has elapsed is gone.
     ///
     /// Every handler calls this first, including the reporting ones. That is the one write
@@ -1413,22 +1421,29 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                     _ => true,
                 }
             });
-            // A type's only transition in this slice is the one `CreateType` starts:
-            // `CREATING` -> `ACTIVE`. `DELETING` belongs to `DeleteType`, which is
-            // still a scaffold, so nothing here can put a type in it.
-            for udt in keyspace.types.values_mut() {
+            // A type has the two transitions its operations start: `CREATING` ->
+            // `ACTIVE` from `CreateType`, and `DELETING` -> gone from `DeleteType`.
+            keyspace.types.retain(|_, udt| {
                 let Some(due) = udt.status_due_at else {
-                    continue;
+                    return true;
                 };
                 if now < due {
                     earliest = earlier_of(earliest, due);
-                    continue;
+                    return true;
                 }
                 udt.status_due_at = None;
-                if udt.status == TYPE_STATUS_CREATING {
-                    udt.status = TYPE_STATUS_ACTIVE.to_string();
+                match udt.status.as_str() {
+                    // The creation the clock owed has completed, so the type is usable.
+                    TYPE_STATUS_CREATING => {
+                        udt.status = TYPE_STATUS_ACTIVE.to_string();
+                        true
+                    }
+                    // The deletion the clock owed has completed, so the type is no
+                    // longer a resource of this keyspace at all.
+                    TYPE_STATUS_DELETING => false,
+                    _ => true,
                 }
-            }
+            });
         }
         self.next_transition_at = earliest;
     }

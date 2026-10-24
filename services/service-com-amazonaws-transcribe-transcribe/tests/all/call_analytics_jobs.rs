@@ -158,7 +158,56 @@ async fn get(transcribe: &Transcribe, name: &str) -> Reply {
         .await
 }
 
+/// Create the custom resources the rows of [`start_requests`] NAME, so each row
+/// applies a custom vocabulary, vocabulary filter and language model this account
+/// holds.
+///
+/// A start may only name custom resources that exist — "The name of the custom
+/// vocabulary you want to include in your Call Analytics transcription request", and
+/// the same sentence for the filter and the model
+/// (`smithy_query(query="shape", shape="CallAnalyticsJobSettings")`) — so a suite that
+/// starts a job with settings creates what those settings name first.
+async fn create_named_resources(transcribe: &Transcribe) {
+    transcribe
+        .call(
+            "CreateVocabulary",
+            json!({
+                "VocabularyName": "call-terms",
+                "LanguageCode": "en-US",
+                "Phrases": ["Aardvark", "Transcribe"]
+            }),
+        )
+        .await
+        .ok("CreateVocabulary call-terms");
+    transcribe
+        .call(
+            "CreateVocabularyFilter",
+            json!({
+                "VocabularyFilterName": "blocked-terms",
+                "LanguageCode": "en-US",
+                "Words": ["crud"]
+            }),
+        )
+        .await
+        .ok("CreateVocabularyFilter blocked-terms");
+    transcribe
+        .call(
+            "CreateLanguageModel",
+            json!({
+                "ModelName": "support-model",
+                "LanguageCode": "en-US",
+                "BaseModelName": "WideBand",
+                "InputDataConfig": {
+                    "S3Uri": "s3://DOC-EXAMPLE-BUCKET/training/",
+                    "DataAccessRoleArn": ROLE_ARN
+                }
+            }),
+        )
+        .await
+        .ok("CreateLanguageModel support-model");
+}
 
+/// `ListCallAnalyticsJobs` with `request`.
 async fn list(transcribe: &Transcribe, request: Value) -> Reply {
     transcribe.call("ListCallAnalyticsJobs", request).await
 }
@@ -181,6 +230,7 @@ fn names_of(summaries: &Value) -> Vec<String> {
 #[tokio::test]
 async fn a_started_call_analytics_job_reads_back_exactly_as_it_was_started() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         let started = transcribe
@@ -268,6 +318,7 @@ async fn a_started_call_analytics_job_reads_back_exactly_as_it_was_started() {
 #[tokio::test]
 async fn a_call_analytics_job_completes_once_its_processing_span_has_elapsed() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -836,6 +887,7 @@ async fn a_start_whose_members_cannot_hold_together_is_refused() {
 #[tokio::test]
 async fn a_second_start_under_a_live_job_name_is_a_conflict() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe

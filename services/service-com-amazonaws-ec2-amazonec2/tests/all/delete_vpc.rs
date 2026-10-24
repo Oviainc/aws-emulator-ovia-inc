@@ -314,7 +314,8 @@ async fn an_id_that_names_no_vpc_deletes_nothing() {
     }
 
     // A request that omits the member entirely never reaches the operation: `VpcId` is
-    // required, so the boundary validator refuses it first.
+    // required, so the boundary validator refuses it first — with the boundary's own code
+    // for a member the request left out.
     let (status, body) = delete_vpc(&router, &[]).await;
     assert_eq!(
         status, 400,

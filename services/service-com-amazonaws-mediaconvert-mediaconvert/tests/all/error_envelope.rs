@@ -77,7 +77,19 @@ async fn seeded() -> (Emulator, Vec<Case>) {
     let template = emulator
         .create_job_template(json!({
             "name": DELETED_TEMPLATE,
-            "settings": { "inputs": [{ "timecodeSource": "ZEROBASED" }] }
+            // A graph a job can be built from: `JobTemplateSettings` needs an output
+            // group, so the fixture states one rather than inputs alone.
+            "settings": {
+                "inputs": [{ "timecodeSource": "ZEROBASED" }],
+                "outputGroups": [{
+                    "name": "File Group",
+                    "outputs": [{ "nameModifier": "_0" }],
+                    "outputGroupSettings": {
+                        "type": "FILE_GROUP_SETTINGS",
+                        "fileGroupSettings": { "destination": "s3://example-bucket/out/" }
+                    }
+                }]
+            }
         }))
         .await;
     assert_eq!(

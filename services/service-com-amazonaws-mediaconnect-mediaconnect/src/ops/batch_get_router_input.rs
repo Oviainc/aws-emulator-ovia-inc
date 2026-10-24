@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetRouterInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetRouterInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetRouterInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, for the ARNs one request names, the stored router inputs they address —
+//! each computed from the record in [`crate::state`] that CreateRouterInput wrote — and
+//! one `Errors` entry for every named ARN this store holds no router input for.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +74,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `BatchGetRouterInputError$Code` for an ARN this store holds no router input for.
+///
+/// The per-ARN error carries the code of the failure that ARN would have been answered
+/// with on its own: GetRouterInput models `NotFoundException` (HTTP 404) for an ARN that
+/// addresses no router input, so that is the code a batch read reports for it, and the
+/// message is the one envelope every not-found in this crate is worded through
+/// ([`crate::state::not_found_message`]).
+const NOT_FOUND_CODE: &str = "NotFoundException";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +156,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetRouterInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetRouterInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetRouterInput"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetRouterInputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router input store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes: a router input state change the
+        // clock already made due (see `crate::state::TRANSITION_SPAN`) was owed at that
+        // instant whether or not anybody called, so it is materialised before reporting —
+        // which `router_input_projection` does, for every ARN at the SAME instant, so no
+        // two inputs in one answer are settled against different clocks.
+        let now = ::std::time::SystemTime::now();
+
+        // The whole request is answered: an ARN that resolves nothing is NOT a failure of
+        // the call, it is an entry in `Errors` — that is what makes this a batch read. Both
+        // lists follow the order the request named the ARNs in, and each requested resource
+        // is reported once however many times the request repeats its ARN.
+        let mut router_inputs: Vec<RouterInput> = Vec::new();
+        let mut errors: Vec<BatchGetRouterInputError2> = Vec::new();
+        let mut reported: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for arn in &input.arns {
+            if !reported.insert(arn.as_str()) {
+                continue;
+            }
+            match store.router_input_projection(arn, now) {
+                Some(router_input) => router_inputs.push(router_input),
+                None => errors.push(BatchGetRouterInputError2 {
+                    arn: arn.clone(),
+                    code: NOT_FOUND_CODE.to_string(),
+                    message: crate::state::not_found_message(arn),
+                }),
+            }
+        }
+
+        Ok(BatchGetRouterInputOutput {
+            router_inputs,
+            errors,
+        })
     }
 }
+

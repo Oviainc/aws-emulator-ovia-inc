@@ -15,14 +15,21 @@
 //! `GetConnectInstanceConfig` projects the config it holds, and `CreateCampaign`
 //! consults it before minting a campaign — an instance with no finished onboarding job
 //! is not a campaign target.
+//!
+//! The integration store is the single source of truth for what an onboarded Connect
+//! instance is integrated with: `PutConnectInstanceIntegration` writes one record per
+//! integration the instance holds, keyed by the kind and resource ARN that identify
+//! it, and `ListConnectInstanceIntegrations` projects those records.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
     Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimits,
-    CommunicationLimitsConfig, CommunicationTimeConfig, EncryptionConfig, EntryLimitsConfig,
-    InstanceConfig, InstanceOnboardingJobStatus, Schedule, Source,
+    CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationSummary,
+    EncryptionConfig, EntryLimitsConfig, InstanceConfig, InstanceOnboardingJobStatus,
+    IntegrationConfig, IntegrationSummary, LambdaIntegrationSummary, QConnectIntegrationSummary,
+    Schedule, Source,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -442,14 +449,14 @@ impl StoredCampaign {
     }
 }
 
-/// Record one state-changing instance-onboarding operation: who asked (the access
-/// key id the request presented), which Connect instance it named and how the call
-/// ended.
+/// Record one state-changing Connect-instance operation — onboarding a instance, or
+/// configuring one: who asked (the access key id the request presented), which
+/// Connect instance it named and how the call ended.
 ///
-/// The one place this service writes an onboarding audit record, so a later
-/// onboarding mutator records the same fields. Only wire metadata and the request's
-/// instance id go in: never the stored encryption config, a key ARN or any
-/// credential material.
+/// The one place this service writes an instance audit record, so a later instance
+/// mutator records the same fields. Only wire metadata and the request's instance id
+/// go in: never a stored encryption or integration config, a key or resource ARN or
+/// any credential material.
 pub fn audit_onboarding_change(
     parts: &::http::request::Parts,
     operation: &'static str,
@@ -634,6 +641,122 @@ pub fn service_linked_role_arn() -> String {
     )
 }
 
+/// What this service answers when a Connect instance id names no instance onboarded
+/// to Campaigns.
+///
+/// The one text every operation that resolves an instance id against the
+/// instance-onboarding store uses, so two of them cannot disagree about a request
+/// they both refuse. Composed from the request, which is why it names the id it was
+/// given.
+pub fn instance_not_found_message(connect_instance_id: &str) -> String {
+    format!(
+        "Connect instance {connect_instance_id} does not exist or is not enabled to use Campaigns"
+    )
+}
+
+/// The most integrations one Connect instance's store holds, after which a further
+/// put is refused rather than taken.
+///
+/// AWS publishes no limit on the integrations of a Connect instance, so this figure
+/// is the emulator's own: without a ceiling a caller could put integrations until the
+/// process runs out of memory. It is set far above any plausible workload — the model
+/// declares three integration kinds, and one instance integrates few resources of
+/// each.
+pub const MAX_INTEGRATIONS_PER_INSTANCE: usize = 100;
+
+/// Which of the three integrations the `IntegrationConfig`, `IntegrationIdentifier`
+/// and `IntegrationSummary` unions each declare a member for a record is.
+///
+/// The kind and the ARN of the integrated resource together identify one integration
+/// of one Connect instance: that pair is exactly what the matching
+/// `IntegrationIdentifier` member carries (`customerProfiles` a domain ARN, `qConnect`
+/// a knowledge-base ARN, `lambda` a function ARN), so it is the key an integration is
+/// stored under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationKind {
+    CustomerProfiles,
+    QConnect,
+    Lambda,
+}
+
+impl IntegrationKind {
+    /// The union member this kind is carried in, as the model names it — the key a
+    /// request or response body carries the integration under.
+    pub fn member_name(self) -> &'static str {
+        match self {
+            Self::CustomerProfiles => "customerProfiles",
+            Self::QConnect => "qConnect",
+            Self::Lambda => "lambda",
+        }
+    }
+}
+
+/// The identity of the integration `config` configures: its kind, and the ARN of the
+/// resource it integrates (see [`IntegrationKind`]).
+///
+/// The one place that pair is read off a config, so the key a put stores under and
+/// the key a reader matches on cannot disagree.
+pub fn integration_key(config: &IntegrationConfig) -> (IntegrationKind, &str) {
+    match config {
+        IntegrationConfig::customerProfiles(config) => (
+            IntegrationKind::CustomerProfiles,
+            config.domain_arn.as_str(),
+        ),
+        IntegrationConfig::qConnect(config) => (
+            IntegrationKind::QConnect,
+            config.knowledge_base_arn.as_str(),
+        ),
+        IntegrationConfig::Lambda(config) => {
+            (IntegrationKind::Lambda, config.function_arn.as_str())
+        }
+    }
+}
+
+/// One integration of one Connect instance: the config the
+/// `PutConnectInstanceIntegration` call persisted, and where in the store's order it
+/// sits.
+#[derive(Debug, Clone)]
+pub struct StoredIntegration {
+    /// The store-wide sequence number this integration was first put at — the value
+    /// a `ListConnectInstanceIntegrations` cursor names. Updating an integration
+    /// keeps it, so a put does not reorder a page a caller is part way through.
+    pub sequence: u64,
+    /// The integration config, exactly as the call that put it supplied it.
+    pub config: IntegrationConfig,
+}
+
+impl StoredIntegration {
+    /// Which integration this is: the kind and resource ARN it is stored under (see
+    /// [`integration_key`]).
+    pub fn key(&self) -> (IntegrationKind, &str) {
+        integration_key(&self.config)
+    }
+
+    /// This record as the modelled `IntegrationSummary` `ListConnectInstanceIntegrations`
+    /// returns: the same union member as the stored config, carrying the values that
+    /// config holds.
+    pub fn to_summary(&self) -> IntegrationSummary {
+        match &self.config {
+            IntegrationConfig::customerProfiles(config) => {
+                IntegrationSummary::customerProfiles(CustomerProfilesIntegrationSummary {
+                    domain_arn: config.domain_arn.clone(),
+                    object_type_names: config.object_type_names.clone(),
+                })
+            }
+            IntegrationConfig::qConnect(config) => {
+                IntegrationSummary::qConnect(QConnectIntegrationSummary {
+                    knowledge_base_arn: config.knowledge_base_arn.clone(),
+                })
+            }
+            IntegrationConfig::Lambda(config) => {
+                IntegrationSummary::Lambda(LambdaIntegrationSummary {
+                    function_arn: config.function_arn.clone(),
+                })
+            }
+        }
+    }
+}
+
 /// Why the store refused to take a campaign, as
 /// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::insert_new_campaign`]
 /// reports it. Nothing is stored in either case.
@@ -661,6 +784,11 @@ pub enum InsertRejected {
 /// [`Self::start_instance_onboarding`]. It is the one place "is this instance a
 /// campaign target?" is answered, so `CreateCampaign`'s gate and
 /// `GetConnectInstanceConfig` / `GetInstanceOnboardingJobStatus` cannot disagree.
+///
+/// `instance_integrations` is the third: the integrations of each Connect instance,
+/// which `PutConnectInstanceIntegration` writes and
+/// `ListConnectInstanceIntegrations` projects, so the list reports what the puts
+/// stored and nothing else.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     campaigns: HashMap<String, StoredCampaign>,
@@ -670,6 +798,13 @@ pub struct ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
     /// One onboarding record per Connect instance, keyed by instance id. Bounded by
     /// [`MAX_ONBOARDED_INSTANCES`], enforced by [`Self::start_instance_onboarding`].
     instance_onboarding: HashMap<String, StoredInstanceOnboarding>,
+    /// The integrations of each Connect instance, keyed by instance id, each
+    /// instance's in the order they were first put — the order
+    /// `ListConnectInstanceIntegrations` pages through. Bounded at
+    /// [`MAX_INTEGRATIONS_PER_INSTANCE`] per instance by
+    /// [`Self::put_instance_integration`].
+    instance_integrations: HashMap<String, Vec<StoredIntegration>>,
+    next_integration_sequence: u64,
 }
 
 impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
@@ -896,6 +1031,75 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         }
         self.instance_onboarding.remove(connect_instance_id);
         DeleteOnboardingOutcome::Deleted
+    }
+
+    /// Put `config` as an integration of `connect_instance_id`, and hand back the
+    /// record now in the store — so a handler reports what the store holds rather
+    /// than what the request carried.
+    ///
+    /// An integration already stored under the same identity (see
+    /// [`integration_key`]) takes the new config and KEEPS its sequence number: that
+    /// is what makes the call an update of that integration rather than a second one
+    /// beside it. A config under an identity the instance does not hold is appended.
+    ///
+    /// `None` means the instance already holds [`MAX_INTEGRATIONS_PER_INSTANCE`]
+    /// integrations and nothing was written — a refusal consumes no sequence number
+    /// and leaves no empty entry behind.
+    pub fn put_instance_integration(
+        &mut self,
+        connect_instance_id: &str,
+        config: IntegrationConfig,
+    ) -> Option<StoredIntegration> {
+        let (kind, arn) = {
+            let (kind, arn) = integration_key(&config);
+            (kind, arn.to_string())
+        };
+        let held = self
+            .instance_integrations
+            .get(connect_instance_id)
+            .map_or(0, Vec::len);
+        if let Some(existing) = self
+            .instance_integrations
+            .get_mut(connect_instance_id)
+            .and_then(|integrations| {
+                integrations
+                    .iter_mut()
+                    .find(|stored| stored.key() == (kind, arn.as_str()))
+            })
+        {
+            existing.config = config;
+            return Some(existing.clone());
+        }
+        if held >= MAX_INTEGRATIONS_PER_INSTANCE {
+            return None;
+        }
+        // Only now, past the refusal, is a sequence number taken — so the cursor
+        // space has no gaps a refused put left behind.
+        let record = StoredIntegration {
+            sequence: self.next_integration_sequence,
+            config,
+        };
+        self.next_integration_sequence = self.next_integration_sequence.saturating_add(1);
+        self.instance_integrations
+            .entry(connect_instance_id.to_string())
+            .or_default()
+            .push(record.clone());
+        Some(record)
+    }
+
+    /// Every integration of `connect_instance_id`, in the order they were first put.
+    ///
+    /// An instance that holds none yields nothing, which is not the same as an
+    /// instance that is not onboarded: whether the instance exists at all is
+    /// [`Self::is_onboarded`]'s answer, not this one's.
+    pub fn instance_integrations(
+        &self,
+        connect_instance_id: &str,
+    ) -> impl Iterator<Item = &StoredIntegration> {
+        self.instance_integrations
+            .get(connect_instance_id)
+            .into_iter()
+            .flatten()
     }
 }
 

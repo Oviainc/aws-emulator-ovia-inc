@@ -14,6 +14,12 @@
 //! a walk with any page size the model allows (`MaxResults` @range 1..100) yields
 //! that one duplicate-free listing and only the LAST page carries no `NextToken`.
 //!
+//! The unasked page is a RULE of its own, asserted here too: `MaxResults` bounds what
+//! a CALLER may ask for and not what `ListServices` returns when the caller names
+//! none, so an unasked `ListServices` — the single call a client makes to discover a
+//! `ServiceCode` — carries the integrated-service inventory WHOLE, past the largest
+//! page a caller may ask for, with no `NextToken`.
+//!
 //! A catalog that is a handful of sample rows satisfies the wire shape and still
 //! breaks the rule: every page size collapses to one page, so these suites assert
 //! the catalog's EXTENT too — the service list and EC2's quota list each exceed the
@@ -25,6 +31,8 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_servicequotas_servicequotasv20190624::state::MAX_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages_counted, Client};
 
@@ -321,4 +329,133 @@ async fn a_quota_the_checks_did_not_cite_round_trips_through_the_single_reads() 
         "case uncited services: expected a quota from each of {UNCITED_SERVICES:?}, checked only \
          {checked}"
     );
+}
+
+/// The `Services` list of a response, or a panic naming the case.
+fn services(case: &str, response: &Value) -> Vec<Value> {
+    response["Services"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected a Services list, got {response}"))
+        .clone()
+}
+
+/// RULE: `MaxResults` bounds what a CALLER may ask for, not the page this listing
+/// returns when the caller names none \u2014 so a `ListServices` call with no `MaxResults`
+/// carries the WHOLE integrated-service inventory, past the largest page a caller may
+/// ask for, in one page with no `NextToken`.
+#[tokio::test]
+async fn an_unasked_service_listing_returns_the_whole_inventory_in_one_page() {
+    let engine = emulator();
+
+    // The inventory as the token chain yields it at the largest page size a caller may
+    // ask for: the one listing every row below is measured against.
+    let reference = walk(
+        &client(&engine, "us-east-1"),
+        "ListServices",
+        &json!({}),
+        "Services",
+        Some(MAX_PAGE_SIZE as i64),
+    )
+    .await
+    .items;
+    assert!(
+        reference.len() > MAX_PAGE_SIZE,
+        "case ListServices: the inventory must outgrow the largest page a caller may ask for \
+         ({MAX_PAGE_SIZE}), got {} entries",
+        reference.len()
+    );
+
+    // Rows: the regions this listing is served from (the inventory is the same in
+    // every one) crossed with the request forms that name NO page size — an empty
+    // body, and one carrying the empty `NextToken` the modelled @length 0..2048
+    // allows, which asks for the listing from its beginning.
+    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+        let client = client(&engine, region);
+        for body in [json!({}), json!({"NextToken": ""})] {
+            let case = format!("ListServices {region} {body}");
+            let response = client.ok("ListServices", body.clone()).await;
+            let page = services(&case, &response);
+            assert_eq!(
+                page.len(),
+                reference.len(),
+                "case {case}: an unasked listing carries the whole inventory of {} entries, got {}",
+                reference.len(),
+                page.len()
+            );
+            assert_eq!(
+                page, reference,
+                "case {case}: the unasked page must be the published listing itself"
+            );
+            assert!(
+                response["NextToken"].is_null(),
+                "case {case}: the whole inventory is the last page, so no NextToken follows it, \
+                 got {}",
+                response["NextToken"]
+            );
+        }
+    }
+}
+
+/// RULE, the other half: a caller that DOES name `MaxResults` gets exactly that page
+/// size with a `NextToken` while entries remain, and a continuation that names no page
+/// size again serves the whole remainder in one page.
+#[tokio::test]
+async fn an_asked_page_size_still_bounds_the_service_listing() {
+    let engine = emulator();
+    let client = client(&engine, "us-west-2");
+
+    let whole = services(
+        "ListServices unasked",
+        &client.ok("ListServices", json!({})).await,
+    );
+
+    // Rows: both published bounds of the modelled `MaxResults` @range 1..100 and two
+    // sizes between them that divide no catalog evenly. (A size outside the range is
+    // refused by the request validator, which `quota_workflow.rs` pins.)
+    for size in [1_i64, 7, 63, MAX_PAGE_SIZE as i64] {
+        let case = format!("ListServices MaxResults={size}");
+        let asked = client
+            .ok("ListServices", json!({"MaxResults": size}))
+            .await;
+        let page = services(&case, &asked);
+        let taken = (size as usize).min(whole.len());
+        assert_eq!(
+            page.len(),
+            taken,
+            "case {case}: an asked page holds the asked size, expected {taken}, got {}",
+            page.len()
+        );
+        assert_eq!(
+            page,
+            whole[..taken],
+            "case {case}: the first page must be the first entries of the published order"
+        );
+
+        let token = asked["NextToken"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !token.is_empty(),
+            "case {case}: {} entries remain after this page, so a NextToken must follow it, got \
+             {asked}",
+            whole.len() - taken
+        );
+
+        // Resuming without a page size serves the rest in one page: the unasked page
+        // size governs a continuation the same way.
+        let resumed = client
+            .ok("ListServices", json!({"NextToken": token}))
+            .await;
+        let rest = services(&format!("{case} resumed"), &resumed);
+        assert_eq!(
+            rest,
+            whole[taken..],
+            "case {case} resumed: an unasked continuation carries the remaining {} entries, got {}",
+            whole.len() - taken,
+            rest.len()
+        );
+        assert!(
+            resumed["NextToken"].is_null(),
+            "case {case} resumed: the remainder is the last page, got {}",
+            resumed["NextToken"]
+        );
+    }
 }

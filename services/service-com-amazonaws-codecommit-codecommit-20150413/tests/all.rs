@@ -79,6 +79,8 @@ mod merge_options;
 mod object_store_bounds;
 #[path = "all/path_depth_bound.rs"]
 mod path_depth_bound;
+#[path = "all/pull_request_creation.rs"]
+mod pull_request_creation;
 #[path = "all/repositories_for_approval_rule_template.rs"]
 mod repositories_for_approval_rule_template;
 #[path = "all/repository_description.rs"]

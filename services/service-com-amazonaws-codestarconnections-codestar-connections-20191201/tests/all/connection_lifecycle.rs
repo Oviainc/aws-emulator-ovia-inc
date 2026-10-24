@@ -8,6 +8,11 @@
 //! body), so what is asserted here is the service's HTTP behaviour and not a handler
 //! called directly.
 //!
+//! This file also holds the crate's ONE wire harness — [`Emulator`], the signing-scope
+//! header it sends, [`error_code`] and the ARN/catalog helpers — which the other suites
+//! under `tests/all/` reach through `use super::connection_lifecycle::…`, so there is a
+//! single statement of how a request is dispatched and it cannot drift between suites.
+//!
 //! The tables below span the classes the rules generalise over — every modeled
 //! `ProviderType`, the published `ConnectionName` length bounds, a range of page sizes,
 //! several tag sets — rather than one recorded request.
@@ -34,7 +39,7 @@ pub(crate) const TARGET_PREFIX: &str = "CodeStar_connections_20191201";
 /// (`src/ops/types/shared_types.rs::PROVIDER_TYPE_VALUES`, from
 /// `smithy_query(query="shape", shape="ProviderType")`), so the table below widens
 /// with the model instead of drifting from it.
-const PROVIDER_TYPES: &[&str] = codestar::ops::types::shared_types::PROVIDER_TYPE_VALUES;
+pub(crate) const PROVIDER_TYPES: &[&str] = codestar::ops::types::shared_types::PROVIDER_TYPE_VALUES;
 
 /// The `ProviderType` every host [`Emulator::create_host`] creates holds — a host's
 /// provider is what a connection created through that host reaches.
@@ -164,6 +169,15 @@ impl Emulator {
 /// The error code an awsJson error envelope carries (`__type`).
 pub(crate) fn error_code(response: &Value) -> String {
     response["__type"].as_str().unwrap_or_default().to_string()
+}
+
+/// The message an awsJson error envelope carries, under either casing the protocols use.
+pub(crate) fn error_message(response: &Value) -> String {
+    response["Message"]
+        .as_str()
+        .or_else(|| response["message"].as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Assert `arn` is a connection ARN of the modeled form

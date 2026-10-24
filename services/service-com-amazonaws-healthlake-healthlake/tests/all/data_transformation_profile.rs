@@ -32,24 +32,27 @@ const CREATE_SUCCESS_STATUS: u16 = 201;
 /// The shared router harness plus the case-labelled assertions this suite's tables
 /// need: every row names itself in the failure message, and this slice's create
 /// answers the modelled 201 rather than the 200 the shared `ok` requires.
-struct Profiles {
+///
+/// `pub(crate)` so the sibling profile suites in `tests/all/` drive the slice
+/// through this one harness rather than each writing its own.
+pub(crate) struct Profiles {
     healthlake: HealthLake,
 }
 
 impl Profiles {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             healthlake: HealthLake::new(),
         }
     }
 
     /// Dispatch one awsJson1_0 call, returning the HTTP status and the parsed body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.healthlake.call(operation, body).await
     }
 
     /// Dispatch a call that must succeed, returning its body.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, payload) = self.call(operation, body).await;
         assert!(
             (200..300).contains(&status),
@@ -59,14 +62,14 @@ impl Profiles {
     }
 
     /// Dispatch a call that must be refused, returning `(status, error code)`.
-    async fn refused(&self, case: &str, operation: &str, body: &Value) -> (u16, String) {
+    pub(crate) async fn refused(&self, case: &str, operation: &str, body: &Value) -> (u16, String) {
         let (status, code, _) = self.refused_body(case, operation, body).await;
         (status, code)
     }
 
     /// Dispatch a call that must be refused, returning `(status, error code, body)`
     /// for a case that also asserts on the refusal's modelled `Message`.
-    async fn refused_body(
+    pub(crate) async fn refused_body(
         &self,
         case: &str,
         operation: &str,
@@ -83,12 +86,12 @@ impl Profiles {
 
 /// The modelled `Message` member of an error body, under that exact key — the key
 /// this service's own error shapes declare, not the framework's lowercase one.
-fn modelled_message(payload: &Value) -> Option<&str> {
+pub(crate) fn modelled_message(payload: &Value) -> Option<&str> {
     payload.get("Message").and_then(Value::as_str)
 }
 
 /// A `Source` union naming raw profile content.
-fn profile_mapping_source(mapping: &BTreeMap<String, String>) -> Value {
+pub(crate) fn profile_mapping_source(mapping: &BTreeMap<String, String>) -> Value {
     let content: Map<String, Value> = mapping
         .iter()
         .map(|(path, content)| (path.clone(), Value::String(content.clone())))
@@ -97,7 +100,7 @@ fn profile_mapping_source(mapping: &BTreeMap<String, String>) -> Value {
 }
 
 /// A mapping built from `(path, content)` pairs.
-fn mapping(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn mapping(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
         .iter()
         .map(|(path, content)| ((*path).to_string(), (*content).to_string()))
@@ -105,7 +108,7 @@ fn mapping(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 /// A mapping of `count` distinct entries, for the entry-count bounds.
-fn mapping_of(count: usize) -> BTreeMap<String, String> {
+pub(crate) fn mapping_of(count: usize) -> BTreeMap<String, String> {
     (0..count)
         .map(|index| {
             (
@@ -119,7 +122,7 @@ fn mapping_of(count: usize) -> BTreeMap<String, String> {
 /// A mapping just past `bytes` bytes of keys and values together, built from entries
 /// each INSIDE its own modelled bound (a 100 000-character value is under the
 /// modelled 102 400 maximum), for the retained-byte ceiling.
-fn mapping_of_bytes(bytes: usize) -> BTreeMap<String, String> {
+pub(crate) fn mapping_of_bytes(bytes: usize) -> BTreeMap<String, String> {
     let content = "v".repeat(100_000);
     let entries = bytes / content.len() + 1;
     (0..entries)
@@ -128,7 +131,7 @@ fn mapping_of_bytes(bytes: usize) -> BTreeMap<String, String> {
 }
 
 /// The `ProfileMapping` a response reports, as a comparable map.
-fn reported_mapping(case: &str, body: &Value) -> BTreeMap<String, String> {
+pub(crate) fn reported_mapping(case: &str, body: &Value) -> BTreeMap<String, String> {
     body["ProfileMapping"]
         .as_object()
         .unwrap_or_else(|| {
@@ -151,7 +154,7 @@ fn reported_mapping(case: &str, body: &Value) -> BTreeMap<String, String> {
 
 /// `ProfileId` values satisfy the modelled `ProfileIdString` pattern
 /// `^[a-f0-9]{32}$`.
-fn assert_well_formed_profile_id(case: &str, id: &str) {
+pub(crate) fn assert_well_formed_profile_id(case: &str, id: &str) {
     assert_eq!(
         id.len(),
         32,

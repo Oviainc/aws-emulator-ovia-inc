@@ -14,9 +14,10 @@
 //!   `Quotas` list, because the code exists;
 //! * the ARN of an AWS DEFAULT quota carries no account segment, while the APPLIED
 //!   quota of the same pair carries the account;
-//! * a listing called with no `MaxResults` returns ONE BOUNDED page, with a
+//! * a QUOTA listing called with no `MaxResults` returns ONE BOUNDED page, with a
 //!   `NextToken` while items remain, and the same items come back however the
-//!   listing is paged.
+//!   listing is paged (the integrated-service inventory is served whole unasked,
+//!   which `catalog_pagination.rs` pins).
 //!
 //! The harness (`client`, `walk_pages`, `ACCOUNT`) is the one `quota_workflow.rs`
 //! already uses, so both suites speak to the emulator the same way.
@@ -320,19 +321,19 @@ async fn an_aws_default_quota_arn_names_no_account_and_the_applied_one_does() {
     }
 }
 
-/// A listing called with no `MaxResults` returns ONE BOUNDED page — the page size
-/// the listing applies, with a `NextToken` while items remain — and a caller that
-/// names a page size gets that page size, with the walk yielding the same items.
+/// A QUOTA listing called with no `MaxResults` returns ONE BOUNDED page — the page
+/// size the listing applies, with a `NextToken` while items remain — and a caller
+/// that names a page size gets that page size, with the walk yielding the same items.
+/// (`ListServices` serves its whole inventory unasked instead; `catalog_pagination.rs`
+/// pins that.)
 #[tokio::test]
-async fn a_listing_with_no_page_size_returns_one_bounded_page() {
+async fn a_quota_listing_with_no_page_size_returns_one_bounded_page() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
-    // Rows: a listing far longer than the modelled MaxResults ceiling (the catalog),
-    // and listings shorter than it (the seeded quota sets), including one shorter
-    // than a single unasked page.
+    // Rows: seeded quota sets of several lengths, including one shorter than a single
+    // unasked page and one longer than it.
     let listings = [
-        ("ListServices", json!({}), "Services"),
         (
             "ListAWSDefaultServiceQuotas",
             json!({"ServiceCode": "vpc"}),

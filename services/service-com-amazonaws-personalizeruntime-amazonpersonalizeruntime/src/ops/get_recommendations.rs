@@ -17,14 +17,14 @@
 //!    used", and for a recommender the input its domain use case requires.
 //! 3. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
 //!    its expression, bound to `filterValues`, decides which stored catalog entries
-//!    are candidates at all.
+//!    come back — not what any of them scores.
 //! 4. **Score and order.** Each candidate's score is [`crate::state::scoring::relevance`]
 //!    of its STORED `base_score` and the request's `userId`/`itemId`/`context`, so an
 //!    identical request returns an identical ordering (the operation is
 //!    `@idempotent`). The list is reported "sorted in descending order by prediction
-//!    score". The scores are normalized across the whole filter-surviving candidate
-//!    set BEFORE `numResults` and any promotion decide which candidates come back, so
-//!    one item's score is the same whatever the request asked for.
+//!    score". The scores are normalized across the whole stored catalog BEFORE the
+//!    request's filter, `numResults` and any promotion decide which candidates come
+//!    back, so one item's score is the same whatever the request asked for.
 //! 5. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
 //!    slots from the entries its own filter selects; each such item carries
 //!    `promotionName` and the documented `reason` "Promoted item".
@@ -250,9 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(deny)?;
         let promotion = promotion(&guard, input.promotions.as_deref(), num_results)?;
 
-        // 5. Score every stored catalog entry the filter keeps, in descending score
-        //    order. `RELATED_ITEMS` recommends items related to `itemId`, never the
-        //    queried item itself.
+        // 5. Score the resolved resource's WHOLE stored catalog and settle each entry's
+        //    share of the certainty over it. `RELATED_ITEMS` recommends items related
+        //    to `itemId`, never the queried item itself, so that item is no candidate
+        //    at all — `itemId` is a personalization input, not a selection member.
         let context_seed = scoring::context_seed(input.context.as_ref());
         let mut candidates: Vec<(usize, f64)> = resolved
             .items
@@ -260,11 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .enumerate()
             .filter(|(_, item)| {
                 !(resolved.required_input == RequiredInput::Item && item.item_id == item_id)
-            })
-            .filter(|(_, item)| {
-                request_filter
-                    .as_ref()
-                    .is_none_or(|filter| filter.retains(&item.attributes))
             })
             .map(|(index, item)| {
                 let score = scoring::relevance(
@@ -280,13 +276,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (index, score)
             })
             .collect();
-        // The reported score of an item is a property of the resolved resource, the
-        // request's personalization inputs and the item, so the denominator is the
-        // WHOLE filter-surviving candidate set and is settled before `numResults` or a
-        // promotion selects which candidates come back. A response that reports fewer
-        // items reports each of them with the same score a larger one would, and sums
-        // to at most 1.0.
+        // The reported score of an item is the model's certainty for the resolved
+        // resource, the request's personalization inputs and that item, so the
+        // denominator is the WHOLE scored catalog and is settled before any member
+        // that only selects which items come back — the request's filter, `numResults`
+        // and a promotion. A response that reports fewer items reports each of them
+        // with the same score a larger one would, and sums to at most 1.0.
         scoring::normalize_by(&mut candidates, |(_, score)| score);
+        // "a filter you created to include items or exclude items from recommendations"
+        // — it decides WHICH candidates come back, never what one of them scores.
+        candidates.retain(|(index, _)| {
+            request_filter
+                .as_ref()
+                .is_none_or(|filter| filter.retains(&resolved.items[*index].attributes))
+        });
         candidates.sort_by(|(left, left_score), (right, right_score)| {
             scoring::by_score_desc(
                 (&resolved.items[*left].item_id, *left_score),

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePullRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePullRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePullRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: persists a pull request between two branches of one stored
+//! repository in `crate::state` and answers with the stored pull request.
 //!
 //! ## Shape of an operation
 //!
@@ -196,6 +189,82 @@ impl From<CreatePullRequestErrorModeled> for CreatePullRequestError {
     }
 }
 
+/// The branch a target's reference names, or the error CodeCommit answers for a
+/// reference that names no branch.
+///
+/// The classification itself is `crate::state`'s, so every operation that takes a
+/// pull request reference agrees about which references address a branch, and so
+/// is each message — the request boundary (`crate::service`) words these codes
+/// from the very same constants. This only maps each outcome onto the error THIS
+/// operation models for it.
+fn checked_reference(raw: &str) -> Result<&str, CreatePullRequestError> {
+    crate::state::pull_request_reference(raw).map_err(|problem| match problem {
+        crate::state::ReferenceProblem::Missing => {
+            CreatePullRequestErrorModeled::ReferenceNameRequiredException(
+                ReferenceNameRequiredException {
+                    message: Some(crate::state::REFERENCE_NAME_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::ReferenceProblem::Invalid => {
+            CreatePullRequestErrorModeled::InvalidReferenceNameException(
+                InvalidReferenceNameException {
+                    message: Some(crate::state::INVALID_REFERENCE_NAME_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::ReferenceProblem::UnsupportedType => {
+            CreatePullRequestErrorModeled::ReferenceTypeNotSupportedException(
+                ReferenceTypeNotSupportedException {
+                    message: Some(
+                        crate::state::REFERENCE_TYPE_NOT_SUPPORTED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into()
+        }
+    })
+}
+
+/// The pull request this call created (or, on a repeated idempotency token, the
+/// one the first call created).
+fn created(record: &crate::state::PullRequestRecord) -> CreatePullRequestOutput {
+    CreatePullRequestOutput {
+        pull_request: record.to_modeled(),
+    }
+}
+
+/// The idempotency token this request names. A blank token names no earlier
+/// request, the same as leaving the optional member out.
+fn client_request_token(input: &CreatePullRequestInput) -> Option<&str> {
+    input
+        .client_request_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+}
+
+/// Is a repeated `clientRequestToken` carrying the request it was first accepted
+/// for — the same title, description and target?
+fn unchanged_request(
+    existing: &crate::state::PullRequestRecord,
+    title: &str,
+    description: Option<&str>,
+    repository_name: &str,
+    source_reference: &str,
+    destination_reference: &str,
+) -> bool {
+    existing.title == title
+        && existing.description.as_deref() == description
+        && existing.targets.len() == 1
+        && existing.targets.iter().all(|target| {
+            target.repository_name == repository_name
+                && target.source_reference == source_reference
+                && target.destination_reference == destination_reference
+        })
+}
+
 /// The `CreatePullRequest` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -232,18 +301,399 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePullRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePullRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePullRequest"))
+        // "A pull request title is required. It cannot be empty or null."
+        // `Title`'s modelled length is 0..150, so an empty title reaches here.
+        if input.title.trim().is_empty() {
+            return Err(CreatePullRequestErrorModeled::TitleRequiredException(
+                TitleRequiredException {
+                    message: Some("A pull request title is required.".to_string()),
+                },
+            )
+            .into());
+        }
+        // A pull request holds no empty description: one set to an empty string
+        // simply has none, so `description` is ABSENT on the answer and on every
+        // later read rather than reported as an empty string.
+        let description = input.description.clone().filter(|text| !text.is_empty());
+
+        // "An array of target objects is required. It cannot be empty or null."
+        if input.targets.is_empty() {
+            return Err(CreatePullRequestErrorModeled::TargetsRequiredException(
+                TargetsRequiredException {
+                    message: Some(
+                        "An array of target objects is required. It cannot be empty or null."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // "You cannot include more than one repository in a pull request."
+        let repositories: std::collections::BTreeSet<&str> = input
+            .targets
+            .iter()
+            .map(|target| target.repository_name.as_str())
+            .collect();
+        if repositories.len() > 1 {
+            return Err(
+                CreatePullRequestErrorModeled::MultipleRepositoriesInPullRequestException(
+                    MultipleRepositoriesInPullRequestException {
+                        message: Some(
+                            "You cannot include more than one repository in a pull request. Make \
+                             sure you have specified only one repository name in your request, and \
+                             then try again."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A pull request is between ONE source and ONE destination: a second
+        // target in the same repository names a second pair of branches, which
+        // is not a pull request CodeCommit holds.
+        if input.targets.len() > 1 {
+            return Err(CreatePullRequestErrorModeled::InvalidTargetsException(
+                InvalidTargetsException {
+                    message: Some(
+                        "The targets for the pull request is not valid or not in a valid format. \
+                         A pull request has one target."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        let target = &input.targets[0];
+
+        // `RepositoryName`'s modelled length and pattern are refused at the
+        // request boundary; this is the part of the rule the model cannot
+        // express (see `crate::state::is_repository_name`).
+        if target.repository_name.is_empty() {
+            return Err(
+                CreatePullRequestErrorModeled::RepositoryNameRequiredException(
+                    RepositoryNameRequiredException {
+                        message: Some(
+                            "A repository name is required, but was not specified.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if !crate::state::is_repository_name(&target.repository_name) {
+            return Err(
+                CreatePullRequestErrorModeled::InvalidRepositoryNameException(
+                    InvalidRepositoryNameException {
+                        message: Some("A specified repository name is not valid.".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let source_branch = checked_reference(&target.source_reference)?.to_string();
+        // A blank `destinationReference` names no branch, the same as leaving the
+        // optional member out: the destination is then the repository's default
+        // branch, which only stored state knows. Whether a reference is blank is
+        // the one question asked here; classifying what a non-blank one names is
+        // `checked_reference`'s, which trims it exactly as it trims the source.
+        let requested_destination = target
+            .destination_reference
+            .as_deref()
+            .filter(|reference| !reference.trim().is_empty())
+            .map(checked_reference)
+            .transpose()?
+            .map(str::to_string);
+
+        let now = std::time::SystemTime::now();
+        let author_arn = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // Everything this call reads out of stored state, resolved before
+        // anything is written: which branches the two references name, the tips
+        // they point at, their merge base, and the approval rule templates the
+        // repository's associations apply to the new pull request.
+        let (
+            destination_branch,
+            source_commit,
+            destination_commit,
+            merge_base,
+            applied_templates,
+            existing_token_answer,
+        ) = {
+            let repository = store
+                .repositories
+                .get(&target.repository_name)
+                .ok_or_else(|| {
+                    CreatePullRequestErrorModeled::RepositoryDoesNotExistException(
+                        RepositoryDoesNotExistException {
+                            message: Some(crate::state::repository_does_not_exist_message(
+                                &target.repository_name,
+                            )),
+                        },
+                    )
+                })?;
+
+            let reference_does_not_exist = || {
+                CreatePullRequestErrorModeled::ReferenceDoesNotExistException(
+                    ReferenceDoesNotExistException {
+                        message: Some(
+                            crate::state::REFERENCE_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+            };
+            // "The branch of the repository where the pull request changes are
+            // merged": the request's own destination, or the repository's
+            // default branch when it names none.
+            let destination_branch = match requested_destination.clone() {
+                Some(branch) => branch,
+                None => repository
+                    .default_branch
+                    .clone()
+                    .ok_or_else(reference_does_not_exist)?,
+            };
+            // "The source branch and destination branch for the pull request are
+            // the same. You must specify different branches for the source and
+            // the destination."
+            if source_branch == destination_branch {
+                return Err(
+                    CreatePullRequestErrorModeled::SourceAndDestinationAreSameException(
+                        SourceAndDestinationAreSameException {
+                            message: Some(
+                                "The source branch and destination branch for the pull request are \
+                                 the same. You must specify different branches for the source and \
+                                 destination."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Both branches have to be references this repository holds: a pull
+            // request is between stored tips, never between a name the
+            // repository never had.
+            let source_commit = repository
+                .branches
+                .get(&source_branch)
+                .ok_or_else(reference_does_not_exist)?
+                .commit_id
+                .clone();
+            let destination_commit = repository
+                .branches
+                .get(&destination_branch)
+                .ok_or_else(reference_does_not_exist)?
+                .commit_id
+                .clone();
+
+            let source_reference = crate::state::qualified_reference(&source_branch);
+            let destination_reference = crate::state::qualified_reference(&destination_branch);
+
+            // An idempotency token that was already used: the same request
+            // returns the pull request it first created, and a changed one is
+            // refused rather than opening a second pull request under the same
+            // token. The token is judged against the request it was first
+            // accepted for, so a later edit of the pull request does not turn a
+            // replay of that request into a mismatch.
+            let mut existing_token_answer = None;
+            if let Some(token) = client_request_token(&input) {
+                if let Some(existing) = repository
+                    .pull_request_tokens
+                    .get(token)
+                    .and_then(|id| repository.pull_requests.get(id))
+                {
+                    if unchanged_request(
+                        existing,
+                        &input.title,
+                        description.as_deref(),
+                        &target.repository_name,
+                        &source_reference,
+                        &destination_reference,
+                    ) {
+                        existing_token_answer = Some(created(existing));
+                    } else {
+                        return Err(
+                            CreatePullRequestErrorModeled::IdempotencyParameterMismatchException(
+                                IdempotencyParameterMismatchException {
+                                    message: Some(format!(
+                                        "the client request token {token} was used in a previous \
+                                         request with different parameters"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+
+            // "You cannot create the pull request because the repository has too
+            // many open pull requests."
+            if existing_token_answer.is_none()
+                && repository.open_pull_requests()
+                    >= crate::state::MAX_OPEN_PULL_REQUESTS_PER_REPOSITORY
+            {
+                return Err(
+                    CreatePullRequestErrorModeled::MaximumOpenPullRequestsExceededException(
+                        MaximumOpenPullRequestsExceededException {
+                            message: Some(format!(
+                                "You cannot create the pull request because the repository has too \
+                                 many open pull requests. The maximum number of open pull requests \
+                                 for a repository is {}. Close one or more open pull requests, and \
+                                 then try again.",
+                                crate::state::MAX_OPEN_PULL_REQUESTS_PER_REPOSITORY
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if existing_token_answer.is_none()
+                && repository.pull_requests.len()
+                    >= crate::state::MAX_PULL_REQUESTS_PER_REPOSITORY
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "this emulator holds at most {} pull requests per repository",
+                    crate::state::MAX_PULL_REQUESTS_PER_REPOSITORY
+                )));
+            }
+
+            // "The commit ID of the most recent commit that the source branch and
+            // the destination branch have in common." Two histories that share
+            // no commit have none, and neither does a pair whose histories are
+            // longer than one request resolves a base over — this operation
+            // models no error for either, and `mergeBase` is optional, so the
+            // answer simply reports no base rather than a commit that is not one.
+            let merge_base = crate::service::off_the_async_worker(|| {
+                let mut budget = crate::state::merge::MergeBudget::for_one_request();
+                crate::state::merge::merge_base(
+                    repository,
+                    &source_commit,
+                    &destination_commit,
+                    &mut budget,
+                )
+            })
+            .ok();
+
+            // "When you associate an approval rule template with a repository,
+            // it is applied to the pull requests created in that repository
+            // after the association": the templates this repository is
+            // associated with, less any whose document scopes it to other
+            // destination branches.
+            let applied_templates: Vec<(String, String, String)> = repository
+                .associated_templates
+                .iter()
+                .filter_map(|name| store.approval_rule_templates.get(name))
+                .filter(|template| {
+                    crate::state::template_applies_to_destination(
+                        &template.content,
+                        &destination_reference,
+                    )
+                })
+                .map(|template| {
+                    (
+                        template.template_id.clone(),
+                        template.name.clone(),
+                        template.content.clone(),
+                    )
+                })
+                .collect();
+
+            (
+                destination_branch,
+                source_commit,
+                destination_commit,
+                merge_base,
+                applied_templates,
+                existing_token_answer,
+            )
+        };
+        if let Some(answer) = existing_token_answer {
+            return Ok(answer);
+        }
+
+        // Ids are minted per ACCOUNT and never reused, so the counter only goes
+        // up — a pull request deleted with its repository does not free its id.
+        store.pull_requests_created = store.pull_requests_created.saturating_add(1);
+        let pull_request_id = store.pull_requests_created;
+
+        let approval_rules: Vec<crate::state::ApprovalRuleRecord> = applied_templates
+            .into_iter()
+            .map(|(template_id, template_name, content)| crate::state::ApprovalRuleRecord {
+                approval_rule_id: crate::state::approval_rule_id(
+                    pull_request_id,
+                    &template_name,
+                    now,
+                ),
+                // A rule a template applied carries the template's name, which
+                // is what `originApprovalRuleTemplate` then attributes it to.
+                approval_rule_name: template_name.clone(),
+                content,
+                creation_date: now,
+                last_modified_date: now,
+                last_modified_user: crate::state::SERVICE_PRINCIPAL.to_string(),
+                origin_template: Some((template_id, template_name)),
+            })
+            .collect();
+
+        let record = crate::state::PullRequestRecord {
+            pull_request_id,
+            title: input.title.clone(),
+            description,
+            creation_date: now,
+            // Nothing has happened to the pull request yet, so its last
+            // activity IS its creation.
+            last_activity_date: now,
+            status: crate::state::PULL_REQUEST_STATUS_OPEN.to_string(),
+            author_arn,
+            client_request_token: client_request_token(&input).map(str::to_string),
+            targets: vec![crate::state::PullRequestTargetRecord {
+                repository_name: target.repository_name.clone(),
+                source_reference: crate::state::qualified_reference(&source_branch),
+                destination_reference: crate::state::qualified_reference(&destination_branch),
+                source_commit,
+                destination_commit,
+                merge_base,
+                // A new pull request is not merged, and nothing merged it.
+                merged: false,
+                merged_by: None,
+                merge_commit_id: None,
+                merge_option: None,
+            }],
+            approval_rules,
+            revision: 0,
+        };
+
+        let repository = store
+            .repositories
+            .get_mut(&target.repository_name)
+            .ok_or_else(|| {
+                // The repository was read above under this same guard, so it is
+                // still there; answering the modelled failure rather than
+                // panicking keeps the handler total.
+                CreatePullRequestErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &target.repository_name,
+                        )),
+                    },
+                )
+            })?;
+        if let Some(token) = record.client_request_token.clone() {
+            repository
+                .pull_request_tokens
+                .insert(token, pull_request_id);
+        }
+        let response = created(&record);
+        repository.pull_requests.insert(pull_request_id, record);
+        Ok(response)
     }
 }

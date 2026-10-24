@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_limits.rs"]
 mod account_limits;
+#[path = "all/checker_ip_ranges.rs"]
+mod checker_ip_ranges;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/hosted_zone_config.rs"]

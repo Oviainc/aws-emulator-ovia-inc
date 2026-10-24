@@ -25,6 +25,8 @@ mod budget_action_read_purity;
 mod budget_action_settle_history;
 #[path = "all/budget_action_subscriber_limits.rs"]
 mod budget_action_subscriber_limits;
+#[path = "all/budget_actions_for_budget.rs"]
+mod budget_actions_for_budget;
 #[path = "all/budget_creation_limits.rs"]
 mod budget_creation_limits;
 #[path = "all/budget_lifecycle.rs"]

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutboundConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOutboundConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOutboundConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one cross-cluster connection from a source (local) domain to a destination
+//! (remote) one and persists it as a [`crate::state::Connection`] — the same record
+//! `DescribeOutboundConnections` reports.
+//!
+//! The request is `VALIDATING` when this call returns, and the clock owes it the
+//! outcome of validating its two references against the domain registry:
+//! `PENDING_ACCEPTANCE` where both resolve, `VALIDATION_FAILED` where either names a
+//! domain this service does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +95,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    connection_alias_exists, Connection, OwedStatus, CONNECTION_MODE_DIRECT, CONNECTION_QUOTA,
+    CONNECTION_STATUS_PENDING_ACCEPTANCE, CONNECTION_STATUS_VALIDATING,
+    CONNECTION_STATUS_VALIDATION_FAILED, CONNECTION_STORE_QUOTA, PROVISIONING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,18 +172,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOutboundConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOutboundConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOutboundConnection"))
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let local = domain_reference("LocalDomainInfo", input.local_domain_info, &region)?;
+        let remote = domain_reference("RemoteDomainInfo", input.remote_domain_info, &region)?;
+
+        let mut store = state.lock();
+
+        // The alias is how the source domain names the remote cluster it is connected
+        // to, so one source domain cannot hold two connections under one alias: the
+        // existing record stays exactly as it is and the second create is the modelled
+        // already-exists refusal rather than another record. The source domain is the
+        // name, as resolved above: this emulator serves one account's registry.
+        if store.connections.values().any(|connection| {
+            connection.local_domain.domain_name == local.domain_name
+                && connection.connection_alias == input.connection_alias
+        }) {
+            return Err(
+                CreateOutboundConnectionErrorModeled::ResourceAlreadyExistsException(
+                    connection_alias_exists(&input.connection_alias, &local.domain_name),
+                )
+                .into(),
+            );
+        }
+
+        // The store is BOUNDED in the AGGREGATE: past this cap a create is refused
+        // rather than adding another record, and no request field partitions the
+        // count, so a caller cannot get a fresh allowance by varying what it names.
+        // This is the bound that dominates the growth site below; the per-source-domain
+        // quota after it is the service's own per-resource limit.
+        // `LimitExceededException` is the modelled refusal for "trying to create more
+        // than the allowed number of resources or sub-resources".
+        if store.connections.len() >= CONNECTION_STORE_QUOTA {
+            return Err(CreateOutboundConnectionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {CONNECTION_STORE_QUOTA} cross-cluster connections"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Past its quota ONE source domain takes no further connection, so a caller
+        // looping with fresh aliases on a domain cannot fill the store by itself.
+        let held = store
+            .connections
+            .values()
+            .filter(|connection| connection.local_domain.domain_name == local.domain_name)
+            .count();
+        if held >= CONNECTION_QUOTA {
+            return Err(CreateOutboundConnectionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Domain {} already holds the maximum of {CONNECTION_QUOTA} cross-cluster connections",
+                        local.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let connection_id = store.mint_connection_id();
+        // A connection request is VALIDATED before it can be accepted, and what it is
+        // validated against is the domain registry: a reference that resolves to no
+        // domain this service holds names a cluster nothing can be connected to, so
+        // the request fails validation instead of waiting for a decision no owner can
+        // make. The outcome is the status the clock owes the record; it is not
+        // reported until the validation span has passed, because that is when the
+        // validation this emulator does in one step would have finished.
+        let mut unresolved: Vec<String> = [&local, &remote]
+            .into_iter()
+            .map(|reference| reference.domain_name.clone())
+            .filter(|domain_name| !store.domains.contains_key(domain_name))
+            .collect();
+        // The two references may name the SAME absent domain; it is one thing that
+        // did not resolve, so the message says it once.
+        unresolved.dedup();
+        let owed = if unresolved.is_empty() {
+            OwedStatus {
+                status: CONNECTION_STATUS_PENDING_ACCEPTANCE.to_string(),
+                message: None,
+                due: now + PROVISIONING,
+            }
+        } else {
+            OwedStatus {
+                status: CONNECTION_STATUS_VALIDATION_FAILED.to_string(),
+                message: Some(format!(
+                    "Validation failed: no domain found for {}",
+                    unresolved.join(", ")
+                )),
+                due: now + PROVISIONING,
+            }
+        };
+
+        store.connections.insert(
+            connection_id.clone(),
+            Connection {
+                connection_id: connection_id.clone(),
+                connection_alias: input.connection_alias,
+                local_domain: local,
+                remote_domain: remote,
+                // `DIRECT` is the mode used for cross-cluster search, which is what
+                // this operation connects two domains for.
+                connection_mode: input
+                    .connection_mode
+                    .unwrap_or_else(|| CONNECTION_MODE_DIRECT.to_string()),
+                connection_properties: input.connection_properties,
+                // A connection is not ready to be accepted the instant the create
+                // returns: the request is VALIDATING, and the clock owes it the
+                // outcome above once the validation span has passed.
+                status: CONNECTION_STATUS_VALIDATING.to_string(),
+                status_message: None,
+                owed: Some(owed),
+            },
+        );
+
+        // Answered from the STORED record, through the same projection
+        // `DescribeOutboundConnections` reports it with, so the create's answer and a
+        // later read of the connection cannot disagree.
+        let stored = store
+            .connections
+            .get(&connection_id)
+            .ok_or_else(crate::state::state_unavailable)?
+            .to_outbound();
+        Ok(CreateOutboundConnectionOutput {
+            local_domain_info: stored.local_domain_info,
+            remote_domain_info: stored.remote_domain_info,
+            connection_alias: stored.connection_alias,
+            connection_status: stored.connection_status,
+            connection_id: stored.connection_id,
+            connection_mode: stored.connection_mode,
+            connection_properties: stored.connection_properties,
+        })
     }
+}
+
+/// The domain a `DomainInformationContainer` references, with the account and Region
+/// it is resolved against filled in.
+///
+/// A reference that names no `OwnerId` is to a domain of the account making the call,
+/// and one that names no `Region` is to a domain in the Region the call was signed
+/// for — so the stored record, and every report of it, names the domain in full
+/// however little the request said. The owner and the Region are RECORDED with the
+/// reference; what a reference is resolved against is the registry this emulator
+/// serves, which holds the one account's domains keyed by name, so it is the domain
+/// NAME that resolves.
+///
+/// `DomainInformationContainer$AWSDomainInformation` is not required by the model, so
+/// a request can reach this handler naming neither domain. A connection has no
+/// meaning without both, and this operation models no client-input error, so that is
+/// refused with the 400 `ValidationException` rather than stored half-formed.
+fn domain_reference(
+    member: &str,
+    container: DomainInformationContainer,
+    region: &str,
+) -> Result<AWSDomainInformation, CreateOutboundConnectionError> {
+    let info = container.aws_domain_information.ok_or_else(|| {
+        crate::scaffolded::Scaffolded::validation(format!(
+            "{member}.AWSDomainInformation is required: it names the domain the connection is to"
+        ))
+    })?;
+    Ok(AWSDomainInformation {
+        owner_id: Some(
+            info.owner_id
+                .unwrap_or_else(|| ::engine::emulator_account_id().to_string()),
+        ),
+        domain_name: info.domain_name,
+        region: Some(info.region.unwrap_or_else(|| region.to_string())),
+    })
 }

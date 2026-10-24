@@ -205,40 +205,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        let Some(rule) = store.rules.get_mut(&input.identifier) else {
-            return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
-                crate::state::rule_not_found(&input.identifier),
-            )
-            .into());
-        };
-        // Whatever the clock already owes this rule is materialised before the guards
-        // below read its state: they must decide on the state the clock has actually
-        // reached, not one it has already left.
-        rule.settle(now);
-        // A locked rule "can't be modified or deleted", and an unlocked one still
-        // inside its unlock delay can be modified "only after the unlock delay period
-        // has expired" — to the caller, both are a rule that is locked.
-        if rule.is_lock_protected(now) {
-            return Err(UpdateRuleErrorModeled::ConflictException(
-                crate::state::rule_state_conflict(
-                    crate::state::BlockedAction::Modify,
-                    &rule.identifier,
-                    crate::state::BlockingCondition::Locked,
-                ),
-            )
-            .into());
-        }
-
         // Only the members the request carried are applied; an absent member leaves the
         // stored value alone. `ResourceType` is deliberately NOT applied: the model says
         // "This parameter is currently not supported. You can't update a retention
         // rule's resource type after creation."
-        let merged_resource_tags = input
-            .resource_tags
-            .unwrap_or_else(|| rule.resource_tags.clone());
-        let merged_exclude_resource_tags = input
-            .exclude_resource_tags
-            .unwrap_or_else(|| rule.exclude_resource_tags.clone());
+        //
+        // The merge is computed first, and the whole store is still free to be read
+        // afterwards, because the cross-rule quota below counts the OTHER rules.
+        let (merged_resource_tags, merged_exclude_resource_tags) = {
+            let Some(rule) = store.rules.get_mut(&input.identifier) else {
+                return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::rule_not_found(&input.identifier),
+                )
+                .into());
+            };
+            // Whatever the clock already owes this rule is materialised before the guards
+            // below read its state: they must decide on the state the clock has actually
+            // reached, not one it has already left.
+            rule.settle(now);
+            // A locked rule "can't be modified or deleted", and an unlocked one still
+            // inside its unlock delay can be modified "only after the unlock delay period
+            // has expired" — to the caller, both are a rule that is locked.
+            if rule.is_lock_protected(now) {
+                return Err(UpdateRuleErrorModeled::ConflictException(
+                    crate::state::rule_state_conflict(
+                        crate::state::BlockedAction::Modify,
+                        &rule.identifier,
+                        crate::state::BlockingCondition::Locked,
+                    ),
+                )
+                .into());
+            }
+            (
+                input
+                    .resource_tags
+                    .unwrap_or_else(|| rule.resource_tags.clone()),
+                input
+                    .exclude_resource_tags
+                    .unwrap_or_else(|| rule.exclude_resource_tags.clone()),
+            )
+        };
         if !merged_resource_tags.is_empty() && !merged_exclude_resource_tags.is_empty() {
             // A rule the MODEL cannot express, stated in the same envelope a modelled
             // constraint takes: the member that cannot hold, and what it must satisfy.
@@ -250,6 +256,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // One resource tag key and value pair selects a bounded number of retention
+        // rules, so a request that would make a pair the selector of one rule too many
+        // is refused and the rule is left exactly as it was. The rule being updated does
+        // not count against itself, so re-sending the pairs it already selects on — or
+        // any other member beside them — is never refused.
+        if store.exceeds_resource_tag_quota(&merged_resource_tags, Some(&input.identifier)) {
+            return Err(UpdateRuleErrorModeled::ServiceQuotaExceededException(
+                crate::state::resource_tag_quota_exceeded(),
+            )
+            .into());
+        }
+        // Every guard has passed, so the rule is taken for modification again — the
+        // store, not a copy, is what the response is read back out of.
+        let Some(rule) = store.rules.get_mut(&input.identifier) else {
+            return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
+                crate::state::rule_not_found(&input.identifier),
+            )
+            .into());
+        };
         if let Some(retention_period) = input.retention_period {
             rule.retention_period = retention_period;
         }

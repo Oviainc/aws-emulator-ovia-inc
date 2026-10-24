@@ -45,6 +45,8 @@ mod settings_co_requirements;
 mod state_roundtrip;
 #[path = "all/tagging_resource_families.rs"]
 mod tagging_resource_families;
+#[path = "all/transcription_job_request_rules.rs"]
+mod transcription_job_request_rules;
 #[path = "all/transcription_jobs.rs"]
 mod transcription_jobs;
 #[path = "all/vocabularies.rs"]

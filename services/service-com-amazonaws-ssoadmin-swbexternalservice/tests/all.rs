@@ -37,6 +37,8 @@ mod application_provider_describe;
 mod application_providers;
 #[path = "all/customer_managed_policy_references.rs"]
 mod customer_managed_policy_references;
+#[path = "all/inline_policy.rs"]
+mod inline_policy;
 #[path = "all/instance_create.rs"]
 mod instance_create;
 #[path = "all/instance_delete.rs"]

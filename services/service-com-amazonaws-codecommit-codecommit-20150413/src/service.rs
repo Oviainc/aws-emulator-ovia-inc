@@ -129,11 +129,15 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
     let leaf = violation.path.rsplit('.').next().unwrap_or_default();
     let missing = matches!(violation.kind, ViolationKind::MissingRequiredMember);
     let (code, requirement) = match (member, &violation.kind) {
-        ("repositoryName", _) if missing => (
+        // A `repositoryName` names a repository wherever it sits: as the top-level
+        // member of most operations, and as a member of the nested `Target` shape a
+        // pull request's target list carries. One row speaks for both, so the
+        // wording for this code lives in one place.
+        (_, _) if missing && (member == "repositoryName" || leaf == "repositoryName") => (
             "RepositoryNameRequiredException",
             "A repository name is required, but was not specified.",
         ),
-        ("repositoryName", _) => (
+        (_, _) if member == "repositoryName" || leaf == "repositoryName" => (
             "InvalidRepositoryNameException",
             "A specified repository name is not valid.",
         ),
@@ -310,6 +314,54 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         ("nextToken", _) => (
             "InvalidContinuationTokenException",
             "The specified continuation token is not valid.",
+        ),
+        // `title` and `description` carry a pull request's text: the only members
+        // of either name in this model belong to the pull request operations,
+        // which model these codes for them.
+        ("title", _) if missing => (
+            "TitleRequiredException",
+            "A pull request title is required.",
+        ),
+        ("title", _) => (
+            "InvalidTitleException",
+            "The title of the pull request is not valid.",
+        ),
+        ("description", _) => (
+            "InvalidDescriptionException",
+            "The pull request description is not valid.",
+        ),
+        ("targets", _) if missing && leaf == "targets" => (
+            "TargetsRequiredException",
+            "An array of target objects is required. It cannot be empty or null.",
+        ),
+        // `sourceReference` and `destinationReference` are members of the nested
+        // `Target` shape, so each is the path's LEAF rather than its top-level
+        // member — and each takes the error for the member actually at fault
+        // rather than the one for the list that holds it.
+        (_, _) if missing && matches!(leaf, "sourceReference" | "destinationReference") => (
+            "ReferenceNameRequiredException",
+            crate::state::REFERENCE_NAME_REQUIRED_MESSAGE,
+        ),
+        (_, _) if matches!(leaf, "sourceReference" | "destinationReference") => (
+            "InvalidReferenceNameException",
+            crate::state::INVALID_REFERENCE_NAME_MESSAGE,
+        ),
+        // The list itself, rather than a member of one of its entries.
+        ("targets", _) if leaf == "targets" => (
+            "InvalidTargetsException",
+            "The targets for the pull request is not valid or not in a valid format.",
+        ),
+        ("targets", _) => (
+            "InvalidTargetException",
+            "The target for the pull request is not valid. A target must contain the full values for the repository name, source branch, and destination branch for the pull request.",
+        ),
+        ("pullRequestId", _) if missing => (
+            "PullRequestIdRequiredException",
+            crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE,
+        ),
+        ("pullRequestId", _) => (
+            "InvalidPullRequestIdException",
+            crate::state::INVALID_PULL_REQUEST_ID_MESSAGE,
         ),
         ("tags", _) if missing => (
             "TagsMapRequiredException",

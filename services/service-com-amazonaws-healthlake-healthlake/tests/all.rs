@@ -47,5 +47,7 @@ mod resource_untagging;
 mod restore_fhir_datastore;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_data_transformation_profile.rs"]
+mod update_data_transformation_profile;
 #[path = "all/update_fhir_datastore.rs"]
 mod update_fhir_datastore;

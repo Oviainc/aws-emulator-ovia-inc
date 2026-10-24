@@ -20,6 +20,13 @@ mod agent_goal_listing;
 #[path = "all/agent_goals.rs"]
 mod agent_goals;
 
+// Out of alphabetical order ON PURPOSE: declared next to the goal suites it extends
+// rather than ahead of them, because the sorted position for this name falls in the one
+// gap of this list that every new agent suite lands in, and an insertion there is what
+// repeatedly refused to merge.
+#[path = "all/agent_goal_create_limits.rs"]
+mod agent_goal_create_limits;
+
 #[path = "all/agent_profile_lifecycle.rs"]
 mod agent_profile_lifecycle;
 
