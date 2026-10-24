@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCaptureData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCaptureData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the video a workspace's capture source holds for
+//! the requested time range, from the shared engine store (`crate::state`); this is the
+//! ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCaptureData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A capture source is a time series of a workspace, named by its `timeSeriesId` or by
+//! the `propertyAlias` bound to it, and its video is kept as the segments the producer
+//! ingested ([`crate::state::CaptureSegment`]). A segment is ATOMIC — this emulator
+//! stores media exactly as it arrived and decodes nothing — so one answer carries one
+//! segment, reports the span that segment really covers, and hands back the `nextToken`
+//! that resumes at the following overlapping segment. Reading writes nothing: the
+//! resume point is carried in the token rather than recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +168,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCaptureData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCaptureDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCaptureData"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCaptureDataError::Modeled(GetCaptureDataErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        // Nothing here is derived from the request's metadata: the capture source is
+        // named in the body and the path, and this operation reports no ARN.
+        let _ = ctx;
+
+        // The window, as the same total order the stored segments are kept in.
+        // `endTime`'s own documentation states the rule the model cannot: it "must be
+        // greater than startTime", so a range that covers no time is refused rather
+        // than answered with whatever happens to sit at one instant.
+        let start = crate::state::timestamp_key(&input.start_time);
+        let end = crate::state::timestamp_key(&input.end_time);
+        if end <= start {
+            return Err(invalid_request(
+                "endTime must be greater than startTime.".to_string(),
+            ));
+        }
+
+        // The capture source is named by EXACTLY one of the two identifying forms:
+        // `timeSeriesId` and `propertyAlias` each "identifies the capture source" and
+        // are documented as mutually exclusive, so a request carrying both says
+        // nothing about which to believe and one carrying neither names no source.
+        let identifier = match (
+            input.time_series_id.as_deref(),
+            input.property_alias.as_deref(),
+        ) {
+            (Some(time_series_id), None) => Identifier::TimeSeriesId(time_series_id),
+            (None, Some(alias)) => Identifier::Alias(alias),
+            _ => {
+                return Err(invalid_request(
+                    "Specify either timeSeriesId or propertyAlias.".to_string(),
+                ))
+            }
+        };
+
+        // `formatSettings` asks for the OUTPUT to be re-encoded (frame rate, width,
+        // height). This emulator serves the media exactly as the producer ingested it
+        // and runs no encoder, so the settings change neither which segments are
+        // selected nor the bytes returned — a recorded limitation, not a refusal: the
+        // request is one the real service accepts.
+        let _ = &input.format_settings;
+
+        let store = state.lock();
+
+        // The workspace is what "contains the capture source", so a workspace this
+        // store does not hold is reported as the absent resource it is, before the
+        // source is looked for inside it.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+        let source = match identifier {
+            Identifier::TimeSeriesId(time_series_id) => {
+                store.capture_source_by_id(&input.workspace_name, time_series_id)
+            }
+            Identifier::Alias(alias) => {
+                store.capture_source_by_alias(&input.workspace_name, alias)
+            }
+        }
+        .ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_TIME_SERIES,
+                identifier.requested(),
+            ))
+        })?;
+
+        // Every stored segment that carries video INSIDE the window, oldest first: the
+        // window is half-open, so a segment ending exactly where it begins (or
+        // beginning exactly where it ends) covers none of it. The log is already
+        // sorted ascending by start time, so this selection needs no sort.
+        let selected: Vec<&crate::state::CaptureSegment> = source
+            .segments
+            .iter()
+            .filter(|segment| {
+                crate::state::timestamp_key(&segment.start_time) < end
+                    && crate::state::timestamp_key(&segment.end_time) > start
+            })
+            .collect();
+
+        // `nextToken` is "the token from a previous response used to continue
+        // retrieving data": this enumeration's resume point, the start time of the
+        // next segment to deliver. A token whose resume point is not in this
+        // enumeration is refused rather than answered with an empty chunk, which
+        // would report absence as success.
+        let at = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume =
+                    crate::state::decode_timestamp_token(token).ok_or_else(invalid_token)?;
+                selected
+                    .iter()
+                    .position(|segment| {
+                        crate::state::timestamp_key(&segment.start_time) == resume
+                    })
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+
+        // A window the source holds no video in is an EMPTY answer, not an absent
+        // resource: the source exists and simply recorded nothing then. There is no
+        // span of returned data to report, so the requested bounds are echoed as the
+        // range the (empty) answer covers.
+        let Some(chunk) = selected.get(at) else {
+            return Ok(GetCaptureDataOutput {
+                data: Vec::new(),
+                start_time: input.start_time.clone(),
+                end_time: input.end_time.clone(),
+                data_type: source.data_type.clone(),
+                next_token: None,
+            });
+        };
+
+        // One answer carries ONE segment: the media is stored as it was ingested and
+        // this emulator neither re-encodes nor splices it, so a chunk is a stored
+        // segment and the response reports that segment's own span. The token is
+        // absent on the last one — "Absent if no more data is available".
+        let next_token = selected.get(at.saturating_add(1)).map(|segment| {
+            crate::state::encode_timestamp_token(crate::state::timestamp_key(&segment.start_time))
+        });
+
+        Ok(GetCaptureDataOutput {
+            data: chunk.data.clone(),
+            start_time: chunk.start_time.clone(),
+            end_time: chunk.end_time.clone(),
+            data_type: source.data_type.clone(),
+            next_token,
+        })
     }
+}
+
+/// Which capture source of the workspace a well-formed request named.
+#[derive(Debug, Clone, Copy)]
+enum Identifier<'a> {
+    /// The source its `TimeSeriesId` names.
+    TimeSeriesId(&'a str),
+    /// The source the `propertyAlias` bound to it names.
+    Alias(&'a str),
+}
+
+impl Identifier<'_> {
+    /// The identifier the REQUEST supplied, which is what a not-found refusal
+    /// echoes whichever form it took.
+    fn requested(&self) -> &str {
+        match self {
+            Identifier::TimeSeriesId(time_series_id) => time_series_id,
+            Identifier::Alias(alias) => alias,
+        }
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> GetCaptureDataError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> GetCaptureDataError {
+    GetCaptureDataError::Modeled(GetCaptureDataErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> GetCaptureDataError {
+    GetCaptureDataError::Modeled(GetCaptureDataErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    ))
 }

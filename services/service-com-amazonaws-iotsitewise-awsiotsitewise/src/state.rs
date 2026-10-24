@@ -27,7 +27,12 @@
 //! the logging options, one entry per scope a call named
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]), and the
 //! account's default encryption configuration
-//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::default_encryption`]). Every
+//! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::default_encryption`]). A
+//! workspace's capture sources — the video streams `GetCaptureData` reads — live
+//! in [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_sources`], keyed by
+//! the workspace and the source's `timeSeriesId`, with
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_source_aliases`] the
+//! index the alias form of that lookup resolves through. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -45,7 +50,7 @@ use crate::ops::types::{
     MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
     PropertyType, ResourceStatus, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
     WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo, WorkspaceStatus,
-    ENCRYPTION_TYPE_VALUES,
+    ENCRYPTION_TYPE_VALUES, VIDEO_DATA_TYPE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -430,6 +435,64 @@ pub const MAX_DISASSOCIATED_TIME_SERIES: usize = 1_000;
 /// ordinary workflow meets it.
 pub const MAX_LOGGING_SCOPES: usize = 1_000;
 
+/// How many capture sources this store keeps, across every workspace.
+///
+/// A capture source is created by the producer path that first writes video for
+/// it ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_capture_segment`]), and
+/// nothing removes one, so the collection needs a bound of its own: past this
+/// many sources a write naming a NEW one is refused rather than evicting a
+/// source a caller can still read. The emulator's own bound, not a published AWS
+/// quota, and high enough that no ordinary workspace meets it.
+pub const MAX_CAPTURE_SOURCES: usize = 1_000;
+
+/// How many video segments one capture source keeps.
+///
+/// Like a time series' samples ([`MAX_SAMPLES_PER_SERIES`]), a capture source's
+/// video is an unbounded stream with an eviction policy available to it: the
+/// OLDEST segment is the one that goes, so repeated ingestion cannot grow one
+/// source without limit. The emulator's own bound; AWS publishes a retention
+/// period rather than a segment count.
+pub const MAX_CAPTURE_SEGMENTS_PER_SOURCE: usize = 1_000;
+
+/// The shortest `TimeSeriesId` the model admits. Source:
+/// `smithy_query(query="shape", shape="TimeSeriesId")` — length 36..73.
+pub const MIN_TIME_SERIES_ID_LENGTH: usize = 36;
+
+/// The longest `TimeSeriesId` the model admits; see
+/// [`MIN_TIME_SERIES_ID_LENGTH`].
+pub const MAX_TIME_SERIES_ID_LENGTH: usize = 73;
+
+/// The shortest `AssetPropertyAlias` the model admits. Source:
+/// `smithy_query(query="shape", shape="AssetPropertyAlias")` — length 1..2048.
+pub const MIN_PROPERTY_ALIAS_LENGTH: usize = 1;
+
+/// The longest `AssetPropertyAlias` the model admits; see
+/// [`MIN_PROPERTY_ALIAS_LENGTH`].
+pub const MAX_PROPERTY_ALIAS_LENGTH: usize = 2048;
+
+/// The earliest `timeInSeconds` a `TimeInNanos` can carry. Source:
+/// `smithy_query(query="shape", shape="TimeInNanos")` — `timeInSeconds` is
+/// `range 1..9223372036854774`.
+pub const MIN_TIME_IN_SECONDS: i64 = 1;
+
+/// The latest `timeInSeconds` a `TimeInNanos` can carry; see
+/// [`MIN_TIME_IN_SECONDS`].
+pub const MAX_TIME_IN_SECONDS: i64 = 9_223_372_036_854_774;
+
+/// The largest `offsetInNanos` a `TimeInNanos` can carry: the member is
+/// `range 0..999999999`, one nanosecond short of a whole second.
+pub const MAX_OFFSET_IN_NANOS: i32 = 999_999_999;
+
+/// Whether `at` is a `TimeInNanos` the model can express — see
+/// [`MIN_TIME_IN_SECONDS`] and [`MAX_OFFSET_IN_NANOS`].
+///
+/// What the producer entry point checks before it stores an instant, so no span
+/// this store holds can be reported through a member its own model would refuse.
+fn is_modelled_time(at: &TimeInNanos) -> bool {
+    (MIN_TIME_IN_SECONDS..=MAX_TIME_IN_SECONDS).contains(&at.time_in_seconds)
+        && (0..=MAX_OFFSET_IN_NANOS).contains(&at.offset_in_nanos.unwrap_or(0))
+}
+
 /// One scope's logging options and the instant they were set.
 ///
 /// The instant is what the bound on
@@ -483,6 +546,97 @@ pub struct DisassociatedTimeSeriesRecord {
     /// written while it was associated travel with it rather than staying on the
     /// asset property, and come back to a property the alias is bound to again.
     pub values: Vec<AssetPropertyValue>,
+}
+
+/// Why [`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_capture_segment`]
+/// refused to store a segment. Each variant is ONE rule, so a producer handler
+/// maps a refusal to one modelled error rather than re-deriving the checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureWriteRefusal {
+    /// The store holds no workspace of that name — a capture source lives in a
+    /// workspace.
+    NoSuchWorkspace,
+    /// The `TimeSeriesId` is outside [`MIN_TIME_SERIES_ID_LENGTH`]..=[`MAX_TIME_SERIES_ID_LENGTH`].
+    TimeSeriesIdLength,
+    /// The alias is outside [`MIN_PROPERTY_ALIAS_LENGTH`]..=[`MAX_PROPERTY_ALIAS_LENGTH`].
+    AliasLength,
+    /// The data type is not a value the modelled `VideoDataType` declares.
+    UnmodelledDataType,
+    /// The source already holds media of ANOTHER `VideoDataType`. The modelled
+    /// enum declares exactly one value today, so this is what keeps the rule
+    /// true if it ever grows.
+    DataTypeMismatch,
+    /// A bound of the span is not an instant the modelled `TimeInNanos` can
+    /// express; see [`MIN_TIME_IN_SECONDS`].
+    UnmodelledInstant,
+    /// The span covers no time: its start is not before its end.
+    EmptySpan,
+    /// The source does not exist yet and the store already holds
+    /// [`MAX_CAPTURE_SOURCES`].
+    SourceLimit,
+}
+
+/// One persisted span of a capture source's video: the bytes a producer ingested
+/// and the span of time they cover.
+///
+/// A segment is ATOMIC — this emulator stores the media exactly as it was
+/// ingested and decodes nothing, so a read that overlaps part of a segment is
+/// answered with the whole segment and reports the span the segment really
+/// covers, which is what `GetCaptureData`'s own output members are for ("The
+/// actual start time of the returned data").
+#[derive(Debug, Clone)]
+pub struct CaptureSegment {
+    /// When the video in [`Self::data`] begins.
+    pub start_time: TimeInNanos,
+    /// When it ends. Always later than [`Self::start_time`]: the writer refuses a
+    /// segment covering no time at all.
+    pub end_time: TimeInNanos,
+    /// The media bytes, exactly as the producer ingested them.
+    pub data: Vec<u8>,
+}
+
+/// A capture source inside a workspace: the video stream `GetCaptureData` reads.
+///
+/// A capture source is a time series of a workspace — `GetCaptureData` names one
+/// by its `timeSeriesId` or by the `propertyAlias` bound to it, the same two
+/// identifying forms every other time-series operation of this service accepts —
+/// so the record carries both identities plus the `VideoDataType` of the media it
+/// holds, which a read reports rather than assuming.
+///
+/// The PRODUCER side (video an edge gateway publishes for the source, and the
+/// bulk import of `mp4` files a `CreateBulkImportJob` asks for) is not
+/// implemented in this emulator yet, so today the only writer of this log is
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_capture_segment`] — the one
+/// entry point a producer path (or a test seeding a capture source) calls.
+/// `GetCaptureData` itself never appends a segment and never creates a source.
+///
+/// WHY this is its own registry rather than a field on the records
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::property_alias_index`] and
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociated_time_series`]
+/// resolve: a capture source is addressed INSIDE a workspace, and those streams
+/// belong to no workspace at all — nothing that creates or ingests one records
+/// one for it, which is why a workspace-scoped `DescribeTimeSeries` resolves to
+/// nothing and a workspace-scoped `ListTimeSeries` is empty. Keying a source by
+/// `(workspaceName, timeSeriesId)` is what makes one identifier free in every
+/// other workspace, and it stays correct when the operations that ingest a
+/// workspace's streams arrive: a stream that gains a workspace gains a capture
+/// source under that key, rather than this read having to guess which workspace
+/// an account-wide stream belongs to.
+#[derive(Debug, Clone)]
+pub struct CaptureSourceRecord {
+    /// The workspace that contains the source. A source is addressable only
+    /// inside it, which is what makes one identifier free in every other
+    /// workspace.
+    pub workspace_name: String,
+    /// The source's `TimeSeriesId`.
+    pub time_series_id: String,
+    /// The `propertyAlias` bound to the source, when one is.
+    pub alias: Option<String>,
+    /// A `VideoDataType` value: the type of the media the segments hold.
+    pub data_type: String,
+    /// The source's video, kept sorted ascending by start time and
+    /// single-valued at a start time, exactly as a time series' samples are.
+    pub segments: Vec<CaptureSegment>,
 }
 
 /// A stored asset model: everything `DescribeAssetModel` reports, plus the
@@ -2226,6 +2380,17 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// of starting a second one. Written beside the execution itself, and
     /// bounded by it: at most one entry per execution that carried a token.
     pub pipeline_execution_tokens: HashMap<String, String>,
+    /// The capture sources (video streams) of every workspace: the workspace
+    /// they live in, then the source's own `timeSeriesId`, because a capture
+    /// source is addressable only inside its workspace — nested so a lookup
+    /// borrows the two names instead of allocating a key on every read. Written
+    /// by [`Self::put_capture_segment`] and read by `GetCaptureData`.
+    pub capture_sources: HashMap<String, HashMap<String, CaptureSourceRecord>>,
+    /// `workspaceName` -> `propertyAlias` -> `timeSeriesId`, so the alias form of
+    /// a capture-source lookup resolves to the same record the id form does.
+    /// Written beside the source itself, and bounded by it: at most one entry per
+    /// source that carries an alias.
+    pub capture_source_aliases: HashMap<String, HashMap<String, String>>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -2620,6 +2785,166 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         if let Some(properties) = self.property_values.get_mut(asset_id) {
             properties.remove(property_id);
         }
+    }
+
+    /// Store `segment` on the capture source `(workspace_name, time_series_id)`
+    /// names, creating the source on first write.
+    ///
+    /// This is the PRODUCER-side entry point — the one writer of a workspace's
+    /// video, which `GetCaptureData` then reads. The producer paths themselves
+    /// (video an edge gateway publishes for a capture source, and the bulk import
+    /// of `mp4` files `CreateBulkImportJob` takes) are not implemented in this
+    /// emulator yet, so a test seeding a capture source is today's only caller;
+    /// everything a read of that video must answer from is written here and
+    /// nowhere else.
+    ///
+    /// `alias` BINDS that alias to the source, so the alias form of a lookup
+    /// reaches the same record; an alias another source of the same workspace
+    /// already carries moves to this one, record and index together, exactly as a
+    /// rebound property alias does.
+    ///
+    /// The segment log stays sorted ascending by start time and single-valued at
+    /// a start time — re-ingesting the span replaces the bytes stored for it —
+    /// and is bounded at [`MAX_CAPTURE_SEGMENTS_PER_SOURCE`] by dropping the
+    /// oldest segment, the same eviction a time series' samples get.
+    ///
+    /// The `Err` names WHICH rule refused the write ([`CaptureWriteRefusal`]), so
+    /// the producer handlers this serves can map one refusal to one modelled
+    /// error instead of re-deriving the checks — and nothing is written on any of
+    /// them.
+    pub fn put_capture_segment(
+        &mut self,
+        workspace_name: &str,
+        time_series_id: &str,
+        alias: Option<&str>,
+        data_type: &str,
+        segment: CaptureSegment,
+    ) -> Result<(), CaptureWriteRefusal> {
+        if !self.workspaces.contains_key(workspace_name) {
+            return Err(CaptureWriteRefusal::NoSuchWorkspace);
+        }
+        let id_length = time_series_id.chars().count();
+        if !(MIN_TIME_SERIES_ID_LENGTH..=MAX_TIME_SERIES_ID_LENGTH).contains(&id_length) {
+            return Err(CaptureWriteRefusal::TimeSeriesIdLength);
+        }
+        if let Some(alias) = alias {
+            let alias_length = alias.chars().count();
+            if !(MIN_PROPERTY_ALIAS_LENGTH..=MAX_PROPERTY_ALIAS_LENGTH).contains(&alias_length) {
+                return Err(CaptureWriteRefusal::AliasLength);
+            }
+        }
+        if !VIDEO_DATA_TYPE_VALUES.contains(&data_type) {
+            return Err(CaptureWriteRefusal::UnmodelledDataType);
+        }
+        if !is_modelled_time(&segment.start_time) || !is_modelled_time(&segment.end_time) {
+            return Err(CaptureWriteRefusal::UnmodelledInstant);
+        }
+        if timestamp_key(&segment.start_time) >= timestamp_key(&segment.end_time) {
+            return Err(CaptureWriteRefusal::EmptySpan);
+        }
+        // The data type is the media type the source's video is in: it is
+        // established by the write that creates the source, so a later write
+        // naming another type is refused rather than accepted and ignored — a
+        // producer is never told it stored media of a type a read will not
+        // report.
+        if let Some(source) = self.capture_source_by_id(workspace_name, time_series_id) {
+            if source.data_type != data_type {
+                return Err(CaptureWriteRefusal::DataTypeMismatch);
+            }
+        } else if self.capture_source_count() >= MAX_CAPTURE_SOURCES {
+            return Err(CaptureWriteRefusal::SourceLimit);
+        }
+
+        let source = self
+            .capture_sources
+            .entry(workspace_name.to_string())
+            .or_default()
+            .entry(time_series_id.to_string())
+            .or_insert_with(|| CaptureSourceRecord {
+                workspace_name: workspace_name.to_string(),
+                time_series_id: time_series_id.to_string(),
+                alias: None,
+                data_type: data_type.to_string(),
+                segments: Vec::new(),
+            });
+
+        // A source's `alias` and the alias index move together: the alias the
+        // source carried before is dropped from the index below, so nothing
+        // resolves the source by it afterwards.
+        let previous_alias = match alias {
+            Some(alias) if source.alias.as_deref() != Some(alias) => {
+                source.alias.replace(alias.to_string())
+            }
+            _ => None,
+        };
+
+        let at = source.segments.binary_search_by(|stored| {
+            timestamp_key(&stored.start_time).cmp(&timestamp_key(&segment.start_time))
+        });
+        match at {
+            Ok(at) => source.segments[at] = segment,
+            Err(at) => source.segments.insert(at, segment),
+        }
+        if source.segments.len() > MAX_CAPTURE_SEGMENTS_PER_SOURCE {
+            let excess = source.segments.len() - MAX_CAPTURE_SEGMENTS_PER_SOURCE;
+            source.segments.drain(..excess);
+        }
+
+        if let Some(alias) = alias {
+            let aliases = self
+                .capture_source_aliases
+                .entry(workspace_name.to_string())
+                .or_default();
+            if let Some(previous) = previous_alias {
+                aliases.remove(&previous);
+            }
+            // Whoever held this alias in this workspace loses it, record and
+            // index together, so no two stored sources can report one alias
+            // while the index names only the newer.
+            let displaced = aliases.insert(alias.to_string(), time_series_id.to_string());
+            if let Some(displaced) = displaced.filter(|held| held != time_series_id) {
+                if let Some(source) = self
+                    .capture_sources
+                    .get_mut(workspace_name)
+                    .and_then(|sources| sources.get_mut(&displaced))
+                {
+                    source.alias = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How many capture sources this store holds, across every workspace — what
+    /// [`MAX_CAPTURE_SOURCES`] bounds.
+    pub fn capture_source_count(&self) -> usize {
+        self.capture_sources
+            .values()
+            .map(::std::collections::HashMap::len)
+            .sum()
+    }
+
+    /// The capture source `workspace_name` holds under `time_series_id`, or
+    /// `None` when it holds none — which a read of it answers as
+    /// `ResourceNotFoundException`.
+    pub fn capture_source_by_id(
+        &self,
+        workspace_name: &str,
+        time_series_id: &str,
+    ) -> Option<&CaptureSourceRecord> {
+        self.capture_sources.get(workspace_name)?.get(time_series_id)
+    }
+
+    /// The capture source `workspace_name` holds under the `propertyAlias`
+    /// `alias`. The alias index is what makes the two identifying forms resolve
+    /// to one source.
+    pub fn capture_source_by_alias(
+        &self,
+        workspace_name: &str,
+        alias: &str,
+    ) -> Option<&CaptureSourceRecord> {
+        let time_series_id = self.capture_source_aliases.get(workspace_name)?.get(alias)?;
+        self.capture_source_by_id(workspace_name, time_series_id)
     }
 
     /// The logging options `workspace` reports: the ones last set for that scope,
@@ -3353,6 +3678,32 @@ pub fn timestamp_key(timestamp: &TimeInNanos) -> (i64, i32) {
         timestamp.offset_in_nanos.unwrap_or(0),
     )
 }
+
+/// The opaque pagination token that resumes at the [`timestamp_key`] `resume`:
+/// the hex of `seconds.nanos`.
+///
+/// ONE recipe for every time-ranged read of this service that pages by the
+/// instant it stopped at, so an encoding fix cannot drift between operations.
+/// Hex keeps the text inside the `^[A-Za-z0-9+/=]+$` pattern the paging members
+/// of this service carry.
+pub fn encode_timestamp_token(resume: (i64, i32)) -> String {
+    let (seconds, nanos) = resume;
+    ::hex::encode(format!("{seconds}{TIMESTAMP_TOKEN_SEPARATOR}{nanos}").as_bytes())
+}
+
+/// The [`timestamp_key`] `token` encodes, or `None` for text this service never
+/// issued as a token — which its caller answers as the modelled refusal for an
+/// invalid `nextToken`.
+pub fn decode_timestamp_token(token: &str) -> Option<(i64, i32)> {
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    let (seconds, nanos) = decoded.split_once(TIMESTAMP_TOKEN_SEPARATOR)?;
+    Some((seconds.parse().ok()?, nanos.parse().ok()?))
+}
+
+/// What joins the two halves of a token [`encode_timestamp_token`] builds.
+const TIMESTAMP_TOKEN_SEPARATOR: char = '.';
 
 /// The `Quality` a TQV that names none carries.
 ///

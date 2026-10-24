@@ -289,7 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // as success.
         let start = match input.next_token.as_deref() {
             Some(token) => {
-                let resume = decode_token(token)?;
+                let resume =
+                    crate::state::decode_timestamp_token(token).ok_or_else(invalid_token)?;
                 selected
                     .iter()
                     .position(|sample| crate::state::timestamp_key(&sample.timestamp) == resume)
@@ -299,9 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let end = start.saturating_add(page_size).min(selected.len());
 
-        let next_token = selected
-            .get(end)
-            .map(|sample| encode_token(crate::state::timestamp_key(&sample.timestamp)));
+        let next_token = selected.get(end).map(|sample| {
+            crate::state::encode_timestamp_token(crate::state::timestamp_key(&sample.timestamp))
+        });
         selected.truncate(end);
 
         Ok(GetAssetPropertyValueHistoryOutput {
@@ -350,25 +351,6 @@ fn date_key(at: &::aws_smithy_types::DateTime) -> (i64, i32) {
         // A subsecond offset is at most 999_999_999 nanoseconds, so it always fits.
         i32::try_from(at.subsec_nanos()).unwrap_or(i32::MAX),
     )
-}
-
-/// The `nextToken` that resumes at the sample with timestamp `resume`.
-fn encode_token(resume: (i64, i32)) -> String {
-    let (seconds, nanos) = resume;
-    ::hex::encode(format!("{seconds}.{nanos}").as_bytes())
-}
-
-/// Decode a `nextToken` back into the timestamp it resumes from.
-fn decode_token(token: &str) -> Result<(i64, i32), GetAssetPropertyValueHistoryError> {
-    let decoded = ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)?;
-    let (seconds, nanos) = decoded.split_once('.').ok_or_else(invalid_token)?;
-    Ok((
-        seconds.parse().map_err(|_| invalid_token())?,
-        nanos.parse().map_err(|_| invalid_token())?,
-    ))
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
