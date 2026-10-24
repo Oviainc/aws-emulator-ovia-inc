@@ -177,6 +177,33 @@
 //! and [`byoip_cidr_payload_bytes`] is the one definition of what a range is charged, given
 //! back when the clock's release drops it.
 //!
+//! ## Public IPv4 address pools
+//!
+//! "Provisioning an IPv4 or IPv6 address range … creates a corresponding address pool"
+//! (`ProvisionByoipCidr`), so a provisioned IPv4 range gives the account one public IPv4
+//! pool, held in [`ComAmazonawsEc2Amazonec2State::public_ipv4_pools`] as a
+//! [`PublicIpv4PoolRecord`] under the `ipv4pool-ec2-…` id the provision minted — the same id
+//! the range reports as its `ByoipCidr$PoolId`, so the range and the pool cannot name each
+//! other differently, and the pool goes away with the range when the clock's release drops
+//! it. What the two stores CAN differ on is contents: `DeprovisionPublicIpv4PoolCidr` takes a
+//! range out of the pool while `DeprovisionByoipCidr` is still what gives the address range
+//! itself back, which is the order AWS documents, so between those two calls the account
+//! holds a range whose pool is empty.
+//!
+//! A record holds the pool's own facts (its description, its network border group, the pool
+//! tags `ProvisionByoipCidrRequest$PoolTagSpecifications` asked for) beside the ADDRESS
+//! RANGES provisioned to it, each a canonical IPv4 CIDR block
+//! ([`canonical_public_ipv4_pool_cidr`]) — the one source of truth for what the pool holds.
+//! Everything the modelled `crate::ops::types::PublicIpv4Pool` reports about those ranges is
+//! DERIVED from them
+//! on read by [`ComAmazonawsEc2Amazonec2State::public_ipv4_pool_view`] — each range's first
+//! and last address, its address count, and how many of those addresses are still available,
+//! which is the count less the account's Elastic IP addresses that fall inside the block
+//! ([`ComAmazonawsEc2Amazonec2State::addresses_in_byoip_cidr`]) — so a count can never drift
+//! from the ranges and the addresses it is a count of. `DeprovisionPublicIpv4PoolCidr` takes
+//! one range back out of a pool, and [`public_ipv4_pool_payload_bytes`] is the one definition
+//! of what a pool is charged against the byte budget.
+//!
 //! ## Elastic IP addresses
 //!
 //! [`ComAmazonawsEc2Amazonec2State::addresses`] holds the account's Elastic IP addresses
@@ -1458,6 +1485,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Starts EMPTY: a CoIP pool exists only on an Outpost local gateway, so a fresh
     /// account has none until something creates one through [`Self::insert_coip_pool`].
     pub coip_pools: BTreeMap<String, crate::ops::types::CoipPool>,
+    /// Every public IPv4 address pool the account holds, by `Ipv4PoolEc2Id` — see the module
+    /// docs. Ordered by that id in a [`BTreeMap`], the arrangement every other pool store
+    /// here uses: that id order is the one stable order `DescribePublicIpv4Pools` reports and
+    /// pages over, so a pagination token can name the id the next page starts at.
+    ///
+    /// Starts EMPTY: a public IPv4 pool exists only for an address range the account brought
+    /// to AWS, so a fresh account has none until a provision creates one through
+    /// [`Self::insert_public_ipv4_pool`].
+    pub public_ipv4_pools: BTreeMap<String, PublicIpv4PoolRecord>,
     /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
     /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
     pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
@@ -1742,6 +1778,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             secondary_network_client_tokens: HashMap::new(),
             // A fresh account has brought no address range of its own.
             byoip_cidrs: BTreeMap::new(),
+            public_ipv4_pools: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
             application_status: BTreeMap::new(),
@@ -2862,6 +2899,14 @@ impl ComAmazonawsEc2Amazonec2State {
                 // ([`ByoipCidrRecord::pending`]), so nothing can resurrect a released range.
                 if let Some(record) = self.byoip_cidrs.remove(&cidr) {
                     self.release_stored_bytes(byoip_cidr_payload_bytes(&record));
+                    // The address pool the provision created for the range goes with it: a
+                    // pool holds the addresses OF a range, so once the account does not hold
+                    // the range there is no pool of those addresses either, and its bytes
+                    // return to the budget as well. An `ipv6pool-ec2` id names no stored
+                    // pool, so this finds nothing for an IPv6 range.
+                    if let Some(pool_id) = record.byoip_cidr.pool_id.as_deref() {
+                        self.remove_public_ipv4_pool(pool_id);
+                    }
                 }
                 continue;
             }
@@ -9514,7 +9559,7 @@ impl AddressFamily {
     /// own id, which is how EC2 spells a public pool id (`ipv4pool-ec2-…`).
     pub fn pool_resource_type(self) -> &'static str {
         match self {
-            Self::Ipv4 => "ipv4pool-ec2",
+            Self::Ipv4 => PUBLIC_IPV4_POOL_RESOURCE_TYPE,
             Self::Ipv6 => "ipv6pool-ec2",
         }
     }
@@ -9831,6 +9876,247 @@ pub fn invalid_cidr_not_found<E>(cidr: &str) -> Scaffolded<E> {
 // `INCORRECT_STATE` / `incorrect_state`, declared with the fast launch codes below;
 // `WithdrawByoipCidr`'s and `DeprovisionByoipCidr`'s state refusals use that one rather
 // than a second copy.
+
+// ---------------------------------------------------------------------------
+// Public IPv4 address pools
+// ---------------------------------------------------------------------------
+
+/// The `ResourceType` and id prefix of a public IPv4 pool — `ipv4pool-ec2`, which is also
+/// what [`AddressFamily::pool_resource_type`] answers for an IPv4 range, named here so a
+/// reader of this section does not have to go through the family to find it.
+pub const PUBLIC_IPV4_POOL_RESOURCE_TYPE: &str = "ipv4pool-ec2";
+
+/// EC2's error code for a public IPv4 pool id the request named that the account holds no
+/// pool for, so there is no pool to act on.
+pub const INVALID_PUBLIC_IPV4_POOL_NOT_FOUND: &str = "InvalidPublicIpv4Pool.NotFound";
+
+/// Refuse a request that named a public IPv4 pool this account does not hold: HTTP 400
+/// `InvalidPublicIpv4Pool.NotFound`.
+///
+/// A code of its own rather than the `InvalidPoolID.NotFound` the customer-owned pools are
+/// refused with ([`invalid_pool_id_not_found`]): the two are different resources, and a
+/// client branches on the code. The message names the pool id the REQUEST sent, so the
+/// caller can tell which of several ids was not found from the text alone.
+pub fn invalid_public_ipv4_pool_not_found<E>(pool_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PUBLIC_IPV4_POOL_NOT_FOUND,
+        400,
+        format!("The pool ID '{pool_id}' does not exist."),
+    )
+}
+
+/// `value` as an address range of a public IPv4 pool, in the canonical form the pool store
+/// keys its ranges by: an IPv4 CIDR block with its host bits cleared.
+///
+/// A public IPv4 pool holds IPv4 addresses only — `PublicIpv4PoolRange$FirstAddress` is a
+/// dotted quad — so an IPv6 block is not a range of one, unlike [`canonical_byoip_cidr`]
+/// which reads both families. Deliberately NO prefix-length rule: what is provisionable is
+/// decided where a range is PROVISIONED ("The least specific netmask length you can define
+/// is 24", `ProvisionPublicIpv4PoolCidrRequest$NetmaskLength`), and a bound invented here
+/// would refuse a range the pool actually holds.
+pub fn canonical_public_ipv4_pool_cidr(value: &str) -> Result<String, CidrProblem> {
+    canonical_ipv4_cidr(value)
+}
+
+/// One public IPv4 address pool the account holds: the pool's own facts, beside the address
+/// ranges provisioned to it.
+///
+/// NOT the modelled `crate::ops::types::PublicIpv4Pool` itself, unlike the CoIP pool store:
+/// every member that
+/// shape carries about the ranges — each range's bounds and counts, and the pool's totals —
+/// is a FUNCTION of the ranges and of the addresses the account holds out of them, so
+/// storing them would be storing a cache that can drift. The ranges are the one source of
+/// truth, and [`ComAmazonawsEc2Amazonec2State::public_ipv4_pool_view`] derives the rest on
+/// read.
+#[derive(Debug, Clone)]
+pub struct PublicIpv4PoolRecord {
+    /// The pool's own id (`ipv4pool-ec2-…`), minted by the store.
+    pub pool_id: String,
+    /// "A description of the address pool" (`PublicIpv4Pool$Description`) — for a pool a
+    /// BYOIP provision created, the description that provision gave the range and the pool
+    /// ("A description for the address range and the address pool",
+    /// `ProvisionByoipCidrRequest$Description`).
+    pub description: Option<String>,
+    /// "The name of the location from which the address pool is advertised"
+    /// (`PublicIpv4Pool$NetworkBorderGroup`).
+    pub network_border_group: Option<String>,
+    /// "Any tags for the address pool" (`PublicIpv4Pool$Tags`) — the tags
+    /// `ProvisionByoipCidrRequest$PoolTagSpecifications` asked for.
+    pub tags: Vec<Tag>,
+    /// The address ranges provisioned to the pool, each a canonical IPv4 CIDR block
+    /// ([`canonical_public_ipv4_pool_cidr`]). A set, so one block cannot be provisioned to
+    /// one pool twice, and the pool's `PoolAddressRanges` are reported in address order
+    /// whatever order they were provisioned in.
+    pub cidrs: BTreeSet<String>,
+}
+
+/// What a provision stores for the pool it creates, read from the request before the store
+/// is touched.
+#[derive(Debug, Clone)]
+pub struct PublicIpv4PoolSpec {
+    /// "A description of the address pool" (`PublicIpv4Pool$Description`).
+    pub description: Option<String>,
+    /// The network border group the pool's addresses are advertised from.
+    pub network_border_group: String,
+    /// The tags the create asked to put on the pool.
+    pub tags: Vec<Tag>,
+    /// The address ranges the pool starts with, each canonical.
+    pub cidrs: Vec<String>,
+}
+
+/// The bytes one stored public IPv4 pool holds.
+///
+/// The ONE definition of that charge, the way [`byoip_cidr_payload_bytes`] is for an address
+/// range: the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus the
+/// caller-chosen text the record carries — its description, its tags and its address ranges.
+/// Every path that stores a pool charges exactly this and every path that drops one gives
+/// back exactly this.
+pub fn public_ipv4_pool_payload_bytes(record: &PublicIpv4PoolRecord) -> usize {
+    let cidr_bytes: usize = record
+        .cidrs
+        .iter()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(record.description.as_deref().map_or(0, str::len))
+        .saturating_add(record.network_border_group.as_deref().map_or(0, str::len))
+        .saturating_add(tag_list_bytes(&record.tags))
+        .saturating_add(cidr_bytes)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another public IPv4 pool fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    pub fn has_public_ipv4_pool_capacity(&self) -> bool {
+        self.public_ipv4_pools.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store `spec` as a new public IPv4 pool and answer the id minted for it.
+    ///
+    /// The id is minted HERE from the store's own counter, so no caller can choose a pool id,
+    /// exactly as [`Self::insert_coip_pool`] does for a customer-owned pool. The ranges are
+    /// canonicalised on the way in, so a writer cannot create a range no lookup can name.
+    ///
+    /// `None`, with NOTHING written, when a range of the spec is not an IPv4 CIDR block at
+    /// all — a pool created without the range it was asked to hold is not the pool the
+    /// caller asked for — when the store is at [`MAX_STORED_RECORDS_PER_STORE`], or when the
+    /// bytes the pool would hold would cross [`MAX_STORED_BYTES`]. All three are asked before
+    /// the first write, so a refused create leaves the store exactly as it was.
+    pub fn insert_public_ipv4_pool(&mut self, spec: PublicIpv4PoolSpec) -> Option<String> {
+        let mut cidrs = BTreeSet::new();
+        for cidr in &spec.cidrs {
+            cidrs.insert(canonical_public_ipv4_pool_cidr(cidr).ok()?);
+        }
+        let record = PublicIpv4PoolRecord {
+            // Minted after the ceilings below would be asked, so a refused create does not
+            // burn an id; `next_id` is the only source of one.
+            pool_id: String::new(),
+            description: spec.description,
+            network_border_group: Some(spec.network_border_group),
+            tags: spec.tags,
+            cidrs,
+        };
+        let charge = public_ipv4_pool_payload_bytes(&record);
+        if !self.has_public_ipv4_pool_capacity() || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        let pool_id = self.next_id(PUBLIC_IPV4_POOL_RESOURCE_TYPE);
+        self.add_stored_bytes(charge);
+        self.public_ipv4_pools.insert(
+            pool_id.clone(),
+            PublicIpv4PoolRecord {
+                pool_id: pool_id.clone(),
+                ..record
+            },
+        );
+        Some(pool_id)
+    }
+
+    /// Drop the public IPv4 pool `pool_id`, giving its bytes back to the budget, and answer
+    /// whether the store held one.
+    pub fn remove_public_ipv4_pool(&mut self, pool_id: &str) -> bool {
+        match self.public_ipv4_pools.remove(pool_id) {
+            Some(record) => {
+                self.release_stored_bytes(public_ipv4_pool_payload_bytes(&record));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Take the address range `cidr` back out of the pool `pool_id`, giving the bytes it held
+    /// back to the budget, and answer whether the pool held that range.
+    ///
+    /// `cidr` is expected canonical ([`canonical_public_ipv4_pool_cidr`]), the form the record
+    /// keys its ranges by, so a caller that has not canonicalised the request's value finds
+    /// nothing rather than removing the wrong range.
+    pub fn deprovision_public_ipv4_pool_cidr(&mut self, pool_id: &str, cidr: &str) -> bool {
+        let Some(record) = self.public_ipv4_pools.get_mut(pool_id) else {
+            return false;
+        };
+        if !record.cidrs.remove(cidr) {
+            return false;
+        }
+        self.release_stored_bytes(cidr.len());
+        true
+    }
+
+    /// The pool `record` as the API reports it: the modelled `crate::ops::types::PublicIpv4Pool`,
+    /// with every
+    /// member about its address ranges derived from the ranges the record holds.
+    ///
+    /// Each range reports "The first IP address in the range" and "The last IP address in the
+    /// range" (`PublicIpv4PoolRange`) of its block and "The number of addresses in the range",
+    /// which is the block's size; "The number of available addresses in the range" is that
+    /// less the account's Elastic IP addresses that fall inside the block, which is what
+    /// [`Self::addresses_in_byoip_cidr`] answers for an address range — an address allocated
+    /// out of a range is not an address the range still has to give. The pool's
+    /// `TotalAddressCount` and `TotalAvailableAddressCount` are the sums of those, so no total
+    /// can disagree with the ranges it totals. A count is clamped to the `Integer` the model
+    /// carries rather than wrapped.
+    ///
+    /// Reads NOTHING into the store: every value here is computed from what is already held.
+    pub fn public_ipv4_pool_view(
+        &self,
+        record: &PublicIpv4PoolRecord,
+    ) -> crate::ops::types::PublicIpv4Pool {
+        let clamped = |count: i64| -> i32 { i32::try_from(count.max(0)).unwrap_or(i32::MAX) };
+        // The ranges in ADDRESS order, which the record's key order (the block's text) is
+        // not: `10.0.0.0/24` sorts before `9.0.0.0/24` as text.
+        let mut blocks: Vec<(u32, u32, &String)> = record
+            .cidrs
+            .iter()
+            .filter_map(|cidr| ipv4_cidr_bounds(cidr).map(|(first, last)| (first, last, cidr)))
+            .collect();
+        blocks.sort_unstable();
+        let mut ranges: Vec<crate::ops::types::PublicIpv4PoolRange> =
+            Vec::with_capacity(blocks.len());
+        let mut total = 0i64;
+        let mut total_available = 0i64;
+        for (first, last, cidr) in blocks {
+            let count = i64::from(last - first) + 1;
+            let held = i64::try_from(self.addresses_in_byoip_cidr(cidr).len()).unwrap_or(i64::MAX);
+            let available = count.saturating_sub(held).max(0);
+            total = total.saturating_add(count);
+            total_available = total_available.saturating_add(available);
+            ranges.push(crate::ops::types::PublicIpv4PoolRange {
+                first_address: Some(::std::net::Ipv4Addr::from(first).to_string()),
+                last_address: Some(::std::net::Ipv4Addr::from(last).to_string()),
+                address_count: Some(clamped(count)),
+                available_address_count: Some(clamped(available)),
+            });
+        }
+        crate::ops::types::PublicIpv4Pool {
+            pool_id: Some(record.pool_id.clone()),
+            description: record.description.clone(),
+            pool_address_ranges: Some(ranges),
+            total_address_count: Some(clamped(total)),
+            total_available_address_count: Some(clamped(total_available)),
+            network_border_group: record.network_border_group.clone(),
+            tags: Some(record.tags.clone()),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Capacity Blocks
@@ -10646,6 +10932,11 @@ pub struct ByoipCidrSpec {
     /// Whether the range "will be publicly advertised to the internet"
     /// (`ProvisionByoipCidrRequest$PubliclyAdvertisable`).
     pub publicly_advertisable: bool,
+    /// "The tags to apply to the address pool"
+    /// (`ProvisionByoipCidrRequest$PoolTagSpecifications`), already held to the bounds every
+    /// create holds its tags to. They go on the address pool the provision creates, which is
+    /// the only resource this action tags.
+    pub pool_tags: Vec<Tag>,
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -10667,13 +10958,29 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`TRANSITION_DELAY`] from now ([`ByoipCidrRecord::pending`]).
     ///
     /// The pool the range gets ("creates a corresponding address pool",
-    /// `ProvisionByoipCidr`) is minted here from the store's own id counter, so no caller
-    /// can choose a pool id. The record goes in through [`Self::insert_byoip_cidr`], the one
-    /// write path, which charges the bytes it holds and REFUSES a record that does not fit
-    /// the store's ceilings — so `None`, with nothing stored, rather than a range reported
-    /// to a caller that the store does not hold.
+    /// `ProvisionByoipCidr`) is minted here rather than taken from the request, so no caller
+    /// can choose a pool id. For an IPv4 range that pool is a resource this store HOLDS — a
+    /// [`PublicIpv4PoolRecord`] carrying the range and the request's pool tags, which
+    /// `DescribePublicIpv4Pools` reports and `DeprovisionPublicIpv4PoolCidr` takes the range
+    /// back out of; for an IPv6 range the corresponding pool is an `ipv6pool-ec2`, which no
+    /// store here holds yet, so only its id is minted.
+    ///
+    /// The record goes in through [`Self::insert_byoip_cidr`], the one write path, which
+    /// charges the bytes it holds and REFUSES a record that does not fit the store's ceilings
+    /// — so `None`, with nothing stored, rather than a range reported to a caller that the
+    /// store does not hold.
     pub fn provision_byoip_cidr(&mut self, spec: ByoipCidrSpec) -> Option<ByoipCidr> {
-        let pool_id = self.next_id(spec.block.family.pool_resource_type());
+        let pool_id = match spec.block.family {
+            AddressFamily::Ipv4 => self.insert_public_ipv4_pool(PublicIpv4PoolSpec {
+                // "A description for the address range AND THE ADDRESS POOL"
+                // (`ProvisionByoipCidrRequest$Description`): the one value describes both.
+                description: spec.description.clone(),
+                network_border_group: spec.network_border_group.clone(),
+                tags: spec.pool_tags.clone(),
+                cidrs: vec![spec.block.cidr.clone()],
+            })?,
+            AddressFamily::Ipv6 => self.next_id(spec.block.family.pool_resource_type()),
+        };
         let becomes = match (spec.block.family, spec.publicly_advertisable) {
             (AddressFamily::Ipv6, false) => BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
             _ => BYOIP_CIDR_STATE_PROVISIONED,
@@ -10694,7 +11001,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 // `ByoipCidr$AdvertisementType` is how the range IS advertised, and this
                 // one is not advertised yet — `AdvertiseByoipCidr` is what starts that.
                 advertisement_type: None,
-                pool_id: Some(pool_id),
+                pool_id: Some(pool_id.clone()),
                 // "The ID of the IPAM pool associated with the CIDR"
                 // (`ByoipCidr$IpamPoolId`): a range provisioned through this operation is
                 // not in an IPAM pool; `MoveByoipCidrToIpam` is what puts one there.
@@ -10712,7 +11019,14 @@ impl ComAmazonawsEc2Amazonec2State {
             pending: Some(PendingStateMove::starting_now(becomes)),
         };
         let reported = record.byoip_cidr.clone();
-        self.insert_byoip_cidr(record).then_some(reported)
+        if !self.insert_byoip_cidr(record) {
+            // A range the store would not hold is not reported, so the pool created a moment
+            // ago for it goes back too: a pool whose range was never provisioned is no pool
+            // of this account, and its bytes return to the budget.
+            self.remove_public_ipv4_pool(&pool_id);
+            return None;
+        }
+        Some(reported)
     }
 }
 

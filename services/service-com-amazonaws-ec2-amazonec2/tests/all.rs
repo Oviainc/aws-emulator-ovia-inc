@@ -108,6 +108,8 @@ mod network_performance_data;
 mod placement_groups;
 #[path = "all/principal_id_format.rs"]
 mod principal_id_format;
+#[path = "all/public_ipv4_pools.rs"]
+mod public_ipv4_pools;
 // What `DeleteQueuedReservedInstances` deletes and what it reports per id.
 #[path = "all/queued_reserved_instances.rs"]
 mod queued_reserved_instances;

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeprovisionPublicIpv4PoolCidr
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeprovisionPublicIpv4PoolCidr`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeprovisionPublicIpv4PoolCidr::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: this operation takes one address range back out of a public IPv4 pool the
+//! account holds — this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +129,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeprovisionPublicIpv4PoolCidr` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeprovisionPublicIpv4PoolCidrErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — a pool is
+        // named by its own id, which is the key the store holds it under, and the range by
+        // the block itself. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the pool that you want to deprovision the CIDR from" (`$PoolId`) and
+        // "The CIDR you want to deprovision from the pool" (`$Cidr`). Both members are
+        // modelled `clientOptional`, so a request that leaves one out reaches this handler
+        // with an empty string and is refused here rather than looked up.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeprovisionPublicIpv4PoolCidr"))
+        // The REQUEST is read before the dry run is answered: a value that is no address
+        // range is wrong whatever the caller's permissions are, and `DryRun` is about "the
+        // required permissions for the action" (`$DryRun`) rather than about the request's
+        // syntax.
+        let pool_id = input.pool_id.as_str();
+        if pool_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter poolId",
+            ));
+        }
+        let requested = input.cidr.as_str();
+        if requested.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter cidr",
+            ));
+        }
+        // A public IPv4 pool holds IPv4 addresses, so a value that is not an IPv4 CIDR block
+        // names no range of one. The block is canonicalised, so the range a caller names with
+        // host bits set is the range the pool actually holds rather than one no lookup finds.
+        let Ok(cidr) = state::canonical_public_ipv4_pool_cidr(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter cidr is invalid. \
+                 This is not a valid IPv4 CIDR block."
+            )));
+        };
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`$DryRun`). What is checked is
+        // the CALLER's permissions, not the account's pools, so it is answered before the
+        // store is read at all: a dry run neither looks a pool up nor changes one, and
+        // answers `DryRunOperation` for a pool the account does not hold.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A release of the address range this pool belongs to was owed at its due instant
+        // whether or not anybody called, and it takes the pool with it — so a pool whose
+        // release has fallen due is gone, and deprovisioning out of it finds nothing.
+        store.materialize_due_transitions();
+
+        // "Deprovision a CIDR from a public IPv4 pool": a pool id this account holds no pool
+        // for is a refusal, not a no-op. The message names the id the REQUEST sent, which is
+        // what the caller has to correct.
+        let Some(record) = store.public_ipv4_pools.get(pool_id) else {
+            return Err(state::invalid_public_ipv4_pool_not_found(pool_id));
+        };
+        // A block the pool does not hold is not a CIDR there is anything to deprovision FROM
+        // it. The whole provisioned range is what comes back out — the pool's
+        // `PoolAddressRanges` are the ranges it was given, and nothing in this surface splits
+        // one — so a block that merely falls inside a provisioned range is refused too rather
+        // than silently taking that range away.
+        if !record.cidrs.contains(&cidr) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter cidr is invalid. \
+                 The CIDR {cidr} is not provisioned to the pool {pool_id}."
+            )));
+        }
+
+        // The range leaves the pool. The store's own remover is what gives the bytes it held
+        // back to the budget, so no path can drop a range uncharged; it answers `false` only
+        // for a range the pool does not hold, which the check above has already ruled out.
+        //
+        // The BYOIP record of a range this pool was created for is deliberately left ALONE.
+        // The two are different resources on the caller's own teardown path: "Before you can
+        // release an address range, you must stop advertising it and you must not have any IP
+        // addresses allocated from its address range" (`DeprovisionByoipCidr`) is still the
+        // call that gives the RANGE back, and AWS's documented order is to take the CIDR out
+        // of the pool first and release the range after. So an account that has only done
+        // this half holds a range it still owns (`DescribeByoipCidrs` reports it, in the
+        // state it was in) whose pool now holds nothing (`DescribePublicIpv4Pools` reports it
+        // empty) — which is what the real service reports between the two calls. What the two
+        // stores may never disagree on is the pool's IDENTITY, and that is untouched here:
+        // the range keeps naming this pool, and the pool keeps the id it was minted with.
+        if !store.deprovision_public_ipv4_pool_cidr(pool_id, &cidr) {
+            return Err(state::internal_error(
+                "the address range checked a moment ago could not be deprovisioned",
+            ));
+        }
+
+        Ok(DeprovisionPublicIpv4PoolCidrOutput {
+            // "The ID of the pool that you deprovisioned the CIDR from" (`$PoolId`) and "The
+            // deprovisioned CIDRs" (`$DeprovisionedAddresses`) — the one range this call took
+            // out, in the canonical form the pool held it in.
+            pool_id: Some(pool_id.to_string()),
+            deprovisioned_addresses: Some(vec![cidr]),
+        })
     }
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
+#[path = "all/device_lifecycle.rs"]
+mod device_lifecycle;
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
 #[path = "all/link_lifecycle.rs"]
