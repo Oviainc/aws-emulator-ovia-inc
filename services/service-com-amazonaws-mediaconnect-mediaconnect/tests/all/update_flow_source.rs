@@ -22,8 +22,8 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
 use crate::flow_sources::{
-    create_flow_with_sources, described_sources, remove_flow_source, unknown_flow_arn,
-    unknown_source_arn,
+    create_flow_from, create_flow_with_sources, described_sources, failover_active,
+    remove_flow_source, unknown_flow_arn, unknown_source_arn,
 };
 use crate::update_flow_output::{at_path, without_keys};
 
@@ -307,14 +307,24 @@ fn update_cases() -> Vec<UpdateCase> {
 #[tokio::test]
 async fn update_flow_source_applies_only_the_settings_the_request_carries() {
     let emulator = Emulator::new();
-    let flow_arn = create_flow_with_sources(
+    // Two of the rows below put the source on the NDI® transport, and a flow whose source
+    // is NDI exists only at an NDI-capable size: "set this optional parameter to LARGE if
+    // you want to enable NDI sources or outputs on the flow"
+    // (`smithy_query(query="doc",shape="CreateFlowRequest",member="FlowSize")`), asserted
+    // over the whole `FlowSize` catalog in `crate::flow_ndi_sizing`. The pair of sources
+    // needs source failover ACTIVE.
+    let flow_arn = create_flow_from(
         &emulator,
         "updates",
-        "flow-update-source",
-        json!([
-            { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16", "ingestPort": 5001 },
-            { "name": "secondary", "protocol": "rtp", "whitelistCidr": "10.2.0.0/16", "ingestPort": 5002 }
-        ]),
+        json!({
+            "name": "flow-update-source",
+            "flowSize": "LARGE",
+            "sourceFailoverConfig": failover_active(),
+            "sources": [
+                { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16", "ingestPort": 5001 },
+                { "name": "secondary", "protocol": "rtp", "whitelistCidr": "10.2.0.0/16", "ingestPort": 5002 }
+            ]
+        }),
     )
     .await;
     let held = described_sources(&emulator, "updates", &flow_arn).await;

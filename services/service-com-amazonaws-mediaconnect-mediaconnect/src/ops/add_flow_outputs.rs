@@ -234,6 +234,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // NDI needs the larger flow: "set this optional parameter to LARGE if you want to
+        // enable NDI sources or outputs on the flow" (`CreateFlowRequest$FlowSize`), so an
+        // output using the NDI transport cannot be added to a flow whose size does not
+        // carry NDI — the rule, its markers and its wording all read from the one place
+        // CreateFlow and UpdateFlow read them from (`crate::state`).
+        if let Some((offset, output)) = input
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, output)| crate::state::output_request_uses_ndi(output))
+        {
+            let feature = match output.name.as_deref() {
+                Some(name) => format!("The NDI output {name:?}"),
+                None => format!("The NDI output at Outputs[{offset}]"),
+            };
+            if let Some(rejection) =
+                crate::state::ndi_flow_size_rejection(&feature, flow.flow_size.as_deref())
+            {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // An output's name is unique within its flow, so each new output is named
         // against the flow's existing outputs AND against the ones earlier in this
         // request.

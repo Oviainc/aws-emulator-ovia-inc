@@ -222,6 +222,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(rejection));
         }
 
+        // NDI needs the larger flow: "set this optional parameter to LARGE if you want to
+        // enable NDI sources or outputs on the flow" (`CreateFlowRequest$FlowSize`), so a
+        // source using the NDI transport cannot be added to a flow whose size does not
+        // carry NDI — the rule, its markers and its wording all read from the one place
+        // CreateFlow and UpdateFlow read them from (`crate::state`).
+        if let Some((offset, source)) = input
+            .sources
+            .iter()
+            .enumerate()
+            .find(|(_, source)| crate::state::source_request_uses_ndi(source))
+        {
+            let feature = match source.name.as_deref() {
+                Some(name) => format!("The NDI source {name:?}"),
+                None => format!("The NDI source at Sources[{offset}]"),
+            };
+            if let Some(rejection) =
+                crate::state::ndi_flow_size_rejection(&feature, flow.flow_size.as_deref())
+            {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // `Source.Name` is required while `SetSourceRequest.Name` is optional, so a
         // source whose request named none is named by the service — against the flow's
         // existing source names AND the names resolved for earlier sources of this same
