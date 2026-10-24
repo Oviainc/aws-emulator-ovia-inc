@@ -228,17 +228,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `eventRuleSource` selects the configurations carrying an
                 // EventRule with that source, and `channelArn` those associated
                 // with that channel, so both are looked up on the record's own
-                // associations. Those sets are empty on every record today
-                // because `CreateEventRule` and `AssociateChannel` are still 501
-                // stubs; implementing them populates the record and makes these
-                // filters select without another change here.
+                // associations, which `CreateEventRule` and `AssociateChannel`
+                // maintain.
                 if let Some(source) = input.event_rule_source.as_deref() {
                     if !record.event_rule_sources.contains(source) {
                         return false;
                     }
                 }
                 if let Some(channel) = input.channel_arn.as_deref() {
-                    if !record.channel_arns.contains(channel) {
+                    if !record.channel_arns.contains_key(channel) {
                         return false;
                     }
                 }
