@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ConfigureLogsErrorModeled::InternalServerErrorException(
@@ -174,11 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
 
-        // The group this request ADDRESSES (`Id` is an `@httpLabel`), so one this
-        // service holds none of is a 404 rather than a parameter violation.
-        let Some(stored) = state.packaging_groups.get_mut(&input.id) else {
+        // The group this request ADDRESSES (`Id` is an `@httpLabel`) in the Region it
+        // was served in, so one that Region holds none of is a 404 rather than a
+        // parameter violation — and never another Region's group, which this call
+        // cannot reach, let alone reconfigure.
+        let Some(stored) = state.packaging_group_mut(&region, &input.id) else {
             return Err(ConfigureLogsErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::scaffolded::not_found_message(
                     "PackagingGroup",
@@ -207,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ConfigureLogsOutput {
             // Counted from the asset map on every read, exactly as
             // `DescribePackagingGroup` counts it: configuring logs changes no asset.
-            approximate_asset_count: Some(state.asset_count(&id)),
+            approximate_asset_count: Some(state.asset_count(&region, &id)),
             authorization,
             created_at: Some(created_at),
             domain_name: Some(domain_name),

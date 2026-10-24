@@ -179,17 +179,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An id in the request BODY that resolves to nothing is a violation of that
         // PARAMETER, not a missing addressed resource: the request addresses
         // `/assets`, which exists. So it is the 422 that names the member, not a 404.
-        if !state
-            .packaging_groups
-            .contains_key(&input.packaging_group_id)
-        {
+        if !state.has_packaging_group(&region, &input.packaging_group_id) {
             return Err(crate::scaffolded::UnprocessableEntity::member(
                 "packagingGroupId",
                 "does not exist",
             )
             .into());
         }
-        if state.assets.contains_key(&input.id) {
+        // Scoped to this request's Region: the same asset `Id` in another Region is
+        // another asset, not a duplicate of this one.
+        if state.has_asset(&region, &input.id) {
             return Err(CreateAssetErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
                     message: Some(crate::scaffolded::already_exists_message(
@@ -216,6 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::resource_arn("assets", &region, &input.id);
         let record = crate::state::AssetRecord {
             id: input.id.clone(),
+            region: region.clone(),
             arn: arn.clone(),
             created_at: crate::state::now_iso8601(),
             packaging_group_id: input.packaging_group_id,
@@ -229,9 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_instant: std::time::Instant::now(),
         };
         state.set_tags(&arn, input.tags.as_ref());
-        state.assets.insert(input.id.clone(), record);
+        state.insert_asset(record);
 
-        let Some(stored) = state.assets.get(&input.id) else {
+        let Some(stored) = state.asset(&region, &input.id) else {
             return Err(CreateAssetErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
                     message: Some("the Asset could not be read back".to_string()),

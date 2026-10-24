@@ -690,6 +690,7 @@ async fn max_results_and_next_token_follow_their_modelled_constraints() {
 fn filler_group(id: &str) -> vod::PackagingGroupRecord {
     vod::PackagingGroupRecord {
         id: id.to_string(),
+        region: REGION.to_string(),
         arn: vod::resource_arn("packaging-groups", REGION, id),
         domain_name: vod::packaging_group_domain_name(id, REGION),
         created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -702,6 +703,7 @@ fn filler_group(id: &str) -> vod::PackagingGroupRecord {
 fn filler_config(id: &str, group_id: &str) -> vod::PackagingConfigurationRecord {
     vod::PackagingConfigurationRecord {
         id: id.to_string(),
+        region: REGION.to_string(),
         arn: vod::resource_arn("packaging-configurations", REGION, id),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         packaging_group_id: group_id.to_string(),
@@ -717,6 +719,7 @@ fn filler_config(id: &str, group_id: &str) -> vod::PackagingConfigurationRecord 
 fn filler_asset(id: &str, group_id: &str) -> vod::AssetRecord {
     vod::AssetRecord {
         id: id.to_string(),
+        region: REGION.to_string(),
         arn: vod::resource_arn("assets", REGION, id),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         packaging_group_id: group_id.to_string(),
@@ -745,7 +748,7 @@ async fn creates_are_refused_at_each_capacity_bound() {
             let mut state = store.lock();
             for index in 0..held {
                 let id = format!("filler-{index:05}");
-                state.packaging_groups.insert(id.clone(), filler_group(&id));
+                state.insert_packaging_group(filler_group(&id));
             }
         }
         let router = router_over(engine);
@@ -771,17 +774,13 @@ async fn creates_are_refused_at_each_capacity_bound() {
         {
             let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
             let mut state = store.lock();
-            state
-                .packaging_groups
-                .insert("g".to_string(), filler_group("g"));
+            state.insert_packaging_group(filler_group("g"));
             for index in 0..held {
                 // Spread over synthetic groups so the per-group bound is not what
                 // refuses this create.
                 let id = format!("filler-{index:05}");
                 let group = format!("group-{}", index / 10);
-                state
-                    .packaging_configurations
-                    .insert(id.clone(), filler_config(&id, &group));
+                state.insert_packaging_configuration(filler_config(&id, &group));
             }
         }
         let router = router_over(engine);
@@ -809,14 +808,10 @@ async fn creates_are_refused_at_each_capacity_bound() {
         {
             let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
             let mut state = store.lock();
-            state
-                .packaging_groups
-                .insert("g".to_string(), filler_group("g"));
+            state.insert_packaging_group(filler_group("g"));
             for index in 0..held {
                 let id = format!("filler-{index:05}");
-                state
-                    .packaging_configurations
-                    .insert(id.clone(), filler_config(&id, "g"));
+                state.insert_packaging_configuration(filler_config(&id, "g"));
             }
         }
         let router = router_over(engine);
@@ -844,12 +839,10 @@ async fn creates_are_refused_at_each_capacity_bound() {
         {
             let store = engine.state::<vod::ComAmazonawsMediapackagevodMediapackagevodState>();
             let mut state = store.lock();
-            state
-                .packaging_groups
-                .insert("g".to_string(), filler_group("g"));
+            state.insert_packaging_group(filler_group("g"));
             for index in 0..held {
                 let id = format!("filler-{index:05}");
-                state.assets.insert(id.clone(), filler_asset(&id, "g"));
+                state.insert_asset(filler_asset(&id, "g"));
             }
         }
         let router = router_over(engine);
