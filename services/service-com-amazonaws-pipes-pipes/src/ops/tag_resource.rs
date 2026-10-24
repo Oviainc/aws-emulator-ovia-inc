@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges the request's tags into the ones persisted on the pipe the
+//! `resourceArn` names — a new key is added, a key already present has its value replaced.
+//! An ARN no stored pipe carries is `NotFoundException` (404); a merge that would push the
+//! pipe past 50 tags is `ValidationException` (400). This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! STILL MISSING, tracked by `issues/.../pipes-tagresource-stub.md`: the refusals AWS makes
+//! on a tag key's CONTENT (the reserved `aws:` prefix, and the character rules the modelled
+//! `TagKey`/`TagValue` length constraints do not express). Those keys are accepted here.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +147,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The tags are written onto the stored record; nothing here depends on request
+        // metadata.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalException(InternalException {
+                message: "the pipes store is not reachable from this engine".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        let mut state = store.lock();
+        state.settle_due_transitions();
+
+        let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Pipe not found: {}", input.resource_arn)),
+            })
+        })?;
+
+        // The documented cap is on the tags a pipe CARRIES, so it is the merged set that
+        // has to fit: a request within `TagMap`'s own bound can still take the pipe past
+        // it. Counted before anything is written, so a refused call changes nothing.
+        let merged = pipe
+            .tags
+            .keys()
+            .filter(|key| !input.tags.contains_key(key.as_str()))
+            .count()
+            + input.tags.len();
+        if merged > crate::state::MAX_TAGS_PER_PIPE {
+            let limit = crate::state::MAX_TAGS_PER_PIPE;
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "A pipe can be associated with at most {limit} tags; this request would \
+                     leave it with {merged}."
+                )),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "tags".to_string(),
+                    message: format!("must leave the pipe with at most {limit} tags"),
+                }]),
+            })
+            .into());
+        }
+
+        // A new key is appended, a key already on the pipe has its value replaced — and a
+        // key the request does not name is left alone, which is what makes a repeated
+        // `TagResource` idempotent.
+        for (key, value) in &input.tags {
+            pipe.tags.insert(key.clone(), value.clone());
+        }
+
+        // `LastModifiedTime` is left alone: AWS documents it as when the PIPE was last
+        // updated, and tagging is a separate resource-tagging call, not a pipe update.
+        Ok(TagResourceOutput {})
     }
 }

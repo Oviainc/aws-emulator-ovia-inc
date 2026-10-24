@@ -30,7 +30,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span, Answer,
 };
 
 /// The `ControlIdentifier` of a control, shaped like the ARNs AWS Control Tower names
@@ -961,10 +961,7 @@ async fn target_regions_are_the_governed_regions_of_the_deployed_landing_zone() 
                 "/create-landingzone",
                 serde_json::json!({
                     "version": "3.3",
-                    "manifest": {
-                        "governedRegions": governed,
-                        "organizationStructure": { "security": { "name": "Security" } }
-                    }
+                    "manifest": manifest_governing(governed)
                 }),
             )
             .await;
