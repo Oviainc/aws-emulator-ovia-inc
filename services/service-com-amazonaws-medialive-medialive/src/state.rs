@@ -336,6 +336,22 @@ pub use clusters::{
 
 pub(crate) use clusters::cluster_description_output;
 
+/// The OFFERING slice: the catalog of reserved resources available for purchase
+/// that `ListOfferings`, `DescribeOffering` and `PurchaseOffering` all answer
+/// from, in one module of its own for the same reason as the slices above. It is
+/// a catalog rather than a store — an offering is not a resource a caller
+/// creates — so it adds no member to [`ComAmazonawsMedialiveMedialiveState`];
+/// what it takes FROM the state is the configuration of a stored channel, which
+/// is what the `ChannelConfiguration` filter matches offerings against.
+pub mod offerings;
+
+pub use offerings::{
+    catalog, offering_by_id, offering_id, offering_index, offering_page,
+    reservation_resource_type, ChannelOfferingConfiguration, OfferingFilters, OfferingSpec,
+    OFFERING_CURRENCY_CODE, OFFERING_DURATION, OFFERING_DURATION_UNITS, OFFERING_FIXED_PRICE,
+    OFFERING_TYPE,
+};
+
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ChannelState")`:
 /// CREATING | CREATE_FAILED | IDLE | STARTING | RUNNING | RECOVERING | STOPPING |

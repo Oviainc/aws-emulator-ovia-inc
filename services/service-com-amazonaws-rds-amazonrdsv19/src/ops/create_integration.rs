@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a zero-ETL integration between a database this service holds and an Amazon
+//! Redshift data warehouse. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The order the two inputs are checked in is part of the contract: `TargetArn` publishes
+//! a length bound and no pattern, so its SYNTAX is checked here — and checked BEFORE the
+//! source database is resolved, so a request carrying a target that is not an ARN is
+//! refused for that whatever its source names.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +201,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntegration"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateIntegrationError::validation)?;
+
+        // `TargetArn`'s syntax, first of everything — see the module docs for why the order
+        // matters.
+        crate::state::check_integration_target_arn(&input.target_arn)
+            .map_err(CreateIntegrationError::invalid_parameter_value)?;
+        // A KMS key the request names has to be a key identifier at all; a value of no
+        // such form names no key, which is what the modelled fault reports.
+        if let Some(kms_key_id) = &input.kms_key_id {
+            if let Err(message) = crate::state::check_kms_key_id(kms_key_id) {
+                return Err(CreateIntegrationErrorModeled::KMSKeyNotAccessibleFault(
+                    KMSKeyNotAccessibleFault {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+        // Nothing caller-sized reaches the store unchecked: the encryption context is a
+        // caller-sized MAP with no published bound, so its entry count and every key and
+        // value are bounded, and the tag list is count- and length-bounded.
+        let encryption_context = input.additional_encryption_context.unwrap_or_default();
+        crate::state::check_request_list_len(
+            "AdditionalEncryptionContext",
+            encryption_context.len(),
+            crate::state::MAX_COLLECTION_ENTRIES,
+        )
+        .map_err(CreateIntegrationError::invalid_parameter_value)?;
+        for (key, value) in &encryption_context {
+            crate::state::check_free_form("AdditionalEncryptionContext", key)
+                .map_err(CreateIntegrationError::invalid_parameter_value)?;
+            crate::state::check_free_form("AdditionalEncryptionContext", value)
+                .map_err(CreateIntegrationError::invalid_parameter_value)?;
+        }
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags).map_err(CreateIntegrationError::invalid_parameter_value)?;
+
+        // `SourceArn` is pattern-constrained to an RDS `cluster` or `db` ARN, so the
+        // boundary has already refused anything else; which of the two it names decides
+        // which store the source is resolved in, and so which not-found fault answers a
+        // source that resolves to nothing. The fault names the DATABASE the ARN names,
+        // because that is what the caller has to create for the request to be served.
+        let source_named = input.source_arn.clone();
+        let Some(source_arn) = crate::state::parse_rds_resource_arn(&source_named) else {
+            return Err(CreateIntegrationError::invalid_parameter_value(format!(
+                "invalid value '{source_named}' for SourceArn: expected the ARN of an Amazon \
+                 RDS DB cluster or DB instance"
+            )));
+        };
+        let source_is_cluster = source_arn.resource_type == "cluster";
+        // RDS is regional and so is this store: a source is looked for in the region its
+        // own ARN names.
+        let source_region = source_arn.region.to_string();
+        let source_identifier = source_arn.identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated integration.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&source_region);
+        if source_region != region {
+            store.settle_due_transitions(&region);
+        }
+
+        if source_is_cluster {
+            if !store
+                .db_clusters
+                .contains_key(&(source_region.clone(), source_identifier.clone()))
+            {
+                return Err(CreateIntegrationErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(format!(
+                            "RDS DB cluster {source_identifier} does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        } else if !store
+            .db_instances
+            .contains_key(&(source_region.clone(), source_identifier.clone()))
+        {
+            return Err(CreateIntegrationErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!(
+                        "RDS DB instance {source_identifier} does not exist"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The integration is created in the region the request was signed for, and one
+        // name names one integration there.
+        let key = (region.clone(), input.integration_name.clone());
+        if store.integrations.contains_key(&key) {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
+                    IntegrationAlreadyExistsFault {
+                        message: Some(format!(
+                            "An integration named {} already exists",
+                            input.integration_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.integrations_in(&region).len() >= crate::state::INTEGRATION_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationQuotaExceededFault(
+                    IntegrationQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} integrations in {region}",
+                            crate::state::INTEGRATION_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mint = store.next_mint();
+        // A new integration is not yet replicating: it reports `creating` and reaches
+        // `active` on its own. The due instant is stored on the record — nothing sleeps.
+        let record = crate::state::IntegrationRecord {
+            name: input.integration_name,
+            region: region.clone(),
+            integration_id: crate::state::mint_integration_id(mint),
+            source_arn: source_named,
+            target_arn: input.target_arn,
+            kms_key_id: input.kms_key_id,
+            additional_encryption_context: encryption_context,
+            data_filter: input.data_filter,
+            description: input.description,
+            status: crate::state::INTEGRATION_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::INTEGRATION_STATUS_ACTIVE,
+            )),
+            create_time: crate::state::now_as_wire_timestamp(),
+            tags,
+        };
+        let integration = record.to_wire();
+        store.integrations.insert(key, record);
+        Ok(integration)
     }
 }
