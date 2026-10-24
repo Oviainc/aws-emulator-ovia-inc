@@ -19,6 +19,10 @@
 //! rows vary what the rule generalises over: which reserved spelling, key length, value
 //! length, tag count, and whether a length is counted in characters or bytes.
 //!
+//! The two tables are `pub(crate)`: `TagResource` assigns a tag map to an EXISTING
+//! resource and is held to the same rules, which `crate::resource_tagging` asserts over
+//! these same rows rather than over a second copy of them.
+//!
 //! The bounds themselves are the constants in `state` (each citing its source);
 //! nothing here hardcodes a number the rule is stated with.
 
@@ -47,11 +51,12 @@ enum Target {
 }
 
 impl Target {
-    /// Every create of this service that accepts a `tags` map and is implemented
+    /// Every create of this service that accepts a `tags` map and is asserted here
     /// (`smithy_query(query="operation", operation="CreateConfig,CreateMissionProfile,\
-    /// CreateDataflowEndpointGroup,ReserveContact")` — `TagResource`, `CreateEphemeris`
-    /// and `RegisterAgent` also take one but are still scaffolded 501s, each with its
-    /// own open issue).
+    /// CreateDataflowEndpointGroup,ReserveContact")`). `CreateEphemeris`, `RegisterAgent`
+    /// and `TagResource` take one too and are held to the same rules; all three are
+    /// asserted in `crate::resource_tagging`, which creates a tagged ephemeris and a
+    /// tagged agent and runs the tables below through `TagResource`.
     const ALL: [Target; 4] = [
         Target::Config,
         Target::MissionProfile,
@@ -179,7 +184,7 @@ fn stored_count(engine: &engine::InMemoryEngine, target: Target) -> usize {
 }
 
 /// `count` distinct legal tags: `tag-00` … , each with a short value.
-fn tag_map(count: usize) -> Value {
+pub(crate) fn tag_map(count: usize) -> Value {
     let mut map = Map::new();
     for index in 0..count {
         map.insert(format!("tag-{index:03}"), json!("v"));
@@ -198,7 +203,7 @@ fn sized(fill: char, chars: usize) -> String {
 }
 
 /// The tag maps the rules refuse, each row differing in WHAT it breaks.
-fn illegal_tag_maps() -> Vec<(String, Value)> {
+pub(crate) fn illegal_tag_maps() -> Vec<(String, Value)> {
     let (min_key, max_key) = TAG_KEY_CHARS;
     vec![
         (
@@ -273,7 +278,7 @@ fn illegal_tag_maps() -> Vec<(String, Value)> {
 
 /// The tag maps the rules allow, including every published bound and the near misses of
 /// the reserved prefix. `None` is a request with no `tags` member at all.
-fn legal_tag_maps() -> Vec<(String, Option<Value>)> {
+pub(crate) fn legal_tag_maps() -> Vec<(String, Option<Value>)> {
     let (min_key, max_key) = TAG_KEY_CHARS;
     vec![
         ("no tags member at all".to_string(), None),

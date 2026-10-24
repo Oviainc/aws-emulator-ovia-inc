@@ -229,6 +229,24 @@ impl RestApiEntry {
         ordered.sort_by_key(|part| (part.sequence, part.id.clone()));
         ordered
     }
+
+    /// This API's deployments in creation order — the oldest deployment first, by the
+    /// creation rank stamped on each record, exactly as this crate's other collections of
+    /// an API's children are ordered.
+    pub fn deployments_in_creation_order(&self) -> Vec<&DeploymentEntry> {
+        let mut ordered: Vec<&DeploymentEntry> = self.deployments.values().collect();
+        ordered.sort_by_key(|deployment| (deployment.sequence, deployment.id.clone()));
+        ordered
+    }
+
+    /// The ids of [`Self::deployments_in_creation_order`], the stable sequence
+    /// [`page_of`] cuts a `GetDeployments` page out of.
+    pub fn deployment_ids_in_creation_order(&self) -> Vec<String> {
+        self.deployments_in_creation_order()
+            .into_iter()
+            .map(|deployment| deployment.id.clone())
+            .collect()
+    }
 }
 
 /// One stored `Resource`: a node of an API's path tree.

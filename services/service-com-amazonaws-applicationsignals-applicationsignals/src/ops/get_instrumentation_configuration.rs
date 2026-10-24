@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstrumentationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstrumentationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the persisted dynamic instrumentation configuration a request's identity names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstrumentationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,23 +140,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_INSTRUMENTATION_CONFIGURATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the stored instrumentation configuration, unchanged.
+    ///
+    /// A read: it returns the record `CreateInstrumentationConfiguration` wrote
+    /// ("configurations are immutable after creation") and writes nothing of its own, so two
+    /// Gets of one configuration answer identically. The identity is the one every
+    /// instrumentation operation addresses a configuration by — the
+    /// [`crate::state::InstrumentationScope`] (instrumentation type, service and
+    /// environment) plus the [`crate::state::instrumentation_key`] (signal type and location
+    /// hash) — so a Get resolves exactly the record the create of that identity stored, and a
+    /// Get naming any other identity, the other instrumentation type included, is the
+    /// modelled `ResourceNotFoundException`.
+    ///
+    /// `LocationIdentifier` is resolved by the shared location-or-hash rule
+    /// ([`crate::state::identified_location_hash`]), so a Get naming the full code location
+    /// and a Get naming its pre-computed hash reach the same record.
+    ///
+    /// The one write it performs is the expiry the CLOCK already made due: `ExpiresAt` is
+    /// "the timestamp after which this configuration is no longer served to clients", so an
+    /// expired BREAKPOINT configuration is gone and reported as not found — the same answer
+    /// this call would give had nobody ever made it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstrumentationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstrumentationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstrumentationConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInstrumentationConfigurationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::region_of(ctx.parts());
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let scope = crate::state::InstrumentationScope::new(
+            &input.instrumentation_type,
+            &input.service,
+            &input.environment,
+        );
+        let location_hash = crate::state::identified_location_hash(&input.location_identifier);
+        let key = crate::state::instrumentation_key(&input.signal_type, &location_hash);
+
+        let mut store = state.lock();
+
+        // A BREAKPOINT configuration whose expiry has fallen due is no longer served, so the
+        // pass that materialises the lapse runs before the lookup.
+        store.expire_instrumentation_configurations(&now);
+
+        match store.instrumentation_configuration(&scope, &key) {
+            Some(configuration) => Ok(GetInstrumentationConfigurationOutput {
+                configuration: configuration.clone(),
+            }),
+            None => Err(
+                GetInstrumentationConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::instrumentation_configuration_not_found(
+                        &region,
+                        &scope,
+                        &input.signal_type,
+                        &location_hash,
+                    ),
+                )
+                .into(),
+            ),
+        }
     }
 }

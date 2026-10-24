@@ -15,6 +15,8 @@
 mod env_endpoint_not_found_wording;
 #[path = "all/env_endpoint_payload.rs"]
 mod env_endpoint_payload;
+#[path = "all/environment_business_rules.rs"]
+mod environment_business_rules;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
 #[path = "all/environment_service_defaults.rs"]

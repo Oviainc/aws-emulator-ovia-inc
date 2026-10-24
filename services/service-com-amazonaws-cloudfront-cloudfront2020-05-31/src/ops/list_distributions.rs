@@ -67,7 +67,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::ops::Bound;
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -175,46 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the status its distribution has at this instant.
         store.settle(SystemTime::now());
 
-        let mut items: Vec<DistributionSummary> = Vec::new();
-        let mut is_truncated = false;
-        // `Marker` names where the previous page ENDED, so this page starts after it:
-        // walking the pages enumerates every distribution exactly once. The store is
-        // ordered by id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
-            Some(marker) => Bound::Excluded(marker),
-            None => Bound::Unbounded,
-        };
-        for (_, stored) in store
-            .distributions
-            .range::<str, _>((start, Bound::Unbounded))
-        {
-            if items.len() >= page_size {
-                is_truncated = true;
-                break;
-            }
-            items.push(stored.to_summary());
-        }
-
+        // Every distribution in the store, paged by the one page walk every CloudFront
+        // distribution listing shares.
         Ok(ListDistributionsOutput {
-            distribution_list: Some(DistributionList {
-                // "The value you provided for the Marker request parameter."
-                marker: input.marker.unwrap_or_default(),
-                // Present exactly when more distributions remain, carrying the id this
-                // page ended at.
-                next_marker: if is_truncated {
-                    items.last().map(|summary| summary.id.clone())
-                } else {
-                    None
-                },
-                // "The value you provided for the MaxItems request parameter."
+            distribution_list: Some(crate::state::distribution_page(
+                &store.distributions,
+                input.marker.as_deref(),
                 max_items,
-                is_truncated,
-                // "The number of distributions" in this page: the length of `Items`.
-                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
-                // A page that lists nothing carries no `Items` element at all, rather
-                // than an empty one.
-                items: if items.is_empty() { None } else { Some(items) },
-            }),
+                page_size,
+                |_| true,
+            )),
         })
     }
 }

@@ -37,6 +37,10 @@
 //! * The activation of a new identity source ([`IDENTITY_SOURCE_ACTIVATION_DELAY`]). A
 //!   source is `CREATING` until it comes due and `ACTIVE` afterwards, which is what
 //!   `IdentitySourceStatus`' non-terminal `CREATING` token stands for.
+//! * The removal of an identity source whose deletion `DeleteIdentitySource` started
+//!   ([`IDENTITY_SOURCE_DELETION_DELAY`]). The source is reported `DELETING` — the
+//!   model's other non-terminal `IdentitySourceStatus` token — until the removal comes
+//!   due, and is gone afterwards, so `ListIdentitySources` omits it.
 //! * The activation of a new session ([`SESSION_ACTIVATION_DELAY`]) and, after it, that
 //!   session's expiration ([`SESSION_EXPIRATION`]): a session is `CREATING` until its
 //!   activation comes due, `PENDING` while it waits on its approvers, and `FAILED` with
@@ -62,6 +66,11 @@
 //! `ListIdentitySources` pages over them in creation order
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::identity_sources_in_creation_order`]),
 //! so a listed entry is always read off the stored record.
+//!
+//! `DeleteIdentitySource` is what takes one out again: it puts the stored record into
+//! `DELETING` ([`IdentitySource::begin_deletion`]) and the clock removes it
+//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::remove_identity_source`]), so the
+//! record a later read reports — or omits — is this one store's.
 //!
 //! # The policy catalog
 //!
@@ -140,6 +149,15 @@ pub const INVITATION_RESPONSE_DELAY: Duration = Duration::from_millis(500);
 /// fixes for a clock-owed transition, so a caller that lists the source immediately
 /// still observes the transient `CREATING` status the model declares.
 pub const IDENTITY_SOURCE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteIdentitySource` the emulator stops reporting the source at all
+/// (and therefore how long it stays `DELETING`).
+///
+/// CHOSEN, not documented: AWS publishes no duration for an identity source's removal to
+/// settle. It sits inside the 250–750 ms window this project fixes for a clock-owed
+/// transition, so a caller that lists the source straight after the delete call still
+/// observes the transient `DELETING` status the model declares.
+pub const IDENTITY_SOURCE_DELETION_DELAY: Duration = Duration::from_millis(500);
 
 /// How long after a session is started the emulator reports it as `PENDING` (and
 /// therefore how long it stays `CREATING`).
@@ -483,12 +501,13 @@ impl IdentitySourceType {
 
 /// Status of an identity source, in the tokens `IdentitySourceStatus` declares.
 ///
-/// `CREATING` and `ACTIVE` are the two a source this service records moves through
-/// ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] owes the transition).
-/// `DELETING` is for `DeleteIdentitySource` to record and `ERROR` for a failed
-/// association — both still scaffolded, so nothing constructs them today; they are
-/// carried here so the enum is the model's whole token catalog rather than the subset
-/// one operation reaches.
+/// `CREATING` and `ACTIVE` are the two a freshly created source moves through, and
+/// `DELETING` the one `DeleteIdentitySource` records until the removal it started comes
+/// due ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] owes every one of
+/// those transitions). `ERROR` is for a failed association with the IAM Identity Center
+/// instance, which nothing in this emulator produces — no operation of this model reports
+/// an association failure — so nothing constructs it today; it is carried here so the
+/// enum is the model's whole token catalog rather than the subset one operation reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentitySourceStatus {
     Creating,
@@ -527,6 +546,10 @@ pub struct IdentitySource {
     /// Instant at which this source's activation (`CREATING` -> `ACTIVE`) becomes due.
     /// `None` once it has been materialised.
     pub activation_due: Option<SystemTime>,
+    /// Instant at which this source's removal becomes due, set when
+    /// `DeleteIdentitySource` starts it. `None` on a source whose deletion nobody has
+    /// asked for.
+    pub deletion_due: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
     /// Creation order, the stable ordering `ListIdentitySources` pages over.
     pub seq: u64,
@@ -553,9 +576,28 @@ impl IdentitySource {
             status: IdentitySourceStatus::Creating,
             creation_time: now,
             activation_due: Some(now + IDENTITY_SOURCE_ACTIVATION_DELAY),
+            deletion_due: None,
             tags,
             seq,
         }
+    }
+
+    /// Put this source into `DELETING` and record the instant its removal comes due
+    /// ([`IDENTITY_SOURCE_DELETION_DELAY`]), which
+    /// [`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] materialises for
+    /// every later reader.
+    ///
+    /// A source whose deletion has started is no longer waiting to become `ACTIVE`, so
+    /// its activation is dropped: the clock owes exactly one transition from here, the
+    /// removal. Idempotent — a repeat delete keeps the due instant the first one
+    /// recorded, so asking twice does not postpone the removal.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.status == IdentitySourceStatus::Deleting {
+            return;
+        }
+        self.status = IdentitySourceStatus::Deleting;
+        self.activation_due = None;
+        self.deletion_due = Some(now + IDENTITY_SOURCE_DELETION_DELAY);
     }
 }
 
@@ -1355,6 +1397,22 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             source.activation_due = None;
         }
 
+        // An identity source whose deletion `DeleteIdentitySource` started is gone once
+        // that removal comes due: until then it is reported `DELETING`, afterwards
+        // `ListIdentitySources` omits it.
+        let deleted: Vec<String> = self
+            .identity_sources
+            .values()
+            .filter(|source| {
+                source.status == IdentitySourceStatus::Deleting
+                    && source.deletion_due.is_some_and(|due| due <= now)
+            })
+            .map(|source| source.arn.clone())
+            .collect();
+        for arn in deleted {
+            self.remove_identity_source(&arn);
+        }
+
         for session in self.sessions.values_mut() {
             // A new session is PENDING — waiting on its approvers — once its activation
             // comes due.
@@ -1457,6 +1515,38 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// Record an identity source, replacing any entry under the same ARN.
     pub fn insert_identity_source(&mut self, source: IdentitySource) {
         self.identity_sources.insert(source.arn.clone(), source);
+    }
+
+    /// Drop an identity source and everything that indexes it.
+    ///
+    /// The record's tags go with it, so the source stops being a taggable resource at
+    /// the same instant it stops being listed, and an `@idempotencyToken` that resolved
+    /// to it is freed the way [`ComAmazonawsMpaAwsfluffycoreserviceState::remove_team`]
+    /// frees a team's: a replay of the create that minted this source mints a new one
+    /// rather than answering with a record that is gone.
+    pub fn remove_identity_source(&mut self, arn: &str) {
+        self.identity_sources.remove(arn);
+        self.idempotency_tokens.retain(|_, stored| stored != arn);
+    }
+
+    /// The ARN of a stored approval team whose approvers authenticate through the
+    /// identity source `arn` names, if any.
+    ///
+    /// A team's approvers are recorded with the identity source each of them is
+    /// authenticated by (`Approver::primary_identity_source_arn`), so a source with such
+    /// a reference is IN USE: removing it would leave the team pointing at a source this
+    /// store no longer holds. It is the one place that reference is resolved, so every
+    /// operation deciding whether a source is in use reads the same records.
+    #[must_use]
+    pub fn team_arn_using_identity_source(&self, arn: &str) -> Option<&str> {
+        self.approval_teams
+            .values()
+            .find(|team| {
+                team.approvers
+                    .iter()
+                    .any(|approver| approver.primary_identity_source_arn == arn)
+            })
+            .map(|team| team.arn.as_str())
     }
 
     /// Every stored identity source in creation order — the stable ordering

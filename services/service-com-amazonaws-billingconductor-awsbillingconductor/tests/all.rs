@@ -27,6 +27,8 @@ mod payer_gate_precedes_idempotency_existence_and_assembly;
 mod percentage_custom_line_item_resource_associations;
 #[path = "all/pricing_plan_delete.rs"]
 mod pricing_plan_delete;
+#[path = "all/pricing_plan_list.rs"]
+mod pricing_plan_list;
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 #[path = "all/pricing_rule_core_loop.rs"]
