@@ -27,6 +27,8 @@ mod duplicate_name_conflict_message;
 mod iso8601_timestamps;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_rules.rs"]
+mod tag_rules;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
 #[path = "all/worker_configuration_create_and_describe.rs"]
