@@ -24,10 +24,13 @@
 //! reports names the region of the endpoint the request addressed
 //! ([`AnalysedResource::arn_in`], [`request_region`]). Idle resource recommendations have their own store
 //! ([`IdleRecommendationStore`]): no operation of this API creates one — Compute Optimizer's
-//! own analysis of an observed workload does — so the store is what `GetIdleRecommendations`
-//! filters, orders and pages over, and the rules it applies to a stored recommendation (the
-//! filter vocabulary, the sort dimensions, the ARN -> resource-type catalog) are stated
-//! once, here. The Lambda functions the service observes are their own inventory too
+//! own analysis of an observed workload does — so that analysis is part of the store's INITIAL
+//! VALUE ([`seed_idle_resource_analyses`]), exactly as the volume, group, function and license
+//! observations are, and `GetIdleRecommendations` filters, orders and pages over it. Every
+//! member of a reported recommendation is DERIVED from the stored analysis
+//! ([`IdleResourceAnalysis::to_recommendation`]), and the rules a reader applies to it (the
+//! filter vocabulary, the sort dimensions, the ARN -> resource-type catalog) are stated once,
+//! here. The Lambda functions the service observes are their own inventory too
 //! ([`ObservedFunction`]), from which `GetLambdaFunctionRecommendations` DERIVES every
 //! recommendation it reports, and so are the licensed Amazon EC2 instances
 //! ([`ObservedLicensedInstance`]), from which `GetLicenseRecommendations` DERIVES every
@@ -45,8 +48,9 @@ use crate::ops::types::{
     EBSEffectiveRecommendationPreferences, EBSEstimatedMonthlySavings, EBSSavingsEstimationMode,
     EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, EffectivePreferredResource,
     EffectiveRecommendationPreferences, EnrollmentFilter, EstimatedMonthlySavings,
-    ExportDestination, ExternalMetricsPreference, IdleRecommendation, IdleRecommendationFilter,
-    InstanceSavingsEstimationMode, JobFilter,
+    ExportDestination, ExternalMetricsPreference, IdleEstimatedMonthlySavings, IdleRecommendation,
+    IdleRecommendationFilter, IdleSavingsOpportunity, IdleSavingsOpportunityAfterDiscounts,
+    IdleUtilizationMetric, InstanceSavingsEstimationMode, JobFilter,
     LambdaEffectiveRecommendationPreferences, LambdaEstimatedMonthlySavings,
     LambdaFunctionMemoryProjectedMetric, LambdaFunctionMemoryRecommendationOption,
     LambdaFunctionRecommendation, LambdaFunctionRecommendationFilter,
@@ -698,8 +702,56 @@ impl<'a> ParsedArn<'a> {
     /// The leading segment of the resource part — the resource KIND (`instance`,
     /// `volume`, `autoScalingGroup`, …), which is what names the resource's type.
     pub fn resource_kind(&self) -> &'a str {
-        self.resource.split(['/', ':']).next().unwrap_or_default()
+        resource_kind_of(self.resource)
     }
+}
+
+/// The leading segment of an ARN's resource part — the resource KIND (`instance`, `volume`,
+/// `natgateway`, …), which is what names the resource's type. The one rule for reading a
+/// kind, so a record that keeps a resource part on its own reads it exactly as a record that
+/// parses it out of an ARN does.
+pub fn resource_kind_of(arn_resource: &str) -> &str {
+    arn_resource.split(['/', ':']).next().unwrap_or_default()
+}
+
+/// A resource's ARN as the endpoint in `region` reports it, built from the REGION-FREE
+/// identity a record keeps: the resource's service namespace, the account that owns it, and
+/// everything after the account field of its ARN.
+///
+/// Compute Optimizer is a REGIONAL service: each regional endpoint analyses and reports the
+/// resources of its own region, so a resource this service holds is a resource of the region
+/// whose endpoint a request addressed, and every reader builds the ARN for the region its
+/// request was signed for ([`request_region`]) rather than storing one.
+pub fn resource_arn_in(
+    arn_service: &str,
+    region: &str,
+    account_id: &str,
+    arn_resource: &str,
+) -> String {
+    if account_id == ::engine::emulator_account_id() {
+        ::engine::emulator_arn(arn_service, region, arn_resource)
+    } else {
+        // `emulator_arn` always names the emulator's own account; a record kept for another
+        // account keeps that account in its ARN.
+        format!("arn:aws:{arn_service}:{region}:{account_id}:{arn_resource}")
+    }
+}
+
+/// A resource's REGION-FREE identity: the ARN fields every regional endpoint that reports it
+/// agrees on. The ARNs of one resource at two regional endpoints share one identity, which is
+/// what lets a record be held once and reported wherever it is asked about.
+pub fn resource_identity(arn_service: &str, account_id: &str, arn_resource: &str) -> String {
+    format!("{arn_service}:{account_id}:{arn_resource}")
+}
+
+/// The [`resource_identity`] of the resource `arn` names, or `None` when `arn` is not an ARN.
+pub fn identity_of_arn(arn: &str) -> Option<String> {
+    let parsed = parse_arn(arn)?;
+    Some(resource_identity(
+        parsed.service,
+        parsed.account_id,
+        parsed.resource,
+    ))
 }
 
 /// Split `arn` into its six ARN fields, or `None` when it is not an ARN at all. The one
@@ -1173,15 +1225,7 @@ impl ObservedVolume {
 
     /// The volume's tags as the modelled `Tags` list, or `None` when it carries none.
     pub fn tag_list(&self) -> Option<Vec<Tag>> {
-        (!self.tags.is_empty()).then(|| {
-            self.tags
-                .iter()
-                .map(|(key, value)| Tag {
-                    key: Some(key.clone()),
-                    value: Some(value.clone()),
-                })
-                .collect()
-        })
+        modelled_tags(&self.tags)
     }
 
     /// The volume recommendation this observation yields in `region` under
@@ -1850,6 +1894,20 @@ pub fn round_hundredths(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+/// A resource's tags as the modelled `Tags` list, or `None` where it carries none. Every
+/// record of this service reports its tags through this one projection, so no two readers can
+/// word an empty tag set differently.
+pub fn modelled_tags(tags: &[(String, String)]) -> Option<Vec<Tag>> {
+    (!tags.is_empty()).then(|| {
+        tags.iter()
+            .map(|(key, value)| Tag {
+                key: Some(key.clone()),
+                value: Some(value.clone()),
+            })
+            .collect()
+    })
+}
+
 /// The number of days a `LookBackPeriodPreference` names
 /// (`LOOK_BACK_PERIOD_PREFERENCE_VALUES` are `DAYS_14` | `DAYS_32` | `DAYS_93`), which is
 /// what `lookBackPeriodInDays` reports: "the number of days for which utilization metrics
@@ -2229,16 +2287,7 @@ impl AnalysedResource {
     /// reader builds the ARN for the region its request was signed for
     /// ([`request_region`]).
     pub fn arn_in(&self, region: &str) -> String {
-        if self.account_id == ::engine::emulator_account_id() {
-            ::engine::emulator_arn(&self.arn_service, region, &self.arn_resource)
-        } else {
-            // `emulator_arn` always names the emulator's own account; a row recorded for
-            // another account keeps that account in its ARN.
-            format!(
-                "arn:aws:{}:{region}:{}:{}",
-                self.arn_service, self.account_id, self.arn_resource
-            )
-        }
+        resource_arn_in(&self.arn_service, region, &self.account_id, &self.arn_resource)
     }
 
     /// The monthly saving of adopting the recommendation for this resource: what it costs
@@ -2256,9 +2305,12 @@ impl AnalysedResource {
 // Compute Optimizer "generates recommendations for idle resources that meet a
 // specific set of requirements" from the utilization it OBSERVES, so no request to
 // this API produces one: `GetIdleRecommendations` only reports what the analysis
-// recorded. Everything below is therefore about reading that record — the filter
-// vocabulary, the sort dimensions, the ARN -> resource-type catalog and the page
-// cursor — and nothing below writes a recommendation.
+// recorded. That analysis is therefore part of the store's initial value
+// (`seed_idle_resource_analyses`), the way the volume, group, function and license
+// observations are, and everything below is about reading it — the observation a
+// recommendation is DERIVED from, the filter vocabulary, the sort dimensions, the
+// ARN -> resource-type catalog and the page cursor. Nothing below is written by a
+// request.
 // ---------------------------------------------------------------------------
 
 /// The largest page `GetIdleRecommendations` will build, whatever `maxResults` asks for,
@@ -2292,51 +2344,406 @@ pub const ORDER_DESC: &str = "Desc";
 /// every reader reports the same one; the requirement the entry carries is its `identifier`.
 pub const NO_RECOMMENDATION_CODE: &str = "ResourceNotFound";
 
-/// The idle resource recommendations this service holds, keyed by the resource ARN that
-/// identifies one, in the order they were recorded.
+/// The `IdleFinding` values (`crate::ops::types::IDLE_FINDING_VALUES`), named so the rules
+/// below read as the model's own vocabulary.
+pub const IDLE_FINDING_IDLE: &str = "Idle";
+/// See [`IDLE_FINDING_IDLE`].
+pub const IDLE_FINDING_UNATTACHED: &str = "Unattached";
+/// See [`IDLE_FINDING_IDLE`].
+pub const IDLE_FINDING_UNUSED: &str = "Unused";
+
+/// One resource Compute Optimizer's analysis found IDLE: the finding it reached, the
+/// utilization it observed as the evidence for it, how long it has been observing the
+/// resource and what the resource costs its account per month.
 ///
-/// Compute Optimizer's own analysis of an observed workload is what produces an idle
-/// resource recommendation, so NO operation of this API creates one: the store holds the
-/// modelled `IdleRecommendation` as recorded, and `GetIdleRecommendations` reports entries
-/// straight out of it, never from the request. `insert` is the only writer, so the record
-/// order a page walks and the by-ARN index a lookup uses cannot drift apart.
+/// This is the OBSERVATION; every member of the `IdleRecommendation` a reader reports is
+/// DERIVED from it ([`Self::to_recommendation`]), so no two reads of one resource can
+/// disagree about its finding, the period analysed or what dropping it would save. A record
+/// keeps the resource's REGION-FREE identity for the reason [`resource_arn_in`] gives: the
+/// ARN a reader reports names the region of the endpoint the request addressed.
+#[derive(Debug, Clone)]
+pub struct IdleResourceAnalysis {
+    /// The account that owns the resource (`IdleRecommendation$accountId`).
+    pub account_id: String,
+    /// The service namespace of the resource's ARN — its `ec2`, `dynamodb`, … field — which
+    /// together with [`Self::arn_resource`] decides the `IdleRecommendationResourceType`
+    /// reported for it ([`idle_resource_type_of`]).
+    pub arn_service: String,
+    /// Everything after the account field of the resource's ARN
+    /// (`natgateway/nat-0a1b2c3d4e5f60001`), separators included.
+    pub arn_resource: String,
+    /// The `IdleFinding` the analysis reached: [`IDLE_FINDING_IDLE`],
+    /// [`IDLE_FINDING_UNATTACHED`] or [`IDLE_FINDING_UNUSED`].
+    pub finding: String,
+    /// The `IdleUtilizationMetric`s the analysis observed — the evidence for the finding, in
+    /// the `IdleMetricName` vocabulary the resource's own kind publishes. An idle resource's
+    /// utilization does not vary over the period, so the value observed is the value over
+    /// any part of it.
+    pub utilization_metrics: Vec<IdleUtilizationMetric>,
+    /// How many days Compute Optimizer has been observing this resource. A look-back period
+    /// longer than this cannot be honoured, so what a reader reports as analysed is the
+    /// shorter of the two ([`Self::analysed_days`]).
+    pub days_observed: f64,
+    /// What the resource costs its account per month, in [`CURRENCY_USD`]: the figure the
+    /// savings opportunity is computed from, because the recommendation for a resource
+    /// nothing is using is to stop paying for it.
+    pub monthly_cost: f64,
+    /// The resource's tags, as key/value pairs, in the order its own service reports them.
+    pub tags: Vec<(String, String)>,
+}
+
+impl IdleResourceAnalysis {
+    /// This resource's REGION-FREE identity — the key [`IdleRecommendationStore`] holds the
+    /// record under ([`resource_identity`]).
+    pub fn identity(&self) -> String {
+        resource_identity(&self.arn_service, &self.account_id, &self.arn_resource)
+    }
+
+    /// This resource's ARN as the endpoint in `region` reports it ([`resource_arn_in`]).
+    pub fn arn_in(&self, region: &str) -> String {
+        resource_arn_in(&self.arn_service, region, &self.account_id, &self.arn_resource)
+    }
+
+    /// `IdleRecommendation$resourceId` — "the unique identifier for the resource": the last
+    /// segment of its ARN's resource part, which is the id or name the resource's own service
+    /// gives it (`natgateway/nat-0a1b…` -> `nat-0a1b…`).
+    pub fn resource_id(&self) -> String {
+        self.arn_resource
+            .split(['/', ':'])
+            .next_back()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The `IdleRecommendationResourceType` this resource is, or `None` for a resource kind
+    /// idle recommendations do not cover ([`idle_resource_type_of`]).
+    pub fn resource_type(&self) -> Option<&'static str> {
+        idle_resource_type_of(&self.arn_service, resource_kind_of(&self.arn_resource))
+    }
+
+    /// How many days of utilization a recommendation for this resource reports as analysed
+    /// under `look_back_period`: the period in force, capped by how long the resource has
+    /// been observed — the same rule every other observation of this service follows.
+    pub fn analysed_days(&self, look_back_period: &str) -> f64 {
+        look_back_period_in_days(look_back_period).min(self.days_observed)
+    }
+
+    /// What adopting this recommendation saves per month, and that saving as a percentage of
+    /// what the resource costs.
+    ///
+    /// `IdleSavingsOpportunity$savingsOpportunityPercentage` is "the estimated monthly
+    /// savings possible as a percentage of monthly cost by adopting Compute Optimizer's idle
+    /// resource recommendations", and the recommendation for a resource the analysis found
+    /// idle is to stop paying for it: the whole of what it costs is saved, whatever kind of
+    /// resource it is. A resource costing nothing saves nothing.
+    pub fn savings(&self) -> (f64, f64) {
+        let cost = round_hundredths(self.monthly_cost.max(0.0));
+        (percentage_of(cost, cost), cost)
+    }
+
+    /// `findingDescription` — "a summary of the findings for the resource": what the stored
+    /// finding says about this kind of resource over the days analysed. Derived from the
+    /// record, so the sentence cannot disagree with the members reported beside it.
+    pub fn finding_description(&self, look_back_days: f64) -> String {
+        let resource_type = self.resource_type().unwrap_or("resource");
+        let days = round_hundredths(look_back_days);
+        match self.finding.as_str() {
+            IDLE_FINDING_UNATTACHED => format!(
+                "The {resource_type} was not attached to any resource over the last {days} days."
+            ),
+            IDLE_FINDING_UNUSED => {
+                format!("The {resource_type} was not used over the last {days} days.")
+            }
+            // `Idle`, and anything else the vocabulary holds: the analysis saw next to no use.
+            _ => format!(
+                "The {resource_type} showed little to no utilization over the last {days} days."
+            ),
+        }
+    }
+
+    /// The modelled `IdleRecommendation` this analysis yields at the endpoint in `region`
+    /// under `look_back_period`, as generated at `last_refresh_timestamp`.
+    pub fn to_recommendation(
+        &self,
+        region: &str,
+        look_back_period: &str,
+        last_refresh_timestamp: Option<DateTime>,
+    ) -> IdleRecommendation {
+        let look_back_days = self.analysed_days(look_back_period);
+        let (percentage, value) = self.savings();
+        let estimated = || {
+            Some(IdleEstimatedMonthlySavings {
+                currency: Some(CURRENCY_USD.to_string()),
+                value,
+            })
+        };
+        IdleRecommendation {
+            resource_arn: Some(self.arn_in(region)),
+            resource_id: Some(self.resource_id()),
+            resource_type: self.resource_type().map(ToString::to_string),
+            account_id: Some(self.account_id.clone()),
+            finding: Some(self.finding.clone()),
+            finding_description: Some(self.finding_description(look_back_days)),
+            savings_opportunity: Some(IdleSavingsOpportunity {
+                savings_opportunity_percentage: percentage,
+                estimated_monthly_savings: estimated(),
+            }),
+            // This emulator prices every resource from public pricing and records no
+            // negotiated discount ([`SAVINGS_ESTIMATION_SOURCE`]), so the after-discount
+            // figures are the before-discount ones — the same stance the volume, function and
+            // group readers of this service take.
+            savings_opportunity_after_discounts: Some(IdleSavingsOpportunityAfterDiscounts {
+                savings_opportunity_percentage: percentage,
+                estimated_monthly_savings: estimated(),
+            }),
+            utilization_metrics: (!self.utilization_metrics.is_empty())
+                .then(|| self.utilization_metrics.clone()),
+            look_back_period_in_days: look_back_days,
+            last_refresh_timestamp,
+            tags: modelled_tags(&self.tags),
+        }
+    }
+}
+
+/// The idle resource analysis this service holds, keyed by the REGION-FREE identity of the
+/// resource it is about, in the order the analysis recorded it.
+///
+/// Compute Optimizer's own analysis of an observed workload is what produces an idle resource
+/// recommendation, so NO operation of this API creates one: the analysis is part of the
+/// store's initial value ([`seed_idle_resource_analyses`]) and `GetIdleRecommendations`
+/// reports what is held here, never anything a request carried. `insert` is the only writer,
+/// so the record order a page walks and the index a lookup uses cannot drift apart.
 #[derive(Debug, Default)]
 pub struct IdleRecommendationStore {
-    /// Resource ARNs in record order, so a page walks a stable sequence.
+    /// Resource identities in record order, so a page walks a stable sequence.
     order: Vec<String>,
-    by_arn: HashMap<String, IdleRecommendation>,
+    by_identity: HashMap<String, IdleResourceAnalysis>,
 }
 
 impl IdleRecommendationStore {
-    /// Record `recommendation` under `resource_arn`. Re-recording the same ARN replaces the
-    /// stored recommendation in place, keeping its position in the order — a refreshed
-    /// analysis of one resource does not reorder the rest.
-    pub fn insert(&mut self, resource_arn: String, recommendation: IdleRecommendation) {
-        if !self.by_arn.contains_key(&resource_arn) {
-            self.order.push(resource_arn.clone());
+    /// Record `analysis` under the identity of the resource it is about. Re-recording the
+    /// same resource replaces the stored analysis in place, keeping its position in the
+    /// order — a refreshed analysis of one resource does not reorder the rest.
+    pub fn insert(&mut self, analysis: IdleResourceAnalysis) {
+        let identity = analysis.identity();
+        if !self.by_identity.contains_key(&identity) {
+            self.order.push(identity.clone());
         }
-        self.by_arn.insert(resource_arn, recommendation);
+        self.by_identity.insert(identity, analysis);
     }
 
-    /// The recommendation held for `resource_arn`, or `None` when the service holds none —
-    /// which is what puts that ARN in a response's `errors` list.
-    pub fn get(&self, resource_arn: &str) -> Option<&IdleRecommendation> {
-        self.by_arn.get(resource_arn)
+    /// The analysis held for the resource `resource_arn` names, or `None` when the service
+    /// holds none — which is what puts that ARN in a response's `errors` list. The lookup is
+    /// region-free, so an ARN naming the resource at any regional endpoint finds it.
+    pub fn get(&self, resource_arn: &str) -> Option<&IdleResourceAnalysis> {
+        self.by_identity.get(&identity_of_arn(resource_arn)?)
     }
 
-    /// Every recorded recommendation, in record order.
-    pub fn iter_in_order(&self) -> impl Iterator<Item = &IdleRecommendation> {
-        self.order.iter().filter_map(|arn| self.by_arn.get(arn))
+    /// Every recorded analysis, in record order.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &IdleResourceAnalysis> {
+        self.order
+            .iter()
+            .filter_map(|identity| self.by_identity.get(identity))
     }
 
-    /// How many recommendations are recorded.
+    /// How many resources the analysis found idle.
     pub fn len(&self) -> usize {
-        self.by_arn.len()
+        self.by_identity.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_arn.is_empty()
+        self.by_identity.is_empty()
     }
+}
+
+impl FromIterator<IdleResourceAnalysis> for IdleRecommendationStore {
+    /// The store holding `analyses`, in the order they are given — how the seeded analysis
+    /// becomes the store's initial value.
+    fn from_iter<T: IntoIterator<Item = IdleResourceAnalysis>>(analyses: T) -> Self {
+        let mut store = Self::default();
+        for analysis in analyses {
+            store.insert(analysis);
+        }
+        store
+    }
+}
+
+/// The idle resource analysis this emulator holds, built once when the store is created.
+///
+/// Compute Optimizer "generates recommendations for idle resources that meet a specific set of
+/// requirements" from the utilization it observes, so WHICH resources are idle is analysis
+/// output and not something a request writes: like the EBS volume observation, the Auto
+/// Scaling group analysis and the findings catalog, it is part of the store's initial value,
+/// and every figure a reader reports is computed from what is recorded here.
+///
+/// The set holds the resource kinds Compute Optimizer reports ONLY as idle resources — a NAT
+/// gateway, a DynamoDB table, an ElastiCache cluster, a MemoryDB cluster, a DocumentDB
+/// cluster, a WorkSpace and a SageMaker endpoint — plus an UNATTACHED Amazon EBS volume,
+/// which is not part of the volume inventory [`observed_volumes`] holds either, because a
+/// volume attached to nothing carries no workload to rightsize. Every `IdleFinding` value
+/// occurs, the costs all differ so an ordering is observable, the observed periods differ so a
+/// look-back preference is observable, and each row's metrics are the ones its own resource
+/// kind publishes.
+///
+/// A row records the resource's REGION-FREE identity ([`resource_arn_in`]): Compute Optimizer
+/// is regional, so the region a reported ARN names is the region of the endpoint the request
+/// addressed.
+fn seed_idle_resource_analyses() -> Vec<IdleResourceAnalysis> {
+    let account_id = ::engine::emulator_account_id().to_string();
+    // Every metric this analysis records is the highest value observed over the period, which
+    // is the one statistic this API reports ([`METRIC_STATISTIC_MAXIMUM`]).
+    let metric = |name: &str, value: f64| IdleUtilizationMetric {
+        name: Some(name.to_string()),
+        statistic: Some(METRIC_STATISTIC_MAXIMUM.to_string()),
+        value,
+        // The analysis recorded no dimension breakdown for these metrics.
+        dimensions: None,
+    };
+    let row = |arn_service: &str,
+               arn_resource: &str,
+               finding: &str,
+               utilization_metrics: Vec<IdleUtilizationMetric>,
+               days_observed: f64,
+               monthly_cost: f64,
+               tags: &[(&str, &str)]| IdleResourceAnalysis {
+        account_id: account_id.clone(),
+        arn_service: arn_service.to_string(),
+        arn_resource: arn_resource.to_string(),
+        finding: finding.to_string(),
+        utilization_metrics,
+        days_observed,
+        monthly_cost: round_hundredths(monthly_cost),
+        tags: tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+    };
+
+    vec![
+        // A NAT gateway nothing routes through: no connection and no packet from either
+        // side. Priced at the published $0.045 per gateway-hour.
+        row(
+            "ec2",
+            "natgateway/nat-0a1b2c3d4e5f60001",
+            IDLE_FINDING_UNUSED,
+            vec![
+                metric("ActiveConnectionCount", 0.0),
+                metric("PacketsInFromSource", 0.0),
+                metric("PacketsInFromDestination", 0.0),
+            ],
+            60.0,
+            0.045 * HOURS_PER_MONTH,
+            &[("Name", "legacy-egress")],
+        ),
+        // A 200 GiB gp2 volume attached to nothing: no read and no write operation reaches
+        // it. Priced by [`volume_monthly_cost`], the same table the volume reader prices
+        // from, so one volume type has one price in this service.
+        row(
+            "ec2",
+            "volume/vol-0a1b2c3d4e5f60009",
+            IDLE_FINDING_UNATTACHED,
+            vec![
+                metric("VolumeReadOpsPerSecond", 0.0),
+                metric("VolumeWriteOpsPerSecond", 0.0),
+            ],
+            93.0,
+            volume_monthly_cost(&VolumeConfiguration {
+                volume_type: Some("gp2".to_string()),
+                volume_size: 200,
+                volume_baseline_iops: 600,
+                volume_burst_iops: 3_000,
+                volume_baseline_throughput: 128,
+                volume_burst_throughput: 128,
+                root_volume: Some(false),
+            })
+            .unwrap_or_default(),
+            &[("Owner", "TeamA")],
+        ),
+        // A provisioned DynamoDB table nothing reads or writes. Priced at its provisioned
+        // capacity: 20 read and 20 write capacity units at the published $0.00013 and
+        // $0.00065 per unit-hour.
+        row(
+            "dynamodb",
+            "table/legacy-sessions",
+            IDLE_FINDING_IDLE,
+            vec![
+                metric("ConsumedReadCapacityUnits", 0.0),
+                metric("ConsumedWriteCapacityUnits", 0.0),
+                metric("ConsumedChangeDataCaptureUnits", 0.0),
+            ],
+            14.0,
+            20.0 * (0.000_13 + 0.000_65) * HOURS_PER_MONTH,
+            &[("Owner", "TeamB")],
+        ),
+        // An ElastiCache cluster serving nothing: no command, no connection and a processor
+        // that is all but idle. Priced at the published $0.154 per cache.m6g.large-hour.
+        row(
+            "elasticache",
+            "cluster:sessions-cache",
+            IDLE_FINDING_IDLE,
+            vec![
+                metric("EngineCPUUtilization", 0.8),
+                metric("CurrConnections", 0.0),
+                metric("GetTypeCmds", 0.0),
+                metric("SetTypeCmds", 0.0),
+            ],
+            30.0,
+            0.154 * HOURS_PER_MONTH,
+            &[],
+        ),
+        // A MemoryDB cluster nothing has queried: no keyspace hit and no keyspace miss.
+        // Priced at the published $0.068 per db.t4g.small-hour.
+        row(
+            "memorydb",
+            "cluster/leaderboard-archive",
+            IDLE_FINDING_UNUSED,
+            vec![
+                metric("KeyspaceHits", 0.0),
+                metric("KeyspaceMisses", 0.0),
+                metric("NewConnections", 0.0),
+            ],
+            9.0,
+            0.068 * HOURS_PER_MONTH,
+            &[("Owner", "TeamB"), ("Environment", "Archive")],
+        ),
+        // A DocumentDB cluster no client connects to. Priced at the published $0.078 per
+        // db.t3.medium-hour.
+        row(
+            "rds",
+            "cluster:docdb-reporting",
+            IDLE_FINDING_IDLE,
+            vec![
+                metric("DatabaseConnections", 0.0),
+                metric("CPU", 1.1),
+                metric("Memory", 12.0),
+            ],
+            45.0,
+            0.078 * HOURS_PER_MONTH,
+            &[],
+        ),
+        // A WorkSpace nobody logs in to, billed monthly: the published $35.00 per month of a
+        // Value bundle on monthly billing.
+        row(
+            "workspaces",
+            "workspace/ws-0a1b2c3d4e5f6",
+            IDLE_FINDING_UNUSED,
+            vec![metric("UserConnected", 0.0), metric("IsIdle", 1.0)],
+            93.0,
+            35.00,
+            &[("Owner", "TeamC")],
+        ),
+        // A SageMaker endpoint nothing invokes. Priced at the published $0.115 per
+        // ml.m5.large-hour.
+        row(
+            "sagemaker",
+            "endpoint/scoring-canary",
+            IDLE_FINDING_IDLE,
+            vec![metric("Invocations", 0.0), metric("CPU", 0.6)],
+            21.0,
+            0.115 * HOURS_PER_MONTH,
+            &[("Owner", "TeamC")],
+        ),
+    ]
 }
 
 /// The `IdleRecommendationResourceType` an ARN names, or `None` when the ARN names no
@@ -2350,7 +2757,15 @@ impl IdleRecommendationStore {
 /// `DocumentDBCluster`, the one cluster type idle recommendations cover.
 pub fn idle_resource_type_of_arn(arn: &str) -> Option<&'static str> {
     let parsed = parse_arn(arn)?;
-    let resource_type = match (parsed.service, parsed.resource_kind()) {
+    idle_resource_type_of(parsed.service, parsed.resource_kind())
+}
+
+/// The `IdleRecommendationResourceType` the `<service>:<resource-kind>` ARN fields name, or
+/// `None` for a resource kind idle recommendations do not cover — the catalog
+/// [`idle_resource_type_of_arn`] documents, for a record that keeps those two fields on their
+/// own rather than one ARN to parse.
+pub fn idle_resource_type_of(service: &str, resource_kind: &str) -> Option<&'static str> {
+    let resource_type = match (service, resource_kind) {
         ("ec2", "instance") => "EC2Instance",
         ("ec2", "volume") => "EBSVolume",
         ("ec2", "natgateway") => "NatGateway",
@@ -4132,15 +4547,7 @@ impl ObservedLicensedInstance {
 
     /// The instance's tags as the modelled `Tags` list, or `None` when it carries none.
     pub fn tag_list(&self) -> Option<Vec<Tag>> {
-        (!self.tags.is_empty()).then(|| {
-            self.tags
-                .iter()
-                .map(|(key, value)| Tag {
-                    key: Some(key.clone()),
-                    value: Some(value.clone()),
-                })
-                .collect()
-        })
+        modelled_tags(&self.tags)
     }
 
     /// "An object that describes the current configuration of an instance that runs on a
@@ -4845,9 +5252,12 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// [`Self::functions`] ([`seed_analysed_resources`]), so the two readers of one resource
     /// cannot disagree about its finding, its risk or what it costs.
     pub analysed_resources: Vec<AnalysedResource>,
-    /// The idle resource recommendations this service holds, which
-    /// `GetIdleRecommendations` reports. See [`IdleRecommendationStore`]: no operation of
-    /// this API writes one.
+    /// The resources Compute Optimizer's analysis found IDLE, which
+    /// `GetIdleRecommendations` reports. Part of the store's initial value rather than
+    /// something a reader writes on first use: that reader REPORTS this analysis and must
+    /// not mutate the store (see [`IdleRecommendationStore`] and
+    /// [`seed_idle_resource_analyses`]). It is the SINGLE source for an idle resource:
+    /// `GetRDSDatabaseRecommendations$idle` is derived from it too.
     pub idle_recommendations: IdleRecommendationStore,
     /// The licensed Amazon EC2 instances Compute Optimizer observes, by instance id, so a
     /// page boundary is stable across calls and the iteration order is the order a reader
@@ -4866,10 +5276,9 @@ pub struct ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The store's initial value: the account is not opted in, this emulator records no
     /// organization so it holds no member account, nobody has written a preference, the EBS
-    /// volume observation, the Auto Scaling group analysis and the findings catalog this
-    /// emulator analysed — which a reader only sees once the account is enrolled — no idle
-    /// resource recommendation (only an analysis records one) and no export job (only an
-    /// export call creates one).
+    /// volume observation, the Auto Scaling group analysis, the findings catalog and the
+    /// idle resource analysis this emulator analysed — which a reader only sees once the
+    /// account is enrolled — and no export job (only an export call creates one).
     fn default() -> Self {
         Self {
             enrollment: Enrollment::default(),
@@ -4885,7 +5294,7 @@ impl Default for ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 .collect(),
             auto_scaling_group_analyses: seed_auto_scaling_group_analyses(),
             analysed_resources: seed_analysed_resources(),
-            idle_recommendations: IdleRecommendationStore::default(),
+            idle_recommendations: seed_idle_resource_analyses().into_iter().collect(),
             licenses: observed_licensed_instances()
                 .into_iter()
                 .map(|license| (license.instance_id.clone(), license))
@@ -5240,6 +5649,22 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     pub fn visible_licenses(&self) -> impl Iterator<Item = &ObservedLicensedInstance> {
         let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
         self.licenses.values().filter(move |_| visible)
+    }
+
+    /// The idle resource analysis a caller can read, in record order.
+    ///
+    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// for an ENROLLED account only, and only once the analysis that enrollment starts is
+    /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
+    /// one that has just opted in all read the empty set rather than an analysis nothing has
+    /// produced yet.
+    ///
+    /// [`visible_volumes`]: Self::visible_volumes
+    pub fn visible_idle_recommendations(&self) -> impl Iterator<Item = &IdleResourceAnalysis> {
+        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        self.idle_recommendations
+            .iter_in_order()
+            .filter(move |_| visible)
     }
 }
 

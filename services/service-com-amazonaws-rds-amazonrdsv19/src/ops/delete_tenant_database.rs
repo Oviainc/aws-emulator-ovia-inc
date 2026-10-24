@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTenantDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTenantDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a tenant database from a DB instance this service holds, taking a final DB
+//! snapshot of the instance unless the request skips it. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTenantDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The instance is resolved FIRST: an identifier that names no DB instance is
+//! `DBInstanceNotFoundFault`, whatever the tenant name or the final-snapshot parameters
+//! say. An instance that exists but does not use the multi-tenant configuration holds no
+//! tenant databases at all — that is a combination of parameters this service cannot
+//! resolve together (`InvalidParameterCombination`), not a missing resource — and only then
+//! is the tenant name itself looked up, which is `TenantDatabaseNotFoundFault` when it
+//! names none.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTenantDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTenantDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTenantDatabase"))
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteTenantDatabaseError::validation)?;
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        let tenant_db_name = input.tenant_db_name.clone();
+        let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
+        if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
+            crate::state::check_identifier(
+                "FinalDBSnapshotIdentifier",
+                snapshot_identifier,
+                255,
+            )
+            .map_err(DeleteTenantDatabaseError::invalid_parameter_value)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated delete.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope. The
+        // instance comes first — see the module docs for the order and why it matters.
+        let instance_key = (region.clone(), identifier.clone());
+        let Some(instance) = store.db_instances.get(&instance_key) else {
+            return Err(DeleteTenantDatabaseErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance not found: {identifier}")),
+                },
+            )
+            .into());
+        };
+        if !crate::state::is_multi_tenant_engine(&instance.engine) {
+            return Err(DeleteTenantDatabaseError::invalid_parameter_combination(
+                format!(
+                    "DB instance {identifier} runs engine {} and does not use the \
+                     multi-tenant configuration, so it holds no tenant databases",
+                    instance.engine
+                ),
+            ));
+        }
+        // An instance already on its way out cannot have a tenant database deleted from
+        // it: the delete it is running takes everything with it.
+        if instance.is_deleting() {
+            return Err(
+                DeleteTenantDatabaseErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(format!(
+                            "DB instance {identifier} is in state {} and cannot have a tenant \
+                             database deleted",
+                            instance.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let deletion_protection = instance.deletion_protection;
+
+        // `SkipFinalSnapshot`: "By default, RDS doesn't skip the final snapshot", and the
+        // snapshot identifier is required unless it does, while naming both at once
+        // "results in an error". Neither combination has a modelled error, so both are
+        // refused with the Query API code for parameters that cannot hold together — and
+        // AFTER the instance has been resolved, which is the order the service answers in:
+        // an identifier that names no DB instance is reported as that whatever the
+        // snapshot parameters say.
+        match (skip_final_snapshot, &input.final_db_snapshot_identifier) {
+            (true, Some(_)) => {
+                return Err(DeleteTenantDatabaseError::invalid_parameter_combination(
+                    "FinalDBSnapshotIdentifier can't be specified when SkipFinalSnapshot is \
+                     enabled",
+                ));
+            }
+            (false, None) => {
+                return Err(DeleteTenantDatabaseError::invalid_parameter_combination(
+                    "FinalDBSnapshotIdentifier must be specified unless SkipFinalSnapshot is \
+                     enabled",
+                ));
+            }
+            _ => {}
+        }
+
+        let key = (
+            region.clone(),
+            crate::state::tenant_database_key(&identifier, &tenant_db_name),
+        );
+        let Some(tenant) = store.tenant_databases.get(&key) else {
+            return Err(
+                DeleteTenantDatabaseErrorModeled::TenantDatabaseNotFoundFault(
+                    TenantDatabaseNotFoundFault {
+                        message: Some(format!(
+                            "TenantDatabase {tenant_db_name} not found in DB instance \
+                             {identifier}."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "This operation can't be canceled or reverted after it begins", so a second
+        // delete of a tenant database already on its way out is the state fault too.
+        if tenant.is_deleting() {
+            return Err(
+                DeleteTenantDatabaseErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(format!(
+                            "Tenant database {tenant_db_name} in DB instance {identifier} is \
+                             already being deleted"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The final snapshot the request asked for is a DB snapshot of the instance the
+        // tenant database lives in, taken before the tenant database goes, and it is
+        // subject to the same name conflict the other snapshot paths of this service are.
+        if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
+            let snapshot_key = (region.clone(), snapshot_identifier.clone());
+            if store.db_snapshots.contains_key(&snapshot_key) {
+                return Err(
+                    DeleteTenantDatabaseErrorModeled::DBSnapshotAlreadyExistsFault(
+                        DBSnapshotAlreadyExistsFault {
+                            message: Some(format!(
+                                "DB snapshot already exists: {snapshot_identifier}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.snapshots_in(&region).len() < crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+                && store.has_room_for_region(&region)
+            {
+                let source = &store.db_instances[&instance_key];
+                let snapshot = crate::state::DbSnapshotRecord::from_instance(
+                    source,
+                    snapshot_identifier,
+                    source.tags.clone(),
+                );
+                store.db_snapshots.insert(snapshot_key, snapshot);
+            } else {
+                // The region's manual snapshot quota is reached. This operation models no
+                // snapshot-quota fault, so the request is refused with the Query API code
+                // for parameters that cannot be served together rather than silently
+                // deleting the tenant database without the snapshot it asked for.
+                return Err(DeleteTenantDatabaseError::invalid_parameter_combination(
+                    format!(
+                        "the final snapshot {snapshot_identifier} would exceed the allowed \
+                         number of manual DB snapshots ({}); enable SkipFinalSnapshot or \
+                         delete a snapshot first",
+                        crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+                    ),
+                ));
+            }
+        }
+
+        let tenant = store
+            .tenant_databases
+            .get_mut(&key)
+            .expect("the tenant database was found above and the store is locked");
+        // The delete is accepted, so the tenant database reports `deleting` and the clock
+        // owes its removal: the next read within the span sees `deleting`, and every read
+        // after it is a `TenantDatabaseNotFoundFault`.
+        tenant.begin_deletion();
+        Ok(DeleteTenantDatabaseOutput {
+            tenant_database: Some(tenant.to_wire(deletion_protection)),
+        })
     }
 }

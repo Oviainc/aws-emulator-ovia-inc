@@ -150,7 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A regional resource is reachable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetWorkspaceInstanceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -167,8 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record whose
         // retention has run out — each of which was due at the same instant whether
         // or not anybody read the instance.
-        let Some(record) = state.settled(&input.workspace_instance_id, std::time::Instant::now())
-        else {
+        //
+        // An id whose instance belongs to another Region names no instance HERE, so it
+        // answers the same not-found this service gives an id it never minted.
+        let Some(record) = state.settled(
+            &region,
+            &input.workspace_instance_id,
+            std::time::Instant::now(),
+        ) else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 GetWorkspaceInstanceErrorModeled::ResourceNotFoundException,

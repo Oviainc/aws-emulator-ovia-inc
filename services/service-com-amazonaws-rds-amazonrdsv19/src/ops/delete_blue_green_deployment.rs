@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBlueGreenDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBlueGreenDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a blue/green deployment, and with it the databases in the green environment
+//! when `DeleteTarget` asks for them. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBlueGreenDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two refusals this operation must keep apart, because a client branches on the
+//! difference: a `BlueGreenDeploymentIdentifier` that is not of the form the service
+//! MINTS is a value the parameter does not accept (`InvalidParameterValue`), while one of
+//! that form naming no stored deployment is `BlueGreenDeploymentNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +148,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBlueGreenDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBlueGreenDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBlueGreenDeployment"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DeleteBlueGreenDeploymentError::validation)?;
+        // The identifier is SYSTEM-generated, so a value of another form is refused as a
+        // value this parameter does not accept, before any lookup — see the module docs.
+        crate::state::check_blue_green_deployment_identifier(
+            "BlueGreenDeploymentIdentifier",
+            &input.blue_green_deployment_identifier,
+        )
+        .map_err(DeleteBlueGreenDeploymentError::invalid_parameter_value)?;
+        let identifier = crate::state::blue_green_deployment_identifier_of(
+            &input.blue_green_deployment_identifier,
+        )
+        .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated delete.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(deployment) = store.blue_green_deployments.get(&key) else {
+            return Err(
+                DeleteBlueGreenDeploymentErrorModeled::BlueGreenDeploymentNotFoundFault(
+                    BlueGreenDeploymentNotFoundFault {
+                        message: Some(format!(
+                            "BlueGreenDeployment {identifier} not found."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A delete "can't be canceled or reverted after it begins": a deployment already on
+        // its way out is not in a state this operation can be performed in.
+        if deployment.is_deleting() {
+            return Err(
+                DeleteBlueGreenDeploymentErrorModeled::InvalidBlueGreenDeploymentStateFault(
+                    InvalidBlueGreenDeploymentStateFault {
+                        message: Some(format!(
+                            "Blue/green deployment {identifier} is in state {} and cannot be \
+                             deleted",
+                            deployment.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let target_is_cluster = deployment.target_is_cluster;
+        let target_identifier = crate::state::arn_resource_name_of(&deployment.target_arn)
+            .to_ascii_lowercase();
+
+        // `DeleteTarget`: "Specifies whether to delete the resources in the green
+        // environment." Those resources are the real DB instance or DB cluster records this
+        // service cloned, so the delete they are given is the same one their own delete
+        // operation gives them: the status moves to `deleting` and the clock owes their
+        // removal.
+        if input.delete_target == Some(true) {
+            if target_is_cluster {
+                if let Some(cluster) = store
+                    .db_clusters
+                    .get_mut(&(region.clone(), target_identifier.clone()))
+                {
+                    if !cluster.is_deleting() {
+                        cluster.begin_deletion();
+                    }
+                }
+            } else if let Some(instance) = store
+                .db_instances
+                .get_mut(&(region.clone(), target_identifier.clone()))
+            {
+                if !instance.is_deleting() {
+                    instance.begin_deletion();
+                }
+            }
+        }
+
+        let deployment = store
+            .blue_green_deployments
+            .get_mut(&key)
+            .expect("the deployment was found above and the store is locked");
+        deployment.begin_deletion();
+        Ok(DeleteBlueGreenDeploymentOutput {
+            blue_green_deployment: Some(deployment.to_wire()),
+        })
     }
 }

@@ -137,7 +137,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A regional resource is reachable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -150,9 +152,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Read through the same clock-due settle every other instance lookup uses, so
-        // a record whose teardown retention has elapsed is not reported here either.
-        let Some(record) = state.settled(&input.workspace_instance_id, std::time::Instant::now())
-        else {
+        // a record whose teardown retention has elapsed is not reported here either,
+        // and scoped to the request's Region, so an instance of another Region is not
+        // found here.
+        let Some(record) = state.settled(
+            &region,
+            &input.workspace_instance_id,
+            std::time::Instant::now(),
+        ) else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 ListTagsForResourceErrorModeled::ResourceNotFoundException,

@@ -142,3 +142,5 @@ mod control_plane_deletes;
 mod delete_deployment;
 #[path = "all/rest_api_create_from_import.rs"]
 mod rest_api_create_from_import;
+#[path = "all/usage_plan_collection.rs"]
+mod usage_plan_collection;

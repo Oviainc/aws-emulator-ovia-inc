@@ -135,7 +135,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A regional resource is mutable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
         // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
         // caller may set, so the request is refused BEFORE the store is reached: the
         // resource's tag set is left exactly as it was.
@@ -156,8 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        let Some(record) = state.settled_mut(&input.workspace_instance_id, std::time::Instant::now())
-        else {
+        let Some(record) = state.settled_mut(
+            &region,
+            &input.workspace_instance_id,
+            std::time::Instant::now(),
+        ) else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 TagResourceErrorModeled::ResourceNotFoundException,

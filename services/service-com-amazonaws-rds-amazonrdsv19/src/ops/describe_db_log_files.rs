@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBLogFiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBLogFiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the log files of a DB instance this service holds: the file's name, its size and
+//! when its last line was written. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBLogFiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What that file CONTAINS is this service's own record of the instance's lifecycle — no
+//! database engine runs behind this emulator, so there is no engine log to copy and
+//! nothing is invented in its place; see `crate::state::engine_log`.
+//!
+//! Log access reaches an instance only once it has FINISHED being created: against one
+//! that is still `creating`, as against an identifier that never existed, the answer is
+//! `DBInstanceNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBLogFiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBLogFilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBLogFiles"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBLogFilesError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBLogFilesError::invalid_parameter_value)?;
+        // This operation's `Filters` member documents "this parameter isn't currently
+        // supported", so there is nothing to match on: a request that carries one is
+        // refused rather than served a list the filter was meant to narrow.
+        if let Some(filter) = input.filters.unwrap_or_default().first() {
+            return Err(DescribeDBLogFilesError::invalid_parameter_value(format!(
+                "unrecognized filter name: {}; Filters isn't currently supported by this \
+                 operation",
+                filter.name
+            )));
+        }
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called — which is also what takes an
+        // instance out of `creating` once its span has passed.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope. An
+        // instance that has not finished being created is not reachable through log
+        // access at all — see the module docs. The two misses are worded the way the
+        // service words them: an instance that is there but not yet reachable names
+        // itself first, while an identifier this service holds no record of is reported as
+        // a name that resolves to nothing.
+        let instance = match store.db_instances.get(&(region, identifier.clone())) {
+            Some(instance) if instance.status != "creating" => instance,
+            Some(_) => {
+                return Err(DescribeDBLogFilesErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance {identifier} not found.")),
+                    },
+                )
+                .into())
+            }
+            None => {
+                return Err(DescribeDBLogFilesErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        message: Some(format!("DBInstance not found: {identifier}")),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The instance has the one log file its engine writes, whose size and last-written
+        // time are those of the lines this service has recorded in it.
+        let log_file_name = instance.log_file_name().to_string();
+        let details = DescribeDBLogFilesDetails {
+            log_file_name: Some(log_file_name.clone()),
+            last_written: instance.engine_log.last_written(),
+            size: Some(instance.engine_log.size()),
+        };
+        // The three narrowing members each drop the file when it does not match:
+        // `FilenameContains` is "filters the available log files for log file names that
+        // contain the specified string", `FileLastWritten` "filters the available log
+        // files for files written since the specified date" and `FileSize` "filters the
+        // available log files for files larger than the specified size".
+        let matches = input
+            .filename_contains
+            .as_ref()
+            .is_none_or(|wanted| log_file_name.contains(wanted.as_str()))
+        && input.file_last_written.is_none_or(|since| {
+            details.last_written.is_some_and(|written| written >= since)
+        })
+        && input
+            .file_size
+            .is_none_or(|larger_than| details.size.is_some_and(|size| size > larger_than));
+        let files: Vec<(String, DescribeDBLogFilesDetails)> = if matches {
+            vec![(log_file_name, details)]
+        } else {
+            Vec::new()
+        };
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(files, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBLogFilesError::invalid_parameter_value)?;
+        Ok(DescribeDBLogFilesOutput {
+            describe_db_log_files: Some(page.items),
+            marker: page.next_marker,
+        })
     }
 }
