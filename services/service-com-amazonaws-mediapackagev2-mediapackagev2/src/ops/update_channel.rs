@@ -9,6 +9,9 @@
 //! types is refused on the channel's STORED (immutable) input type through the same rule
 //! table `CreateChannel` uses; and the multiview configuration — which the model says
 //! can be changed but neither added nor removed — is preserved when the request omits it.
+//! The read-only `AttachedMultiviewChannels` member is DERIVED from the group after the
+//! write, as on every other channel reader, since an update neither adds nor removes an
+//! attachment.
 //!
 //! ## The conditional-update contract
 //!
@@ -341,9 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannel` will read.
-        Ok(UpdateChannelOutput {
+        let mut output = UpdateChannelOutput {
             multiview_configuration: channel.multiview_configuration.clone(),
-            // Updating a channel attaches no multiview source channels to it.
+            // Derived below, once the channel borrow this struct is built from has been
+            // released: the member is read over the whole group, not over one channel.
             attached_multiview_channels: None,
             arn: channel.arn.clone(),
             channel_name: channel.name.clone(),
@@ -358,6 +362,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input_switch_configuration: Some(channel.input_switch_configuration.clone()),
             output_header_configuration: Some(channel.output_header_configuration.clone()),
             output_locking_mode: channel.output_locking_mode.clone(),
-        })
+        };
+
+        // Read-only and derived on every channel read, exactly as `GetChannel`,
+        // `CreateChannel` and `ListChannels` derive it: the multiview channels of this
+        // group that list this channel as an available source. The update neither adds
+        // nor removes such an attachment, so the member reports the attachments the
+        // channel already has — computed after the write commits, so a request that
+        // changed a multiview channel's own source list is reflected here too. Every
+        // field above is owned, so the borrow of `channel` has ended and the whole group
+        // can be read again.
+        let attached = crate::state::attached_multiview_channels(group, &output.channel_name);
+        output.attached_multiview_channels = attached;
+
+        Ok(output)
     }
 }

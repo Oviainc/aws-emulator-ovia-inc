@@ -62,5 +62,7 @@ mod resource_tags;
 mod published_data_plane_urls;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
+#[path = "all/attached_multiview_channels.rs"]
+mod attached_multiview_channels;
 #[path = "all/delete_channel_multiview_source.rs"]
 mod delete_channel_multiview_source;

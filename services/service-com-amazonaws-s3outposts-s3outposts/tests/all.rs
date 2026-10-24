@@ -15,6 +15,8 @@
 mod endpoint_lifecycle;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/shared_endpoint_listing.rs"]
+mod shared_endpoint_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unprovisioned_account.rs"]

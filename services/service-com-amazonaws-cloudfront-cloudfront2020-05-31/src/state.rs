@@ -25,6 +25,8 @@
 //! * a distribution CloudFront has just created or reconfigured is `InProgress` until
 //!   its configuration has propagated, and is `Deployed` after
 //!   ([`PROPAGATION_DELAY`]);
+//! * a streaming (RTMP) distribution is `InProgress` and `Deployed` on the same rule, for
+//!   the same reason ([`PROPAGATION_DELAY`]);
 //! * an invalidation is `InProgress` until its batch finishes, and `Completed` after;
 //! * a key value store CloudFront has just created is `PROVISIONING` until it has been
 //!   provisioned, and `READY` after ([`KVS_PROVISIONING_DELAY`]);
@@ -48,7 +50,8 @@ use std::time::{Duration, SystemTime};
 // their use sites through their full `crate::ops::types::` path rather than added to
 // this list, which every operation added to this service edits.
 use crate::ops::types::{
-    ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
+    ActiveTrustedKeyGroups, ActiveTrustedSigners, Aliases, AllowedMethods, CacheBehavior,
+    CacheBehaviors,
     CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
     CloudFrontOriginAccessIdentitySummary,
@@ -69,8 +72,9 @@ use crate::ops::types::{
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
     PublicKey, PublicKeyConfig, PublicKeySummary, ResponseHeadersPolicy,
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
-    SessionStickinessConfig, Signer, StringSchemaConfig, Tag, Tags, TrafficConfig,
-    TrustedKeyGroups, TrustedSigners, ViewerCertificate,
+    SessionStickinessConfig, Signer, StreamingDistribution, StreamingDistributionConfig,
+    StreamingDistributionSummary, StreamingLoggingConfig, StringSchemaConfig, Tag, Tags,
+    TrafficConfig, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
 };
 
 /// The CloudFront FUNCTION slice of this store: the function record, its two stages,
@@ -153,6 +157,16 @@ pub const MAX_ITEMS: i32 = 100;
 /// number of distributions allowed."
 pub const MAX_DISTRIBUTIONS: usize = 10_000;
 
+/// The most streaming (RTMP) distributions this emulator holds.
+///
+/// Same construct and same reasoning as [`MAX_DISTRIBUTIONS`]: a streaming distribution
+/// record is what `GetStreamingDistribution` answers from, so it cannot be evicted and
+/// the bound is a maximum entry count refused on the create path before anything is
+/// minted. Over it, the refusal is the modelled `TooManyStreamingDistributions`:
+/// "Processing your request would cause you to exceed the maximum number of streaming
+/// distributions allowed."
+pub const MAX_STREAMING_DISTRIBUTIONS: usize = 10_000;
+
 /// The most invalidations this emulator holds for ONE distribution.
 ///
 /// Same shape as [`MAX_DISTRIBUTIONS`]: an invalidation record is what `GetInvalidation`
@@ -171,6 +185,15 @@ pub const MAX_INVALIDATIONS_PER_DISTRIBUTION: usize = 1_000;
 /// cannot be stored with an unbounded number of them. Over it, the refusal is the modelled
 /// `TooManyCacheBehaviors`: "You cannot create more cache behaviors for the distribution."
 pub const MAX_CACHE_BEHAVIORS: usize = 25;
+
+/// The most alternate domain names (CNAMEs) ONE distribution's configuration may state.
+///
+/// CloudFront's published quota is 100 alternate domain names per distribution (the Amazon
+/// CloudFront Developer Guide's "Quotas", general quotas on distributions). Over it, a
+/// streaming distribution create is refused with the modelled
+/// `TooManyStreamingDistributionCNAMEs`: "Your request contains more CNAMEs than are
+/// allowed per distribution."
+pub const MAX_DISTRIBUTION_CNAMES: usize = 100;
 
 /// The most trusted signers ONE distribution's configuration may state, counted across
 /// its cache behaviours.
@@ -1122,6 +1145,181 @@ impl StoredDistribution {
     }
 }
 
+/// One CloudFront streaming (RTMP) distribution, as this emulator persists it.
+///
+/// The record is the single source of truth for the distribution's id, ARN, domain name,
+/// status, version token (`ETag`) and configuration, so the create, a later get and a
+/// later listing all answer from it rather than from the request that is being served —
+/// the same shape [`StoredDistribution`] takes for a web distribution.
+#[derive(Debug, Clone)]
+pub struct StoredStreamingDistribution {
+    /// `StreamingDistribution$Id`, allocated at creation and never reused.
+    pub id: String,
+    /// `StreamingDistribution$ARN`. CloudFront is a global service, so the ARN carries no
+    /// region.
+    pub arn: String,
+    /// `StreamingDistribution$DomainName`, allocated at creation and stable for the
+    /// distribution's whole life.
+    pub domain_name: String,
+    /// [`STATUS_IN_PROGRESS`] until [`StoredStreamingDistribution::deployed_due`], then
+    /// [`STATUS_DEPLOYED`].
+    pub status: String,
+    /// The instant this distribution's current configuration is owed to be `Deployed`.
+    pub deployed_due: SystemTime,
+    /// `StreamingDistribution$LastModifiedTime`: when the configuration last changed.
+    pub last_modified_time: SystemTime,
+    /// The version token the last mutation handed back, and the single source of truth for
+    /// every `If-Match` check against this distribution.
+    pub etag: String,
+    /// The configuration as submitted, with every member the service itself materialises
+    /// resolved into it ([`resolve_streaming_distribution_config`]), stored whole so a
+    /// later read returns the configuration the distribution actually runs under.
+    pub config: StreamingDistributionConfig,
+}
+
+impl StoredStreamingDistribution {
+    /// Apply every transition the clock owes this streaming distribution at `now`.
+    ///
+    /// Idempotent and monotonic, for the same reason [`StoredDistribution::settle`] is: a
+    /// status that is already terminal stays put, so applying this on a read cannot change
+    /// what a later caller sees.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status != STATUS_DEPLOYED && now >= self.deployed_due {
+            self.status = STATUS_DEPLOYED.to_string();
+        }
+    }
+
+    /// "A complex type that lists the Amazon Web Services accounts, if any, that you
+    /// included in the `TrustedSigners` complex type for this distribution."
+    ///
+    /// Read from the stored configuration, which is what says who the trusted signers are;
+    /// each account is named once, at the position it first appears. A signer's
+    /// `KeyPairIds` are the ACTIVE CloudFront key pairs of that account, and no call in
+    /// this emulator creates a CloudFront key pair, so the reported set is empty — the
+    /// same rule [`StoredDistribution::active_trusted_signers`] follows.
+    pub fn active_trusted_signers(&self) -> ActiveTrustedSigners {
+        let accounts = first_seen(
+            self.config
+                .trusted_signers
+                .items
+                .as_deref()
+                .unwrap_or_default()
+                .iter(),
+        );
+        ActiveTrustedSigners {
+            enabled: self.config.trusted_signers.enabled,
+            quantity: i32::try_from(accounts.len()).unwrap_or(i32::MAX),
+            items: (!accounts.is_empty()).then(|| {
+                accounts
+                    .into_iter()
+                    .map(|account| Signer {
+                        aws_account_number: Some(account),
+                        key_pair_ids: Some(KeyPairIds {
+                            quantity: 0,
+                            items: None,
+                        }),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// The `StreamingDistribution` projection `CreateStreamingDistribution` and
+    /// `GetStreamingDistribution` return.
+    pub fn to_streaming_distribution(&self) -> StreamingDistribution {
+        StreamingDistribution {
+            id: self.id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.clone(),
+            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+            domain_name: self.domain_name.clone(),
+            active_trusted_signers: self.active_trusted_signers(),
+            streaming_distribution_config: self.config.clone(),
+        }
+    }
+
+    /// The `StreamingDistributionSummary` projection `ListStreamingDistributions` returns.
+    ///
+    /// Every member it shares with
+    /// [`StoredStreamingDistribution::to_streaming_distribution`] takes the same value:
+    /// both read the one stored record. The configuration is stored resolved
+    /// ([`resolve_streaming_distribution_config`]), so the members the summary requires
+    /// but the configuration makes optional are present on it.
+    pub fn to_summary(&self) -> StreamingDistributionSummary {
+        let config = &self.config;
+        StreamingDistributionSummary {
+            id: self.id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            domain_name: self.domain_name.clone(),
+            s3_origin: config.s3_origin.clone(),
+            aliases: config.aliases.clone().unwrap_or_default(),
+            trusted_signers: config.trusted_signers.clone(),
+            comment: config.comment.clone(),
+            price_class: config
+                .price_class
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PRICE_CLASS.to_string()),
+            enabled: config.enabled,
+        }
+    }
+}
+
+/// Resolve every member of a submitted `StreamingDistributionConfig` that the SERVICE
+/// supplies, so the stored record is the configuration the distribution actually runs
+/// under rather than the request document that asked for it.
+///
+/// Three members are optional on the wire and mean something definite when left out, so
+/// each is materialised here once, when the configuration is STORED:
+///
+/// * `Aliases` — "a complex type that contains information about CNAMEs (alternate domain
+///   names), if any": naming none is the empty wrapper;
+/// * `Logging` — "a complex type that controls whether access logs are written": naming no
+///   logging configuration means logging is off, with no bucket and no prefix;
+/// * `PriceClass` — the price class the distribution serves from, which is
+///   [`DEFAULT_PRICE_CLASS`] where a configuration states none, exactly as it is for a web
+///   distribution ([`resolve_distribution_config`]).
+///
+/// Resolving on the way IN is what makes two creates that describe the same distribution —
+/// one stating a default explicitly, one leaving it out — the same request to the
+/// caller-reference comparison.
+pub fn resolve_streaming_distribution_config(
+    mut config: StreamingDistributionConfig,
+) -> StreamingDistributionConfig {
+    config.aliases = Some(config.aliases.unwrap_or(Aliases {
+        quantity: 0,
+        items: None,
+    }));
+    config.logging = Some(config.logging.unwrap_or(StreamingLoggingConfig {
+        enabled: false,
+        bucket: String::new(),
+        prefix: String::new(),
+    }));
+    config.price_class = Some(
+        config
+            .price_class
+            .unwrap_or_else(|| DEFAULT_PRICE_CLASS.to_string()),
+    );
+    config
+}
+
+/// Whether two streaming distribution configurations ask for the same thing, which is what
+/// decides whether a repeated `CallerReference` is the same create again or a second
+/// streaming distribution under a reference that is already taken.
+///
+/// The same comparison [`same_origin_access_identity_config`] makes, for the same reasons:
+/// every member a caller can submit takes part — down to the members a request left out,
+/// which are resolved before the comparison — and comparing the DESERIALIZED
+/// configurations is what makes it insensitive to the request document's whitespace and
+/// member order.
+pub fn same_streaming_distribution_config(
+    left: &StreamingDistributionConfig,
+    right: &StreamingDistributionConfig,
+) -> bool {
+    format!("{left:?}") == format!("{right:?}")
+}
+
 /// One CloudFront key value store, as this emulator persists it.
 ///
 /// The record is the single source of truth for the store's id, ARN, comment, status and
@@ -1825,6 +2023,11 @@ pub struct ComAmazonawsCloudfrontCloudfront20200531State {
     /// `distributions`: one stable total order for `ListPublicKeys`'s `Marker` to index
     /// into.
     pub public_keys: BTreeMap<String, StoredPublicKey>,
+    /// Every streaming (RTMP) distribution this emulator holds, keyed by its id — the
+    /// identifier every streaming distribution operation addresses one by. A `BTreeMap`
+    /// for the same reason as `distributions`: one stable total order for
+    /// `ListStreamingDistributions`'s `Marker` to index into.
+    pub streaming_distributions: BTreeMap<String, StoredStreamingDistribution>,
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -1841,6 +2044,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         for connection_group in self.connection_groups.values_mut() {
             connection_group.settle(now);
+        }
+        for streaming_distribution in self.streaming_distributions.values_mut() {
+            streaming_distribution.settle(now);
         }
     }
 
@@ -1868,6 +2074,28 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.origin_access_identities
             .values()
             .find(|identity| identity.config.caller_reference == caller_reference)
+    }
+
+    /// The streaming distribution `id` names, or `None` when the store holds none.
+    pub fn streaming_distribution(&self, id: &str) -> Option<&StoredStreamingDistribution> {
+        self.streaming_distributions.get(id)
+    }
+
+    /// The streaming distribution created under `caller_reference`, or `None` when no
+    /// streaming distribution was.
+    ///
+    /// A scan over the stored records rather than a second index beside them, for the
+    /// reason [`ComAmazonawsCloudfrontCloudfront20200531State::origin_access_identity_by_caller_reference`]
+    /// is one: the records are the single source of truth for which references are taken,
+    /// so a scan cannot drift out of step with them, and the collection is bounded by
+    /// [`MAX_STREAMING_DISTRIBUTIONS`].
+    pub fn streaming_distribution_by_caller_reference(
+        &self,
+        caller_reference: &str,
+    ) -> Option<&StoredStreamingDistribution> {
+        self.streaming_distributions
+            .values()
+            .find(|distribution| distribution.config.caller_reference == caller_reference)
     }
 
     /// The distribution `id` names, or `None` when the store holds none.
@@ -2345,6 +2573,21 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         loop {
             let candidate = format!("E{}", self.mint(ID_BODY_LEN));
             if !self.distributions.contains_key(&candidate) {
+                break candidate;
+            }
+        }
+    }
+
+    /// Allocate a streaming distribution id no stored streaming distribution holds.
+    ///
+    /// `StreamingDistribution$Id` is "The identifier for the RTMP distribution. For
+    /// example: `EGTXBD79EXAMPLE`": the same shape a distribution id takes (`E` +
+    /// [`ID_BODY_LEN`] uppercase alphanumerics), drawn from the same mint, so no two
+    /// streaming distributions are minted the same id.
+    pub fn allocate_streaming_distribution_id(&mut self) -> String {
+        loop {
+            let candidate = format!("E{}", self.mint(ID_BODY_LEN));
+            if !self.streaming_distributions.contains_key(&candidate) {
                 break candidate;
             }
         }
@@ -2924,6 +3167,19 @@ pub fn distribution_path(id: &str) -> String {
     format!("/2020-05-31/distribution/{id}")
 }
 
+/// The ARN of a streaming distribution. CloudFront is a GLOBAL service, so the ARN's
+/// region segment is empty, and the resource part names the RTMP resource kind:
+/// `arn:aws:cloudfront::<account>:streaming-distribution/<Id>`.
+pub fn streaming_distribution_arn(id: &str) -> String {
+    ::engine::emulator_arn("cloudfront", "", &format!("streaming-distribution/{id}"))
+}
+
+/// The path of a streaming distribution resource under this service's API version — the
+/// URI `CreateStreamingDistribution` reports as the `Location` of what it created.
+pub fn streaming_distribution_path(id: &str) -> String {
+    format!("/2020-05-31/streaming-distribution/{id}")
+}
+
 /// The path of one invalidation of one distribution.
 pub fn invalidation_path(distribution_id: &str, invalidation_id: &str) -> String {
     format!("/2020-05-31/distribution/{distribution_id}/invalidation/{invalidation_id}")
@@ -3188,6 +3444,18 @@ pub fn location_uri(path: &str) -> String {
 /// further than `string`, so this is what tells a resume point the service issued from
 /// a value a client made up.
 pub fn is_distribution_id(value: &str) -> bool {
+    is_prefixed_token(value, 'E')
+}
+
+/// Whether `value` has the shape of a streaming distribution id this service mints.
+///
+/// `ListStreamingDistributions`'s `Marker` is "the value you can use for the `Marker`
+/// request parameter to continue listing your RTMP distributions where they left off",
+/// which is a streaming distribution id this service handed out, and the model constrains
+/// it no further than `string` — so this is what tells a resume point the service issued
+/// from a value a client made up. The same shape [`is_distribution_id`] describes, because
+/// CloudFront draws every distribution id from it.
+pub fn is_streaming_distribution_id(value: &str) -> bool {
     is_prefixed_token(value, 'E')
 }
 
@@ -4837,6 +5105,56 @@ pub fn origin_access_identity_already_exists_message(existing_id: &str) -> Strin
     format!(
         "The caller reference that you are using to create an origin access identity is \
          associated with another identity. Already exists: {existing_id}"
+    )
+}
+
+/// The modelled `InvalidArgument` for a `ListStreamingDistributions` `Marker` that is no
+/// resume point this service ever handed out.
+///
+/// States the CONSTRAINT on the parameter rather than the value that broke it, the way
+/// [`invalid_origin_access_identity_marker`] and [`invalid_public_key_marker`] do for the
+/// listings of their own resource kinds.
+pub fn invalid_streaming_distribution_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_STREAMING_DISTRIBUTION_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence [`invalid_streaming_distribution_marker`] carries: a `Marker` for this
+/// listing is a streaming distribution id.
+///
+/// The WIRE text, as the recorded service answers this refusal with — the same shape
+/// [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] takes for its own listing, down to naming the
+/// resource kind the id belongs to.
+pub const INVALID_STREAMING_DISTRIBUTION_MARKER_MESSAGE: &str =
+    "Marker must be a valid streaming distribution Id";
+
+/// The modelled `NoSuchStreamingDistribution` for a streaming distribution id the store
+/// does not hold.
+///
+/// The id is NOT in the message, for the same reason it is not in
+/// [`no_such_distribution`]'s: the sentence is fixed service text, and the caller already
+/// knows which distribution it asked for.
+pub fn no_such_streaming_distribution() -> crate::ops::types::NoSuchStreamingDistribution {
+    crate::ops::types::NoSuchStreamingDistribution {
+        message: Some(NO_SUCH_STREAMING_DISTRIBUTION_MESSAGE.to_string()),
+    }
+}
+
+/// `NoSuchStreamingDistribution`'s message: the sentence the model states on the shape
+/// itself, "The specified streaming distribution does not exist."
+pub const NO_SUCH_STREAMING_DISTRIBUTION_MESSAGE: &str =
+    "The specified streaming distribution does not exist.";
+
+/// The sentence `StreamingDistributionAlreadyExists` carries, up to the streaming
+/// distribution the caller reference is already associated with, which is named at the end
+/// — the one piece of request-derived detail in it, and the one a caller cannot work out
+/// for itself. The same shape [`distribution_already_exists_message`] takes, for the same
+/// rule applied to the other resource.
+pub fn streaming_distribution_already_exists_message(existing_id: &str) -> String {
+    format!(
+        "The caller reference that you are using to create a streaming distribution is \
+         associated with another streaming distribution. Already exists: {existing_id}"
     )
 }
 

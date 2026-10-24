@@ -185,8 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `@idempotencyToken`: a repeat of the SAME request answers with the
-        // version the first call stored and attaches nothing further; the same
-        // token with a different document is a conflict.
+        // version the first call ISSUED — kept with the token, because the
+        // cluster's policy need not still be that one — and attaches nothing
+        // further; the same token with a different document is a conflict.
         let fingerprint = crate::state::request_fingerprint(&[
             input.identifier.clone(),
             input.policy.clone(),
@@ -198,17 +199,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tokens_of(crate::state::TokenScope::PutClusterPolicy)
                 .verdict(token, &fingerprint)
             {
-                crate::state::TokenVerdict::Replay(identifier) => {
-                    if let Some(version) = state
-                        .clusters
-                        .get(&identifier)
-                        .and_then(|cluster| cluster.policy.as_ref())
-                        .map(|policy| policy.version.clone())
-                    {
-                        return Ok(PutClusterPolicyOutput {
-                            policy_version: version,
-                        });
-                    }
+                crate::state::TokenVerdict::Replay(recorded) => {
+                    // The first call's own answer, whatever has happened to the
+                    // cluster's policy since — a later write supersedes the
+                    // version and a removal drops it, and neither changes what
+                    // this request produced. Returning here is also what keeps
+                    // the retry free of effect: it never reaches the attach
+                    // below.
+                    let Some(version) = recorded.answered(crate::state::POLICY_VERSION_MEMBER)
+                    else {
+                        // A recorded write always keeps the version it issued,
+                        // so there is nothing to serve here and nothing this
+                        // request may attach in its place.
+                        return Err(PutClusterPolicyErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the recorded result of this request is unavailable"
+                                    .to_string(),
+                                retry_after_seconds: None,
+                            },
+                        )
+                        .into());
+                    };
+                    return Ok(PutClusterPolicyOutput {
+                        policy_version: version.to_string(),
+                    });
                 }
                 crate::state::TokenVerdict::Mismatch => {
                     return Err(PutClusterPolicyErrorModeled::ConflictException(
@@ -303,9 +317,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         if let Some(token) = input.client_token {
-            state
-                .tokens(crate::state::TokenScope::PutClusterPolicy)
-                .record(token, fingerprint, &input.identifier);
+            state.tokens(crate::state::TokenScope::PutClusterPolicy).record(
+                token,
+                fingerprint,
+                crate::state::RecordedCall::new(&input.identifier)
+                    .answering(crate::state::POLICY_VERSION_MEMBER, &version),
+            );
         }
         Ok(PutClusterPolicyOutput {
             policy_version: version,

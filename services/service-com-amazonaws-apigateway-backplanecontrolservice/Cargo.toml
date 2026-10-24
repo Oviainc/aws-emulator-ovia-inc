@@ -32,6 +32,11 @@ tracing = { workspace = true }
 # already required to be UTF-8 before the parser sees it — and dropping it keeps
 # SR-MEM-001 true of the whole request path.
 yaml-rust2 = { version = "0.10", default-features = false }
+# Reads the comma-separated API key file `ImportApiKeys` imports — the maintained reader
+# for the format, so a quoted cell carrying a comma, a line ending or a doubled quote is
+# one value rather than whatever a hand-written splitter would make of it. The same
+# version the sibling comprehend service declares for the same job.
+csv = "1.3"
 # `arn`: the ONE parse of a caller-supplied `resourceArn`, so this service agrees with
 # every other on what an ARN's six fields are and which ARNs name its own resources —
 # what `state::parse_tagged_resource` reads a tag operation's `resourceArn` with.

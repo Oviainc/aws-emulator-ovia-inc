@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatasetExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatasetExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatasetExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +157,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatasetExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatasetExportJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDatasetExportJobError::Modeled(
+                CreateDatasetExportJobErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // The rules the input shapes state, checked before anything is written so a
+        // refused create starts no job.
+        crate::state::check_processing_input(&input.input).map_err(invalid_request)?;
+
+        let mut store = state.lock();
+
+        // "If you retry a request that completed successfully using the same client
+        // token, the server returns the cached result from the original successful
+        // request without performing the operation again": the retry writes nothing
+        // and reports the job the ORIGINAL call started. Answered BEFORE the request
+        // is resolved against the store, so a replay stays the answer the first call
+        // gave whatever has changed since.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store.dataset_export_jobs.values().find(|job| {
+                job.workspace_name == input.workspace_name
+                    && job.client_token.as_deref() == Some(token)
+            }) {
+                return Ok(CreateDatasetExportJobOutput {
+                    job_id: existing.job_id.clone(),
+                    workspace_name: existing.workspace_name.clone(),
+                });
+            }
+        }
+
+        // "A dataset containing multiple items to process": the input names a
+        // dataset of this service's own control plane, so one no dataset holds is
+        // the modelled not-found refusal. The dataset's own `workspaceName` is
+        // optional in the model — a dataset connected to an external datasource has
+        // none — so the job's workspace is not a constraint over it.
+        if let ProcessingInput::Dataset(item) = &input.input {
+            if !store.datasets.contains_key(&item.dataset_id) {
+                return Err(CreateDatasetExportJobError::Modeled(
+                    CreateDatasetExportJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::not_found_message(
+                                crate::state::RESOURCE_DATASET,
+                                &item.dataset_id,
+                            ),
+                        },
+                    ),
+                ));
+            }
+        }
+
+        // The store is bounded: a create is the only thing that adds a job and
+        // nothing evicts one. Past either cap the request exceeds what this emulator
+        // holds, which is the quota refusal this operation models. The total is
+        // checked as well as the per-workspace count, because `workspaceName` is a
+        // caller-supplied string this service has no registry to resolve, so a caller
+        // naming a fresh workspace each time would otherwise open one more
+        // per-workspace bucket every time.
+        if store.dataset_export_jobs.len() >= crate::state::MAX_DATASET_EXPORT_JOBS {
+            return Err(throttled(format!(
+                "This emulator holds at most {} dataset export jobs.",
+                crate::state::MAX_DATASET_EXPORT_JOBS
+            )));
+        }
+        let held = store
+            .dataset_export_jobs
+            .keys()
+            .filter(|(workspace, _)| *workspace == input.workspace_name)
+            .count();
+        if held >= crate::state::MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE {
+            return Err(throttled(format!(
+                "This emulator holds at most {} dataset export jobs per workspace.",
+                crate::state::MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE
+            )));
+        }
+
+        let job_id = loop {
+            let candidate = crate::state::new_id();
+            let key = crate::state::dataset_export_job_key(&input.workspace_name, &candidate);
+            if !store.dataset_export_jobs.contains_key(&key) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::DatasetExportJobRecord {
+            job_id,
+            workspace_name: input.workspace_name.clone(),
+            destination_s3_uri: input.destination_s3_uri.clone(),
+            error_report_location: input.error_report_location.clone(),
+            input: input.input.clone(),
+            client_token: input.client_token.clone(),
+            // The job's whole lifecycle is owed from here; the status is derived from
+            // this instant rather than stored, and nothing is slept on.
+            started_at: now,
+        };
+
+        let output = CreateDatasetExportJobOutput {
+            job_id: record.job_id.clone(),
+            workspace_name: record.workspace_name.clone(),
+        };
+        let key = crate::state::dataset_export_job_key(&record.workspace_name, &record.job_id);
+        store.dataset_export_jobs.insert(key, record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateDatasetExportJobError {
+    CreateDatasetExportJobError::Modeled(
+        CreateDatasetExportJobErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
+}
+
+/// HTTP 429 `ThrottlingException` carrying `message` — the quota refusal this
+/// operation models ("Your request exceeded a rate limit … For more information,
+/// see Quotas in the IoT SiteWise User Guide"), used for the bound on how many
+/// jobs this emulator holds.
+fn throttled(message: String) -> CreateDatasetExportJobError {
+    CreateDatasetExportJobError::Modeled(CreateDatasetExportJobErrorModeled::ThrottlingException(
+        ThrottlingException { message },
+    ))
 }

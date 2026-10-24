@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountHealth
-//! Reports the health of DevOps Guru analysis for this account, computed from the
-//! coverage [`crate::ops::update_resource_collection`] persisted. A pure read: it never
-//! writes to the store.
+//! Reports the health of DevOps Guru analysis for this account, computed from the store:
+//! the coverage [`crate::ops::update_resource_collection`] persisted, and the insights and
+//! anomalies DevOps Guru's own analysis produced. A pure read: it never writes to the
+//! store.
 //!
 //! ## Where each number comes from
 //!
@@ -18,12 +19,21 @@
 //!   bills one resource-hour per analysed resource per hour, so one whole hour accrues
 //!   for each resource under coverage: the value is the monitored-resource count.
 //!   Coverage a client has already removed is not retained, so it is not billed.
-//! * `MetricsAnalyzed`, `OpenProactiveInsights`, `OpenReactiveInsights` — zero. These
-//!   count the work of DevOps Guru's anomaly-detection analysis, which runs over real
-//!   CloudWatch metrics and produces insights; this emulator runs no such analysis and
-//!   `crate::state` therefore holds no metric and no insight. Zero is what nothing
-//!   analysed and nothing open means — the alternative, a synthesised count, would
-//!   report work that never ran.
+//! * `OpenProactiveInsights`, `OpenReactiveInsights` — the account-level tally over the
+//!   insights the store holds, counting the `ONGOING` ones of each `InsightType`, as
+//!   [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::account_insight_tally`]
+//!   computes it. That is the SAME map, walked the same way, that
+//!   [`crate::ops::describe_resource_collection_health`] tallies per collection member
+//!   and [`crate::ops::list_insights`] lists, so the account-level read and the
+//!   narrower reads of one store cannot contradict each other.
+//! * `MetricsAnalyzed` — how many metrics the store records DevOps Guru's analysis as
+//!   having read, counted by metric identity over the source details of the anomalies
+//!   the store holds; see
+//!   [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::analyzed_metric_count`].
+//!
+//! All three are zero exactly while the store holds nothing of the kind they count,
+//! which is the state of an emulator over which no analysis has run — zero because the
+//! set tallied is empty, not because the number is a constant.
 //!
 //! ## Shape of an operation
 //!
@@ -183,16 +193,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        let monitored = state.lock().resource_collection.monitored_resource_count();
+        let guard = state.lock();
+        let monitored = guard.resource_collection.monitored_resource_count();
         // `crate::state`'s coverage caps bound the count far below `i64::MAX`, so the
         // saturating arm is unreachable; it is here so the conversion cannot panic.
         let monitored = i64::try_from(monitored).unwrap_or(i64::MAX);
+        // The open counts are the account-level tally over the store's insights — the
+        // map every insight read walks — so this read agrees with them.
+        let insights = guard.account_insight_tally();
+        let metrics_analyzed = guard.analyzed_metric_count();
 
         Ok(DescribeAccountHealthOutput {
-            // Nothing analyses metrics or produces insights here — see the module docs.
-            open_reactive_insights: 0,
-            open_proactive_insights: 0,
-            metrics_analyzed: 0,
+            open_reactive_insights: insights.open_reactive,
+            open_proactive_insights: insights.open_proactive,
+            metrics_analyzed,
             // One resource-analysis hour per monitored resource in the last hour.
             resource_hours: monitored,
             analyzed_resource_count: Some(monitored),

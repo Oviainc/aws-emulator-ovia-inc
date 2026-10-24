@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreamingDistributions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreamingDistributions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreamingDistributions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted streaming (RTMP) distributions, one page at a time:
+//! `MaxItems` is the page size, `Marker` is the streaming distribution id the previous
+//! page ended at, and `NextMarker` arrives exactly when distributions remain.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +62,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,18 +134,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreamingDistributions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamingDistributionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreamingDistributions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the value that you provided for the MaxItems request parameter" — the
+        // maximum number of streaming distributions one response carries, so a page holds
+        // at least one item and a non-positive size names no page at all. The size served
+        // is bounded above by this emulator's own page ceiling, so one request cannot serve
+        // the whole store in a single response. A value the parameter cannot take is
+        // refused with the one sentence this service states the constraint in, whether it
+        // is out of range here or unreadable as an integer at the request boundary (see
+        // `crate::service::envelope`).
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListStreamingDistributionsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+        // "NextMarker: the value you can use for the Marker request parameter to continue
+        // listing your RTMP distributions where they left off" — the marker is a resume
+        // point this service handed out, a streaming distribution id, so a value outside
+        // that shape was never one.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_streaming_distribution_id(marker) {
+                return Err(ListStreamingDistributionsErrorModeled::InvalidArgument(
+                    crate::state::invalid_streaming_distribution_marker(),
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so each summary reports the
+        // status its distribution has at this instant.
+        store.settle(SystemTime::now());
+
+        let mut items: Vec<StreamingDistributionSummary> = Vec::new();
+        let mut is_truncated = false;
+        // `Marker` names where the previous page ENDED, so this page starts after it, and
+        // walking the pages enumerates every streaming distribution exactly once. The
+        // store is ordered by id, so the resume point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        for (_, stored) in store
+            .streaming_distributions
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            items.push(stored.to_summary());
+        }
+
+        Ok(ListStreamingDistributionsOutput {
+            streaming_distribution_list: Some(StreamingDistributionList {
+                // "The value you provided for the Marker request parameter", echoed back,
+                // and empty on a first page, which named none.
+                marker: input.marker.unwrap_or_default(),
+                // "If IsTruncated is true, this element is present and contains the value
+                // you can use for the Marker request parameter to continue listing your
+                // RTMP distributions where they left off" — the id the page ended at, and
+                // nothing at all on a page that ends the collection.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.id.clone())
+                } else {
+                    None
+                },
+                // "The value you provided for the MaxItems request parameter": what the
+                // request asked for, not the number served.
+                max_items,
+                // "A flag that indicates whether more streaming distributions remain to be
+                // listed."
+                is_truncated,
+                // The number of streaming distributions this page carries: the length of
+                // `Items`.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // "A complex type that contains one StreamingDistributionSummary element
+                // for each distribution that was created by the current Amazon Web
+                // Services account": a page that lists nothing carries no `Items` element
+                // at all, rather than an empty one — the form every other CloudFront
+                // listing here takes for an account using none of the resource.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

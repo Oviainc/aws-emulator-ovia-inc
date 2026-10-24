@@ -2438,6 +2438,11 @@ impl DbClusterParameterGroupRecord {
 /// A parameter the engine publishes for a family, as the modelled `Parameter` with its
 /// default value and `Source` [`PARAMETER_SOURCE_ENGINE_DEFAULT`]: what a describe reports
 /// when the caller asks for the engine's own parameters rather than a group's.
+///
+/// `MinimumEngineVersion` is reported only where the catalog publishes the version the
+/// parameter was introduced in; an entry that names none reports none rather than a guessed
+/// version, since "the earliest engine version to which the parameter can apply" is a fact
+/// about the engine's release history and not something this front door can derive.
 pub fn engine_default_parameter_to_wire(spec: &ClusterParameterSpec) -> Parameter {
     Parameter {
         parameter_name: Some(spec.name.to_string()),
@@ -2448,7 +2453,8 @@ pub fn engine_default_parameter_to_wire(spec: &ClusterParameterSpec) -> Paramete
         data_type: Some(spec.data_type.to_string()),
         allowed_values: Some(spec.allowed_values.to_string()),
         is_modifiable: Some(spec.is_modifiable),
-        minimum_engine_version: Some(spec.minimum_engine_version.to_string()),
+        minimum_engine_version: (!spec.minimum_engine_version.is_empty())
+            .then(|| spec.minimum_engine_version.to_string()),
         apply_method: None,
         supported_engine_modes: None,
     }

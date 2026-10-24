@@ -230,6 +230,20 @@ fn a_system_template_name(emulator: &Emulator) -> String {
         .unwrap_or_default()
 }
 
+/// The name of a BUILT-IN (`SYSTEM`) preset, read from the STORE so no case here
+/// hard-codes the built-in catalogue.
+fn a_system_preset_name(emulator: &Emulator) -> String {
+    emulator
+        .engine
+        .state::<ComAmazonawsMediaconvertMediaconvertState>()
+        .lock()
+        .presets
+        .values()
+        .find(|record| record.preset_type == TYPE_SYSTEM)
+        .map(|record| record.name.clone())
+        .unwrap_or_default()
+}
+
 /// A repeated `Create*` under a name that is already stored answers the operation's own
 /// success status with the resource that is ALREADY there, byte for byte, whatever the
 /// repeat's body says — and changes nothing, so the reader keeps answering what the FIRST
@@ -525,6 +539,30 @@ async fn deleting_a_resource_that_is_already_gone_is_a_no_op_success() {
             create: None,
             name: "never-a-template",
         },
+        DeleteCase {
+            label: "a preset that was created",
+            collection: "presets",
+            create: Some(json!({
+                "name": "teardown-preset",
+                "settings": preset_settings("MP4")
+            })),
+            name: "teardown-preset",
+        },
+        DeleteCase {
+            label: "a preset name nothing ever created",
+            collection: "presets",
+            create: None,
+            name: "never-a-preset",
+        },
+        DeleteCase {
+            label: "a preset name differing from a stored one only in case",
+            collection: "presets",
+            create: Some(json!({
+                "name": "teardown-preset",
+                "settings": preset_settings("MP4")
+            })),
+            name: "TEARDOWN-PRESET",
+        },
     ];
 
     for case in cases {
@@ -583,6 +621,11 @@ async fn deleting_a_built_in_resource_stays_refused() {
             "a built-in job template",
             "jobTemplates",
             a_system_template_name(&emulator),
+        ),
+        (
+            "a built-in preset",
+            "presets",
+            a_system_preset_name(&emulator),
         ),
     ];
 

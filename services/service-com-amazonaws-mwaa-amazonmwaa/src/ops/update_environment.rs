@@ -3,9 +3,10 @@
 //! @op UpdateEnvironment
 //!
 //! Merges ONLY the members the request carries onto the stored environment record — an
-//! absent member leaves the stored value alone — then records the `LastUpdate` and enters
-//! `UPDATING`, which the clock settles to `AVAILABLE` one
-//! `crate::state::TRANSITION_SPAN` later.
+//! absent member leaves the stored value alone — then records the `LastUpdate` and walks
+//! the two non-terminal statuses of an update: `CREATING_SNAPSHOT` while Amazon MWAA
+//! snapshots the environment's database cluster, then `UPDATING`, which the clock settles
+//! to `AVAILABLE` one `crate::state::TRANSITION_SPAN` after the call.
 //!
 //! ## Shape of an operation
 //!

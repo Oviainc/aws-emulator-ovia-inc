@@ -18,8 +18,8 @@
 use serde_json::{json, Value};
 
 use crate::endpoint_lifecycle::{
-    create, delete_endpoint, emulator, endpoint_id_of, list_shared, minimal_create,
-    owned_outposts, shared_outpost, string_at, Answer,
+    another_accounts_endpoint_id, create, delete_endpoint, emulator, endpoint_id_of, list_shared,
+    minimal_create, owned_outposts, shared_outpost, string_at, Answer,
 };
 
 /// The one text an unresolvable reference under an `OutpostId` answers with. Recorded AWS
@@ -202,14 +202,7 @@ async fn an_unresolvable_endpoint_under_a_resolvable_outpost_carries_the_same_te
         created.status, created.body
     );
     let mine = endpoint_id_of(&string_at(&created.body, "EndpointArn"));
-    let listing = list_shared(&router, &format!("?outpostId={shared}&maxResults=100")).await;
-    let others = endpoint_id_of(&string_at(
-        listing
-            .endpoints()
-            .first()
-            .unwrap_or_else(|| panic!("the shared Outpost carries an endpoint: {:?}", listing.body)),
-        "EndpointArn",
-    ));
+    let others = another_accounts_endpoint_id(&router, &shared).await;
 
     let cases = [
         (

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the configuration options the platform version behind the
+//! request's configuration set — a stored configuration template or a stored
+//! environment — or the platform version the request names outright defines, from
+//! this service's published option catalog (`crate::state::
+//! published_configuration_options`). This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,273 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A managed platform version's ARN names the version in a REGION, so
+        // resolving one — and reporting the ARN of a version the request named
+        // by its solution stack name — is done in the request's own region.
+        let region = crate::state::request_region(ctx);
+
+        // Statements about the REQUEST are answered before anything the request
+        // names is resolved.
+
+        // The four members name the configuration whose options to describe in
+        // four ways: `TemplateName` and `EnvironmentName` name a configuration
+        // SET ("the configuration options that are used in a particular
+        // configuration template or environment"), `SolutionStackName` and
+        // `PlatformArn` name a platform VERSION ("that a specified solution
+        // stack defines"). A request naming a set two ways, or a platform
+        // version two ways, asks for one catalog from two sources.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationOptions"))
+        // "ApplicationName: the name of the application associated with the
+        // configuration template or environment. ONLY needed if you want to
+        // describe the configuration options associated with either the
+        // configuration template or environment" — so a request that names one
+        // of those two has to name the application it belongs to, and a request
+        // that names neither needs no application at all. The set and the
+        // application it is resolved inside are decided TOGETHER here, which is
+        // what lets the resolution below name one with no absent application to
+        // account for.
+        let configuration_set = match (
+            input.template_name.as_deref(),
+            input.environment_name.as_deref(),
+            input.application_name.as_deref(),
+        ) {
+            (Some(_), Some(_), _) => {
+                return Err(
+                    DescribeConfigurationOptionsError::invalid_parameter_combination(
+                        "You cannot specify both TemplateName and EnvironmentName.",
+                    ),
+                );
+            }
+            (Some(_), None, None) | (None, Some(_), None) => {
+                return Err(
+                    DescribeConfigurationOptionsError::missing_required_parameter(
+                        "Must specify an ApplicationName with a TemplateName or an \
+                         EnvironmentName.",
+                    ),
+                );
+            }
+            (Some(template_name), None, Some(application_name)) => {
+                Some(ConfigurationSet::Template {
+                    application_name,
+                    template_name,
+                })
+            }
+            (None, Some(environment_name), Some(application_name)) => {
+                Some(ConfigurationSet::Environment {
+                    application_name,
+                    environment_name,
+                })
+            }
+            (None, None, _) => None,
+        };
+        if input.solution_stack_name.is_some() && input.platform_arn.is_some() {
+            return Err(
+                DescribeConfigurationOptionsError::invalid_parameter_combination(
+                    "You cannot specify both SolutionStackName and PlatformArn.",
+                ),
+            );
+        }
+
+        // A configuration set IS for a platform version, so a request that
+        // names a set AND a platform version asks for one catalog from two
+        // sources exactly as the two combinations above do. It is refused
+        // rather than answered from one of them: silently dropping a member
+        // the request stated would answer a question it did not ask.
+        if configuration_set.is_some()
+            && (input.solution_stack_name.is_some() || input.platform_arn.is_some())
+        {
+            return Err(
+                DescribeConfigurationOptionsError::invalid_parameter_combination(
+                    "You cannot specify a SolutionStackName or a PlatformArn with a \
+                     TemplateName or an EnvironmentName.",
+                ),
+            );
+        }
+
+        // A request that names no configuration set and no platform version
+        // names no catalog to report: there is no platform version whose
+        // options these would be.
+        if configuration_set.is_none()
+            && input.solution_stack_name.is_none()
+            && input.platform_arn.is_none()
+        {
+            return Err(
+                DescribeConfigurationOptionsError::missing_required_parameter(
+                    "Must specify either a TemplateName, an EnvironmentName, a \
+                     SolutionStackName or a PlatformArn.",
+                ),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeConfigurationOptionsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // This operation only REPORTS. The one write it performs is the clock's
+        // own — an environment status change or an application deletion the
+        // clock has already made due — which was owed at the same instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // The platform version whose options are reported: the one the
+        // configuration set the request names is FOR, or the one the request
+        // names itself.
+        let (mut solution_stack_name, mut platform_arn, named_outright) = match configuration_set {
+            Some(ConfigurationSet::Template {
+                application_name,
+                template_name,
+            }) => {
+                let Some(template) = store
+                    .configuration_templates
+                    .get(&(application_name.to_string(), template_name.to_string()))
+                else {
+                    return Err(
+                        DescribeConfigurationOptionsError::invalid_parameter_value(
+                            crate::state::missing_configuration_template_message(template_name),
+                        ),
+                    );
+                };
+                (
+                    template.solution_stack_name.clone(),
+                    template.platform_arn.clone(),
+                    false,
+                )
+            }
+            // A terminated environment runs nothing, so it is no longer a
+            // configuration set whose options can be described — the same
+            // resolution `DescribeConfigurationSettings` makes for the member.
+            Some(ConfigurationSet::Environment {
+                application_name,
+                environment_name,
+            }) => {
+                let Some(environment) = store
+                    .environment_name_index
+                    .get(environment_name)
+                    .and_then(|environment_id| store.environments.get(environment_id))
+                    .filter(|environment| {
+                        !environment.is_terminated()
+                            && environment.application_name == application_name
+                    })
+                else {
+                    return Err(
+                        DescribeConfigurationOptionsError::invalid_parameter_value(
+                            crate::state::missing_environment_message(None, Some(environment_name)),
+                        ),
+                    );
+                };
+                (
+                    environment.solution_stack_name.clone(),
+                    environment.platform_arn.clone(),
+                    false,
+                )
+            }
+            None => (
+                input.solution_stack_name.clone(),
+                input.platform_arn.clone(),
+                true,
+            ),
+        };
+
+        // A platform version is named by its solution stack name and by its
+        // ARN, and this service's catalog publishes both, so either form
+        // resolves the one published version — the same resolution
+        // `CreateConfigurationTemplate` and `CreateEnvironment` make.
+        let stack = solution_stack_name
+            .as_deref()
+            .and_then(crate::state::solution_stack_named)
+            .or_else(|| {
+                platform_arn
+                    .as_deref()
+                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
+            });
+
+        // A platform version the request named OUTRIGHT has to be one this
+        // account can read: a version this service publishes, or a custom
+        // version created in this account. A name or an ARN that answers to
+        // neither names no platform version, and so no catalog. A platform
+        // version a stored configuration set is for is NOT re-checked: the set
+        // exists and reports the platform it was created for, whatever the
+        // catalog publishes today.
+        if stack.is_none() && named_outright {
+            if let Some(arn) = platform_arn.as_deref() {
+                if !store.platform_versions.contains_key(arn) {
+                    return Err(
+                        DescribeConfigurationOptionsError::invalid_parameter_value(format!(
+                            "No Platform named '{arn}' found."
+                        )),
+                    );
+                }
+            } else if let Some(name) = solution_stack_name.as_deref() {
+                return Err(
+                    DescribeConfigurationOptionsError::invalid_parameter_value(format!(
+                        "No Solution Stack named '{name}' found."
+                    )),
+                );
+            }
+        }
+
+        // The Amazon SQS daemon's options belong to a platform version that can
+        // run a WORKER environment, which is what its branch's supported tiers
+        // say — the same rule this service applies to the worker daemon
+        // addition it reports for a platform version.
+        let supports_worker_tier = stack
+            .and_then(|stack| store.platform_branch_named(stack.branch_name))
+            .is_some_and(|branch| {
+                branch
+                    .supported_tiers
+                    .iter()
+                    .any(|tier| tier == crate::state::TIER_WORKER)
+            });
+
+        // "SolutionStackName: the name of the solution stack these
+        // configuration options belong to" and "PlatformArn: the ARN of the
+        // platform version": the form the request did not use is filled in from
+        // the catalog, and a version the catalog does not publish — a custom
+        // one — reports only the form it is named by rather than a made-up
+        // second name.
+        platform_arn = platform_arn.or_else(|| stack.map(|stack| stack.platform_arn(&region)));
+        solution_stack_name = solution_stack_name.or_else(|| stack.map(|stack| stack.name()));
+
+        // "Options: if specified, restricts the descriptions to only the
+        // specified options." A request that restricts to nothing restricts
+        // nothing: the whole catalog is reported.
+        let specifications = input.options.as_deref().unwrap_or_default();
+        let options = crate::state::published_configuration_options(stack, supports_worker_tier)
+            .into_iter()
+            .filter(|option| {
+                specifications.is_empty()
+                    || specifications
+                        .iter()
+                        .any(|specification| option.is_named_by(specification))
+            })
+            .map(crate::state::ConfigurationOption::to_description)
+            .collect();
+
+        Ok(DescribeConfigurationOptionsOutput {
+            solution_stack_name,
+            platform_arn,
+            options: Some(options),
+        })
     }
+}
+
+/// Which configuration set the request named, where it named one: "the
+/// configuration options that are used in a particular configuration template
+/// or environment". A request that names a platform version instead names
+/// neither of these. Each variant carries the application the set is resolved
+/// inside, which the request has to name alongside it, so a set reaches the
+/// store only together with its application.
+enum ConfigurationSet<'a> {
+    /// `ApplicationName` and `TemplateName`.
+    Template {
+        application_name: &'a str,
+        template_name: &'a str,
+    },
+    /// `ApplicationName` and `EnvironmentName`.
+    Environment {
+        application_name: &'a str,
+        environment_name: &'a str,
+    },
 }

@@ -6,7 +6,7 @@
 //! implemented operation computes its answer from the records below: nothing is canned,
 //! and nothing is echoed straight back out of a request without being stored first.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -22,17 +22,26 @@ pub const ARN_SERVICE: &str = "airflow";
 /// unsigned request still routes by endpoint host).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long a new environment stays `CREATING`, and an updated one `UPDATING`, before
-/// the clock owes it `AVAILABLE`.
+/// How long a new environment stays `CREATING`, and an environment under update stays in
+/// the non-terminal statuses of its update, before the clock owes it `AVAILABLE`.
 ///
-/// `CREATING` and `UPDATING` are non-terminal `EnvironmentStatus` values, so the move to
-/// `AVAILABLE` is a transition the clock owes. The span is the emulator's own choice (no
-/// AWS-documented duration applies to MWAA provisioning) and is deliberately non-zero, so
-/// a caller reading straight after the call still observes the transient status as it
-/// does against the real service. The instant it comes due is stored on the record
-/// ([`PendingTransition::due_at`]) and materialised by
+/// `CREATING`, `CREATING_SNAPSHOT` and `UPDATING` are non-terminal `EnvironmentStatus`
+/// values, so the move to `AVAILABLE` is a transition the clock owes. The span is the
+/// emulator's own choice (no AWS-documented duration applies to MWAA provisioning) and is
+/// deliberately non-zero, so a caller reading straight after the call still observes the
+/// transient status as it does against the real service. The instant it comes due is
+/// stored on the record ([`PendingTransition::due_at`]) and materialised by
 /// [`ComAmazonawsMwaaAmazonmwaaState::settle`]; nothing sleeps.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long each PHASE of an accepted update lasts.
+///
+/// An accepted update walks two non-terminal statuses before it settles —
+/// [`STATUS_CREATING_SNAPSHOT`] and then [`STATUS_UPDATING`] — so each phase takes half of
+/// [`TRANSITION_SPAN`]: every phase is non-zero, so a caller polling straight after the
+/// call still observes the snapshot phase, and the whole update still settles one
+/// [`TRANSITION_SPAN`] after the call that started it, exactly like a create.
+pub const UPDATE_PHASE_SPAN: Duration = Duration::from_millis(250);
 
 /// `MaxResults` upper bound on `ListEnvironments`, from its `@range(1, 25)`. Also the
 /// page size used when a caller names none, so one unparameterised request cannot
@@ -57,6 +66,14 @@ pub const STATUS_CREATING: &str = "CREATING";
 /// `EnvironmentStatus` once the environment is ready — "The request was successful and
 /// the environment is ready to use."
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `EnvironmentStatus` while an accepted update is snapshotting the environment's database
+/// before it is applied — "The request to update environment details, or upgrade the
+/// environment version, is in progress and Amazon MWAA is creating a storage volume
+/// snapshot of the Amazon RDS database cluster associated with the environment." (the
+/// `Status` member's own doc). It is the FIRST status of every accepted update: the doc
+/// names both an update of environment details and a version change.
+pub const STATUS_CREATING_SNAPSHOT: &str = "CREATING_SNAPSHOT";
 
 /// `EnvironmentStatus` while an update is in progress — "The request to update the
 /// environment is in progress."
@@ -475,6 +492,10 @@ pub fn update_not_allowed_message(name: &str, status: &str) -> String {
 }
 
 /// A status change the clock owes an environment: where it lands, and when.
+///
+/// A record holds a QUEUE of these ([`EnvironmentRecord::pending`]), because a lifecycle
+/// can walk more than one non-terminal status before it settles: an accepted update
+/// snapshots the environment's database and only then applies the change.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// The `EnvironmentStatus` the environment settles into.
@@ -506,8 +527,8 @@ pub struct EnvironmentRecord {
     pub region: String,
     /// An `EnvironmentStatus` value.
     pub status: String,
-    /// The transition the clock owes, or `None` in a settled status.
-    pub pending: Option<PendingTransition>,
+    /// The transitions the clock owes, soonest first; empty in a settled status.
+    pub pending: VecDeque<PendingTransition>,
     pub created_at: SystemTime,
     pub webserver_url: String,
     pub service_role_arn: String,
@@ -522,24 +543,25 @@ pub struct EnvironmentRecord {
 }
 
 impl EnvironmentRecord {
-    /// Materialise the transition the clock already owes this environment.
+    /// Materialise every transition the clock already owes this environment, in order —
+    /// so a caller that reads long after a multi-phase lifecycle started lands on the
+    /// status that lifecycle ends in, not on an intermediate one.
     ///
     /// This is the ONLY write a reporting operation makes: the change was owed at this
     /// instant whether or not anybody called.
     fn settle(&mut self, now: SystemTime) {
-        let Some(pending) = self.pending.clone() else {
-            return;
-        };
-        if now < pending.due_at {
-            return;
+        while self.pending.front().is_some_and(|next| now >= next.due_at) {
+            let pending = self
+                .pending
+                .pop_front()
+                .expect("the queue front was just observed");
+            self.status = pending.to;
+            if let (Some(status), Some(last_update)) =
+                (pending.last_update_status, self.last_update.as_mut())
+            {
+                last_update.status = status;
+            }
         }
-        self.status = pending.to;
-        if let (Some(status), Some(last_update)) =
-            (pending.last_update_status, self.last_update.as_mut())
-        {
-            last_update.status = status;
-        }
-        self.pending = None;
     }
 
     /// The modelled `Environment` for this record — the one shape `GetEnvironment`
@@ -606,29 +628,47 @@ impl EnvironmentRecord {
     /// it has settled into [`STATUS_AVAILABLE`], with no transition still owed. See
     /// [`update_not_allowed_message`].
     pub fn accepts_update(&self) -> bool {
-        self.status == STATUS_AVAILABLE && self.pending.is_none()
+        self.status == STATUS_AVAILABLE && self.pending.is_empty()
     }
 
-    /// Enter `UPDATING` with a `PENDING` `LastUpdate`, and owe `AVAILABLE` with a
-    /// `SUCCESS` one once [`TRANSITION_SPAN`] has elapsed.
+    /// Begin an accepted update: enter [`STATUS_CREATING_SNAPSHOT`] with a `PENDING`
+    /// `LastUpdate`, then owe [`STATUS_UPDATING`] one [`UPDATE_PHASE_SPAN`] later and
+    /// [`STATUS_AVAILABLE`] with a `SUCCESS` `LastUpdate` one phase after that.
+    ///
+    /// Amazon MWAA snapshots the environment's database cluster BEFORE it applies the
+    /// change (so it can restore the environment if the update fails), which is what the
+    /// first of those statuses reports; the change itself is applied in the second. Both
+    /// phases belong to every accepted update — an update of environment details as much
+    /// as a version change — so nothing here branches on which members the request
+    /// carried.
     pub fn begin_update(
         &mut self,
         now: SystemTime,
         source: &str,
         worker_replacement_strategy: Option<String>,
     ) {
-        self.status = STATUS_UPDATING.to_string();
+        self.status = STATUS_CREATING_SNAPSHOT.to_string();
         self.last_update = Some(LastUpdateRecord {
             status: UPDATE_STATUS_PENDING.to_string(),
             created_at: now,
             source: source.to_string(),
             worker_replacement_strategy,
         });
-        self.pending = Some(PendingTransition {
-            to: STATUS_AVAILABLE.to_string(),
-            last_update_status: Some(UPDATE_STATUS_SUCCESS.to_string()),
-            due_at: now + TRANSITION_SPAN,
-        });
+        self.pending = [
+            PendingTransition {
+                to: STATUS_UPDATING.to_string(),
+                // The update has not landed yet: `LastUpdate` stays `PENDING` across the
+                // snapshot phase and the apply phase alike.
+                last_update_status: None,
+                due_at: now + UPDATE_PHASE_SPAN,
+            },
+            PendingTransition {
+                to: STATUS_AVAILABLE.to_string(),
+                last_update_status: Some(UPDATE_STATUS_SUCCESS.to_string()),
+                due_at: now + UPDATE_PHASE_SPAN * 2,
+            },
+        ]
+        .into();
     }
 }
 

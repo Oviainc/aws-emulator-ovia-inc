@@ -15,6 +15,8 @@
 mod findings_report_account_summary;
 #[path = "all/findings_reports_listing.rs"]
 mod findings_reports_listing;
+#[path = "all/interval_validation.rs"]
+mod interval_validation;
 #[path = "all/notification_channels.rs"]
 mod notification_channels;
 #[path = "all/notification_configuration.rs"]

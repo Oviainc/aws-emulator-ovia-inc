@@ -430,11 +430,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region,
             // A new environment is not ready yet: the clock owes it AVAILABLE.
             status: crate::state::STATUS_CREATING.to_string(),
-            pending: Some(crate::state::PendingTransition {
+            pending: [crate::state::PendingTransition {
                 to: crate::state::STATUS_AVAILABLE.to_string(),
                 last_update_status: None,
                 due_at: now + crate::state::TRANSITION_SPAN,
-            }),
+            }]
+            .into(),
             created_at: now,
             spec,
             last_update: None,

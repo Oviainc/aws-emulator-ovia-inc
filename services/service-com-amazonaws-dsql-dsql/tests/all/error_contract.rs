@@ -44,7 +44,10 @@ fn kinesis_target(account: &str, role: &str) -> Value {
 
 /// A `CreateStream` body whose target is in this account — the only part of it
 /// under test elsewhere is the role.
-fn stream_request(account: &str, role: &str) -> Value {
+///
+/// Shared with `tests/all/idempotent_replay_result.rs`, which drives the same
+/// body twice under one `clientToken`.
+pub(crate) fn stream_request(account: &str, role: &str) -> Value {
     json!({
         "targetDefinition": kinesis_target(account, role),
         "ordering": "UNORDERED",

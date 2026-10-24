@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStreamingDistribution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStreamingDistribution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStreamingDistribution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a streaming (RTMP) distribution from the configuration submitted and persists
+//! it: the record this handler stores is what `GetStreamingDistribution` and
+//! `ListStreamingDistributions` answer from afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +89,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -174,18 +171,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStreamingDistribution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamingDistributionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStreamingDistribution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        // The configuration as the service will run it: the members submitted plus every
+        // member the service itself supplies. Resolved BEFORE the caller-reference
+        // question below so that comparison is one between like and like — the stored
+        // record is resolved too.
+        let config = crate::state::resolve_streaming_distribution_config(
+            input.streaming_distribution_config,
+        );
+
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does.
+        store.settle(now);
+
+        // "The value of Quantity and the size of Items don't match." Every CloudFront list
+        // travels in a wrapper that states its own length beside the list itself, and a
+        // request where the two disagree is refused — for each wrapper a streaming
+        // distribution configuration reaches.
+        let aliases = config.aliases.clone().unwrap_or_default();
+        let alias_count = aliases.items.as_ref().map_or(0, Vec::len);
+        let signers = config.trusted_signers.items.as_deref().unwrap_or_default();
+        for (label, quantity, length) in [
+            ("Aliases", aliases.quantity, alias_count),
+            (
+                "TrustedSigners",
+                config.trusted_signers.quantity,
+                signers.len(),
+            ),
+        ] {
+            if usize::try_from(quantity).ok() != Some(length) {
+                return Err(
+                    CreateStreamingDistributionErrorModeled::InconsistentQuantities(
+                        InconsistentQuantities {
+                            message: Some(format!(
+                                "The value of Quantity and the size of Items don't match \
+                                 for {label}."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "Your request contains more trusted signers than are allowed per distribution."
+        if signers.len() > crate::state::MAX_TRUSTED_SIGNERS {
+            return Err(
+                CreateStreamingDistributionErrorModeled::TooManyTrustedSigners(
+                    TooManyTrustedSigners {
+                        message: Some(format!(
+                            "This streaming distribution states {} trusted signers; at most \
+                             {} are allowed per distribution",
+                            signers.len(),
+                            crate::state::MAX_TRUSTED_SIGNERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Your request contains more CNAMEs than are allowed per distribution."
+        if alias_count > crate::state::MAX_DISTRIBUTION_CNAMES {
+            return Err(
+                CreateStreamingDistributionErrorModeled::TooManyStreamingDistributionCNAMEs(
+                    TooManyStreamingDistributionCNAMEs {
+                        message: Some(format!(
+                            "This streaming distribution states {alias_count} alternate domain \
+                             names; at most {} are allowed per distribution",
+                            crate::state::MAX_DISTRIBUTION_CNAMES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A caller reference identifies ONE streaming distribution for its whole life. "If
+        // the value of CallerReference is new (regardless of the content of the
+        // StreamingDistributionConfig object), CloudFront creates a new distribution. If
+        // CallerReference is a value that you already sent in a previous request to create
+        // a distribution, CloudFront returns a DistributionAlreadyExists error" — so a
+        // repeat whose configuration is the one that reference already names is answered
+        // with that distribution, creating nothing, and a repeat that changes the
+        // configuration is refused. The same rule the distribution create path follows.
+        if let Some(existing) = store.streaming_distribution_by_caller_reference(
+            &config.caller_reference,
+        ) {
+            if crate::state::same_streaming_distribution_config(&existing.config, &config) {
+                return Ok(CreateStreamingDistributionOutput {
+                    streaming_distribution: Some(existing.to_streaming_distribution()),
+                    location: Some(crate::state::location_uri(
+                        &crate::state::streaming_distribution_path(&existing.id),
+                    )),
+                    e_tag: Some(existing.etag.clone()),
+                });
+            }
+            let message =
+                crate::state::streaming_distribution_already_exists_message(&existing.id);
+            return Err(
+                CreateStreamingDistributionErrorModeled::StreamingDistributionAlreadyExists(
+                    StreamingDistributionAlreadyExists {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Processing your request would cause you to exceed the maximum number of
+        // streaming distributions allowed." A record is what a later read answers from, so
+        // it cannot be evicted: the bound is an entry count refused BEFORE anything is
+        // minted.
+        if store.streaming_distributions.len() >= crate::state::MAX_STREAMING_DISTRIBUTIONS {
+            return Err(
+                CreateStreamingDistributionErrorModeled::TooManyStreamingDistributions(
+                    TooManyStreamingDistributions {
+                        message: Some(format!(
+                            "This emulator holds at most {} streaming distributions; delete \
+                             one before creating another",
+                            crate::state::MAX_STREAMING_DISTRIBUTIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.allocate_streaming_distribution_id();
+        let domain_name = store.allocate_domain_name();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredStreamingDistribution {
+            arn: crate::state::streaming_distribution_arn(&id),
+            id: id.clone(),
+            domain_name,
+            // A distribution CloudFront has just accepted is not yet propagated to the
+            // edge locations, so it reports the transient status until the clock owes it
+            // the terminal one.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            deployed_due: now + crate::state::PROPAGATION_DELAY,
+            last_modified_time: now,
+            etag: etag.clone(),
+            // Stored whole: a later read answers from this record — the configuration the
+            // distribution actually runs under — never from the request that was served.
+            config,
+        };
+        let streaming_distribution = stored.to_streaming_distribution();
+        let location =
+            crate::state::location_uri(&crate::state::streaming_distribution_path(&id));
+        store.streaming_distributions.insert(id, stored);
+
+        Ok(CreateStreamingDistributionOutput {
+            // "The streaming distribution's information."
+            streaming_distribution: Some(streaming_distribution),
+            // "The fully qualified URI of the new streaming distribution resource just
+            // created."
+            location: Some(location),
+            // "The current version of the streaming distribution created."
+            e_tag: Some(etag),
+        })
     }
 }

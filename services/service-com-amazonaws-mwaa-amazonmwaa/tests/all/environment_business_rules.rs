@@ -597,13 +597,31 @@ async fn an_update_is_refused_while_the_environment_has_not_settled_into_availab
         answer.status, answer.body
     );
 
-    // Already UPDATING: the update in flight has not settled, so a second one is refused
-    // rather than silently overwriting it.
+    // Already under update: the update in flight has not settled, so a second one is
+    // refused rather than silently overwriting it — in the snapshot phase as much as in
+    // the apply phase.
+    let updating = harness.environment("while updating", name).await;
+    assert_eq!(
+        updating.get("Status"),
+        Some(&json!(state::STATUS_CREATING_SNAPSHOT)),
+        "case while updating: the accepted update first reports CREATING_SNAPSHOT, got {:?}",
+        updating.get("Status")
+    );
+    let answer = harness.update(name, &json!({"MaxWorkers": 9})).await;
+    assert_refused("while updating", &answer);
+    assert_eq!(
+        harness.environment("while updating", name).await,
+        updating,
+        "case while updating: a refused update must not overwrite the update in flight"
+    );
+
+    // And in the second phase, once the snapshot is done and the change is being applied.
+    tokio::time::sleep(state::UPDATE_PHASE_SPAN + Duration::from_millis(50)).await;
     let updating = harness.environment("while UPDATING", name).await;
     assert_eq!(
         updating.get("Status"),
-        Some(&json!("UPDATING")),
-        "case while UPDATING: the accepted update leaves the environment UPDATING, got {:?}",
+        Some(&json!(state::STATUS_UPDATING)),
+        "case while UPDATING: the snapshot phase is followed by UPDATING, got {:?}",
         updating.get("Status")
     );
     let answer = harness.update(name, &json!({"MaxWorkers": 9})).await;

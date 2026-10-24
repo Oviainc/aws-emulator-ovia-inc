@@ -178,15 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // `startTime`/`endTime` are the range to report about, so a range that ends
-        // before it starts names no period at all: the operation's own modelled
-        // `ValidationException` ("The parameter is not valid") refuses it, naming the
-        // members, rather than reporting an empty page for an unanswerable request.
-        if input.start_time.as_secs_f64() > input.end_time.as_secs_f64() {
+        // `startTime`/`endTime` are the range to report about, and a pair of bounds is a
+        // range only when the start is strictly before the end — the service-wide
+        // interval rule ([`crate::state::validate_interval`]), which the model cannot
+        // express. A reversed or zero-width pair is refused with the operation's own
+        // modelled `ValidationException` ("The parameter is not valid"), naming both
+        // bounds, rather than reporting a page for an unanswerable request.
+        if let Err(message) = crate::state::validate_interval(input.start_time, input.end_time) {
             return Err(ListFindingsReportsErrorModeled::ValidationException(
-                ValidationException {
-                    message: "endTime must not be earlier than startTime".to_string(),
-                },
+                ValidationException { message },
             )
             .into());
         }

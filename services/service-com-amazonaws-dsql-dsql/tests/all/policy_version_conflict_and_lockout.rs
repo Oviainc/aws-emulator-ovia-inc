@@ -32,7 +32,10 @@ use crate::harness::{expected_arn, Dsql};
 /// A policy document the lockout safety check has no reason to refuse: one named
 /// principal, one action, on every resource. `round` varies the action so two
 /// successive attachments are different documents.
-fn benign_document(round: usize) -> String {
+///
+/// Shared with `tests/all/idempotent_replay_result.rs`, which attaches the same
+/// benign documents to drive a `clientToken` replay.
+pub(crate) fn benign_document(round: usize) -> String {
     let action = if round.is_multiple_of(2) {
         "dsql:DbConnect"
     } else {

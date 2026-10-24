@@ -27,11 +27,26 @@ pub struct AccountEnforcedGuardrailInferenceInputConfiguration {
     pub model_enforcement: Option<ModelEnforcement>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#PutEnforcedGuardrailConfigurationResponse")]
+/// `PutEnforcedGuardrailConfigurationResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `updatedAt` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="PutEnforcedGuardrailConfiguration")`),
+/// which the derive does not put on a member schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct PutEnforcedGuardrailConfigurationOutput {
     pub config_id: Option<String>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
     pub updated_by: Option<String>,
 }
+
+bedrock_schema_and_codec!(
+    PutEnforcedGuardrailConfigurationOutput,
+    PUT_ENFORCED_GUARDRAIL_CONFIGURATION_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#PutEnforcedGuardrailConfigurationResponse",
+    "com.amazonaws.bedrock",
+    "PutEnforcedGuardrailConfigurationResponse",
+    (M_CONFIG_ID, config_id, "configId", 0, opt, string),
+    (M_UPDATED_AT, updated_at, "updatedAt", 1, opt, date_time),
+    (M_UPDATED_BY, updated_by, "updatedBy", 2, opt, string),
+);
 
