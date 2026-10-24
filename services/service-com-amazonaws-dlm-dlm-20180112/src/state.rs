@@ -16,7 +16,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     CreateRule, CrossRegionCopyTarget, Exclusions, InvalidRequestException, LifecyclePolicy,
-    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, Schedule, Tag,
+    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, RetainRule, Schedule, Tag,
 };
 
 /// The region a policy ARN is built for when the request carries no SigV4
@@ -292,6 +292,18 @@ pub const POLICY_QUOTA: usize = 1_000;
 /// interval unit, a nested deprecate/archive/fast-restore rule's members. They
 /// keep exactly what the request stated, because inventing one would be
 /// fabrication.
+/// True when `details` configures an EVENT-BASED policy rather than a custom
+/// snapshot or AMI one.
+///
+/// `PolicyDetails$PolicyType` names the type, and `EventSource` ("[Event-based
+/// policies only] The event that activates the event-based policy") is declared
+/// by that kind of policy alone, so either of them makes the configuration an
+/// event-based one.
+pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
+    details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
+        || details.event_source.is_some()
+}
+
 pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails {
     if details.policy_language.as_deref() == Some(SIMPLIFIED_POLICY_LANGUAGE) {
         // A DEFAULT policy's configuration. Its `[Default policies only]`
@@ -307,9 +319,7 @@ pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails 
     // Resource locations and schedules are `[Custom snapshot and AMI policies
     // only]`; an event-based policy configures an `EventSource` and `Actions`
     // instead, so it carries neither.
-    let event_based = details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
-        || details.event_source.is_some();
-    if event_based {
+    if configures_event_based_policy(&details) {
         return details;
     }
     // `CreateRule$Location` is `[Custom snapshot policies only]`, so an AMI
@@ -951,32 +961,6 @@ pub fn unsupported_create_rule_interval(schedule: &str, interval: i32) -> Invali
     ))
 }
 
-/// How the first schedule in `details` whose `CreateRule` states when to create
-/// BOTH ways is named, or `None` when no schedule does.
-///
-/// `CreateRule` documents "You must specify either CronExpression, or Interval,
-/// IntervalUnit, and Times", so the cron form and the interval form are
-/// alternatives: a rule carrying a `CronExpression` beside any interval member
-/// states its schedule twice, and the two cannot be reconciled into one.
-///
-/// `Schedule$Name` is optional, so a schedule that carries none is named by its
-/// position in `Schedules` instead — what matters is that the caller can tell
-/// WHICH of its schedules to correct.
-pub fn schedule_with_conflicting_create_rule(details: Option<&PolicyDetails>) -> Option<String> {
-    details?
-        .schedules
-        .as_ref()?
-        .iter()
-        .enumerate()
-        .find(|(_, schedule)| {
-            schedule
-                .create_rule
-                .as_ref()
-                .is_some_and(create_rule_states_both_forms)
-        })
-        .map(|(position, schedule)| schedule_label(position, schedule))
-}
-
 /// How a refusal names the schedule at `position` in `Schedules`.
 ///
 /// `Schedule$Name` is optional, so a schedule that carries none is named by its
@@ -990,26 +974,290 @@ fn schedule_label(position: usize, schedule: &Schedule) -> String {
     }
 }
 
-/// True when `rule` states its schedule as a cron expression AND as an interval.
-///
-/// `Interval`, `IntervalUnit` and `Times` are the three members of the interval
-/// form, so ANY of them beside a `CronExpression` is the conflict — a request
-/// does not have to carry all three to have stated the schedule twice.
-fn create_rule_states_both_forms(rule: &CreateRule) -> bool {
-    let interval_based = rule.interval.is_some()
-        || rule.interval_unit.is_some()
-        || rule.times.as_ref().is_some_and(|times| !times.is_empty());
-    rule.cron_expression.is_some() && interval_based
+/// The wire path a refusal names the schedule at `position` by, so a caller can
+/// tell which member of which list element to correct.
+fn schedule_path(position: usize) -> String {
+    format!("{POLICY_DETAILS_PREFIX}Schedules[{}]", position + 1)
 }
 
-/// The `InvalidRequestException` for a schedule whose `CreateRule` states when
-/// to create both ways. The message names the schedule that carries both, which
-/// is what tells a caller which of its schedules to correct.
-pub fn conflicting_create_rule(schedule: &str) -> InvalidRequestException {
-    invalid_request(format!(
-        "Interval based CreateRule and Cron based CreateRule cannot both be present in \
-         schedule {{{schedule}}}."
-    ))
+/// The `PolicyDetails` members a request OMITTED that the kind of policy its
+/// configuration describes cannot be built from, as the wire paths a refusal
+/// names. Empty when the configuration states every one of them.
+///
+/// `PolicyDetails` declares the members of every policy kind at once, so the
+/// model can mark none of them `@required`: which ones a request must carry
+/// depends on the kind of policy it configures, and the documentation is what
+/// states them, member by member.
+///
+/// * A custom snapshot or AMI policy is built from `ResourceTypes` ("the target
+///   resource type for snapshot and AMI lifecycle policies"), `TargetTags`
+///   ("the single tag that identifies targeted resources for this policy") and
+///   `Schedules` ("A policy can have up to four schedules—one mandatory
+///   schedule and up to three optional schedules"). Without them nothing says
+///   what the policy targets or when it acts.
+/// * An event-based policy is built from `EventSource` ("the event that
+///   activates the event-based policy") and `Actions` ("the actions to be
+///   performed when the event-based policy is activated") instead.
+///
+/// A DEFAULT policy is configured from the `[Default policies only]` members,
+/// each of which documents a value the service fills in, so it requires none of
+/// them and is not judged here.
+///
+/// Source: `smithy_query(query="shape", shape="PolicyDetails")`.
+pub fn omitted_configuration_members(details: &PolicyDetails) -> Vec<String> {
+    let required: Vec<(&str, bool)> = if configures_event_based_policy(details) {
+        vec![
+            ("EventSource", details.event_source.is_some()),
+            ("Actions", details.actions.is_some()),
+        ]
+    } else {
+        vec![
+            ("ResourceTypes", details.resource_types.is_some()),
+            ("TargetTags", details.target_tags.is_some()),
+            ("Schedules", details.schedules.is_some()),
+        ]
+    };
+    required
+        .into_iter()
+        .filter(|(_, stated)| !*stated)
+        .map(|(name, _)| format!("{POLICY_DETAILS_PREFIX}{name}"))
+        .collect()
+}
+
+/// The `InvalidRequestException` for a create that states no policy
+/// configuration at all.
+///
+/// `CreateLifecyclePolicy` documents two ways of saying what a policy would do:
+/// `DefaultPolicy`, which "specif[ies] the type of default policy to create",
+/// and `PolicyDetails`, "the configuration details of the lifecycle policy". A
+/// request carrying neither describes no policy, so there is none to create.
+pub fn no_policy_configuration() -> InvalidRequestException {
+    required_parameters_omitted(
+        "The parameter PolicyDetails is required: a lifecycle policy is configured either by \
+         DefaultPolicy or by PolicyDetails."
+            .to_string(),
+        vec!["PolicyDetails".to_string()],
+    )
+}
+
+/// The `InvalidRequestException` for a configuration that omitted `parameters`
+/// the kind of policy it describes is built from. The message is built from the
+/// request: it names the parameters that were omitted.
+pub fn configuration_members_omitted(parameters: &[String]) -> InvalidRequestException {
+    let (noun, verb) = plural(parameters.len());
+    required_parameters_omitted(
+        format!(
+            "The {noun} {} {verb} required for this policy configuration.",
+            parameters.join(", ")
+        ),
+        parameters.to_vec(),
+    )
+}
+
+/// `("parameter", "is")` or `("parameters", "are")`, so a refusal that names one
+/// member and one that names several read the same way.
+fn plural(count: usize) -> (&'static str, &'static str) {
+    if count == 1 {
+        ("parameter", "is")
+    } else {
+        ("parameters", "are")
+    }
+}
+
+/// Why Amazon Data Lifecycle Manager refuses one of the schedules `details`
+/// carries, or `None` when every one of them states its creation and retention
+/// rules in a form the documentation admits.
+///
+/// Two documented either/or rules, neither of them expressible in the model,
+/// judged on EVERY element of `Schedules` (`@length(min: 1, max: 4)`) so a
+/// policy is refused for whichever of its schedules carries the fault:
+///
+/// * `CreateRule` — "You must specify either CronExpression, or Interval,
+///   IntervalUnit, and Times." A schedule states when to create in exactly one
+///   of the two forms: neither form, both forms, or an interval form missing a
+///   member it names, are each refused.
+/// * `RetainRule` — "You can retain snapshots based on either a count or a time
+///   interval. Count-based retention: You must specify Count ... Age-based
+///   retention: You must specify Interval and IntervalUnit." A retention rule
+///   states exactly one of the two modes.
+pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<InvalidRequestException> {
+    details?
+        .schedules
+        .as_ref()?
+        .iter()
+        .enumerate()
+        .find_map(|(position, schedule)| {
+            let label = schedule_label(position, schedule);
+            let path = schedule_path(position);
+            create_rule_violation(&label, &path, schedule.create_rule.as_ref()).or_else(|| {
+                schedule
+                    .retain_rule
+                    .as_ref()
+                    .and_then(|rule| retain_rule_violation(&label, &path, rule))
+            })
+        })
+}
+
+/// Why a schedule's creation rule is refused, or `None` when it states when to
+/// create in exactly one of the two documented forms.
+///
+/// `Times` is not required of the interval form even though the sentence names
+/// it: its own documentation gives it a default ("If you do not specify a time,
+/// Amazon Data Lifecycle Manager selects a time within the next 24 hours"), so a
+/// rule that omits it still says when to create.
+fn create_rule_violation(
+    label: &str,
+    path: &str,
+    rule: Option<&CreateRule>,
+) -> Option<InvalidRequestException> {
+    let cron_based = rule.is_some_and(|rule| rule.cron_expression.is_some());
+    let interval = rule.and_then(|rule| rule.interval);
+    let interval_unit = rule.and_then(|rule| rule.interval_unit.as_deref());
+    // Any one of the interval form's three members states the schedule as an
+    // interval, whether or not the other two are there.
+    let interval_based = interval.is_some()
+        || interval_unit.is_some()
+        || rule.is_some_and(|rule| rule.times.as_ref().is_some_and(|times| !times.is_empty()));
+
+    match (cron_based, interval_based) {
+        (true, true) => Some(parameters_cannot_be_combined(
+            format!(
+                "Interval based CreateRule and Cron based CreateRule cannot both be present in \
+                 schedule {{{label}}}."
+            ),
+            stated_members(
+                &format!("{path}.CreateRule"),
+                [
+                    ("CronExpression", true),
+                    ("Interval", interval.is_some()),
+                    ("IntervalUnit", interval_unit.is_some()),
+                    (
+                        "Times",
+                        rule.is_some_and(|rule| {
+                            rule.times.as_ref().is_some_and(|times| !times.is_empty())
+                        }),
+                    ),
+                ],
+            ),
+        )),
+        (false, false) => Some(required_in_schedule(
+            label,
+            vec![format!("{path}.CreateRule")],
+            "a schedule states when to create either as a CronExpression or as an Interval and \
+             IntervalUnit",
+        )),
+        (false, true) => {
+            let omitted = omitted_members(
+                &format!("{path}.CreateRule"),
+                [
+                    ("Interval", interval.is_some()),
+                    ("IntervalUnit", interval_unit.is_some()),
+                ],
+            );
+            (!omitted.is_empty()).then(|| {
+                required_in_schedule(
+                    label,
+                    omitted,
+                    "an interval based CreateRule states both Interval and IntervalUnit",
+                )
+            })
+        }
+        (true, false) => None,
+    }
+}
+
+/// Why a schedule's retention rule is refused, or `None` when it states exactly
+/// one of the two documented retention modes.
+///
+/// A retention interval of [`UNSET_RULE_INTERVAL`] is the value this service
+/// itself materializes for a rule that stated none, so it is not a time interval
+/// the request asked for: a unit, or any other interval, is what states the
+/// age-based mode.
+fn retain_rule_violation(
+    label: &str,
+    path: &str,
+    rule: &RetainRule,
+) -> Option<InvalidRequestException> {
+    let count_based = rule.count.is_some();
+    let age_based = rule.interval_unit.is_some()
+        || rule.interval.is_some_and(|value| value != UNSET_RULE_INTERVAL);
+
+    match (count_based, age_based) {
+        (true, true) => Some(parameters_cannot_be_combined(
+            format!(
+                "Count based RetainRule and interval based RetainRule cannot both be present in \
+                 schedule {{{label}}}."
+            ),
+            stated_members(
+                &format!("{path}.RetainRule"),
+                [
+                    ("Count", true),
+                    ("Interval", rule.interval.is_some()),
+                    ("IntervalUnit", rule.interval_unit.is_some()),
+                ],
+            ),
+        )),
+        (false, false) => Some(required_in_schedule(
+            label,
+            vec![format!("{path}.RetainRule")],
+            "a RetainRule retains either based on a Count or based on an Interval and \
+             IntervalUnit",
+        )),
+        (false, true) => {
+            let omitted = omitted_members(
+                &format!("{path}.RetainRule"),
+                [
+                    ("Interval", rule.interval.is_some()),
+                    ("IntervalUnit", rule.interval_unit.is_some()),
+                ],
+            );
+            (!omitted.is_empty()).then(|| {
+                required_in_schedule(
+                    label,
+                    omitted,
+                    "age based retention states both Interval and IntervalUnit",
+                )
+            })
+        }
+        (true, false) => None,
+    }
+}
+
+/// The wire paths of the members of `path` that are STATED, for the
+/// `MutuallyExclusiveParameters` of a refusal.
+fn stated_members<const N: usize>(path: &str, members: [(&str, bool); N]) -> Vec<String> {
+    members
+        .into_iter()
+        .filter(|(_, stated)| *stated)
+        .map(|(name, _)| format!("{path}.{name}"))
+        .collect()
+}
+
+/// The wire paths of the members of `path` that are OMITTED, for the
+/// `RequiredParameters` of a refusal.
+fn omitted_members<const N: usize>(path: &str, members: [(&str, bool); N]) -> Vec<String> {
+    members
+        .into_iter()
+        .filter(|(_, stated)| !*stated)
+        .map(|(name, _)| format!("{path}.{name}"))
+        .collect()
+}
+
+/// The `InvalidRequestException` for a schedule that omitted `parameters` the
+/// form its rule states requires. `why` is the rule the requirement comes from,
+/// and the message names the schedule, which is what tells a caller which of its
+/// schedules to correct.
+fn required_in_schedule(
+    label: &str,
+    parameters: Vec<String>,
+    why: &str,
+) -> InvalidRequestException {
+    let (noun, verb) = plural(parameters.len());
+    let message = format!(
+        "The {noun} {} {verb} required in schedule {{{label}}}: {why}.",
+        parameters.join(", ")
+    );
+    required_parameters_omitted(message, parameters)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

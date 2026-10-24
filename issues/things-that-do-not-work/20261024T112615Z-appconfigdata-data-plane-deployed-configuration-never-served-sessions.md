@@ -1,0 +1,99 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: appconfigdata.appconfigdata-first-poll-returns-deployed-configuration appconfigdata.appconfigdata-start-session-poll-interval-out-of-range-rejected appconfigdata.early-poll-rejected-when-minimum-interval-requested appconfigdata.environment-deletion-does-not-immediately-break-active-session-or-new-session appconfigdata.same-named-profile-across-applications-does-not-cross-deliver appconfig__appconfigdata.appconfig-hierarchy-round-trips-and-omits-validators appconfig__appconfigdata.logical-id-shaped-application-identifier-rejected appconfigdata.start-session-unknown-identifier-rejected-per-resource-type appconfigdata.corrupted-configuration-token-rejected-with-problem-detail appconfigdata.start-session-missing-permission-access-denied appconfigdata.appconfigdata-empty-configuration-profile-first-poll-returns-empty
+Issue-Key: appconfigdata|GetLatestConfiguration|ResourceNotFoundException
+Issue-Key: appconfigdata.start-session-unknown-identifier-rejected-per-resource-type|_error_response#14|AssertionError|raise AssertionError(
+Issue-Key: appconfigdata.corrupted-configuration-token-rejected-with-problem-detail|run#20|AssertionError|assert problem == "Corrupted", (
+Issue-Key: appconfigdata.start-session-missing-permission-access-denied|_client_error#12|AssertionError|raise AssertionError(f"the call was expected to be refused but succeeded: {result!r}")
+Issue-Key: appconfigdata|ListDeployments|NotImplemented
+Issue-Commit: 6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8
+
+# AppConfigData data plane: deployed configuration never served, sessions minted for unknown resources, no Details discriminator, no authorization, and ListDeployments is a stub (5 causes)
+
+> _Note: this issue was identified against the code base at commit `6b8dcd825499bdd91675cbbb3bc6eaac525bf5b8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetLatestConfiguration
+
+## Description
+Five distinct root causes in the bootstrapped appconfigdata surface (plus one appconfig control-plane stub that only appconfigdata checks hit), every one grounded in a replayed behavioral check. They are numbered Cause 1 of 5 .. Cause 5 of 5; close ALL FIVE before submitting and re-replay every check id listed in trace_ids.
+
+AppConfigData has exactly two operations (Smithy sdkId AppConfigData, protocol restJson1): StartConfigurationSession (POST /configurationsessions, success 201) and GetLatestConfiguration (GET /configuration, success 200). Both model BadRequestException (400), ResourceNotFoundException (404), InternalServerException (500) and ThrottlingException (429).
+
+NOTE ON OVERLAP: the open issue 20261023T163610Z-appconfigdata-session-and-poll-surface-errors-lack-modeled.md describes the same emulator surface from WIRE fixtures (its Cause 3 is the unreachable deployed configuration, its Cause 2 the session minted for a nonexistent application, its Cause 1 the missing Details discriminator). That issue carries no behavioral replay key, so none of the check ids below are bound to it; Causes 1-3 here bind them, and Causes 4-5 are net-new behavior it does not describe at all.
+
+=== Cause 1 of 5: GetLatestConfiguration answers 404 'No deployed configuration found' after the control plane reports the deployment COMPLETE ===
+AWS: once a hosted configuration version has been deployed to an environment, StartConfigurationSession on (application, environment, configuration profile) returns 201 with an InitialConfigurationToken, and GetLatestConfiguration with that token returns HTTP 200 with the configuration bytes as the HTTP payload plus the poll headers (Smithy: GetLatestConfigurationResponse members Configuration @httpPayload blob (sensitive), NextPollConfigurationToken @httpHeader Next-Poll-Configuration-Token, NextPollIntervalInSeconds @httpHeader Next-Poll-Interval-In-Seconds, ContentType @httpHeader Content-Type, VersionLabel @httpHeader Version-Label; http 200). The identifiers may be ids OR names.
+Emulator: GetLatestConfiguration refuses with ResourceNotFoundException, HTTP 404, message of the form "No deployed configuration found for application '<app>', environment '<env>' and configuration profile '<profile>'" (recorded example: application 'ho65pb1', environment 'algcbw8', configuration profile 'tn20ygr'; one check saw the profile referenced by name, 'sim2real-acd-shared-profile-...'). This happens even though the same check's appconfig deployment reached State COMPLETE and the session token was issued, so the data plane serves nothing at all: the single operation the service exists for never succeeds.
+Why: total failure of the data plane. Any client that starts a session and polls gets a not-found instead of its configuration, and because no NextPollConfigurationToken is returned the poll chain cannot continue either. Every downstream behavior (poll-interval enforcement, version-label reporting, isolation between same-named profiles in different applications) is unobservable.
+Fix: the GetLatestConfiguration handler and the session state it reads - resolve the token to its session, look up the latest COMPLETE deployment for that application/environment/configuration-profile triple in appconfig state (accepting ids and names for each identifier), and serve the stored content as the httpPayload with ContentType, VersionLabel, a fresh NextPollConfigurationToken and NextPollIntervalInSeconds.
+Traces: appconfigdata.appconfigdata-first-poll-returns-deployed-configuration, appconfigdata.appconfigdata-start-session-poll-interval-out-of-range-rejected, appconfigdata.early-poll-rejected-when-minimum-interval-requested, appconfigdata.environment-deletion-does-not-immediately-break-active-session-or-new-session, appconfigdata.same-named-profile-across-applications-does-not-cross-deliver, and the two cross-service checks appconfig__appconfigdata.appconfig-hierarchy-round-trips-and-omits-validators and appconfig__appconfigdata.logical-id-shaped-application-identifier-rejected (both reach their appconfig assertions and then fail on this GetLatestConfiguration 404).
+
+=== Cause 2 of 5: StartConfigurationSession mints a session for identifiers that do not exist, and never says WHICH one was missing ===
+AWS: the three identifiers are @required and are resolved against appconfig state; an unresolvable one is refused with ResourceNotFoundException, HTTP 404, and the envelope names the resource (Smithy: ResourceNotFoundException httpError 404, members Message, ResourceType -> ResourceType enum {Application, ConfigurationProfile, Deployment, Environment, Configuration}, ReferencedBy -> StringMap of the request parameters that referenced the missing resource). Breaking exactly one identifier at a time must yield ResourceType 'Application' / 'Environment' / 'ConfigurationProfile' respectively, with ReferencedBy = {<the offending request member>: <value sent>}, and no InitialConfigurationToken in the response.
+Emulator: the call SUCCEEDS with HTTP 201 and returns an InitialConfigurationToken (observed body {'InitialConfigurationToken': '672d4bb6...'}), for all three single-broken-identifier variants against an otherwise working, deployed hierarchy. No 404, no ResourceType, no ReferencedBy.
+Why: the emulator mints a usable token for a hierarchy that does not exist, so a typo surfaces later (or never) rather than at session start, and a cross-application read of another application's profile is not refused. Negative tests pass in the emulator and fail against AWS.
+Fix: StartConfigurationSession's handler must resolve ApplicationIdentifier, EnvironmentIdentifier and ConfigurationProfileIdentifier (and the parent-child relationship between them) in appconfig state before creating a session, and refuse an unresolvable one with the modeled ResourceNotFoundException (404), setting ResourceType to the enum member for the missing level and ReferencedBy to the request member that named it.
+Traces: appconfigdata.start-session-unknown-identifier-rejected-per-resource-type.
+
+=== Cause 3 of 5: the BadRequestException for a corrupted ConfigurationToken carries Reason but no Details.InvalidParameters ===
+AWS: GetLatestConfiguration with a token the service never issued is refused with BadRequestException, HTTP 400, and the envelope says why in structured form (Smithy: BadRequestException members Message, Reason -> BadRequestReason, Details -> BadRequestDetails, a union whose InvalidParameters member is a map of parameter name -> InvalidParameterDetail{Problem}; InvalidParameterProblem values are Corrupted, Expired, PollIntervalNotSatisfied). For a garbage token the entry is Details.InvalidParameters.ConfigurationToken = {'Problem': 'Corrupted'}. An EMPTY ConfigurationToken is a missing-parameter refusal instead and must carry NO Details union.
+Emulator: status 400, code BadRequestException and Reason 'InvalidParameters' are correct (those assertions passed), but the body carries no Details member - Details.InvalidParameters.ConfigurationToken.Problem reads None where 'Corrupted' is required.
+Why: Details.InvalidParameters[<param>].Problem is the modeled way for a polling client to tell 'restart the session' (Corrupted/Expired) from 'back off and retry the same token' (PollIntervalNotSatisfied). With Details absent every bad-token case looks identical and a long-poll loop cannot choose. The message text is only an example; the structured discriminator is the requirement.
+Fix: GetLatestConfiguration's token-validation path and the appconfigdata error serializer - populate Details.InvalidParameters with an entry keyed by the offending input member ('ConfigurationToken') whose Problem is the modeled enum value for the failure actually detected, while keeping Details absent for a required/empty-member validation refusal.
+Traces: appconfigdata.corrupted-configuration-token-rejected-with-problem-detail.
+
+=== Cause 4 of 5: StartConfigurationSession is served for a principal with no appconfig permissions ===
+AWS: appconfigdata calls are sigv4-authenticated and authorized; a principal with no identity-based allow for appconfig:StartConfigurationSession is denied by IAM's implicit deny - AccessDeniedException, HTTP 403, with the standard request-derived message naming the principal, the action appconfig:StartConfigurationSession and the application/environment/configuration resource ARN (that message is built mechanically from the request, so the rule is the requirement, not the recorded sentence). Recorded behavior: the check creates a role with a trust policy and NO permission policy, assumes it, and the scoped-down client is refused while the fully permissioned principal succeeds against the identical triple.
+Emulator: the restricted client's start_configuration_session SUCCEEDS with HTTP 201 and an InitialConfigurationToken (observed {'InitialConfigurationToken': '41cb45c4...'}); no AccessDeniedException is ever returned, so the check's credential-propagation wait never sees a denial.
+Why: authorization is not enforced on the data plane, so least-privilege regressions cannot be caught in the emulator: a negative test asserting that an unpermissioned role is denied passes against AWS and fails here, and any code path gated on AccessDeniedException is never exercised.
+Fix: the appconfigdata request authorization layer (the sigv4 principal resolution plus the appconfig action authorization it consults) - deny StartConfigurationSession for a principal with no allow for appconfig:StartConfigurationSession with AccessDeniedException/403 built from the caller identity, the action and the target resource ARN.
+Traces: appconfigdata.start-session-missing-permission-access-denied.
+
+=== Cause 5 of 5: ListDeployments is an unimplemented scaffold stub, so the first-poll-of-an-empty-profile check cannot run ===
+AWS: ListDeployments (appconfig control plane, GET /applications/{ApplicationId}/environments/{EnvironmentId}/deployments) returns the environment's deployment summaries - an empty Items list for an environment with no deployment. The operation belongs to appconfig; it is listed here because only this appconfigdata check hits it, and the check id's leading token is appconfigdata.
+Emulator: answers HTTP 501 with error code 'NotImplemented' and message 'operation ListDeployments is scaffolded but not implemented in this emulator'. The handler services/service-com-amazonaws-appconfig-amazonappconfig/src/ops/list_deployments.rs still carries the '//! SCAFFOLDED, NOT IMPLEMENTED:' marker and returns Scaffolded::not_implemented. No open issue names ListDeployments.
+Why: a client (or a check) that enumerates deployments to decide whether a profile has ever been deployed gets a server-fault 501 instead of a list, so the 'empty configuration profile, first poll returns empty' behavior cannot be reached at all.
+Fix: implement the operation in its handler file against appconfig deployment state and delete that file's SCAFFOLDED marker line; a 501 is correct for a stub, so do not change the stub's error, implement the operation.
+Traces: appconfigdata.appconfigdata-empty-configuration-profile-first-poll-returns-empty.
+
+## Evidence
+Behavioral replay of suite simparity-behavioral-ga-prod-v1 against the booted emulator (13 checks, 0 passed, 4 mismatched, 9 errored, 0 skipped; the emulator answered every request, so this is not a bootstrap failure). No failing check was marked ALREADY FILED or OWNED by an open issue.
+
+Cause 1 - seven checks fail on the same refusal, e.g.
+  appconfigdata.appconfigdata-first-poll-returns-deployed-configuration:
+    botocore.errorfactory.ResourceNotFoundException: An error occurred (ResourceNotFoundException) when calling the GetLatestConfiguration operation: No deployed configuration found for application 'ho65pb1', environment 'algcbw8' and configuration profile 'tn20ygr'.
+  appconfigdata.same-named-profile-across-applications-does-not-cross-deliver: identical, with configuration profile 'sim2real-acd-shared-profile-0bc6c974b96a'.
+  Same refusal in appconfigdata.appconfigdata-start-session-poll-interval-out-of-range-rejected, appconfigdata.early-poll-rejected-when-minimum-interval-requested, appconfigdata.environment-deletion-does-not-immediately-break-active-session-or-new-session, appconfig__appconfigdata.appconfig-hierarchy-round-trips-and-omits-validators and appconfig__appconfigdata.logical-id-shaped-application-identifier-rejected. In the delete-profile check in the same run the appconfig deployment DID report State 'COMPLETE', so the control plane completes the deployment while the data plane cannot find it.
+
+Cause 2 - appconfigdata.start-session-unknown-identifier-rejected-per-resource-type [mismatch]:
+  AssertionError: the call was expected to be REJECTED but SUCCEEDED, returning {'ResponseMetadata': {'HTTPStatusCode': 201, ...}, 'InitialConfigurationToken': '672d4bb6d65d8aeafb1a8df5d4f7e04f301d412e89b5e26e87797e0c910a6594'}
+  The check breaks exactly one of ApplicationIdentifier / EnvironmentIdentifier / ConfigurationProfileIdentifier against a working deployed hierarchy and asserts code ResourceNotFoundException, HTTP 404, ResourceType in {Application, Environment, ConfigurationProfile} and ReferencedBy == {<member>: <value>}; the first variant already returns 201.
+
+Cause 3 - appconfigdata.corrupted-configuration-token-rejected-with-problem-detail [mismatch]:
+  AssertionError: Details.InvalidParameters.ConfigurationToken.Problem was None, expected 'Corrupted'. Without it a client cannot tell 'restart the session' from 'retry later', and BadRequestException alone says both
+  The preceding assertions on code=BadRequestException, status=400 and Reason='InvalidParameters' passed, so only the Details union is missing.
+
+Cause 4 - appconfigdata.start-session-missing-permission-access-denied [mismatch]:
+  AssertionError: the call was expected to be refused but succeeded: {'ResponseMetadata': {'HTTPStatusCode': 201, ...}, 'InitialConfigurationToken': '41cb45c4e807593a03a111e500a3a8f3aeca3b8ee5aa9b592d59bd186f18f009'}
+  raised from _wait_past_credential_propagation_lag, i.e. the denial never appeared for an assumed role carrying no permission policy.
+
+Cause 5 - appconfigdata.appconfigdata-empty-configuration-profile-first-poll-returns-empty [error]:
+  botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the ListDeployments operation: operation ListDeployments is scaffolded but not implemented in this emulator
+  Confirmed in the checkout: services/service-com-amazonaws-appconfig-amazonappconfig/src/ops/list_deployments.rs line 4 carries '//! SCAFFOLDED, NOT IMPLEMENTED:'.
+
+Smithy consulted: services/service-com-amazonaws-appconfigdata-appconfigdata/smithy-model/com-amazonaws-appconfigdata-appconfigdata.json - GetLatestConfiguration (GET /configuration, 200) and StartConfigurationSession (POST /configurationsessions, 201); shapes GetLatestConfigurationResponse, ResourceNotFoundException (404, Message/ResourceType/ReferencedBy), BadRequestException (400, Message/Reason/Details), BadRequestDetails (union, InvalidParameters map), InvalidParameterDetail{Problem}, InvalidParameterProblem {Corrupted, Expired, PollIntervalNotSatisfied}, ResourceType {Application, ConfigurationProfile, Deployment, Environment, Configuration}.
+
+## Steps to Reproduce
+Boot the emulator and point an appconfig client and an appconfigdata client at its data listener (region and credentials are irrelevant except for Cause 4).
+
+Cause 1: create_application -> create_environment -> create_configuration_profile(LocationUri='hosted') -> create_deployment_strategy(DeploymentDurationInMinutes=0, GrowthFactor=100, FinalBakeTimeInMinutes=0, ReplicateTo='NONE') -> create_hosted_configuration_version(Content=b'{"useNewBackend": true}') -> start_deployment and poll get_deployment until State == 'COMPLETE' -> start_configuration_session(ApplicationIdentifier=app, EnvironmentIdentifier=env, ConfigurationProfileIdentifier=profile) -> get_latest_configuration(ConfigurationToken=token). Expected HTTP 200 whose payload is the deployed bytes plus Next-Poll-Configuration-Token / Next-Poll-Interval-In-Seconds / Content-Type / Version-Label; the emulator raises ResourceNotFoundException (404) 'No deployed configuration found for application ...'. Re-replay the seven check ids in trace_ids.
+
+Cause 2: with that working hierarchy in place, call start_configuration_session three times, each time replacing exactly ONE of the three identifiers with a name that does not exist. Each must raise ResourceNotFoundException / 404 with ResourceType = Application | Environment | ConfigurationProfile and ReferencedBy = {<that request member>: <bogus value>} and must return no InitialConfigurationToken; the emulator returns 201 with a token.
+
+Cause 3: get_latest_configuration(ConfigurationToken='<a token the emulator never issued>'). Status 400 / BadRequestException / Reason 'InvalidParameters' are already right; assert Details.InvalidParameters.ConfigurationToken.Problem == 'Corrupted' - it is absent. Then get_latest_configuration(ConfigurationToken='') and assert Details is ABSENT for that missing-parameter refusal.
+
+Cause 4: iam.create_role with a trust policy allowing the account root and NO permission policy, sts.assume_role it, build an appconfigdata client from the returned credentials and call start_configuration_session on the working triple. Expected AccessDeniedException / HTTP 403 naming the principal and appconfig:StartConfigurationSession; the emulator returns 201 with a token.
+
+Cause 5: appconfig list_deployments(ApplicationId=<app>, EnvironmentId=<env>) for an environment with no deployment. Expected a 200 with an empty Items list; the emulator answers 501 'NotImplemented'.
