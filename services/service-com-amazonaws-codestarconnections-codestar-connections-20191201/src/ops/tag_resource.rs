@@ -153,12 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modeled member is a `ResourceArn`; an ARN naming no stored resource is not
         // taggable. See `state::holds_resource`.
         if !store.holds_resource(&input.resource_arn) {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Could not find resource {}", input.resource_arn)),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::absent_resource_message(&input.resource_arn)),
+                }),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
         }
         // A resource holds at most as many tags as one request could set
         // (`TagList` is modeled `len 0..200`), so repeated merges cannot grow it past

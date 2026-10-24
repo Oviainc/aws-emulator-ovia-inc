@@ -180,6 +180,29 @@ pub(crate) fn error_message(response: &Value) -> String {
         .to_string()
 }
 
+/// The wording an ARN that resolves to no CONNECTION reads, as a LITERAL: the point of
+/// asserting it is to pin what a client reads, so it must not be read back out of the
+/// constant the handler writes. It is a FIXED sentence — the recorded wire does not echo
+/// the ARN back here, unlike the host and repository-link refusals.
+const NO_SUCH_CONNECTION_MESSAGE: &str = "No connection exists with the ARN";
+
+/// The wording an ARN that resolves to no resource reads, worded for the KIND the ARN
+/// names: a tag operation's `ResourceArn` may address a host or a repository link as well
+/// as a connection, and each kind reads as the operations that own it word it.
+fn absent_resource_message(resource_arn: &str) -> String {
+    match resource_arn.rsplit(':').next().and_then(|resource| {
+        resource
+            .split_once('/')
+            .map(|(resource_type, _)| resource_type)
+    }) {
+        Some("host") => format!("No host exists with the ARN: {resource_arn}"),
+        Some("repository-link") => {
+            format!("No repository link exists with the ARN: {resource_arn}")
+        }
+        _ => NO_SUCH_CONNECTION_MESSAGE.to_string(),
+    }
+}
+
 /// Assert `arn` is a connection ARN of the modeled form
 /// `^arn:aws(-[\w]+)*:.+:.+:[0-9]{12}:.+$`, in this request's region, whose resource is
 /// `connection/<uuid>`.
@@ -343,6 +366,9 @@ async fn a_created_connection_round_trips_through_get_for_every_provider_type() 
 async fn each_connection_gets_its_own_arn_and_keeps_its_host_arn() {
     let emulator = Emulator::new();
 
+    // A `HostArn` is resolved against the host store, so the hosts these rows name are
+    // put there first; `host_reference_resolution.rs` pins what happens when they are
+    // not.
     let cases = [
         ("no host", None),
         // A host-backed connection resolves its `HostArn` against the host store, so
@@ -737,7 +763,11 @@ async fn delete_removes_the_connection_and_its_tags() {
         "a deleted connection was still listed"
     );
 
-    // Every reader of the deleted ARN now answers 404, including a second delete.
+    // Every reader of the deleted ARN now answers the modelled absence, including a
+    // second delete: `ResourceNotFoundException`, at the status the live service answers
+    // an absent resource with (`state::RESOURCE_NOT_FOUND_STATUS`, 400, not the shape's
+    // `@httpError(404)`) and in the service's own fixed wording, which does not echo the
+    // ARN back.
     let readers: Vec<(&str, Value)> = vec![
         ("GetConnection", json!({ "ConnectionArn": doomed })),
         ("DeleteConnection", json!({ "ConnectionArn": doomed })),
@@ -754,13 +784,18 @@ async fn delete_removes_the_connection_and_its_tags() {
     for (operation, body) in readers {
         let (status, response) = emulator.call(operation, body).await;
         assert_eq!(
-            status, 404,
-            "case {operation:?}: expected 404 for a deleted ARN, got {status} {response:?}"
+            status, 400,
+            "case {operation:?}: expected 400 for a deleted ARN, got {status} {response:?}"
         );
         assert_eq!(
             error_code(&response),
             "ResourceNotFoundException",
             "case {operation:?}: wrong error code in {response:?}"
+        );
+        assert_eq!(
+            error_message(&response),
+            NO_SUCH_CONNECTION_MESSAGE,
+            "case {operation:?}: wrong message in {response:?}"
         );
     }
 
@@ -774,10 +809,11 @@ async fn delete_removes_the_connection_and_its_tags() {
     );
 }
 
-/// RULE: an ARN naming no stored connection is a `ResourceNotFoundException` (404) on
-/// every operation that addresses one, whatever the ARN looks like.
+/// RULE: an ARN naming no stored connection is this service's `ResourceNotFoundException`
+/// on every operation that addresses one, whatever the ARN looks like — at the status and
+/// with the wording the service answers it with.
 #[tokio::test]
-async fn an_arn_naming_no_connection_is_a_404() {
+async fn an_arn_naming_no_connection_is_refused_as_not_found() {
     let emulator = Emulator::new();
     // Create one connection so state is non-empty: the 404 must come from the lookup,
     // not from an empty store.
@@ -798,29 +834,51 @@ async fn an_arn_naming_no_connection_is_a_404() {
     ];
 
     for arn in &unknown_arns {
-        for (operation, body) in [
-            ("GetConnection", json!({ "ConnectionArn": arn })),
-            ("DeleteConnection", json!({ "ConnectionArn": arn })),
-            ("ListTagsForResource", json!({ "ResourceArn": arn })),
+        // A CONNECTION reader addresses a connection whatever the ARN looks like, so it
+        // words its refusal as a connection's; a TAG operation addresses a resource of
+        // any kind, so it words the kind the ARN names.
+        for (operation, body, wording) in [
+            (
+                "GetConnection",
+                json!({ "ConnectionArn": arn }),
+                NO_SUCH_CONNECTION_MESSAGE.to_string(),
+            ),
+            (
+                "DeleteConnection",
+                json!({ "ConnectionArn": arn }),
+                NO_SUCH_CONNECTION_MESSAGE.to_string(),
+            ),
+            (
+                "ListTagsForResource",
+                json!({ "ResourceArn": arn }),
+                absent_resource_message(arn),
+            ),
             (
                 "TagResource",
                 json!({ "ResourceArn": arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
+                absent_resource_message(arn),
             ),
             (
                 "UntagResource",
                 json!({ "ResourceArn": arn, "TagKeys": ["k"] }),
+                absent_resource_message(arn),
             ),
         ] {
             let case = format!("{operation} {arn}");
             let (status, response) = emulator.call(operation, body).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404, got {status} {response:?}"
+                status, 400,
+                "case {case:?}: expected 400, got {status} {response:?}"
             );
             assert_eq!(
                 error_code(&response),
                 "ResourceNotFoundException",
                 "case {case:?}: wrong error code in {response:?}"
+            );
+            assert_eq!(
+                error_message(&response),
+                wording,
+                "case {case:?}: wrong message in {response:?}"
             );
         }
     }
@@ -865,6 +923,84 @@ async fn a_connection_name_outside_the_modeled_bounds_is_refused() {
     );
 }
 
+/// RULE: a modelled error is answered at the status this service answers that condition
+/// with, and the body's `__type` carries the error code a client branches on — while the
+/// scaffold's "not written yet" signal keeps its own 501, which no modelled error may be
+/// confused with. One row per error this service can be made to answer cheaply, spanning
+/// three different `@httpError` values in the model (404, 429, and the request walk's own
+/// 400).
+///
+/// `ResourceNotFoundException` is answered at 400 rather than at its modelled 404: see
+/// `state::RESOURCE_NOT_FOUND_STATUS` for the recorded wire behind that, and
+/// `LimitExceededException` beside it for a modelled status this service does keep.
+#[tokio::test]
+async fn every_modeled_error_is_answered_at_the_status_this_service_answers_it_with() {
+    let emulator = Emulator::new();
+    let absent = format!(
+        "arn:aws:codestar-connections:{REGION}:{ACCOUNT_ID}:connection/00000000-0000-0000-0000-000000000000"
+    );
+    let present = emulator
+        .create(
+            "seed",
+            json!({
+                "ConnectionName": "seed",
+                "ProviderType": "GitHub",
+                // Filled to `TagList`'s modeled maximum, so the one key added below
+                // takes the merge past the per-resource bound and is refused with
+                // `LimitExceededException` rather than by the boundary validator.
+                "Tags": (0..codestar::state::MAX_TAGS_PER_RESOURCE)
+                    .map(|index| json!({ "Key": format!("k{index}"), "Value": "v" }))
+                    .collect::<Vec<Value>>(),
+            }),
+        )
+        .await;
+
+    // (case, operation, body, expected status, expected __type)
+    let rows: Vec<(&str, &str, Value, u16, &str)> = vec![
+        (
+            "ResourceNotFoundException, modeled @httpError(404), answered at 400",
+            "GetConnection",
+            json!({ "ConnectionArn": absent }),
+            400,
+            "ResourceNotFoundException",
+        ),
+        (
+            "LimitExceededException, modeled @httpError(429)",
+            "TagResource",
+            json!({ "ResourceArn": present, "Tags": [{ "Key": "overflow", "Value": "v" }] }),
+            429,
+            "LimitExceededException",
+        ),
+        (
+            "the request walk refusing an absent required member",
+            "GetConnection",
+            json!({}),
+            400,
+            "ValidationException",
+        ),
+        (
+            "the scaffold's own signal keeps 501",
+            "ListSyncConfigurations",
+            json!({ "RepositoryLinkId": "00000000-0000-0000-0000-000000000000", "SyncType": "CFN_STACK_SYNC" }),
+            501,
+            "NotImplemented",
+        ),
+    ];
+
+    for (case, operation, body, expected_status, expected_code) in rows {
+        let (status, response) = emulator.call(operation, body).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} {response:?}"
+        );
+        assert_eq!(
+            error_code(&response),
+            expected_code,
+            "case {case:?}: wrong error code in {response:?}"
+        );
+    }
+}
+
 /// RULE: the number of connections one emulator holds is bounded, and a create past
 /// the bound is refused with the `LimitExceededException` the model declares for it —
 /// so repeated creates cannot grow state without limit.
@@ -884,6 +1020,8 @@ async fn creating_past_the_connection_bound_is_refused_with_the_modeled_error() 
     }
 
     // Two attempts past the bound: the refusal is the steady state, not a one-off.
+    // `LimitExceededException` is modeled `@httpError(429)`, and the error CODE in
+    // `__type` is what tells one client error from another, so that is asserted too.
     for attempt in 0..2 {
         let case = format!("past-bound-{attempt}");
         let (status, response) = emulator

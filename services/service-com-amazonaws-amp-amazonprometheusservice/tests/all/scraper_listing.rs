@@ -21,7 +21,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 /// One seeded scraper. `scraperId` is what the listing orders and pages by.
-fn scraper(
+///
+/// `pub(crate)` with the three shape helpers below, because `scraper_deletion` seeds the
+/// same stored record through the same engine: a second copy of this builder is a second
+/// set of rules about what a stored scraper looks like.
+pub(crate) fn scraper(
     scraper_id: &str,
     alias: Option<&str>,
     status_code: &str,
@@ -49,11 +53,13 @@ fn scraper(
         destination,
         role_configuration: None,
         exporters: Vec::new(),
+        transition_due: None,
+        delete_token: None,
     }
 }
 
 /// An EKS cluster source, named by the ARN the `sourceArn` filter matches on.
-fn eks_source(cluster: &str) -> Source {
+pub(crate) fn eks_source(cluster: &str) -> Source {
     Source::eksConfiguration(EksConfiguration {
         cluster_arn: format!(
             "arn:aws:eks:us-west-2:{}:cluster/{cluster}",
@@ -66,7 +72,7 @@ fn eks_source(cluster: &str) -> Source {
 
 /// An Amazon Managed Service for Prometheus destination, named by the workspace ARN the
 /// `destinationArn` filter matches on.
-fn workspace_destination(workspace_id: &str) -> Destination {
+pub(crate) fn workspace_destination(workspace_id: &str) -> Destination {
     Destination::ampConfiguration(AmpConfiguration {
         workspace_arn: format!(
             "arn:aws:aps:us-west-2:{}:workspace/{workspace_id}",
@@ -77,7 +83,7 @@ fn workspace_destination(workspace_id: &str) -> Destination {
 
 /// A CloudWatch dataset destination — the union's other variant, so the
 /// `destinationArn` filter is exercised on both.
-fn dataset_destination(dataset: &str) -> Destination {
+pub(crate) fn dataset_destination(dataset: &str) -> Destination {
     Destination::cloudWatchConfiguration(CloudWatchConfiguration {
         dataset_arn: format!(
             "arn:aws:cloudwatch:us-west-2:{}:dataset/{dataset}",
@@ -86,8 +92,9 @@ fn dataset_destination(dataset: &str) -> Destination {
     })
 }
 
-/// The `scraperId`s a listing reported, in the order it reported them.
-fn listed(body: &serde_json::Value) -> Vec<String> {
+/// The `scraperId`s a listing reported, in the order it reported them. `pub(crate)` for
+/// the same reason the seeding helpers are: the deletion suite reads a listing back too.
+pub(crate) fn listed(body: &serde_json::Value) -> Vec<String> {
     body["scrapers"]
         .as_array()
         .map(|entries| {

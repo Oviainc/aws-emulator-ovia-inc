@@ -284,6 +284,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             relationship_status: crate::state::RELATIONSHIP_CREATED.to_string(),
                             invited_at_millis: None,
                             updated_at_millis: now,
+                            // The member account's detector starts in the
+                            // configuration a detector created without a
+                            // `Features` list gets; `UpdateMemberDetectors` is
+                            // what the administrator changes it with.
+                            features: crate::state::default_features(now),
                         },
                     );
                 }

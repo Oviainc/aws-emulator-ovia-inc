@@ -68,6 +68,8 @@ mod capacity_blocks;
 mod capacity_reservation_billing_requests;
 #[path = "all/capacity_reservation_fleets.rs"]
 mod capacity_reservation_fleets;
+#[path = "all/carrier_gateways.rs"]
+mod carrier_gateways;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
 #[path = "all/copy_volumes.rs"]
