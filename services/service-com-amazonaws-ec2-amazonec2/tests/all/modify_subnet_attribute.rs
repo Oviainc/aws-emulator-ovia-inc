@@ -610,7 +610,8 @@ async fn a_bad_request_is_refused_with_the_ec2_error_code_for_it_and_writes_noth
             vec![param("PrivateDnsHostnameTypeOnLaunch", "instance-name")],
             400,
             // The modelled `HostnameType` enum constraint refuses it BEFORE the handler
-            // runs, the same way `DescribeVpcAttribute`'s `Attribute` is refused.
+            // runs, the same way `DescribeVpcAttribute`'s `Attribute` is refused — with the
+            // boundary's own code for a value outside a declared constraint.
             "ValidationError",
         ),
         (
