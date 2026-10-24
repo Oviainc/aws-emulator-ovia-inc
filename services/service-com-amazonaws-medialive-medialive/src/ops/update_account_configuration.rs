@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! "Update account configuration". The account's MediaLive configuration is not a
+//! resource a caller creates: it exists for every account, so this call CHANGES
+//! the settings the request carries and leaves the rest as they stood, and the
+//! configuration it answers with is read back out of the store — which is what
+//! the next `DescribeAccountConfiguration` answers with too. The store is the
+//! [`crate::state::account_configuration`] slice, keyed by the region the
+//! request was signed for, because MediaLive is a regional service and each
+//! regional endpoint answers for its own region's configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +154,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // What this request asks to SET, as against what it leaves alone: bound
+        // once, because both the syntax check and the store's bound turn on it.
+        let requested_kms_key_id = requested_kms_key_id(&input);
+
+        // Request SYNTAX first, before anything is written: `KmsKeyId` is
+        // "Specify the ARN of a KMS key that you have created. Or leave blank to
+        // use the key that MediaLive creates and manages for you", so a value
+        // that is neither blank nor a KMS key ARN names no key at all — a bad
+        // request rather than a setting to store.
+        if let Some(kms_key_id) = requested_kms_key_id {
+            if !kms_key_id.is_empty() && !crate::state::is_kms_key_arn(kms_key_id) {
+                return Err(not_a_kms_key(kms_key_id));
+            }
+        }
+
+        // The configuration belongs to the account IN THE REGION this request was
+        // signed for, which is the region whose endpoint the caller reached.
+        let region = crate::state::request_region(ctx.parts());
+
+        // ONE lock for the write and the read-back, so the configuration this
+        // call reports is the one it committed rather than one a concurrent
+        // update replaced in between.
+        let mut state = state.lock();
+
+        // The store keeps one record per region and is bounded, so an update loop
+        // over made-up region names cannot grow the emulator's heap without
+        // limit: once it is full, a region it holds no record for gets this
+        // operation's own modelled throttle instead of a new record. A region the
+        // store already holds a record for is never refused, and neither is an
+        // update that SETS nothing — one that omits the parameter, and one that
+        // blanks it, both leave the region without a record, so neither needs
+        // room.
+        let sets_a_parameter = requested_kms_key_id.is_some_and(|key| !key.is_empty());
+        if sets_a_parameter && state.account_configurations_full(&region) {
+            return Err(too_many_regions());
+        }
+
+        // "List of account configuration parameters to update"
+        // (`UpdateAccountConfigurationRequest`): the parameters the request
+        // carries are applied and the ones it omits keep their stored values, so
+        // a request that carries no `AccountConfiguration` at all reports the
+        // configuration unchanged rather than resetting it. The result is read
+        // back out of the store, never built from `input`, so what this update
+        // answers is what the next `DescribeAccountConfiguration` answers.
+        let configuration =
+            state.update_account_configuration(&region, input.account_configuration.as_ref());
+
+        Ok(UpdateAccountConfigurationOutput {
+            account_configuration: Some(configuration),
+        })
     }
+}
+
+/// The `KmsKeyId` this request asks for, if it asks for one at all: `None` both
+/// when the request carries no `AccountConfiguration` and when the configuration
+/// it carries omits the member — in either case the stored key is not being
+/// changed. `Some("")` is the member's documented BLANK, which asks for the key
+/// MediaLive manages and is a change like any other.
+fn requested_kms_key_id(input: &UpdateAccountConfigurationInput) -> Option<&str> {
+    input.account_configuration.as_ref()?.kms_key_id.as_deref()
+}
+
+/// `KmsKeyId` was supplied non-blank but is not the ARN of a KMS key, so it names
+/// nothing this account could encrypt with. The operation's own modelled client
+/// error, with a message built from the request: the member and the value that
+/// broke the rule.
+fn not_a_kms_key(kms_key_id: &str) -> UpdateAccountConfigurationError {
+    UpdateAccountConfigurationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!("KmsKeyId is not the ARN of a KMS key: {kms_key_id}")),
+    })
+    .into()
+}
+
+/// This emulator already holds an account configuration for
+/// [`crate::state::MAX_ACCOUNT_CONFIGURATION_REGIONS`] regions and this request
+/// is signed for another one, so there is no room to record it. The operation's
+/// own modelled throttle, as every other bounded store of this service answers
+/// when it is full.
+fn too_many_regions() -> UpdateAccountConfigurationError {
+    UpdateAccountConfigurationErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        message: Some(format!(
+            "This emulator keeps an account configuration for at most {} regions",
+            crate::state::MAX_ACCOUNT_CONFIGURATION_REGIONS
+        )),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to write the configuration to. A modelled server error,
+/// never a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateAccountConfigurationError {
+    UpdateAccountConfigurationErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

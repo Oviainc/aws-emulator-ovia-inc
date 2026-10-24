@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstanceGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstanceGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstanceGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the persisted instance groups of one cluster, in creation order,
+//! paginating with `Marker`. Every entry is a projection of a
+//! [`crate::state::InstanceGroupRecord`]; nothing is synthesised here.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstanceGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstanceGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::LIST_INSTANCE_GROUPS_PAGE_SIZE;
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInstanceGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A listing reports group state, so every transition the clock already made due
+        // is materialised first: a group whose provisioning span has passed is RUNNING,
+        // and the groups of a cluster whose termination came due have ENDED.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ListInstanceGroupsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The marker is the id of the first group the previous page did not report, so a
+        // page boundary survives groups being added between calls.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstanceGroups"))
+        // The page's records are taken under the lock and PROJECTED after it is released:
+        // building the wire shapes is caller-driven work that no other request should
+        // wait on.
+        let (page, marker) = {
+            let start = match input.marker.as_ref() {
+                Some(marker) => match cluster.groups.iter().position(|group| group.id == *marker) {
+                    Some(at) => at,
+                    None => {
+                        return Err(ListInstanceGroupsErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                error_code: None,
+                                message: Some(format!("Marker '{marker}' is not valid.")),
+                            },
+                        )
+                        .into())
+                    }
+                },
+                None => 0,
+            };
+            let end = cluster
+                .groups
+                .len()
+                .min(start + LIST_INSTANCE_GROUPS_PAGE_SIZE);
+            (
+                cluster.groups[start..end].to_vec(),
+                cluster.groups.get(end).map(|group| group.id.clone()),
+            )
+        };
+        drop(store);
+
+        let instance_groups: Vec<InstanceGroup> = page
+            .iter()
+            .map(crate::state::InstanceGroupRecord::to_instance_group)
+            .collect();
+
+        Ok(ListInstanceGroupsOutput {
+            instance_groups: Some(instance_groups),
+            marker,
+        })
     }
 }

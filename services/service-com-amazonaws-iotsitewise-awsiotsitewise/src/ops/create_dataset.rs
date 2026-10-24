@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below mints (or honours the caller-supplied id of) a
+//! dataset, persists it in this service's store with the configuration, metadata
+//! and source the request carries, and starts the `CREATING` -> `ACTIVE`
+//! transition the call owes, so a later `DescribeDataset` reports exactly what was
+//! written here.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +186,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDatasetError::Modeled(CreateDatasetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // dataset rather than replaying the first answer. Left to the idempotency
+        // issue, exactly as `CreateAsset` leaves it; nothing is fabricated for it.
+
+        // Where a dataset lives is the caller's to state, and the model states the
+        // rule on `workspaceName` itself: "Required for session and curated datasets.
+        // Omit this field for datasets that connect to an external datasource." It is
+        // checked only when the request names a `datasetType`, since without one
+        // there is nothing that says which side of the rule the dataset falls on.
+        if let Some(dataset_type) = input.dataset_type.as_deref() {
+            let workspace = input.workspace_name.is_some();
+            match (dataset_type, workspace) {
+                (DATASET_TYPE_EXTERNAL, true) => {
+                    return Err(invalid_request(format!(
+                        "workspaceName must be omitted for a {DATASET_TYPE_EXTERNAL} dataset."
+                    )));
+                }
+                (DATASET_TYPE_SESSION | DATASET_TYPE_CURATED, false) => {
+                    return Err(invalid_request(format!(
+                        "workspaceName is required for a {dataset_type} dataset."
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The store is bounded: a create is the only thing that adds a dataset and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.datasets.len() >= crate::state::MAX_DATASETS {
+            return Err(CreateDatasetError::Modeled(
+                CreateDatasetErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} datasets.",
+                        crate::state::MAX_DATASETS
+                    ),
+                }),
+            ));
+        }
+
+        // A caller-supplied id names the dataset this create would make, so an id a
+        // stored dataset already holds is a collision on that dataset's own identity;
+        // an absent one is minted.
+        let dataset_id = match input.dataset_id.clone() {
+            Some(id) => {
+                if let Some(existing) = store.datasets.get(&id) {
+                    return Err(already_exists(existing));
+                }
+                id
+            }
+            None => loop {
+                let candidate = crate::state::new_id();
+                if !store.datasets.contains_key(&candidate) {
+                    break candidate;
+                }
+            },
+        };
+
+        let record = crate::state::DatasetRecord {
+            id: dataset_id.clone(),
+            arn: crate::state::dataset_arn(&region, &dataset_id),
+            name: input.dataset_name.clone(),
+            description: input.dataset_description.clone(),
+            dataset_type: input.dataset_type.clone(),
+            config: input.dataset_config.clone(),
+            metadata: input.metadata.clone().unwrap_or_default(),
+            source: input.dataset_source.clone(),
+            workspace_name: input.workspace_name.clone(),
+            creation_date: now,
+            last_update_date: now,
+            // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            settling_state: crate::state::STATE_CREATING.to_string(),
+            version: crate::state::DATASET_INITIAL_VERSION,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateDatasetOutput {
+            dataset_id: record.id.clone(),
+            dataset_arn: record.arn.clone(),
+            dataset_status: record.status(now),
+        };
+
+        store.datasets.insert(record.id.clone(), record);
+
+        Ok(output)
     }
 }
+
+/// The `DatasetTypeEnum` values this handler's `workspaceName` rule is keyed on.
+/// Source: `smithy_query(query="shape", shape="DatasetTypeEnum")` — SESSION,
+/// CURATED, EXTERNAL, the enum's whole value list.
+const DATASET_TYPE_SESSION: &str = "SESSION";
+/// See [`DATASET_TYPE_SESSION`].
+const DATASET_TYPE_CURATED: &str = "CURATED";
+/// See [`DATASET_TYPE_SESSION`].
+const DATASET_TYPE_EXTERNAL: &str = "EXTERNAL";
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateDatasetError {
+    CreateDatasetError::Modeled(CreateDatasetErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the dataset the create
+/// collided with: its own stored id and the ARN it was minted with, never one
+/// rebuilt from this request's region.
+fn already_exists(existing: &crate::state::DatasetRecord) -> CreateDatasetError {
+    CreateDatasetError::Modeled(CreateDatasetErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message: crate::state::already_using_message("dataset", "ID"),
+            resource_id: existing.id.clone(),
+            resource_arn: existing.arn.clone(),
+        },
+    ))
+}
+

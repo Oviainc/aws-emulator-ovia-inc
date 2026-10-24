@@ -44,7 +44,7 @@ pub(crate) fn user_pool_arn(pool: &str) -> String {
 }
 
 /// `CreateAuthorizer` on `api` with `request`.
-async fn create_authorizer(gateway: &Gateway, api: &str, request: Value) -> Answer {
+pub(crate) async fn create_authorizer(gateway: &Gateway, api: &str, request: Value) -> Answer {
     gateway
         .call("POST", &format!("/restapis/{api}/authorizers"), Some(request))
         .await
@@ -82,7 +82,7 @@ pub(crate) async fn created_authorizer(
 
 /// A TOKEN authorizer request carrying every member that type requires, so a case that
 /// varies one member varies only that one.
-fn token_request(name: &str) -> Value {
+pub(crate) fn token_request(name: &str) -> Value {
     json!({
         "name": name,
         "type": "TOKEN",
