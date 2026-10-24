@@ -4,6 +4,12 @@
 //!
 //! The WorkSpace Instance lifecycle is backed here: every value an operation
 //! returns is read out of one of these records, never built from the request.
+//!
+//! This service is REGIONAL, so every resource here carries the Region it belongs to
+//! (the one its create call was signed for, [`request_region`]) and every lookup takes
+//! the Region of the request making it: an account's resources in one Region are not
+//! reachable, countable or mutable from another, and the Regions the service serves
+//! them in are the ones it reports as supporting it ([`SUPPORTED_REGIONS`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -74,7 +80,13 @@ pub const WORKSPACE_INSTANCE_QUOTA_CODE: &str = "L-WorkSpaceInstancesPerAccount"
 /// this is the emulator's own stable identifier for the quota it enforces.
 pub const VOLUME_QUOTA_CODE: &str = "L-VolumesPerAccount";
 
-/// The number of RUNNING WorkSpace Instances this emulator will hold at once.
+/// The number of RUNNING WorkSpace Instances this emulator will hold at once IN ONE
+/// REGION.
+///
+/// A Service Quotas limit applies to one account in one Region, so this is counted per
+/// Region ([`ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState::running_instance_count`]
+/// takes the Region the create was signed for): instances in another Region leave this
+/// Region's capacity untouched.
 ///
 /// A real account has a Service Quotas limit on running WorkSpace Instances, and
 /// `CreateWorkspaceInstance` models `ServiceQuotaExceededException` (HTTP 402) for
@@ -96,8 +108,9 @@ pub const VOLUME_QUOTA_CODE: &str = "L-VolumesPerAccount";
 /// is what keeps that bounded.
 pub const MAX_INSTANCES: usize = 500;
 
-/// The number of WorkSpace Instance RECORDS this emulator will hold at once, counting
-/// the ones that are tearing down and so no longer count against [`MAX_INSTANCES`].
+/// The number of WorkSpace Instance RECORDS this emulator will hold at once in one
+/// Region, counting the ones that are tearing down and so no longer count against
+/// [`MAX_INSTANCES`].
 ///
 /// CHOSEN, like [`MAX_INSTANCES`], and for the same purpose: a caller that creates and
 /// deletes in a tight loop leaves behind records that are still reported for
@@ -107,7 +120,7 @@ pub const MAX_INSTANCES: usize = 500;
 /// `ServiceQuotaExceededException`, never by exhausting memory.
 pub const MAX_HELD_INSTANCES: usize = 2 * MAX_INSTANCES;
 
-/// The number of volumes this emulator will hold at once.
+/// The number of volumes this emulator will hold at once in one Region.
 ///
 /// As with [`MAX_INSTANCES`], a real account has a Service Quotas limit on volumes
 /// and `CreateVolume` models `ServiceQuotaExceededException` (HTTP 402) for reaching
@@ -201,6 +214,12 @@ pub const DEFAULT_INSTANCE_TYPES_MAX_RESULTS: usize = 600;
 /// (`smithy_query(query="shape",shape="ValidationExceptionReason")`, mirrored by the
 /// generated [`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
 pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// The `ValidationExceptionReason` this service reports when the request names no
+/// member this service can fault, because it is the CALL that this service cannot
+/// serve — a create addressed to a Region the service is not available in. A value of
+/// the same modelled enum as [`VALIDATION_REASON_FIELD_VALIDATION_FAILED`].
+pub const VALIDATION_REASON_UNSUPPORTED_OPERATION: &str = "UNSUPPORTED_OPERATION";
 
 // ---------------------------------------------------------------------------
 // The instance-type catalog
@@ -1088,6 +1107,33 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// Whether this service is available in Region `region`: whether the Region is one of
+/// the [`SUPPORTED_REGIONS`] `ListRegions` reports.
+///
+/// A caller reads that set to decide where it may deploy, so the Regions the service
+/// serves resources in are exactly the Regions it reports as supporting it — a Region
+/// outside the set (another partition, or a commercial Region the service has not
+/// launched in) has no endpoint of this service and so holds none of its resources.
+pub fn is_supported_region(region: &str) -> bool {
+    SUPPORTED_REGIONS.contains(&region)
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a create addressed to a Region
+/// this service is not available in ([`is_supported_region`]).
+///
+/// `Reason` is [`VALIDATION_REASON_UNSUPPORTED_OPERATION`] and `FieldList` is absent:
+/// no member of the request is at fault — the Region travels in the credential scope —
+/// so there is no member to name, and the wording states the rule without echoing what
+/// the caller sent.
+pub fn region_not_supported() -> ValidationException {
+    ValidationException {
+        message: "this service is not available in the Region the request was signed for"
+            .to_string(),
+        reason: VALIDATION_REASON_UNSUPPORTED_OPERATION.to_string(),
+        field_list: None,
+    }
+}
+
 /// The letters an AWS Region's Availability Zones are named with.
 ///
 /// A zone's name is its Region's name followed by a letter, counting from `a`
@@ -1255,6 +1301,13 @@ pub fn volume_type_spec(volume_type: &str) -> Option<&'static VolumeTypeSpec> {
 pub struct WorkspaceInstanceRecord {
     /// The minted `wsinst-…` id, matching `^wsinst-[0-9a-zA-Z]{8,63}$`.
     pub id: String,
+    /// The Region this instance lives in: the one the create call that made it was
+    /// signed for ([`request_region`]).
+    ///
+    /// This service is REGIONAL, so the record belongs to that Region alone and is
+    /// listed, read, tagged and deleted only through it; a call signed for any other
+    /// Region sees an account that does not hold this instance.
+    pub region: String,
     /// A `ProvisionStateEnum` value — see [`PROVISION_STATE_ALLOCATING`].
     pub provision_state: String,
     /// The `ManagedInstance` configuration exactly as supplied at create time. Held
@@ -1348,6 +1401,11 @@ impl WorkspaceInstanceRecord {
 pub struct VolumeRecord {
     /// The minted `vol-…` id, matching `^vol-[0-9a-zA-Z]{1,63}$`.
     pub id: String,
+    /// The Region this volume lives in: the one the create call that made it was
+    /// signed for ([`request_region`]), which is also the Region
+    /// [`Self::availability_zone`] names a zone of. Like a WorkSpace Instance, the
+    /// volume is reachable only through that Region.
+    pub region: String,
     /// The `AvailabilityZone` the volume was created in (a required member).
     pub availability_zone: String,
     /// `SizeInGB`, inside the modelled `range 1..16384` when present.
@@ -1401,17 +1459,23 @@ pub enum TokenOutcome {
     Mismatch(String),
 }
 
-/// Resolve a create's `ClientToken` against the claims this service already holds.
+/// Resolve a create's `ClientToken` against the claims this service already holds for
+/// the Region the create was signed for.
 ///
 /// The ONE place the idempotency decision is made, so every `@idempotent` create of
 /// this service tells a retry from a reuse the same way: a token is matched on the
-/// token AND the fingerprint of the request's parameters, never on the token alone.
+/// Region, the token AND the fingerprint of the request's parameters, never on the
+/// token alone. The Region is part of the key because what the token created is
+/// regional — the same token at another Region's endpoint asks that Region for a
+/// resource it does not hold, so it creates one there rather than replaying this one.
 pub fn resolve_client_token(
-    claims: &BTreeMap<String, IdempotencyClaim>,
+    claims: &BTreeMap<(String, String), IdempotencyClaim>,
+    region: &str,
     token: Option<&str>,
     fingerprint: &str,
 ) -> TokenOutcome {
-    let Some(claim) = token.and_then(|token| claims.get(token)) else {
+    let Some(claim) = token.and_then(|token| claims.get(&(region.to_string(), token.to_string())))
+    else {
         return TokenOutcome::Unclaimed;
     };
     if claim.fingerprint == fingerprint {
@@ -1477,21 +1541,33 @@ pub fn idempotent_parameter_mismatch(resource_id: &str, resource_type: &str) -> 
 /// id order, which is what makes `ListWorkspaceInstances`' `NextToken` resume at a
 /// well-defined place: ids are minted from `id_counter` zero-padded, so id order
 /// is creation order.
+///
+/// Every resource here carries the Region it belongs to, and every lookup below takes
+/// the Region of the request making it: this service is regional, so one store holds
+/// each Region's resources side by side without any of them being reachable from
+/// another Region.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
-    /// Every live WorkSpace Instance, keyed by its `wsinst-…` id.
+    /// Every live WorkSpace Instance, keyed by its `wsinst-…` id. The id is minted
+    /// from the one account-wide [`Self::id_counter`], so it is unique across Regions
+    /// and the Region a record belongs to is the one on the record itself.
     pub instances: BTreeMap<String, WorkspaceInstanceRecord>,
-    /// `ClientToken` -> the [`IdempotencyClaim`] `CreateWorkspaceInstance` spent it
-    /// on: the instance id to replay, and the fingerprint of the request that minted
-    /// it, so a token reused for different parameters is refused rather than replayed.
-    pub client_tokens: BTreeMap<String, IdempotencyClaim>,
-    /// Every live volume, keyed by its `vol-…` id.
+    /// (Region, `ClientToken`) -> the [`IdempotencyClaim`] `CreateWorkspaceInstance`
+    /// spent that token on in that Region: the instance id to replay, and the
+    /// fingerprint of the request that minted it, so a token reused for different
+    /// parameters is refused rather than replayed.
+    ///
+    /// Keyed by Region as well as token because the resource a token creates is
+    /// regional: the same token presented to another Region's endpoint is a create
+    /// for a Region that holds nothing yet, not a retry of this one.
+    pub client_tokens: BTreeMap<(String, String), IdempotencyClaim>,
+    /// Every live volume, keyed by its `vol-…` id, each carrying its own Region.
     pub volumes: BTreeMap<String, VolumeRecord>,
-    /// `ClientToken` -> the [`IdempotencyClaim`] `CreateVolume` spent it on. A
-    /// separate namespace from [`Self::client_tokens`]: a token is scoped to the
+    /// (Region, `ClientToken`) -> the [`IdempotencyClaim`] `CreateVolume` spent it on.
+    /// A separate namespace from [`Self::client_tokens`]: a token is scoped to the
     /// create call that carried it, so a volume token can never replay an instance
     /// id (the two ids are not even the same shape).
-    pub volume_client_tokens: BTreeMap<String, IdempotencyClaim>,
+    pub volume_client_tokens: BTreeMap<(String, String), IdempotencyClaim>,
     /// Source of the unique `wsinst-…` / `i-…` identifiers.
     pub id_counter: u64,
 }
@@ -1509,23 +1585,41 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
         (format!("wsinst-{n:016x}"), format!("i-{n:017x}"))
     }
 
-    /// Apply every clock-due transition, then hand back the record for `id`.
+    /// Apply every clock-due transition, then hand back Region `region`'s record for
+    /// `id`.
     ///
-    /// `None` both for an id this service never minted and for one whose teardown has
-    /// taken it past [`DEALLOCATED_RETENTION`]: a torn-down record that the clock has
-    /// already made due for removal is removed here, so a reporting operation answers
-    /// not-found for it rather than reporting a resource the service would have
-    /// forgotten by now.
-    pub fn settled(&mut self, id: &str, now: Instant) -> Option<&WorkspaceInstanceRecord> {
-        self.settled_mut(id, now).map(|record| &*record)
+    /// `None` for an id this service never minted, for one whose teardown has taken it
+    /// past [`DEALLOCATED_RETENTION`] (a torn-down record the clock has already made
+    /// due for removal is removed here, so a reporting operation answers not-found for
+    /// it rather than reporting a resource the service would have forgotten by now),
+    /// and for one whose record belongs to ANOTHER Region: that instance is not one
+    /// this Region's endpoint holds, so every operation looking it up here answers
+    /// exactly as it does for an id that was never minted.
+    pub fn settled(
+        &mut self,
+        region: &str,
+        id: &str,
+        now: Instant,
+    ) -> Option<&WorkspaceInstanceRecord> {
+        self.settled_mut(region, id, now).map(|record| &*record)
     }
 
     /// [`Self::settled`] for an operation that goes on to CHANGE the record.
-    pub fn settled_mut(&mut self, id: &str, now: Instant) -> Option<&mut WorkspaceInstanceRecord> {
+    pub fn settled_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+        now: Instant,
+    ) -> Option<&mut WorkspaceInstanceRecord> {
         // The clock-due work is done under its own borrow, so the forgotten record can
         // be dropped (which needs the store again) before the record is handed back.
+        // The Region is checked FIRST: a call signed for another Region must not even
+        // settle this record, since to that caller the instance does not exist.
         let forgotten = {
             let record = self.instances.get_mut(id)?;
+            if record.region != region {
+                return None;
+            }
             record.settle(now);
             record.is_forgotten(now)
         };
@@ -1554,30 +1648,48 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
 
     /// Stop reporting a torn-down record: the record goes, and so does the
     /// `ClientToken` of the create that made it, since replaying that token must not
-    /// hand back an id the service no longer knows.
+    /// hand back an id the service no longer knows. The claim is retired under the
+    /// Region the record belonged to, which is the Region that create was signed for.
     fn forget(&mut self, id: &str) {
         if let Some(removed) = self.instances.remove(id) {
             if let Some(token) = removed.client_token {
-                self.client_tokens.remove(&token);
+                self.client_tokens.remove(&(removed.region, token));
             }
         }
     }
 
-    /// The instances that count against the running-instance quota: every stored
-    /// record no delete has been accepted for. See [`MAX_INSTANCES`].
-    pub fn running_instance_count(&self) -> usize {
+    /// The instances of Region `region` that count against the running-instance quota:
+    /// every record of that Region no delete has been accepted for. See
+    /// [`MAX_INSTANCES`].
+    ///
+    /// Per Region as well as per account: a Service Quotas limit applies to one
+    /// account in one Region, so instances in another Region leave this one's capacity
+    /// untouched.
+    pub fn running_instance_count(&self, region: &str) -> usize {
         self.instances
             .values()
-            .filter(|record| !record.is_tearing_down())
+            .filter(|record| record.region == region && !record.is_tearing_down())
             .count()
     }
 
-    /// Whether another instance fits inside BOTH bounds this service keeps: the
-    /// running-instance quota [`MAX_INSTANCES`], and [`MAX_HELD_INSTANCES`] on the
-    /// records held in total, so a create/delete burst cannot grow the store without
-    /// bound through the records teardown leaves reported.
-    pub fn has_instance_capacity(&self) -> bool {
-        self.running_instance_count() < MAX_INSTANCES && self.instances.len() < MAX_HELD_INSTANCES
+    /// The records Region `region` holds in total, counting the ones that are tearing
+    /// down and so no longer count against [`MAX_INSTANCES`]. See
+    /// [`MAX_HELD_INSTANCES`].
+    pub fn held_instance_count(&self, region: &str) -> usize {
+        self.instances
+            .values()
+            .filter(|record| record.region == region)
+            .count()
+    }
+
+    /// Whether another instance fits inside BOTH bounds this service keeps for Region
+    /// `region`: the running-instance quota [`MAX_INSTANCES`], and
+    /// [`MAX_HELD_INSTANCES`] on the records held in total, so a create/delete burst
+    /// cannot grow the store without bound through the records teardown leaves
+    /// reported.
+    pub fn has_instance_capacity(&self, region: &str) -> bool {
+        self.running_instance_count(region) < MAX_INSTANCES
+            && self.held_instance_count(region) < MAX_HELD_INSTANCES
     }
 
     /// Mint the next `vol-…` volume id.
@@ -1591,9 +1703,41 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
         format!("vol-{:017x}", self.id_counter)
     }
 
-    /// Whether another volume fits inside [`MAX_VOLUMES`].
-    pub fn has_volume_capacity(&self) -> bool {
-        self.volumes.len() < MAX_VOLUMES
+    /// Whether another volume fits inside [`MAX_VOLUMES`] for Region `region`.
+    pub fn has_volume_capacity(&self, region: &str) -> bool {
+        self.volume_count(region) < MAX_VOLUMES
+    }
+
+    /// The volumes Region `region` holds: what that Region's volume quota is counted
+    /// against, per account AND per Region like the instance quota above.
+    pub fn volume_count(&self, region: &str) -> usize {
+        self.volumes
+            .values()
+            .filter(|record| record.region == region)
+            .count()
+    }
+
+    /// Take Region `region`'s volume `id` out of the store, as `DeleteVolume` does.
+    ///
+    /// `None` both for an id this service never minted and for one whose volume
+    /// belongs to another Region: that volume is not one this Region's endpoint holds,
+    /// so the delete answers not-found and the volume itself is left untouched.
+    ///
+    /// The `ClientToken` of the create that made the volume is retired WITH the record,
+    /// exactly as [`Self::forget`] retires an instance's: replaying that token must not
+    /// hand back an id the service no longer knows, and a claim that outlived its
+    /// resource would let a create/delete cycle grow the claim map without bound even
+    /// though [`MAX_VOLUMES`] holds.
+    pub fn remove_volume(&mut self, region: &str, id: &str) -> Option<VolumeRecord> {
+        if self.volumes.get(id)?.region != region {
+            return None;
+        }
+        let removed = self.volumes.remove(id)?;
+        if let Some(token) = removed.client_token.clone() {
+            self.volume_client_tokens
+                .remove(&(removed.region.clone(), token));
+        }
+        Some(removed)
     }
 }
 
@@ -1614,12 +1758,14 @@ pub fn is_workspace_instance_id(candidate: &str) -> bool {
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would
 /// pass [`MAX_INSTANCES`]. Every member the model marks `@required` is filled.
 ///
-/// The quota is account-scoped and no instance was created, so `ResourceId` names the
-/// subject the quota applies to — this emulator's account.
+/// The quota is scoped to one account in one Region and no instance was created, so
+/// `ResourceId` names the subject the quota applies to — this emulator's account —
+/// and `held` is what that account holds in the Region the create was signed for.
 pub fn instance_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
         message: format!(
-            "the account already holds {held} WorkSpace Instances, the maximum for this quota"
+            "the account already holds {held} WorkSpace Instances in this Region, the maximum \
+             for this quota"
         ),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: WORKSPACE_INSTANCE_RESOURCE_TYPE.to_string(),
@@ -1814,11 +1960,15 @@ pub fn volume_not_found_error<E>(
 }
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would
-/// pass [`MAX_VOLUMES`]. The quota is account-scoped and no volume was created, so
-/// `ResourceId` names the subject the quota applies to — this emulator's account.
+/// pass [`MAX_VOLUMES`]. The quota is scoped to one account in one Region and no
+/// volume was created, so `ResourceId` names the subject the quota applies to — this
+/// emulator's account — and `held` is what it holds in the Region the create was
+/// signed for.
 pub fn volume_quota_exceeded(held: usize) -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
-        message: format!("the account already holds {held} volumes, the maximum for this quota"),
+        message: format!(
+            "the account already holds {held} volumes in this Region, the maximum for this quota"
+        ),
         resource_id: ::engine::emulator_account_id().to_string(),
         resource_type: VOLUME_RESOURCE_TYPE.to_string(),
         service_code: SERVICE_CODE.to_string(),
