@@ -6,7 +6,9 @@
 //! `crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_policies`, so
 //! `GetResourcePolicy` afterwards reports no document and the access the policy granted is
 //! gone. Idempotent: the operation models no not-found failure, so deleting a policy that
-//! is not there succeeds and removes nothing.
+//! is not there succeeds and removes nothing — which is also the answer for a resource
+//! that cannot carry a policy at all (see
+//! [`crate::state::parse_policy_attachable_arn`]).
 //!
 //! ## Shape of an operation
 //!
@@ -147,11 +149,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // A string that is not an ARN of this service names no resource at all, which is a
-        // bad request rather than a resource that carries no policy.
-        if crate::state::parse_resource_arn(&input.resource_arn).is_none() {
+        // A string that names no resource these operations address at all is a bad request
+        // rather than a resource that carries no policy.
+        if crate::state::parse_policy_resource_arn(&input.resource_arn).is_none() {
             return Err(DeleteResourcePolicyErrorModeled::ValidationException(
-                crate::state::malformed_resource_arn(crate::state::FIELD_RESOURCE_ARN),
+                crate::state::malformed_policy_resource_arn(crate::state::FIELD_RESOURCE_ARN),
             )
             .into());
         }
