@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read of this account's package catalog
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::packages`]): it reports the
+//! record `CreatePackage` persisted under that name, member for member.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPackage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPackageErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // A pure read of the package catalog: the record is cloned out and reported,
+        // and a name the catalog does not hold is a 404, never a hollow 200.
+        let store = state.lock();
+        let package = store.packages.get(&input.package_name).ok_or_else(|| {
+            GetPackageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("Package {} does not exist", input.package_name)),
+            })
+        })?;
+
+        Ok(GetPackageOutput {
+            package_name: Some(package.package_name.clone()),
+            package_arn: Some(package.package_arn.clone()),
+            description: package.description.clone(),
+            default_version_name: package.default_version_name.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(package.creation_date)),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(
+                package.last_modified_date,
+            )),
+        })
     }
 }

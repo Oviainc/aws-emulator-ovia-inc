@@ -49,6 +49,11 @@
 //! never updated it still has one (fleet indexing disabled), which is why the field
 //! has a default and the reader never has to create what it reports.
 //!
+//! It also holds the account's SOFTWARE PACKAGES, keyed by `packageName` for the same
+//! reason: the name is the package's identity and the `@httpLabel` of
+//! `/packages/{packageName}`. One record carries everything a reader hands back, so
+//! `GetPackage` after `CreatePackage` returns the created package member-for-member.
+//!
 //! Finally it holds the account's COMMANDS, keyed by `commandId` ("A unique
 //! identifier for the command", and the `@httpLabel` of `/commands/{commandId}`),
 //! whose EXISTENCE the IoT Jobs data plane also needs — `StartCommandExecution`
@@ -404,6 +409,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// this command exist?". Both are bounded by
     /// [`iot_commands::MAX_REGISTERED_COMMANDS`].
     pub commands: BTreeMap<String, RegisteredCommand>,
+    /// Every software package that exists, keyed by `packageName`.
+    ///
+    /// The name is the package's identity — the model binds it as the `@httpLabel` of
+    /// `/packages/{packageName}` on every single-package operation — so a `BTreeMap`
+    /// keyed by name is the package catalog itself. `BTreeMap` (not `HashMap`) because
+    /// `ListPackages` is `@paginated` and a page boundary is only meaningful over a
+    /// stable order.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_PACKAGES`] is the ceiling
+    /// `CreatePackage` refuses past.
+    pub packages: BTreeMap<String, RegisteredPackage>,
     /// The account's FLEET INDEXING configuration — one record, read by
     /// `GetIndexingConfiguration` and replaced by `UpdateIndexingConfiguration`.
     ///
@@ -1798,4 +1814,95 @@ pub fn parse_string_date_time(value: &str) -> Option<i64> {
 /// How many characters a civil date-time given to MINUTE precision has
 /// (`yyyy-MM-ddTHH:mm`), the form `TimeFilter`'s members document.
 const MINUTE_PRECISION_LENGTH: usize = "yyyy-MM-ddTHH:mm".len();
+
+/// The ARN of a software package:
+/// `arn:aws:iot:<region>:<account>:package/<packageName>`.
+///
+/// `package/` is the resource type AWS IoT's Software Package Catalog ARNs use — it
+/// is what an `iot:GetPackage` policy statement names and what
+/// `CreatePackage$packageArn` / `GetPackage$packageArn` report (`PackageArn` is an
+/// opaque string in the model, `smithy_query(query="shape",shape="PackageArn")`, so
+/// the form comes from the service's documented ARN layout); the namespace and
+/// account segments are the ones [`thing_arn`] documents.
+pub fn package_arn(region: &str, package_name: &str) -> String {
+    ::emulator_server::emulator_arn("iot", region, &format!("package/{package_name}"))
+}
+
+/// How many software packages this emulator keeps for the account.
+///
+/// AWS publishes a service quota on an account's packages; the exact figure is not in
+/// the model, so this is the emulator's own ceiling on a store a caller can grow —
+/// the same reason [`MAX_AUTHORIZERS`] exists — and `CreatePackage` past it refuses
+/// with the modelled `ServiceQuotaExceededException` ("Service quota has been
+/// exceeded", HTTP 402) rather than growing without bound.
+pub const MAX_PACKAGES: usize = 500;
+
+/// One software package in the package catalog, as this service persists it.
+///
+/// A package is a NAME plus the description of what it contains and which of its
+/// versions is the default: the name is its identity — the model binds it as the
+/// `@httpLabel` of `/packages/{packageName}` on every single-package operation — and
+/// the rest is what `GetPackage` reports member for member, so a reader clones this
+/// record and the writer and the reader cannot drift.
+///
+/// `description` and `default_version_name` stay `Option` because ABSENT is
+/// distinguishable from a value: a package created without a summary has no
+/// description, and a package with no version promoted yet has no default version
+/// (`CreatePackage` names none at all — `UpdatePackage$defaultVersionName` is what
+/// sets one).
+#[derive(Debug, Clone)]
+pub struct RegisteredPackage {
+    /// The name the package was created under; also its key in the catalog.
+    pub package_name: String,
+    /// `arn:aws:iot:<region>:<account>:package/<packageName>`, minted on create.
+    pub package_arn: String,
+    /// "A summary of the package being created", when the create carried one.
+    pub description: Option<String>,
+    /// "The name of the default package version", once one is promoted. A create
+    /// promotes none.
+    pub default_version_name: Option<String>,
+    /// "Metadata that can be used to manage the package", keyed by tag key —
+    /// `TagMap` is a map, so the key is the identity and a `BTreeMap` keeps one
+    /// stable order for every reader.
+    pub tags: BTreeMap<String, String>,
+    /// The `clientToken` the create carried, when it carried one.
+    ///
+    /// `CreatePackage$clientToken` is "A unique case-sensitive identifier that you
+    /// can provide to ensure the idempotency of the request. Don't reuse this client
+    /// token if a new idempotent request is required", so a repeat of the create that
+    /// minted this record — same name, same token — is that one request arriving
+    /// twice and answers from the record instead of conflicting with it.
+    pub client_token: Option<String>,
+    /// "The date that the package was created" (`PackageSummary$creationDate`).
+    pub creation_date: SystemTime,
+    /// "The date that the package was last updated"
+    /// (`PackageSummary$lastModifiedDate`). A package nobody has updated was last
+    /// modified when it was created.
+    pub last_modified_date: SystemTime,
+}
+
+impl RegisteredPackage {
+    /// Record a package created now: the name and ARN are its identity, the
+    /// description and tags are what the create supplied, no version is default yet,
+    /// and both dates are the instant of the create.
+    pub fn new(
+        package_name: String,
+        package_arn: String,
+        description: Option<String>,
+        tags: BTreeMap<String, String>,
+        client_token: Option<String>,
+        created_at: SystemTime,
+    ) -> Self {
+        Self {
+            package_name,
+            package_arn,
+            description,
+            default_version_name: None,
+            tags,
+            client_token,
+            creation_date: created_at,
+            last_modified_date: created_at,
+        }
+    }
+}
 
