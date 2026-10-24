@@ -123,6 +123,8 @@ mod relational_database_snapshot_listing;
 mod relational_database_start_stop;
 #[path = "all/relational_database_update.rs"]
 mod relational_database_update;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]

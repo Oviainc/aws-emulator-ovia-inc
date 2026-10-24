@@ -204,8 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A profile keeps its identity across puts — same name, same ARN, same
         // creation time — and gains a version per put, so the version this call
-        // returns is new even for a name that already exists.
-        let existing = store.profiles.get(&input.profile_name);
+        // returns is new even for a name that already exists. "Same name" is
+        // per REGION: this put re-versions the profile of this region's endpoint,
+        // and creates a new one when only another region holds that name.
+        let existing = store.profile(&region, &input.profile_name);
         let created_at = existing.map_or(now, |profile| profile.created_at);
         let mut versions = existing
             .map(|profile| profile.versions.clone())
@@ -263,10 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The answer is read back out of the store, so what this call reports is
         // exactly what a later Get, List or StartSigningJob resolves.
         let profile_name = record.profile_name.clone();
-        store.profiles.insert(profile_name.clone(), record);
+        store.insert_profile(&region, record);
         let stored = store
-            .profiles
-            .get(&profile_name)
+            .profile(&region, &profile_name)
             .expect("the profile just inserted is in the store");
         Ok(PutSigningProfileOutput {
             arn: Some(stored.arn.clone()),

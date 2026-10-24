@@ -254,3 +254,5 @@ mod cloudformation_provisions_cloudwatch_metric_streams;
 mod cloudformation_provisions_event_rules_and_ssm_parameters;
 #[path = "all/cloudformation_provisions_sfn_activities.rs"]
 mod cloudformation_provisions_sfn_activities;
+#[path = "all/cloudformation_provisions_s3vectors_resources.rs"]
+mod cloudformation_provisions_s3vectors_resources;

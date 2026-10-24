@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 
 // The harness, the base declaration and the stage builders are shared with the
 // create/read suite rather than copied (`tests/all/pipeline_lifecycle.rs`).
-use crate::pipeline_lifecycle::{build_stage, declaration, source_stage, Emulator, ROLE_ARN};
+use crate::pipeline_lifecycle::{
+    build_stage, declaration, reported_stages, source_stage, Emulator, ROLE_ARN,
+};
 
 /// A cross-region `artifactStores` map, the other form of artifact store a
 /// declaration can carry (`PipelineDeclaration$artifactStores`).
@@ -192,6 +194,9 @@ async fn an_update_replaces_the_stored_structure_at_the_next_version() {
         expected["version"] = json!(2);
         expected["pipelineType"] = json!(pipeline_type);
         expected["executionMode"] = json!(execution_mode);
+        // An action's artifact lists are reported present, empty where the action
+        // declares none, so the sent stages take that form here too.
+        expected["stages"] = reported_stages(&updated);
         assert_eq!(
             reported, expected,
             "case {case:?}: the stored declaration must be the sent structure with \

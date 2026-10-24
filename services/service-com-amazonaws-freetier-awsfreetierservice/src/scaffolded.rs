@@ -203,9 +203,10 @@ pub enum Scaffolded<E> {
     /// `__type`, the body, the schema and the `awsQueryError` code — so a client
     /// still reads exactly the modeled shape. Reach for this ONLY with recorded
     /// evidence that the service answers a status its model does not declare (see
-    /// [`crate::ops::get_account_plan_state`], where the recorded
-    /// `ResourceNotFoundException` is an HTTP 400 and the model annotates 404),
-    /// never to reclassify an error at will.
+    /// [`resource_not_found`], where the recorded `ResourceNotFoundException` is
+    /// an HTTP 400 and the model annotates 404), never to reclassify an error at
+    /// will. A status restated from recorded evidence belongs to the SERVICE and
+    /// its error shape, so it is stated once here rather than per operation.
     Restated {
         /// The modeled error, rendered as the model declares it.
         modeled: E,
@@ -246,6 +247,25 @@ impl<E> Scaffolded<E> {
     pub fn restated(modeled: E, status: u16) -> Self {
         Self::Restated { modeled, status }
     }
+}
+
+/// The HTTP status this service answers the modeled `ResourceNotFoundException`
+/// with, whichever operation raises it.
+///
+/// The model annotates that shape `@httpError 404`, but every recorded response
+/// of the condition in this service is an HTTP 400 carrying `__type`
+/// `ResourceNotFoundException`. The status an error shape is answered with is a
+/// property of the service and the shape, not of the operation, so it is stated
+/// once here: two operations raising one shape cannot answer two statuses.
+pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
+/// Any operation's modeled not-found error, answered with the status this service
+/// sends for it ([`RESOURCE_NOT_FOUND_STATUS`]).
+///
+/// The shape, the body, the schema and the wire error code stay the modeled ones
+/// — only the status line is restated; see [`Scaffolded::Restated`].
+pub fn resource_not_found<E>(modeled: E) -> Scaffolded<E> {
+    Scaffolded::restated(modeled, RESOURCE_NOT_FOUND_STATUS)
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {

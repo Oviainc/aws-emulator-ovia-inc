@@ -579,7 +579,7 @@ async fn each_optional_parameter_selects_the_stored_payment_requests_it_names() 
             expected: &[0, 1, 2],
         },
         Selector {
-            case: "another agreement type selects nothing",
+            case: "the other agreement type the member admits selects nothing",
             selector: json!({"agreementType": "VendorInsightsAgreement"}),
             expected: &[],
         },

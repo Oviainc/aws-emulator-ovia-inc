@@ -13,7 +13,8 @@
 //! whether a purchase order is linked to each charge". `agreementId`, `agreementType`
 //! and `catalog` select on the agreement; an `agreementId` the store holds no agreement
 //! for is refused as an invalid value for that member, as the sibling listings of this
-//! service refuse it.
+//! service refuse it, and so is an `agreementType` or a `catalog` outside the value set
+//! the service publishes for it.
 //!
 //! ## Shape of an operation
 //!

@@ -27,6 +27,8 @@ mod core_network_lifecycle;
 mod core_network_policy_version_restore;
 #[path = "all/core_network_policy_versions.rs"]
 mod core_network_policy_versions;
+#[path = "all/core_network_prefix_list_association.rs"]
+mod core_network_prefix_list_association;
 #[path = "all/delete_attachment.rs"]
 mod delete_attachment;
 #[path = "all/delete_dependency_refusal.rs"]

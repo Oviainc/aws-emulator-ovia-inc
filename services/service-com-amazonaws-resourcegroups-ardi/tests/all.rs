@@ -23,6 +23,8 @@ mod group_tags;
 mod group_untag;
 #[path = "all/grouping_statuses.rs"]
 mod grouping_statuses;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/resource_group_lifecycle.rs"]
 mod resource_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The MSK Replicator lifecycle (`CreateReplicator`, `DescribeReplicator`), driven
-//! end to end over the same `MultiServiceRouter` the emulator serves from.
+//! The MSK Replicator lifecycle (`CreateReplicator`, `DescribeReplicator`,
+//! `DeleteReplicator`), driven end to end over the same `MultiServiceRouter` the
+//! emulator serves from.
 //!
 //! Each suite asserts a RULE over a TABLE of inputs, not one recorded request. The
 //! rows differ along whatever the rule generalises over: how many Kafka clusters
@@ -19,7 +20,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
     MAX_CLUSTERS_PER_REPLICATOR, MAX_FLOWS_PER_REPLICATOR, MAX_TAGS_PER_REPLICATOR,
-    REPLICATOR_ACTIVATION_DELAY,
+    REPLICATOR_ACTIVATION_DELAY, REPLICATOR_STATE_DELETING,
 };
 
 use crate::kafka_harness::{pct, Emulator, Reply, ACCOUNT, REGION};
@@ -32,6 +33,15 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/MskReplicato
 /// clusters themselves are never created: `CreateReplicator` is asynchronous and
 /// does not resolve them.
 const GHOST_CLUSTER_ID: &str = "11111111-2222-4333-8444-555555555555-1";
+
+/// The message a replicator operation refuses an ARN it cannot resolve with:
+/// MSK's replicator APIs name the INPUT MEMBER at fault and then the service's
+/// fixed not-found sentence (whose apostrophe is U+2019), and say nothing about
+/// the serving endpoint — not the region that looked, and not the ARN itself.
+/// Written out here rather than built from the handler's own helper, so the form
+/// is pinned by the suite instead of by the code under test.
+const NOT_FOUND_MESSAGE: &str =
+    "Invalid parameter replicatorArn: The requested resource doesn\u{2019}t exist.";
 
 /// Sleep past the emulator's own `CREATING` -> `RUNNING` span, so a later read sees
 /// a settled replicator. `std::thread::sleep` because the workspace's tokio carries
@@ -322,6 +332,32 @@ async fn describe_in(emulator: &Emulator, region: &str, arn: &str) -> Reply {
 
 async fn describe(emulator: &Emulator, arn: &str) -> Reply {
     describe_in(emulator, REGION, arn).await
+}
+
+/// `DeleteReplicator` for `arn`, signed for `region`, quoting `current_version`
+/// when the row carries one — the model binds `CurrentVersion` to the
+/// `currentVersion` query parameter.
+async fn delete_in(
+    emulator: &Emulator,
+    region: &str,
+    arn: &str,
+    current_version: Option<&str>,
+) -> Reply {
+    let query = current_version
+        .map(|version| format!("?currentVersion={}", pct(version)))
+        .unwrap_or_default();
+    emulator
+        .call_in(
+            region,
+            "DELETE",
+            &format!("/replication/v1/replicators/{}{query}", pct(arn)),
+            None,
+        )
+        .await
+}
+
+async fn delete(emulator: &Emulator, arn: &str, current_version: Option<&str>) -> Reply {
+    delete_in(emulator, REGION, arn, current_version).await
 }
 
 /// Create `request` and hand back the minted ARN, asserting it succeeded.
@@ -1074,9 +1110,11 @@ async fn a_kafka_cluster_that_identifies_nothing_is_refused() {
     }
 }
 
-/// RULE: a reader refuses a value that is not shaped like a replicator ARN with
-/// HTTP 400 `BadRequestException`, and reserves HTTP 404 `NotFoundException` for a
-/// well-formed ARN this region holds no replicator for.
+/// RULE: a replicator operation refuses a value that is not shaped like a
+/// replicator ARN with HTTP 400 `BadRequestException`, and reserves HTTP 404
+/// `NotFoundException` for a well-formed ARN this region holds no replicator for —
+/// whose message names the INPUT MEMBER that resolved to nothing, followed by the
+/// service's fixed not-found sentence and nothing else.
 #[tokio::test]
 async fn an_unknown_or_malformed_replicator_arn_is_refused() {
     let emulator = Emulator::new();
@@ -1121,25 +1159,55 @@ async fn an_unknown_or_malformed_replicator_arn_is_refused() {
     ];
 
     for (arn, status, code) in &rows {
-        let described = describe(&emulator, arn).await;
-        assert_eq!(
-            (described.status, described.error_code()),
-            (*status, *code),
-            "case arn={arn:?}: expected {status} {code} from DescribeReplicator, got {} {}",
-            described.status,
-            described.body
-        );
+        // Both paths that resolve a replicator by ARN answer the same way: the
+        // reader and the delete.
+        for (operation, reply) in [
+            ("DescribeReplicator", describe(&emulator, arn).await),
+            ("DeleteReplicator", delete(&emulator, arn, None).await),
+        ] {
+            assert_eq!(
+                (reply.status, reply.error_code()),
+                (*status, *code),
+                "case arn={arn:?}: expected {status} {code} from {operation}, got {} {}",
+                reply.status,
+                reply.body
+            );
+            if *status == 404 {
+                assert_eq!(
+                    reply.error_message(),
+                    NOT_FOUND_MESSAGE,
+                    "case arn={arn:?}: {operation}'s refusal must name the parameter at fault, \
+                     got {}",
+                    reply.body
+                );
+            }
+        }
     }
 
     // A replicator belongs to the region it was created in: a regional endpoint
-    // elsewhere answers for it exactly as it does for an ARN nobody ever issued.
-    let elsewhere = describe_in(&emulator, "us-east-1", &present).await;
+    // elsewhere answers for it exactly as it does for an ARN nobody ever issued,
+    // and cannot delete it either.
+    for operation in ["DescribeReplicator", "DeleteReplicator"] {
+        let elsewhere = match operation {
+            "DescribeReplicator" => describe_in(&emulator, "us-east-1", &present).await,
+            _ => delete_in(&emulator, "us-east-1", &present, None).await,
+        };
+        assert_eq!(
+            (elsewhere.status, elsewhere.error_code(), elsewhere.error_message()),
+            (404, "NotFoundException", NOT_FOUND_MESSAGE),
+            "case arn={present:?}: a replicator must be invisible to {operation} outside its \
+             region, got {} {}",
+            elsewhere.status,
+            elsewhere.body
+        );
+    }
+
+    // And none of those refusals touched the replicator that does exist.
+    let still_there = describe(&emulator, &present).await;
     assert_eq!(
-        (elsewhere.status, elsewhere.error_code()),
-        (404, "NotFoundException"),
-        "case arn={present:?}: a replicator must be invisible outside its region, got {} {}",
-        elsewhere.status,
-        elsewhere.body
+        still_there.status, 200,
+        "the stored replicator must survive every refused call, got {} {}",
+        still_there.status, still_there.body
     );
 }
 
@@ -1184,6 +1252,132 @@ async fn a_new_replicator_runs_once_the_clock_owes_it() {
             &current_version,
             "case settling (read {attempt}): currentVersion must be stable across reads, got {}",
             settled.at("/currentVersion")
+        );
+    }
+}
+
+/// RULE: `DeleteReplicator` removes the replicator the ARN names and reports it in
+/// `DELETING`; afterwards the ARN resolves to nothing — every later read, delete
+/// and listing answers for it exactly as for an ARN nobody ever issued — and the
+/// name it held is free again.
+#[tokio::test]
+async fn a_deleted_replicator_is_gone_from_every_reader() {
+    let emulator = Emulator::new();
+
+    // The rows differ along what the rule generalises over: whether the delete
+    // quotes the replicator's `CurrentVersion` or omits it, and whether the
+    // replicator is still `CREATING` or has settled into `RUNNING` when the delete
+    // arrives.
+    let rows: [(&str, bool, bool); 4] = [
+        ("creating-no-version", false, false),
+        ("creating-with-version", true, false),
+        ("running-no-version", false, true),
+        ("running-with-version", true, true),
+    ];
+
+    for (case, quote_version, settle) in rows {
+        let request = ReplicatorRequest::named(case);
+        let arn = create_ok(&emulator, &request).await;
+        if settle {
+            sleep_past_running();
+        }
+        let read = describe(&emulator, &arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: the replicator must be readable before the delete, got {} {}",
+            read.status, read.body
+        );
+        let version = read
+            .at("/currentVersion")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: DescribeReplicator reported no currentVersion"))
+            .to_string();
+
+        // A `CurrentVersion` other than the replicator's own is refused, and the
+        // replicator survives that refusal.
+        let stale = delete(&emulator, &arn, Some("K0000000000000")).await;
+        assert_eq!(
+            (stale.status, stale.error_code()),
+            (400, "BadRequestException"),
+            "case {case}: expected a stale currentVersion to be refused, got {} {}",
+            stale.status,
+            stale.body
+        );
+        assert_eq!(
+            describe(&emulator, &arn).await.status,
+            200,
+            "case {case}: a refused delete must leave the replicator in place"
+        );
+
+        let quoted = if quote_version {
+            Some(version.as_str())
+        } else {
+            None
+        };
+        let deleted = delete(&emulator, &arn, quoted).await;
+        assert_eq!(
+            (deleted.status, deleted.error_code()),
+            (200, ""),
+            "case {case}: expected DeleteReplicator to answer 200, got {} {}",
+            deleted.status,
+            deleted.body
+        );
+        assert_eq!(
+            deleted.at("/replicatorArn").as_str(),
+            Some(arn.as_str()),
+            "case {case}: the delete must report the ARN it was given, got {}",
+            deleted.body
+        );
+        assert_eq!(
+            deleted.at("/replicatorState").as_str(),
+            Some(REPLICATOR_STATE_DELETING),
+            "case {case}: a deleted replicator is reported DELETING, got {}",
+            deleted.body
+        );
+
+        // Gone from the reader, from a repeated delete and from the listing.
+        let read_again = describe(&emulator, &arn).await;
+        assert_eq!(
+            (
+                read_again.status,
+                read_again.error_code(),
+                read_again.error_message()
+            ),
+            (404, "NotFoundException", NOT_FOUND_MESSAGE),
+            "case {case}: a deleted replicator must read as missing, got {} {}",
+            read_again.status,
+            read_again.body
+        );
+        let twice = delete(&emulator, &arn, None).await;
+        assert_eq!(
+            (twice.status, twice.error_code(), twice.error_message()),
+            (404, "NotFoundException", NOT_FOUND_MESSAGE),
+            "case {case}: a repeated delete must answer as for an ARN never issued, got {} {}",
+            twice.status,
+            twice.body
+        );
+        let listed = emulator
+            .call("GET", "/replication/v1/replicators", None)
+            .await;
+        assert!(
+            !listed.body["replicators"]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry["replicatorArn"].as_str() == Some(arn.as_str()))
+                })
+                .unwrap_or_default(),
+            "case {case}: a deleted replicator must not be listed, got {}",
+            listed.body
+        );
+
+        // The name is free again, and the replicator created under it is a new
+        // resource with its own ARN.
+        let recreated = create_ok(&emulator, &request).await;
+        assert_ne!(
+            recreated, arn,
+            "case {case}: re-creating the name must mint a new ARN, got {recreated}"
         );
     }
 }

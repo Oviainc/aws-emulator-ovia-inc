@@ -1636,8 +1636,10 @@ async fn a_private_zone_must_be_created_with_a_complete_vpc() {
     }
 
     // A PUBLIC zone needs no VPC, so the same create without one is accepted —
-    // and a VPC on a public zone is refused, since the member is "(Private
-    // hosted zones only)".
+    // and since the member is "(Private hosted zones only)", naming a VPC is
+    // itself what asks for a private zone, with no `HostedZoneConfig` needed
+    // (see `private_zone_creation::naming_a_vpc_is_what_makes_a_new_hosted_zone_private`
+    // for the whole table).
     assert_eq!(
         create_zone(&router, "public.example.com", "ref-public-no-vpc", "")
             .await
@@ -1645,23 +1647,23 @@ async fn a_private_zone_must_be_created_with_a_complete_vpc() {
         201,
         "case a public zone with no VPC: expected 201"
     );
-    let public_with_vpc = create_zone(
+    let vpc_only = create_zone(
         &router,
-        "public.example.com",
-        "ref-public-with-vpc",
-        "<VPC><VPCRegion>us-east-1</VPCRegion><VPCId>vpc-1a2b3c4d</VPCId></VPC>",
+        "vpc-only.example.com",
+        "ref-vpc-only",
+        "<VPC><VPCRegion>us-east-1</VPCRegion><VPCId>vpc-0a1b2c3d4e5f60718</VPCId></VPC>",
     )
     .await;
     assert_eq!(
-        public_with_vpc.status, 400,
-        "case a public zone with a VPC: expected 400, got {} with body {}",
-        public_with_vpc.status, public_with_vpc.body
+        vpc_only.status, 201,
+        "case a VPC with no HostedZoneConfig: expected 201, got {} with body {}",
+        vpc_only.status, vpc_only.body
     );
     assert_eq!(
-        public_with_vpc.error_code(),
-        "InvalidInput",
-        "case a public zone with a VPC: expected InvalidInput, got {}",
-        public_with_vpc.body
+        vpc_only.first("Config/PrivateZone"),
+        Some("true"),
+        "case a VPC with no HostedZoneConfig: the zone must be private, got {}",
+        vpc_only.body
     );
 
     // A `<VPC></VPC>` element naming neither member is not an association, so a

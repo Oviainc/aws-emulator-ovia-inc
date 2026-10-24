@@ -20,6 +20,9 @@ mod profile_permissions;
 #[path = "all/profile_revocation_and_identity.rs"]
 mod profile_revocation_and_identity;
 
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

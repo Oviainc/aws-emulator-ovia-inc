@@ -122,6 +122,12 @@
 //!   CloudFormation decides set on the way out and the declared tag MAP sent as the
 //!   `[{Key, Value}]` list that request takes. That one call is "Create or update a
 //!   parameter in Parameter Store", so `Overwrite` makes it this type's update too.
+//! * the two `AWS::S3Vectors::*` types' properties are their creates' own members with a
+//!   lower-case initial, and each type's IDENTITY is its own ARN rather than a name: `Ref`
+//!   returns the vector bucket's `bucket/<name>` ARN and the index's
+//!   `bucket/<bucket>/index/<name>` one, so the names each create carries are read back off
+//!   that ARN ([`vector_bucket_name`], [`vector_index_identity`]) and the delete and the
+//!   drift read address the resource by the ARN itself.
 //!
 //! ## The tags every created resource carries
 //!
@@ -162,8 +168,9 @@ use super::provisioning::{
 use super::template::{
     AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY,
     ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
-    GUARDDUTY_DETECTOR, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER,
-    STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
+    GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX, S3VECTORS_VECTOR_BUCKET,
+    SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
+    WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -201,6 +208,8 @@ pub(super) enum Provisioner {
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     S3Bucket,
+    S3VectorsVectorBucket,
+    S3VectorsIndex,
     EmrCluster,
     IamRole,
     CodePipelinePipeline,
@@ -228,6 +237,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         S3_BUCKET => Some(Provisioner::S3Bucket),
+        S3VECTORS_VECTOR_BUCKET => Some(Provisioner::S3VectorsVectorBucket),
+        S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
         IAM_ROLE => Some(Provisioner::IamRole),
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
@@ -283,6 +294,10 @@ impl Provisioner {
                 create_public_repository(ctx, region, resource, propagated).await
             }
             Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
+            Self::S3VectorsVectorBucket => {
+                create_vector_bucket(ctx, region, resource, propagated).await
+            }
+            Self::S3VectorsIndex => create_index(ctx, region, resource, propagated).await,
             Self::IamRole => create_role(ctx, region, resource, propagated).await,
             Self::CodePipelinePipeline => {
                 create_pipeline(ctx, region, resource, propagated).await
@@ -342,7 +357,13 @@ impl Provisioner {
     /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
     /// way.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
-        let refuses_reserved_keys = matches!(self, Self::IamRole | Self::CodePipelinePipeline);
+        let refuses_reserved_keys = matches!(
+            self,
+            Self::IamRole
+                | Self::CodePipelinePipeline
+                | Self::S3VectorsVectorBucket
+                | Self::S3VectorsIndex
+        );
         propagated
             .iter()
             .filter(|(key, _)| !(refuses_reserved_keys && is_reserved_tag_key(key)))
@@ -437,6 +458,10 @@ impl Provisioner {
                 delete_collection(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => delete_bucket(ctx, region, physical_resource_id).await,
+            Self::S3VectorsVectorBucket => {
+                delete_vector_bucket(ctx, region, physical_resource_id).await
+            }
+            Self::S3VectorsIndex => delete_index(ctx, region, physical_resource_id).await,
             Self::EmrCluster => terminate_job_flow(ctx, region, physical_resource_id).await,
             // The role's policies have to go first, and only the resource's own record
             // says which ones there are.
@@ -499,6 +524,10 @@ impl Provisioner {
                 describe_public_repository(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
+            Self::S3VectorsVectorBucket => {
+                describe_vector_bucket(ctx, region, physical_resource_id).await
+            }
+            Self::S3VectorsIndex => describe_index(ctx, region, physical_resource_id).await,
             Self::EmrCluster => describe_job_flow(ctx, region, physical_resource_id).await,
             Self::IamRole => describe_role(ctx, region, physical_resource_id).await,
             Self::CodePipelinePipeline => {
@@ -5549,6 +5578,332 @@ async fn call_sfn(
         AWS_JSON_1_0,
         &format!("{SFN_TARGET_PREFIX}.{operation}"),
         request,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon S3 Vectors: AWS::S3Vectors::VectorBucket / ::Index
+// ---------------------------------------------------------------------------
+
+/// Amazon S3 Vectors' signing name, from its model (`sigv4Name: s3vectors`, service shape
+/// `S3Vectors`), which speaks `restJson1` — so its calls ride on [`call_rest_json`], each
+/// on the URI its own operation's `@http` binding declares.
+const S3VECTORS_SIGNING_NAME: &str = "s3vectors";
+
+/// The URIs the S3 Vectors operations a stack makes are bound to, as that model's `@http`
+/// traits declare them (`POST /CreateVectorBucket` and so on: every operation of this
+/// service is a POST to a URI named after it).
+const S3VECTORS_CREATE_VECTOR_BUCKET_URI: &str = "/CreateVectorBucket";
+const S3VECTORS_GET_VECTOR_BUCKET_URI: &str = "/GetVectorBucket";
+const S3VECTORS_DELETE_VECTOR_BUCKET_URI: &str = "/DeleteVectorBucket";
+const S3VECTORS_CREATE_INDEX_URI: &str = "/CreateIndex";
+const S3VECTORS_GET_INDEX_URI: &str = "/GetIndex";
+const S3VECTORS_DELETE_INDEX_URI: &str = "/DeleteIndex";
+
+/// The error code S3 Vectors answers for a vector bucket or a vector index it does not
+/// hold (`NotFoundException`, the modelled 404 of its reads and deletes).
+const S3VECTORS_NOT_FOUND: &str = "NotFoundException";
+
+/// The members of an `AWS::S3Vectors::Index`'s own declaration that are `CreateIndex`'s own
+/// members under the same name with a lower-case initial, and whose values are scalars that
+/// go through as the template spells them.
+///
+/// Source: `CreateIndex`'s input members in that service's model (`indexName`, `dataType`,
+/// `dimension`, `distanceMetric`), against the upper-camel property names a CloudFormation
+/// template spells. The parent vector bucket is NOT one of them: it is resolved from the
+/// resource's own ARN ([`vector_index_identity`]).
+const S3VECTORS_INDEX_SCALAR_MEMBERS: &[(&str, &str)] = &[
+    ("DataType", "dataType"),
+    ("Dimension", "dimension"),
+    ("DistanceMetric", "distanceMetric"),
+];
+
+/// Create the vector bucket an `AWS::S3Vectors::VectorBucket` declares, so a client that
+/// deployed the stack and then calls `s3vectors GetVectorBucket` with the ARN the stack
+/// publishes reads the bucket back rather than a `NotFoundException`.
+///
+/// `Ref` of this type returns the bucket's ARN, which is this resource's physical id, and
+/// such an ARN is a total function of the Region and the bucket's NAME — so the bucket is
+/// created under the name CloudFormation decided ([`vector_bucket_name`]) and the ARN S3
+/// Vectors answers with is the one the stack already computed. It is reported back as the
+/// resource's `VectorBucketArn` attribute all the same, so the handle the stack publishes
+/// is the one that service really minted.
+///
+/// The type's remaining properties are `CreateVectorBucket`'s own members: the
+/// `EncryptionConfiguration`, whose members S3 Vectors spells in lower camel case, and the
+/// tags — the ones the declaration asks for plus the ones CloudFormation gives the resource
+/// ([`tags_of`]), as the MAP that request takes, so `s3vectors ListTagsForResource` on the
+/// ARN the stack publishes answers with the stack's own tags.
+async fn create_vector_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert(
+        "vectorBucketName".to_string(),
+        Value::String(vector_bucket_name(resource)),
+    );
+    if let Some(configuration) = resource.properties.get("EncryptionConfiguration") {
+        request.insert(
+            "encryptionConfiguration".to_string(),
+            lower_camel_members(configuration, 0)?,
+        );
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered = call_s3vectors(
+        ctx,
+        region,
+        S3VECTORS_CREATE_VECTOR_BUCKET_URI,
+        &Value::Object(request),
+    )
+    .await?;
+    let arn = answered
+        .get("vectorBucketArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "Amazon S3 Vectors answered CreateVectorBucket without a vectorBucketArn"
+                .to_string(),
+        })?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("VectorBucketArn".to_string(), arn.to_string());
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the vector bucket a stack created, addressed by its ARN — this resource's
+/// physical id, which is what `Ref` returns for the type. A bucket S3 Vectors no longer
+/// holds (`NotFoundException`, judged on the CODE and never on a message that carries the
+/// request's own name) is already in the state the delete asks for; one that still holds
+/// vector indexes is NOT deleted (`ConflictException`), and that refusal is what the stack
+/// reports.
+async fn delete_vector_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "vectorBucketArn": physical_resource_id });
+    match call_s3vectors(ctx, region, S3VECTORS_DELETE_VECTOR_BUCKET_URI, &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == S3VECTORS_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The vector bucket's configuration as Amazon S3 Vectors reports it, for drift detection:
+/// `GetVectorBucket`'s own record, read by the ARN that is this resource's physical id. One
+/// it no longer holds (`NotFoundException`) was deleted.
+///
+/// The one property its read reports under the name this type declares is the bucket's
+/// `VectorBucketName`; the encryption settings it reports are spelled in that service's own
+/// member names, and a property the read does not report is not evidence of anything
+/// ([`super::drift`]).
+async fn describe_vector_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "vectorBucketArn": physical_resource_id });
+    match call_s3vectors(ctx, region, S3VECTORS_GET_VECTOR_BUCKET_URI, &request).await {
+        Ok(answer) => Ok(answer.get("vectorBucket").map(|bucket| {
+            reported_as_properties(bucket, &[("VectorBucketName", "vectorBucketName")])
+        })),
+        Err(refusal) if refusal.code == S3VECTORS_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the vector index an `AWS::S3Vectors::Index` declares, in the vector bucket its
+/// own ARN names.
+///
+/// `Ref` of this type returns the index's ARN, which is this resource's physical id and
+/// which carries both names S3 Vectors keys an index by
+/// (`bucket/<bucket>/index/<index>`) — so [`vector_index_identity`] reads the pair back off
+/// it and the index is created under exactly the names the stack already published.
+///
+/// The type's remaining properties are `CreateIndex`'s own members: the three scalars
+/// [`S3VECTORS_INDEX_SCALAR_MEMBERS`] names, and the `MetadataConfiguration` and
+/// `EncryptionConfiguration` structures, whose members S3 Vectors spells in lower camel
+/// case.
+async fn create_index(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let (bucket, index) = vector_index_identity(resource);
+    let mut request = Map::new();
+    if let Some(bucket) = bucket {
+        request.insert("vectorBucketName".to_string(), Value::String(bucket));
+    }
+    request.insert("indexName".to_string(), Value::String(index));
+    copy_members(&properties, S3VECTORS_INDEX_SCALAR_MEMBERS, &mut request);
+    for (property, member) in [
+        ("MetadataConfiguration", "metadataConfiguration"),
+        ("EncryptionConfiguration", "encryptionConfiguration"),
+    ] {
+        if let Some(configuration) = properties.get(property) {
+            request.insert(member.to_string(), lower_camel_members(configuration, 0)?);
+        }
+    }
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered =
+        call_s3vectors(ctx, region, S3VECTORS_CREATE_INDEX_URI, &Value::Object(request))
+            .await?;
+    let arn = answered
+        .get("indexArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "Amazon S3 Vectors answered CreateIndex without an indexArn".to_string(),
+        })?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("IndexArn".to_string(), arn.to_string());
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the vector index a stack created, addressed by its ARN — this resource's physical
+/// id. One S3 Vectors no longer holds (`NotFoundException`) is already in the state the
+/// delete asks for.
+async fn delete_index(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "indexArn": physical_resource_id });
+    match call_s3vectors(ctx, region, S3VECTORS_DELETE_INDEX_URI, &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == S3VECTORS_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The vector index's configuration as Amazon S3 Vectors reports it, for drift detection:
+/// `GetIndex`'s own record, read by the ARN that is this resource's physical id. One it no
+/// longer holds (`NotFoundException`) was deleted.
+///
+/// The properties its read reports under the names this type declares are the ones named
+/// identically on both sides up to their initial letter; a property the read does not
+/// report is not evidence of anything ([`super::drift`]).
+async fn describe_index(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "indexArn": physical_resource_id });
+    match call_s3vectors(ctx, region, S3VECTORS_GET_INDEX_URI, &request).await {
+        Ok(answer) => Ok(answer.get("index").map(|index| {
+            let mut members = vec![
+                ("VectorBucketName", "vectorBucketName"),
+                ("IndexName", "indexName"),
+            ];
+            members.extend_from_slice(S3VECTORS_INDEX_SCALAR_MEMBERS);
+            reported_as_properties(index, &members)
+        })),
+        Err(refusal) if refusal.code == S3VECTORS_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The NAME of the vector bucket a resource record describes: the `VectorBucketName` the
+/// deployment gave it, which is the name the template asked for or the
+/// `<stack>-<logical id>-<suffix>` name CloudFormation generated — never the physical id,
+/// which for this type is the bucket's ARN.
+///
+/// A record with no such attribute (one whose attribute budget was spent) falls back to the
+/// bucket segment of that ARN, which is the bucket's name.
+fn vector_bucket_name(resource: &StoredResource) -> String {
+    if let Some(name) = resource.attributes.get("VectorBucketName") {
+        return name.clone();
+    }
+    vector_bucket_of(&resource.physical_resource_id).unwrap_or_default()
+}
+
+/// The vector bucket and index a provisioned `AWS::S3Vectors::Index` record names: the two
+/// segments of the index ARN that is this type's physical id
+/// (`bucket/<bucket>/index/<index>`), which is how S3 Vectors keys an index.
+///
+/// A record whose physical id is NOT such an ARN names no bucket here either — the
+/// declaration named none, so the deployment left the index with CloudFormation's own
+/// generated name ([`super::template`]) — and the create then carries the index name alone,
+/// so what the stack reports is S3 Vectors' own refusal of a request that addresses no
+/// vector bucket rather than one invented here.
+fn vector_index_identity(resource: &StoredResource) -> (Option<String>, String) {
+    let parsed = arn_resource(&resource.physical_resource_id)
+        .and_then(|resource| resource.strip_prefix(S3VECTORS_BUCKET_SEGMENT))
+        .and_then(|rest| rest.split_once("/index/"))
+        .filter(|(bucket, index)| {
+            !bucket.is_empty()
+                && !bucket.contains('/')
+                && !index.is_empty()
+                && !index.contains('/')
+        });
+    match parsed {
+        Some((bucket, index)) => (Some(bucket.to_string()), index.to_string()),
+        None => (
+            None,
+            resource
+                .attributes
+                .get("IndexName")
+                .cloned()
+                .unwrap_or_else(|| resource.physical_resource_id.clone()),
+        ),
+    }
+}
+
+/// The bucket name an Amazon S3 Vectors vector-bucket ARN carries, or `None` for anything
+/// that is not one.
+fn vector_bucket_of(arn: &str) -> Option<String> {
+    let bucket = arn_resource(arn)?.strip_prefix(S3VECTORS_BUCKET_SEGMENT)?;
+    (!bucket.is_empty() && !bucket.contains('/')).then(|| bucket.to_string())
+}
+
+/// The RESOURCE portion of an ARN: everything past the fifth `:`, which is where every ARN
+/// puts the resource it names.
+fn arn_resource(arn: &str) -> Option<&str> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(_partition), Some(_service), Some(_region), Some(_account)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    fields.next()
+}
+
+/// Call one Amazon S3 Vectors operation on the `restJson1` wire its model declares: a POST
+/// to the operation's own URI, carrying the request document.
+async fn call_s3vectors(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uri: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_rest_json(
+        ctx,
+        S3VECTORS_SIGNING_NAME,
+        region,
+        "POST",
+        uri,
+        Some(request),
     )
     .await
 }

@@ -5,6 +5,13 @@
 //! Adds tags to the Savings Plan the ARN names, so a later
 //! `ListTagsForResource` and `DescribeSavingsPlans` both report them.
 //!
+//! A write is all or nothing, and which refusal it gets follows what it broke:
+//! a merged tag set that does not fit the per-resource tag allowance has
+//! exhausted a quota, so it answers with the modelled
+//! `ServiceQuotaExceededException` (402); a tag key or value outside the length
+//! the service accepts is a malformed input parameter, so it answers with
+//! `ValidationException` (400). Either way the stored tags are unchanged.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -160,9 +167,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         // All or nothing: a write that would take the plan past the service's
-        // tag limit is refused without storing any of it.
-        plan.merge_tags(input.tags).map_err(|message| {
-            TagResourceErrorModeled::ValidationException(ValidationException { message })
+        // tag limit is refused without storing any of it. Which refusal it is
+        // follows what the write broke: a merged tag set that does not fit the
+        // per-resource tag allowance has exhausted a QUOTA, so it answers with
+        // the operation's modelled `ServiceQuotaExceededException` (402), while
+        // a key or value outside the length the service accepts is a malformed
+        // input parameter and stays a `ValidationException` (400).
+        plan.merge_tags(input.tags).map_err(|rejection| {
+            if rejection.is_quota_exceeded() {
+                TagResourceErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: rejection.into_message(),
+                    },
+                )
+            } else {
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: rejection.into_message(),
+                })
+            }
         })?;
 
         Ok(TagResourceOutput {})

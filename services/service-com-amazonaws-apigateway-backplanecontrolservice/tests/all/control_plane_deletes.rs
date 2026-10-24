@@ -29,7 +29,9 @@
 use serde_json::{json, Value};
 
 use crate::gateway_response::{get_gateway_response, put_gateway_response};
-use crate::integration_response::{get_integration_response, put_integration_response};
+use crate::integration_response::{
+    delete_integration_response, get_integration_response, put_integration_response,
+};
 use crate::method_integration::{get_integration, put_integration, resource_with_a_method};
 use crate::rest_api_lifecycle::{assert_failure, create_api, string_member, Answer, Gateway};
 use crate::stage_lifecycle::{create_deployment, get_stage};
@@ -55,26 +57,6 @@ async fn delete_gateway_response(gateway: &Gateway, api: &str, response_type: &s
         .call(
             "DELETE",
             &format!("/restapis/{api}/gatewayresponses/{response_type}"),
-            None,
-        )
-        .await
-}
-
-/// `DeleteIntegrationResponse` for `status` on the integration of the `verb` method of
-/// `resource`.
-async fn delete_integration_response(
-    gateway: &Gateway,
-    api: &str,
-    resource: &str,
-    verb: &str,
-    status: &str,
-) -> Answer {
-    gateway
-        .call(
-            "DELETE",
-            &format!(
-                "/restapis/{api}/resources/{resource}/methods/{verb}/integration/responses/{status}"
-            ),
             None,
         )
         .await

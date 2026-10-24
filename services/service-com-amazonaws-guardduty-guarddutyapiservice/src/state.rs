@@ -2072,7 +2072,23 @@ pub struct MemberRecord {
     pub invited_at_millis: Option<i64>,
     /// When the relationship last changed, in epoch milliseconds — the member's
     /// `UpdatedAt`.
+    ///
+    /// The RELATIONSHIP's instant, not the configuration's:
+    /// [`Self::features`] carries its own per-feature `UpdatedAt`, so configuring
+    /// the member account's detector moves that and leaves this where it was.
     pub updated_at_millis: i64,
+    /// The configuration of the member account's own detector, as the
+    /// administrator maintains it — what `UpdateMemberDetectors` writes and
+    /// `GetMemberDetectors` reports, under both the `Features` and the deprecated
+    /// `DataSources` view.
+    ///
+    /// Held as the same [`FeatureRecord`] list a detector carries, because it is
+    /// the same configuration seen from the administrator's side: one stored
+    /// switch per feature, each with the instant it last changed. A member starts
+    /// with the feature set a detector created without a `Features` list gets
+    /// ([`default_features`]), and only the features the `OrgFeature` enum carries
+    /// ([`MEMBER_FEATURES`]) can be configured through a member request.
+    pub features: Vec<FeatureRecord>,
 }
 
 impl MemberRecord {
@@ -2084,6 +2100,19 @@ impl MemberRecord {
     /// first, `DisassociateMembers` acts on the second.
     pub fn is_associated(&self) -> bool {
         self.relationship_status != RELATIONSHIP_REMOVED
+    }
+
+    /// Set one feature's status on the member account's configuration, recording
+    /// `now` as its `UpdatedAt` — [`Detector::set_feature`] for the member side of
+    /// the same switch.
+    pub fn set_feature(&mut self, name: &str, status: &str, now: i64) {
+        set_feature_in(&mut self.features, name, status, now);
+    }
+
+    /// What one of the member's data sources reports: the status of the feature
+    /// that governs it and the instant that feature last changed.
+    pub fn data_source(&self, feature: &str) -> (String, i64) {
+        feature_data_source(&self.features, feature, self.updated_at_millis)
     }
 }
 
@@ -2156,10 +2185,7 @@ impl Detector {
     /// the feature and data-source views carry the configuration, which a detector
     /// keeps across being disabled and enabled again.
     pub fn data_source(&self, feature: &str) -> (String, i64) {
-        self.features.iter().find(|f| f.name == feature).map_or_else(
-            || (DISABLED.to_string(), self.updated_at_millis),
-            |f| (f.status.clone(), f.updated_at_millis),
-        )
+        feature_data_source(&self.features, feature, self.updated_at_millis)
     }
 
     /// Materialise every threat list's clock-owed status change, so no two readers
@@ -2287,19 +2313,7 @@ impl Detector {
     /// Set one feature's status, recording `now` as its `UpdatedAt`. Adds the
     /// feature when the detector does not carry it yet.
     pub fn set_feature(&mut self, name: &str, status: &str, now: i64) {
-        if let Some(existing) = self.features.iter_mut().find(|f| f.name == name) {
-            if existing.status != status {
-                existing.status = status.to_string();
-                existing.updated_at_millis = now;
-            }
-        } else {
-            self.features.push(FeatureRecord {
-                name: name.to_string(),
-                status: status.to_string(),
-                updated_at_millis: now,
-                additional_configuration: Vec::new(),
-            });
-        }
+        set_feature_in(&mut self.features, name, status, now);
     }
 
     /// The publishing destination a create carrying `token` already minted, if any
@@ -4663,38 +4677,147 @@ pub fn default_features(now: i64) -> Vec<FeatureRecord> {
 /// Refuse a `Features` list this service cannot accept, with the message the
 /// refusal carries.
 ///
-/// Two rules, both from `CreateDetector`'s own documentation: a feature name must
-/// be a `DetectorFeature` member, and EKS Runtime Monitoring and Runtime
+/// Three rules, two of them from `CreateDetector`'s own documentation: a feature
+/// name must be a `DetectorFeature` member, EKS Runtime Monitoring and Runtime
 /// Monitoring cannot both be requested because Runtime Monitoring already includes
-/// Amazon EKS.
+/// Amazon EKS, and — since each entry configures one member of that enum — a list
+/// may carry no more entries than the enum has members
+/// ([`validate_feature_list_length`]).
 pub fn validate_feature_configurations(
     features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
 ) -> Result<(), String> {
     let Some(features) = features else {
         return Ok(());
     };
+    validate_feature_list_length(&DETECTOR_FEATURES, features.len(), FEATURES_MEMBER)?;
     for feature in features {
         let Some(name) = feature.name.as_deref() else {
             continue;
         };
-        if !DETECTOR_FEATURES.contains(&name) {
-            return Err(format!(
-                "Features: '{name}' is not a supported detector feature. Supported features are {}.",
-                DETECTOR_FEATURES.join(", ")
-            ));
-        }
-        if let Some(status) = feature.status.as_deref() {
-            if status != ENABLED && status != DISABLED {
-                return Err(format!(
-                    "Features: '{status}' is not a supported status for feature '{name}'. Supported values are {ENABLED}, {DISABLED}."
-                ));
-            }
+        validate_feature_entry(&DETECTOR_FEATURES, name, feature.status.as_deref())?;
+        if let Some(additional) = feature.additional_configuration.as_ref() {
+            validate_feature_list_length(
+                DETECTOR_ADDITIONAL_CONFIGURATIONS,
+                additional.len(),
+                ADDITIONAL_CONFIGURATION_MEMBER,
+            )?;
         }
     }
+    validate_runtime_monitoring_pair(features.iter().map(|f| (f.name.as_deref(), f.status.as_deref())))
+}
+
+/// Refuse a member-account `Features` list this service cannot accept, with the
+/// message the refusal carries.
+///
+/// The member side of [`validate_feature_configurations`], and the same two rules:
+/// `MemberFeaturesConfiguration.Name` targets `OrgFeature`
+/// (`smithy_query(shape="MemberFeaturesConfiguration")`), so the accepted catalog
+/// is [`MEMBER_FEATURES`] rather than [`DETECTOR_FEATURES`], and
+/// `UpdateMemberDetectors` documents the same Runtime Monitoring exclusion
+/// `CreateDetector` does. An `AdditionalConfiguration` entry is checked the same
+/// way against the `OrgFeatureAdditionalConfiguration` members it may name.
+pub fn validate_member_feature_configurations(
+    features: Option<&Vec<crate::ops::types::update_member_detectors_types::MemberFeaturesConfiguration>>,
+) -> Result<(), String> {
+    let Some(features) = features else {
+        return Ok(());
+    };
+    validate_feature_list_length(MEMBER_FEATURES, features.len(), FEATURES_MEMBER)?;
+    for feature in features {
+        let Some(name) = feature.name.as_deref() else {
+            continue;
+        };
+        validate_feature_entry(MEMBER_FEATURES, name, feature.status.as_deref())?;
+        if let Some(additional) = feature.additional_configuration.as_ref() {
+            validate_feature_list_length(
+                MEMBER_ADDITIONAL_CONFIGURATIONS,
+                additional.len(),
+                ADDITIONAL_CONFIGURATION_MEMBER,
+            )?;
+        }
+        for additional in feature.additional_configuration.iter().flatten() {
+            let Some(additional_name) = additional.name.as_deref() else {
+                continue;
+            };
+            validate_feature_entry(
+                MEMBER_ADDITIONAL_CONFIGURATIONS,
+                additional_name,
+                additional.status.as_deref(),
+            )?;
+        }
+    }
+    validate_runtime_monitoring_pair(features.iter().map(|f| (f.name.as_deref(), f.status.as_deref())))
+}
+
+/// Refuse a feature list longer than the enum `catalog` its entries name: each
+/// entry configures one member of that enum, so a list with more entries than the
+/// enum has members necessarily names one twice, and the request is refused rather
+/// than stored. `member` is the wire name of the list the refusal is about.
+///
+/// This is also what keeps a request from growing the store (or the work one call
+/// does) by the length of a list the model declares no `@length` for: the stored
+/// configuration is keyed by name, so it can never be longer than the catalog, and
+/// neither can the list a request is allowed to send.
+fn validate_feature_list_length(
+    catalog: &[&str],
+    length: usize,
+    member: &str,
+) -> Result<(), String> {
+    if length > catalog.len() {
+        return Err(format!(
+            "{member}: at most {} entries may be given, one for each supported value, but {length} were given.",
+            catalog.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The wire name of the per-feature additional-configuration list both the
+/// detector and the member feature shapes carry
+/// (`smithy_query(shape="MemberFeaturesConfiguration")`).
+const ADDITIONAL_CONFIGURATION_MEMBER: &str = "features.additionalConfiguration";
+
+/// The wire name of the feature list itself.
+const FEATURES_MEMBER: &str = "features";
+
+/// Refuse one `(name, status)` entry of a feature list: the name must be a member
+/// of the enum `catalog` the request's member targets, and the status, where
+/// supplied, a `FeatureStatus` member.
+fn validate_feature_entry(
+    catalog: &[&str],
+    name: &str,
+    status: Option<&str>,
+) -> Result<(), String> {
+    if !catalog.contains(&name) {
+        return Err(format!(
+            "Features: '{name}' is not a supported detector feature. Supported features are {}.",
+            catalog.join(", ")
+        ));
+    }
+    if let Some(status) = status {
+        if status != ENABLED && status != DISABLED {
+            return Err(format!(
+                "Features: '{status}' is not a supported status for feature '{name}'. Supported values are {ENABLED}, {DISABLED}."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a feature list that asks for EKS Runtime Monitoring and Runtime
+/// Monitoring together: "Specifying both EKS Runtime Monitoring
+/// (EKS_RUNTIME_MONITORING) and Runtime Monitoring (RUNTIME_MONITORING) will cause
+/// an error. You can add only one of these two features because Runtime Monitoring
+/// already includes the threat detection for Amazon EKS resources"
+/// (`smithy_query(query="doc",shape="UpdateMemberDetectors")`, which
+/// `CreateDetector` and `UpdateDetector` document identically).
+fn validate_runtime_monitoring_pair<'a>(
+    entries: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)> + Clone,
+) -> Result<(), String> {
     let named = |wanted: &str| {
-        features
-            .iter()
-            .any(|f| f.name.as_deref() == Some(wanted) && f.status.as_deref() != Some(DISABLED))
+        entries
+            .clone()
+            .any(|(name, status)| name == Some(wanted) && status != Some(DISABLED))
     };
     if named(FEATURE_EKS_RUNTIME_MONITORING) && named(FEATURE_RUNTIME_MONITORING) {
         return Err(format!(
@@ -4832,21 +4955,123 @@ pub fn apply_feature_configurations(
         let status = feature.status.as_deref().unwrap_or(ENABLED);
         detector.set_feature(name, status, now);
         if let Some(additional) = feature.additional_configuration.as_ref() {
-            let configured: Vec<AdditionalConfigRecord> = additional
-                .iter()
-                .filter_map(|cfg| {
-                    cfg.name.as_deref().map(|name| AdditionalConfigRecord {
-                        name: name.to_string(),
-                        status: cfg.status.as_deref().unwrap_or(ENABLED).to_string(),
-                        updated_at_millis: now,
-                    })
-                })
-                .collect();
-            if let Some(record) = detector.features.iter_mut().find(|f| f.name == name) {
-                record.additional_configuration = configured;
-            }
+            let configured = additional_configuration_records(
+                additional
+                    .iter()
+                    .map(|cfg| (cfg.name.as_deref(), cfg.status.as_deref())),
+                now,
+            );
+            set_additional_configuration_in(&mut detector.features, name, configured);
         }
     }
+}
+
+/// Write a member-account `Features` list onto `member`'s stored configuration,
+/// the member side of [`apply_feature_configurations`]. A feature the list does
+/// not name keeps the status it already had, so one request configures only the
+/// switches it names.
+pub fn apply_member_feature_configurations(
+    member: &mut MemberRecord,
+    features: Option<
+        &Vec<crate::ops::types::update_member_detectors_types::MemberFeaturesConfiguration>,
+    >,
+    now: i64,
+) {
+    let Some(features) = features else { return };
+    for feature in features {
+        let Some(name) = feature.name.as_deref() else {
+            continue;
+        };
+        let status = feature.status.as_deref().unwrap_or(ENABLED);
+        member.set_feature(name, status, now);
+        if let Some(additional) = feature.additional_configuration.as_ref() {
+            let configured = additional_configuration_records(
+                additional
+                    .iter()
+                    .map(|cfg| (cfg.name.as_deref(), cfg.status.as_deref())),
+                now,
+            );
+            set_additional_configuration_in(&mut member.features, name, configured);
+        }
+    }
+}
+
+/// Set one feature's status in a stored feature list, recording `now` as its
+/// `UpdatedAt`, and adding the feature when the list does not carry it yet.
+///
+/// The one place a feature switch is written, so a detector's configuration and a
+/// member's follow the same rule: re-applying the status a feature already has
+/// changes nothing, `UpdatedAt` included, which is what makes the instant say when
+/// the switch last CHANGED rather than when it was last written.
+pub fn set_feature_in(features: &mut Vec<FeatureRecord>, name: &str, status: &str, now: i64) {
+    if let Some(existing) = features.iter_mut().find(|f| f.name == name) {
+        if existing.status != status {
+            existing.status = status.to_string();
+            existing.updated_at_millis = now;
+        }
+    } else {
+        features.push(FeatureRecord {
+            name: name.to_string(),
+            status: status.to_string(),
+            updated_at_millis: now,
+            additional_configuration: Vec::new(),
+        });
+    }
+}
+
+/// Build one feature's stored additional-configuration set from the `(name,
+/// status)` entries a request gave, keyed by NAME.
+///
+/// Each entry configures one member of the additional-configuration enum, so the
+/// stored set is keyed by that name the way [`set_feature_in`] keys a feature
+/// switch: a repeated name is ONE configuration and the last entry naming it wins,
+/// which is also what keeps the stored set no longer than the enum's own member
+/// list however long the request's list is. An entry naming nothing configures
+/// nothing and is dropped.
+fn additional_configuration_records<'a>(
+    entries: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
+    now: i64,
+) -> Vec<AdditionalConfigRecord> {
+    let mut by_name: BTreeMap<&str, AdditionalConfigRecord> = BTreeMap::new();
+    for (name, status) in entries {
+        let Some(name) = name else { continue };
+        by_name.insert(
+            name,
+            AdditionalConfigRecord {
+                name: name.to_string(),
+                status: status.unwrap_or(ENABLED).to_string(),
+                updated_at_millis: now,
+            },
+        );
+    }
+    by_name.into_values().collect()
+}
+
+/// Replace one feature's additional configuration in a stored feature list.
+fn set_additional_configuration_in(
+    features: &mut [FeatureRecord],
+    name: &str,
+    configured: Vec<AdditionalConfigRecord>,
+) {
+    if let Some(record) = features.iter_mut().find(|f| f.name == name) {
+        record.additional_configuration = configured;
+    }
+}
+
+/// What one data source reports, read off the feature that governs it: that
+/// feature's own status and the instant it last changed, in epoch milliseconds.
+///
+/// `fallback_millis` is the instant reported for a feature the list does not carry
+/// at all, which reports [`DISABLED`].
+pub fn feature_data_source(
+    features: &[FeatureRecord],
+    feature: &str,
+    fallback_millis: i64,
+) -> (String, i64) {
+    features.iter().find(|f| f.name == feature).map_or_else(
+        || (DISABLED.to_string(), fallback_millis),
+        |f| (f.status.clone(), f.updated_at_millis),
+    )
 }
 
 /// Write the deprecated `DataSources` view onto `detector`.
@@ -4860,15 +5085,37 @@ pub fn apply_data_sources(
     data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
     now: i64,
 ) {
+    apply_data_sources_to(&mut detector.features, data_sources, now);
+}
+
+/// Write the deprecated `DataSources` view onto `member`'s stored configuration,
+/// the member side of [`apply_data_sources`].
+pub fn apply_member_data_sources(
+    member: &mut MemberRecord,
+    data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
+    now: i64,
+) {
+    apply_data_sources_to(&mut member.features, data_sources, now);
+}
+
+/// Write the deprecated `DataSources` view onto a stored feature list: the switch
+/// each data source names is the feature that governs it, so the detector view and
+/// the member view cannot disagree about which switch a node writes.
+fn apply_data_sources_to(
+    features: &mut Vec<FeatureRecord>,
+    data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
+    now: i64,
+) {
     let Some(data_sources) = data_sources else {
         return;
     };
     let status = |enable: bool| if enable { ENABLED } else { DISABLED };
     if let Some(s3) = data_sources.s3_logs.as_ref() {
-        detector.set_feature(FEATURE_S3_DATA_EVENTS, status(s3.enable), now);
+        set_feature_in(features, FEATURE_S3_DATA_EVENTS, status(s3.enable), now);
     }
     if let Some(kubernetes) = data_sources.kubernetes.as_ref() {
-        detector.set_feature(
+        set_feature_in(
+            features,
             FEATURE_EKS_AUDIT_LOGS,
             status(kubernetes.audit_logs.enable),
             now,
@@ -4880,7 +5127,186 @@ pub fn apply_data_sources(
         .and_then(|m| m.scan_ec2_instance_with_findings.as_ref())
         .and_then(|s| s.ebs_volumes)
     {
-        detector.set_feature(FEATURE_EBS_MALWARE_PROTECTION, status(enable), now);
+        set_feature_in(features, FEATURE_EBS_MALWARE_PROTECTION, status(enable), now);
+    }
+}
+
+/// Every feature a member-account request may configure: the `OrgFeature` members
+/// `MemberFeaturesConfiguration.Name` targets
+/// (`smithy_query(shape="MemberFeaturesConfiguration")`), taken from the crate's
+/// MODEL-DERIVED list so a member the model gains cannot be missed here.
+///
+/// A narrower catalog than [`DETECTOR_FEATURES`]: the features an administrator
+/// configures for a member account are the organisation-level ones.
+pub const MEMBER_FEATURES: &[&str] = crate::ops::types::shared_types::ORG_FEATURE_VALUES;
+
+/// Every additional configuration a member-account request may name: the
+/// `OrgFeatureAdditionalConfiguration` members
+/// `MemberAdditionalConfiguration.Name` targets
+/// (`smithy_query(shape="MemberAdditionalConfiguration")`).
+pub const MEMBER_ADDITIONAL_CONFIGURATIONS: &[&str] =
+    crate::ops::types::shared_types::ORG_FEATURE_ADDITIONAL_CONFIGURATION_VALUES;
+
+/// Every additional configuration a DETECTOR request may name: the
+/// `FeatureAdditionalConfiguration` members
+/// `DetectorAdditionalConfiguration.Name` targets
+/// (`smithy_query(shape="DetectorAdditionalConfiguration")`).
+pub const DETECTOR_ADDITIONAL_CONFIGURATIONS: &[&str] =
+    crate::ops::types::shared_types::FEATURE_ADDITIONAL_CONFIGURATION_VALUES;
+
+/// Every feature a MEMBER's configuration reports, in the order it reports them:
+/// the [`MEMBER_FEATURES`] in [`DETECTOR_FEATURES`] (model) order, so one member
+/// read orders its features the way a detector read orders its own.
+///
+/// The list is a total order over a SET, so a client may index it positionally.
+pub fn member_reported_features() -> Vec<&'static str> {
+    DETECTOR_FEATURES
+        .iter()
+        .copied()
+        .filter(|name| MEMBER_FEATURES.contains(name))
+        .collect()
+}
+
+/// The deprecated `DataSources` view of one stored feature list.
+///
+/// `DataSources` is "deprecated, use Features instead"
+/// (`smithy_query(operation="GetDetector")`), so every node here is read back off
+/// the feature that governs it: the same stored switch, projected under its other
+/// name. Each node carries that switch's status AND the instant it last changed.
+///
+/// One projection for both readers — `GetDetector` for a detector and
+/// `GetMemberDetectors` for a member account — so two reads of one switch cannot
+/// disagree. `malware_protection_service_role` is the Malware Protection
+/// service-linked role to report, which is `None` for a role this emulator does
+/// not hold (the member account's own), and the member is optional, so it is
+/// omitted rather than invented.
+pub fn data_source_configurations_view(
+    features: &[FeatureRecord],
+    fallback_millis: i64,
+    malware_protection_service_role: Option<&str>,
+) -> crate::ops::types::shared_types::DataSourceConfigurationsResult {
+    use crate::ops::types::shared_types::*;
+
+    let reported = |feature: &str| {
+        let (status, millis) = feature_data_source(features, feature, fallback_millis);
+        (status, iso8601(millis))
+    };
+    let (cloud_trail, cloud_trail_at) = reported(FEATURE_CLOUD_TRAIL);
+    let (dns_logs, dns_logs_at) = reported(FEATURE_DNS_LOGS);
+    let (flow_logs, flow_logs_at) = reported(FEATURE_FLOW_LOGS);
+    let (s3_logs, s3_logs_at) = reported(FEATURE_S3_DATA_EVENTS);
+    let (audit_logs, audit_logs_at) = reported(FEATURE_EKS_AUDIT_LOGS);
+    let (ebs_volumes, ebs_volumes_at) = reported(FEATURE_EBS_MALWARE_PROTECTION);
+    let (database_events, database_events_at) = reported(FEATURE_RDS_LOGIN_EVENTS);
+    DataSourceConfigurationsResult {
+        cloud_trail: CloudTrailConfigurationResult {
+            status: cloud_trail,
+            updated_at: Some(cloud_trail_at),
+        },
+        dns_logs: DNSLogsConfigurationResult {
+            status: dns_logs,
+            updated_at: Some(dns_logs_at),
+        },
+        flow_logs: FlowLogsConfigurationResult {
+            status: flow_logs,
+            updated_at: Some(flow_logs_at),
+        },
+        s3_logs: S3LogsConfigurationResult {
+            status: s3_logs,
+            updated_at: Some(s3_logs_at),
+        },
+        kubernetes: Some(KubernetesConfigurationResult {
+            audit_logs: KubernetesAuditLogsConfigurationResult {
+                status: audit_logs,
+                updated_at: Some(audit_logs_at),
+            },
+        }),
+        malware_protection: Some(MalwareProtectionConfigurationResult {
+            scan_ec2_instance_with_findings: Some(ScanEc2InstanceWithFindingsResult {
+                ebs_volumes: Some(EbsVolumesResult {
+                    status: Some(ebs_volumes),
+                    // Nothing stopped the source from being enabled, so there is no
+                    // reason to report.
+                    reason: None,
+                    updated_at: Some(ebs_volumes_at),
+                }),
+            }),
+            service_role: malware_protection_service_role.map(str::to_string),
+        }),
+        // RDS login activity, the `Database` view of the RDS_LOGIN_EVENTS feature.
+        database: Some(DatabaseConfigurationResult {
+            rds: Some(RdsConfigurationResult {
+                database_events: Some(DatabaseEventsConfigurationResult {
+                    status: Some(database_events),
+                    updated_at: Some(database_events_at),
+                }),
+            }),
+        }),
+    }
+}
+
+/// The modelled `MemberDataSourceConfiguration` a read reports for one stored
+/// member account: its configuration under both the `Features` and the deprecated
+/// `DataSources` view, the same two views `GetDetector` reports for a detector.
+///
+/// The projection lives here, beside the record, because it is what a member
+/// configuration READ answers with — `GetMemberDetectors` today, and any later
+/// reader of the same facts.
+pub fn member_data_source_configuration_view(
+    member: &MemberRecord,
+) -> crate::ops::types::get_member_detectors_types::MemberDataSourceConfiguration {
+    use crate::ops::types::get_member_detectors_types::*;
+
+    MemberDataSourceConfiguration {
+        account_id: member.account_id.clone(),
+        data_sources: data_source_configurations_view(
+            &member.features,
+            member.updated_at_millis,
+            // The Malware Protection service-linked role of a member account lives
+            // in THAT account, which this emulator does not hold, and the member is
+            // optional: omitted rather than invented.
+            None,
+        ),
+        features: Some(
+            member_reported_features()
+                .into_iter()
+                .map(|name| {
+                    let record = member.features.iter().find(|f| f.name == name);
+                    MemberFeaturesConfigurationResult {
+                        name: Some(name.to_string()),
+                        status: Some(
+                            record
+                                .map_or(DISABLED, |f| f.status.as_str())
+                                .to_string(),
+                        ),
+                        updated_at: Some(::aws_smithy_types::DateTime::from_millis(
+                            record.map_or(member.updated_at_millis, |f| f.updated_at_millis),
+                        )),
+                        additional_configuration: record
+                            .filter(|f| !f.additional_configuration.is_empty())
+                            .map(|f| {
+                                f.additional_configuration
+                                    .iter()
+                                    .map(|cfg| MemberAdditionalConfigurationResult {
+                                        name: Some(cfg.name.clone()),
+                                        status: Some(cfg.status.clone()),
+                                        updated_at: Some(
+                                            ::aws_smithy_types::DateTime::from_millis(
+                                                cfg.updated_at_millis,
+                                            ),
+                                        ),
+                                        // Nothing in this emulator configures a
+                                        // member through a GuardDuty policy, so the
+                                        // optional member is absent.
+                                        managed_by: None,
+                                    })
+                                    .collect()
+                            }),
+                        managed_by: None,
+                    }
+                })
+                .collect(),
+        ),
     }
 }
 

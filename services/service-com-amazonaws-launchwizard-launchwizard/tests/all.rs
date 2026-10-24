@@ -25,6 +25,8 @@ mod deployment_pattern_versions;
 mod deployment_resource_group;
 #[path = "all/deployment_update.rs"]
 mod deployment_update;
+#[path = "all/deployment_update_in_flight.rs"]
+mod deployment_update_in_flight;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/not_found_contract.rs"]

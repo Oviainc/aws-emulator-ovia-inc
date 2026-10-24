@@ -174,10 +174,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => now,
         };
         // The purchase's own tags are bounded by the same rule `TagResource`
-        // enforces, so a plan cannot be created over the tag limit either.
+        // enforces, so a plan cannot be created over the tag limit either —
+        // and refused the same way: a tag set that does not fit the
+        // per-resource tag allowance is the operation's modelled
+        // `ServiceQuotaExceededException` (402), a malformed tag a
+        // `ValidationException` (400).
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
-        crate::state::check_tags(&tags).map_err(validation)?;
+        crate::state::check_tags(&tags).map_err(|rejection| -> CreateSavingsPlanError {
+            if rejection.is_quota_exceeded() {
+                CreateSavingsPlanErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: rejection.into_message(),
+                    },
+                )
+                .into()
+            } else {
+                validation(rejection.into_message())
+            }
+        })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSavingsPlanErrorModeled::InternalServerException(InternalServerException {

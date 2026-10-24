@@ -10,6 +10,9 @@
 //!   request and every operation that resolves a username: it reports that the
 //!   lookup found no user and names neither the username asked for nor the pool,
 //!   so the refusal cannot be read as an answer about one particular identity.
+//! * the `ResourceNotFoundException` of a group lookup carries ONE fixed
+//!   sentence too, the same for every group name and for every operation that
+//!   resolves a `GroupName` against a pool's stored groups.
 //! * a password-policy refusal (`InvalidPasswordException`) carries a fixed
 //!   prefix that says the password missed the pool's password policy, followed by
 //!   the fixed clause for the requirement it missed — a clause per requirement,
@@ -40,6 +43,9 @@ const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
 /// The one sentence a `UserNotFoundException` says.
 const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+
+/// The one sentence a group lookup that found nothing says.
+const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
 
 /// The prefix a password-policy refusal carries ahead of the clause for the
 /// requirement the password missed.
@@ -277,6 +283,113 @@ async fn an_absent_user_is_refused_with_one_fixed_message() {
         found["Username"],
         json!("present"),
         "a stored user is still read back, got {found}"
+    );
+}
+
+/// The rule: the `ResourceNotFoundException` of a group lookup carries ONE
+/// fixed sentence, whatever group name was asked for and whichever operation
+/// resolved it, so the refusal reports that the lookup found nothing without
+/// naming the group or the pool it looked in.
+#[tokio::test]
+async fn an_absent_group_is_refused_with_one_fixed_message() {
+    let router = router();
+    let user_pool_id = pool(&router, "absent-group-pool", json!({})).await;
+    // A group and a user that DO exist, so each lookup below fails on the group
+    // name it is given rather than on an empty pool.
+    ok(
+        &router,
+        "CreateGroup",
+        &json!({ "UserPoolId": user_pool_id, "GroupName": "present" }),
+    )
+    .await;
+    ok(
+        &router,
+        "AdminCreateUser",
+        &json!({ "UserPoolId": user_pool_id, "Username": "member" }),
+    )
+    .await;
+
+    // The names span what `GroupNameType` admits (length 1..128, pattern
+    // `^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`, from
+    // `smithy_query(query="shape",shape="GroupNameType")`): a plain name, both
+    // published length bounds, a non-ASCII name, a punctuation-heavy name, and
+    // the stored name re-cased, which names a different group.
+    let longest = "g".repeat(128);
+    let group_names = [
+        ("a plain name", "sim-absent-group".to_string()),
+        ("the 128-character length maximum", longest),
+        ("the one-character length minimum", "z".to_string()),
+        ("a non-ASCII name", "グループ①".to_string()),
+        ("a punctuation-heavy name", "ops.team-1_a/x".to_string()),
+        ("the stored name re-cased", "Present".to_string()),
+    ];
+
+    for (name_case, group_name) in &group_names {
+        // Every implemented operation that resolves a `GroupName` against a
+        // pool's stored groups; each row is (operation, request).
+        let requests = [
+            (
+                "GetGroup",
+                json!({ "UserPoolId": user_pool_id, "GroupName": group_name }),
+            ),
+            (
+                "UpdateGroup",
+                json!({
+                    "UserPoolId": user_pool_id,
+                    "GroupName": group_name,
+                    "Description": "a description for a group that is not there",
+                }),
+            ),
+            (
+                "AdminAddUserToGroup",
+                json!({
+                    "UserPoolId": user_pool_id,
+                    "Username": "member",
+                    "GroupName": group_name,
+                }),
+            ),
+            (
+                "DeleteGroup",
+                json!({ "UserPoolId": user_pool_id, "GroupName": group_name }),
+            ),
+        ];
+
+        for (operation, body) in &requests {
+            let case = format!("{operation} with {name_case}");
+            let (status, payload) = call(&router, operation, body).await;
+            assert_eq!(
+                (status, error_code(&payload)),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: expected a 404 ResourceNotFoundException, got {status} with {payload}"
+            );
+            let message = error_message(&payload);
+            assert_eq!(
+                message, GROUP_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected {GROUP_NOT_FOUND_MESSAGE:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(group_name.as_str()),
+                "case {case:?}: the refusal must not name the group asked for, got {message:?}"
+            );
+            assert!(
+                !message.contains(user_pool_id.as_str()),
+                "case {case:?}: the refusal must not name the pool, got {message:?}"
+            );
+        }
+    }
+
+    // The same lookup still SERVES the group that exists, so the fixed message is
+    // the answer to an absent group and not to every lookup.
+    let found = ok(
+        &router,
+        "GetGroup",
+        &json!({ "UserPoolId": user_pool_id, "GroupName": "present" }),
+    )
+    .await;
+    assert_eq!(
+        found["Group"]["GroupName"],
+        json!("present"),
+        "a stored group is still read back, got {found}"
     );
 }
 

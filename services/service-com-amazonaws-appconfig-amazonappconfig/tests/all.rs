@@ -59,6 +59,8 @@ mod resource_deletes;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_deployment.rs"]
+mod stop_deployment;
 #[path = "all/update_application.rs"]
 mod update_application;
 #[path = "all/update_configuration_profile.rs"]

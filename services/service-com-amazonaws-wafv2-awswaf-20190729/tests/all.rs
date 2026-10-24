@@ -19,6 +19,8 @@ mod exception_messages;
 mod ip_set_mutations;
 #[path = "all/list_rule_groups.rs"]
 mod list_rule_groups;
+#[path = "all/managed_rule_group_versions.rs"]
+mod managed_rule_group_versions;
 #[path = "all/managed_rule_groups.rs"]
 mod managed_rule_groups;
 #[path = "all/parameter_validation.rs"]

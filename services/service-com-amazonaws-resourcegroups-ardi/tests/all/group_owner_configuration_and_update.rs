@@ -118,10 +118,12 @@ async fn every_group_payload_reports_the_owning_account_id() {
         );
         assert_owner_id(case, "CreateGroup", &created["Group"]);
 
-        let read = emulator.ok("/get-group", &json!({ "Group": name })).await;
+        let read = emulator
+            .ok_in(region, "/get-group", &json!({ "Group": name }))
+            .await;
         assert_owner_id(case, "GetGroup", &read["Group"]);
 
-        let listed = emulator.ok("/groups-list", &json!({})).await;
+        let listed = emulator.ok_in(region, "/groups-list", &json!({})).await;
         assert_eq!(
             identifier_names(&listed),
             vec![name.to_string()],
@@ -130,14 +132,17 @@ async fn every_group_payload_reports_the_owning_account_id() {
         assert_owner_id(case, "the deprecated ListGroups$Groups", &listed["Groups"][0]);
 
         let updated = emulator
-            .ok(
+            .ok_in(
+                region,
                 "/update-group",
                 &json!({ "Group": name, "Description": "Updated probe group" }),
             )
             .await;
         assert_owner_id(case, "UpdateGroup", &updated["Group"]);
 
-        let deleted = emulator.ok("/delete-group", &json!({ "Group": name })).await;
+        let deleted = emulator
+            .ok_in(region, "/delete-group", &json!({ "Group": name }))
+            .await;
         assert_owner_id(case, "DeleteGroup", &deleted["Group"]);
     }
 }

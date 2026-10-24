@@ -14,11 +14,13 @@
 //! owed at that instant whether or not anybody called, so no caller's read
 //! causes it. Nothing else here mutates state.
 //!
-//! Inheritance is not resolved: `extendsFrom` is reported as stored, and the
+//! Inheritance is not FLATTENED: `extendsFrom` is reported as stored, and the
 //! property definitions, functions and property groups reported are the
-//! component type's OWN (`isInherited` false throughout), because this emulator
-//! holds no registry of the service's built-in parent component types to
-//! flatten a definition out of.
+//! component type's OWN (`isInherited` false throughout) — resolving an
+//! inherited definition onto a child is its own issue. The parents themselves
+//! do resolve: a workspace is provisioned with the service's built-in component
+//! types ([`crate::state::built_in_component_types`]), so a read of one answers
+//! with its abstractness and its own definitions.
 //!
 //! ## Shape of an operation
 //!
@@ -290,12 +292,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             creation_date_time: crate::state::timestamp(component_type.creation_date_time),
             update_date_time: crate::state::timestamp(component_type.update_date_time),
-            // `isAbstract` is derived from the stored record by
-            // `ComponentType::is_abstract`, which is also what a
+            // `isAbstract` is read off the stored record, which is also what a
             // `ListComponentTypes` `isAbstract` filter selects on, so the read
             // and the listing cannot disagree: no component type created
-            // through this API is abstract.
-            is_abstract: Some(component_type.is_abstract()),
+            // through this API is abstract, and the abstract ones are the
+            // service's own built-ins.
+            is_abstract: Some(component_type.is_abstract),
             // "Whether the component type has a schema initializer and that the
             // schema initializer has run" — see
             // `ComponentType::is_schema_initialized`.

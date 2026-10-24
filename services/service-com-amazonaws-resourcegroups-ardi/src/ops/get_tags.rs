@@ -158,8 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` is deliberately unreachable here and a success says
         // nothing about the caller's permissions. Reporting changes nothing a later
-        // caller sees, so this operation emits no audit record and `ctx` is unread.
-        let _ = ctx;
+        // caller sees, so this operation emits no audit record; `ctx` is read below
+        // for the region the request addressed.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetTagsErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -173,12 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
             }))
         };
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // `Arn` is a group ARN (the modelled `GroupArnV2`), so it resolves only
-        // against a group's own STORED ARN: an ARN for another region or account
-        // addresses no group here.
-        let name = store.lookup(&input.arn).ok_or_else(not_found)?;
-        let record = store.groups.get(&name).ok_or_else(not_found)?;
+        // against a group's own STORED ARN, and only within the region the request
+        // addressed: an ARN for another region or account addresses no group here.
+        let key = store.lookup(&region, &input.arn).ok_or_else(not_found)?;
+        let record = store.groups.get(&key).ok_or_else(not_found)?;
         // Both members come from the record, so the ARN reported is the stored one
         // and the map is whatever the store holds — an empty map for a group that
         // carries no tags.

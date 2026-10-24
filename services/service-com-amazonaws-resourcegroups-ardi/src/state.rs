@@ -6,9 +6,12 @@
 //! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `ListGroups`, `GroupResources`,
 //! `ListGroupResources`, `ListGroupingStatuses`, `UpdateGroup` and `DeleteGroup` all read
 //! and write the same records. The map is a
-//! [`BTreeMap`] keyed by group name: the key order is the listing order, which is
-//! what makes `ListGroups` paging deterministic and resumable from an opaque
-//! token even after a group in the middle of the listing is deleted.
+//! [`BTreeMap`] keyed by [`GroupKey`] — the region the group was created in and its
+//! name — because this service is REGIONAL: a group belongs to the region whose
+//! endpoint created it, and only that region's callers see it. Within one region
+//! the key order is group-name order, which is the listing order, and what makes
+//! `ListGroups` paging deterministic and resumable from an opaque token even after
+//! a group in the middle of the listing is deleted.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -21,22 +24,62 @@ use crate::ops::types::{
 /// Per-service state for com-amazonaws-resourcegroups-ardi. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsResourcegroupsArdiState {
-    /// Every persisted resource group, keyed by `GroupRecord::name`. Ordered, so
-    /// a listing and its continuation token are stable.
-    pub groups: BTreeMap<String, GroupRecord>,
+    /// Every persisted resource group, keyed by the region it lives in and its
+    /// name. Ordered by region and then by name, so one region's listing and its
+    /// continuation token are stable.
+    pub groups: BTreeMap<GroupKey, GroupRecord>,
+}
+
+/// Where one resource group lives: the region whose endpoint created it, and the
+/// group's name.
+///
+/// A region-qualified key is what makes this service's state regional. A group
+/// name only has to be unique within one region of one account, so the name alone
+/// does not identify a group; the pair does. Ordered by region first and name
+/// second, which keeps one region's groups a contiguous, name-ordered range of the
+/// map ([`ComAmazonawsResourcegroupsArdiState::groups_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GroupKey {
+    /// The region the group was created in — the one in the creating caller's
+    /// SigV4 credential scope, and the one its stored ARN names.
+    pub region: String,
+    /// The group's name, unique within [`GroupKey::region`].
+    pub name: String,
+}
+
+impl GroupKey {
+    /// The key of the group named `name` in `region`.
+    pub fn new(region: &str, name: &str) -> Self {
+        Self {
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// A key that sorts at or before every key of `region`: the start of that
+    /// region's range of the map. A group name is at least one character long (the
+    /// modelled `GroupName`), so no stored key sorts before this one.
+    fn first_in(region: &str) -> Self {
+        Self::new(region, "")
+    }
 }
 
 impl ComAmazonawsResourcegroupsArdiState {
-    /// The name of the group `identifier` names, or `None` when nothing stored
-    /// answers to it.
+    /// The key of the group `identifier` names IN `region`, or `None` when nothing
+    /// stored there answers to it.
+    ///
+    /// `region` is the region the request addressed (its SigV4 credential scope),
+    /// and resolution never leaves it: a group created through another region's
+    /// endpoint is another region's resource, so it is invisible here however it is
+    /// addressed.
     ///
     /// An identifier is either a group ARN or a bare group name, and it is read by
     /// SHAPE, not by prefix:
     ///
     /// * a full `arn:<partition>:resource-groups:<region>:<account>:group/<name>`
     ///   names exactly one resource, so it resolves only when it equals that
-    ///   group's STORED ARN — which keeps an ARN for another account or region from
-    ///   resolving to a same-named local group;
+    ///   group's STORED ARN — which keeps an ARN for another account, partition or
+    ///   region from resolving to a same-named local group;
     /// * anything else must be a bare `GroupName`, which the model constrains to
     ///   `[a-zA-Z0-9_\.-]{1,300}` or `<name>/<ulid>` — no colon — so an identifier
     ///   that is neither a well-formed ARN nor a well-formed name resolves to
@@ -45,21 +88,34 @@ impl ComAmazonawsResourcegroupsArdiState {
     /// The caller picks the identifier: an operation that models both members takes
     /// `Group` and falls back to the deprecated `GroupName`, so the group a request
     /// resolves to never depends on which of the two a handler happens to read.
-    pub fn lookup(&self, identifier: &str) -> Option<String> {
+    pub fn lookup(&self, region: &str, identifier: &str) -> Option<GroupKey> {
         if let Some((service, resource)) = parse_arn(identifier) {
             if service != "resource-groups" {
                 return None;
             }
-            let record = self.groups.get(resource.strip_prefix("group/")?)?;
+            let key = GroupKey::new(region, resource.strip_prefix("group/")?);
+            let record = self.groups.get(&key)?;
             if identifier != record.group_arn {
                 return None;
             }
-            return Some(record.name.clone());
+            return Some(key);
         }
         if identifier.contains(':') {
             return None;
         }
-        Some(self.groups.get(identifier)?.name.clone())
+        let key = GroupKey::new(region, identifier);
+        self.groups.contains_key(&key).then_some(key)
+    }
+
+    /// Every group stored in `region`, in group-name order — the listing order.
+    ///
+    /// A region's groups are a contiguous range of the map, so this walks that
+    /// range alone and a group of another region is never reached.
+    pub fn groups_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a GroupRecord> + 'a {
+        self.groups
+            .range(GroupKey::first_in(region)..)
+            .take_while(move |(key, _)| key.region == region)
+            .map(|(_, record)| record)
     }
 }
 
@@ -249,7 +305,8 @@ pub const DELETION_PROTECTION_UNLESS_EMPTY: &str = "UNLESS_EMPTY";
 /// static members.
 #[derive(Debug, Clone)]
 pub struct GroupRecord {
-    /// The group's name, which is also its key in [`ComAmazonawsResourcegroupsArdiState::groups`].
+    /// The group's name, which with the region it lives in is its
+    /// [`GroupKey`] in [`ComAmazonawsResourcegroupsArdiState::groups`].
     pub name: String,
     /// `arn:aws:resource-groups:<region>:<account>:group/<name>`, minted once at
     /// create time and never recomputed, so every later read returns the same ARN.

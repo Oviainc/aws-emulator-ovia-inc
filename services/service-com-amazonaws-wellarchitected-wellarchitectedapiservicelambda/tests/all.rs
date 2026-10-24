@@ -144,6 +144,9 @@ mod workload_harness;
 #[path = "all/workload_lifecycle.rs"]
 mod workload_lifecycle;
 
+#[path = "all/workload_profile_association.rs"]
+mod workload_profile_association;
+
 #[path = "all/workload_profile_disassociation.rs"]
 mod workload_profile_disassociation;
 

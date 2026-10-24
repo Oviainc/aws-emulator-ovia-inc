@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/abac_attribute_configuration.rs"]
 mod abac_attribute_configuration;
+#[path = "all/account_assignment_creation_status.rs"]
+mod account_assignment_creation_status;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
 #[path = "all/application_access_scope_limits.rs"]

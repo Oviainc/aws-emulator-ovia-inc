@@ -74,7 +74,8 @@ use crate::ops::types::{
     PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm, RequestedTermConfiguration,
     Resource, ResourceNotFoundException, SendAgreementPaymentRequestInput, SupportTerm,
     TaxConfiguration, ThrottlingException, UsageBasedPricingTerm, ValidationException,
-    ValidationExceptionField, ValidityTerm, VariablePaymentTerm,
+    ValidationExceptionField, ValidityTerm, VariablePaymentTerm, AGREEMENT_STATUS_VALUES,
+    END_TIME_BEHAVIOR_REASON_CODE_VALUES, END_TIME_BEHAVIOR_TYPE_VALUES,
 };
 
 /// The `agreementType` every agreement this slice mints carries.
@@ -1899,11 +1900,13 @@ pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
                 path: filter_member_path(index, "name"),
             });
         }
-        if name == "PartyType" && !PARTY_TYPE_VALUES.contains(&value) {
-            return Err(FilterRefusal {
-                reason: "INVALID_PARTY_TYPE",
-                path: filter_value_path(index),
-            });
+        if let Some((values, reason)) = published_filter_values(name) {
+            if !values.contains(&value) {
+                return Err(FilterRefusal {
+                    reason,
+                    path: filter_value_path(index),
+                });
+            }
         }
         // Every `Before…`/`After…` filter selects on an instant, so its value
         // has to be one.
@@ -1917,6 +1920,32 @@ pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
         }
     }
     Ok(())
+}
+
+/// The closed set of values one filter's value admits, and the
+/// `ValidationException` reason a value outside it is refused with — or `None`
+/// for a filter whose values are open (an account id, an identifier, an ARN, an
+/// instant, a product type whose list `SearchAgreementsInput$filters` leaves
+/// open).
+///
+/// A filter selects on an attribute the model gives a closed value set for
+/// (`PartyType`, `AgreementType`, and the enums `AgreementStatus`,
+/// `EndTimeBehaviorType` and `EndTimeBehaviorReasonCode`), so a value outside
+/// that set names nothing this service could ever hold. The reason is the one
+/// `ValidationExceptionReason` models for THAT attribute where it models one,
+/// and the generic `INVALID_FILTER_VALUES` otherwise.
+fn published_filter_values(name: &str) -> Option<(&'static [&'static str], &'static str)> {
+    match name {
+        "PartyType" => Some((PARTY_TYPE_VALUES, "INVALID_PARTY_TYPE")),
+        "AgreementType" => Some((AGREEMENT_TYPE_VALUES, "INVALID_AGREEMENT_TYPE")),
+        "Status" => Some((AGREEMENT_STATUS_VALUES, "INVALID_STATUS")),
+        "EndTimeBehaviorType" => Some((END_TIME_BEHAVIOR_TYPE_VALUES, "INVALID_FILTER_VALUES")),
+        "EndTimeBehaviorReasonCode" => Some((
+            END_TIME_BEHAVIOR_REASON_CODE_VALUES,
+            "INVALID_FILTER_VALUES",
+        )),
+        _ => None,
+    }
 }
 
 /// The party type a search is scoped to: the value of its `PartyType` filter,

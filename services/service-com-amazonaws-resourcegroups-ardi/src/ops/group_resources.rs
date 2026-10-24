@@ -213,9 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         // `Group` is the only identifier this operation models, and it carries
-        // either a bare group name or a group ARN; `lookup` resolves both.
-        let name = store.lookup(input.group.as_str()).ok_or_else(not_found)?;
-        let group = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // either a bare group name or a group ARN; `lookup` resolves both, within
+        // the region the request addressed, since a group of another region is
+        // another region's resource.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, input.group.as_str()).ok_or_else(not_found)?;
+        let group = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // The emulator's own ceiling on stored state (see `MAX_MEMBERS_PER_GROUP`),
         // so a client looping on this operation is refused instead of growing one
         // group's membership without end. Counted over a SET, because `add_member` is
@@ -276,8 +279,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
-            region = ?crate::state::request_region(ctx.parts()),
-            group = ?name,
+            region = ?region,
+            group = ?key.name,
             members_requested = input.resource_arns.len(),
             members_added = added_count,
             members_now_present = succeeded.len(),

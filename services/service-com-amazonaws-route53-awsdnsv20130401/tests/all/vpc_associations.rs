@@ -91,7 +91,7 @@ pub(crate) async fn get_zone(router: &MultiServiceRouter, zone_id: &str) -> Repl
 }
 
 /// The bare (`Z…`) id from a reply carrying a `HostedZone`.
-fn bare_zone_id(reply: &Reply) -> String {
+pub(crate) fn bare_zone_id(reply: &Reply) -> String {
     let id = reply
         .first("HostedZone/Id")
         .unwrap_or_else(|| panic!("the reply must carry HostedZone/Id; body {}", reply.body));
@@ -100,7 +100,7 @@ fn bare_zone_id(reply: &Reply) -> String {
 
 /// Create a zone and return the reply. `config` is the `HostedZoneConfig` (and,
 /// for a private zone, `VPC`) block.
-async fn create_zone(
+pub(crate) async fn create_zone(
     router: &MultiServiceRouter,
     name: &str,
     caller_reference: &str,

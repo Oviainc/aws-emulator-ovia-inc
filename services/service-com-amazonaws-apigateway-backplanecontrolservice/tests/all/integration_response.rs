@@ -74,6 +74,30 @@ pub(crate) async fn get_integration_response(
         .await
 }
 
+/// `DeleteIntegrationResponse` for `status` on the integration of the `verb` method of
+/// `resource`, with `verb` sent exactly as the caller spelled it.
+///
+/// This crate's one copy of that call, shared with the sibling `control_plane_deletes` and
+/// `delete_integration_response` suites, so every suite deletes an integration response
+/// the same way; see [`put_integration_response`].
+pub(crate) async fn delete_integration_response(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    verb: &str,
+    status: &str,
+) -> Answer {
+    gateway
+        .call(
+            "DELETE",
+            &format!(
+                "/restapis/{api}/resources/{resource}/methods/{verb}/integration/responses/{status}"
+            ),
+            None,
+        )
+        .await
+}
+
 /// A fresh resource under `root` carrying one `verb` method with a MOCK integration on
 /// it, answering its resource id: an integration response hangs off the integration, so
 /// every case needs one standing first.

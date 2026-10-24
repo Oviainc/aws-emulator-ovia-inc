@@ -37,10 +37,11 @@ use crate::package_group_hierarchy::{create_package_group, describe_package_grou
 ///
 /// Source: `smithy_query(query="shape", shape="PackageGroupOriginRestrictionType")` →
 /// values `["EXTERNAL_UPSTREAM", "INTERNAL_UPSTREAM", "PUBLISH"]`.
-const RESTRICTION_TYPES: [&str; 3] = ["EXTERNAL_UPSTREAM", "INTERNAL_UPSTREAM", "PUBLISH"];
+pub(crate) const RESTRICTION_TYPES: [&str; 3] =
+    ["EXTERNAL_UPSTREAM", "INTERNAL_UPSTREAM", "PUBLISH"];
 
 /// The only `PackageGroupOriginRestrictionMode` that carries an allowed-repository list.
-const ALLOW_SPECIFIC: &str = "ALLOW_SPECIFIC_REPOSITORIES";
+pub(crate) const ALLOW_SPECIFIC: &str = "ALLOW_SPECIFIC_REPOSITORIES";
 
 /// The modes that carry NO allowed-repository list — the rest of
 /// `PackageGroupOriginRestrictionMode` (`["ALLOW", "ALLOW_SPECIFIC_REPOSITORIES", "BLOCK",
@@ -48,7 +49,7 @@ const ALLOW_SPECIFIC: &str = "ALLOW_SPECIFIC_REPOSITORIES";
 const MODES_WITHOUT_A_LIST: [&str; 3] = ["ALLOW", "BLOCK", "INHERIT"];
 
 /// `ListAllowedRepositoriesForGroup`: every input member is `httpQuery`-bound.
-async fn list_allowed_repositories(
+pub(crate) async fn list_allowed_repositories(
     router: &MultiServiceRouter,
     domain: &str,
     pattern: &str,
@@ -71,7 +72,7 @@ async fn list_allowed_repositories(
 
 /// `UpdatePackageGroupOriginConfiguration`: the domain and the pattern are
 /// `httpQuery`-bound, everything else travels in the body.
-async fn update_origin_configuration(
+pub(crate) async fn update_origin_configuration(
     router: &MultiServiceRouter,
     domain: &str,
     pattern: &str,
@@ -87,7 +88,7 @@ async fn update_origin_configuration(
 }
 
 /// A `PackageGroupAllowedRepository` list for one restriction type.
-fn allowed_repository_entries(restriction_type: &str, repositories: &[&str]) -> Value {
+pub(crate) fn allowed_repository_entries(restriction_type: &str, repositories: &[&str]) -> Value {
     Value::Array(
         repositories
             .iter()
@@ -103,7 +104,7 @@ fn allowed_repository_entries(restriction_type: &str, repositories: &[&str]) -> 
 
 /// Put `repositories` in the allowed-repository list of `restriction_type`, moving that
 /// restriction to `ALLOW_SPECIFIC_REPOSITORIES` in the same call.
-async fn allow_specific_repositories(
+pub(crate) async fn allow_specific_repositories(
     router: &MultiServiceRouter,
     domain: &str,
     pattern: &str,
@@ -123,7 +124,7 @@ async fn allow_specific_repositories(
 }
 
 /// The `allowedRepositories` of a successful listing.
-fn listed(label: &str, answer: &Answer) -> Vec<String> {
+pub(crate) fn listed(label: &str, answer: &Answer) -> Vec<String> {
     answer
         .body
         .get("allowedRepositories")
@@ -149,7 +150,7 @@ fn next_token(answer: &Answer) -> Option<String> {
 
 /// One restriction of a group's `originConfiguration`, as `DescribePackageGroup` reports
 /// it.
-fn restriction<'a>(label: &str, group: &'a Value, restriction_type: &str) -> &'a Value {
+pub(crate) fn restriction<'a>(label: &str, group: &'a Value, restriction_type: &str) -> &'a Value {
     group
         .get("originConfiguration")
         .and_then(|configuration| configuration.get("restrictions"))

@@ -19,7 +19,9 @@
 //! the same way, and `ListLenses` pages over those
 //! lenses beside the AWS-official lens this emulator ships. The Well-Architected
 //! Tool profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
-//! `ProfileArn` the create minted. The agent profiles
+//! `ProfileArn` the create minted, and the association of one with a workload
+//! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
+//! OF. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are
 //! backed the same way,
@@ -893,12 +895,11 @@ pub const LENS_REVIEW_RESOURCE_TYPE: &str = "LENS_REVIEW";
 ///
 /// The enum publishes exactly `PRIORITIZED` and `NON_PRIORITIZED`
 /// (`smithy_query(query="shape", shape="QuestionType")`), and a question is prioritized
-/// because a PROFILE associated with the workload prioritises it. No profile can be
-/// associated with a workload in this emulator yet — `AssociateProfiles` is a stub with
-/// its own issue, and `CreateWorkload` refuses a `ProfileArn` with a 404, because which
-/// lens questions a profile prioritises is decided by the profile TEMPLATE's questions,
-/// which this emulator does not carry (`GetProfileTemplate` is a stub with its own
-/// issue) — so no question of any workload is prioritized.
+/// because a PROFILE associated with the workload prioritises it. WHICH lens questions a
+/// profile prioritises is decided by the profile TEMPLATE's questions, which this emulator
+/// does not carry (`GetProfileTemplate` is a stub with its own issue), so a profile
+/// associated with a workload prioritises no question of it and every question of every
+/// workload reports this type.
 pub const DEFAULT_QUESTION_TYPE: &str = "NON_PRIORITIZED";
 
 /// The `QuestionType` a question is prioritized with, the counterpart of
@@ -979,6 +980,35 @@ pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
 /// create runs ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::unapplicable_lenses_refusal`])
 /// and the per-lens work of every read that reports its lens reviews.
 pub const MAX_LENSES_PER_WORKLOAD: usize = 10;
+
+/// The most profiles one workload is reviewed against — a MODELLED bound, unlike the lens
+/// quota above: `WorkloadProfiles`, the list every read of a workload reports its
+/// associations by, is `@length(max: 1)` (`smithy_query(query="shape",
+/// shape="WorkloadProfiles")`), as is `CreateWorkloadInput$ProfileArns`. A workload holding
+/// more than one could not be serialized, so an association request that would leave it
+/// holding more is refused instead ([`PROFILE_ARNS_MEMBER`]).
+pub const MAX_PROFILES_PER_WORKLOAD: usize = 1;
+
+/// The modelled input member a profile-association finding names
+/// (`AssociateProfilesInput$ProfileArns` / `DisassociateProfilesInput$ProfileArns`).
+pub const PROFILE_ARNS_MEMBER: &str = "ProfileArns";
+
+/// The most `ProfileArn`s one `AssociateProfiles` / `DisassociateProfiles` request may
+/// name — an emulator quota, like [`MAX_LENSES_PER_WORKLOAD`], because the member those
+/// two operations carry the ARNs in (`ProfileArns`) publishes only `@length(min: 1)`
+/// (`smithy_query(query="shape", shape="ProfileArns")`), so nothing in the model bounds
+/// the list a caller sends. The number is the one the service publishes for the list of
+/// the SIBLING associate/disassociate pair: "Up to 10 lenses can be specified"
+/// (`smithy_query(query="shape", shape="LensAliases")`).
+///
+/// It is what makes the per-request work of those operations constant rather than
+/// caller-chosen: the length is checked before any per-entry work and before the shared
+/// store lock is taken, so an oversized list costs one comparison. Being a request-shape
+/// rule rather than a resource quota — and neither operation models
+/// `ServiceQuotaExceededException` — it is answered with the modelled
+/// `ValidationException` naming [`PROFILE_ARNS_MEMBER`]
+/// ([`too_many_profile_arns_exception`]).
+pub const MAX_PROFILE_ARNS_PER_REQUEST: usize = 10;
 
 /// `ReviewTemplateUpdateStatus$CURRENT`: what a review template reports while every lens
 /// applied to it is at its current version. The enum publishes exactly `CURRENT` and
@@ -1505,9 +1535,10 @@ pub struct WorkloadRecord {
     /// `CreateWorkloadInput$ProfileArns`) and its order is the order the response
     /// reports.
     ///
-    /// `DisassociateProfiles` is what removes an entry here, and `AssociateProfiles` —
-    /// still a stub with its own issue, which is why no HTTP path adds one yet — is what
-    /// will add one.
+    /// `AssociateProfiles` (and a `CreateWorkload` that names a profile) is what adds an
+    /// entry here, through [`Self::associate_profile`]; `DisassociateProfiles` is what
+    /// removes one. The list is held at [`MAX_PROFILES_PER_WORKLOAD`] by the operations
+    /// that add to it.
     pub profiles: Vec<WorkloadProfileRecord>,
 }
 
@@ -1540,6 +1571,26 @@ impl WorkloadRecord {
         self.profiles
             .iter()
             .any(|associated| associated.profile_arn == profile_arn)
+    }
+
+    /// Record the association of one profile, pinned at `profile_version`, with this
+    /// workload, and answer whether it added one.
+    ///
+    /// Idempotent in the ARN: the ARN identifies the profile on its own
+    /// ([`Self::associates_profile`]), so a profile the workload already holds is left
+    /// exactly as it stood — at the version the association pinned — and `false` says so.
+    /// Bounding the list is the CALLER's: a workload reports at most
+    /// [`MAX_PROFILES_PER_WORKLOAD`] associations, so an operation that would push past
+    /// that refuses before it writes.
+    pub fn associate_profile(&mut self, profile_arn: &str, profile_version: &str) -> bool {
+        if self.associates_profile(profile_arn) {
+            return false;
+        }
+        self.profiles.push(WorkloadProfileRecord {
+            profile_arn: profile_arn.to_string(),
+            profile_version: profile_version.to_string(),
+        });
+        true
     }
 
     /// Drop the association of one profile from this workload.
@@ -5269,6 +5320,52 @@ pub fn workload_profile_not_found(
         profile_arn.to_string(),
         &format!("profile with ARN {profile_arn} associated with a workload with ID {workload_id}"),
     )
+}
+
+/// [`conflict`] for a workload that is already reviewed against a profile: a workload
+/// reports at most [`MAX_PROFILES_PER_WORKLOAD`] of them, so the association it already
+/// holds is what a request associating a DIFFERENT profile collides with — the modelled
+/// `ConflictException`'s own "the resource has already been processed" case. `existing_arn`
+/// is the association as STORED, so the caller is told which profile to disassociate, and
+/// `resource_id` names the workload the collision is inside, as the other
+/// association failures of a workload report it.
+pub fn workload_profile_conflict(workload_id: &str, existing_arn: &str) -> ConflictException {
+    conflict(
+        WORKLOAD_RESOURCE_TYPE,
+        workload_id.to_string(),
+        &format!(
+            "The workload with ID {workload_id} is already associated with the profile with \
+             ARN {existing_arn}."
+        ),
+    )
+}
+
+/// The refusal for a request that would leave one workload reviewed against more than
+/// [`MAX_PROFILES_PER_WORKLOAD`] profiles: the list the association is reported by is
+/// modelled `@length(max: 1)`, so the request asks for a result the API cannot carry,
+/// whatever the store holds. `Fields` names the member that carried the ARNs.
+pub fn too_many_profiles_exception() -> crate::ops::types::ValidationException {
+    field_validation_exception(&[(
+        PROFILE_ARNS_MEMBER.to_string(),
+        format!(
+            "A workload is associated with at most {MAX_PROFILES_PER_WORKLOAD} profile, so a \
+             request must not name more distinct profiles than that."
+        ),
+    )])
+}
+
+/// The refusal for a request whose `ProfileArns` is longer than
+/// [`MAX_PROFILE_ARNS_PER_REQUEST`]: the member publishes no modelled maximum, so this is
+/// the quota that keeps the per-request work of an association constant. `named` is the
+/// length as sent, so the caller is told how far past the quota it is.
+pub fn too_many_profile_arns_exception(named: usize) -> crate::ops::types::ValidationException {
+    field_validation_exception(&[(
+        PROFILE_ARNS_MEMBER.to_string(),
+        format!(
+            "{PROFILE_ARNS_MEMBER} must name at most {MAX_PROFILE_ARNS_PER_REQUEST} profile \
+             ARNs; {named} were named."
+        ),
+    )])
 }
 
 /// [`resource_not_found`] for a template ARN that names no stored review template.

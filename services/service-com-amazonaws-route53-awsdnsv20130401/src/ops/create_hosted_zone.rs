@@ -155,8 +155,8 @@
 use super::types::*;
 
 use crate::state::{
-    normalize_dns_name, resource_location, RecordKey, StoredZone,
-    HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
+    normalize_dns_name, resource_location, vpc_id_is_well_formed, vpc_region_is_modelled,
+    RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
 };
 use std::collections::BTreeMap;
 
@@ -326,49 +326,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let private_zone = input
-            .hosted_zone_config
-            .as_ref()
-            .is_some_and(|config| config.private_zone);
         let comment = input
             .hosted_zone_config
             .as_ref()
             .and_then(|config| config.comment.clone());
 
-        // A private hosted zone exists to serve a VPC, so the first association
-        // is made at creation: "If you are associating a VPC with a hosted zone
-        // with this request, the paramaters VPCId and VPCRegion are also
-        // required." A private zone with no VPC has nothing to answer for, and
-        // a VPC belongs to no PUBLIC zone at all: "(Private hosted zones only) A
-        // complex type that contains information about the Amazon VPC that
-        // you're associating with this hosted zone."
+        // Naming a VPC is itself what makes the new zone PRIVATE. `VPC` is
+        // "(Private hosted zones only) A complex type that contains information
+        // about the Amazon VPC that you're associating with this hosted zone",
+        // and the only further requirement the model states when it is given is
+        // that both of its members be there: "If you are associating a VPC with
+        // a hosted zone with this request, the paramaters VPCId and VPCRegion
+        // are also required." `HostedZoneConfig$PrivateZone` is a boolean with a
+        // modelled default of false, so a request that omits it is
+        // indistinguishable from one that sends it false; the flag can only ADD
+        // to what naming a VPC already says, never contradict it.
         let absent =
             |member: Option<&String>| member.map(String::as_str).unwrap_or_default().is_empty();
         let vpc = input
             .vpc
             .as_ref()
             .filter(|vpc| !absent(vpc.vpc_id.as_ref()) || !absent(vpc.vpc_region.as_ref()));
+        let private_zone = vpc.is_some()
+            || input
+                .hosted_zone_config
+                .as_ref()
+                .is_some_and(|config| config.private_zone);
+
+        // A private hosted zone exists to serve a VPC, so its first association
+        // is made at creation and a private zone asked for with no complete VPC
+        // has nothing to answer for.
         if private_zone {
-            if vpc.is_none_or(|vpc| absent(vpc.vpc_id.as_ref()) || absent(vpc.vpc_region.as_ref()))
-            {
-                return Err(CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
-                    message: Some(
-                        "Invalid request: a private hosted zone must be created with a VPC, \
-                         naming both VPC.VPCId and VPC.VPCRegion"
-                            .to_string(),
-                    ),
+            let named = vpc
+                .filter(|vpc| !absent(vpc.vpc_id.as_ref()) && !absent(vpc.vpc_region.as_ref()))
+                .ok_or_else(|| {
+                    CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(
+                            "Invalid request: a private hosted zone must be created with a VPC, \
+                             naming both VPC.VPCId and VPC.VPCRegion"
+                                .to_string(),
+                        ),
+                    })
+                })?;
+            // A VPC is named here exactly as `AssociateVPCWithHostedZone` names
+            // one: by an Amazon VPC id, in a region a VPC can have been created
+            // in, so the same two values identify the same VPC whichever call
+            // associated it.
+            let vpc_id = named.vpc_id.as_deref().unwrap_or_default();
+            if !vpc_id_is_well_formed(vpc_id) {
+                return Err(CreateHostedZoneErrorModeled::InvalidVPCId(InvalidVPCId {
+                    message: Some(format!(
+                        "Invalid VPC ID: {vpc_id:?} is not a valid Amazon VPC ID"
+                    )),
                 })
                 .into());
             }
-        } else if vpc.is_some() {
-            return Err(CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
-                message: Some(
-                    "Invalid request: a VPC can be associated only with a private hosted zone, \
-                     so HostedZoneConfig.PrivateZone must be true when VPC is given"
-                        .to_string(),
-                ),
-            })
-            .into());
+            let vpc_region = named.vpc_region.as_deref().unwrap_or_default();
+            // The backstop for the region: `VPCRegion` is a modelled enum, so
+            // the request boundary refuses a value outside it with its own 400
+            // before this runs; the check is here so the two VPC members are
+            // validated in one place whatever reaches the handler.
+            if !vpc_region_is_modelled(vpc_region) {
+                return Err(CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(format!(
+                        "Invalid request: VPC.VPCRegion {vpc_region:?} is not a region an Amazon \
+                         VPC can be created in"
+                    )),
+                })
+                .into());
+            }
         }
 
         let mut store = state.lock();

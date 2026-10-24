@@ -317,11 +317,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Bring the environment up to date first: a deployment whose rollout and bake
         // time have both elapsed is no longer in flight, and must not block this one.
         environment.materialize(started_at);
-        if let Some(in_flight) = environment.deployment_in_flight() {
+        if let Some(active) = environment.active_deployment() {
             return Err(StartDeploymentErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::environment_not_ready_for_deployment(
                     &environment.id,
-                    &in_flight.state,
+                    &active.state,
                 )),
             })
             .into());

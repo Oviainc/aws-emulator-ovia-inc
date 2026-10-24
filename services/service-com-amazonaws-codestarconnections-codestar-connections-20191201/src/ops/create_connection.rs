@@ -226,12 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             let Some(host) = store.hosts.get(host_arn) else {
-                return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::host_not_found_message(host_arn)),
-                    },
-                )
-                .into());
+                // The host reference resolves to nothing: the modeled absence, answered
+                // at the status the live service answers an absent resource with
+                // (`state::RESOURCE_NOT_FOUND_STATUS`) and with the host wording, which
+                // names the ARN that was supplied.
+                return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                    CreateConnectionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::host_not_found_message(host_arn)),
+                        },
+                    ),
+                    crate::state::RESOURCE_NOT_FOUND_STATUS,
+                ));
             };
             // A host-backed connection reaches its provider THROUGH the host, which is
             // what makes `ProviderType` optional beside a `HostArn`: the host record

@@ -13,6 +13,12 @@
 //! [`crate::state::Workspace::component_type_references`] is the one place that
 //! says what counts as a reference.
 //!
+//! A component type the SERVICE ships is not a caller's to delete: a workspace
+//! is provisioned with the built-ins
+//! ([`crate::state::built_in_component_types`]) and they outlive every caller's
+//! write, so a delete addressed to one is refused with the modelled
+//! `ValidationException` (HTTP 400).
+//!
 //! The removal is performed by this call, and the `state` it answers is the
 //! `DELETING` the service reports for the deletion it performs, the same
 //! reading `DeleteEntity` gives its own removal. Both labels address an EXISTING
@@ -196,6 +202,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &input.workspace_id,
                         &input.component_type_id,
                     )),
+                },
+            )
+            .into());
+        }
+
+        // A built-in component type is the service's own, provisioned with the
+        // workspace: no caller's delete applies to it. Refused AFTER the
+        // existence check above, so an id in the reserved namespace the store
+        // does not hold is still the 404 it deserves.
+        if crate::state::built_in_component_type_id(&input.component_type_id) {
+            return Err(DeleteComponentTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::built_in_component_type_not_writable_message(
+                            &input.workspace_id,
+                            &input.component_type_id,
+                        ),
+                    ),
                 },
             )
             .into());

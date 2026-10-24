@@ -12,8 +12,8 @@
 //! * the operation reports the query the addressed group was STORED with, verbatim,
 //!   beside that group's own stored name;
 //! * a group is addressed by name, by its stored ARN, or through the deprecated
-//!   `GroupName`, and every form reports the same query, in every region the caller's
-//!   credential scope can name;
+//!   `GroupName`, and every form reports the same query, in the region the group
+//!   lives in;
 //! * reporting changes nothing: repeated calls answer the same query and the group is
 //!   unchanged afterwards;
 //! * an identifier that names no stored group is `NotFoundException` (404), and a
@@ -168,28 +168,30 @@ async fn a_stored_query_is_reported_for_every_identifier_form() {
             );
         }
 
-        // The query is reported from the store, not from the request, so a caller
-        // in another region reads the same answer for the same group.
+        // A group belongs to the region whose endpoint created it, so a caller
+        // signing for another region addresses no group at all.
         let (status, elsewhere) = emulator
             .call_in("eu-central-1", "/get-group-query", &json!({ "Group": case.name }))
             .await;
         assert_eq!(
-            (status, &elsewhere["GroupQuery"]),
-            (200, &expected),
-            "case {label:?}: expected the same query from another region, \
+            (status, error_code(&elsewhere)),
+            (404, "NotFoundException"),
+            "case {label:?}: expected 404 NotFoundException from another region, \
              got {status} {elsewhere}",
         );
 
         // Reporting is not a mutation: the group still reads back as itself, and
         // its query is unchanged.
-        let group = emulator.ok("/get-group", &json!({ "Group": case.name })).await;
+        let group = emulator
+            .ok_in(case.region, "/get-group", &json!({ "Group": case.name }))
+            .await;
         assert_eq!(
             group["Group"]["GroupArn"].as_str(),
             Some(group_arn(case.region, case.name).as_str()),
             "case {label:?}: expected GetGroup to still report the group, got {group}",
         );
         let again = emulator
-            .ok("/get-group-query", &json!({ "Group": case.name }))
+            .ok_in(case.region, "/get-group-query", &json!({ "Group": case.name }))
             .await;
         assert_eq!(
             again["GroupQuery"], expected,

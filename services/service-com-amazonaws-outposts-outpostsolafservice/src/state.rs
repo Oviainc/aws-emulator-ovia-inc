@@ -1635,6 +1635,34 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         })
     }
 
+    /// The asset `asset_id` of the Outpost `outpost_id`, if that Outpost holds one.
+    ///
+    /// An asset is a nested resource of exactly ONE Outpost — the modelled route is
+    /// `/outposts/{OutpostIdentifier}/assets` and [`OutpostRecord::assets`] holds
+    /// the hardware recorded for it — so an `AssetId` is resolved WITHIN the Outpost
+    /// the request names: an operation scoped to an Outpost resolves the asset it
+    /// was given here rather than walking the store itself, and `None` means that
+    /// Outpost holds no such asset.
+    pub fn asset_of_outpost(&self, outpost_id: &str, asset_id: &str) -> Option<&AssetInfo> {
+        self.outposts
+            .get(outpost_id)?
+            .assets
+            .iter()
+            .find(|asset| asset.asset_id.as_deref() == Some(asset_id))
+    }
+
+    /// Whether this store holds the Amazon Web Services Outposts order `order_id`.
+    ///
+    /// An order is a TOP-LEVEL resource of the account (`CreateOrder` persists one
+    /// and `GetOrder` reads it back at `/orders/{OrderId}`), so this asks only
+    /// whether the account placed it. An operation that scopes its answer to the
+    /// hardware an order is FOR needs the narrower question — whether the order was
+    /// placed against the Outpost in hand — and asks it of
+    /// [`OrderRecord::order`]'s own `OutpostId`.
+    pub fn holds_order(&self, order_id: &str) -> bool {
+        self.orders.contains_key(order_id)
+    }
+
     /// Mint a fresh 32-byte digest for a resource of kind `kind`, with the creation
     /// sequence to record on it.
     ///

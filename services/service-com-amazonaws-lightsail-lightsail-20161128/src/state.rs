@@ -41,7 +41,7 @@
 //!   hardware, firewall rules, user name and lifecycle state — each computed
 //!   from the request plus this store's own allocators, never from a canned body.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -6122,7 +6122,11 @@ pub struct StoredOperation {
     pub location: StoredLocation,
     pub is_terminal: bool,
     pub operation_details: Option<String>,
-    pub operation_type: String,
+    /// The kind of call this entry records, a value of the modelled
+    /// `OperationType` enum — and `None` for a call that enum declares no member
+    /// for, which is what [`ComAmazonawsLightsailLightsail20161128State::record_untyped_operation`]
+    /// writes.
+    pub operation_type: Option<String>,
     pub status: String,
     pub status_changed_at_ms: i64,
     pub error_code: Option<String>,
@@ -6143,7 +6147,7 @@ impl StoredOperation {
             location: Some(self.location.view()),
             is_terminal: Some(self.is_terminal),
             operation_details: self.operation_details.clone(),
-            operation_type: Some(self.operation_type.clone()),
+            operation_type: self.operation_type.clone(),
             status: Some(self.status.clone()),
             status_changed_at: Some(timestamp(self.status_changed_at_ms)),
             error_code: self.error_code.clone(),
@@ -9329,6 +9333,48 @@ impl ComAmazonawsLightsailLightsail20161128State {
         location: &StoredLocation,
         settles_at_ms: Option<i64>,
     ) -> StoredOperation {
+        self.log_operation(
+            now_ms,
+            Some(operation_type.to_string()),
+            resource_type,
+            resource_name,
+            location,
+            settles_at_ms,
+        )
+    }
+
+    /// Build and record a TERMINAL operation against `resource_name` that
+    /// reports no `operationType`.
+    ///
+    /// The modelled `OperationType` enum declares a member for each call that
+    /// writes this log and none for a change to a resource's tags, so an entry
+    /// for one leaves `Operation$operationType` — an optional member — absent
+    /// rather than reporting a value the model does not define. The entry is
+    /// terminal because a tag change is complete when the call returns: the
+    /// tags the next read reports are already the new ones, so the clock owes
+    /// the entry nothing.
+    pub fn record_untyped_operation(
+        &mut self,
+        now_ms: i64,
+        resource_type: &str,
+        resource_name: &str,
+        location: &StoredLocation,
+    ) -> StoredOperation {
+        self.log_operation(now_ms, None, resource_type, resource_name, location, None)
+    }
+
+    /// The one place an operation-log entry is built, so every entry this
+    /// service writes has the same members whether or not the modelled
+    /// `OperationType` enum has a value for the call that wrote it.
+    fn log_operation(
+        &mut self,
+        now_ms: i64,
+        operation_type: Option<String>,
+        resource_type: &str,
+        resource_name: &str,
+        location: &StoredLocation,
+        settles_at_ms: Option<i64>,
+    ) -> StoredOperation {
         let id = self.mint_uuid();
         let terminal = settles_at_ms.is_none();
         let operation = StoredOperation {
@@ -9339,7 +9385,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
             location: location.clone(),
             is_terminal: terminal,
             operation_details: Some(resource_name.to_string()),
-            operation_type: operation_type.to_string(),
+            operation_type,
             status: if terminal {
                 OPERATION_STATUS_SUCCEEDED.to_string()
             } else {
@@ -9584,6 +9630,176 @@ impl ComAmazonawsLightsailLightsail20161128State {
             }
         }
     }
+
+    /// Run `body` against the tag-carrying record `name` names in `region` —
+    /// whichever kind of resource that turns out to be — together with the
+    /// `ResourceType` that kind reports. `None` when this account holds no
+    /// tag-carrying resource of that name there.
+    ///
+    /// ONE name addresses one resource: `GetActiveNames` answers "the names of
+    /// all active (not deleted) resources" of the account as a single flat list,
+    /// with no resource type qualifying them, so at most one of the maps below
+    /// holds a given name. Each map is searched the way that resource's OWN
+    /// operations address it, so a tag change reaches exactly what they reach
+    /// and no more: the maps keyed by `(region, name)` hold the resources whose
+    /// identity includes a Region — a bucket, a container service, a load
+    /// balancer, whose listings report "all of your … in the Amazon Web Services
+    /// Region where the request is made" — so one of those is resolved in
+    /// `region` alone; the maps keyed by name alone hold the resources every
+    /// operation of theirs takes by name alone (`GetInstance`, `GetDisk`,
+    /// `GetRelationalDatabase` and the rest serve them whichever Region the
+    /// request is made from), so a tag change does the same rather than refusing
+    /// a resource their own readers serve. A contact method is the one resource
+    /// whose store key is neither: it is held under its Region and its PROTOCOL,
+    /// so the map is resolved by scanning that Region's few entries for the name
+    /// the store minted.
+    ///
+    /// The one place a tag change resolves a resource, so every operation that
+    /// edits tags admits exactly the same set of resources — the ones whose
+    /// modelled shape carries a `tags` member.
+    pub fn with_tagged_record<R>(
+        &mut self,
+        region: &str,
+        name: &str,
+        body: impl FnOnce(&mut dyn TaggedRecord, &'static str) -> R,
+    ) -> Option<R> {
+        if let Some(record) = self.instances.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_INSTANCE));
+        }
+        if let Some(record) = self.disks.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_DISK));
+        }
+        if let Some(record) = self.disk_snapshots.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_DISK_SNAPSHOT));
+        }
+        if let Some(record) = self.instance_snapshots.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_INSTANCE_SNAPSHOT));
+        }
+        if let Some(record) = self.domains.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_DOMAIN));
+        }
+        if let Some(record) = self.relational_databases.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_RELATIONAL_DATABASE));
+        }
+        if let Some(record) = self.relational_database_snapshots.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT));
+        }
+        if let Some(record) = self.alarms.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_ALARM));
+        }
+        if let Some(record) = self.distributions.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_DISTRIBUTION));
+        }
+        // Only the Region-keyed maps need the pair, so it is built here rather
+        // than above: a name the maps keyed by name alone hold never allocates
+        // it.
+        let regional = (region.to_string(), name.to_string());
+        if let Some(record) = self.buckets.get_mut(&regional) {
+            return Some(body(record, RESOURCE_TYPE_BUCKET));
+        }
+        if let Some(record) = self.container_services.get_mut(&regional) {
+            return Some(body(record, RESOURCE_TYPE_CONTAINER_SERVICE));
+        }
+        if let Some(record) = self.load_balancers.get_mut(&regional) {
+            return Some(body(record, RESOURCE_TYPE_LOAD_BALANCER));
+        }
+        // A contact method is held under its Region and its protocol, so the
+        // name it is tagged by — the one this store minted for it, which
+        // `GetContactMethods` reports — is found by walking that Region's
+        // entries. One Region holds at most one contact method per protocol, so
+        // the walk is over as many entries as the modelled `ContactProtocol`
+        // enum has members.
+        if let Some(record) = self
+            .contact_methods
+            .iter_mut()
+            .filter(|((method_region, _), _)| method_region == region)
+            .map(|(_, method)| method)
+            .find(|method| method.name == name)
+        {
+            return Some(body(record, RESOURCE_TYPE_CONTACT_METHOD));
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource tags
+//
+// Every Lightsail resource whose modelled shape carries a `tags` member holds
+// those tags on its own stored record, beside the rest of what the resource is.
+// The trait below is what lets one tag operation reach them all without knowing
+// which kind of resource it was handed: see
+// [`ComAmazonawsLightsailLightsail20161128State::with_tagged_record`].
+// ---------------------------------------------------------------------------
+
+/// What a stored record must expose for a tag operation to work on it: where it
+/// is, how else it can be named, and the tags it carries.
+pub trait TaggedRecord {
+    /// The resource's ARN, which a tag operation may name it by as well as by
+    /// its name.
+    fn arn(&self) -> &str;
+    /// Where the resource is, for the operation-log entry a tag change writes.
+    fn location(&self) -> &StoredLocation;
+    /// The tags the resource carries now.
+    fn tags(&self) -> &[Tag];
+    /// Replace the tags the resource carries.
+    fn set_tags(&mut self, tags: Vec<Tag>);
+}
+
+/// Implement [`TaggedRecord`] for each stored record that holds `arn`,
+/// `location` and `tags` — which every tag-carrying Lightsail resource's record
+/// does, so the implementation is the same for all of them.
+macro_rules! tagged_records {
+    ($($record:ident),+ $(,)?) => {
+        $(impl TaggedRecord for $record {
+            fn arn(&self) -> &str {
+                &self.arn
+            }
+
+            fn location(&self) -> &StoredLocation {
+                &self.location
+            }
+
+            fn tags(&self) -> &[Tag] {
+                &self.tags
+            }
+
+            fn set_tags(&mut self, tags: Vec<Tag>) {
+                self.tags = tags;
+            }
+        })+
+    };
+}
+
+tagged_records!(
+    StoredInstance,
+    StoredDisk,
+    StoredDiskSnapshot,
+    StoredInstanceSnapshot,
+    StoredDomain,
+    StoredRelationalDatabase,
+    StoredRelationalDatabaseSnapshot,
+    StoredAlarm,
+    StoredContactMethod,
+    StoredDistribution,
+    StoredBucket,
+    StoredContainerService,
+    StoredLoadBalancer,
+);
+
+/// The tags of `record` with every tag whose key is in `keys` removed.
+///
+/// Removal is BY KEY, whatever value the tag carries, and a key the resource
+/// does not carry removes nothing — so the result depends only on which keys
+/// the request named, never on how many times it named one or on whether the
+/// resource ever carried it.
+pub fn tags_without(record: &dyn TaggedRecord, keys: &BTreeSet<String>) -> Vec<Tag> {
+    record
+        .tags()
+        .iter()
+        .filter(|tag| tag.key.as_deref().is_none_or(|key| !keys.contains(key)))
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

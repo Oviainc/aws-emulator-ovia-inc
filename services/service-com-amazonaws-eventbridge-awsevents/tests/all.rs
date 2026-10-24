@@ -21,6 +21,8 @@ mod event_bus_deletion;
 mod event_bus_lifecycle;
 #[path = "all/input_validation.rs"]
 mod input_validation;
+#[path = "all/missing_resource_wording.rs"]
+mod missing_resource_wording;
 #[path = "all/reserved_event_source.rs"]
 mod reserved_event_source;
 #[path = "all/resource_tagging.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExportTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExportTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExportTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the snapshot and cluster export tasks this service holds in the region the
+//! request is signed for, narrowed by the members and filters the operation publishes and
+//! paged like every other RDS describe. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExportTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExportTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExportTasks"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeExportTasksError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeExportTasksError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeExportTasksError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeExportTasksError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the export tasks of the region it was
+        // signed for. Naming one task narrows the report to it, and an identifier that
+        // names no export task is the modelled not-found fault — the one condition this
+        // operation models an error for.
+        let candidates: Vec<&crate::state::ExportTaskRecord> =
+            match &input.export_task_identifier {
+                Some(requested) => {
+                    let record =
+                        store.resolve_export_task(&region, requested).ok_or_else(|| {
+                            DescribeExportTasksError::from(
+                                DescribeExportTasksErrorModeled::ExportTaskNotFoundFault(
+                                    ExportTaskNotFoundFault {
+                                        message: Some(format!(
+                                            "ExportTask {requested} not found."
+                                        )),
+                                    },
+                                ),
+                            )
+                        })?;
+                    vec![record]
+                }
+                None => store.export_tasks_in(&region),
+            };
+        let matching: Vec<(String, CancelExportTaskOutput)> = candidates
+            .into_iter()
+            // `SourceArn` and `SourceType` select the exports OF one source and of one
+            // kind of source: a report narrowed by either carries only the tasks whose
+            // stored value equals it. `SourceType` targets the `ExportSourceType` enum, so
+            // a value outside the set the model publishes has already been refused at the
+            // boundary and cannot reach here.
+            .filter(|record| {
+                input
+                    .source_arn
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == record.source_arn)
+            })
+            .filter(|record| {
+                input
+                    .source_type
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == record.source_type)
+            })
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.identifier.clone(), record.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeExportTasksError::invalid_parameter_value)?;
+        Ok(DescribeExportTasksOutput {
+            marker: page.next_marker,
+            export_tasks: Some(page.items),
+        })
     }
+}
+
+/// The filter names this operation's `Filters` member documents: "export-task-identifier
+/// … s3-bucket … source-arn … status". RDS refuses any other name, and so does this
+/// operation — with a 400, because quietly ignoring a filter would report export tasks the
+/// caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 4] = [
+    "export-task-identifier",
+    "s3-bucket",
+    "source-arn",
+    "status",
+];
+
+/// Refuse a filter this operation does not support. "Filter names and values are
+/// case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches the
+/// member that filter names.
+///
+/// The `status` filter is the one whose values are not the stored text: the member
+/// documents "Must be lowercase. Valid statuses are the following: canceled canceling
+/// complete failed in_progress starting", while `ExportTask$Status` reports those statuses
+/// upper case, so the stored status is folded for this comparison. Every other filter
+/// value is matched as given, because "filter values are case-sensitive".
+fn matches_filter(record: &crate::state::ExportTaskRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        "export-task-identifier" => *wanted == record.identifier,
+        "s3-bucket" => *wanted == record.s3_bucket,
+        "source-arn" => *wanted == record.source_arn,
+        "status" => *wanted == record.status.to_ascii_lowercase(),
+        // Unreachable: `check_filter_names` has already refused every name outside
+        // `SUPPORTED_FILTER_NAMES`. A `&str` match needs the arm all the same.
+        _ => false,
+    })
 }

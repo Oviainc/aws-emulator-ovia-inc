@@ -222,7 +222,7 @@ async fn the_proposer_listing_filters_the_requests_it_owns() {
             selects: vec![0, 1, 2],
         },
         Selector {
-            case: "another agreement type",
+            case: "the other agreement type the member admits",
             filters: json!({"agreementType": "VendorInsightsAgreement"}),
             selects: vec![],
         },

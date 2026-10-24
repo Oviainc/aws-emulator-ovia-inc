@@ -29,16 +29,23 @@
 //!    it asks for is about installed instance capacity this emulator does not model.
 //! 6. The store a task lands in is bounded: at the emulator's entry ceiling a start
 //!    is refused and nothing is stored.
+//! 7. The two optional references a task carries name OTHER resources, each resolved
+//!    in the scope the model gives it: an `OrderId` is an order the account placed,
+//!    an `AssetId` is hardware installed on the Outpost the task runs on. One that
+//!    resolves to nothing is 404 `NotFoundException` with the identifier echo of the
+//!    member it arrived in, and no task is created.
 
 use std::collections::VecDeque;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_outposts_outpostsolafservice::ops::types::AssetInfo;
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
     store_full, CapacityTaskRecord, CAPACITY_TASK_COMPLETED, CAPACITY_TASK_IN_PROGRESS,
     CAPACITY_TASK_REQUESTED, CAPACITY_TASK_STEP, MAX_RESOURCES,
 };
 
+use crate::outpost_assets::{asset, record};
 use crate::site_and_outpost_lifecycle::{
     segment, text, Outposts, Reply, ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
 };
@@ -53,13 +60,77 @@ const CAPACITY_TASK_ID_LENGTH: usize = 21;
 /// accepts it, and naming nothing.
 pub(crate) const ABSENT_CAPACITY_TASK_ID: &str = "cap-00000000000000000";
 
-/// An `OrderId` of the modelled form `^oo-[a-f0-9]{17}$`. A capacity task names the
-/// order it belongs to without that order having to be one this store holds, so an
-/// order id here is only ever a value a capacity task carries and is keyed by (what a
-/// persisted order is, is exercised in [`crate::order_lifecycle`]).
-const ORDER_ID: &str = "oo-1111111111111111a";
-/// A second order, for the case that shows the one-active-task rule is per order.
-const OTHER_ORDER_ID: &str = "oo-2222222222222222b";
+/// The placeholder an `OrderId` row carries before the order behind it exists: a
+/// value of the modelled form `^oo-[a-f0-9]{17}$` that [`resolvable`] replaces with
+/// the id of an order actually placed, because `CreateOrder` mints the id and no row
+/// can know it in advance (what a persisted order is, is exercised in
+/// [`crate::order_lifecycle`]).
+const ORDER_PLACEHOLDER: &str = "oo-1111111111111111a";
+
+/// An `OrderId` of the modelled form that no order of this store carries.
+const ABSENT_ORDER_ID: &str = "oo-00000000000000000";
+
+/// The two `AssetId`s a row's hardware is recorded under, both of the form the
+/// modelled `AssetIdInput` declares (`^\d{10}$`).
+const INSTALLED: [&str; 2] = ["1234567890", "9876543210"];
+
+/// An `AssetId` of that same form that no Outpost of this store holds.
+const ABSENT_ASSET_ID: &str = "9999999999";
+
+/// The `AssetId` recorded on the OTHER Outpost of the reference-resolution case, so a
+/// row can name hardware that exists without being hardware of the Outpost in hand.
+const ELSEWHERE_ASSET_ID: &str = "2000000001";
+
+/// The two members `CreateOrder` marks `@required`, with one line item: the smallest
+/// order this service accepts, which is all a row that only needs an order to EXIST
+/// asks of it. The `CatalogItemId` is of the modelled `SKU` form (`^OR-[A-Z0-9]{7}$`).
+async fn an_order(outposts: &Outposts, outpost_identifier: &str) -> String {
+    let answered = outposts
+        .ok(
+            "POST",
+            "/orders",
+            Some(&json!({
+                "OutpostIdentifier": outpost_identifier,
+                "PaymentOption": "ALL_UPFRONT",
+                "LineItems": [{ "CatalogItemId": "OR-1A2B3C4", "Quantity": 1 }],
+            })),
+        )
+        .await;
+    text(&answered["Order"], "OrderId")
+}
+
+/// Record `asset_ids` as the hardware installed on the stored Outpost.
+///
+/// An asset is a physical unit Amazon Web Services installs once an order is
+/// fulfilled, so no call in this API creates one: it is recorded through the store,
+/// the same seam [`crate::outpost_assets`] records hardware through, and that module
+/// owns the projection every member of one is asserted against.
+fn install(outposts: &Outposts, outpost_id: &str, asset_ids: &[&str], case: &str) {
+    let assets: Vec<AssetInfo> = asset_ids
+        .iter()
+        .map(|asset_id| asset(asset_id, "rack-1", Some("COMPUTE"), None, None))
+        .collect();
+    record(outposts, outpost_id, &assets, case);
+}
+
+/// Make the optional references a row's request names resolve to resources the
+/// service holds (rule 7), and answer the request as it will be sent: the `AssetId`
+/// is recorded as hardware installed on this Outpost, and the `OrderId` placeholder
+/// is replaced by the id of an order placed against it.
+async fn resolvable(outposts: &Outposts, outpost_id: &str, request: &Value, case: &str) -> Value {
+    let mut request = request.clone();
+    if let Some(asset_id) = request
+        .get("AssetId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        install(outposts, outpost_id, &[&asset_id], case);
+    }
+    if request.get("OrderId").is_some() {
+        request["OrderId"] = json!(an_order(outposts, outpost_id).await);
+    }
+    request
+}
 
 /// The two values the modelled `TaskActionOnBlockingInstances` enum accepts, from
 /// `smithy_query(query="shape",shape="TaskActionOnBlockingInstances")`.
@@ -226,8 +297,8 @@ async fn start_capacity_task_persists_and_get_capacity_task_reads_it_back() {
             "an order and an asset",
             json!({
                 "InstancePools": [pool("m5.4xlarge", 1)],
-                "OrderId": ORDER_ID,
-                "AssetId": "1234567890",
+                "OrderId": ORDER_PLACEHOLDER,
+                "AssetId": INSTALLED[0],
             }),
         ),
         (
@@ -252,8 +323,8 @@ async fn start_capacity_task_persists_and_get_capacity_task_reads_it_back() {
             "every optional member at once",
             json!({
                 "InstancePools": [pool("m5.4xlarge", 4), pool("m5.8xlarge", 2)],
-                "OrderId": OTHER_ORDER_ID,
-                "AssetId": "9876543210",
+                "OrderId": ORDER_PLACEHOLDER,
+                "AssetId": INSTALLED[1],
                 "InstancesToExclude": { "Instances": ["i-0123456789abcdef0"] },
                 "TaskActionOnBlockingInstances": TASK_ACTIONS[0],
                 "DryRun": false,
@@ -272,6 +343,10 @@ async fn start_capacity_task_persists_and_get_capacity_task_reads_it_back() {
         // A fresh Outpost per row: the one-active-task rule (rule 3) is what stops
         // two tasks running on one Outpost, and is stated there.
         let outpost_id = outpost(&outposts, &format!("capacity-{index}")).await;
+        // The references the row names have to resolve to resources the service
+        // holds (rule 7), so the order and the asset exist before the start names
+        // them, and the request is asserted against the one that was sent.
+        let request = &resolvable(&outposts, &outpost_id, request, case).await;
         let started = start_ok(&outposts, &outpost_id, request).await;
         let task_id = text(&started, "CapacityTaskId");
 
@@ -361,7 +436,8 @@ async fn start_capacity_task_persists_and_get_capacity_task_reads_it_back() {
 async fn both_outpost_identifier_forms_read_the_same_capacity_task() {
     let outposts = Outposts::new();
     let outpost_id = outpost(&outposts, "both-forms").await;
-    let request = json!({ "InstancePools": [pool("m5.4xlarge", 2)], "OrderId": ORDER_ID });
+    let order_id = an_order(&outposts, &outpost_id).await;
+    let request = json!({ "InstancePools": [pool("m5.4xlarge", 2)], "OrderId": order_id });
     let started = start_ok(&outposts, &outpost_id, &request).await;
     let task_id = text(&started, "CapacityTaskId");
     let outpost_arn = format!("{OUTPOST_ARN_PREFIX}{outpost_id}");
@@ -479,7 +555,11 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
     let outposts = Outposts::new();
     let first_outpost = outpost(&outposts, "conflict-first").await;
     let second_outpost = outpost(&outposts, "conflict-second").await;
-    let request = json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": ORDER_ID });
+    // Two orders the account actually placed (rule 7), one per Outpost: an order is
+    // a resource of the account, so a task on either Outpost may name either one.
+    let order_id = an_order(&outposts, &first_outpost).await;
+    let other_order_id = an_order(&outposts, &second_outpost).await;
+    let request = json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": order_id });
     let active = text(
         &start_ok(&outposts, &first_outpost, &request).await,
         "CapacityTaskId",
@@ -495,7 +575,7 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
         (
             "a task on another Outpost for the same order",
             &second_outpost,
-            ORDER_ID.to_string(),
+            order_id.clone(),
             "ORDER",
         ),
     ];
@@ -529,7 +609,7 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
     let other = start_ok(
         &outposts,
         &second_outpost,
-        &json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": OTHER_ORDER_ID }),
+        &json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": other_order_id }),
     )
     .await;
     assert_ne!(
@@ -558,6 +638,188 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
             text(&read, "CapacityTaskId"),
             *task_id,
             "case {case:?}: every task of an Outpost stays readable"
+        );
+    }
+}
+
+/// Which order a row of the reference-resolution case names: one the account placed
+/// against the Outpost the task runs on, one it placed against another Outpost, or
+/// none at all.
+#[derive(Debug, Clone, Copy)]
+enum NamedOrder {
+    OfThisOutpost,
+    OfAnotherOutpost,
+    None,
+}
+
+/// Rule 7: the two optional references a capacity task carries are resolved against
+/// what the service holds, each in the scope the model gives it, and a reference that
+/// resolves to nothing is refused with no task created.
+///
+/// The rows differ along everything the rule generalises over: which of the two
+/// members carries the dangling reference, whether the other one resolves, whether
+/// the named hardware exists somewhere else or nowhere at all, whether the Outpost
+/// has hardware recorded, and — on the accepting side — each combination of an order
+/// of this Outpost, an order of another one and no order with an asset and no asset.
+#[tokio::test]
+async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
+    let outposts = Outposts::new();
+    let outpost_id = outpost(&outposts, "references").await;
+    let elsewhere = outpost(&outposts, "references-elsewhere").await;
+    // An Outpost with no hardware recorded at all: nothing is installed on it, so no
+    // `AssetId` whatsoever resolves there.
+    let bare = outpost(&outposts, "references-bare").await;
+    install(&outposts, &outpost_id, &INSTALLED, "references");
+    install(
+        &outposts,
+        &elsewhere,
+        &[ELSEWHERE_ASSET_ID],
+        "references-elsewhere",
+    );
+    let order_id = an_order(&outposts, &outpost_id).await;
+    let elsewhere_order_id = an_order(&outposts, &elsewhere).await;
+
+    // The refusals. Each row names a reference that resolves to nothing, and the
+    // identifier echo the refusal must carry: the member it arrived in, and the value
+    // exactly as supplied.
+    let refused: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "an OrderId this store holds no order for",
+            &outpost_id,
+            json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": ABSENT_ORDER_ID }),
+            format!("orderId={ABSENT_ORDER_ID}"),
+        ),
+        (
+            "an OrderId that names nothing, beside an asset that exists",
+            &outpost_id,
+            json!({
+                "InstancePools": [pool("m5.4xlarge", 1)],
+                "OrderId": ABSENT_ORDER_ID,
+                "AssetId": INSTALLED[0],
+            }),
+            format!("orderId={ABSENT_ORDER_ID}"),
+        ),
+        (
+            "an AssetId none of the Outpost's assets carries",
+            &outpost_id,
+            json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": ABSENT_ASSET_ID }),
+            format!("assetId={ABSENT_ASSET_ID}"),
+        ),
+        (
+            "an AssetId installed on another Outpost",
+            &outpost_id,
+            json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": ELSEWHERE_ASSET_ID }),
+            format!("assetId={ELSEWHERE_ASSET_ID}"),
+        ),
+        (
+            "an AssetId beside an order that does resolve",
+            &outpost_id,
+            json!({
+                "InstancePools": [pool("m5.4xlarge", 1)],
+                "OrderId": order_id,
+                "AssetId": ABSENT_ASSET_ID,
+            }),
+            format!("assetId={ABSENT_ASSET_ID}"),
+        ),
+        (
+            "an asset of this Outpost named on an Outpost with no hardware recorded",
+            &bare,
+            json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": INSTALLED[0] }),
+            format!("assetId={}", INSTALLED[0]),
+        ),
+        (
+            "both references dangling: the coarser member is the one named",
+            &outpost_id,
+            json!({
+                "InstancePools": [pool("m5.4xlarge", 1)],
+                "OrderId": ABSENT_ORDER_ID,
+                "AssetId": ABSENT_ASSET_ID,
+            }),
+            format!("orderId={ABSENT_ORDER_ID}"),
+        ),
+    ];
+    for (case, outpost_identifier, request, expected) in &refused {
+        let reply = start(&outposts, outpost_identifier, request).await;
+        assert_eq!(
+            (reply.status, reply.error_code.as_str()),
+            (404, "NotFoundException"),
+            "case {case:?}: expected 404 NotFoundException, got {} {} {}",
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+        assert_eq!(
+            text(&reply.body, "Message"),
+            *expected,
+            "case {case:?}: expected the identifier echo {expected:?}, got {}",
+            reply.body
+        );
+    }
+    // A refused start creates nothing: no task was stored, and the Outpost every
+    // refused row named can still take one — which it could not if a refusal had left
+    // a task active on it.
+    let held = outposts.store().lock().capacity_tasks.len();
+    assert_eq!(
+        held, 0,
+        "a refused start must create no capacity task: expected 0 held, got {held}"
+    );
+
+    // The accepting side: every combination of the two references that does resolve.
+    let accepted: Vec<(&str, NamedOrder, Option<&str>)> = vec![
+        (
+            "an order of this Outpost and an asset installed on it",
+            NamedOrder::OfThisOutpost,
+            Some(INSTALLED[0]),
+        ),
+        (
+            "an order of this Outpost and no asset",
+            NamedOrder::OfThisOutpost,
+            None,
+        ),
+        (
+            "an order the account placed against another Outpost",
+            NamedOrder::OfAnotherOutpost,
+            Some(INSTALLED[1]),
+        ),
+        ("an asset and no order", NamedOrder::None, Some(INSTALLED[1])),
+        ("neither reference", NamedOrder::None, None),
+    ];
+    for (index, (case, named_order, asset_id)) in accepted.iter().enumerate() {
+        // One Outpost per row, because only ONE capacity task can be active on an
+        // Outpost at a time (rule 3).
+        let target = outpost(&outposts, &format!("references-ok-{index}")).await;
+        install(&outposts, &target, &INSTALLED, case);
+        let mut request = json!({ "InstancePools": [pool("m5.4xlarge", 1)] });
+        let named_order_id = match named_order {
+            NamedOrder::OfThisOutpost => Some(an_order(&outposts, &target).await),
+            NamedOrder::OfAnotherOutpost => Some(elsewhere_order_id.clone()),
+            NamedOrder::None => None,
+        };
+        if let Some(named_order_id) = &named_order_id {
+            request["OrderId"] = json!(named_order_id);
+        }
+        if let Some(asset_id) = asset_id {
+            request["AssetId"] = json!(asset_id);
+        }
+
+        let started = start_ok(&outposts, &target, &request).await;
+        for (member, expected) in [
+            ("OrderId", named_order_id.as_deref()),
+            ("AssetId", *asset_id),
+        ] {
+            assert_eq!(
+                started.get(member).and_then(Value::as_str),
+                expected,
+                "case {case:?}: a resolved reference is reported as the task's own \
+                 {member} ({expected:?}), got {started}"
+            );
+        }
+        // The round trip: the reference the start resolved is what the read answers.
+        let read = get_ok(&outposts, &target, &text(&started, "CapacityTaskId")).await;
+        assert_eq!(
+            stable(&read),
+            stable(&started),
+            "case {case:?}: GetCapacityTask must answer the persisted task"
         );
     }
 }

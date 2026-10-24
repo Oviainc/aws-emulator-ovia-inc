@@ -7,6 +7,7 @@
 //! validation and the handler all run exactly as they do in production.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -636,6 +637,169 @@ pub(crate) fn minimal_create(name: &str, token: &str) -> Value {
         "ReviewOwner": "owner@example.com",
         "ClientRequestToken": token,
     })
+}
+
+/// One member of an answer's body as a string, empty when the body carries none. The one
+/// member reader the suites in this crate share.
+pub(crate) fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
+    answer.body.get(name).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A minimal valid `CreateProfile` request: `ProfileName`, `ProfileDescription`,
+/// `ProfileQuestions` and `ClientRequestToken` are all `@required`
+/// (`smithy_query(query="operation", operation="CreateProfile")`). The one profile request
+/// builder this crate's suites share.
+pub(crate) fn minimal_profile(name: &str) -> Value {
+    json!({
+        "ProfileName": name,
+        "ProfileDescription": "a profile under test",
+        "ProfileQuestions": [{
+            "QuestionId": "priority",
+            "SelectedChoiceIds": ["priority_cost"],
+        }],
+        "ClientRequestToken": format!("tok-{name}"),
+    })
+}
+
+/// A profile minted over HTTP: its `ProfileArn` and the `ProfileVersion` the service put
+/// it at, both checked against the modelled forms
+/// (`^arn:aws[-a-z]*:wellarchitected:[a-z]{2}(-gov)?-[a-z]+-\d:\d{12}:profile/[a-z0-9]+$`
+/// and `@length(1, 32)` `^[A-Za-z0-9-]+$`). The one profile-minting helper this crate's
+/// suites share.
+pub(crate) async fn created_profile(client: &Client, name: &str) -> (String, String) {
+    let answer = client.create_profile(minimal_profile(name)).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {name:?}: expected CreateProfile 200, got {answer:?}"
+    );
+    let arn = member(&answer, "ProfileArn").to_string();
+    let version = member(&answer, "ProfileVersion").to_string();
+    assert!(
+        arn.starts_with(&format!(
+            "arn:aws:wellarchitected:us-west-2:{}:profile/",
+            engine::emulator_account_id()
+        )),
+        "case {name:?}: unexpected ProfileArn {arn:?}"
+    );
+    assert!(
+        (1..=32).contains(&version.len())
+            && version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "case {name:?}: ProfileVersion must match ^[A-Za-z0-9-]{{1,32}}$, got {version:?}"
+    );
+    (arn, version)
+}
+
+/// The `Workload` a `GetWorkload` reports, as a JSON object.
+pub(crate) async fn stored_workload(client: &Client, workload_id: &str, case: &str) -> Value {
+    let answer = client.get(workload_id).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected GetWorkload 200, got {answer:?}"
+    );
+    answer.body.get("Workload").cloned().unwrap_or(Value::Null)
+}
+
+/// The `Workload$Profiles` a workload reports, empty for a workload that reports none.
+pub(crate) async fn profiles_of(client: &Client, workload_id: &str, case: &str) -> Vec<Value> {
+    stored_workload(client, workload_id, case)
+        .await
+        .get("Profiles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `LensReview$Profiles` the workload's review of one lens reports: "the profiles
+/// associated with the workload" (`smithy_query(query="doc", shape="LensReview",
+/// member="Profiles")`), so a review has to agree with `GetWorkload` about them.
+pub(crate) async fn lens_review_profiles(
+    client: &Client,
+    workload_id: &str,
+    lens: &str,
+    case: &str,
+) -> Vec<Value> {
+    let answer = client
+        .send(
+            "GET",
+            &format!(
+                "/workloads/{workload_id}/lensReviews/{}",
+                encode_path_segment(lens)
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected GetLensReview 200, got {answer:?}"
+    );
+    answer
+        .body
+        .get("LensReview")
+        .and_then(|review| review.get("Profiles"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `Workload$UpdatedAt` a workload reports, as the epoch seconds restJson1 carries it.
+pub(crate) async fn updated_at_of(client: &Client, workload_id: &str, case: &str) -> f64 {
+    stored_workload(client, workload_id, case)
+        .await
+        .get("UpdatedAt")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("case {case:?}: the workload must report UpdatedAt"))
+}
+
+/// Move the stored workload's `UpdatedAt` back by `age`, so a write the handler makes to
+/// it is observable whatever the clock's granularity between two in-process requests.
+/// Only the SEED reaches state directly; the write under test is the handler's.
+pub(crate) fn age_workload(client: &Client, workload_id: &str, age: Duration) {
+    let state = client.store();
+    let mut store = state.lock();
+    let workload = store
+        .workloads
+        .get_mut(workload_id)
+        .expect("the workload under test must exist");
+    workload.updated_at = SystemTime::now() - age;
+}
+
+/// The refusal a lookup that resolved nothing gets: 404 `ResourceNotFoundException`, with
+/// the modelled `ResourceType` of the resource that was missing and the identifier AS SENT.
+pub(crate) fn assert_not_found(
+    case: &str,
+    answer: &Answer,
+    resource_type: &str,
+    resource_id: &str,
+    subject: &str,
+) {
+    assert_eq!(
+        answer.status, 404,
+        "case {case:?}: expected HTTP 404, got {answer:?}"
+    );
+    assert_eq!(
+        answer.error_code, "ResourceNotFoundException",
+        "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+    );
+    assert_eq!(
+        member(answer, "ResourceType"),
+        resource_type,
+        "case {case:?}: expected ResourceType {resource_type}, got {answer:?}"
+    );
+    assert_eq!(
+        member(answer, "ResourceId"),
+        resource_id,
+        "case {case:?}: ResourceId must be the identifier as sent, got {answer:?}"
+    );
+    assert_eq!(
+        member(answer, "Message"),
+        format!(
+            "[ResourceNotFound] No {subject} was found in account {}.",
+            engine::emulator_account_id()
+        ),
+        "case {case:?}: unexpected Message, got {answer:?}"
+    );
 }
 
 /// A minimal valid `CreateReviewTemplate` request; callers override the members their
