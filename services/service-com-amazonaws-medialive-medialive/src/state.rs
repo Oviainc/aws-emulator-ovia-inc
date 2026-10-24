@@ -35,7 +35,9 @@
 //! `MedialiveInputArns` out of the inputs this store holds — see
 //! [`input_devices`]. A device also carries the TRANSFER pending on it, which
 //! `TransferInputDevice` records and `ListInputDeviceTransfers` reports in the
-//! direction the reader asks for.
+//! direction the reader asks for, and the latest THUMBNAIL it has sent, which
+//! `DescribeInputDeviceThumbnail` reports — one only a connected Link unit
+//! sends, so a device claimed through this emulator's API has none.
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
@@ -314,7 +316,8 @@ pub mod input_devices;
 pub use input_devices::{
     input_device_transfer_type, input_device_type_for_id, is_account_id,
     not_a_device_id_message, not_an_account_id_message, InputDeviceRecord,
-    InputDeviceTransferRecord, MAX_INPUT_DEVICES, MAX_TRANSFER_MESSAGE_CHARS,
+    InputDeviceThumbnailRecord, InputDeviceTransferRecord, MAX_INPUT_DEVICES,
+    MAX_INPUT_DEVICE_THUMBNAIL_BYTES, MAX_TRANSFER_MESSAGE_CHARS,
 };
 
 pub(crate) use input_devices::input_device_output;
@@ -3864,6 +3867,56 @@ pub fn is_resource_arn(arn: &str) -> bool {
 /// from the request. One helper, so no two operations word it two ways.
 pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} {identifier} not found")
+}
+
+/// Whether an `Accept` header allows a response of the media type `media_type`.
+///
+/// One definition for every operation that negotiates a response media type, so
+/// the refusal and the response cannot disagree about what was asked for. It
+/// lives beside [`not_found_message`] rather than on a resource slice, because it
+/// is a property of the REQUEST and not of any resource this state holds.
+///
+/// The header is a comma-separated list of media ranges, each optionally carrying
+/// parameters after a `;`. A range allows a type when it names that type, that
+/// type's wildcard (`type/*`) or the wildcard that allows anything (`*/*`);
+/// matching is case-insensitive, as media types are. A range whose quality
+/// parameter is zero allows NOTHING — a zero quality is how a caller says a type
+/// is not acceptable — so it is skipped, and every other parameter is ignored
+/// because none of them narrows which type may be sent. A request that carries no
+/// `Accept` at all asks for no particular type, so every type is allowed.
+pub fn accept_allows(accept: &str, media_type: &str) -> bool {
+    if accept.trim().is_empty() {
+        return true;
+    }
+    let media_type = media_type.to_ascii_lowercase();
+    let (top_level, _) = media_type.split_once('/').unwrap_or((&media_type, ""));
+    let wildcard = format!("{top_level}/*");
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';');
+        let name = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        if name != "*/*" && name != wildcard && name != media_type {
+            return false;
+        }
+        // A quality of zero is a refusal of the range it is on, so the range
+        // allows nothing; any other quality still allows the type, since this
+        // service has one representation to offer rather than a choice between
+        // several to rank.
+        !parts.any(|parameter| {
+            let (key, value) = parameter.split_once('=').unwrap_or_default();
+            key.trim().eq_ignore_ascii_case("q")
+                && value.trim().parse::<f64>().is_ok_and(|quality| quality <= 0.0)
+        })
+    })
+}
+
+/// The message a read refused for an `Accept` it cannot satisfy carries: what the
+/// request asked for and the media types the operation can answer with. Built
+/// from the request, so it names what the caller must change.
+pub fn unacceptable_media_type_message(accept: &str, served: &[&str]) -> String {
+    format!(
+        "{accept} is not a media type this operation can answer with: it serves {}",
+        served.join(", ")
+    )
 }
 
 /// The `message` a not-found refusal carries when what the identifier failed to

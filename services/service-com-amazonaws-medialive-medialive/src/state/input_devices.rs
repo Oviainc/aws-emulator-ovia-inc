@@ -50,13 +50,30 @@
 //! and [`ComAmazonawsMedialiveMedialiveState::settle`] — which every operation
 //! runs first — is what closes it once it comes due, back to `UP_TO_DATE`. The
 //! instant is stored and never slept on.
+//!
+//! A device's latest THUMBNAIL is one optional record on the device it is a
+//! thumbnail of ([`InputDeviceThumbnailRecord`]): the image data, the media type
+//! it is in and the instant the device last updated it — which is exactly what
+//! `DescribeInputDeviceThumbnail` reports ("the thumbnail that the Link device
+//! has most recently sent to MediaLive"). Its length and its entity tag are
+//! DERIVED from that data on every read, never stored beside it, so a reported
+//! `ContentLength` and `ETag` cannot disagree with the bytes they describe.
+//!
+//! A thumbnail reaches the store exactly one way,
+//! [`ComAmazonawsMedialiveMedialiveState::record_input_device_thumbnail`], which
+//! is the Link unit SENDING one. No unit is connected to this emulator — the
+//! same reason the device's MAC address, serial number and network settings stay
+//! absent — so no operation in this service calls it and a device claimed
+//! through the API has no thumbnail, which is what the read then reports: the
+//! empty payload its `Body` member defaults to, and none of the metadata that
+//! describes an image that was never sent.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
     InputDeviceHdSettings, InputDeviceSummary, InputDeviceUhdSettings,
-    TransferringInputDeviceSummary,
+    TransferringInputDeviceSummary, CONTENT_TYPE_VALUES,
 };
 
 use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
@@ -243,6 +260,78 @@ pub struct InputDeviceTransferRecord {
     pub message: Option<String>,
 }
 
+/// The largest thumbnail this emulator keeps for one device, in bytes.
+///
+/// A ceiling, not a published quota: a thumbnail is pushed INTO the store rather
+/// than created by an API call, so without a cap one sender could grow the
+/// emulator's heap without bound. A Link unit's preview image is a small JPEG, so
+/// a mebibyte is room for one many times over.
+pub const MAX_INPUT_DEVICE_THUMBNAIL_BYTES: usize = 1024 * 1024;
+
+/// The latest thumbnail one input device has sent.
+///
+/// The members are the ones the device SENDS: the image data, the media type it
+/// is in, and the instant the device last updated it. The `ContentLength` and the
+/// `ETag` a read reports are NOT among them — both are derived from the data (see
+/// [`InputDeviceThumbnailRecord::content_length`] and
+/// [`InputDeviceThumbnailRecord::etag`]), so neither can drift from the bytes it
+/// describes.
+#[derive(Debug, Clone)]
+pub struct InputDeviceThumbnailRecord {
+    /// "The binary data for the thumbnail that the Link device has most recently
+    /// sent to MediaLive".
+    pub body: Vec<u8>,
+    /// The media type that data is in, which a read reports as the thumbnail's
+    /// `ContentType` ("Specifies the media type of the thumbnail"). One of the
+    /// values the model's own enum declares, which
+    /// [`ComAmazonawsMedialiveMedialiveState::record_input_device_thumbnail`] is
+    /// what holds it to.
+    pub content_type: String,
+    /// "The date and time the thumbnail was last updated at the device" — the
+    /// device's instant, carried with the image rather than read off this
+    /// service's clock, because it is when the UNIT updated it.
+    pub last_modified: SystemTime,
+}
+
+impl InputDeviceThumbnailRecord {
+    /// The thumbnail `body`, in the media type `content_type`, as the device last
+    /// updated it at `last_modified`.
+    pub fn new(body: Vec<u8>, content_type: &str, last_modified: SystemTime) -> Self {
+        Self {
+            body,
+            content_type: content_type.to_string(),
+            last_modified,
+        }
+    }
+
+    /// "The length of the content": the length of the data itself, derived on
+    /// every read so it is the length of what the response actually carries.
+    ///
+    /// Saturating rather than wrapping, so a body longer than `i64::MAX` could
+    /// only ever under-report; nothing this store accepts comes near it
+    /// ([`MAX_INPUT_DEVICE_THUMBNAIL_BYTES`]).
+    pub fn content_length(&self) -> i64 {
+        i64::try_from(self.body.len()).unwrap_or(i64::MAX)
+    }
+
+    /// "The unique, cacheable version of this thumbnail": an entity tag over the
+    /// image data.
+    ///
+    /// Derived from the CONTENT, so it is stable across reads of one thumbnail
+    /// and differs whenever the data differs — which is what makes it cacheable
+    /// (a client that holds this tag holds that exact image). A digest is all
+    /// that takes, which the `sha2` and `hex` crates this crate already depends
+    /// on provide. Quoted, because an entity tag travels on the wire as a quoted
+    /// string.
+    pub fn etag(&self) -> String {
+        use ::sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(&self.body);
+        format!("\"{}\"", ::hex::encode(hasher.finalize()))
+    }
+}
+
 /// One claimed input device.
 ///
 /// The members mirror the model's `InputDeviceSummary` shape minus the ones that
@@ -290,6 +379,13 @@ pub struct InputDeviceRecord {
     /// [`InputDeviceRecord::stop_streaming`], and the only way to read it is
     /// [`InputDeviceRecord::device_state`].
     streaming: bool,
+    /// The latest thumbnail this device has sent, or `None` while it has sent
+    /// none.
+    ///
+    /// PRIVATE, so the only way in is
+    /// [`ComAmazonawsMedialiveMedialiveState::record_input_device_thumbnail`]
+    /// and the only way to read it is [`InputDeviceRecord::thumbnail`].
+    thumbnail: Option<InputDeviceThumbnailRecord>,
 }
 
 impl InputDeviceRecord {
@@ -398,6 +494,13 @@ impl InputDeviceRecord {
     pub fn begin_transfer(&mut self, transfer: InputDeviceTransferRecord) {
         self.transfer = Some(transfer);
     }
+
+    /// The latest thumbnail this device has sent, or `None` while it has sent
+    /// none — which is every device of this emulator, because no Link unit is
+    /// connected to it to send one (see the module docs).
+    pub fn thumbnail(&self) -> Option<&InputDeviceThumbnailRecord> {
+        self.thumbnail.as_ref()
+    }
 }
 
 /// A freshly claimed device: the id the claim named, the ARN built from it, and
@@ -415,6 +518,8 @@ pub fn new_input_device(id: String, arn: String, device_type: &str) -> InputDevi
         transfer: None,
         // A claimed device is producing nothing until a start says so.
         streaming: false,
+        // And it has sent no image until it sends one.
+        thumbnail: None,
     }
 }
 
@@ -523,6 +628,54 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// conjured out of the request.
     pub fn input_device_mut(&mut self, id: &str) -> Option<&mut InputDeviceRecord> {
         self.input_devices.get_mut(id)
+    }
+
+    /// The device this account owns under `id`, to read, or `None` when no claim
+    /// has registered that id.
+    ///
+    /// The read side of [`ComAmazonawsMedialiveMedialiveState::input_device_mut`]:
+    /// a reader that needs the RECORD rather than its
+    /// [`InputDeviceSummary`] projection (the thumbnail read, which reports the
+    /// image the device sent rather than the device) resolves its id here, so an
+    /// id this account has not claimed is the operation's own not-found.
+    pub fn input_device(&self, id: &str) -> Option<&InputDeviceRecord> {
+        self.input_devices.get(id)
+    }
+
+    /// Record `thumbnail` as the latest thumbnail of the device `id`, answering
+    /// whether a device with that id took it.
+    ///
+    /// REPLACING: a device sends one thumbnail after another and the read reports
+    /// "the thumbnail that the Link device has most recently sent", so the latest
+    /// one is what the record keeps.
+    ///
+    /// It refuses, answering `false`, what the service could not report back: a
+    /// device this account has not claimed, a media type outside the one the
+    /// model's `ContentType` enum declares (a response member may only carry a
+    /// value the model declares), and an image over
+    /// [`MAX_INPUT_DEVICE_THUMBNAIL_BYTES`].
+    ///
+    /// The real service receives these FROM the connected Link unit; no unit is
+    /// connected to this emulator, so no operation in this service calls this and
+    /// a device claimed through the API has no thumbnail (see the module docs). It
+    /// is the ONE way a thumbnail reaches a device, so
+    /// `DescribeInputDeviceThumbnail` reports what was sent rather than anything
+    /// it invented.
+    pub fn record_input_device_thumbnail(
+        &mut self,
+        id: &str,
+        thumbnail: InputDeviceThumbnailRecord,
+    ) -> bool {
+        if !CONTENT_TYPE_VALUES.contains(&thumbnail.content_type.as_str())
+            || thumbnail.body.len() > MAX_INPUT_DEVICE_THUMBNAIL_BYTES
+        {
+            return false;
+        }
+        let Some(device) = self.input_devices.get_mut(id) else {
+            return false;
+        };
+        device.thumbnail = Some(thumbnail);
+        true
     }
 
     /// The ARNs of the inputs currently ingesting from the device `id` —
