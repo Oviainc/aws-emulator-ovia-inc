@@ -11,7 +11,7 @@
 //! writes, plus the projections the model asks for (`ChangeSummary`,
 //! `ChangeSetSummaryListItem`, `EntitySummary`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::Document;
@@ -21,7 +21,8 @@ use crate::ops::types::{
     AccessDeniedException, AMISecuritySummary, AmiProductSummary, AssessmentSummary,
     AssessmentTargetFilter, AssessmentTargetSummary, ChangeSetSummaryListItem, ChangeSummary,
     ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, DataProductSummary,
-    Entity, EntitySummary, FrameworkFilters, FrameworkSummary, MachineLearningProductSummary,
+    Entity, EntitySummary, ErrorDetail, FrameworkFilters, FrameworkSummary,
+    MachineLearningProductSummary,
     ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
     ValidationException,
 };
@@ -252,6 +253,36 @@ pub const STATUS_APPLYING: &str = "APPLYING";
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// A `ChangeStatus` value.
 pub const STATUS_CANCELLED: &str = "CANCELLED";
+/// A `ChangeStatus` value: the terminal status of a change set whose changes
+/// could not be applied.
+pub const STATUS_FAILED: &str = "FAILED";
+
+/// The `FailureCode` of a change set that failed on what its request asked
+/// for: `FailureCode` documents "CLIENT_ERROR, which means that there are
+/// issues with the request (see the ErrorDetailList)".
+pub const FAILURE_CODE_CLIENT_ERROR: &str = "CLIENT_ERROR";
+
+/// The other `FailureCode`: "SERVER_FAULT, which means that there is a problem
+/// in the system, and you should retry your request". A change set of this
+/// emulator fails only on its own content, so nothing reports this value — the
+/// emulator does not fabricate a system problem.
+pub const FAILURE_CODE_SERVER_FAULT: &str = "SERVER_FAULT";
+
+/// The `ErrorDetail$ErrorCode` of a change whose details give a member the
+/// catalog reads a value that member cannot carry.
+///
+/// `ErrorCodeString` is `@length(1..72)`, `^[a-zA-Z_]+$`, which every code
+/// here stays inside.
+pub const ERROR_CODE_INVALID_VALUE: &str = "INVALID_VALUE";
+
+/// The `ErrorDetail$ErrorCode` of a change whose `EntityTags` would leave its
+/// entity holding more than [`MAX_RESOURCE_TAGS`] tags.
+pub const ERROR_CODE_LIMIT_EXCEEDED: &str = "LIMIT_EXCEEDED";
+
+/// How much of a submitted details value an `ErrorDetail$ErrorMessage` or a
+/// `FailureDescription` quotes, so a message built from a large value stays
+/// inside `ExceptionMessageContent`'s 2048 characters.
+pub const DETAIL_VALUE_QUOTE_LIMIT: usize = 256;
 
 /// An `Intent` value — `StartChangeSetRequest$Intent` documents "The default is
 /// APPLY".
@@ -287,6 +318,10 @@ pub struct ChangeRecord {
     /// of a `VALIDATE` change set that names no existing entity, since a
     /// validation never creates one.
     pub entity_id: Option<String>,
+    /// `ChangeSummary$ErrorDetailList`: what applying this change found wrong
+    /// with it. Empty until the change set's changes are applied, and empty
+    /// afterwards for a change that was applicable.
+    pub errors: Vec<ErrorDetail>,
 }
 
 impl ChangeRecord {
@@ -318,10 +353,10 @@ impl ChangeRecord {
                 // `None` is unreachable: a document deeper than
                 // `MAX_DETAILS_DEPTH` is refused before it is stored.
                 .and_then(json_to_document),
-            // No change this emulator applies fails, so no change carries an
-            // error detail; `FailureCode`/`FailureDescription` are reported for
-            // the same reason only on a `FAILED` change set.
-            error_detail_list: None,
+            // "An array of ErrorDetail objects associated with the change":
+            // reported by a change applying found something wrong with, and
+            // absent for every other change.
+            error_detail_list: (!self.errors.is_empty()).then(|| self.errors.clone()),
             change_name: self.change_name.clone(),
         }
     }
@@ -832,31 +867,118 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
     }
 
     /// Materialise every change the clock owes: a change set past its due
-    /// instant moves on, and one that reaches `SUCCEEDED` with `Intent=APPLY`
-    /// writes the entities its changes describe.
+    /// instant moves on, and the transition that ends it is the one that
+    /// applies its changes — which either writes the entities they describe
+    /// (`Intent=APPLY`) or fails the change set on what they asked for.
     ///
     /// Each change is stamped with the instant it fell DUE, never with `now`,
     /// so what a caller reads does not depend on when it read.
     pub fn settle(&mut self, now: SystemTime) {
         let ids: Vec<String> = self.change_sets.keys().cloned().collect();
         for id in ids {
-            while let Some(record) = self.change_sets.get_mut(&id) {
-                let due = match record.schedule.first() {
-                    Some(next) if now >= next.due => next.due,
-                    _ => break,
+            while let Some(record) = self.change_sets.get(&id) {
+                let Some(next) = record.schedule.first() else {
+                    break;
                 };
-                let transition = record.schedule.remove(0);
-                record.status = transition.status.clone();
-                if transition.status != STATUS_SUCCEEDED {
+                if now < next.due {
+                    break;
+                }
+                let (due, status) = (next.due, next.status.clone());
+                // The terminal transition is where the changes are APPLIED, so
+                // the status it lands on is the OUTCOME of applying them: the
+                // schedule asks for the end of the run, not for a success.
+                let verdict = if status == STATUS_SUCCEEDED {
+                    self.judge_change_set(&id)
+                } else {
+                    ChangeSetVerdict::default()
+                };
+                let Some(record) = self.change_sets.get_mut(&id) else {
+                    break;
+                };
+                record.schedule.remove(0);
+                if status != STATUS_SUCCEEDED {
+                    record.status = status;
                     continue;
                 }
                 record.end_time = Some(iso8601(due));
-                let apply = record.intent == INTENT_APPLY;
-                if apply {
+                if verdict.failed() {
+                    record.status = STATUS_FAILED.to_string();
+                    record.failure_code = Some(FAILURE_CODE_CLIENT_ERROR.to_string());
+                    record.failure_description = verdict.failure_description;
+                    for (change, errors) in record.changes.iter_mut().zip(verdict.change_errors) {
+                        change.errors = errors;
+                    }
+                    // A change set that failed applied nothing: the entities
+                    // its changes described are not written, and the ones they
+                    // named are left as they were.
+                    continue;
+                }
+                record.status = status;
+                if record.intent == INTENT_APPLY {
                     self.apply_changes(&id, due);
                 }
             }
         }
+    }
+
+    /// Judge the changes of change set `id` the way applying them does, without
+    /// writing anything.
+    ///
+    /// A change's details are an opaque JSON document — `Change$Details` is a
+    /// `Json` string and `Change$DetailsDocument` "accepts a JSON value instead
+    /// of a string for `ChangeType` details", and the model declares no shape
+    /// for what is inside either — so a defect among the members the catalog
+    /// READS is one only applying can find. Applying is also the first point
+    /// that knows what the entity already holds, which is what the tag bound is
+    /// judged against.
+    pub fn judge_change_set(&self, id: &str) -> ChangeSetVerdict {
+        let Some(record) = self.change_sets.get(id) else {
+            return ChangeSetVerdict::default();
+        };
+        let mut verdict = ChangeSetVerdict {
+            change_errors: vec![Vec::new(); record.changes.len()],
+            failure_description: None,
+        };
+        // The tag keys each entity this change set touches would end up
+        // holding, carried across the changes in submission order the way
+        // applying merges them — so the change that crosses the bound is the
+        // one that reports it. A SET, so merging one change's tags costs one
+        // lookup per tag rather than a scan of the keys already held.
+        let mut tag_keys: HashMap<String, HashSet<String>> = HashMap::new();
+        for (index, change) in record.changes.iter().enumerate() {
+            verdict.change_errors[index] = details_defects(change.details_value().as_ref());
+            let Some(entity_id) = change.entity_id.as_deref() else {
+                continue;
+            };
+            let held = tag_keys.entry(entity_id.to_string()).or_insert_with(|| {
+                self.entities
+                    .get(entity_id)
+                    .map(|entity| entity.tags.iter().map(|tag| tag.key.clone()).collect())
+                    .unwrap_or_default()
+            });
+            for tag in &change.entity_tags {
+                held.insert(tag.key.clone());
+            }
+            if held.len() > MAX_RESOURCE_TAGS {
+                let count = held.len();
+                verdict.change_errors[index].push(ErrorDetail {
+                    error_code: Some(ERROR_CODE_LIMIT_EXCEEDED.to_string()),
+                    error_message: Some(format!(
+                        "EntityTags: an entity holds at most {MAX_RESOURCE_TAGS} tags, and this \
+                         change would leave {entity_id} with {count}"
+                    )),
+                });
+            }
+        }
+        if verdict.failed() {
+            return verdict;
+        }
+        // `FailureDescription` is "Returned if there is a failure on the change
+        // set, but that failure is not related to any of the changes in the
+        // request": every change above is applicable on its own, so a failure
+        // left here belongs to the set rather than to one of its changes.
+        verdict.failure_description = contradicting_details(&record.changes);
+        verdict
     }
 
     /// Write the entities the changes of change set `id` describe, as of `at`.
@@ -928,9 +1050,9 @@ fn detail_name(members: &Map<String, Value>) -> Option<String> {
 
 /// The `Visibility` the details of an applied change give an entity, if any.
 ///
-/// A value outside [`ENTITY_VISIBILITY_VALUES`] is left to
-/// [`invalid_visibility`], which refuses the request before it is applied, so
-/// nothing outside the modelled set reaches a record.
+/// Only an applied change set reaches here, and a value outside
+/// [`ENTITY_VISIBILITY_VALUES`] fails the change set before it is applied
+/// ([`details_defects`]), so nothing outside the modelled set reaches a record.
 fn detail_visibility(members: &Map<String, Value>) -> Option<String> {
     let value = members.get(ENTITY_VISIBILITY_DETAIL_MEMBER)?.as_str()?;
     ENTITY_VISIBILITY_VALUES
@@ -938,14 +1060,138 @@ fn detail_visibility(members: &Map<String, Value>) -> Option<String> {
         .then(|| value.to_string())
 }
 
-/// The `Visibility` in these details if the details name one the model has no
-/// value for — what a handler refuses a change for before storing it.
-pub fn invalid_visibility(details: &Value) -> Option<String> {
-    let value = details
-        .as_object()?
-        .get(ENTITY_VISIBILITY_DETAIL_MEMBER)?
-        .as_str()?;
-    (!ENTITY_VISIBILITY_VALUES.contains(&value)).then(|| value.to_string())
+/// What applying a change set found: the `ErrorDetailList` of each of its
+/// changes, and a failure of the change set that belongs to none of them.
+#[derive(Debug, Default, Clone)]
+pub struct ChangeSetVerdict {
+    /// One entry per change, in submission order. A change applying found
+    /// nothing wrong with carries an empty one.
+    pub change_errors: Vec<Vec<ErrorDetail>>,
+    /// `FailureDescription`, for a failure "not related to any of the changes
+    /// in the request".
+    pub failure_description: Option<String>,
+}
+
+impl ChangeSetVerdict {
+    /// True when the change set cannot be applied, so the end of its run is
+    /// `FAILED` rather than `SUCCEEDED`.
+    pub fn failed(&self) -> bool {
+        self.failure_description.is_some()
+            || self.change_errors.iter().any(|errors| !errors.is_empty())
+    }
+}
+
+/// The `ErrorDetail`s applying a change finds among the details members the
+/// catalog READS into the entity's own attributes.
+///
+/// The members of a change's details belong to its change type, which the model
+/// declares no shape for, so what the catalog can judge is what it reads: the
+/// member an entity's `Name` comes from ([`ENTITY_NAME_DETAIL_MEMBERS`]) is a
+/// string, and the one its `Visibility` comes from
+/// ([`ENTITY_VISIBILITY_DETAIL_MEMBER`]) is one of the values the model's
+/// `*VisibilityString` enums publish ([`ENTITY_VISIBILITY_VALUES`]). Every
+/// other member is carried into the entity's details untouched, so nothing here
+/// judges it.
+pub fn details_defects(details: Option<&Value>) -> Vec<ErrorDetail> {
+    let mut defects: Vec<ErrorDetail> = Vec::new();
+    let Some(Value::Object(members)) = details else {
+        return defects;
+    };
+    for member in ENTITY_NAME_DETAIL_MEMBERS {
+        if let Some(value) = members.get(*member) {
+            if !value.is_string() {
+                defects.push(invalid_detail_value(member, "a string", value));
+            }
+        }
+    }
+    if let Some(value) = members.get(ENTITY_VISIBILITY_DETAIL_MEMBER) {
+        if value
+            .as_str()
+            .is_none_or(|text| !ENTITY_VISIBILITY_VALUES.contains(&text))
+        {
+            defects.push(invalid_detail_value(
+                ENTITY_VISIBILITY_DETAIL_MEMBER,
+                &format!("one of {ENTITY_VISIBILITY_VALUES:?}"),
+                value,
+            ));
+        }
+    }
+    defects
+}
+
+/// The `ErrorDetail` for a details member whose value the catalog cannot read,
+/// built from the change: the member, what that member accepts, and the value
+/// the change gave it.
+fn invalid_detail_value(member: &str, accepts: &str, value: &Value) -> ErrorDetail {
+    ErrorDetail {
+        error_code: Some(ERROR_CODE_INVALID_VALUE.to_string()),
+        error_message: Some(format!(
+            "Details.{member} accepts {accepts}, not {}",
+            quoted(value)
+        )),
+    }
+}
+
+/// The `FailureDescription` of a change set that contradicts itself: two of its
+/// changes claim a different value for the SAME attribute of the same entity,
+/// so each change is applicable on its own and it is their combination the
+/// catalog cannot apply.
+///
+/// Only the members the catalog READS are claims about the entity
+/// ([`details_defects`] lists them): every other member is carried into the
+/// entity's details, where the last change to name it is the one that stands,
+/// so two changes naming it is a merge rather than a contradiction. Each change
+/// is therefore looked at through that fixed, short list of members, never by
+/// walking the submitted document, and `RequestedChangeList` bounds the changes
+/// at 20 — so the work here is bounded by the request's modelled length and not
+/// by how wide a details document the caller sent.
+fn contradicting_details(changes: &[ChangeRecord]) -> Option<String> {
+    let read_members = || {
+        ENTITY_NAME_DETAIL_MEMBERS
+            .iter()
+            .chain(::std::iter::once(&ENTITY_VISIBILITY_DETAIL_MEMBER))
+    };
+    let mut claimed: HashMap<(String, &str), Value> = HashMap::new();
+    for change in changes {
+        let Some(entity_id) = change.entity_id.clone() else {
+            continue;
+        };
+        let Some(Value::Object(members)) = change.details_value() else {
+            continue;
+        };
+        for member in read_members() {
+            let Some(value) = members.get(*member) else {
+                continue;
+            };
+            let key = (entity_id.clone(), *member);
+            match claimed.get(&key) {
+                Some(held) if held != value => {
+                    return Some(format!(
+                        "The changes of this request give {member} of entity {entity_id} both \
+                         {} and {}.",
+                        quoted(held),
+                        quoted(value)
+                    ))
+                }
+                Some(_) => continue,
+                None => {
+                    claimed.insert(key, value.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A submitted details value as a message quotes it: its JSON rendering, cut at
+/// [`DETAIL_VALUE_QUOTE_LIMIT`] characters so the message built around it stays
+/// inside `ExceptionMessageContent`'s 2048.
+fn quoted(value: &Value) -> String {
+    let text = value.to_string();
+    match text.char_indices().nth(DETAIL_VALUE_QUOTE_LIMIT) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
 }
 
 /// True when `value` is a `DateTimeISO8601`: the 20-character

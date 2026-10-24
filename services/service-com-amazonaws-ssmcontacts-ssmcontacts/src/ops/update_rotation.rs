@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the on-call rotation `RotationId` names, in place: the rotation keeps its ARN,
+//! its `Name`, its tags and its overrides, and the members this request carries replace what
+//! the store held. `Recurrence` is modelled REQUIRED, so every call replaces the recurrence;
+//! `ContactIds`, `StartTime` and `TimeZoneId` are optional, and one the request omits is
+//! left exactly as it was rather than cleared. `GetRotation`/`ListRotations` read the result
+//! back out of the same record, so there is nothing to recompute here.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +159,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::check_enum;
+
+        // This operation addresses its rotation by ARN and mints nothing, so it reads
+        // nothing off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `RotationId` is resolved and
+        // before anything is written, so a non-onboarded account is refused identically
+        // whether or not its rotation exists. This operation's subject is one resource ARN,
+        // so the refusal is the ARN-shaped one the crate reserves for that case, exactly as
+        // `GetRotation` and `DeleteRotation` answer it.
+        state
+            .require_active_replication_set_for(&input.rotation_id)
+            .map_err(account_precondition_failed)?;
+
+        // The request is checked whole before any of it is applied, so a refused update
+        // leaves the stored rotation exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRotation"))
+        // `DayOfWeek` is an enum SHAPE, so it arrives as a plain string — the same two
+        // places `CreateRotation` checks it in a `RecurrenceSettings`.
+        for setting in input.recurrence.weekly_settings.iter().flatten() {
+            check_enum(
+                "recurrence.weeklySettings.dayOfWeek",
+                &setting.day_of_week,
+                DAY_OF_WEEK_VALUES,
+            )
+            .map_err(validation)?;
+        }
+        for day in input.recurrence.shift_coverages.iter().flatten().map(|(day, _)| day) {
+            check_enum("recurrence.shiftCoverages", day, DAY_OF_WEEK_VALUES)
+                .map_err(validation)?;
+        }
+
+        // A recurrence with no daily, weekly or monthly settings describes no shift at all,
+        // and `Recurrence` is required here: an update cannot leave a rotation describing a
+        // schedule `CreateRotation` would have refused.
+        let describes_a_schedule = carries_a_setting(&input.recurrence.daily_settings)
+            || carries_a_setting(&input.recurrence.weekly_settings)
+            || carries_a_setting(&input.recurrence.monthly_settings);
+        if !describes_a_schedule {
+            return Err(validation(
+                "Value at 'recurrence' failed to satisfy constraint: Member must carry one of \
+                 dailySettings, weeklySettings or monthlySettings",
+            ));
+        }
+
+        if !state.rotations.contains_key(&input.rotation_id) {
+            return Err(not_found(
+                format!("Rotation {} not found", input.rotation_id),
+                &input.rotation_id,
+                ROTATION_RESOURCE_TYPE,
+            ));
+        }
+
+        // The updated shift team is named by `ContactArn`, so every entry must resolve to a
+        // stored contact, exactly as `CreateRotation` resolves its own `ContactIds`.
+        if let Some(missing) = input
+            .contact_ids
+            .iter()
+            .flatten()
+            .find(|contact_id| !state.contacts.contains_key(*contact_id))
+        {
+            return Err(not_found(
+                format!("Contact {missing} not found"),
+                missing,
+                CONTACT_RESOURCE_TYPE,
+            ));
+        }
+
+        let Some(rotation) = state.rotations.get_mut(&input.rotation_id) else {
+            // Unreachable: the key was found above, under this same lock.
+            return Err(internal());
+        };
+
+        // Named members replace, omitted members are left alone. `Recurrence` is modelled
+        // required, so it always replaces; the others are optional, and clearing a
+        // rotation's team, start or time zone is not something this operation can express.
+        rotation.recurrence = input.recurrence.clone();
+        if let Some(contact_ids) = &input.contact_ids {
+            // "The order in which you list the contacts is their shift order in the rotation
+            // schedule": the list is stored as given, so a request naming the same contacts
+            // in another order reorders the shifts.
+            rotation.contact_ids = contact_ids.clone();
+        }
+        if let Some(start_time) = input.start_time {
+            rotation.start_time = Some(start_time);
+        }
+        if let Some(time_zone_id) = &input.time_zone_id {
+            rotation.time_zone_id = time_zone_id.clone();
+        }
+
+        Ok(UpdateRotationOutput {})
     }
+}
+
+/// The `resourceType` a not-found error names for the rotation being updated, spelled as the
+/// other rotation handlers spell it.
+const ROTATION_RESOURCE_TYPE: &str = "rotation";
+
+/// The `resourceType` a not-found error names for a contact, spelled as the contact handlers
+/// spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// Whether one of `RecurrenceSettings`' settings lists is present AND carries an entry.
+///
+/// An absent list and an empty one say the same thing: this recurrence has no shift of that
+/// period.
+fn carries_a_setting<T>(settings: &Option<Vec<T>>) -> bool {
+    settings.as_ref().is_some_and(|settings| !settings.is_empty())
+}
+
+/// This operation's modelled 404, carrying the ARN the request named.
+fn not_found(message: String, resource_id: &str, resource_type: &str) -> UpdateRotationError {
+    UpdateRotationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY: the failure is account level,
+/// so no field of the request is at fault.
+fn account_precondition_failed(message: String) -> UpdateRotationError {
+    UpdateRotationErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> UpdateRotationError {
+    UpdateRotationErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store there
+/// is no rotation to update, and that is this emulator's own failure rather than anything
+/// about the request.
+fn internal() -> UpdateRotationError {
+    UpdateRotationErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }
