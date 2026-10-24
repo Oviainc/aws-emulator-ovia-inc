@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a software package in this account's package catalog and persists it in
+//! [`crate::state::ComAmazonawsIotAwsiotserviceState::packages`], from where
+//! `GetPackage` reads it back member for member.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePackage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePackageErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `TagMap` is a map keyed by tag key, so the key is the tag's identity; the
+        // record keeps the map ordered so every reader reports the tags the same way.
+        // How many tags one request may carry is already bounded by the member's
+        // modelled `length 1..50`, refused before this handler runs.
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+
+        let mut store = state.lock();
+
+        if let Some(existing) = store.packages.get(&input.package_name) {
+            // `clientToken` is "a unique case-sensitive identifier that you can
+            // provide to ensure the idempotency of the request", so a create repeating
+            // the token that minted this record is the SAME request arriving twice: it
+            // answers from the record and writes nothing.
+            if input.client_token.is_some() && input.client_token == existing.client_token {
+                return Ok(CreatePackageOutput {
+                    package_name: Some(existing.package_name.clone()),
+                    package_arn: Some(existing.package_arn.clone()),
+                    description: existing.description.clone(),
+                });
+            }
+            // Otherwise the name, which is the package's identity, is already taken,
+            // which is what this operation's `ConflictException` (HTTP 409, "The
+            // request conflicts with the current state of the resource") names.
+            // Changing a package that exists is `UpdatePackage`'s job, so nothing is
+            // overwritten here.
+            return Err(CreatePackageErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("Package {} already exists", existing.package_name)),
+                resource_id: Some(existing.package_name.clone()),
+            })
+            .into());
+        }
+
+        // The catalog is one a CALLER grows, a package at a time, so the number an
+        // account can hold is bounded. The ceiling is read AFTER the conflict check,
+        // because a name already taken adds no record. `ServiceQuotaExceededException`
+        // (HTTP 402) is the modelled refusal for exactly this, never a 200 that records
+        // nothing.
+        if store.packages.len() >= crate::state::MAX_PACKAGES {
+            return Err(CreatePackageErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the maximum of {} packages is already reached",
+                        crate::state::MAX_PACKAGES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let package_arn = crate::state::package_arn(&region, &input.package_name);
+        let package = crate::state::RegisteredPackage::new(
+            input.package_name,
+            package_arn,
+            input.description,
+            tags,
+            input.client_token,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `GetPackage` reads are one value, not two
+        // that could drift.
+        let output = CreatePackageOutput {
+            package_name: Some(package.package_name.clone()),
+            package_arn: Some(package.package_arn.clone()),
+            description: package.description.clone(),
+        };
+        store.packages.insert(package.package_name.clone(), package);
+        Ok(output)
     }
 }
