@@ -25,6 +25,8 @@ mod configuration_templates;
 mod describe_application_versions;
 #[path = "all/dns_availability.rs"]
 mod dns_availability;
+#[path = "all/environment_draft_configuration.rs"]
+mod environment_draft_configuration;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
 #[path = "all/environment_resources.rs"]

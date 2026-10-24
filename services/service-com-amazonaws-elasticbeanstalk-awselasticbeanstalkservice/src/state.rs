@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
     ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, CustomAmi, EnvironmentTier,
+    CONFIGURATION_DEPLOYMENT_STATUS_VALUES,
     EventDescription, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule, OptionSpecification,
     PlatformBranchSummary, PlatformDescription, PlatformFramework, PlatformProgrammingLanguage,
     PlatformSummary, S3Location, Tag,
@@ -62,6 +63,21 @@ pub const STATUS_ABORTING: &str = "Aborting";
 /// environment reports while the update `UpdateEnvironment` starts is in
 /// flight.
 pub const STATUS_UPDATING: &str = "Updating";
+
+/// The `ConfigurationDeploymentStatus` values this service writes, read from
+/// the modelled value set [`CONFIGURATION_DEPLOYMENT_STATUS_VALUES`] rather
+/// than written out a second time, so this service cannot report a status the
+/// model does not declare.
+///
+/// "deployed: This is the configuration that is currently deployed to the
+/// associated running environment."
+pub const DEPLOYMENT_STATUS_DEPLOYED: &str = CONFIGURATION_DEPLOYMENT_STATUS_VALUES[0];
+/// "failed: This is a draft configuration that failed to deploy." See
+/// [`DEPLOYMENT_STATUS_DEPLOYED`].
+pub const DEPLOYMENT_STATUS_FAILED: &str = CONFIGURATION_DEPLOYMENT_STATUS_VALUES[1];
+/// "pending: This is a draft configuration that is waiting to be deployed to
+/// the associated running environment." See [`DEPLOYMENT_STATUS_DEPLOYED`].
+pub const DEPLOYMENT_STATUS_PENDING: &str = CONFIGURATION_DEPLOYMENT_STATUS_VALUES[2];
 
 /// `EnvironmentHealth` values this service writes (modelled set:
 /// `crate::ops::types::ENVIRONMENT_HEALTH_VALUES`). `Grey` is the value the model
@@ -1955,6 +1971,89 @@ pub fn merge_option_settings(
     merged
 }
 
+/// Whether two configurations hold the SAME options with the same values —
+/// option by option, by the [`option_setting_key`] triple that identifies one,
+/// so a configuration whose options are merely listed in another order is the
+/// same configuration.
+///
+/// This is what "updating a running environment with ANY configuration changes"
+/// is decided by: an update whose merged result is the configuration the
+/// environment already runs deploys no change, so it creates no draft.
+pub fn same_option_settings(
+    left: &[ConfigurationOptionSetting],
+    right: &[ConfigurationOptionSetting],
+) -> bool {
+    let keyed = |settings: &[ConfigurationOptionSetting]| {
+        settings
+            .iter()
+            .map(|setting| (option_setting_key(setting), setting.value.clone()))
+            .collect::<BTreeMap<(String, String, String), Option<String>>>()
+    };
+    keyed(left) == keyed(right)
+}
+
+/// The DRAFT configuration an environment carries: the configuration an update
+/// is deploying, or one a deployment never delivered.
+///
+/// `UpdateEnvironment` is documented as "when updating the configuration
+/// settings to a new template or individual settings, a draft configuration is
+/// created and DescribeConfigurationSettings for this environment returns two
+/// setting descriptions with different DeploymentStatus values", and
+/// `DeleteEnvironmentConfiguration` as "deletes the draft configuration
+/// associated with the running environment … the draft configuration remains in
+/// existence until it is deleted with this action". So an environment holds at
+/// most ONE draft beside the configuration it runs: `pending` while the update
+/// that created it is in flight, `failed` once that deployment was cancelled,
+/// and gone either when the clock deploys it or when the delete removes it.
+#[derive(Debug, Clone)]
+pub struct DraftConfiguration {
+    /// The option settings this configuration holds — what the environment will
+    /// run if the deployment completes.
+    pub option_settings: Vec<ConfigurationOptionSetting>,
+    /// The platform version the configuration belongs to, by solution stack
+    /// name and by ARN, as the update that created the draft resolved it.
+    pub solution_stack_name: Option<String>,
+    pub platform_arn: Option<String>,
+    /// [`DEPLOYMENT_STATUS_PENDING`] or [`DEPLOYMENT_STATUS_FAILED`] — a draft
+    /// is never `deployed`, because a configuration that reached the
+    /// environment is no longer a draft.
+    pub deployment_status: String,
+    pub date_created: ::aws_smithy_types::DateTime,
+    pub date_updated: ::aws_smithy_types::DateTime,
+}
+
+impl DraftConfiguration {
+    /// The draft an update creates: "pending: This is a draft configuration
+    /// that is waiting to be deployed to the associated running environment."
+    pub fn pending(
+        option_settings: Vec<ConfigurationOptionSetting>,
+        solution_stack_name: Option<String>,
+        platform_arn: Option<String>,
+    ) -> Self {
+        let at = now();
+        Self {
+            option_settings,
+            solution_stack_name,
+            platform_arn,
+            deployment_status: DEPLOYMENT_STATUS_PENDING.to_string(),
+            date_created: at,
+            date_updated: at,
+        }
+    }
+
+    /// Whether this draft is still waiting to be deployed.
+    pub fn is_pending(&self) -> bool {
+        self.deployment_status == DEPLOYMENT_STATUS_PENDING
+    }
+
+    /// Record that the deployment this draft was waiting for will not happen:
+    /// "failed: This is a draft configuration that failed to deploy."
+    pub fn fail(&mut self) {
+        self.deployment_status = DEPLOYMENT_STATUS_FAILED.to_string();
+        self.date_updated = now();
+    }
+}
+
 /// Build one of the generated `ConfigurationSettingsDescription` structs from a
 /// stored configuration template.
 ///
@@ -3474,6 +3573,13 @@ pub struct Environment {
     pub endpoint_url: Option<String>,
     pub tier: Option<EnvironmentTier>,
     pub option_settings: Vec<ConfigurationOptionSetting>,
+    /// The DRAFT configuration this environment carries, if any: the
+    /// configuration an update is deploying (`pending`), or one a cancelled
+    /// deployment never delivered (`failed`). `DescribeConfigurationSettings`
+    /// reports it as the second of the "two setting descriptions with
+    /// different DeploymentStatus values" an updating environment has, and
+    /// `DeleteEnvironmentConfiguration` deletes it. See [`DraftConfiguration`].
+    pub draft_configuration: Option<DraftConfiguration>,
     pub operations_role: Option<String>,
     pub status: String,
     pub health: String,
@@ -3623,6 +3729,20 @@ impl Environment {
     /// for an environment whose "health checks are suspended during an
     /// UpdateEnvironment or RestartEnvironment request".
     pub fn begin_abort(&mut self, request_id: &str) {
+        // "Cancels in-progress environment configuration update": the
+        // configuration that update was deploying never reaches the
+        // environment, so the draft it created stops waiting to be deployed and
+        // becomes the draft of a deployment that did not happen — "failed: This
+        // is a draft configuration that failed to deploy" — which "remains in
+        // existence until it is deleted with"
+        // `DeleteEnvironmentConfiguration`.
+        if let Some(draft) = self
+            .draft_configuration
+            .as_mut()
+            .filter(|draft| draft.is_pending())
+        {
+            draft.fail();
+        }
         self.status = STATUS_ABORTING.to_string();
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
@@ -3643,10 +3763,24 @@ impl Environment {
     /// later. `request_id` is the request asking for the update, which the
     /// completion event is then attributed to.
     ///
+    /// `draft` is the configuration this update is deploying, for an update that
+    /// changes the environment's configuration at all: "when updating the
+    /// configuration settings to a new template or individual settings, a draft
+    /// configuration is created". It becomes the environment's deployed
+    /// configuration when the clock completes this update (see
+    /// [`Self::materialize_due`]) — until then the environment keeps running the
+    /// configuration it already had. An update that deploys no configuration
+    /// change passes `None`, which leaves whatever draft the environment already
+    /// carries where it is: a draft "remains in existence until it is deleted"
+    /// by `DeleteEnvironmentConfiguration`.
+    ///
     /// Health goes `Grey`/`Pending` for the duration, as the model documents for
     /// an environment whose "health checks are suspended during an
     /// UpdateEnvironment or RestartEnvironment request".
-    pub fn begin_update(&mut self, request_id: &str) {
+    pub fn begin_update(&mut self, request_id: &str, draft: Option<DraftConfiguration>) {
+        if let Some(draft) = draft {
+            self.draft_configuration = Some(draft);
+        }
         self.status = STATUS_UPDATING.to_string();
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
@@ -3676,6 +3810,29 @@ impl Environment {
         }
     }
 
+    /// Deploy the configuration a `pending` draft holds, if this environment
+    /// carries one: the deployment the update started has reached the
+    /// environment, so that configuration is now the one it runs and is no
+    /// longer a draft.
+    ///
+    /// A `failed` draft is left alone — its deployment was cancelled, and it
+    /// "remains in existence until it is deleted" by
+    /// `DeleteEnvironmentConfiguration`.
+    fn deploy_pending_draft(&mut self) {
+        if self
+            .draft_configuration
+            .as_ref()
+            .is_none_or(|draft| !draft.is_pending())
+        {
+            return;
+        }
+        let draft = self.draft_configuration.take().expect("checked above");
+        self.option_settings = draft.option_settings;
+        // The resources the environment runs on follow the configuration that
+        // is now deployed; see [`Self::reconfigure_resources`].
+        self.reconfigure_resources();
+    }
+
     /// Apply the pending status change if the clock has already made it due, and
     /// answer the completion that change records (`None` when nothing was due).
     ///
@@ -3695,6 +3852,14 @@ impl Environment {
         self.health_status = pending.health_status;
         self.abortable_operation_in_progress = pending.abortable_operation_in_progress;
         self.date_updated = pending.due_date;
+        if self.status == STATUS_READY {
+            // The environment is available again, so the deployment that was in
+            // flight has landed: a configuration waiting to be deployed is the
+            // configuration it now runs. A deployment that was CANCELLED left
+            // its draft `failed` rather than `pending`, so the abort's own
+            // return to `Ready` deploys nothing.
+            self.deploy_pending_draft();
+        }
         if self.status == STATUS_TERMINATED {
             self.date_terminated = Some(pending.due_date);
             // The termination the clock has now completed deleted the

@@ -3,7 +3,8 @@
 //! @op DescribeConfigurationSettings
 //! Implemented: reports the settings of the configuration set the request names — a
 //! stored configuration template, or the configuration deployed to a stored
-//! environment — from the store. This is the ONLY file to touch for this operation.
+//! environment, together with that environment's DRAFT configuration when it carries
+//! one — from the store. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not anybody called.
         store.materialize_due_transitions();
 
-        let settings = match wanted {
+        let settings: Vec<CreateConfigurationTemplateOutput> = match wanted {
             // "The name of the configuration template to describe." A template
             // name is unique per application, so the pair resolves one record.
             ConfigurationSet::Template(template_name) => {
@@ -213,10 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     );
                 };
-                crate::state::configuration_settings_description!(
+                vec![crate::state::configuration_settings_description!(
                     CreateConfigurationTemplateOutput,
                     template
-                )
+                )]
             }
             // "The name of the environment to describe" — the configuration set
             // associated with a running environment. A terminated environment
@@ -237,7 +238,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     );
                 };
-                CreateConfigurationTemplateOutput {
+                // "When describing the settings for the configuration set
+                // associated with a running environment, it is possible to
+                // receive two sets of setting descriptions. One is the deployed
+                // configuration set, and the other is a draft configuration of
+                // an environment that is either in the process of deployment or
+                // that failed to deploy." The deployed one comes first, so a
+                // caller reading one description reads the configuration the
+                // environment is running.
+                let deployed = CreateConfigurationTemplateOutput {
                     solution_stack_name: environment.solution_stack_name.clone(),
                     platform_arn: environment.platform_arn.clone(),
                     application_name: Some(environment.application_name.clone()),
@@ -256,31 +265,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // rather than a sentence invented here.
                     description: environment.description.clone(),
                     // "deployed: This is the configuration that is currently
-                    // deployed to the associated running environment." The
-                    // second description the operation can report is a DRAFT
-                    // configuration (`pending`/`failed`) of an update in
-                    // flight, which this store holds none of: an update applies
-                    // its settings to the environment when it starts, so the
-                    // configuration the environment carries is always the
-                    // deployed one.
-                    deployment_status: Some(DEPLOYMENT_STATUS_DEPLOYED.to_string()),
+                    // deployed to the associated running environment."
+                    deployment_status: Some(crate::state::DEPLOYMENT_STATUS_DEPLOYED.to_string()),
                     date_created: Some(environment.date_created),
                     date_updated: Some(environment.date_updated),
                     option_settings: Some(environment.option_settings.clone()),
-                }
+                };
+                let draft = environment.draft_configuration.as_ref().map(|draft| {
+                    CreateConfigurationTemplateOutput {
+                        // The platform version the DRAFT belongs to, which is
+                        // the one the update that created it deploys.
+                        solution_stack_name: draft.solution_stack_name.clone(),
+                        platform_arn: draft.platform_arn.clone(),
+                        application_name: Some(environment.application_name.clone()),
+                        // A draft of an environment's configuration is no more a
+                        // template than the deployed one is.
+                        template_name: None,
+                        environment_name: Some(environment.environment_name.clone()),
+                        description: environment.description.clone(),
+                        // `pending` while the deployment that created it is in
+                        // flight, `failed` once that deployment was cancelled:
+                        // "the DeploymentStatus for the draft configuration
+                        // indicates whether the deployment is in process or has
+                        // failed".
+                        deployment_status: Some(draft.deployment_status.clone()),
+                        // The draft is a configuration set of its own, so it
+                        // reports when IT was created and last changed — not the
+                        // environment's instants.
+                        date_created: Some(draft.date_created),
+                        date_updated: Some(draft.date_updated),
+                        option_settings: Some(draft.option_settings.clone()),
+                    }
+                });
+                [Some(deployed), draft].into_iter().flatten().collect()
             }
         };
 
         Ok(DescribeConfigurationSettingsOutput {
-            configuration_settings: Some(vec![settings]),
+            configuration_settings: Some(settings),
         })
     }
 }
-
-/// The `ConfigurationDeploymentStatus` a running environment's configuration set
-/// reports, from [`CONFIGURATION_DEPLOYMENT_STATUS_VALUES`] — the modelled value
-/// set — read from the catalogue rather than written out a second time.
-const DEPLOYMENT_STATUS_DEPLOYED: &str = CONFIGURATION_DEPLOYMENT_STATUS_VALUES[0];
 
 /// Which configuration set the request named: "either a configuration template
 /// or the configuration set associated with a running environment". The request

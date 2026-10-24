@@ -2,17 +2,19 @@
 
 //! @op UpdateEnvironment
 //! Implemented: resolves the environment the request names, refuses the combinations the
-//! model documents as refused, applies the new release and the new configuration to the
-//! stored environment, and starts the update — `Updating`, abortable, with the return to
-//! `Ready` owed by the clock. This is the ONLY file to touch for this operation.
+//! model documents as refused, applies the new release and the new platform version to the
+//! stored environment, makes the configuration it deploys that environment's DRAFT
+//! configuration, and starts the update — `Updating`, abortable, with the return to
+//! `Ready` owed by the clock, which is when the draft becomes the deployed configuration.
+//! This is the ONLY file to touch for this operation.
 //!
-//! What this operation does NOT model: the DRAFT configuration the model's own
-//! description mentions ("a draft configuration is created and
-//! DescribeConfigurationSettings for this environment returns two setting descriptions
-//! with different DeploymentStatus values"). The new configuration becomes the
-//! environment's deployed configuration when the update starts, so
-//! `DescribeConfigurationSettings` reports the one `deployed` description it has always
-//! reported rather than a second, `pending` one.
+//! The draft is what the model's own description asks for: "when updating the
+//! configuration settings to a new template or individual settings, a draft
+//! configuration is created and DescribeConfigurationSettings for this environment
+//! returns two setting descriptions with different DeploymentStatus values" — the
+//! `deployed` one the environment is still running and the `pending` one this update is
+//! deploying. An update that leaves the configuration exactly as it stands deploys no
+//! configuration change, so it creates no draft.
 //!
 //! ## Shape of an operation
 //!
@@ -487,14 +489,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration template used to ORIGINALLY LAUNCH this environment", so
         // deploying a template's settings does not rename the template the
         // environment was launched from.
-        environment.option_settings = option_settings;
         environment.solution_stack_name = solution_stack_name;
         environment.platform_arn = platform_arn;
-        // The resources the environment runs on follow the configuration it now
-        // carries, keeping the identity of every resource that configuration
-        // still calls for: an update is not a reprovision.
-        environment.reconfigure_resources();
-        environment.begin_update(&request_id);
+        // "When updating the configuration settings to a new template or
+        // individual settings, a draft configuration is created and
+        // DescribeConfigurationSettings for this environment returns two
+        // setting descriptions with different DeploymentStatus values": the
+        // configuration this update deploys does NOT become the environment's
+        // deployed configuration here — it is the environment's draft
+        // ("pending: This is a draft configuration that is waiting to be
+        // deployed to the associated running environment") until the clock
+        // completes this update, which is when the environment starts running it
+        // and the resources it calls for follow. An update whose merged result
+        // is the configuration the environment already runs deploys no
+        // configuration change, so it creates no draft.
+        let draft = (!crate::state::same_option_settings(
+            &environment.option_settings,
+            &option_settings,
+        ))
+        .then(|| {
+            crate::state::DraftConfiguration::pending(
+                option_settings,
+                environment.solution_stack_name.clone(),
+                environment.platform_arn.clone(),
+            )
+        });
+        environment.begin_update(&request_id, draft);
 
         let output = crate::state::environment_description!(UpdateEnvironmentOutput, environment);
         let subject = environment.event_subject();
