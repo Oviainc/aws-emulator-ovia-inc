@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::Finding;
+use crate::ops::types::{Finding, FindingMetricsValuePerSeverity};
 
 /// The region an emulated request is for: the region of its SigV4 credential scope,
 /// or the emulator's documented default when the request carries no scope (see
@@ -58,6 +58,9 @@ pub const STATUS_ALL: &str = "All";
 /// `Status`; see [`STATUS_ALL`]. The status an OPEN finding carries, which is what the
 /// metrics operations count.
 pub const STATUS_OPEN: &str = "Open";
+/// `Status`; see [`STATUS_ALL`]. The status a finding carries once it is no longer
+/// open, which `ListFindingsMetrics` counts as a close.
+pub const STATUS_CLOSED: &str = "Closed";
 
 /// `Severity`, from `types::shared_types::SEVERITY_VALUES`
 /// (`Critical | High | Info | Low | Medium`). One constant per value, because the
@@ -479,6 +482,44 @@ pub fn start_of_utc_day_millis(epoch_millis: i64) -> i64 {
 /// as of a specified date").
 pub fn end_of_utc_day_millis(epoch_millis: i64) -> i64 {
     start_of_utc_day_millis(epoch_millis).saturating_add(MILLIS_PER_DAY - 1)
+}
+
+/// The bucket of `FindingMetricsValuePerSeverity` a finding's `severity` is counted in,
+/// or `None` when the finding records no modelled `Severity` value.
+///
+/// Shared by both metrics operations (`GetMetricsSummary` and `ListFindingsMetrics`), so
+/// one definition decides which severity a stored finding is counted under.
+pub fn severity_bucket(severity: Option<&str>) -> Option<&'static str> {
+    match severity? {
+        SEVERITY_INFO => Some(SEVERITY_INFO),
+        SEVERITY_LOW => Some(SEVERITY_LOW),
+        SEVERITY_MEDIUM => Some(SEVERITY_MEDIUM),
+        SEVERITY_HIGH => Some(SEVERITY_HIGH),
+        SEVERITY_CRITICAL => Some(SEVERITY_CRITICAL),
+        _ => None,
+    }
+}
+
+/// A `FindingMetricsValuePerSeverity` whose members are what `value_of` answers for each
+/// modelled `Severity`. The ONE place the mapping from a severity to its member lives,
+/// so every per-severity metric of this service reports the same five buckets.
+pub fn per_severity_with(
+    mut value_of: impl FnMut(&'static str) -> Option<f64>,
+) -> FindingMetricsValuePerSeverity {
+    FindingMetricsValuePerSeverity {
+        info: value_of(SEVERITY_INFO),
+        low: value_of(SEVERITY_LOW),
+        medium: value_of(SEVERITY_MEDIUM),
+        high: value_of(SEVERITY_HIGH),
+        critical: value_of(SEVERITY_CRITICAL),
+    }
+}
+
+/// `FindingMetricsValuePerSeverity` for a COUNT per severity: every severity is
+/// reported, and a severity nothing was counted for reports `0` rather than being left
+/// absent — zero findings of a severity is a measurement, not a missing one.
+pub fn per_severity_value(counts: &BTreeMap<&'static str, i64>) -> FindingMetricsValuePerSeverity {
+    per_severity_with(|severity| Some(counts.get(severity).copied().unwrap_or(0) as f64))
 }
 
 /// The region this request is for, read from its SigV4 credential scope.

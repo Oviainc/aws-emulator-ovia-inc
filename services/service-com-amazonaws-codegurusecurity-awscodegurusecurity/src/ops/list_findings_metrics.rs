@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFindingsMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFindingsMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFindingsMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE `AccountFindingsMetric` per UTC day of the requested interval, each one
+//! aggregated from the SAME findings store `GetFindings`, `BatchGetFindings` and
+//! `GetMetricsSummary` read. Reporting only: it writes nothing, and it reports nothing
+//! about scan runs, so it has no clock-owed transition to materialise.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +83,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -141,6 +139,145 @@ impl<Eng> ListFindingsMetrics<Eng> {
     }
 }
 
+/// The page size this operation uses when the request names no `maxResults`, and the
+/// cap it never exceeds: "If not specified, returns 1000 results"
+/// (`ListFindingsMetricsRequest$maxResults`), whose modelled range is 1..1000 — so a page
+/// never carries more than 1000 daily metrics.
+pub const MAX_PAGE_SIZE: i32 = 1_000;
+
+/// One stored finding reduced to what the per-day metrics need: which severity bucket it
+/// is counted under, when it was created, when it was closed, and whether it is open.
+#[derive(Debug)]
+struct CountedFinding {
+    /// The `FindingMetricsValuePerSeverity` member this finding is counted under.
+    severity: &'static str,
+    /// The finding's `createdAt`, when it records one.
+    created_at_millis: Option<i64>,
+    /// The instant this finding was closed: `Some` only for a finding whose status is
+    /// `Closed` AND which records an `updatedAt`, since a closed finding's last change is
+    /// the change that closed it. A `Closed` finding recording no `updatedAt` records no
+    /// close, so it is counted in no day's `closedFindings` and no day's `openFindings`.
+    closed_at_millis: Option<i64>,
+    /// Whether the finding's CURRENT status is `Open` — the only status the store keeps,
+    /// so an open finding has been open since it was created.
+    open_now: bool,
+}
+
+impl CountedFinding {
+    /// `finding` as this operation counts it, or `None` when it records no modelled
+    /// `Severity`: every member of `AccountFindingsMetric` is a value PER SEVERITY, so a
+    /// finding of no severity is counted in none of them.
+    fn of(finding: &Finding) -> Option<Self> {
+        let severity = crate::state::severity_bucket(finding.severity.as_deref())?;
+        let status = finding.status.as_deref();
+        Some(Self {
+            severity,
+            created_at_millis: finding
+                .created_at
+                .as_ref()
+                .map(crate::state::from_timestamp),
+            closed_at_millis: if status == Some(crate::state::STATUS_CLOSED) {
+                finding.updated_at.as_ref().map(crate::state::from_timestamp)
+            } else {
+                None
+            },
+            open_now: status == Some(crate::state::STATUS_OPEN),
+        })
+    }
+
+    /// Whether this finding was created within the day `day_start..=day_end`: "The number
+    /// of new findings of each severity ON the specified date"
+    /// (`AccountFindingsMetric$newFindings`), so a finding is new on exactly one day.
+    fn created_within(&self, day_start: i64, day_end: i64) -> bool {
+        self.created_at_millis
+            .is_some_and(|created| created >= day_start && created <= day_end)
+    }
+
+    /// Whether this finding was closed within the day `day_start..=day_end`: "The number
+    /// of closed findings of each severity ON the specified date"
+    /// (`AccountFindingsMetric$closedFindings`).
+    fn closed_within(&self, day_start: i64, day_end: i64) -> bool {
+        self.closed_at_millis
+            .is_some_and(|closed| closed >= day_start && closed <= day_end)
+    }
+
+    /// Whether this finding was open AS OF `day_end`: "The number of open findings of
+    /// each severity AS OF the specified date" (`AccountFindingsMetric$openFindings`) — it
+    /// existed by then and had not been closed by then. A finding that records no
+    /// creation instant cannot be placed after the date, so it is not excluded by it (the
+    /// same reading `GetMetricsSummary` takes).
+    fn open_as_of(&self, day_end: i64) -> bool {
+        if self.created_at_millis.is_some_and(|created| created > day_end) {
+            return false;
+        }
+        self.open_now || self.closed_at_millis.is_some_and(|closed| closed > day_end)
+    }
+
+    /// How long this finding took to close, IN DAYS, when it had been closed by `day_end`
+    /// and records both the instant it was created and the instant it was closed; `None`
+    /// otherwise, since there is no duration to average in.
+    fn days_to_close(&self, day_end: i64) -> Option<f64> {
+        let created = self.created_at_millis?;
+        let closed = self.closed_at_millis.filter(|closed| *closed <= day_end)?;
+        Some(closed.saturating_sub(created).max(0) as f64 / crate::state::MILLIS_PER_DAY as f64)
+    }
+}
+
+/// The account's `AccountFindingsMetric` for the UTC day beginning at `day_start`,
+/// accumulated over `findings`.
+fn day_metric(day_start: i64, findings: &[CountedFinding]) -> AccountFindingsMetric {
+    let day_end = crate::state::end_of_utc_day_millis(day_start);
+    let mut new_counts: BTreeMap<&'static str, i64> = BTreeMap::new();
+    let mut closed_counts: BTreeMap<&'static str, i64> = BTreeMap::new();
+    let mut open_counts: BTreeMap<&'static str, i64> = BTreeMap::new();
+    // `(sum of days to close, number of findings closed)` per severity.
+    let mut time_to_close: BTreeMap<&'static str, (f64, i64)> = BTreeMap::new();
+
+    for finding in findings {
+        if finding.created_within(day_start, day_end) {
+            *new_counts.entry(finding.severity).or_insert(0) += 1;
+        }
+        if finding.closed_within(day_start, day_end) {
+            *closed_counts.entry(finding.severity).or_insert(0) += 1;
+        }
+        if finding.open_as_of(day_end) {
+            *open_counts.entry(finding.severity).or_insert(0) += 1;
+        }
+        if let Some(days) = finding.days_to_close(day_end) {
+            let total = time_to_close.entry(finding.severity).or_insert((0.0, 0));
+            total.0 += days;
+            total.1 += 1;
+        }
+    }
+
+    AccountFindingsMetric {
+        date: Some(crate::state::to_timestamp(day_start)),
+        new_findings: Some(crate::state::per_severity_value(&new_counts)),
+        closed_findings: Some(crate::state::per_severity_value(&closed_counts)),
+        open_findings: Some(crate::state::per_severity_value(&open_counts)),
+        // An AVERAGE over nothing is not a number: a severity no finding of which had
+        // been closed by this day reports NO value, rather than claiming `0` days.
+        mean_time_to_close: Some(crate::state::per_severity_with(|severity| {
+            time_to_close
+                .get(severity)
+                .map(|(total_days, closed)| total_days / *closed as f64)
+        })),
+    }
+}
+
+/// The page token: the start of the next day to report, carried through the shared
+/// page-token helpers (hex), so the token always satisfies the modelled `NextToken`
+/// pattern (`^[\S]+$`) and stays opaque to the caller.
+fn encode_day_cursor(day_start_millis: i64) -> String {
+    crate::state::encode_page_token(&day_start_millis.to_string())
+}
+
+/// The day a token built by [`encode_day_cursor`] resumes at; `None` for a token this
+/// service did not issue, which the reader refuses as a `ValidationException`.
+fn decode_day_cursor(token: &str) -> Option<i64> {
+    crate::state::decode_page_token(token)?.parse::<i64>().ok()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListFindingsMetrics<Eng>
 {
@@ -158,18 +295,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFindingsMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFindingsMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata cannot change what an account-wide metrics interval reports.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFindingsMetricsErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "The start date of the interval which you want to retrieve metrics from. Rounds
+        // to the nearest day" / "The end date … Round to the nearest day"
+        // (`ListFindingsMetricsRequest$startDate` / `$endDate`): the interval is a span of
+        // whole UTC days, so each bound selects the day its instant falls in and the
+        // answer reports one `AccountFindingsMetric` per day from the first through the
+        // last, INCLUSIVE. An interval whose end day precedes its start day contains no
+        // day, so it reports no metrics — the model declares no error for it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFindingsMetrics"))
+        // Neither bound is range-checked: a day that precedes every finding the account
+        // has simply reports zeros.
+        let start_day =
+            crate::state::start_of_utc_day_millis(crate::state::from_timestamp(&input.start_date));
+        let end_day =
+            crate::state::start_of_utc_day_millis(crate::state::from_timestamp(&input.end_date));
+
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(MAX_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // The token is the first day the previous page did NOT report, so the next page
+        // resumes exactly there: no day is repeated and none is skipped. A token naming a
+        // day before the requested interval resumes at the interval's first day.
+        let resume_day = match &input.next_token {
+            Some(token) => match decode_day_cursor(token) {
+                Some(day) => day.max(start_day),
+                None => {
+                    return Err(ListFindingsMetricsErrorModeled::ValidationException(
+                        ValidationException {
+                            error_code: "ValidationException".to_string(),
+                            message: "nextToken is not a token this service issued".to_string(),
+                            reason: "fieldValidationFailed".to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "pass back the nextToken from the previous page unchanged"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => start_day,
+        };
+
+        // Reporting only: the store is read, never written, and the findings are reduced
+        // to what the metrics count BEFORE the lock is released, so every day of this
+        // answer is computed from one consistent view of the account.
+        let findings: Vec<CountedFinding> = {
+            let store = state.lock();
+            store
+                .findings
+                .values()
+                .filter_map(CountedFinding::of)
+                .collect()
+        };
+
+        // Bounded per request: at most `page_size` (<= `MAX_PAGE_SIZE`) days are
+        // aggregated, each over the stored findings, which the store's own bounds limit —
+        // an interval of any width is answered page by page.
+        let mut findings_metrics = Vec::new();
+        let mut next_token = None;
+        let mut day = resume_day;
+        while day <= end_day {
+            if findings_metrics.len() == page_size {
+                next_token = Some(encode_day_cursor(day));
+                break;
+            }
+            findings_metrics.push(day_metric(day, &findings));
+            day = day.saturating_add(crate::state::MILLIS_PER_DAY);
+        }
+
+        Ok(ListFindingsMetricsOutput {
+            findings_metrics: Some(findings_metrics),
+            next_token,
+        })
     }
 }

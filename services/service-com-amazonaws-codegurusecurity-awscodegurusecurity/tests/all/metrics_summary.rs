@@ -43,8 +43,9 @@ const DAY_B: i64 = DAY_A + 5 * DAY;
 /// (`All | Closed | Open`): a finding the summary must never count.
 const STATUS_CLOSED: &str = "Closed";
 
-/// An instant as the ISO 8601 form the modelled `date` query member uses.
-fn iso(at_secs: i64) -> String {
+/// An instant as the ISO 8601 form the modelled timestamp query members use. Shared with
+/// the sibling suite of the other metrics operation (`crate::findings_metrics`).
+pub(crate) fn iso(at_secs: i64) -> String {
     DateTime::from_secs(at_secs)
         .fmt(Format::DateTime)
         .unwrap_or_else(|error| panic!("unformattable instant {at_secs}: {error}"))
@@ -81,7 +82,8 @@ fn summary_of<'a>(case: &str, answer: &'a Answer) -> &'a Value {
 ///
 /// restJson1 carries a `Timestamp` member either as epoch seconds or in the ISO 8601
 /// form depending on its `timestampFormat`, so both renderings are read the same way.
-fn instant_secs(case: &str, value: &Value) -> i64 {
+/// Shared with `crate::findings_metrics`, which reads the same kind of member.
+pub(crate) fn instant_secs(case: &str, value: &Value) -> i64 {
     match value {
         Value::String(text) => DateTime::from_str(text, Format::DateTime)
             .unwrap_or_else(|error| panic!("case {case:?}: unparseable instant {text:?}: {error}"))

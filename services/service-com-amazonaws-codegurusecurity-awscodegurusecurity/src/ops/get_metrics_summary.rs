@@ -153,34 +153,11 @@ struct OpenFindingMetrics {
     critical_per_scan: std::collections::BTreeMap<String, i64>,
 }
 
-/// The bucket of `FindingMetricsValuePerSeverity` a finding's `severity` is counted in,
-/// or `None` when the finding records no modelled severity.
-fn severity_bucket(severity: Option<&str>) -> Option<&'static str> {
-    match severity? {
-        crate::state::SEVERITY_INFO => Some(crate::state::SEVERITY_INFO),
-        crate::state::SEVERITY_LOW => Some(crate::state::SEVERITY_LOW),
-        crate::state::SEVERITY_MEDIUM => Some(crate::state::SEVERITY_MEDIUM),
-        crate::state::SEVERITY_HIGH => Some(crate::state::SEVERITY_HIGH),
-        crate::state::SEVERITY_CRITICAL => Some(crate::state::SEVERITY_CRITICAL),
-        _ => None,
-    }
-}
-
-/// `FindingMetricsValuePerSeverity` for `counts`: every severity is reported, and a
-/// severity nothing was counted for reports `0` rather than being left absent — zero
-/// open findings of a severity is a measurement, not a missing one.
-fn per_severity_value(
-    counts: &std::collections::BTreeMap<&'static str, i64>,
-) -> FindingMetricsValuePerSeverity {
-    let count_of = |severity: &'static str| Some(counts.get(severity).copied().unwrap_or(0) as f64);
-    FindingMetricsValuePerSeverity {
-        info: count_of(crate::state::SEVERITY_INFO),
-        low: count_of(crate::state::SEVERITY_LOW),
-        medium: count_of(crate::state::SEVERITY_MEDIUM),
-        high: count_of(crate::state::SEVERITY_HIGH),
-        critical: count_of(crate::state::SEVERITY_CRITICAL),
-    }
-}
+// Which severity bucket a stored finding is counted under
+// (`crate::state::severity_bucket`) and how a per-severity count is rendered
+// (`crate::state::per_severity_value`) live in `crate::state`, shared with the other
+// per-severity metrics operation (`ListFindingsMetrics`), so both report one answer to
+// the same question.
 
 /// The `limit` highest counts of `counts`, most findings first.
 ///
@@ -273,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             *metrics.per_scan.entry(scan_name.clone()).or_insert(0) += 1;
-            if let Some(severity) = severity_bucket(finding.severity.as_deref()) {
+            if let Some(severity) = crate::state::severity_bucket(finding.severity.as_deref()) {
                 *metrics.per_severity.entry(severity).or_insert(0) += 1;
                 if severity == crate::state::SEVERITY_CRITICAL {
                     *metrics
@@ -310,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetMetricsSummaryOutput {
             metrics_summary: Some(MetricsSummary {
                 date: Some(crate::state::to_timestamp(day_start_millis)),
-                open_findings: Some(per_severity_value(&metrics.per_severity)),
+                open_findings: Some(crate::state::per_severity_value(&metrics.per_severity)),
                 categories_with_most_findings: Some(categories),
                 scans_with_most_open_findings: Some(scan_ranking(&metrics.per_scan)),
                 scans_with_most_open_critical_findings: Some(scan_ranking(
