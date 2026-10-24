@@ -17,7 +17,16 @@ pub struct GetProvisionedModelThroughputInput {
     pub provisioned_model_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetProvisionedModelThroughputResponse")]
+/// `GetProvisionedModelThroughputResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime`, `lastModifiedTime` and `commitmentExpirationTime` all carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetProvisionedModelThroughput")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetProvisionedModelThroughputOutput {
     pub model_units: i32,
@@ -34,4 +43,95 @@ pub struct GetProvisionedModelThroughputOutput {
     pub commitment_duration: Option<String>,
     pub commitment_expiration_time: Option<::aws_smithy_types::DateTime>,
 }
+
+bedrock_schema_and_codec!(
+    GetProvisionedModelThroughputOutput,
+    GET_PROVISIONED_MODEL_THROUGHPUT_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetProvisionedModelThroughputResponse",
+    "com.amazonaws.bedrock",
+    "GetProvisionedModelThroughputResponse",
+    (M_MODEL_UNITS, model_units, "modelUnits", 0, req, integer),
+    (
+        M_DESIRED_MODEL_UNITS,
+        desired_model_units,
+        "desiredModelUnits",
+        1,
+        req,
+        integer
+    ),
+    (
+        M_PROVISIONED_MODEL_NAME,
+        provisioned_model_name,
+        "provisionedModelName",
+        2,
+        req,
+        string
+    ),
+    (
+        M_PROVISIONED_MODEL_ARN,
+        provisioned_model_arn,
+        "provisionedModelArn",
+        3,
+        req,
+        string
+    ),
+    (M_MODEL_ARN, model_arn, "modelArn", 4, req, string),
+    (
+        M_DESIRED_MODEL_ARN,
+        desired_model_arn,
+        "desiredModelArn",
+        5,
+        req,
+        string
+    ),
+    (
+        M_FOUNDATION_MODEL_ARN,
+        foundation_model_arn,
+        "foundationModelArn",
+        6,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 7, req, string),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        8,
+        req,
+        date_time
+    ),
+    (
+        M_LAST_MODIFIED_TIME,
+        last_modified_time,
+        "lastModifiedTime",
+        9,
+        req,
+        date_time
+    ),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        10,
+        opt,
+        string
+    ),
+    (
+        M_COMMITMENT_DURATION,
+        commitment_duration,
+        "commitmentDuration",
+        11,
+        opt,
+        string
+    ),
+    (
+        M_COMMITMENT_EXPIRATION_TIME,
+        commitment_expiration_time,
+        "commitmentExpirationTime",
+        12,
+        opt,
+        date_time
+    ),
+);
 

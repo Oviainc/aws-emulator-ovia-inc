@@ -466,6 +466,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         source.latest_version.image_set_state = ImageSetState::Locked;
         source.latest_version.workflow_status = ImageSetWorkflowStatus::CopyingWithReadOnlyAccess;
         source.latest_version.updated_at = now;
+        // The copy READ this source's pixel data and DICOM attributes just above, so the
+        // source was accessed at the instant the copy was admitted — what the image set's
+        // `lastAccessedAt` reports. The DESTINATION is accessed when the content lands in
+        // it, which the clock records where it delivers it
+        // (`crate::state::ImageSet::advance_to`).
+        source.record_access(now);
         source.pending = Some(PendingImageSetTransition {
             workflow_status: source_workflow_status_before_copy,
             // A copy READS its source and writes its destination, so the release of the

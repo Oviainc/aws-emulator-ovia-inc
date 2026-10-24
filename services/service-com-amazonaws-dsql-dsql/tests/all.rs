@@ -35,6 +35,8 @@ mod pagination_token_refusal;
 mod policy_document_class;
 #[path = "all/policy_version_conflict_and_lockout.rs"]
 mod policy_version_conflict_and_lockout;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

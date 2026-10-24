@@ -37,6 +37,8 @@ mod purchase_order_associations;
 mod purchase_order_updates;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/selector_resolution.rs"]
+mod selector_resolution;
 #[path = "all/seller_submitted_request_views.rs"]
 mod seller_submitted_request_views;
 #[path = "all/state_roundtrip.rs"]

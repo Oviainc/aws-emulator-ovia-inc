@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIndexPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIndexPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIndexPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The field index policy that applies to the ONE log group the request names: the policy
+//! stored on that group when it holds one of its own (`source` `LOG_GROUP`, and no
+//! `policyName`, because a log-group level policy has none), otherwise the account-level
+//! `FIELD_INDEX_POLICY` whose `selectionCriteria` select that group (`source` `ACCOUNT`,
+//! carrying that policy's name). A log group that neither holds nor is selected by one has
+//! no index policy to report, which is an empty list rather than a refusal.
+//!
+//! It REPORTS: it reads the store and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIndexPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIndexPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIndexPolicies"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeIndexPoliciesError::from(
+                DescribeIndexPoliciesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: String| {
+            DescribeIndexPoliciesError::from(
+                DescribeIndexPoliciesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // A token this operation never mints cannot be a position in an enumeration it
+        // issued: the request names at most one log group, and one log group has at most
+        // one index policy, so every answer is one page.
+        if let Some(token) = input.next_token.as_deref() {
+            return Err(invalid(format!(
+                "nextToken '{token}' was not issued by DescribeIndexPolicies"
+            )));
+        }
+
+        // "An array containing the name or ARN of the log group that you want to retrieve
+        // field index policies for", which the model bounds to exactly one value — so the
+        // boundary validator has already refused a request naming none or several, and an
+        // ARN resolves to the name the store is keyed by.
+        let Some(identifier) = input.log_group_identifiers.first() else {
+            return Err(invalid(
+                "logGroupIdentifiers must name one log group".to_string(),
+            ));
+        };
+        let log_group_name = crate::state::log_group_name_from_identifier(identifier);
+
+        let Some(group) = store.log_groups.get(log_group_name) else {
+            return Err(DescribeIndexPoliciesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // "If a specified log group has a log-group level index policy, that policy is
+        // returned by this operation. If a specified log group doesn't have a log-group
+        // level index policy, but an account-wide index policy applies to it, that
+        // account-wide policy is returned by this operation."
+        let reported = match group.index_policy.as_ref() {
+            Some(policy) => Some(IndexPolicy {
+                // "The ARN of the log group that this index policy applies to" — the ARN of
+                // the group the request named, whichever form it named it by. The form
+                // without the trailing `:*` is the one the modelled `LogGroupIdentifier`
+                // pattern admits.
+                log_group_identifier: Some(group.log_group_arn.clone()),
+                last_update_time: Some(policy.last_update_time_ms),
+                policy_document: Some(policy.policy_document.clone()),
+                // "Responses about log group-level field index policies don't have this
+                // field, because those policies don't have names."
+                policy_name: None,
+                source: Some(crate::state::INDEX_SOURCE_LOG_GROUP.to_string()),
+            }),
+            None => applicable_account_policy(&store.account_policies, group).map(|policy| {
+                IndexPolicy {
+                    log_group_identifier: Some(group.log_group_arn.clone()),
+                    last_update_time: Some(policy.last_updated_time_ms),
+                    policy_document: Some(policy.policy_document.clone()),
+                    // An account-level policy has a name, which is half of what identifies
+                    // it to `DescribeAccountPolicies` and `DeleteAccountPolicy`.
+                    policy_name: Some(policy.policy_name.clone()),
+                    source: Some(crate::state::INDEX_SOURCE_ACCOUNT.to_string()),
+                }
+            }),
+        };
+
+        Ok(DescribeIndexPoliciesOutput {
+            // "An array containing the field index policies": the one policy that applies
+            // to the group, and nothing at all for a group no policy applies to.
+            index_policies: Some(reported.into_iter().collect()),
+            next_token: None,
+        })
     }
+}
+
+/// The account-level field index policy that applies to one log group, or `None` when none
+/// of the account's does.
+///
+/// An account-level policy applies to a log group when its `selectionCriteria` select that
+/// group, and a policy put without criteria is the one "that applies to all log groups in
+/// the account" ([`crate::state::account_policy_selects_log_group`]). A group can therefore
+/// be selected by both a scoped policy and that account-wide one — `PutAccountPolicy`'s
+/// quota sentence admits "either one account-level policy that applies to all log groups in
+/// the account, or up to 20 policies that are each scoped to a subset", and its overlap rule
+/// ("no two of them can use the same or overlapping log group name prefixes") leaves at most
+/// one SCOPED policy selecting any one group. So the policy that applies to the group is the
+/// scoped one when it has one, and the account-wide one otherwise.
+fn applicable_account_policy<'a>(
+    account_policies: &'a std::collections::BTreeMap<
+        (String, String),
+        crate::state::AccountPolicyRecord,
+    >,
+    group: &crate::state::LogGroupRecord,
+) -> Option<&'a crate::state::AccountPolicyRecord> {
+    let applying: Vec<&crate::state::AccountPolicyRecord> = account_policies
+        .values()
+        .filter(|policy| policy.policy_type == crate::state::POLICY_TYPE_FIELD_INDEX)
+        .filter(|policy| crate::state::account_policy_selects_log_group(policy, group))
+        .collect();
+    applying
+        .iter()
+        .find(|policy| policy.selection_criteria.is_some())
+        .or_else(|| applying.first())
+        .copied()
 }

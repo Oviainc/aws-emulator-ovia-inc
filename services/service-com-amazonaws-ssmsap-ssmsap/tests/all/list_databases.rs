@@ -164,25 +164,29 @@ fn cases() -> Vec<Case> {
 }
 
 /// One `DatabaseSummary` of a listing, reduced to what the assertions read.
+///
+/// `pub(crate)` because the suites of this target read ONE reduction of a listing:
+/// `tests/all/registered_database_arn.rs` pins the databases a registration named by
+/// ARN out of the same `ListDatabases` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Summary {
-    application_id: Option<String>,
-    component_id: Option<String>,
-    database_id: Option<String>,
-    database_type: Option<String>,
-    arn: Option<String>,
+pub(crate) struct Summary {
+    pub(crate) application_id: Option<String>,
+    pub(crate) component_id: Option<String>,
+    pub(crate) database_id: Option<String>,
+    pub(crate) database_type: Option<String>,
+    pub(crate) arn: Option<String>,
     /// Whether the summary carried a `Tags` member at all.
-    tagged: bool,
+    pub(crate) tagged: bool,
 }
 
 impl Summary {
-    fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         self.database_id.as_deref().unwrap_or_default()
     }
 }
 
 /// The `DatabaseSummary` list a reply reported, in the order it reported them.
-fn listed(reply: &Reply) -> Vec<Summary> {
+pub(crate) fn listed(reply: &Reply) -> Vec<Summary> {
     reply
         .member("Databases")
         .and_then(Value::as_array)
@@ -212,15 +216,20 @@ fn string_member(value: &Value, name: &str) -> Option<String> {
 }
 
 /// The `NextToken` a listing handed out, absent when it reported the last page.
-fn next_token(reply: &Reply) -> Option<String> {
+pub(crate) fn next_token(reply: &Reply) -> Option<String> {
     reply
         .member("NextToken")
         .and_then(Value::as_str)
         .map(str::to_string)
 }
 
-/// The ARN the database `database_id` of `application_id` must carry in [`REGION`].
-fn expected_arn(application_id: &str, database_id: &str) -> String {
+/// The ARN the database `database_id` of `application_id` must carry in [`REGION`] when
+/// it is a sub-resource of that application.
+///
+/// `pub(crate)` so the suites of this target read ONE spelling of a database ARN:
+/// `tests/all/registered_database_arn.rs` builds the `DatabaseArn` a registration names
+/// with it and expects it back.
+pub(crate) fn expected_arn(application_id: &str, database_id: &str) -> String {
     format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/{application_id}/{database_id}")
 }
 
@@ -228,7 +237,7 @@ fn expected_arn(application_id: &str, database_id: &str) -> String {
 ///
 /// `CredentialType` is the model's single `CredentialType` value and `SecretId` is a
 /// Secrets Manager id; only the `DatabaseName` varies between rows.
-fn credentials(database_names: &[&str]) -> Value {
+pub(crate) fn credentials(database_names: &[&str]) -> Value {
     Value::Array(
         database_names
             .iter()

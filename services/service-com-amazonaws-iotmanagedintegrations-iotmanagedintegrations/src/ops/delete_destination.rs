@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the destination `crate::state`'s `destinations` store holds under the region
+//! and `Name` the URI names, so an independent `GetDestination` no longer resolves it and
+//! a later mutation of that name fails too. A name this region holds no destination under
+//! is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +135,20 @@ pub struct DeleteDestination<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller
+/// presented (a public identifier, never a secret), the region the destination lived in,
+/// and how the call ended — worded exactly as `CreateDestination` records its own.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "DeleteDestination",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> DeleteDestination<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -165,18 +175,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDestination"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this destination lived in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            DeleteDestinationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the destination store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // A destination is regional, as every resource of this service is: only the region
+        // that created it resolves — and deletes — it.
+        let removed = store
+            .destinations
+            .remove(&crate::state::RegionalName::new(&region, &input.name));
+        drop(store);
+
+        if removed.is_none() {
+            audit(&akid, &region, "not-found");
+            // A mutation states the reason through the one formatter every mutating path of
+            // this service shares, so a delete of a name nothing holds reads exactly the
+            // way an update of it does.
+            return Err(DeleteDestinationErrorModeled::ResourceNotFoundException(
+                crate::state::destination_not_found_on_mutation(&input.name),
+            )
+            .into());
+        }
+
+        audit(&akid, &region, "deleted");
+        Ok(DeleteDestinationOutput)
     }
 }

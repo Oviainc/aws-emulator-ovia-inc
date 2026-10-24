@@ -19,6 +19,8 @@ mod cloud_connector_lifecycle;
 mod connector_destination_lifecycle;
 #[path = "all/default_encryption_configuration.rs"]
 mod default_encryption_configuration;
+#[path = "all/destination_lifecycle.rs"]
+mod destination_lifecycle;
 #[path = "all/device_discovery_lifecycle.rs"]
 mod device_discovery_lifecycle;
 #[path = "all/enum_value_set_rendering.rs"]

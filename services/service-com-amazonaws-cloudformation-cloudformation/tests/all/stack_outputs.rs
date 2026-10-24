@@ -19,8 +19,8 @@
 //! whose one output is `!Ref` of the topic) is the first row.
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, expected_status, member, router, wait_for_the_transition,
-    xml_text, xml_unescape, ACCOUNT_ID, REGION,
+    acknowledging_iam, call, create_stack, describe_stack, expected_status, member, router,
+    wait_for_the_transition, xml_text, xml_unescape, ACCOUNT_ID, REGION,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::template::MAX_OUTPUTS_PER_TEMPLATE;
 use service_com_amazonaws_cloudformation_cloudformation::state::{
@@ -1228,11 +1228,13 @@ async fn declared_outputs_are_evaluated_and_reported_by_describe_stacks() {
     let router = router();
 
     for case in output_cases() {
+        // A row's template may declare the IAM role its other resources use, so the
+        // request acknowledges the template's IAM resources.
         let (status_code, body) = create_stack(
             &router,
             case.stack_name,
             &case.template,
-            &case.parameters,
+            &acknowledging_iam(&case.parameters),
         )
         .await;
         assert_eq!(

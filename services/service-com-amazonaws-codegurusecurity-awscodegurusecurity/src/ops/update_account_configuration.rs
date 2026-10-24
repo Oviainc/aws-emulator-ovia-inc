@@ -2,12 +2,14 @@
 
 //! @op UpdateAccountConfiguration
 //!
-//! WRITES the encryption configuration of the account's EXISTING configuration record
+//! WRITES the account's encryption configuration
 //! ([`crate::state::Store::account_configuration`]) — the single copy
 //! `GetAccountConfiguration` reports and `CreateUploadUrl` derives an upload's
-//! server-side-encryption headers from. An account with no configuration record has
-//! nothing to update, so the call is refused with the modelled
-//! `ResourceNotFoundException` (HTTP 404) rather than creating one.
+//! server-side-encryption headers from. The configuration is a per-account SETTING with
+//! a documented default rather than a named resource, and the request names no resource
+//! at all, so the write always applies: an account that holds no configuration record
+//! yet gets one ([`crate::state::Store::set_encryption_kms_key_arn`]) instead of a
+//! not-found refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -177,47 +179,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs, so a value that arrives here is a well-formed KMS key ARN.
         let requested = input.encryption_config.kms_key_arn.clone();
 
+        let now = crate::state::now_millis();
+
         // ONE lock for the write and the read-back, so the configuration this call
         // reports is the one it committed rather than a value a concurrent update
         // replaced in between.
         let mut store = state.lock();
 
-        // This operation UPDATES the account's existing configuration; it does not bring
-        // one into existence. An account CodeGuru Security holds no configuration record
-        // for therefore has nothing to update, and the call is refused with the modelled
-        // `ResourceNotFoundException` (HTTP 404, "The resource specified in the request
-        // was not found") rather than reported as a configuration that was applied. The
-        // record appears when the account is onboarded to the service, which this
-        // emulator materialises on its first resource-creating call (see
-        // `crate::state::Store::onboard_account`).
-        let Some(config) = store.account_configuration.as_mut() else {
-            return Err(
-                UpdateAccountConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        error_code: "ResourceNotFoundException".to_string(),
-                        message: format!(
-                            "no existing account configuration found for account {account}: \
-                             CodeGuru Security holds no configuration for this account, so \
-                             there is none to update",
-                            account = ::engine::emulator_account_id(),
-                        ),
-                        resource_id: ::engine::emulator_account_id().to_string(),
-                        resource_type: "accountConfiguration".to_string(),
-                    },
-                )
-                .into(),
-            );
-        };
-        config.encryption_kms_key_arn = requested;
-
+        // The account's encryption configuration is a per-account SETTING with a
+        // documented default, not a named resource: the request carries no resource
+        // identifier, and `GetAccountConfiguration` reports the AWS-managed default for
+        // an account that has configured nothing. So the write always applies — an
+        // account CodeGuru Security holds no record for gets one here — and the modelled
+        // `ResourceNotFoundException` is left for a request that names a resource the
+        // service does not hold, of which this operation has none.
+        //
         // "An EncryptionConfig object that contains the KMS key ARN that is used for
         // encryption. If you did not specify a customer-managed KMS key in the request,
         // returns empty" (`UpdateAccountConfigurationResponse$encryptionConfig`): built
         // from the STORE, so what this answers and what GetAccountConfiguration answers
         // are the same value by construction.
+        let committed = store.set_encryption_kms_key_arn(requested, now);
+
         Ok(UpdateAccountConfigurationOutput {
             encryption_config: EncryptionConfig {
-                kms_key_arn: store.encryption_kms_key_arn(),
+                kms_key_arn: committed,
             },
         })
     }

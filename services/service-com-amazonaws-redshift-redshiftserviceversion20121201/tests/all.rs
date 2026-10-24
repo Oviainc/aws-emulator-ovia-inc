@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_attributes.rs"]
 mod account_attributes;
+#[path = "all/batch_modify_cluster_snapshots.rs"]
+mod batch_modify_cluster_snapshots;
 #[path = "all/cluster_iam_roles.rs"]
 mod cluster_iam_roles;
 #[path = "all/cluster_lifecycle.rs"]

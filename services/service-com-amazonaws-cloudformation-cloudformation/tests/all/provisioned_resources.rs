@@ -26,12 +26,14 @@
 //! The second half of this file is the CONTAINER-PLATFORM output table, whose own rule
 //! and bounds are stated where it begins.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
-    xml_texts, ACCOUNT_ID, REGION,
+    acknowledging_iam, call, create_stack, describe_stack, member, router,
+    wait_for_the_transition, xml_text, xml_texts, ACCOUNT_ID, REGION,
 };
 
 /// The `X-Amz-Target` prefix CodePipeline's OPERATIONS.md records.
@@ -44,7 +46,9 @@ async fn deploy(
     name: &str,
     template: &str,
 ) -> (Option<String>, Option<String>) {
-    let (status, body) = create_stack(router, name, template, &[]).await;
+    // A row's template may declare an IAM role, named or not, so the deployment
+    // acknowledges the template's IAM resources.
+    let (status, body) = create_stack(router, name, template, &acknowledging_iam(&[])).await;
     assert_eq!(status, 200, "CreateStack({name}) answered {status}: {body}");
     settled_status(router, name).await
 }
@@ -291,22 +295,30 @@ async fn a_declared_role_exists_in_iam_with_its_policies() {
     // account segment is `aws`, so it is AWS's resource, not this account's).
     const MANAGED_POLICY_ARN: &str = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess";
 
-    let template = json!({"Resources": {"Role": {
-        "Type": "AWS::IAM::Role",
-        "Properties": {
-            "RoleName": "cfn-provisioned-role",
-            "Path": "/service-role/",
-            "Description": "deploys the pipeline",
-            "AssumeRolePolicyDocument": trust_policy(),
-            "ManagedPolicyArns": [MANAGED_POLICY_ARN],
-            "Policies": [{
-                "PolicyName": "artifacts",
-                "PolicyDocument": {
-                    "Version": "2012-10-17",
-                    "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
-                }
-            }]
-        }}}})
+    let template = json!({
+        "Resources": {"Role": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "RoleName": "cfn-provisioned-role",
+                "Path": "/service-role/",
+                "Description": "deploys the pipeline",
+                "AssumeRolePolicyDocument": trust_policy(),
+                "ManagedPolicyArns": [MANAGED_POLICY_ARN],
+                "Policies": [{
+                    "PolicyName": "artifacts",
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+                    }
+                }]
+            }}},
+        // The two identifiers the type publishes as its return values, so the stack's own
+        // report of them can be compared with the records IAM holds.
+        "Outputs": {
+            "RoleArn": {"Value": {"Fn::GetAtt": ["Role", "Arn"]}},
+            "RoleId": {"Value": {"Fn::GetAtt": ["Role", "RoleId"]}},
+        },
+    })
     .to_string();
 
     let router = router();
@@ -327,6 +339,8 @@ async fn a_declared_role_exists_in_iam_with_its_policies() {
         code, 200,
         "expected GetRole({role_name:?}) to answer, got {code}: {body}"
     );
+    // The record IAM holds for the role, kept for the identifier comparison at the end.
+    let role_record = body.clone();
     let reported = xml_text(&body, "RoleName");
     assert_eq!(
         reported.as_deref(),
@@ -372,6 +386,28 @@ async fn a_declared_role_exists_in_iam_with_its_policies() {
     assert!(
         attached.iter().any(|arn| arn == MANAGED_POLICY_ARN),
         "expected the declared ManagedPolicyArns attached to the role, got {attached:?}"
+    );
+
+    // The identifiers the stack reports for the role are the ones IAM holds: `RoleId` is
+    // the unique id IAM MINTS for a role, so an id the stack computed for itself would
+    // have a client reading two different identities for one role.
+    let (code, described) = describe_stack(&router, "role-stack").await;
+    assert_eq!(code, 200, "DescribeStacks answered {code}: {described}");
+    let outputs: BTreeMap<String, String> = xml_texts(&described, "OutputKey")
+        .into_iter()
+        .zip(xml_texts(&described, "OutputValue"))
+        .collect();
+    let held_id = xml_text(&role_record, "RoleId").unwrap_or_default();
+    assert_eq!(
+        outputs.get("RoleId"),
+        Some(&held_id),
+        "expected the stack to report the RoleId IAM minted ({held_id:?}), got {outputs:?}"
+    );
+    let held_arn = xml_text(&role_record, "Arn").unwrap_or_default();
+    assert_eq!(
+        outputs.get("RoleArn"),
+        Some(&held_arn),
+        "expected the stack to report the ARN IAM holds ({held_arn:?}), got {outputs:?}"
     );
 }
 

@@ -299,9 +299,11 @@ struct FilterCase {
 /// Each optional input member filters on the member of the STORED record it
 /// names, and several of them are an AND.
 ///
-/// The rows differ along which member is filtered, whether the value is one the
-/// store holds or one it does not, and how many members are combined. The member
-/// names and their meanings are
+/// The rows differ along which member is filtered, whether the value is one a
+/// stored record carries or another value the member admits, and how many
+/// members are combined — a value the member does NOT admit is a refusal rather
+/// than a selection, which `selector_resolution.rs` pins. The member names and
+/// their meanings are
 /// `ListAgreementCancellationRequests`'s input, from
 /// `smithy_query(query="operation", operation="ListAgreementCancellationRequests")`.
 #[tokio::test]
@@ -311,6 +313,11 @@ async fn every_optional_filter_selects_on_the_stored_member() {
     // two of them, so a filter on it selects a subset rather than everything.
     let first_agreement = agreement(&router, "ap-filters1").await;
     let second_agreement = agreement(&router, "ap-filters2").await;
+    // A third agreement carries no cancellation request at all, so an
+    // `agreementId` naming it is a selector that matches nothing — as opposed to
+    // one naming no agreement, which the suite beside this one pins as a
+    // refusal (`selector_resolution.rs`).
+    let third_agreement = agreement(&router, "ap-filters3").await;
     let stored = [
         cancellation_over(&router, &first_agreement, "OTHER").await,
         cancellation_over(&router, &second_agreement, "BUYER_DISSATISFACTION").await,
@@ -334,8 +341,8 @@ async fn every_optional_filter_selects_on_the_stored_member() {
             selects: vec![1],
         },
         FilterCase {
-            case: "an agreementId the store holds no request for selects nothing",
-            filters: json!({"agreementId": "agmt-does-not-exist"}),
+            case: "an agreement the store holds no request for selects nothing",
+            filters: json!({"agreementId": third_agreement}),
             selects: vec![],
         },
         FilterCase {
@@ -367,11 +374,6 @@ async fn every_optional_filter_selects_on_the_stored_member() {
             case: "the catalog the agreements were created in selects all of them",
             filters: json!({"catalog": CATALOG}),
             selects: vec![0, 1, 2],
-        },
-        FilterCase {
-            case: "another catalog selects nothing",
-            filters: json!({"catalog": "AWSMarketplace.Other"}),
-            selects: vec![],
         },
         FilterCase {
             case: "agreementId and status together are an AND that holds",
