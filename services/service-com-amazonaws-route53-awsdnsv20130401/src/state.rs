@@ -9,8 +9,19 @@
 //! normalization, the sort key `ListResourceRecordSets` orders by, the
 //! `/hostedzone/` and `/change/` id prefixes the API wraps ids in, and the id
 //! minting every create needs.
+//!
+//! Beside those caller-owned resources this store also holds the one
+//! SERVICE-owned record the API reports: the CIDR blocks Route 53's health
+//! checkers send their checks from ([`CHECKER_IP_RANGES`]). No operation
+//! creates, changes or deletes one — the set belongs to the service, not to the
+//! account — so it is built into this struct's [`Default`], which the engine
+//! constructs the first time a handler reaches the store. Seeding it there,
+//! rather than on the first read, is what keeps `GetCheckerIpRanges` a pure
+//! reporting operation: it reads the record and writes nothing, so a read can
+//! never change what a later caller sees.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -190,6 +201,72 @@ pub const HOSTED_ZONE_ALREADY_EXISTS_MESSAGE: &str =
 pub const HOSTED_ZONE_NOT_EMPTY_MESSAGE: &str =
     "The specified hosted zone contains resource record sets other than the default SOA and NS \
      records and so cannot be deleted. Delete all non-default records and try again.";
+
+/// The IPv4 CIDR blocks Route 53's health checkers send their health checks
+/// from, as the service publishes them.
+///
+/// `GetCheckerIpRanges`'s own model documentation points at the published
+/// source: "we recommend that you download ip-ranges.json, which includes IP
+/// address ranges for all Amazon Web Services services" — these are the blocks
+/// that file publishes under the Route 53 health-checks service, one `/26` per
+/// health-checking region (several regions publish more than one). They are
+/// spelled out here, in no particular order, because the ORDER the wire carries
+/// is computed by [`checker_ip_ranges`] rather than being a property of this
+/// table; duplicates in it collapse there too.
+///
+/// A caller reads this set to allow health-check traffic through a firewall, so
+/// what matters about it is that every entry is a well-formed IPv4 CIDR block
+/// and that two reads of it agree — never that a particular block is in it.
+pub const CHECKER_IP_RANGES: &[&str] = &[
+    "54.183.255.128/26",
+    "54.228.16.0/26",
+    "54.232.40.64/26",
+    "54.241.32.64/26",
+    "54.243.31.192/26",
+    "54.244.52.192/26",
+    "54.245.168.0/26",
+    "54.248.220.0/26",
+    "54.250.253.192/26",
+    "54.251.31.128/26",
+    "54.252.79.128/26",
+    "54.252.254.192/26",
+    "54.255.254.192/26",
+    "107.23.255.0/26",
+    "176.34.159.192/26",
+    "177.71.207.128/26",
+    "13.57.226.0/26",
+    "13.124.199.0/26",
+    "13.210.244.128/26",
+];
+
+/// The health-checker CIDR blocks in the order the API reports them, with any
+/// duplicate collapsed.
+///
+/// `CheckerIpRanges`'s own documentation: "A complex type that contains sorted
+/// list of IP ranges in CIDR format". A CIDR block's order is its numeric
+/// position in the address space, not the spelling of its text — `107.23.255.0`
+/// comes after `54.255.254.192`, where a string comparison would put it first —
+/// so the list is ordered by network address and then by prefix length.
+pub fn checker_ip_ranges() -> Vec<String> {
+    let mut ranges: Vec<&str> = CHECKER_IP_RANGES.to_vec();
+    ranges.sort_unstable_by_key(|cidr| cidr_sort_key(cidr));
+    ranges.dedup();
+    ranges.into_iter().map(str::to_string).collect()
+}
+
+/// `(network address, prefix length)` for an `a.b.c.d/nn` block: the pair a CIDR
+/// block's numeric position in the address space is, and so the key
+/// [`checker_ip_ranges`] orders by.
+///
+/// A block that is not a well-formed IPv4 CIDR sorts last rather than
+/// panicking, which keeps the order total whatever the table holds.
+fn cidr_sort_key(cidr: &str) -> (u32, u8) {
+    let (address, prefix) = cidr.split_once('/').unwrap_or((cidr, "32"));
+    (
+        address.parse::<Ipv4Addr>().map_or(u32::MAX, u32::from),
+        prefix.parse::<u8>().unwrap_or(u8::MAX),
+    )
+}
 
 /// The `/hostedzone/` prefix the API wraps a hosted-zone id in.
 pub const HOSTED_ZONE_PREFIX: &str = "/hostedzone/";
@@ -418,7 +495,7 @@ pub fn vpc_position_in(vpcs: &[VPC], vpc_id: &str) -> Option<usize> {
 }
 
 /// Per-service state for com-amazonaws-route53-awsdnsv20130401. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// Every hosted zone, keyed by its bare id. A `BTreeMap` so
     /// `ListHostedZones` pages over a stable total order of zone ids. Bounded by
@@ -435,6 +512,26 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     change_order: VecDeque<String>,
     /// The id generator, kept here so ids stay unique across calls.
     ids: IdMinter,
+    /// The health-checker CIDR blocks `GetCheckerIpRanges` reports, in the order
+    /// it reports them. SERVICE-owned: seeded from [`CHECKER_IP_RANGES`] when
+    /// this store is created and only ever read afterwards, so every call
+    /// answers the same list.
+    checker_ip_ranges: Vec<String>,
+}
+
+/// The store a fresh engine starts with: no zones and no changes, and the
+/// service-owned health-checker ranges already in place (see the module docs).
+impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
+    fn default() -> Self {
+        Self {
+            zones: BTreeMap::new(),
+            zone_by_caller_reference: HashMap::new(),
+            changes: HashMap::new(),
+            change_order: VecDeque::new(),
+            ids: IdMinter::default(),
+            checker_ip_ranges: checker_ip_ranges(),
+        }
+    }
 }
 
 impl ComAmazonawsRoute53Awsdnsv20130401State {
@@ -540,6 +637,15 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 && dns_sort_key(&zone.name) == name_key
                 && zone.vpc_position(vpc_id).is_some()
         })
+    }
+
+    /// The health-checker CIDR blocks this store holds, in the order
+    /// `GetCheckerIpRanges` reports them.
+    ///
+    /// A borrow, not a mutation: the set is service-owned, so reporting it
+    /// leaves the store exactly as it was.
+    pub fn checker_ip_ranges(&self) -> &[String] {
+        &self.checker_ip_ranges
     }
 
     /// Mint the four authoritative name servers for a new hosted zone.
