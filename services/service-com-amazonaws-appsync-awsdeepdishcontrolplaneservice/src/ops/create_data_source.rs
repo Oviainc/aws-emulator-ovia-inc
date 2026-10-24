@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +164,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataSource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataSourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The data source is reported in the region the caller addressed, so its ARN
+        // is built from that region rather than from a fixed one.
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+
+        // A data source lives under a GraphQL API, so it cannot be created under an
+        // API this account does not hold.
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(CreateDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // Every member the request carries is kept as it arrived, except
+        // `description`: an empty description describes nothing, so the data source
+        // keeps none for it (see `crate::state::data_source_description`).
+        let record = crate::state::DataSourceRecord {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &crate::state::data_source_resource(&input.api_id, &input.name),
+            ),
+            name: input.name,
+            description: crate::state::data_source_description(input.description),
+            r#type: input.r#type,
+            service_role_arn: input.service_role_arn,
+            dynamodb_config: input.dynamodb_config,
+            lambda_config: input.lambda_config,
+            elasticsearch_config: input.elasticsearch_config,
+            open_search_service_config: input.open_search_service_config,
+            http_config: input.http_config,
+            relational_database_config: input.relational_database_config,
+            event_bridge_config: input.event_bridge_config,
+            metrics_config: input.metrics_config,
+        };
+
+        // A data source of a type that is set up through a configuration member
+        // cannot be created without it: the request names a backend it does not say
+        // where to find, so it is not well formed.
+        if let Some(member) = record.missing_config() {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::missing_data_source_config_message(
+                    member,
+                    &record.r#type,
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The name identifies the data source within its API — it is what every
+        // data-source operation addresses one by — so a create cannot take a name the
+        // API already holds: it would replace a resource the caller did not name for
+        // replacement.
+        if api.data_sources.contains_key(&record.name) {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::data_source_exists_message(&record.name)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit:
+        // AppSync's quota is 500 data sources per API, and the per-API collection
+        // this create writes to is bounded by it the way the sibling creates in this
+        // crate bound theirs.
+        if api.data_sources.len() >= DATA_SOURCES_PER_API {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "an API may hold at most {DATA_SOURCES_PER_API} data sources"
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let name = record.name.clone();
+        api.data_sources.insert(name.clone(), record);
+
+        // Answer from the STORED record, so this body is the one `GetDataSource` and
+        // `ListDataSources` answer with later.
+        Ok(CreateDataSourceOutput {
+            data_source: api
+                .data_sources
+                .get(&name)
+                .map(crate::state::DataSourceRecord::to_data_source),
+        })
     }
 }
+
+/// The AppSync service quota for data sources on ONE GraphQL API, which also bounds
+/// the per-API collection this operation writes to: a create past it is refused, so
+/// repeating the call cannot grow the store without limit.
+const DATA_SOURCES_PER_API: usize = 500;
