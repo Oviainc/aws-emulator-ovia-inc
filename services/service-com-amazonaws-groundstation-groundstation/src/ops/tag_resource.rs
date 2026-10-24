@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns tags to the resource `resourceArn` names: the request's entries are MERGED
+//! into that resource's tag map — a key it does not hold yet is added, a key it does hold
+//! is overwritten with the value this request carries, and every key the request does not
+//! name is left exactly as it was. So two callers that each assign their own keys both
+//! persist, whatever order they arrive in, and the resource's reads (and
+//! `ListTagsForResource`) report the union.
+//!
+//! Every resource this service hands out is taggable and is addressed here only by ARN,
+//! so the resolution is `crate::state`'s one ARN index
+//! ([`crate::state::ComAmazonawsGroundstationGroundstationState::tags_mut`]); an ARN this
+//! service never minted, or one whose resource has been deleted, is
+//! `ResourceNotFoundException` (HTTP 434).
+//!
+//! The map itself is held to AWS's platform-wide tagging rules — the model constrains
+//! `TagsMap` not at all — through the gate every create of this service already applies
+//! ([`crate::state::validate_tags`]), plus the per-resource bound judged against the
+//! MERGED map ([`crate::state::validate_tag_merge`]), both before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -134,20 +143,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // AWS's platform-wide tagging rules are what bound a tag map here: the model
+        // constrains `TagsMap` not at all, so the boundary validator let every map
+        // through and `crate::state::validate_tags` is the only gate — the same gate
+        // every create of this service applies to the tags it is handed.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // PRECEDENCE: the map is judged before the ARN is resolved, so a request that is
+        // wrong in itself is answered for what is wrong with it (431) whether or not the
+        // resource exists — the same order every create of this service uses, where the
+        // map is checked before anything is looked up or minted.
+        crate::state::validate_tags(Some(&input.tags))
+            .map_err(TagResourceErrorModeled::InvalidParameterException)?;
+
+        // One lock for the lookup AND the merge, so the whole read-modify-write of the
+        // resource's tag map is atomic: a concurrent write of other keys is not lost.
+        let mut guard = state.lock();
+        let tags = guard.tags_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::tagged_resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            })
+        })?;
+
+        // The per-resource bound is about what the resource ENDS UP carrying, and this
+        // call merges into what it already holds, so it is judged against the merged map
+        // — before anything is written, so a refusal leaves the resource untouched.
+        crate::state::validate_tag_merge(tags, &input.tags)
+            .map_err(TagResourceErrorModeled::InvalidParameterException)?;
+
+        // MERGE, not replace: assigning a tag says nothing about the tags the resource
+        // already carries, so a key the request names is written (overwriting the value it
+        // had) and every key it does not name stays.
+        tags.extend(input.tags);
+
+        Ok(TagResourceOutput {})
     }
 }

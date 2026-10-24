@@ -501,6 +501,14 @@ pub const GEO_RESTRICTION_NONE: &str = "none";
 /// `direct` and `tenant-only`.
 pub const CONNECTION_MODE_TENANT_ONLY: &str = "tenant-only";
 
+/// The `ConnectionMode` value that makes a distribution a STANDARD one.
+///
+/// `DistributionConfig$ConnectionMode` is optional and the service applies nothing to it
+/// (see [`resolve_distribution_config`]), so a configuration that names none describes a
+/// standard distribution: one with an edge domain of its own that serves its own traffic.
+/// The model's `ConnectionMode` enum admits exactly `direct` and `tenant-only`.
+pub const CONNECTION_MODE_DIRECT: &str = "direct";
+
 /// The `DomainName` a MULTI-TENANT distribution reports.
 ///
 /// A tenant-only distribution serves no traffic of its own: its viewers reach it through
@@ -2747,6 +2755,82 @@ pub struct CreatedDistribution {
 pub fn is_multi_tenant(config: &DistributionConfig) -> bool {
     config.connection_mode.as_deref() == Some(CONNECTION_MODE_TENANT_ONLY)
         || config.tenant_config.is_some()
+}
+
+/// The `ConnectionMode` a stored configuration describes: [`CONNECTION_MODE_TENANT_ONLY`]
+/// for a multi-tenant distribution, [`CONNECTION_MODE_DIRECT`] for a standard one.
+///
+/// Decided through [`is_multi_tenant`], so the connection mode a distribution is LISTED
+/// under is the same tenancy every other projection of the one record reports — its
+/// `DomainName` above all — and a configuration that named no `ConnectionMode` is listed
+/// as the standard distribution it is served as.
+pub fn connection_mode_of(config: &DistributionConfig) -> &'static str {
+    if is_multi_tenant(config) {
+        CONNECTION_MODE_TENANT_ONLY
+    } else {
+        CONNECTION_MODE_DIRECT
+    }
+}
+
+/// ONE page of the stored distributions `matches` selects, as the `DistributionList`
+/// every CloudFront distribution listing answers with.
+///
+/// The page contract is the same for the unfiltered listing and for each listing that
+/// serves a SUBSET of the store, so it lives here once rather than in each handler:
+///
+/// * `marker` is the distribution id the previous page ended at, so this page starts
+///   after it — the store is ordered by id, so the resume point is a range bound rather
+///   than a scan, and walking the pages enumerates every selected distribution exactly
+///   once, in id order;
+/// * `page_size` is how many summaries this response serves (see [`page_size`]), and
+///   `max_items` is reported as "the value you provided for the MaxItems request
+///   parameter";
+/// * `NextMarker` is present exactly when selected distributions remain, carrying the id
+///   this page ended at, and `IsTruncated` says the same thing;
+/// * `Quantity` is the length of `Items`, and a page that lists nothing carries no
+///   `Items` element at all rather than an empty one.
+///
+/// Each summary is [`StoredDistribution::to_summary`] of the one stored record, so a
+/// filtered listing and the unfiltered one can never disagree about a distribution.
+pub fn distribution_page<F>(
+    distributions: &BTreeMap<String, StoredDistribution>,
+    marker: Option<&str>,
+    max_items: i32,
+    page_size: usize,
+    mut matches: F,
+) -> crate::ops::types::DistributionList
+where
+    F: FnMut(&StoredDistribution) -> bool,
+{
+    let start = match marker {
+        Some(marker) => std::ops::Bound::Excluded(marker),
+        None => std::ops::Bound::Unbounded,
+    };
+    let mut items: Vec<DistributionSummary> = Vec::new();
+    let mut is_truncated = false;
+    for (_, stored) in distributions.range::<str, _>((start, std::ops::Bound::Unbounded)) {
+        if !matches(stored) {
+            continue;
+        }
+        if items.len() >= page_size {
+            is_truncated = true;
+            break;
+        }
+        items.push(stored.to_summary());
+    }
+
+    crate::ops::types::DistributionList {
+        marker: marker.unwrap_or_default().to_string(),
+        next_marker: if is_truncated {
+            items.last().map(|summary| summary.id.clone())
+        } else {
+            None
+        },
+        max_items,
+        is_truncated,
+        quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+        items: if items.is_empty() { None } else { Some(items) },
+    }
 }
 
 /// `methods` in [`EMITTED_METHOD_ORDER`], as a permutation of what was submitted: each

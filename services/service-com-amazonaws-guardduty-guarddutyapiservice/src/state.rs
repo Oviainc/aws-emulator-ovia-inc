@@ -624,6 +624,30 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         ))
     }
 
+    /// The `AssociationMode`s `region`'s endpoint holds an organization
+    /// configuration for `rule_id` in, in mode order.
+    ///
+    /// `UpdateCustomDetectionRuleOrgConfiguration` identifies its configuration by
+    /// `RuleId` ALONE — the operation binds `RuleId` as the URI label and `Mode` to
+    /// the body, where the read and the delete bind `Mode` as a query parameter
+    /// (`smithy_query(operation="UpdateCustomDetectionRuleOrgConfiguration,GetCustomDetectionRuleOrgConfiguration")`)
+    /// — so it needs the modes a rule is configured in rather than one
+    /// `(rule_id, mode)` lookup. A Region holds at most one configuration per
+    /// published rule per mode, so this scans a table of fixed,
+    /// single-digit-times-two length, exactly as
+    /// [`Self::detection_rule_association_by_id`] does.
+    pub fn detection_rule_org_configuration_modes(
+        &self,
+        region: &str,
+        rule_id: &str,
+    ) -> Vec<String> {
+        self.custom_detection_rule_org_configurations
+            .values()
+            .filter(|record| record.region == region && record.rule_id == rule_id)
+            .map(|record| record.mode.clone())
+            .collect()
+    }
+
     /// The organization configuration `region`'s endpoint created under `token`,
     /// if a create recorded one. A pure REPLAY key, exactly as
     /// [`Self::detection_rule_association_for_client_token`] is.
@@ -4738,6 +4762,19 @@ pub fn detection_rule_org_configuration_not_found_message() -> String {
 pub fn detection_rule_org_configuration_conflict_message() -> String {
     format!(
         "The request is rejected because the current account already has an organization configuration for the given {RULE_ID_MEMBER} and {MODE_MEMBER}."
+    )
+}
+
+/// The message an update of a rule the account holds no organization
+/// configuration for answers with.
+///
+/// It names only `RuleId`, because that is what the update identifies the
+/// configuration by: `Mode` is one of the values the update SETS, not a selector
+/// (`smithy_query(query="doc",shape="UpdateCustomDetectionRuleOrgConfiguration")`
+/// — "including the mode and include/exclude account lists").
+pub fn detection_rule_org_configuration_rule_not_found_message() -> String {
+    format!(
+        "The request is rejected because the input {RULE_ID_MEMBER} does not refer to a custom detection rule with an organization configuration of the current account."
     )
 }
 

@@ -429,7 +429,12 @@ fn cases() -> Vec<EnvCase> {
             tags: &[("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")],
             logging: &[("WorkerLogs", true, "WARNING"), ("TaskLogs", false, "INFO")],
             airflow_options: &[("core.parallelism", "64")],
-            s3_pairs: &[("PluginsS3Path", "lib/plugins.zip")],
+            // The plugins object's version travels with its path: `PluginsS3Path`'s own
+            // doc makes the version required whenever the path is specified.
+            s3_pairs: &[
+                ("PluginsS3Path", "lib/plugins.zip"),
+                ("PluginsS3ObjectVersion", "Lm3kQ9pR2sT"),
+            ],
             webserver_access_mode: Some("PUBLIC_AND_PRIVATE"),
             endpoint_management: Some("SERVICE"),
             weekly_window: Some("FRI:23:30"),
