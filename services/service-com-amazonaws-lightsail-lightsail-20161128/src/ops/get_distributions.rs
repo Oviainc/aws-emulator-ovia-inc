@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDistributions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDistributions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDistributions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored CDN distributions: the one `distributionName` names, or a page of
+//! every distribution of the account, each answered from the ONE record
+//! `CreateDistribution` stored.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDistributions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDistributionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE: the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together and says to set the Region to
+        // us-east-1 "to create, VIEW, or edit these resources", so a read is as
+        // restricted as a create. Checked through the crate's one owner of that
+        // rule, before anything is read.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // Past that guard nothing this operation reports depends on the
+        // request's own metadata: a distribution is a GLOBAL resource, held by
+        // name alone, so the Region a served request was signed for selects no
+        // records, and the distribution's published address is minted once, at
+        // create, rather than announced under the endpoint this request arrived
+        // at.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDistributions"))
+        // `distributionName`'s own documentation says an omitted name includes
+        // "all of your distributions in the Amazon Web Services Region where
+        // the request is made", and `LightsailDistribution$location` says "all
+        // distributions are located in the `us-east-1` Region" — so that Region
+        // holds every distribution of the account and a listing is every record
+        // this store has.
+
+        // `pageToken` is the name the previous page stopped before, so a page
+        // is the stored distributions from that name onward in the store's own
+        // total order. Using the name rather than an index means a distribution
+        // deleted between two pages cannot make the walk skip or repeat
+        // another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A named distribution is one record or a refusal: the caller asked
+            // about that distribution, so an answer with an empty list would
+            // say it exists.
+            if let Some(name) = &input.distribution_name {
+                let distribution = store
+                    .distribution(name)
+                    .ok_or_else(|| not_found(name))?;
+                return Ok(GetDistributionsOutput {
+                    distributions: Some(vec![distribution.view()]),
+                    next_page_token: None,
+                });
+            }
+
+            let mut distributions = Vec::new();
+            let mut next_page_token = None;
+            for (name, distribution) in store.distributions.range(page_token..) {
+                if distributions.len() == crate::state::DISTRIBUTION_PAGE_SIZE {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                distributions.push(distribution.view());
+            }
+            Ok(GetDistributionsOutput {
+                // An account with no distributions reports an empty list, not
+                // an absent one: the caller asked what it has, and the answer
+                // is "nothing".
+                distributions: Some(distributions),
+                next_page_token,
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message states the rule
+/// the request broke.
+fn invalid(message: String) -> GetDistributionsError {
+    GetDistributionsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No distribution of that name is stored: Lightsail's `DoesNotExist` rejection
+/// — HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> GetDistributionsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_DISTRIBUTION,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetDistributionsError {
+    GetDistributionsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
