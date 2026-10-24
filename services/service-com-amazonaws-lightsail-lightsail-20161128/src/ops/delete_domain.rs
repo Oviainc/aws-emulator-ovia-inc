@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomain"))
+        // Lightsail serves the domain APIs from the N. Virginia endpoint ALONE,
+        // so the Region the request was signed for decides whether this call is
+        // served at all — checked BEFORE anything is read or written, so a
+        // refused request removes no zone. The rule lives in the one shared
+        // helper every domain handler calls.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // `domainName` is a modelled `@required` member, so the centralized walk
+        // refused an absent one before this body ran.
+        let name = input.domain_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // "Deletes the specified domain recordset and all of its domain
+            // records": a zone's entries live on its record, so removing the
+            // record is what removes both. A name the account does not hold
+            // removes nothing and logs nothing.
+            let Some(deleted) = store.remove_domain(&name) else {
+                return Err(not_found(&name));
+            };
+            // The zone and its records are gone as this call returns — a
+            // `Domain` carries no status member, so there is nothing for the
+            // clock to settle later — which is why the operation it logs is
+            // answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_DOMAIN,
+                crate::state::RESOURCE_TYPE_DOMAIN,
+                &name,
+                &deleted.location,
+                None,
+            );
+            Ok(DeleteDomainOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> DeleteDomainError {
+    DeleteDomainErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No domain recordset of that name is stored, so there is no zone for this
+/// delete to remove: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name. Deleting a zone twice therefore fails
+/// the second time rather than reporting a deletion that did not happen.
+fn not_found(name: &str) -> DeleteDomainError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_DOMAIN, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteDomainError {
+    DeleteDomainErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail domain store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
