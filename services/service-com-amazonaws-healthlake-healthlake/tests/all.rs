@@ -25,6 +25,8 @@ mod fhir_datastore_lifecycle;
 mod fhir_rest_and_validate_source;
 #[path = "all/fhir_update_interaction.rs"]
 mod fhir_update_interaction;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/restore_fhir_datastore.rs"]
