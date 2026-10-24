@@ -203,6 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
+        // the request walk applies (see the map-keys section of `crate::state`).
+        crate::state::check_map_keys(
+            "tags",
+            input.tags.iter().flat_map(|tags| tags.keys()),
+            &crate::state::TAG_KEY,
+        )
+        .map_err(CreateRuleGroupsNamespaceErrorModeled::ValidationException)?;
+
         // "The combined length of a rule group namespace and a rule group name cannot
         // exceed 721 UTF-8 bytes" — the `<important>` callout this operation's own
         // documentation carries. The bound spans TWO members (the namespace `name` and

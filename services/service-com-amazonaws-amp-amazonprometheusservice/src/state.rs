@@ -1606,7 +1606,7 @@ static KMS_KEY_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
 /// carries the constraints.
 static M_KMS_KEY_ARN: Schema = Schema::new_member(
     ShapeId::from_static(
-        "com.amazonaws.amp#CheckedKmsKeyArn$kmsKeyArn",
+        "com.amazonaws.amp#CheckedMember$kmsKeyArn",
         NAMESPACE,
         "kmsKeyArn",
     ),
@@ -1617,29 +1617,36 @@ static M_KMS_KEY_ARN: Schema = Schema::new_member(
 .with_traits(&KMS_KEY_ARN_TRAITS);
 
 /// The root of the shadow input the walk is driven over. Its member list is empty on
-/// purpose: the walk visits what [`CheckedKmsKeyArn`] WRITES, and a root struct schema
+/// purpose: the walk visits what [`CheckedString`] WRITES, and a root struct schema
 /// carries no member name, so it contributes no path segment. The shape id is deliberately
 /// one the model does not declare, so it cannot collide with a modelled shape.
-static CHECKED_KMS_KEY_ARN_SCHEMA: Schema = Schema::new_struct(
+static CHECKED_MEMBER_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
-        "com.amazonaws.amp#CheckedKmsKeyArn",
+        "com.amazonaws.amp#CheckedMember",
         NAMESPACE,
-        "CheckedKmsKeyArn",
+        "CheckedMember",
     ),
     ShapeType::Structure,
     &[],
 );
 
-/// One request's `kmsKeyArn`, written for the validating walk the way the codec writes a
-/// string member.
-struct CheckedKmsKeyArn<'a> {
-    kms_key_arn: &'a str,
+/// One string written for the validating walk the way the codec writes a string member,
+/// against the member schema whose re-declared constraints the walk is to apply.
+struct CheckedString<'a> {
+    member: &'static Schema,
+    value: &'a str,
 }
 
-impl SerializableStruct for CheckedKmsKeyArn<'_> {
+impl SerializableStruct for CheckedString<'_> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        s.write_string(&M_KMS_KEY_ARN, self.kms_key_arn)
+        s.write_string(self.member, self.value)
     }
+}
+
+/// Every constraint `member` declares that `value` violates, found by the framework's own
+/// walk — so a check made here reads exactly like one made at the request boundary.
+fn member_violations(member: &'static Schema, value: &str) -> Vec<Violation> {
+    validate(&CheckedString { member, value }, &CHECKED_MEMBER_SCHEMA)
 }
 
 /// Refuse a `kmsKeyArn` that violates the member's modelled length bound or the pattern
@@ -1651,15 +1658,175 @@ impl SerializableStruct for CheckedKmsKeyArn<'_> {
 /// it failed, and the same `Invalid kmsKeyArn: <requirement>` message, whichever side made
 /// the decision.
 pub fn check_kms_key_arn(kms_key_arn: &str) -> Result<(), crate::ops::types::ValidationException> {
-    let violations: Vec<Violation> = validate(
-        &CheckedKmsKeyArn { kms_key_arn },
-        &CHECKED_KMS_KEY_ARN_SCHEMA,
-    );
+    let violations = member_violations(&M_KMS_KEY_ARN, kms_key_arn);
     if violations.is_empty() {
         return Ok(());
     }
     Err(constraint_validation_failed(&violations))
 }
+
+// =============================================================================
+// Map KEYS: the constraints no request boundary applies
+// =============================================================================
+//
+// The framework's constraint walk captures a map entry's key as the path segment for that
+// entry's VALUE and never checks it against the key shape's own constraints
+// (`vendor/smithy-schema-server/src/constraints.rs`, `write_leaf`). So every `@length` and
+// `@pattern` a map's KEY shape declares has to be applied by the handler that accepts the
+// map; nothing else in the request walk will. A key outside them is otherwise stored and
+// reported back as persisted, which tells a caller its mislabelled resource succeeded.
+//
+// Each key shape is re-declared ONCE below as a [`MapKeyShape`], and every handler that
+// accepts a map of that shape applies it through [`check_map_keys`], so the refusal reads
+// like a boundary refusal: the member named, the requirement
+// [`constraint_requirement`] words for the constraint at fault, and nothing from the
+// request echoed.
+
+/// One map KEY shape's modelled constraints, re-declared so the handler that accepts the
+/// map can apply them.
+pub struct MapKeyShape {
+    /// The key shape's modelled `@length` minimum, in characters (how the framework's
+    /// walk measures a string), or `None` when the shape declares none.
+    min_length: Option<i64>,
+    /// The key shape's modelled `@length` maximum, in characters, or `None`.
+    max_length: Option<i64>,
+    /// The key shape's modelled `@pattern`, exactly as the model declares it: this is what
+    /// a refusal reports as the requirement, whatever form the decision below takes.
+    pattern: &'static str,
+    /// Whether a key satisfies `pattern`.
+    satisfies: fn(&str) -> bool,
+}
+
+impl MapKeyShape {
+    /// Which of the key shape's constraints `key` fails, if any — length before pattern,
+    /// so a key failing both is reported once, by the bound it misses.
+    fn violated_by(&self, key: &str) -> Option<ViolationKind> {
+        let length = i64::try_from(key.chars().count()).unwrap_or(i64::MAX);
+        if let Some(min) = self.min_length.filter(|min| length < *min) {
+            return Some(ViolationKind::MinLength(min));
+        }
+        if let Some(max) = self.max_length.filter(|max| length > *max) {
+            return Some(ViolationKind::MaxLength(max));
+        }
+        if !(self.satisfies)(key) {
+            return Some(ViolationKind::Pattern(self.pattern.to_string()));
+        }
+        None
+    }
+}
+
+/// Refuse a map whose KEYS violate the key shape's modelled constraints, or pass it
+/// through.
+///
+/// The refusal names the MAP member (`labels`, `tags`, `limitsPerLabelSet`): a key is not
+/// a member of its own, so there is no path below the map to report it at, and it is
+/// composed by [`member_validation_failed`] like every other aps member refusal.
+pub fn check_map_keys<'a, I: IntoIterator<Item = &'a String>>(
+    member: &str,
+    keys: I,
+    key_shape: &MapKeyShape,
+) -> Result<(), crate::ops::types::ValidationException> {
+    // Sorted, so a map carrying two bad keys is refused the same way however the request's
+    // map was iterated.
+    let mut keys: Vec<&str> = keys.into_iter().map(String::as_str).collect();
+    keys.sort_unstable();
+    match keys
+        .into_iter()
+        .find_map(|key| key_shape.violated_by(key))
+    {
+        Some(kind) => Err(member_validation_failed(
+            member,
+            &constraint_requirement(&kind),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `PrometheusMetricLabelKey`, the key of `PrometheusMetricLabelMap`
+/// (`smithy_query(query="shape", shape="PrometheusMetricLabelKey")`): `@length(1..7168)`
+/// and `@pattern(^(?!__)[a-zA-Z_][a-zA-Z0-9_]*$)` — a Prometheus label name that must not
+/// begin with the reserved double-underscore prefix.
+pub const PROMETHEUS_METRIC_LABEL_KEY: MapKeyShape = MapKeyShape {
+    min_length: Some(1),
+    max_length: Some(7168),
+    pattern: r"^(?!__)[a-zA-Z_][a-zA-Z0-9_]*$",
+    satisfies: is_prometheus_metric_label_key,
+};
+
+/// `LabelName`, the key of `LabelSet`
+/// (`smithy_query(query="shape", shape="LabelName")`): `@length(min: 1)` and
+/// `@pattern(^[a-zA-Z_][a-zA-Z0-9_]*$)`, the same Prometheus label name without the
+/// reserved-prefix clause — `__name__` is a label a label set may constrain.
+pub const LABEL_NAME: MapKeyShape = MapKeyShape {
+    min_length: Some(1),
+    max_length: None,
+    pattern: r"^[a-zA-Z_][a-zA-Z0-9_]*$",
+    satisfies: is_label_name,
+};
+
+/// `TagKey`, the key of `TagMap` (`smithy_query(query="shape", shape="TagKey")`):
+/// `@length(1..128)` and [`TAG_KEY_PATTERN`].
+pub const TAG_KEY: MapKeyShape = MapKeyShape {
+    min_length: Some(1),
+    max_length: Some(128),
+    pattern: TAG_KEY_PATTERN,
+    satisfies: satisfies_tag_key_pattern,
+};
+
+/// `TagKey`'s modelled `@pattern`, as the model declares it.
+const TAG_KEY_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+
+/// `TAG_KEY_PATTERN` hung on a member schema, so the decision below is the framework's
+/// own walk and the Unicode classes the pattern names mean there exactly what they mean at
+/// the request boundary.
+static TAG_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(TAG_KEY_PATTERN)));
+    traits
+});
+
+/// The member schema carrying [`TAG_KEY_TRAITS`]. Its name is never reported: the refusal
+/// names the MAP member the key belongs to, which [`check_map_keys`] is given.
+static M_TAG_KEY: Schema = Schema::new_member(
+    ShapeId::from_static("com.amazonaws.amp#CheckedMember$tagKey", NAMESPACE, "tagKey"),
+    ShapeType::String,
+    "tagKey",
+    0,
+)
+.with_traits(&TAG_KEY_TRAITS);
+
+/// Whether `key` satisfies [`TAG_KEY_PATTERN`], decided by the framework's constraint
+/// walk rather than by character predicates: the pattern names Unicode general categories,
+/// which only a pattern engine reads the same way the boundary does.
+fn satisfies_tag_key_pattern(key: &str) -> bool {
+    member_violations(&M_TAG_KEY, key).is_empty()
+}
+
+/// Whether `key` satisfies `^[a-zA-Z_][a-zA-Z0-9_]*$` — two character classes, so it is
+/// decided with character predicates rather than a pattern engine.
+fn is_label_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `key` satisfies `^(?!__)[a-zA-Z_][a-zA-Z0-9_]*$`: a label name whose first two
+/// characters are not both underscores.
+///
+/// Decided here rather than by the framework's walk because that walk compiles a
+/// `@pattern` with the `regex` crate, which rejects a negative lookahead and treats a
+/// pattern it cannot compile as matching — so hanging this one on a member schema would
+/// refuse nothing. The two clauses are each a character test.
+fn is_prometheus_metric_label_key(key: &str) -> bool {
+    !key.starts_with(RESERVED_LABEL_NAME_PREFIX) && is_label_name(key)
+}
+
+/// The label-name prefix `PrometheusMetricLabelKey`'s pattern excludes, and which
+/// Prometheus reserves for its own label names ([`METRIC_NAME_LABEL`] is one of them).
+pub const RESERVED_LABEL_NAME_PREFIX: &str = "__";
 
 // =============================================================================
 // Rule groups namespaces

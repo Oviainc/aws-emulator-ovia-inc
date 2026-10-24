@@ -170,6 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
+        // the request walk applies (see the map-keys section of `crate::state`).
+        crate::state::check_map_keys("tags", input.tags.keys(), &crate::state::TAG_KEY)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
