@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteGitHubAccountTokenErrorModeled::GitHubAccountTokenNameRequiredException(
                     GitHubAccountTokenNameRequiredException {
                         message: Some(
-                            "The GitHub account connection name was not specified".to_string(),
+                            crate::state::GITHUB_ACCOUNT_TOKEN_NAME_MISSING.to_string(),
                         ),
                     },
                 )

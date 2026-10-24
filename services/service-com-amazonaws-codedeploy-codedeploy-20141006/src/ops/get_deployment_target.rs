@@ -216,15 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             };
-            // A deployment that has not started has deployed to nothing, so it
-            // has no target state to report.
-            if !deployment.is_started() {
-                return Err(GetDeploymentTargetErrorModeled::DeploymentNotStartedException(
-                    DeploymentNotStartedException {
-                        message: Some(crate::state::deployment_not_started(&deployment_id)),
-                    },
-                ));
-            }
             if crate::state::check_deployment_target_id(&deployment.compute_platform, &target_id)
                 .is_err()
             {
@@ -236,6 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             }
+            // MEMBERSHIP is resolved before the deployment's own progress: the
+            // targets a deployment has are the snapshot its group resolved when
+            // it was created, so whether an id names one of them is already
+            // decided, and an id that names none of them belongs to no target of
+            // this deployment however far the deployment has got. Only for a
+            // target the deployment DOES have is there a state to report, which
+            // is what `DeploymentNotStartedException` refuses until the clock has
+            // started the deployment.
             let Some(target) = crate::state::find_deployment_target(deployment, &target_id) else {
                 return Err(
                     GetDeploymentTargetErrorModeled::DeploymentTargetDoesNotExistException(
@@ -248,6 +247,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             };
+            // A deployment that has not started has deployed to nothing, so it
+            // has no target state to report.
+            if !deployment.is_started() {
+                return Err(GetDeploymentTargetErrorModeled::DeploymentNotStartedException(
+                    DeploymentNotStartedException {
+                        message: Some(crate::state::deployment_not_started(&deployment_id)),
+                    },
+                ));
+            }
             Ok(crate::state::deployment_target_view(state, deployment, target))
         })
         .ok_or_else(|| {

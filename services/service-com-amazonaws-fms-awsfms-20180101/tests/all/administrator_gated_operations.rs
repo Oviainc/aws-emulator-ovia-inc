@@ -62,7 +62,7 @@ fn error_message(body: &Value) -> String {
 
 /// Make this account the Firewall Manager default administrator, which is what
 /// opens the gate.
-async fn associate_admin(router: &MultiServiceRouter) {
+pub(crate) async fn associate_admin(router: &MultiServiceRouter) {
     let (status, body) = call(
         router,
         "AssociateAdminAccount",
@@ -76,10 +76,10 @@ async fn associate_admin(router: &MultiServiceRouter) {
 }
 
 /// Read or write the service's store the way a handler does — used to seed the
-/// resources whose own writers (`PutAppsList`, `PutProtocolsList`,
-/// `AssociateThirdPartyFirewall`, resource discovery) are still stubs tracked by
-/// their own issues.
-fn with_store<R>(
+/// resources whose own writers (`PutAppsList`, `AssociateThirdPartyFirewall`,
+/// resource discovery) are still stubs tracked by their own issues, and the
+/// managed lists no API creates.
+pub(crate) fn with_store<R>(
     engine: &Arc<engine::InMemoryEngine>,
     body: impl FnOnce(&mut state::ComAmazonawsFmsAwsfms20180101State) -> R,
 ) -> R {
@@ -88,8 +88,10 @@ fn with_store<R>(
     body(&mut store)
 }
 
-/// One stored protocols list, as `PutProtocolsList` will write it.
-fn seed_protocols_list(
+/// One stored protocols list, as `PutProtocolsList` writes it. `pub(crate)` so
+/// the `protocols_list_lifecycle` suite seeds a Firewall Manager MANAGED list —
+/// which no API creates — through the same helper.
+pub(crate) fn seed_protocols_list(
     store: &mut state::ComAmazonawsFmsAwsfms20180101State,
     list_id: &str,
     list_name: &str,
@@ -175,6 +177,16 @@ fn gated_calls() -> Vec<Gated> {
         Gated {
             operation: "GetProtocolsList",
             body: json!({ "ListId": UNKNOWN_LIST_ID, "DefaultList": true }),
+        },
+        Gated {
+            operation: "PutProtocolsList",
+            body: json!({
+                "ProtocolsList": {
+                    "ListName": "gated",
+                    "ProtocolsList": ["TCP", "UDP"],
+                },
+                "TagList": [{ "Key": "gated", "Value": "yes" }],
+            }),
         },
         Gated {
             operation: "GetNotificationChannel",
