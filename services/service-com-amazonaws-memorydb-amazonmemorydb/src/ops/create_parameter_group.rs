@@ -196,6 +196,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
+        // `Family` decides which engine defaults the group carries, so it is resolved
+        // against the one catalog the service publishes them from: a family no published
+        // engine version names would leave the group with no parameters at all, which is
+        // not a group this service can serve. Folded first, like every other name in
+        // this store, so the family is matched the way it is stored.
+        let family = crate::state::fold_name(&input.family);
+        if let Some(message) = crate::state::parameter_group_family_rejection(&family) {
+            return Err(
+                CreateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let mut state = state.lock();
         // Besides this create's own insert, the only writes: the status transitions the
         // clock already owed the stored clusters and ACLs at this instant, and the
@@ -236,10 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::parameter_group_arn(&region, &parameter_group_name);
         let group = crate::state::StoredParameterGroup {
             name: parameter_group_name.clone(),
-            // `Family` is recorded as the caller gave it, folded like every other name
-            // in this store: the model publishes no catalog of families, so there is
-            // nothing here to resolve it against.
-            family: crate::state::fold_name(&input.family),
+            // `Family` is one of the families the engine catalog publishes (checked
+            // above), folded like every other name in this store.
+            family,
             // A group created without a description gets the service's own default
             // rather than no description at all, so the create and every later describe
             // report the member.

@@ -6,7 +6,10 @@
 //! `UpdateParameterGroup` persisted for this group when one changed it, in name order
 //! and paged by `MaxResults`/`NextToken`. The `default.<family>` groups MemoryDB owns in
 //! every account are part of that state, so a caller can read any family's baseline
-//! without creating a group.
+//! without creating a group. Each reported parameter also carries the wire's `Source`
+//! (where its value came from: the family's engine defaults, or this group's own
+//! update), a member the service answers and its model does not declare — see
+//! [`crate::ops::types::Parameter`].
 //!
 //! ## Shape of an operation
 //!

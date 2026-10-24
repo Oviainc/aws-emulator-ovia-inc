@@ -344,14 +344,16 @@ pub struct EngineVersion {
 /// every operation which has to resolve an engine version reads the one list and no two
 /// of them can publish different versions.
 ///
-/// Source: the AWS MemoryDB *Supported engine versions* documentation — MemoryDB runs
-/// Redis OSS 6.2, 7.0 and 7.1, and Valkey 7.2 and 8.0, each at the patch release below.
+/// Source: the engine releases the recorded MemoryDB endpoint offers — Redis OSS 6.2,
+/// 7.0 and 7.1, and Valkey 7.2 and 7.3, each at the patch release below. The catalog is
+/// what every other family-bearing answer is resolved against, so a release it does not
+/// publish is a family no parameter group, cluster or snapshot of this service can name.
 pub const ENGINE_VERSIONS: &[EngineVersion] = &[
     EngineVersion { engine: ENGINE_REDIS, major: 6, minor: 2, patch: 6 },
     EngineVersion { engine: ENGINE_REDIS, major: 7, minor: 0, patch: 7 },
     EngineVersion { engine: ENGINE_REDIS, major: 7, minor: 1, patch: 1 },
     EngineVersion { engine: ENGINE_VALKEY, major: 7, minor: 2, patch: 6 },
-    EngineVersion { engine: ENGINE_VALKEY, major: 8, minor: 0, patch: 0 },
+    EngineVersion { engine: ENGINE_VALKEY, major: 7, minor: 3, patch: 0 },
 ];
 
 /// `CreateCluster$Engine`: "The name of the engine to be used for the cluster." MemoryDB
@@ -360,7 +362,7 @@ pub const ENGINE_REDIS: &str = "redis";
 pub const ENGINE_VALKEY: &str = "valkey";
 
 /// The prefix every MemoryDB parameter group family carries, in front of the engine name
-/// and its major version (`memorydb_redis7`, `memorydb_valkey8`).
+/// and its major version (`memorydb_redis7`, `memorydb_valkey7`).
 const PARAMETER_GROUP_FAMILY_PREFIX: &str = "memorydb_";
 
 impl EngineVersion {
@@ -558,16 +560,29 @@ pub struct EngineParameter {
 ///
 /// Redis OSS 7.0 renamed the collection-encoding parameters (`*-ziplist-*` →
 /// `*-listpack-*`), replaced `lua-time-limit` with `busy-reply-threshold` and added the
-/// client-memory and latency-tracking settings; Valkey 7.2 and 8.0 continue that same
-/// line. So the families this service publishes fall into two generations: the Redis 6
-/// one, and the Redis 7 one every later engine follows.
+/// client-memory and latency-tracking settings; Valkey continues that line and adds the
+/// settings of its own engine. So the families this service publishes fall into three
+/// generations, each carrying everything the one before it carried: the Redis 6 line, the
+/// Redis 7 line, and the Valkey line.
 fn version_generation(version: &EngineVersion) -> u32 {
-    if version.engine == ENGINE_REDIS && version.major <= 6 {
-        0
-    } else {
-        1
+    match (version.engine, version.major) {
+        (ENGINE_REDIS, 0..=6) => GENERATION_REDIS6,
+        (ENGINE_REDIS, _) => GENERATION_REDIS7,
+        _ => GENERATION_VALKEY,
     }
 }
+
+/// The Redis OSS 6 line: the engine defaults every family carries, plus the settings the
+/// Redis OSS 7 line renamed or replaced.
+const GENERATION_REDIS6: u32 = 0;
+
+/// The Redis OSS 7 line: the renamed collection-encoding settings and the ones Redis OSS
+/// 7.0 added.
+const GENERATION_REDIS7: u32 = 1;
+
+/// The Valkey line: the Redis OSS 7 settings, plus the ones only Valkey-backed families
+/// carry.
+const GENERATION_VALKEY: u32 = 2;
 
 /// The generation of engine defaults the parameter group family `family` carries, or
 /// `None` when no published engine version belongs to that family.
@@ -638,6 +653,20 @@ pub fn default_parameter_group_description(family: &str) -> String {
     format!("Default parameter group for {family}")
 }
 
+/// Why `family` is not a parameter group family this service publishes, or `None` when it
+/// is one.
+///
+/// A family EXISTS precisely when a published engine version names it
+/// ([`parameter_group_families`] is derived from [`ENGINE_VERSIONS`], as
+/// [`family_generation`] resolves one), so a group created in any other family would
+/// carry no engine defaults at all: nothing to describe, and nothing an update could
+/// name. The message is built from the request — the member and the value it sent for it.
+pub fn parameter_group_family_rejection(family: &str) -> Option<String> {
+    family_generation(family)
+        .is_none()
+        .then(|| format!("ParameterGroupFamily {family} is not a valid parameter group family."))
+}
+
 /// Why a parameter group is not the caller's to change, or `None` when it is.
 ///
 /// The `default.<family>` groups belong to MemoryDB, not to the caller
@@ -676,41 +705,80 @@ impl EngineParameter {
     }
 
     /// `Parameter$MinimumEngineVersion` — "The earliest engine version to which the
-    /// parameter can apply": the lowest published engine version whose family carries
-    /// it, as `<major>.<minor>`.
+    /// parameter can apply" — as a group of `family` reports it: the PATCH version
+    /// (`<major>.<minor>.<patch>`) of the earliest engine release of THAT family which
+    /// carries this parameter.
     ///
-    /// DERIVED from [`ENGINE_VERSIONS`], so it can never name a version this service
-    /// does not offer. `None` only if the catalog published no version at all.
-    pub fn minimum_engine_version(&self) -> Option<String> {
+    /// Family-relative, because a parameter is only ever reported as one family's
+    /// listing: the earliest release a Valkey family's setting can apply to is the
+    /// earliest Valkey release, whatever a Redis OSS family publishes for a setting of
+    /// the same name. DERIVED from [`ENGINE_VERSIONS`], so it can never name a release
+    /// this service does not offer; `None` when no published release of the family
+    /// carries the parameter at all.
+    pub fn minimum_engine_version(&self, family: &str) -> Option<String> {
         ENGINE_VERSIONS
             .iter()
-            .filter(|version| self.covers_generation(version_generation(version)))
-            .min_by_key(|version| (version.major, version.minor))
-            .map(EngineVersion::version)
+            .filter(|version| {
+                version.parameter_group_family() == family
+                    && self.covers_generation(version_generation(version))
+            })
+            .min_by_key(|version| (version.major, version.minor, version.patch))
+            .map(EngineVersion::patch_version)
     }
 
-    /// The modelled `Parameter` for this setting, carrying `value` — the group's stored
-    /// value when an update overrode it, otherwise this engine default.
-    pub fn to_api(&self, value: &str) -> Parameter {
+    /// The modelled `Parameter` for this setting in a group of `family`, where `stored`
+    /// is the value an update persisted for it ON that group and `None` says the group
+    /// never changed it.
+    ///
+    /// `Parameter$Value` and the wire's `Parameter$Source` are both derived from that one
+    /// input, so a value a caller set can never be reported as the engine's own, nor the
+    /// engine's as the caller's.
+    pub fn to_api(&self, family: &str, stored: Option<&str>) -> Parameter {
         Parameter {
             name: Some(self.name.to_string()),
-            value: Some(value.to_string()),
+            value: Some(stored.unwrap_or(self.default_value).to_string()),
             description: Some(self.description.to_string()),
             data_type: Some(self.domain.data_type().to_string()),
             allowed_values: self.domain.allowed_values(),
-            minimum_engine_version: self.minimum_engine_version(),
+            minimum_engine_version: self.minimum_engine_version(family),
+            source: Some(
+                if stored.is_some() {
+                    parameter_source::USER
+                } else {
+                    parameter_source::SYSTEM
+                }
+                .to_string(),
+            ),
         }
     }
 }
 
+/// Where the value a reported parameter carries came from: the engine defaults of the
+/// group's family, or an update a caller made to that group.
+///
+/// `Parameter$Source` is a member of the service's wire answer that its model does not
+/// declare (see `crate::ops::types::Parameter`, which publishes it), and these are the
+/// two tokens it takes. Only `ResetParameterGroup` takes a caller's value back off a
+/// group, so a value equal to the family default is still the caller's.
+pub mod parameter_source {
+    pub const SYSTEM: &str = "system";
+    pub const USER: &str = "user";
+}
+
 /// The engine default parameters MemoryDB publishes for its parameter group families.
 ///
-/// Source: the AWS MemoryDB User Guide, "Configuring MemoryDB parameter groups" — the
-/// per-family default parameter groups (`default.memorydb-redis6`,
-/// `default.memorydb-redis7`, `default.memorydb-valkey7`, `default.memorydb-valkey8`),
-/// whose settings and defaults are the Redis OSS / Valkey engine defaults of the
-/// corresponding engine line. `since`/`until` record which engine line a setting
-/// belongs to, which is what makes one family's listing differ from another's.
+/// Source: the per-family default parameter groups of the recorded service
+/// (`default.memorydb-redis6`, `default.memorydb-redis7`, `default.memorydb-valkey7` —
+/// one per family [`ENGINE_VERSIONS`] publishes), whose settings and defaults are the
+/// Redis OSS / Valkey engine defaults of the corresponding engine line, plus the settings
+/// MemoryDB adds itself. Each `description` is the one-line summary that catalog
+/// publishes for the setting (`Parameter$Description`), which is a phrase rather than a
+/// sentence. `since`/`until` record which engine line a setting belongs to, which is what
+/// makes one family's listing differ from another's.
+///
+/// Every entry is modifiable: MemoryDB's `Parameter` shape models no `IsModifiable`
+/// member, and the settings MemoryDB manages itself (`maxmemory`, `cluster-enabled`,
+/// the append-only settings) are not published as parameters at all.
 ///
 /// Every entry is modifiable: MemoryDB's `Parameter` shape models no `IsModifiable`
 /// member, and the settings MemoryDB manages itself (`maxmemory`, `cluster-enabled`,
@@ -718,285 +786,483 @@ impl EngineParameter {
 pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
     // ---- Carried by every family -------------------------------------------------
     EngineParameter {
+        name: "acllog-max-len",
+        default_value: "128",
+        description: "The maximum number of entries in the ACL log",
+        domain: ParameterDomain::Integer { min: 1, max: Some(10_000) },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "active-defrag-cycle-max",
+        default_value: "75",
+        description: "Maximal effort for defrag in CPU percentage",
+        domain: ParameterDomain::Integer { min: 1, max: Some(75) },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "active-defrag-cycle-min",
+        default_value: "5",
+        description: "Minimal effort for defrag in CPU percentage",
+        domain: ParameterDomain::Integer { min: 1, max: Some(75) },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "active-defrag-ignore-bytes",
+        default_value: "104857600",
+        description: "Minimum amount of fragmentation waste to start active defrag",
+        domain: ParameterDomain::Integer { min: 1_048_576, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "active-defrag-max-scan-fields",
+        default_value: "1000",
+        description: "Maximum number of set/hash/zset/list fields that will be \
+                      processed from the main dictionary scan",
+        domain: ParameterDomain::Integer { min: 1, max: Some(1_000_000) },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "active-defrag-threshold-lower",
+        default_value: "10",
+        description: "Minimum percentage of fragmentation to start active defrag",
+        domain: ParameterDomain::Integer { min: 1, max: Some(100) },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "active-defrag-threshold-upper",
+        default_value: "100",
+        description: "Maximum percentage of fragmentation at which we use maximum effort",
+        domain: ParameterDomain::Integer { min: 1, max: Some(100) },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
         name: "activedefrag",
         default_value: "no",
-        description: "Enabled active memory defragmentation.",
+        description: "Enabled active memory defragmentation",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "activerehashing",
         default_value: "yes",
-        description: "Whether to actively rehash the main dictionary, which frees \
-                      memory faster.",
+        description: "Apply rehashing or not",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "active-expire-effort",
         default_value: "1",
-        description: "The effort the engine spends expiring keys, from 1 (least) to 10 \
-                      (most).",
+        description: "The amount of effort Redis uses to expire items in the active \
+                      expiration job",
         domain: ParameterDomain::Integer { min: 1, max: Some(10) },
-        since: 0,
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    // The four client classes the engine limits output buffers for are published as one
+    // parameter per class and bound, rather than as the engine's own three-part
+    // `<class> <hard> <soft> <seconds>` string: a client reads and sets one bound at a
+    // time. The engine fixes the replica class itself, so only the normal and pub/sub
+    // classes are settings.
+    EngineParameter {
+        name: "client-output-buffer-limit-normal-hard-limit",
+        default_value: "0",
+        description: "Normal client output buffer hard limit in bytes",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "client-output-buffer-limit-normal-soft-limit",
+        default_value: "0",
+        description: "Normal client output buffer soft limit in bytes",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "client-output-buffer-limit-normal-soft-seconds",
+        default_value: "0",
+        description: "Normal client output buffer soft limit in seconds",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "client-output-buffer-limit-pubsub-hard-limit",
+        default_value: "33554432",
+        description: "Pubsub client output buffer hard limit in bytes",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "client-output-buffer-limit-pubsub-soft-limit",
+        default_value: "8388608",
+        description: "Pubsub client output buffer soft limit in bytes",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "client-output-buffer-limit-pubsub-soft-seconds",
+        default_value: "60",
+        description: "Pubsub client output buffer soft limit in seconds",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "hll-sparse-max-bytes",
         default_value: "3000",
-        description: "The size, in bytes, up to which a HyperLogLog is kept in the \
-                      sparse representation.",
-        domain: ParameterDomain::Integer { min: 0, max: Some(16_000) },
-        since: 0,
+        description: "HyperLogLog sparse representation bytes limit",
+        // The engine publishes no upper bound for this one: a larger value costs CPU on
+        // every read of a sparse HyperLogLog rather than being rejected, so the
+        // published set is open-ended.
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "lazyfree-lazy-eviction",
         default_value: "no",
-        description: "Whether eviction frees memory in a background thread.",
+        description: "Perform an asynchronous delete on evictions",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "lazyfree-lazy-expire",
         default_value: "no",
-        description: "Whether key expiry frees memory in a background thread.",
+        description: "Perform an asynchronous delete on expired keys",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "lazyfree-lazy-server-del",
         default_value: "no",
-        description: "Whether commands that implicitly delete a key free memory in a \
-                      background thread.",
+        description: "Perform an asynchronous delete on key updates",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "lazyfree-lazy-user-del",
         default_value: "no",
-        description: "Whether a user-issued delete frees memory in a background thread.",
+        description: "Specifies whether the default behavior of DEL command acts the \
+                      same as UNLINK",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 0,
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "lfu-decay-time",
+        default_value: "1",
+        description: "The amount of time in minutes to decrement the key counter for \
+                      LFU maxmemory policy",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "lfu-log-factor",
+        default_value: "10",
+        description: "The log factor for incrementing key counter for LFU maxmemory \
+                      policy",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "list-compress-depth",
+        default_value: "0",
+        description: "Number of quicklist ziplist nodes from each end of the list to \
+                      exclude from compression",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "maxmemory-policy",
         default_value: "noeviction",
-        description: "The eviction policy applied when the data on a node reaches its \
-                      memory limit.",
+        description: "Max memory policy",
         domain: ParameterDomain::Tokens(MAXMEMORY_POLICIES),
-        since: 0,
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "maxmemory-samples",
+        default_value: "3",
+        description: "Max memory samples",
+        domain: ParameterDomain::Integer { min: 1, max: Some(64) },
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "notify-keyspace-events",
         default_value: "",
-        description: "The keyspace event classes the engine publishes, as the engine's \
-                      flag characters.",
+        description: "The keyspace events for Redis to notify Pub/Sub clients about. By \
+                      default all notifications are disabled",
         domain: ParameterDomain::Text,
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "proto-max-bulk-len",
         default_value: "536870912",
-        description: "The largest single request or bulk reply, in bytes.",
+        description: "The largest single request or bulk reply, in bytes",
         domain: ParameterDomain::Integer { min: 1_048_576, max: Some(536_870_912) },
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "set-max-intset-entries",
         default_value: "512",
-        description: "The most entries an all-integer set keeps in the memory-efficient \
-                      encoding.",
+        description: "The limit in the size of the set in order for the dataset to be \
+                      compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "slowlog-log-slower-than",
         default_value: "10000",
-        description: "The execution time, in microseconds, above which a command is \
-                      recorded in the slow log.",
-        domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
+        description: "The execution time threshold (in microseconds) for logging a \
+                      command in the slow log",
+        // A command slower than this is logged, and the service caps what a caller may
+        // ask for at one second: a threshold above that would log nothing at all.
+        domain: ParameterDomain::Integer { min: 0, max: Some(1_000_000) },
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "slowlog-max-len",
         default_value: "128",
-        description: "The most entries the slow log keeps.",
+        description: "The maximum number of entries in the slow log",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "stream-node-max-bytes",
+        default_value: "4096",
+        description: "The maximum size of a single node in a stream in bytes",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "stream-node-max-entries",
+        default_value: "100",
+        description: "The maximum number of items a single node in a stream can contain",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
+        until: None,
+    },
+    EngineParameter {
+        name: "tcp-keepalive",
+        default_value: "300",
+        description: "If non-zero, use SO_KEEPALIVE to send TCP ACKs to clients in \
+                      absence of communication",
+        domain: ParameterDomain::Integer { min: 0, max: None },
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "timeout",
         default_value: "0",
-        description: "The seconds of client idleness after which the engine closes the \
-                      connection; 0 never closes it.",
+        description: "Close connection if client is idle for a given number of seconds, \
+                      or never if 0",
         // Published as `0,20-`: the engine either never closes an idle connection (0)
         // or waits at least 20 seconds, so the seconds between are not a value the
         // parameter takes.
         domain: ParameterDomain::IntegerRanges(&[(0, Some(0)), (20, None)]),
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     EngineParameter {
         name: "tracking-table-max-keys",
         default_value: "1000000",
-        description: "The most keys the client-side caching invalidation table tracks.",
+        description: "The maximum number of keys in the client-side caching \
+                      invalidation table",
         domain: ParameterDomain::Integer { min: 1, max: Some(100_000_000) },
-        since: 0,
+        since: GENERATION_REDIS6,
         until: None,
     },
     // ---- The Redis 6 line only: renamed or replaced in Redis OSS 7.0 -------------
     EngineParameter {
         name: "hash-max-ziplist-entries",
-        default_value: "128",
-        description: "The most fields a hash keeps in the memory-efficient encoding.",
+        default_value: "512",
+        description: "The maximum number of hash entries in order for the dataset to be \
+                      compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
-        until: Some(1),
+        since: GENERATION_REDIS6,
+        until: Some(GENERATION_REDIS7),
     },
     EngineParameter {
         name: "hash-max-ziplist-value",
         default_value: "64",
-        description: "The longest hash field value, in bytes, kept in the \
-                      memory-efficient encoding.",
+        description: "The threshold of biggest hash entries in order for the dataset to \
+                      be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
-        until: Some(1),
+        since: GENERATION_REDIS6,
+        until: Some(GENERATION_REDIS7),
     },
     EngineParameter {
         name: "list-max-ziplist-size",
         default_value: "128",
-        description: "The most entries a list node keeps in the memory-efficient \
-                      encoding.",
+        description: "The maximum number of list entries in order for the dataset to be \
+                      compressed",
         domain: ParameterDomain::Integer { min: 1, max: None },
-        since: 0,
-        until: Some(1),
+        since: GENERATION_REDIS6,
+        until: Some(GENERATION_REDIS7),
     },
     EngineParameter {
         name: "lua-time-limit",
         default_value: "5000",
-        description: "The milliseconds a script may run before the engine starts \
-                      answering BUSY to other clients.",
+        description: "Max execution time of a Lua script in milliseconds",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
-        until: Some(1),
+        since: GENERATION_REDIS6,
+        until: Some(GENERATION_REDIS7),
     },
     EngineParameter {
         name: "zset-max-ziplist-entries",
         default_value: "128",
-        description: "The most members a sorted set keeps in the memory-efficient \
-                      encoding.",
+        description: "The maximum number of sorted set entries in order for the dataset \
+                      to be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
-        until: Some(1),
+        since: GENERATION_REDIS6,
+        until: Some(GENERATION_REDIS7),
     },
     EngineParameter {
         name: "zset-max-ziplist-value",
         default_value: "64",
-        description: "The longest sorted set member, in bytes, kept in the \
-                      memory-efficient encoding.",
+        description: "The threshold of biggest sorted set entries in order for the \
+                      dataset to be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 0,
-        until: Some(1),
+        since: GENERATION_REDIS6,
+        until: Some(GENERATION_REDIS7),
     },
     // ---- The Redis 7 line and every engine after it ------------------------------
     EngineParameter {
         name: "busy-reply-threshold",
         default_value: "5000",
         description: "The milliseconds a script may run before the engine starts \
-                      answering BUSY to other clients.",
+                      answering BUSY to other clients",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "hash-max-listpack-entries",
-        default_value: "128",
-        description: "The most fields a hash keeps in the memory-efficient encoding.",
+        default_value: "512",
+        description: "The maximum number of hash entries in order for the dataset to be \
+                      compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "hash-max-listpack-value",
         default_value: "64",
-        description: "The longest hash field value, in bytes, kept in the \
-                      memory-efficient encoding.",
+        description: "The threshold of biggest hash entries in order for the dataset to \
+                      be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "latency-tracking",
-        default_value: "yes",
-        description: "Whether the engine tracks per-command latency percentiles.",
+        default_value: "no",
+        description: "Specifies whether to track the per-command latencies",
         domain: ParameterDomain::Tokens(YES_NO),
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "list-max-listpack-size",
         default_value: "128",
-        description: "The most entries a list node keeps in the memory-efficient \
-                      encoding.",
+        description: "The maximum number of list entries in order for the dataset to be \
+                      compressed",
         domain: ParameterDomain::Integer { min: 1, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "maxmemory-clients",
         default_value: "0",
         description: "The memory all client connection buffers together may use, as a \
-                      size or a percentage of the node's memory; 0 removes the limit.",
+                      size or a percentage of the node's memory; 0 removes the limit",
         domain: ParameterDomain::Text,
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "set-max-listpack-entries",
         default_value: "128",
-        description: "The most members a set keeps in the memory-efficient encoding.",
+        description: "The maximum number of set entries in order for the dataset to be \
+                      compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "set-max-listpack-value",
         default_value: "64",
-        description: "The longest set member, in bytes, kept in the memory-efficient \
-                      encoding.",
+        description: "The threshold of biggest set entries in order for the dataset to \
+                      be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "zset-max-listpack-entries",
         default_value: "128",
-        description: "The most members a sorted set keeps in the memory-efficient \
-                      encoding.",
+        description: "The maximum number of sorted set entries in order for the dataset \
+                      to be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
         until: None,
     },
     EngineParameter {
         name: "zset-max-listpack-value",
         default_value: "64",
-        description: "The longest sorted set member, in bytes, kept in the \
-                      memory-efficient encoding.",
+        description: "The threshold of biggest sorted set entries in order for the \
+                      dataset to be compressed",
         domain: ParameterDomain::Integer { min: 0, max: None },
-        since: 1,
+        since: GENERATION_REDIS7,
+        until: None,
+    },
+    // ---- The Valkey line only ----------------------------------------------------
+    // The settings of MemoryDB's Valkey-backed families: the vector-search engine is
+    // Valkey-only, so no Redis OSS family publishes these and both are absent from a
+    // `memorydb_redis*` listing.
+    EngineParameter {
+        name: "search-enabled",
+        default_value: "false",
+        description: "Whether the vector search engine is enabled on the cluster",
+        // Not a Redis OSS setting, and not spelled like one: this is MemoryDB's own,
+        // and the service takes it as a boolean rather than the engine's `yes`/`no`.
+        domain: ParameterDomain::Tokens(TRUE_FALSE),
+        since: GENERATION_VALKEY,
+        until: None,
+    },
+    EngineParameter {
+        name: "search-query-timeout-ms",
+        default_value: "10000",
+        description: "The milliseconds a vector search query may run before it is \
+                      cancelled",
+        domain: ParameterDomain::Integer { min: 1, max: None },
+        since: GENERATION_VALKEY,
         until: None,
     },
 ];
@@ -1004,6 +1270,10 @@ pub const ENGINE_PARAMETERS: &[EngineParameter] = &[
 /// The two tokens every boolean engine parameter takes, in the order MemoryDB
 /// publishes them in `AllowedValues`.
 const YES_NO: &[&str] = &["yes", "no"];
+
+/// The two tokens a MemoryDB-own boolean setting takes — the service's own settings are
+/// not spelled the way the engine's configuration spells its booleans.
+const TRUE_FALSE: &[&str] = &["true", "false"];
 
 /// The eviction policies `maxmemory-policy` takes, in the order the engine documents
 /// them.
@@ -1765,11 +2035,14 @@ impl StoredParameterGroup {
         family_parameters(&self.family)
             .into_iter()
             .map(|parameter| {
-                let value = self
+                let stored = self
                     .parameter_values
                     .get(parameter.name)
-                    .map_or(parameter.default_value, String::as_str);
-                (parameter.name.to_string(), parameter.to_api(value))
+                    .map(String::as_str);
+                (
+                    parameter.name.to_string(),
+                    parameter.to_api(&self.family, stored),
+                )
             })
             .collect()
     }
