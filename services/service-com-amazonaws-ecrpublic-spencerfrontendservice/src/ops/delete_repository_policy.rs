@@ -153,15 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ECR Public serves its API from ONE Region, so a call signed for any other is
-        // refused with the service-common `UnsupportedCommandException` before this
-        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
-        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
-            return Err(
-                DeleteRepositoryPolicyErrorModeled::UnsupportedCommandException(unsupported)
-                    .into(),
-            );
-        }
+        // This operation is served from every Region ECR Public publishes an endpoint in,
+        // so nothing here reads the Region the request was signed for — see
+        // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
+        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteRepositoryPolicyErrorModeled::ServerException(ServerException {

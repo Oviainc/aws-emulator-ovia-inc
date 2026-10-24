@@ -197,14 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ECR Public serves its API from ONE Region, so a call signed for any other is
-        // refused with the service-common `UnsupportedCommandException` before this
-        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
-        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
-            return Err(
-                CompleteLayerUploadErrorModeled::UnsupportedCommandException(unsupported).into(),
-            );
-        }
+        // This operation is served from every Region ECR Public publishes an endpoint in,
+        // so nothing here reads the Region the request was signed for — see
+        // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(server_error());
         };
@@ -254,11 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specified upload ID isn't valid for this repository"
         // (`UploadNotFoundException`), which is the same answer for both. A completed
         // upload is consumed below, so completing one twice reaches this refusal too.
+        //
+        // The message is the clause the service states for an upload: the upload id, the
+        // repository it was issued for and the registry that holds it, all from the
+        // request — the same clause the empty-upload refusal below is built over.
         let upload_not_found = || {
             CompleteLayerUploadErrorModeled::UploadNotFoundException(UploadNotFoundException {
                 message: Some(format!(
-                    "The upload with ID '{}' does not exist for the repository with name \
-                     '{}' in the registry with id '{registry_id}'",
+                    "The upload with id '{}' in the repository with name '{}' in registry \
+                     with id '{registry_id}' does not exist",
                     input.upload_id, input.repository_name
                 )),
             })
@@ -304,6 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that arrived are not that layer. Each requested digest is read under the
         // spelling digests are compared by (`crate::state::canonical_layer_digest`), so
         // the hex's case does not decide the answer and the algorithm's token does.
+        //
+        // The message is the one sentence the service states for the disagreement: it
+        // reports neither the digests the request claimed nor the digest this registry
+        // computed over the uploaded bytes.
         if !input
             .layer_digests
             .iter()
@@ -311,14 +314,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 CompleteLayerUploadErrorModeled::InvalidLayerException(InvalidLayerException {
-                    message: Some(format!(
-                        "The layer digests '{}' of the upload with id '{}' in the repository \
-                         with name '{}' in registry with id '{registry_id}' do not match the \
-                         digest that Amazon ECR has calculated for the uploaded layer",
-                        input.layer_digests.join("', '"),
-                        input.upload_id,
-                        input.repository_name
-                    )),
+                    message: Some(
+                        "None of the provided layer digests match the calculated layer digest"
+                            .to_string(),
+                    ),
                 })
                 .into(),
             );
@@ -339,10 +338,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CompleteLayerUploadErrorModeled::LayerAlreadyExistsException(
                     LayerAlreadyExistsException {
+                        // The refusal is about the completion the caller asked for, so it
+                        // names the upload it would have committed, the repository that
+                        // already holds that layer and the registry — never the digest
+                        // this registry computed over the uploaded bytes.
                         message: Some(format!(
-                            "The layer with digest '{layer_digest}' already exists in the \
-                             repository with name '{}' in registry with id '{registry_id}'",
-                            input.repository_name
+                            "Layer with upload id '{}' already exists in the repository \
+                             with name '{}' in registry with id '{registry_id}'",
+                            input.upload_id, input.repository_name
                         )),
                     },
                 )

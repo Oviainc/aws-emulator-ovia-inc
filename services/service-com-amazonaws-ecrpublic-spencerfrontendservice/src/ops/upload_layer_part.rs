@@ -184,14 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ECR Public serves its API from ONE Region, so a call signed for any other is
-        // refused with the service-common `UnsupportedCommandException` before this
-        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
-        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
-            return Err(
-                UploadLayerPartErrorModeled::UnsupportedCommandException(unsupported).into(),
-            );
-        }
+        // This operation is served from every Region ECR Public publishes an endpoint in,
+        // so nothing here reads the Region the request was signed for — see
+        // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UploadLayerPartErrorModeled::ServerException(ServerException {
@@ -250,11 +245,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for the repository it was issued for — "the upload can't be found, or the
         // specified upload ID isn't valid for this repository"
         // (`UploadNotFoundException`), which is the same answer for both.
+        //
+        // The message is the clause the service states for an upload: the upload id, the
+        // repository it was issued for and the registry that holds it, all from the
+        // request — the same clause `CompleteLayerUpload` words its own refusals over.
         let upload_not_found = || {
             UploadLayerPartErrorModeled::UploadNotFoundException(UploadNotFoundException {
                 message: Some(format!(
-                    "The upload with ID '{}' does not exist for the repository with name \
-                     '{}' in the registry with id '{registry_id}'",
+                    "The upload with id '{}' in the repository with name '{}' in registry \
+                     with id '{registry_id}' does not exist",
                     input.upload_id, input.repository_name
                 )),
             })
@@ -327,12 +326,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // begins exactly where the last accepted part ended, and the first part of an
         // upload begins at byte 0. A part that leaves a gap, overlaps what was received or
         // repeats it is refused, and the upload keeps the bytes it already had.
+        //
+        // The message is the two offsets and nothing else — the first byte the request
+        // declared, then the first byte this upload's ledger expects next — which is what
+        // a resumable push client reads out of the refusal to continue from.
         if input.part_first_byte != expected_first_byte {
             return Err(invalid_part(format!(
-                "The layer part beginning at byte '{}' is not consecutive to the last byte \
-                 received for the upload with ID '{}': the next layer part must begin at \
-                 byte '{expected_first_byte}'",
-                input.part_first_byte, input.upload_id
+                "First byte of the layer part is {} instead of {expected_first_byte}",
+                input.part_first_byte
             ))
             .into());
         }
