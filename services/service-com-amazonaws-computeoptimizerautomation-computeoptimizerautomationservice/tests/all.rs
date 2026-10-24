@@ -23,6 +23,8 @@ mod automation_rule_preview;
 mod automation_rule_preview_summaries;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
+#[path = "all/enum_parameter_rejection.rs"]
+mod enum_parameter_rejection;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
 #[path = "all/recommended_action_summaries.rs"]

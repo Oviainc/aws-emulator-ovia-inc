@@ -401,6 +401,30 @@ impl ComAmazonawsMedialiveMedialiveState {
             .collect()
     }
 
+    /// Remove the cloudwatch alarm template `identifier` names in `region`,
+    /// answering the record that was removed, or `None` when no template in that
+    /// region answers to it.
+    ///
+    /// `DeleteCloudWatchAlarmTemplate` is documented "Deletes a cloudwatch alarm
+    /// template", with no precondition of its own — hence no refusal type, as on
+    /// the eventbridge rule template beside it: a template that exists in the
+    /// request's region goes, and the miss is the only thing a handler has to
+    /// refuse. Once it is gone every later read of either of its identifiers
+    /// misses, its name is free again and the group that held it no longer counts
+    /// it (so an emptied group becomes deletable).
+    pub fn delete_alarm_template(
+        &mut self,
+        region: &str,
+        identifier: &str,
+    ) -> Option<CloudWatchAlarmTemplateRecord> {
+        let id = self.alarm_template(region, identifier)?.id.clone();
+        let removed = self.alarm_templates.remove(&id)?;
+        // A token never outlives the resource it minted, so a retried create
+        // cannot resurrect a deleted template.
+        self.alarm_template_tokens.forget(&id);
+        Some(removed)
+    }
+
     /// Record `token`, as presented in `region`, as having created the template
     /// `template_id`, evicting the oldest token first if that would push the map
     /// past [`MAX_ALARM_TEMPLATE_TOKENS`].
