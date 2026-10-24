@@ -268,9 +268,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // Merge, member by member: a member the request does not carry keeps the value the
-        // create (or an earlier update) stored for it.
-        let spec = &mut stored.spec;
+        // An update reconfigures a RUNNING environment: one still being created, or
+        // already under an update the clock has not settled yet, cannot take another.
+        // Checked AFTER the lookup, so an unknown name is still a 404.
+        if !stored.accepts_update() {
+            return Err(validation(crate::state::update_not_allowed_message(
+                &input.name,
+                &stored.status,
+            )));
+        }
+
+        // An S3 object's version has to travel with its path IN THIS REQUEST, so the
+        // pairing is judged on the request's own members rather than on the merge below.
+        crate::state::RequestedS3Objects {
+            plugins_s3_path: input.plugins_s3_path.as_deref(),
+            plugins_s3_object_version: input.plugins_s3_object_version.as_deref(),
+            requirements_s3_path: input.requirements_s3_path.as_deref(),
+            requirements_s3_object_version: input.requirements_s3_object_version.as_deref(),
+            startup_script_s3_path: input.startup_script_s3_path.as_deref(),
+            startup_script_s3_object_version: input.startup_script_s3_object_version.as_deref(),
+        }
+        .validate()
+        .map_err(validation)?;
+
+        // Merge, member by member, onto a COPY of the stored spec: a member the request
+        // does not carry keeps the value the create (or an earlier update) stored for it,
+        // and a request the business rules refuse below leaves the stored record alone.
+        let mut merged = stored.spec.clone();
+        let spec = &mut merged;
         if let Some(value) = input.execution_role_arn {
             spec.execution_role_arn = value;
         }
@@ -340,6 +365,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             spec.weekly_maintenance_window_start = value;
         }
 
+        // The rules the model cannot state, judged on the configuration this update would
+        // store — so a patch naming only `MinWorkers` is compared against the `MaxWorkers`
+        // already stored, and vice versa.
+        merged.validate().map_err(validation)?;
+
+        stored.spec = merged;
         stored.begin_update(
             now,
             crate::state::UPDATE_SOURCE_API,
@@ -352,4 +383,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(stored.arn.clone()),
         })
     }
+}
+
+/// Refuse the request with this operation's own modelled `ValidationException` (HTTP
+/// 400): "The provided input is not valid."
+fn validation(message: impl Into<String>) -> UpdateEnvironmentError {
+    UpdateEnvironmentErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }
