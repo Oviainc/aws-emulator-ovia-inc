@@ -3,7 +3,9 @@
 //! @op DeletePackagingGroup
 //! IMPLEMENTED: removes the stored PackagingGroup (and the tags stored for it), so a
 //! following `DescribePackagingGroup` answers 404. `Id` naming no stored group is
-//! `NotFoundException` (404).
+//! `NotFoundException` (404); an `Id` naming a group a stored PackagingConfiguration
+//! still references is `UnprocessableEntityException` (422) and the group is left
+//! exactly as it was — see NOTE ON ATTACHED CHILDREN below.
 //!
 //! NOTE ON THE SUCCESS STATUS: the model declares `@http` code 202 for this operation
 //! (and the issue report that asked for this handler quotes that 202), but AWS answers
@@ -16,18 +18,31 @@
 //! (`DeleteAsset` and `DeletePackagingConfiguration` keep the 202 their own models
 //! declare: no recording contradicts those.)
 //!
-//! NOTE ON ATTACHED CHILDREN: this handler does NOT refuse a group a
-//! PackagingConfiguration still references, because the recorded wire behaviour of this
-//! service does not. Replaying the corpus with that refusal in place reported
-//! `DeletePackagingGroup (mediapackage-vod-packaging-configuration-multi-format#teardown#11):
-//! expected HTTP 204, actual HTTP 422; UnprocessableEntityException: id cannot be
-//! deleted because it has attached packaging configurations` — the recorded teardown
-//! deletes a group that still holds the configurations the fixture created, and AWS
-//! answers it 204 — and it also kept the group readable afterwards, which contradicts
-//! the recorded 404 of the following `DescribePackagingGroup`. The group's
-//! PackagingConfigurations and Assets are therefore not removed with it either: each
-//! is a resource addressed by its own id with its own delete operation, and this
-//! operation is modelled with no error for a non-empty group.
+//! NOTE ON ATTACHED CHILDREN: a PackagingGroup that a stored PackagingConfiguration
+//! still names in its `PackagingGroupId` is PROTECTED: the delete is refused with the
+//! modelled `UnprocessableEntityException` (HTTP 422) and nothing about the group
+//! changes — it stays readable through `DescribePackagingGroup` and keeps its tags.
+//! RECORDED behaviour: behavioural unit
+//! `mediapackage-vod.delete-packaging-group-with-dependent-configs-rejected` creates a
+//! group, creates a configuration against it and asserts that the delete raises
+//! `UnprocessableEntityException` while a following `DescribePackagingGroup` still
+//! returns the group; the same delete succeeds once the configuration has been deleted.
+//!
+//! This reconciles an earlier note in this module which claimed the opposite from the
+//! wire corpus: replaying `mediapackage-vod-packaging-configuration-multi-format`
+//! teardown with a refusal in place reported `expected HTTP 204, actual HTTP 422` on its
+//! `DeletePackagingGroup` step. That teardown deletes the three configurations the
+//! fixture created BEFORE the group (its last two steps are the group delete and the
+//! `DescribePackagingGroup` poll for 404), so the 422 came from configurations that were
+//! still stored only because `DeletePackagingConfiguration` was an unimplemented 501
+//! stub at the time — not from AWS accepting a delete of a group with attached children.
+//! The check below therefore keys STRICTLY off configurations actually stored at delete
+//! time: a teardown that removes its configurations first gets its 204.
+//!
+//! Assets are NOT part of the refusal: no recording or model text shows a group holding
+//! only Assets refused, so an asset-holding group still deletes (204) and the group's
+//! Assets, like a protected group's configurations, are never cascaded — each is a
+//! resource addressed by its own id with its own delete operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,7 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = store.lock();
-        let Some(removed) = state.packaging_groups.remove(&input.id) else {
+        // The `Id` addresses the resource (it is an `@httpLabel`), so one this service
+        // holds no group under is the addressed resource missing — 404. Looked up, NOT
+        // removed: the referential check below can still refuse the delete, and a
+        // refused delete must leave the group exactly as it was.
+        let Some(arn) = state
+            .packaging_groups
+            .get(&input.id)
+            .map(|group| group.arn.clone())
+        else {
             return Err(DeletePackagingGroupErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::scaffolded::not_found_message(
@@ -182,9 +205,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Referential integrity: a configuration still names this group in its
+        // `PackagingGroupId`, so removing the group would orphan it. Refused with the
+        // modelled 422 before anything is written, so neither the group nor its tags
+        // are touched on this path.
+        if state.configuration_count(&input.id) > 0 {
+            return Err(crate::scaffolded::UnprocessableEntity::member(
+                "id",
+                "cannot be deleted because it has attached packaging configurations",
+            )
+            .into());
+        }
+        state.packaging_groups.remove(&input.id);
         // The tag store is keyed by ARN, so a deleted group must not leave its tags
         // behind for a later resource that happens to reuse the id.
-        state.forget_tags(&removed.arn);
+        state.forget_tags(&arn);
         Ok(DeletePackagingGroupOutput {})
     }
 }

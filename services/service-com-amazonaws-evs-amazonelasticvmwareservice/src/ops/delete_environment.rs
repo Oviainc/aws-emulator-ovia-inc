@@ -2,9 +2,11 @@
 
 //! @op DeleteEnvironment
 //! Moves the stored environment into `DELETING` and records the `DELETED` the clock
-//! then owes it, stamping `modifiedAt`. `@idempotent`: deleting an environment that
-//! is already going away reports the record as it stands and starts nothing new. An
-//! id this service holds no environment for is a `ResourceNotFoundException`.
+//! then owes it, stamping `modifiedAt`. An environment that still holds ESX hosts is
+//! not enabled for deletion: it is refused with `ValidationException` and nothing about
+//! it changes. `@idempotent`: deleting an environment that is already going away
+//! reports the record as it stands and starts nothing new. An id this service holds no
+//! environment for is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +189,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nor moves `modifiedAt`.
         let already_going_away = environment.state == crate::state::STATE_DELETING
             || environment.state == crate::state::STATE_DELETED;
+
+        // "Amazon EVS environments will only be enabled for deletion once the hosts are
+        // deleted. You can delete hosts using the DeleteEnvironmentHost action."
+        // (`DeleteEnvironment` doc.) An environment that still holds ESX hosts is
+        // refused with this operation's modelled client error, and NOTHING about it
+        // changes: the hosts stay, the environment stays in the state it was in, and
+        // `modifiedAt` does not move. The count is read from the store, so the sentence
+        // tells the caller how many hosts are still in the way. An environment already
+        // going away was enabled for deletion when the delete that started it was
+        // accepted, so the precondition is not re-judged for the idempotent repeat.
+        let live_hosts = environment.live_host_count();
+        if !already_going_away && live_hosts > 0 {
+            return Err(DeleteEnvironmentErrorModeled::ValidationException(
+                crate::state::field_validation_error(
+                    "environmentId",
+                    &format!(
+                        "names an environment that still holds {live_hosts} ESX host(s); an \
+                         environment is only enabled for deletion once its hosts are deleted \
+                         with DeleteEnvironmentHost"
+                    ),
+                ),
+            )
+            .into());
+        }
+
         if !already_going_away {
             environment.state = crate::state::STATE_DELETING.to_string();
             environment.modified_at_ms = crate::state::now_ms();
