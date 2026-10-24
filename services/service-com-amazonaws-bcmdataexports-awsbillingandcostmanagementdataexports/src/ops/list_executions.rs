@@ -5,7 +5,16 @@
 //! Lists the recorded executions OF ONE EXPORT: one `ExecutionReference` per execution
 //! the store holds for the `ExportArn`, in a stable execution-id order, honouring
 //! `MaxResults` and resuming exactly where a previous page ended. A reporting operation
-//! (`@readonly` — smithy_query operation `ListExecutions`): it writes nothing.
+//! (`@readonly` — smithy_query operation `ListExecutions`): the only thing it writes is
+//! what the CLOCK already owed at the instant it ran (see
+//! `crate::state::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::materialize_due`),
+//! so it reports no state of its own making and no later caller sees a different answer
+//! for having been second.
+//!
+//! The executions it pages over are the deliveries the SERVICE records for the export: it
+//! owes one when the export is created and one whenever its definition is updated, each
+//! due a short span later, so an export accrues executions on the clock without any caller
+//! call. This listing materialises whatever the clock already owes before it answers.
 //!
 //! The `ExportArn` is NOT resolved against the export store first. RECORDED AWS behaviour
 //! is that this listing answers 200 with an EMPTY `Executions` list for an ARN that names
@@ -20,11 +29,11 @@
 //!
 //! NOTE on what this emulator holds: an execution is the record of a data-plane DELIVERY
 //! — a query run against the billing data and a file written to the caller's S3 bucket —
-//! and this emulator runs no such delivery, so nothing records an execution and this
-//! operation pages over what `crate::state::StoredExecution` holds rather than reporting a
-//! status for work nothing performed. For an export whose deliveries nothing recorded that
-//! is an empty page, which is also what AWS answers for an export that has not run yet —
-//! never a fabricated execution. `GetExecution` reads one execution out of the same store.
+//! and this emulator performs no such delivery, so the delivery it records ends in the
+//! service's own modelled failure state rather than reporting a `DELIVERY_SUCCESS` for a
+//! file nothing wrote (see `crate::state::StoredExecution`). An export whose first
+//! delivery is not due yet pages empty, which is what AWS answers for an export that has
+//! not run yet. `GetExecution` reads one execution out of the same store.
 //!
 //! ## Shape of an operation
 //!
@@ -176,7 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let references: Vec<(String, ExecutionReference)> = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // The deliveries the clock already owes are materialised first, so this
+            // listing reports the executions the service had recorded by now rather than
+            // only the ones some earlier call happened to materialise. Reporting, not
+            // mutating: every execution this writes was owed at this instant whether or
+            // not anybody called, and is dated from the instant stored when it was owed —
+            // see `crate::state::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::materialize_due`.
+            store.materialize_due(::std::time::SystemTime::now());
             // The ARN is NOT resolved against the export store: RECORDED AWS behaviour is
             // that this listing answers 200 with an empty `Executions` list for an
             // `ExportArn` that names no export (the recording for the export-not-found

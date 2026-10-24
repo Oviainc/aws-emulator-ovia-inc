@@ -228,9 +228,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 },
             )?;
-        let created_at = crate::state::now();
+        // ONE instant answers the whole request: the `CreatedAt`/`LastUpdatedAt` this
+        // create reports, the instant it materialises what the clock already owed, and the
+        // instant the delivery it owes is scheduled from are all this one, so the stored
+        // schedule cannot disagree with the reported status.
+        let at = ::std::time::SystemTime::now();
+        let created_at = crate::state::timestamp(at);
 
         let mut store = state.lock();
+        // Whatever the clock already owes is materialised before this create is judged, so
+        // a delivery owed to an EARLIER export is recorded at the instant it fell due
+        // rather than waiting for a reader of it.
+        store.materialize_due(at);
         // The request is validated BEFORE the store bound is applied: a name already in
         // use is owed the 400, not the quota 402, even when the store happens to be full.
         //
@@ -269,16 +278,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let definition = Export {
+            // The ARN is server-assigned: whatever the request carried in
+            // `Export.ExportArn` is not this export's identity.
+            export_arn: Some(arn.clone()),
+            ..export
+        };
         let stored = crate::state::StoredExport {
             arn: arn.clone(),
-            export: Export {
-                // The ARN is server-assigned: whatever the request carried in
-                // `Export.ExportArn` is not this export's identity.
-                export_arn: Some(arn.clone()),
-                ..export
-            },
             status: crate::state::fresh_status(created_at),
             tags,
+            // The service owes this export a delivery of the definition just persisted:
+            // "The cadence for Amazon Web Services to update the data export in your S3
+            // bucket" (smithy_query shape `RefreshCadence`) is the service's own work, so
+            // the delivery is owed by the CLOCK and not by any call a caller can make. The
+            // instant it falls due is stored here and materialised by whichever request
+            // next reaches the store; nothing sleeps for it.
+            pending_delivery: Some(crate::state::delivery_owed_at(at, &definition, 0)),
+            // The create owes the first delivery, so the next one this export is owed is
+            // its second.
+            deliveries_owed: 1,
+            export: definition,
         };
         store.exports.insert(arn.clone(), stored);
         drop(store);

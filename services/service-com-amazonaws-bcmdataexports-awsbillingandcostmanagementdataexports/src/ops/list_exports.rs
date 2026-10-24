@@ -152,7 +152,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let references: Vec<(String, ExportReference)> = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // Every handler of this service applies what the clock already owes before it
+            // answers, so a delivery falls due at its stored instant whichever operation a
+            // caller happens to use. Reporting, not mutating: this listing's own answer
+            // does not depend on it — an export's `ExportStatus` is not a verdict on its
+            // deliveries (see `crate::state::fresh_status`) — and the executions it
+            // records were owed at this instant whether or not anybody called.
+            store.materialize_due(::std::time::SystemTime::now());
             store
                 .exports
                 .iter()

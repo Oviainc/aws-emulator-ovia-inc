@@ -15,9 +15,12 @@
 //!
 //! NOTE on what this emulator holds: an execution is the record of a data-plane DELIVERY
 //! — a query run against the billing data and a file written to the caller's S3 bucket —
-//! and this emulator runs no such delivery, so nothing records an execution and this
-//! operation reports what `crate::state::StoredExecution` holds rather than a status for
-//! work nothing performed. `ListExecutions` pages over the same store.
+//! and this emulator performs no such delivery, so the delivery the service records ends
+//! in its own modelled failure state rather than reporting a `DELIVERY_SUCCESS` for a file
+//! nothing wrote (see `crate::state::StoredExecution`). The deliveries themselves are owed
+//! by the CLOCK — one when the export is created and one per `UpdateExport` — and this
+//! lookup materialises whatever was already owed before it answers. `ListExecutions` pages
+//! over the same store.
 //!
 //! ## Shape of an operation
 //!
@@ -170,7 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // The deliveries the clock already owes are materialised first, so this lookup
+        // answers from the executions the service had recorded by now. Reporting, not
+        // mutating: every execution this writes was owed at this instant whether or not
+        // anybody called, and carries the values the instant stored when it was owed
+        // determines.
+        store.materialize_due(::std::time::SystemTime::now());
         // The export is resolved first: an `ExecutionId` is only ever an id WITHIN an
         // export, so an ARN naming no export has no execution namespace to look in. The
         // miss goes through `crate::state::not_found_error`, the one place that states the

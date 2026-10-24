@@ -151,7 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Every handler of this service applies what the clock already owes before it
+        // answers, so a delivery falls due at its stored instant whichever operation a
+        // caller happens to use. It changes nothing this read reports: an export's
+        // `ExportStatus` is not a verdict on its deliveries (see
+        // `crate::state::fresh_status`).
+        store.materialize_due(::std::time::SystemTime::now());
         let stored = store.exports.get(&input.export_arn).ok_or_else(|| {
             crate::state::export_not_found_error(
                 &input.export_arn,
