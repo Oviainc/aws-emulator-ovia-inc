@@ -15,6 +15,8 @@
 mod audit_records;
 #[path = "all/dashboard_lifecycle.rs"]
 mod dashboard_lifecycle;
+#[path = "all/dashboard_name_uniqueness.rs"]
+mod dashboard_name_uniqueness;
 #[path = "all/resource_not_found.rs"]
 mod resource_not_found;
 #[path = "all/resource_policy.rs"]

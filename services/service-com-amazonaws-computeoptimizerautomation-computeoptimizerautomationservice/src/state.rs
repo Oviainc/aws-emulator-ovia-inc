@@ -23,7 +23,9 @@ use crate::ops::types::{
     OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
     RecommendedAction, RecommendedActionFilter, ResourceDetails, ResourceTagsCriteriaCondition,
     Schedule, StringCriteriaCondition, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
-    RECOMMENDED_ACTION_FILTER_NAME_VALUES, SAVINGS_ESTIMATION_MODE_VALUES,
+    COMPARISON_OPERATOR_VALUES, ENROLLMENT_STATUS_VALUES,
+    RECOMMENDED_ACTION_FILTER_NAME_VALUES, RECOMMENDED_ACTION_TYPE_VALUES, RULE_APPLY_ORDER_VALUES,
+    RULE_STATUS_VALUES, RULE_TYPE_VALUES, SAVINGS_ESTIMATION_MODE_VALUES,
 };
 
 /// The ARN namespace this service stamps on a rule ARN, from the model's
@@ -356,7 +358,20 @@ const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
 /// some other member) must not be replayed into an error body — and reports a
 /// `@pattern` as the regular expression itself, without the anchors the model
 /// spells it with.
+///
+/// ONE refusal is worded differently, because the service words it itself rather
+/// than leaving it to the generic constraint report: a value outside the value
+/// set of an enum PARAMETER TYPE ([`REQUEST_ENUM_TYPES`]) is refused by naming
+/// that type, the value as sent and the type's modelled values — see
+/// [`enum_parameter_rejection`].
 pub fn validation_report(violations: &[Violation]) -> String {
+    // A value outside one of this service's enum PARAMETER TYPES is reported by
+    // the service's own parameter validation, which names the type and the
+    // value it was sent, and answers AHEAD of the generic constraint report —
+    // see [`enum_parameter_rejection`].
+    if let Some(report) = enum_parameter_rejection(violations) {
+        return report;
+    }
     let count = violations.len();
     let noun = if count == 1 { "error" } else { "errors" };
     let clauses: Vec<String> = violations.iter().map(validation_clause).collect();
@@ -382,6 +397,100 @@ fn validation_clause(violation: &Violation) -> String {
 /// rejected value is echoed in neither.
 pub fn constraint_report(member: &str, requirement: &str) -> String {
     format!("1 validation error detected: Value at '{member}' {CONSTRAINT_MARKER}{requirement}")
+}
+
+/// The enum parameter TYPES a REQUEST of this service can carry a value for,
+/// each under the name the model gives the shape, with the value set that shape
+/// declares.
+///
+/// Every entry is a typed Smithy `enum` SHAPE that some input member targets:
+/// `ruleType` (`RuleType`), an element of `recommendedActionTypes`
+/// (`RecommendedActionType`), `status` (`RuleStatus` on the rule operations,
+/// `EnrollmentStatus` on `UpdateEnrollmentConfiguration`),
+/// `organizationConfiguration.ruleApplyOrder` (`RuleApplyOrder`) and a criteria
+/// condition's `comparison` (`ComparisonOperator`) — the enum-typed input
+/// members of this service
+/// (`smithy_query(query="operation",operation="CreateAutomationRule,UpdateAutomationRule,UpdateEnrollmentConfiguration,ListAutomationRulePreview,ListAutomationRulePreviewSummaries")`).
+/// The model's remaining enum shapes — `EventStatus`, `EventType`, `StepStatus`,
+/// `StepType`, `ResourceType`, `OrganizationRuleMode`, `SavingsEstimationMode` —
+/// appear in RESPONSES only, so no request can be refused against one, and
+/// naming a type here cannot be ambiguous (`EventType` happens to share
+/// `RecommendedActionType`'s value set, and is not a request parameter).
+///
+/// Each value set is the GENERATED, model-derived constant for that shape, so no
+/// value list is spelled here: the set a request is refused against and the set
+/// the refusal enumerates move together with the model.
+///
+/// Membership of this table is also what separates a named parameter type from
+/// the model's legacy `@enum`-constrained STRINGS (`AutomationRuleFilterName`,
+/// `AutomationEventFilterName`, `RecommendedActionFilterName`,
+/// `SummaryDimensionKey`), which name no parameter type of their own and so keep
+/// the generic validation report.
+const REQUEST_ENUM_TYPES: &[(&str, &[&str])] = &[
+    ("ComparisonOperator", COMPARISON_OPERATOR_VALUES),
+    ("EnrollmentStatus", ENROLLMENT_STATUS_VALUES),
+    ("RecommendedActionType", RECOMMENDED_ACTION_TYPE_VALUES),
+    ("RuleApplyOrder", RULE_APPLY_ORDER_VALUES),
+    ("RuleStatus", RULE_STATUS_VALUES),
+    ("RuleType", RULE_TYPE_VALUES),
+];
+
+/// The rejection for the FIRST value these violations carry that fell outside
+/// one of this service's enum parameter types, or `None` when none did.
+///
+/// A request is judged parameter by parameter, so the refusal states the one
+/// parameter type it could not accept a value for rather than a count of
+/// constraint clauses; a refusal carrying no such parameter is left to the
+/// generic report.
+fn enum_parameter_rejection(violations: &[Violation]) -> Option<String> {
+    violations.iter().find_map(|violation| {
+        let ViolationKind::EnumValue(declared) = &violation.kind else {
+            return None;
+        };
+        // An absent member carries no value to name, so it is not this refusal.
+        let value = violation.value.as_deref()?;
+        let enum_type = request_enum_type(declared)?;
+        Some(invalid_enum_value_message(enum_type, value, declared))
+    })
+}
+
+/// The enum parameter type whose declared value set is `declared`.
+///
+/// A violation states the value set it refused a value against but not the shape
+/// that set came from, so the type is recovered by matching the set against
+/// [`REQUEST_ENUM_TYPES`]. Compared as a SET: a violation lists the model's
+/// declaration order, a generated value constant is sorted.
+fn request_enum_type(declared: &[String]) -> Option<&'static str> {
+    REQUEST_ENUM_TYPES
+        .iter()
+        .find(|(_, values)| same_value_set(values, declared))
+        .map(|(enum_type, _)| *enum_type)
+}
+
+/// Do these two value sets hold the same values? An enum's values are distinct,
+/// so equal lengths plus containment is set equality.
+fn same_value_set(declared: &[&str], refused: &[String]) -> bool {
+    declared.len() == refused.len()
+        && refused
+            .iter()
+            .all(|value| declared.contains(&value.as_str()))
+}
+
+/// The `InvalidParameterValueException` message for a value outside an enum
+/// parameter type's modelled value set.
+///
+/// Built from the request and the model and from nothing else: the TYPE whose
+/// set the value missed, the value exactly as the request sent it (bounded by
+/// the framework's echo cap on a violation's value), and that type's modelled
+/// values in the order the model declares them — which is the order the
+/// violation carries them in. The rejected value IS named here, unlike in the
+/// generic report: it is the token the caller has to replace, and a caller that
+/// sent a list of them needs to know which one was refused.
+fn invalid_enum_value_message(enum_type: &str, value: &str, valid: &[String]) -> String {
+    format!(
+        "Invalid {enum_type} value: {value}. Valid values: {}",
+        valid.join(", ")
+    )
 }
 
 /// The requirement a violation states.

@@ -6,10 +6,10 @@
 //! `MultiServiceRouter::dispatch` with real HTTP requests — so what is asserted
 //! is the emulator's wire behaviour, not an internal function's return value.
 //!
-//! The suites are tables over the THREE monitor template resources whose delete
-//! is implemented (the cloudwatch alarm template group, the eventbridge rule
-//! template group and the eventbridge rule template): the recorded case in the
-//! issue is one row of each.
+//! The suites are tables over the FOUR monitor template resources (the
+//! cloudwatch alarm template group, the cloudwatch alarm template, the
+//! eventbridge rule template group and the eventbridge rule template): the
+//! recorded case in the issue is one row of each.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -38,6 +38,9 @@ enum Kind {
     /// `/prod/eventbridge-rule-templates` (`smithy_query(query="operation",
     /// operation="DeleteEventBridgeRuleTemplate")`).
     RuleTemplate,
+    /// `/prod/cloudwatch-alarm-templates` (`smithy_query(query="operation",
+    /// operation="DeleteCloudWatchAlarmTemplate")`).
+    AlarmTemplate,
 }
 
 impl Kind {
@@ -48,19 +51,39 @@ impl Kind {
             Kind::AlarmGroup => "/prod/cloudwatch-alarm-template-groups",
             Kind::RuleGroup => "/prod/eventbridge-rule-template-groups",
             Kind::RuleTemplate => "/prod/eventbridge-rule-templates",
+            Kind::AlarmTemplate => "/prod/cloudwatch-alarm-templates",
+        }
+    }
+
+    /// The group kind a template of this kind belongs to, or `None` for a kind
+    /// that is itself a group.
+    fn parent_kind(self) -> Option<Kind> {
+        match self {
+            Kind::AlarmGroup | Kind::RuleGroup => None,
+            Kind::RuleTemplate => Some(Kind::RuleGroup),
+            Kind::AlarmTemplate => Some(Kind::AlarmGroup),
         }
     }
 
     /// Every kind this suite covers, so a row can span all of them.
-    const ALL: [Kind; 3] = [Kind::AlarmGroup, Kind::RuleGroup, Kind::RuleTemplate];
+    const ALL: [Kind; 4] = [
+        Kind::AlarmGroup,
+        Kind::RuleGroup,
+        Kind::RuleTemplate,
+        Kind::AlarmTemplate,
+    ];
 }
 
 /// The body that creates one resource of `kind` called `name`.
 ///
-/// An eventbridge rule TEMPLATE belongs to a group, so its create carries the
-/// `GroupIdentifier` of the group `parent` names; its `EventType` is one of the
-/// values `EventBridgeRuleTemplateEventType` declares and its one target is an
-/// SNS topic ARN, the kind `EventBridgeRuleTemplateTarget$Arn` documents.
+/// A TEMPLATE belongs to a group, so its create carries the `GroupIdentifier` of
+/// the group `parent` names. An eventbridge rule template's `EventType` is one of
+/// the values `EventBridgeRuleTemplateEventType` declares and its one target is
+/// an SNS topic ARN, the kind `EventBridgeRuleTemplateTarget$Arn` documents; a
+/// cloudwatch alarm template carries every member
+/// `CreateCloudWatchAlarmTemplate` requires, one declared value each
+/// (`smithy_query(query="operation",
+/// operation="CreateCloudWatchAlarmTemplate")`).
 fn create_body(kind: Kind, name: &str, parent: &str) -> Value {
     match kind {
         Kind::AlarmGroup | Kind::RuleGroup => json!({ "name": name }),
@@ -70,15 +93,29 @@ fn create_body(kind: Kind, name: &str, parent: &str) -> Value {
             "eventType": "MEDIALIVE_CHANNEL_STATE_CHANGE",
             "eventTargets": [{ "arn": format!("arn:aws:sns:{REGION}:{ACCOUNT}:alerts") }],
         }),
+        Kind::AlarmTemplate => json!({
+            "name": name,
+            "groupIdentifier": parent,
+            "comparisonOperator": "GreaterThanThreshold",
+            "evaluationPeriods": 1,
+            "metricName": "InputVideoFrameRate",
+            "period": 60,
+            "statistic": "Average",
+            "targetResourceType": "MEDIALIVE_CHANNEL",
+            "threshold": 1.0,
+            "treatMissingData": "missing",
+        }),
     }
 }
 
 /// The status a create of `kind` answers: a group create answers 201, and so
 /// does a template create (`smithy_query(query="operation",
-/// operation="CreateEventBridgeRuleTemplate")`: code 201).
+/// operation="CreateEventBridgeRuleTemplate")` and
+/// `smithy_query(query="operation", operation="CreateCloudWatchAlarmTemplate")`:
+/// code 201).
 const CREATED: u16 = 201;
 
-/// The status a monitor template delete answers: every one of the three is
+/// The status a monitor template delete answers: every one of the four is
 /// modelled `code 204`.
 const DELETED: u16 = 204;
 
@@ -131,15 +168,15 @@ async fn delete_in(
     .await
 }
 
-/// Create the group an eventbridge rule template needs, and answer the
-/// identifier its create must name. The group kinds need no parent, so they get
-/// an identifier nothing reads.
+/// Create the group a template kind needs, and answer the identifier its create
+/// must name. The group kinds need no parent, so they get an identifier nothing
+/// reads.
 async fn parent_of(router: &MultiServiceRouter, kind: Kind, label: &str) -> String {
-    if kind != Kind::RuleTemplate {
+    let Some(parent_kind) = kind.parent_kind() else {
         return String::new();
-    }
+    };
     let name = format!("parent-{label}");
-    let (status, group) = create_in(router, REGION, Kind::RuleGroup, &name, "").await;
+    let (status, group) = create_in(router, REGION, parent_kind, &name, "").await;
     assert_eq!(
         status, CREATED,
         "setup {label}: expected the parent group to be created, got {status}: {group}"
@@ -184,11 +221,11 @@ fn assert_no_body(case: &str, body: &Value) {
 /// delete of the same identifier answers that same 404, and the name the resource
 /// held is free for a new resource to take.
 ///
-/// The rows span what the rule generalises over: the resource TYPE (all three
-/// monitor template resources whose delete is implemented), the identifier FORM
-/// the delete names the resource by ("Can be either be its id or current name")
-/// and the form and size of the name itself, including the published maximum of
-/// the shape `Name` targets and a name outside ASCII.
+/// The rows span what the rule generalises over: the resource TYPE (all four
+/// monitor template resources), the identifier FORM the delete names the resource
+/// by ("Can be either be its id or current name") and the form and size of the
+/// name itself, including the published maximum of the shape `Name` targets and a
+/// name outside ASCII.
 #[tokio::test]
 async fn a_deleted_template_resource_stops_being_readable() {
     // (how the name is shaped, how to build one)
@@ -348,84 +385,93 @@ async fn a_delete_signed_for_another_region_removes_nothing() {
 /// the group and everything holding it stay exactly as they were — and the delete
 /// succeeds once the caller has met it.
 ///
-/// `DeleteEventBridgeRuleTemplateGroup` documents "You must ... ensure its
+/// `DeleteEventBridgeRuleTemplateGroup` and
+/// `DeleteCloudWatchAlarmTemplateGroup` both document "You must ... ensure its
 /// existing templates are moved to another group or deleted", so the rows differ
-/// along the NUMBER of templates the group still holds, up to the member count
-/// the store admits.
+/// along the group KIND and along the NUMBER of templates the group still holds,
+/// up to the member count the store admits.
 #[tokio::test]
 async fn a_group_delete_is_refused_while_it_still_holds_templates() {
-    for held in [1usize, 2, 5] {
-        let case = format!("group holding {held} template(s)");
-        let router = medialive();
+    // (the group kind, the kind of template it holds)
+    let pairs: [(Kind, Kind); 2] = [
+        (Kind::RuleGroup, Kind::RuleTemplate),
+        (Kind::AlarmGroup, Kind::AlarmTemplate),
+    ];
 
-        let group = "crowded-group";
-        let (status, created) = create_in(&router, REGION, Kind::RuleGroup, group, "").await;
-        assert_eq!(
-            status, CREATED,
-            "case {case:?}: expected the group to be created, got {status}: {created}"
-        );
+    for (group_kind, template_kind) in pairs {
+        for held in [1usize, 2, 5] {
+            let case = format!("{group_kind:?} holding {held} {template_kind:?}(s)");
+            let router = medialive();
 
-        let mut templates: Vec<String> = Vec::new();
-        for index in 0..held {
-            let name = format!("member-{index}");
-            let (status, template) =
-                create_in(&router, REGION, Kind::RuleTemplate, &name, group).await;
+            let group = "crowded-group";
+            let (status, created) = create_in(&router, REGION, group_kind, group, "").await;
             assert_eq!(
                 status, CREATED,
-                "case {case:?}: expected member {index} to be created, got {status}: {template}"
+                "case {case:?}: expected the group to be created, got {status}: {created}"
             );
-            templates.push(template["id"].as_str().unwrap_or_default().to_string());
-        }
 
-        let (status, refused) = delete_in(&router, REGION, Kind::RuleGroup, group).await;
-        assert_eq!(
-            status, 409,
-            "case {case:?}: expected the group delete to be refused, got {status}: {refused}"
-        );
-        assert_eq!(
-            error_code(status, &refused),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {refused}"
-        );
+            let mut templates: Vec<String> = Vec::new();
+            for index in 0..held {
+                let name = format!("member-{index}");
+                let (status, template) =
+                    create_in(&router, REGION, template_kind, &name, group).await;
+                assert_eq!(
+                    status, CREATED,
+                    "case {case:?}: expected member {index} to be created, got {status}: {template}"
+                );
+                templates.push(template["id"].as_str().unwrap_or_default().to_string());
+            }
 
-        // Nothing was removed: the group and every member still read back.
-        let (status, read) = get_in(&router, REGION, Kind::RuleGroup, group).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected the refused delete to leave the group, got {status}: {read}"
-        );
-        assert_eq!(
-            read, created,
-            "case {case:?}: expected the group unchanged, got {read}"
-        );
-        for id in &templates {
-            let (status, read) = get_in(&router, REGION, Kind::RuleTemplate, id).await;
+            let (status, refused) = delete_in(&router, REGION, group_kind, group).await;
+            assert_eq!(
+                status, 409,
+                "case {case:?}: expected the group delete to be refused, got {status}: {refused}"
+            );
+            assert_eq!(
+                error_code(status, &refused),
+                "ConflictException",
+                "case {case:?}: expected ConflictException, got {refused}"
+            );
+
+            // Nothing was removed: the group and every member still read back.
+            let (status, read) = get_in(&router, REGION, group_kind, group).await;
             assert_eq!(
                 status, 200,
-                "case {case:?}: expected member {id} to survive, got {status}: {read}"
+                "case {case:?}: expected the refused delete to leave the group, got {status}: {read}"
             );
-        }
+            assert_eq!(
+                read, created,
+                "case {case:?}: expected the group unchanged, got {read}"
+            );
+            for id in &templates {
+                let (status, read) = get_in(&router, REGION, template_kind, id).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected member {id} to survive, got {status}: {read}"
+                );
+            }
 
-        // Meeting the precondition — deleting the members — lets the group go.
-        for id in &templates {
-            let (status, body) = delete_in(&router, REGION, Kind::RuleTemplate, id).await;
+            // Meeting the precondition — deleting the members — lets the group go.
+            for id in &templates {
+                let (status, body) = delete_in(&router, REGION, template_kind, id).await;
+                assert_eq!(
+                    status, DELETED,
+                    "case {case:?}: expected member {id} to be deleted, got {status}: {body}"
+                );
+            }
+            let (status, body) = delete_in(&router, REGION, group_kind, group).await;
             assert_eq!(
                 status, DELETED,
-                "case {case:?}: expected member {id} to be deleted, got {status}: {body}"
+                "case {case:?}: expected the emptied group to be deleted, got {status}: {body}"
+            );
+            assert_no_body(&case, &body);
+
+            let (status, read) = get_in(&router, REGION, group_kind, group).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected the deleted group to read 404, got {status}: {read}"
             );
         }
-        let (status, body) = delete_in(&router, REGION, Kind::RuleGroup, group).await;
-        assert_eq!(
-            status, DELETED,
-            "case {case:?}: expected the emptied group to be deleted, got {status}: {body}"
-        );
-        assert_no_body(&case, &body);
-
-        let (status, read) = get_in(&router, REGION, Kind::RuleGroup, group).await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected the deleted group to read 404, got {status}: {read}"
-        );
     }
 }
 
@@ -527,23 +573,49 @@ async fn a_group_delete_is_refused_while_a_signal_map_names_it() {
 async fn a_delete_removes_only_the_resource_it_named() {
     let router = medialive();
 
-    // Two groups of each kind, and two templates in the first rule group, so
-    // every kind has a sibling the delete must not touch.
-    let (status, group) = create_in(&router, REGION, Kind::RuleGroup, "holder", "").await;
-    assert_eq!(status, CREATED, "setup: the holding group got {status}: {group}");
+    // Two groups of each kind, and two templates of each kind in a holding group
+    // of the matching kind, so every kind has a sibling the delete must not
+    // touch.
+    // (the holding group's kind, its name)
+    let holders: [(Kind, &str); 2] = [
+        (Kind::RuleGroup, "holder"),
+        (Kind::AlarmGroup, "alarm-holder"),
+    ];
+    for (kind, name) in holders {
+        let (status, group) = create_in(&router, REGION, kind, name, "").await;
+        assert_eq!(
+            status, CREATED,
+            "setup: the holding {kind:?} {name:?} got {status}: {group}"
+        );
+    }
+
+    /// The holding group a template of `kind` is created in; a group kind needs
+    /// no parent, so it gets an identifier nothing reads.
+    fn holder_for(kind: Kind) -> &'static str {
+        match kind.parent_kind() {
+            Some(Kind::AlarmGroup) => "alarm-holder",
+            Some(_) => "holder",
+            None => "",
+        }
+    }
 
     // (the kind, the names of the two resources of that kind)
-    let plan: [(Kind, [&str; 2]); 3] = [
+    let plan: [(Kind, [&str; 2]); 4] = [
         (Kind::AlarmGroup, ["alarm-one", "alarm-two"]),
         (Kind::RuleGroup, ["rule-group-one", "rule-group-two"]),
         (Kind::RuleTemplate, ["template-one", "template-two"]),
+        (
+            Kind::AlarmTemplate,
+            ["alarm-template-one", "alarm-template-two"],
+        ),
     ];
 
     // (kind, name, id) of everything created, so the survivors can be re-read.
     let mut stored: Vec<(Kind, String, String)> = Vec::new();
     for (kind, names) in plan {
         for name in names {
-            let (status, created) = create_in(&router, REGION, kind, name, "holder").await;
+            let (status, created) =
+                create_in(&router, REGION, kind, name, holder_for(kind)).await;
             assert_eq!(
                 status, CREATED,
                 "setup {kind:?} {name:?}: expected {CREATED}, got {status}: {created}"

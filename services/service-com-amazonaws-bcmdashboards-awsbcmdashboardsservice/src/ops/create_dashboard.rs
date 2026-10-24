@@ -7,9 +7,13 @@
 //! `createdAt`/`updatedAt` taken at the moment of the call) in this service's state, and
 //! returns the ARN it stored the record under.
 //!
+//! A dashboard's name identifies it within the account, so a create naming a dashboard the
+//! account already holds is refused with the modelled `ValidationException` (HTTP 400) and
+//! stores nothing.
+//!
 //! Being state-changing, it emits the audit record `crate::state::record_state_change`
 //! writes (timestamp, source, presented access key id, operation, resource, outcome) on
-//! both the success and the quota-refusal path.
+//! both the success and the refusal paths (the quota and the duplicate name).
 //!
 //!
 //! ## Shape of an operation
@@ -170,6 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // A dashboard's name identifies it within the account: `name` is documented as
+        // "The name of the dashboard. The name must be unique within your account."
+        // (`smithy_query(query="doc",shape="CreateDashboardRequest",member="name")`), so a
+        // create naming a dashboard the account already holds is refused with this
+        // operation's modelled `ValidationException` (HTTP 400 — it declares no conflict
+        // error) and stores nothing: no ARN is minted and no widget id is consumed.
+        if state.dashboard_arn_by_name(&input.name).is_some() {
+            crate::state::record_state_change(ctx, Self::NAME, "-", "ValidationException");
+            return Err(CreateDashboardErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::duplicate_dashboard_name_message(&input.name),
+                },
+            )
+            .into());
+        }
+
         // Every dashboard is a stored record, so the number of them a caller can create
         // is bounded, as it is on the real service: past the quota this operation answers
         // its own modelled `ServiceQuotaExceededException` (HTTP 402) instead of growing
@@ -192,9 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A fresh ARN per call, so two dashboards created with the same `name` are
-        // distinct resources: this operation models no conflict error, and the ARN
-        // must be the key the record is stored under.
+        // The ARN is the key the record is stored under, and it is fresh per create: a
+        // name the account no longer holds (its dashboard was deleted) can be created
+        // again, and never under the deleted dashboard's ARN.
         let arn = state.mint_dashboard_arn();
         let widgets = state.adopt_widgets(input.widgets);
         let now = ::std::time::SystemTime::now();

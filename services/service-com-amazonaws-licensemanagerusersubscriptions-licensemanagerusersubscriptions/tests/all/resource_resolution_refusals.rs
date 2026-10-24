@@ -1073,8 +1073,10 @@ async fn associating_through_an_unregistered_directory_is_a_not_found() {
 
 /// RULE: a license server endpoint is computed from, and persisted in, state — it is
 /// created against the registration the request names, reported with the members state
-/// holds (never an invented address or health status), and a deletion removes it so the
-/// same ARN fails closed afterwards.
+/// holds (never an invented address or health status), and a deletion puts it in the
+/// `DELETING` status it keeps reporting (`DeleteLicenseServerEndpoint` is `@idempotent`,
+/// so a repeat delete answers with the same endpoint rather than failing closed; the
+/// lifecycle itself is pinned by `license_server_endpoint_deletion.rs`).
 #[tokio::test]
 async fn license_server_endpoints_round_trip_and_deletion_removes_them() {
     let h = harness();
@@ -1175,13 +1177,36 @@ async fn license_server_endpoints_round_trip_and_deletion_removes_them() {
             );
         }
 
-        // Removed means removed: the same ARN fails closed afterwards.
+        // `@idempotent`: deletion is asynchronous, so the endpoint is still held in
+        // `DELETING` and a repeat delete answers with it instead of failing closed.
+        let again = delete_endpoint(
+            &h,
+            &json!({ "LicenseServerEndpointArn": endpoint_arn, "ServerType": "RDS_SAL" }),
+        )
+        .await;
+        let repeated = again.ok(&format!("{case} (repeat deletion)"))["LicenseServerEndpoint"]
+            .clone();
+        assert_eq!(
+            repeated.get("LicenseServerEndpointArn").and_then(Value::as_str),
+            Some(endpoint_arn.as_str()),
+            "case {case:?}: a repeat deletion must answer the same endpoint, got {repeated:?}"
+        );
+        assert_eq!(
+            repeated
+                .get("LicenseServerEndpointProvisioningStatus")
+                .and_then(Value::as_str),
+            Some("DELETING"),
+            "case {case:?}: a repeat deletion must not restart the deletion, got {repeated:?}"
+        );
+
+        // An endpoint ARN state never held still fails closed.
+        let absent = format!("{endpoint_arn}-absent");
         assert_fails_closed(
-            &format!("{case} (after deletion)"),
-            &endpoint_arn,
+            &format!("{case} (an endpoint ARN state never held)"),
+            &absent,
             &delete_endpoint(
                 &h,
-                &json!({ "LicenseServerEndpointArn": endpoint_arn, "ServerType": "RDS_SAL" }),
+                &json!({ "LicenseServerEndpointArn": absent, "ServerType": "RDS_SAL" }),
             )
             .await,
         );

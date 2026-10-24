@@ -50,9 +50,24 @@ pub const PROVISIONING_STATUS_PROVISIONING: &str = "PROVISIONING";
 /// The `LicenseServerEndpointProvisioningStatus` an endpoint carries once provisioning
 /// completed.
 pub const PROVISIONING_STATUS_PROVISIONED: &str = "PROVISIONED";
-/// The `LicenseServerEndpointProvisioningStatus` returned by
-/// `DeleteLicenseServerEndpoint` for the endpoint it removed.
+/// The `LicenseServerEndpointProvisioningStatus` an endpoint carries from the moment
+/// `DeleteLicenseServerEndpoint` accepted its deletion until that deletion completes.
 pub const PROVISIONING_STATUS_DELETING: &str = "DELETING";
+/// The terminal `LicenseServerEndpointProvisioningStatus` an endpoint reaches once the
+/// deletion that put it in [`PROVISIONING_STATUS_DELETING`] has completed.
+pub const PROVISIONING_STATUS_DELETED: &str = "DELETED";
+
+/// Whether `status` is a `LicenseServerEndpointProvisioningStatus` an endpoint carries
+/// because its deletion was accepted — `DELETING` while the deletion runs, `DELETED` once
+/// it finished.
+///
+/// An endpoint in either status is still REPORTED (that is the point of modelling the two
+/// statuses) but is no longer a live resource: it cannot be addressed by
+/// `(IdentityProviderArn, ServerType)`, it is not taggable, and it does not count against
+/// the account's endpoint quota.
+pub fn endpoint_deletion_started(status: &str) -> bool {
+    status == PROVISIONING_STATUS_DELETING || status == PROVISIONING_STATUS_DELETED
+}
 
 /// How long after `RegisterIdentityProvider` the registration becomes `REGISTERED`.
 ///
@@ -79,6 +94,25 @@ const ASSOCIATION_SPAN: Duration = Duration::from_millis(500);
 /// observes that transient status, and a later read materialises the transition the
 /// clock already owed.
 const ENDPOINT_PROVISIONING_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteLicenseServerEndpoint` the endpoint reaches the terminal
+/// `DELETED`.
+///
+/// A chosen span (AWS documents no duration for it), kept inside the emulator's
+/// 250-750 ms window for a clock-owed transition: the delete call answers with the
+/// non-terminal `DELETING` status, so a caller that lists the endpoint straight away
+/// still observes that transient status, and a later read materialises the terminal
+/// `DELETED` the clock already owed.
+const ENDPOINT_DELETION_SPAN: Duration = Duration::from_millis(500);
+
+/// The most endpoints whose deletion has completed that the store keeps reporting.
+///
+/// A deleted endpoint stays observable in its terminal `DELETED` status rather than
+/// vanishing between two reads, so the records cannot simply be dropped — but a caller
+/// looping create/delete must not grow the store without bound either. Beyond this many,
+/// the endpoints deleted EARLIEST are dropped, which keeps the retained set bounded by
+/// the same number as the live one ([`MAX_RESOURCES_PER_KIND`]).
+pub const MAX_DELETED_ENDPOINTS_RETAINED: usize = MAX_RESOURCES_PER_KIND;
 
 /// The most subnets one `UpdateSettings` payload may name in `AddSubnets` or in
 /// `RemoveSubnets`.
@@ -423,7 +457,8 @@ pub struct LicenseServerEndpointRecord {
     /// there is no address to reach while it is still being provisioned.
     pub endpoint: String,
     /// `PROVISIONING` until [`ENDPOINT_PROVISIONING_SPAN`] has elapsed, then
-    /// `PROVISIONED`; `DELETING` on the answer `DeleteLicenseServerEndpoint` returns.
+    /// `PROVISIONED`; `DELETING` from the moment a deletion was accepted until
+    /// [`ENDPOINT_DELETION_SPAN`] has elapsed, then the terminal `DELETED`.
     pub provisioning_status: String,
     /// Set only when the service has something to report; never fabricated.
     pub status_message: Option<String>,
@@ -431,6 +466,13 @@ pub struct LicenseServerEndpointRecord {
     pub created_at: SystemTime,
     /// When the `PROVISIONING` -> `PROVISIONED` transition falls due.
     pub provisioned_due_at: SystemTime,
+    /// When the deletion was accepted, or `None` while the endpoint is still live. The
+    /// order deletions were accepted in is what bounds the retained set (see
+    /// [`MAX_DELETED_ENDPOINTS_RETAINED`]).
+    pub deletion_started_at: Option<SystemTime>,
+    /// When the `DELETING` -> `DELETED` transition falls due, or `None` while the
+    /// endpoint is still live.
+    pub deleted_due_at: Option<SystemTime>,
 }
 
 /// Per-service state for com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions. A handler reaches it through [`service_state`].
@@ -587,8 +629,10 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// registration whose [`REGISTRATION_SPAN`] has elapsed becomes `REGISTERED`, a user
     /// association whose [`ASSOCIATION_SPAN`] has elapsed becomes `ASSOCIATED`, and a
     /// license server endpoint whose [`ENDPOINT_PROVISIONING_SPAN`] has elapsed becomes
-    /// `PROVISIONED`. Reporting operations call this so a read reflects the clock without
-    /// the read itself changing anything a later caller would not have seen anyway.
+    /// `PROVISIONED`, and one whose deletion was accepted [`ENDPOINT_DELETION_SPAN`] ago
+    /// reaches the terminal `DELETED`. Reporting operations call this so a read reflects
+    /// the clock without the read itself changing anything a later caller would not have
+    /// seen anyway.
     ///
     /// Every request runs this, so the common case must not scale with how much the store
     /// holds: `pending_transition_due_at` is the O(1) guard, and a record is visited only
@@ -627,13 +671,22 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             }
         }
         for record in self.license_server_endpoints.values_mut() {
-            if record.provisioning_status != PROVISIONING_STATUS_PROVISIONING {
-                continue;
-            }
-            if now >= record.provisioned_due_at {
-                record.provisioning_status = PROVISIONING_STATUS_PROVISIONED.to_string();
-            } else {
-                still_pending(record.provisioned_due_at, &mut next);
+            if record.provisioning_status == PROVISIONING_STATUS_PROVISIONING {
+                if now >= record.provisioned_due_at {
+                    record.provisioning_status = PROVISIONING_STATUS_PROVISIONED.to_string();
+                } else {
+                    still_pending(record.provisioned_due_at, &mut next);
+                }
+            } else if record.provisioning_status == PROVISIONING_STATUS_DELETING {
+                // The deletion the clock owes: a `DELETING` endpoint reaches the terminal
+                // `DELETED` once its span has elapsed, whether or not anybody called.
+                if let Some(due_at) = record.deleted_due_at {
+                    if now >= due_at {
+                        record.provisioning_status = PROVISIONING_STATUS_DELETED.to_string();
+                    } else {
+                        still_pending(due_at, &mut next);
+                    }
+                }
             }
         }
         self.pending_transition_due_at = next;
@@ -771,8 +824,86 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .collect()
     }
 
+    /// How many LIVE license server endpoints the account holds: an endpoint whose
+    /// deletion was accepted ([`endpoint_deletion_started`]) is still reported, but it no
+    /// longer occupies a slot in the account's quota.
+    pub fn live_license_server_endpoint_count(&self) -> usize {
+        self.license_server_endpoints
+            .values()
+            .filter(|record| !endpoint_deletion_started(&record.provisioning_status))
+            .count()
+    }
+
+    /// Accept the deletion of one license server endpoint: it enters `DELETING` now and
+    /// owes the clock the terminal `DELETED` at [`ENDPOINT_DELETION_SPAN`].
+    ///
+    /// Deletion is ASYNCHRONOUS — that is what `LicenseServerEndpointProvisioningStatus`
+    /// models `DELETING` and `DELETED` for — so the record is NOT dropped here: a caller
+    /// polling `ListLicenseServerEndpoints` keeps seeing the endpoint in `DELETING` and
+    /// then in `DELETED`, instead of it vanishing between two reads. What the deletion
+    /// does take away immediately is everything that made the endpoint a LIVE resource:
+    /// the `(IdentityProviderArn, ServerType)` index entry, so a create for the same pair
+    /// mints a new endpoint rather than resolving this one, and the tags, so the tagging
+    /// surface no longer resolves it.
+    ///
+    /// Returns the record as the deletion left it (`DELETING`), or `None` when the ARN
+    /// names no stored endpoint. An endpoint whose deletion was ALREADY accepted is
+    /// returned unchanged, which is what this operation's `@idempotent` trait asks for:
+    /// a repeat delete neither restarts the deletion nor moves the terminal status back.
+    pub fn begin_license_server_endpoint_deletion(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<LicenseServerEndpointRecord> {
+        let record = self.license_server_endpoints.get_mut(arn)?;
+        if endpoint_deletion_started(&record.provisioning_status) {
+            return Some(record.clone());
+        }
+        record.provisioning_status = PROVISIONING_STATUS_DELETING.to_string();
+        record.deletion_started_at = Some(now);
+        let due_at = now + ENDPOINT_DELETION_SPAN;
+        record.deleted_due_at = Some(due_at);
+        let deleting = record.clone();
+        self.license_server_endpoint_index
+            .retain(|_, indexed| indexed != arn);
+        self.tags.remove(arn);
+        // The `DELETING` -> `DELETED` transition the clock now owes.
+        self.schedule_transition(due_at);
+        self.prune_deleted_license_server_endpoints();
+        Some(deleting)
+    }
+
+    /// Drop the endpoints whose deletion was accepted EARLIEST, so no more than
+    /// [`MAX_DELETED_ENDPOINTS_RETAINED`] deleted endpoints are retained.
+    fn prune_deleted_license_server_endpoints(&mut self) {
+        let mut deleted: Vec<(SystemTime, String)> = self
+            .license_server_endpoints
+            .values()
+            .filter(|record| endpoint_deletion_started(&record.provisioning_status))
+            .map(|record| {
+                (
+                    record.deletion_started_at.unwrap_or(record.created_at),
+                    record.arn.clone(),
+                )
+            })
+            .collect();
+        if deleted.len() <= MAX_DELETED_ENDPOINTS_RETAINED {
+            return;
+        }
+        deleted.sort();
+        let excess = deleted.len() - MAX_DELETED_ENDPOINTS_RETAINED;
+        for (_, arn) in deleted.into_iter().take(excess) {
+            self.remove_license_server_endpoint(&arn);
+        }
+    }
+
     /// Remove one license server endpoint from the store, the order it is listed in and
     /// the `(provider, server type)` index that reaches it.
+    ///
+    /// This is the FINAL drop, which stops reporting the endpoint altogether; a deletion
+    /// the caller asked for goes through
+    /// [`begin_license_server_endpoint_deletion`](Self::begin_license_server_endpoint_deletion)
+    /// instead, so the statuses the model defines for it stay observable.
     pub fn remove_license_server_endpoint(
         &mut self,
         arn: &str,
@@ -788,11 +919,19 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// Whether `arn` names a resource THIS service holds — the one resolution the
     /// tagging surface runs, whose `ResourceArn` may name any of this service's
     /// resource kinds.
+    ///
+    /// A license server endpoint whose deletion was accepted is NOT one: it is still
+    /// reported in its `DELETING`/`DELETED` status, but it is on its way out and carries
+    /// no tags any more, so the tagging surface resolves it exactly as it resolves an
+    /// endpoint that is gone.
     pub fn holds_resource(&self, arn: &str) -> bool {
         self.identity_providers.contains_key(arn)
             || self.product_users.contains_key(arn)
             || self.instance_users.contains_key(arn)
-            || self.license_server_endpoints.contains_key(arn)
+            || self
+                .license_server_endpoints
+                .get(arn)
+                .is_some_and(|record| !endpoint_deletion_started(&record.provisioning_status))
     }
 
     /// Merge `tags` into the tags held against `arn`.
@@ -1042,10 +1181,19 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// through it and the license server endpoints created for it (both are only
     /// reachable through their provider).
     ///
+    /// The endpoints are DELETED the same asynchronous way `DeleteLicenseServerEndpoint`
+    /// deletes one — they enter `DELETING` and reach `DELETED` when the clock owes it —
+    /// because how an endpoint's deletion becomes observable does not depend on what
+    /// asked for it.
+    ///
     /// User ASSOCIATIONS are not removed: an association names a directory and no
     /// product (`AssociateUser` carries no `Product`), so it outlives the registration
     /// of any one product for that directory.
-    pub fn remove_identity_provider(&mut self, arn: &str) -> Option<IdentityProviderRecord> {
+    pub fn remove_identity_provider(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<IdentityProviderRecord> {
         let record = self.identity_providers.remove(arn)?;
         self.identity_provider_order.retain(|a| a != arn);
         self.identity_provider_index
@@ -1066,7 +1214,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .map(|endpoint| endpoint.arn.clone())
             .collect();
         for endpoint_arn in orphaned {
-            self.remove_license_server_endpoint(&endpoint_arn);
+            self.begin_license_server_endpoint_deletion(&endpoint_arn, now);
         }
         // Which products the instances in view provide is read from the registrations, so
         // removing one changes those views.

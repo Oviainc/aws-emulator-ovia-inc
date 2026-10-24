@@ -35,6 +35,7 @@ use service_com_amazonaws_groundstation_groundstation::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::dataflow_endpoint_group_listing::listed_ids;
 use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, REGION};
 
 /// Longer than this service's chosen `creating` -> `created` endpoint settle span, so a
@@ -171,7 +172,7 @@ pub(crate) fn security_details() -> Value {
 
 /// One `EndpointDetails`: the endpoint `member` carries, with the group's security
 /// details when `with_security`.
-fn details(member: &str, body: &Value, with_security: bool) -> Value {
+pub(crate) fn details(member: &str, body: &Value, with_security: bool) -> Value {
     let mut item = Map::new();
     if with_security {
         item.insert("securityDetails".to_string(), security_details());
@@ -189,12 +190,12 @@ fn with_member(body: &Value, key: &str, value: &Value) -> Value {
 }
 
 /// `POST /dataflowEndpointGroup`.
-async fn create_group(router: &MultiServiceRouter, body: Value) -> Reply {
+pub(crate) async fn create_group(router: &MultiServiceRouter, body: Value) -> Reply {
     send(router, "POST", "/dataflowEndpointGroup", Some(body)).await
 }
 
 /// `GET /dataflowEndpointGroup/{dataflowEndpointGroupId}`.
-async fn get_group(router: &MultiServiceRouter, id: &str) -> Reply {
+pub(crate) async fn get_group(router: &MultiServiceRouter, id: &str) -> Reply {
     send(router, "GET", &format!("/dataflowEndpointGroup/{id}"), None).await
 }
 
@@ -210,56 +211,13 @@ async fn delete_group(router: &MultiServiceRouter, id: &str) -> Reply {
 }
 
 /// `GET /dataflowEndpointGroup`, with `query` appended verbatim (`""` for no filters).
-async fn list_groups(router: &MultiServiceRouter, query: &str) -> Reply {
+pub(crate) async fn list_groups(router: &MultiServiceRouter, query: &str) -> Reply {
     send(router, "GET", &format!("/dataflowEndpointGroup{query}"), None).await
-}
-
-/// How many groups the listing reports, across however many pages it takes.
-async fn list_all_ids(router: &MultiServiceRouter, page_size: Option<usize>) -> Vec<String> {
-    let mut ids = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let mut query = Vec::new();
-        if let Some(size) = page_size {
-            query.push(format!("maxResults={size}"));
-        }
-        if let Some(next) = &token {
-            query.push(format!("nextToken={next}"));
-        }
-        let suffix = if query.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", query.join("&"))
-        };
-        let page = list_groups(router, &suffix).await;
-        assert_eq!(
-            page.status, 200,
-            "ListDataflowEndpointGroups{suffix}: expected 200, got {} {}",
-            page.status, page.body
-        );
-        for item in page
-            .field("dataflowEndpointGroupList")
-            .as_array()
-            .unwrap_or_else(|| panic!("dataflowEndpointGroupList is not a list: {}", page.body))
-        {
-            ids.push(
-                item.get("dataflowEndpointGroupId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| panic!("a list item without an id: {item}"))
-                    .to_string(),
-            );
-        }
-        match page.field("nextToken").as_str() {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
-        }
-    }
-    ids
 }
 
 /// The ARN this service mints for a group: `dataflow-endpoint-group/<uuid>` under the
 /// request's region and the emulator's account.
-fn expected_arn(id: &str) -> String {
+pub(crate) fn expected_arn(id: &str) -> String {
     format!(
         "arn:aws:groundstation:{REGION}:{}:dataflow-endpoint-group/{id}",
         engine::emulator_account_id()
@@ -445,10 +403,10 @@ async fn an_endpoint_without_security_details_is_refused_whatever_kind_it_is() {
         );
     }
 
+    let listed = listed_ids(&router, None, 0).await;
     assert!(
-        list_all_ids(&router, None).await.is_empty(),
-        "a refused create must store nothing, got {:?}",
-        list_all_ids(&router, None).await
+        listed.is_empty(),
+        "a refused create must store nothing, got {listed:?}"
     );
 }
 
@@ -578,7 +536,7 @@ async fn one_group_holds_endpoints_of_one_type_and_each_item_names_exactly_one()
         );
     }
 
-    let mut stored = list_all_ids(&router, None).await;
+    let mut stored = listed_ids(&router, None, created_ids.len()).await;
     stored.sort();
     created_ids.sort();
     assert_eq!(
@@ -778,8 +736,10 @@ async fn the_listing_returns_every_group_once_and_a_deleted_group_is_gone() {
     created.sort();
 
     // Every page size reports the same groups, each exactly once, in one stable order.
-    for page_size in [None, Some(1), Some(2), Some(GROUPS), Some(100)] {
-        let listed = list_all_ids(&router, page_size).await;
+    // The page walk itself (with the per-page bound and token-shape assertions it carries)
+    // lives in the listing suite, so this target holds one walker rather than two.
+    for page_size in [None, Some(1), Some(2), Some(GROUPS as i64), Some(100)] {
+        let listed = listed_ids(&router, page_size, GROUPS).await;
         assert_eq!(
             listed, created,
             "case maxResults={page_size:?}: expected {created:?}, got {listed:?}"
@@ -826,7 +786,7 @@ async fn the_listing_returns_every_group_once_and_a_deleted_group_is_gone() {
         );
     }
 
-    let listed = list_all_ids(&router, Some(2)).await;
+    let listed = listed_ids(&router, Some(2), created.len()).await;
     assert_eq!(
         listed, created,
         "after the delete the listing must report the remaining groups: expected \
