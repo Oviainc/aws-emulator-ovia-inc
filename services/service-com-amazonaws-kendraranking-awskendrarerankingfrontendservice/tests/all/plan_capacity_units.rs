@@ -3,14 +3,15 @@
 //! The capacity configuration a rescore execution plan carries, end to end over the
 //! wire.
 //!
-//! The rule under test: a rescore execution plan ALWAYS has a capacity configuration,
-//! so `DescribeRescoreExecutionPlan` always reports `CapacityUnits`, and a plan given
-//! no additional capacity units carries `RescoreCapacityUnits: 0` — "A capacity of zero
-//! indicates that the rescore execution plan is using the default capacity."
-//! (`DescribeRescoreExecutionPlanResponse$CapacityUnits`), because not setting the
-//! member asks for zero EXTRA units ("You are given a single capacity unit by default.
-//! If you want to use the default capacity, you don't set additional capacity units." —
-//! `CreateRescoreExecutionPlanRequest$CapacityUnits`).
+//! The rule under test: `CapacityUnits` is an OPTIONAL member with no `@default` on both
+//! the create request and the describe response (smithy_query:
+//! `CreateRescoreExecutionPlanRequest$CapacityUnits`,
+//! `DescribeRescoreExecutionPlanResponse$CapacityUnits`), so a plan reports the
+//! configuration a call explicitly gave it and NOTHING where no call gave one — a create
+//! that carries no `CapacityUnits` reads back with the key absent, not with a
+//! synthesized zeroed structure. An explicit `CapacityUnits` on a create or an update is
+//! the only thing that configures a plan, and an update that omits the member leaves the
+//! stored configuration (or its absence) alone.
 //!
 //! Each rule is asserted over a TABLE whose rows differ along the capacity the plan was
 //! configured with — the member absent, the bottom of the published range, and values
@@ -18,8 +19,6 @@
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
-
-use service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::state;
 
 use crate::harness::{call, emulator, sleep_past_the_transition};
 
@@ -31,19 +30,22 @@ async fn describe(router: &MultiServiceRouter, id: &str) -> Value {
     described
 }
 
-/// The `CapacityUnits.RescoreCapacityUnits` a describe reported, or `None` when the
-/// answer omitted either level.
-fn reported_capacity(described: &Value) -> Option<i64> {
-    described["CapacityUnits"]["RescoreCapacityUnits"].as_i64()
+/// The `CapacityUnits` a describe reported, exactly as the body carries it:
+/// `Value::Null` when the body has no such key at all.
+fn reported_capacity(described: &Value) -> Value {
+    described
+        .get("CapacityUnits")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 /// One row of the create table: the `CapacityUnits` member the create carried
-/// (`Value::Null` for a create that carries no such member at all), and the capacity the
-/// plan must report afterwards.
+/// (`Value::Null` for a create that carries no such member at all), and the
+/// `CapacityUnits` the plan must report afterwards (`Value::Null` for "no such key").
 struct CreateCase {
     case: &'static str,
     capacity_units: Value,
-    expected: i64,
+    expected: Value,
 }
 
 /// Create a plan named `name` carrying `capacity_units` (`Value::Null` to omit the
@@ -66,117 +68,130 @@ async fn create_with_capacity(
 }
 
 #[tokio::test]
-async fn describe_always_reports_the_capacity_a_create_configured() {
+async fn describe_reports_exactly_the_capacity_a_create_configured() {
     let router = emulator();
 
     // The rows differ along the capacity the create configured. The absent-member row is
-    // the one the default rule is about; the `0` row is the bottom of
-    // `CapacityUnitsConfiguration$RescoreCapacityUnits`'s published `@range` (min 0), and
-    // the others are values above it, including one no other suite in this crate cites.
+    // the one the optionality rule is about; the `0` row is the bottom of
+    // `CapacityUnitsConfiguration$RescoreCapacityUnits`'s published `@range` (min 0) and
+    // is NOT the same answer as the absent one, and the others are values above it,
+    // including one no other suite in this crate cites.
     let cases = [
         CreateCase {
             case: "no CapacityUnits member at all",
             capacity_units: Value::Null,
-            expected: state::DEFAULT_RESCORE_CAPACITY_UNITS.into(),
+            expected: Value::Null,
         },
         CreateCase {
             case: "the bottom of the published range",
             capacity_units: json!({ "RescoreCapacityUnits": 0 }),
-            expected: 0,
+            expected: json!({ "RescoreCapacityUnits": 0 }),
         },
         CreateCase {
             case: "one additional capacity unit",
             capacity_units: json!({ "RescoreCapacityUnits": 1 }),
-            expected: 1,
+            expected: json!({ "RescoreCapacityUnits": 1 }),
         },
         CreateCase {
             case: "many additional capacity units",
             capacity_units: json!({ "RescoreCapacityUnits": 42 }),
-            expected: 42,
+            expected: json!({ "RescoreCapacityUnits": 42 }),
         },
         CreateCase {
             case: "the top of the integer the member is modelled as",
             capacity_units: json!({ "RescoreCapacityUnits": i32::MAX }),
-            expected: i64::from(i32::MAX),
+            expected: json!({ "RescoreCapacityUnits": i32::MAX }),
         },
     ];
 
-    for (index, CreateCase {
-        case,
-        capacity_units,
-        expected,
-    }) in cases.iter().enumerate()
+    for (
+        index,
+        CreateCase {
+            case,
+            capacity_units,
+            expected,
+        },
+    ) in cases.iter().enumerate()
     {
-        let id = create_with_capacity(&router, &format!("capacity-plan-{index}"), capacity_units)
-            .await;
+        let id =
+            create_with_capacity(&router, &format!("capacity-plan-{index}"), capacity_units).await;
 
         // Reported the same way while the plan is still CREATING and once the clock owes
         // it ACTIVE: the capacity is a configuration, not a function of the status.
         let described = describe(&router, &id).await;
+        let actual = reported_capacity(&described);
         assert_eq!(
-            reported_capacity(&described),
-            Some(*expected),
-            "case {case:?}: expected CapacityUnits.RescoreCapacityUnits {expected}, got {described}"
+            &actual, expected,
+            "case {case:?}: expected CapacityUnits {expected}, got {actual:?} in {described}"
         );
 
         sleep_past_the_transition();
         let described = describe(&router, &id).await;
+        let actual = reported_capacity(&described);
         assert_eq!(
-            reported_capacity(&described),
-            Some(*expected),
-            "case {case:?} (settled): expected CapacityUnits.RescoreCapacityUnits \
-             {expected}, got {described}"
+            &actual, expected,
+            "case {case:?} (settled): expected CapacityUnits {expected}, got {actual:?} in \
+             {described}"
         );
     }
 }
 
 /// One row of the update table: the capacity the plan was created with, the
-/// `CapacityUnits` member the update carried, and the capacity the plan must report
-/// afterwards.
+/// `CapacityUnits` member the update carried, and the `CapacityUnits` the plan must
+/// report afterwards. `Value::Null` means "no such member / no such key".
 struct UpdateCase {
     case: &'static str,
     created_with: Value,
     update_with: Value,
-    expected: i64,
+    expected: Value,
 }
 
 #[tokio::test]
-async fn describe_always_reports_the_capacity_after_an_update() {
+async fn an_explicit_capacity_units_is_what_configures_a_plan() {
     let router = emulator();
 
     let cases = [
         UpdateCase {
-            case: "a default-capacity plan updated without CapacityUnits",
+            case: "an unconfigured plan updated without CapacityUnits stays unconfigured",
             created_with: Value::Null,
             update_with: Value::Null,
-            expected: state::DEFAULT_RESCORE_CAPACITY_UNITS.into(),
+            expected: Value::Null,
         },
         UpdateCase {
-            case: "a default-capacity plan given additional units",
+            case: "an unconfigured plan given additional units becomes configured",
             created_with: Value::Null,
             update_with: json!({ "RescoreCapacityUnits": 5 }),
-            expected: 5,
+            expected: json!({ "RescoreCapacityUnits": 5 }),
         },
         UpdateCase {
-            case: "a provisioned plan taken back to the default capacity",
+            case: "an unconfigured plan explicitly pinned to the bottom of the range",
+            created_with: Value::Null,
+            update_with: json!({ "RescoreCapacityUnits": 0 }),
+            expected: json!({ "RescoreCapacityUnits": 0 }),
+        },
+        UpdateCase {
+            case: "a provisioned plan taken down to the bottom of the range",
             created_with: json!({ "RescoreCapacityUnits": 3 }),
             update_with: json!({ "RescoreCapacityUnits": 0 }),
-            expected: 0,
+            expected: json!({ "RescoreCapacityUnits": 0 }),
         },
         UpdateCase {
             case: "a provisioned plan updated without CapacityUnits keeps its capacity",
             created_with: json!({ "RescoreCapacityUnits": 7 }),
             update_with: Value::Null,
-            expected: 7,
+            expected: json!({ "RescoreCapacityUnits": 7 }),
         },
     ];
 
-    for (index, UpdateCase {
-        case,
-        created_with,
-        update_with,
-        expected,
-    }) in cases.iter().enumerate()
+    for (
+        index,
+        UpdateCase {
+            case,
+            created_with,
+            update_with,
+            expected,
+        },
+    ) in cases.iter().enumerate()
     {
         let id =
             create_with_capacity(&router, &format!("updated-plan-{index}"), created_with).await;
@@ -191,10 +206,10 @@ async fn describe_always_reports_the_capacity_after_an_update() {
         assert_eq!(status, 200, "case {case:?}: update got {updated}");
 
         let described = describe(&router, &id).await;
+        let actual = reported_capacity(&described);
         assert_eq!(
-            reported_capacity(&described),
-            Some(*expected),
-            "case {case:?}: expected CapacityUnits.RescoreCapacityUnits {expected}, got {described}"
+            &actual, expected,
+            "case {case:?}: expected CapacityUnits {expected}, got {actual:?} in {described}"
         );
     }
 }
