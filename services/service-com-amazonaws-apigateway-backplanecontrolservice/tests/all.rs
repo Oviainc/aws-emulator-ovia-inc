@@ -25,6 +25,8 @@ mod documentation_part_creation;
 mod account_settings;
 #[path = "all/api_key_collection_members.rs"]
 mod api_key_collection_members;
+#[path = "all/api_key_import.rs"]
+mod api_key_import;
 #[path = "all/api_key_lifecycle.rs"]
 mod api_key_lifecycle;
 #[path = "all/authorizer_lifecycle.rs"]

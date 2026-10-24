@@ -88,7 +88,7 @@ async fn add_key(gateway: &Gateway, case: &str, plan: &str, key_id: &str) -> Val
 }
 
 /// `GetUsagePlanKey` for `key_id` of `plan`.
-async fn get_usage_plan_key(gateway: &Gateway, plan: &str, key_id: &str) -> Answer {
+pub(crate) async fn get_usage_plan_key(gateway: &Gateway, plan: &str, key_id: &str) -> Answer {
     gateway
         .call("GET", &format!("/usageplans/{plan}/keys/{key_id}"), None)
         .await

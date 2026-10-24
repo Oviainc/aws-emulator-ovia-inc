@@ -107,10 +107,14 @@ use crate::state::ApiKeyEntry;
 /// The longest caller-supplied `value` this emulator will store. AWS publishes an API
 /// key value length of 20 to 128 characters for an imported key; the model declares no
 /// constraint, so the bound is enforced here and the refusal names it.
-const MAX_VALUE_CHARS: usize = 128;
+///
+/// `pub` because the published range is the range of an API key VALUE, however the value
+/// reached the service: `ImportApiKeys` reads one per row of its payload and applies this
+/// same bound rather than keeping a second copy of it.
+pub const MAX_VALUE_CHARS: usize = 128;
 
 /// The shortest caller-supplied `value` AWS accepts; see [`MAX_VALUE_CHARS`].
-const MIN_VALUE_CHARS: usize = 20;
+pub const MIN_VALUE_CHARS: usize = 20;
 
 impl From<&ApiKeyEntry> for CreateApiKeyOutput {
     /// The `ApiKey` body for a stored key — the one place this crate renders that
