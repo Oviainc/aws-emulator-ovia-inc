@@ -163,12 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Product` is optional: without it every product of this provider is listed. The
         // (provider key, product) index resolves the registrations; they are then taken in
-        // registration order so a page boundary is stable.
+        // registration order so a page boundary is stable. Only LIVE registrations are
+        // listed through: one whose deregistration was accepted is being torn down, so it
+        // is not a registration this call resolves.
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;
         let provider_arns: Vec<String> = match input.product.as_deref() {
             Some(product) => state
                 .identity_provider_index
                 .get(&(key.clone(), product.to_string()))
+                .filter(|arn| state.live_identity_provider(arn).is_some())
                 .cloned()
                 .into_iter()
                 .collect(),
@@ -178,6 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .iter()
                     .filter(|((indexed_key, _), _)| indexed_key == &key)
                     .map(|(_, arn)| arn.as_str())
+                    .filter(|arn| state.live_identity_provider(arn).is_some())
                     .collect();
                 state
                     .identity_provider_order
