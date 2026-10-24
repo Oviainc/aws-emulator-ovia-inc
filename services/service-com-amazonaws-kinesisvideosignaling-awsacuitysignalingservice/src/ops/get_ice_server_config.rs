@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIceServerConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIceServerConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIceServerConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Issues the TURN credential set a viewer uses to reach the relay that serves a
+//! signaling channel. The channel is resolved out of
+//! [`crate::state`]'s registry: the credential set is minted on this call (the operation
+//! AWS documents as "gets the ICE server configuration information ... including
+//! authenticating with the TURN relay server"), recorded against the (channel, client)
+//! pair, and returned from that record — so a repeat call inside the issuance's `Ttl`
+//! answers with the same credentials, and a channel nobody created answers
+//! `ResourceNotFoundException`.
+//!
+//! The relay the issued `Uris` name is UNREACHABLE BY CONSTRUCTION: this emulator serves
+//! no TURN listener, so the address is an AWS-form name (the form a client parses, logs
+//! and compares) that resolves nowhere. Only the control-plane answer is emulated here; if
+//! a TURN listener is ever served in-process, the `Uris` must name its loopback address
+//! instead. See [`relay_host`].
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +101,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{ChannelLookupError, IceServerRecord, SignalingChannel};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -129,6 +138,231 @@ pub type GetIceServerConfigError = crate::scaffolded::Scaffolded<GetIceServerCon
 impl From<GetIceServerConfigErrorModeled> for GetIceServerConfigError {
     fn from(modeled: GetIceServerConfigErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The `Service` value a request that names none asks for: the `Service` enum's only
+/// member (`smithy_query(query="shape", shape="Service")` -> values `["TURN"]`).
+const DEFAULT_SERVICE: &str = "TURN";
+
+/// The port the relay URIs name.
+///
+/// A chosen value, not a documented one: 443 is the port a viewer behind a firewall that
+/// only allows HTTPS can still reach, which is why TURN deployments conventionally offer
+/// it. The relay itself is unreachable by construction (see this module's header), so the
+/// port is part of the address's form rather than something a caller connects to.
+const TURN_PORT: u16 = 443;
+
+/// Upper bound of the modelled `@length` on `IceServer$Username`
+/// (`smithy_query(query="shape", shape="IceServer")`: len 1..256).
+const USERNAME_MAX_LEN: usize = 256;
+
+/// How many characters a minted TURN password keeps.
+///
+/// A chosen length: 32 characters out of the modelled class carry ~190 bits, far more than
+/// a TURN relay credential needs, and the modelled `IceServer$Password` `@length` of
+/// 1..256 admits it.
+const PASSWORD_LEN: usize = 32;
+
+/// How many credential-store mints one password may draw its characters from.
+///
+/// A chosen bound: the store's secret is long enough that one draw almost always leaves
+/// [`PASSWORD_LEN`] admissible characters, and four bounded draws make a refusal for an
+/// unlucky secret vanishingly unlikely while still keeping the work per request finite.
+const PASSWORD_MINT_ATTEMPTS: usize = 4;
+
+/// A fresh TURN password.
+///
+/// The secret is minted by the emulator's CREDENTIAL STORE — the one component that
+/// generates secrets (`aws_lc_rs::rand`, the OS CSPRNG) — and then removed from that store
+/// again: this password authenticates a client to a TURN relay, NOT a SigV4 request to
+/// this emulator, so the emulator must not go on accepting it as one and nothing
+/// accumulates per issuance. It is the same seam ECR Public's `GetAuthorizationToken`
+/// mints its registry password through, so this crate adds no randomness source of its
+/// own.
+///
+/// Nothing of the request or the clock enters it, so a password is never a function of
+/// client input and never predictable from another issuance. It is the STORED issuance,
+/// not a recomputation, that makes a repeat call inside the `Ttl` answer with the same
+/// one. Only the characters the modelled `IceServer$Password` pattern admits are kept
+/// (the minted secret's alphabet also carries `+` and `/`), which is a filter over a
+/// uniformly drawn secret, not a derivation from anything.
+///
+/// A mint whose secret happens to carry many inadmissible characters leaves fewer than
+/// [`PASSWORD_LEN`] of them, so the store is drawn from again (up to
+/// [`PASSWORD_MINT_ATTEMPTS`] times) rather than refusing a request that is perfectly
+/// valid: each draw is an independent uniform secret, so taking the admissible characters
+/// of several is still a uniform draw and never a derivation.
+///
+/// `None` when the store minted no secret, when it could not be removed again, or when
+/// [`PASSWORD_MINT_ATTEMPTS`] draws together held fewer than [`PASSWORD_LEN`] admissible
+/// characters: a credential is then not issued at all rather than issued from something
+/// weaker than the store gives.
+fn mint_password(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let mut password = String::with_capacity(PASSWORD_LEN);
+    for _ in 0..PASSWORD_MINT_ATTEMPTS {
+        let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+        let secret = minted
+            .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+            .map(str::to_string);
+        // The password is not a credential of this emulator; see above.
+        if let Err(error) = store.delete(&minted.id) {
+            ::tracing::warn!(
+                operation = "GetIceServerConfig",
+                access_key_id = %minted.id,
+                error = ?error,
+                "a credential minted for a TURN password could not be deleted"
+            );
+            return None;
+        }
+        // Every admissible character is ASCII, so `len` counts them.
+        let wanted = PASSWORD_LEN - password.len();
+        password.extend(
+            secret?
+                .chars()
+                .filter(|c| is_modelled_token_char(*c))
+                .take(wanted),
+        );
+        if password.len() == PASSWORD_LEN {
+            return Some(password);
+        }
+    }
+    None
+}
+
+/// The maximum length of ONE DNS label (RFC 1035 §2.3.4: "labels must be 63 characters or
+/// less"), which bounds the leading label of the relay address below.
+const MAX_DNS_LABEL_LEN: usize = 63;
+
+/// The address of the TURN relay that serves `channel`.
+///
+/// AWS answers with a relay in the channel's own region, addressed under
+/// `kinesisvideo.<region>.amazonaws.com`. There is no relay fleet here, so the leading
+/// label names the CHANNEL the relay serves — see [`relay_label`]: stable for a channel (a
+/// viewer that reconnects is sent back to the same relay), different between channels, and
+/// never a per-run value.
+///
+/// The address deliberately keeps the AWS form, which is what a client parses, logs and
+/// compares; the emulator itself never connects to it, and an unresolvable name is exactly
+/// what a client sees for a relay it has no route to.
+fn relay_host(channel: &SignalingChannel) -> String {
+    format!(
+        "{}.kinesisvideo.{}.amazonaws.com",
+        relay_label(channel),
+        channel.region
+    )
+}
+
+/// The leading DNS label of [`relay_host`]: the channel's own name and the creation id
+/// that distinguishes two channels of one name over time, folded into the character class
+/// a DNS label admits (lowercase letters, digits and `-`) and cut to
+/// [`MAX_DNS_LABEL_LEN`].
+///
+/// A channel name is modelled over `[a-zA-Z0-9_.-]`, which carries `_` and `.` that no DNS
+/// label may hold, so those fold to `-`; a label left with nothing admissible is `relay`,
+/// so the address always has one.
+fn relay_label(channel: &SignalingChannel) -> String {
+    let folded: String = format!("{}-{}", channel.name, channel.creation_id)
+        .chars()
+        .map(|c| {
+            let lower = c.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
+                lower
+            } else {
+                '-'
+            }
+        })
+        .take(MAX_DNS_LABEL_LEN)
+        .collect();
+    let trimmed = folded.trim_matches('-');
+    if trimmed.is_empty() {
+        "relay".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The relay URIs a credential set is good for, in the `I-D.petithuguenin-behave-turn-uris`
+/// form `IceServer$Uris` documents: the relay over plain UDP, and over TLS on UDP and TCP.
+fn turn_uris(channel: &SignalingChannel) -> Vec<String> {
+    let host = relay_host(channel);
+    vec![
+        format!("turn:{host}:{TURN_PORT}?transport=udp"),
+        format!("turns:{host}:{TURN_PORT}?transport=udp"),
+        format!("turns:{host}:{TURN_PORT}?transport=tcp"),
+    ]
+}
+
+/// Whether `c` is admitted by the modelled `IceServer$Username` / `IceServer$Password`
+/// pattern `^[a-zA-Z0-9_.-]+$` (`smithy_query(query="shape", shape="IceServer")`).
+fn is_modelled_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// The username a credential set logs in with: when it expires, then who it was issued
+/// to, kept inside the modelled `@length` of 1..256.
+///
+/// A TURN REST username conventionally joins the two with `:`; the modelled
+/// `IceServer$Username` pattern `^[a-zA-Z0-9_.-]+$` does not admit that character, so
+/// `.` joins them here.
+///
+/// The label is the request's own `Username` (or its `ClientId`, or the channel name).
+/// Every source of it is already constrained to that same character class — the input
+/// `Username` and `ClientId` members carry the modelled pattern `^[a-zA-Z0-9_.-]+$`, which
+/// the request boundary refuses a value against (400 `InvalidArgumentException`), and a
+/// channel name comes out of a parsed `ResourceARN`. The filter below is therefore
+/// defence in depth: whatever the label's source, a character the OUTPUT member does not
+/// admit is dropped rather than spliced into a value that would break the modelled
+/// `IceServer$Username` pattern. The expiry prefix is always non-empty, so the result
+/// still meets that member's `@length` minimum of 1 even for a label with nothing
+/// admissible in it.
+fn ice_username(expires_at: SystemTime, label: &str) -> String {
+    let expiry = expires_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let prefix = format!("{expiry}.");
+    let room = USERNAME_MAX_LEN.saturating_sub(prefix.len());
+    prefix
+        + &label
+            .chars()
+            .filter(|c| is_modelled_token_char(*c))
+            .take(room)
+            .collect::<String>()
+}
+
+/// `InvalidArgumentException` (400) — "The value for this input parameter is invalid."
+fn invalid_argument(message: String) -> GetIceServerConfigError {
+    GetIceServerConfigErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `ClientLimitExceededException` (400) — the one modelled error that tells a caller the
+/// request could not be served now and may be retried. Used where the work itself failed
+/// in a way a retry can clear (the OS CSPRNG refusing to mint a credential), never for a
+/// condition that will not clear.
+fn retry_later(message: String) -> GetIceServerConfigError {
+    GetIceServerConfigErrorModeled::ClientLimitExceededException(ClientLimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// How a channel ARN that did not resolve is answered: a malformed ARN is the caller's
+/// mistake (400), an ARN for a channel that does not exist is a missing resource (404).
+fn unresolved_channel(arn: &str, error: ChannelLookupError) -> GetIceServerConfigError {
+    match error {
+        ChannelLookupError::MalformedArn => invalid_argument(format!(
+            "ChannelARN is not a Kinesis Video signaling channel ARN: {arn}"
+        )),
+        ChannelLookupError::NotFound => {
+            GetIceServerConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!("No signaling channel exists with ARN {arn}")),
+            })
+            .into()
+        }
     }
 }
 
@@ -168,18 +402,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIceServerConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIceServerConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIceServerConfig"))
+        // Request metadata is not part of this operation's answer: the whole response is a
+        // function of the channel registry and the request body. `ctx` is reached only for
+        // the emulator's credential store, the seam a minted secret comes from.
+        // The channel registry lives in the shared in-memory engine. If this service was
+        // mounted on some other engine there is no registry to read, so the operation
+        // cannot be served at all: that is the scaffold's 501, not a modelled client
+        // error, and emphatically not a throttle a caller could usefully retry.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| GetIceServerConfigError::not_implemented(Self::NAME))?;
+
+        // `Service` names the relay family the viewer wants. The model admits exactly one
+        // value, so the boundary refuses every other one; absent means that value.
+        let requested_service = input.service.as_deref().unwrap_or(DEFAULT_SERVICE);
+        if !SERVICE_VALUES.contains(&requested_service) {
+            return Err(invalid_argument(format!(
+                "Service must be one of {SERVICE_VALUES:?}: {requested_service}"
+            )));
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(|error| unresolved_channel(&input.channel_arn, error))?;
+
+        // A channel that restricts its viewers issues credentials only to one of them.
+        let known_viewer = input
+            .client_id
+            .as_deref()
+            .is_some_and(|id| channel.viewer_client_ids.contains(id));
+        if !channel.viewer_client_ids.is_empty() && !known_viewer {
+            return Err(GetIceServerConfigErrorModeled::InvalidClientException(
+                InvalidClientException {
+                    message: Some(format!(
+                        "The specified client is invalid for signaling channel {}",
+                        input.channel_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The credential set is minted by this call and recorded against the (channel,
+        // client) pair, so the answer is read out of state: an issuance still inside its
+        // `Ttl` is returned again rather than replaced, and one the clock has expired is
+        // reissued.
+        let record = match channel.valid_credential(input.client_id.as_deref(), now) {
+            Some(held) => held.clone(),
+            None => {
+                let ttl_secs = channel.ttl_secs();
+                let expires_at = now + Duration::from_secs(u64::from(ttl_secs.unsigned_abs()));
+                let label = input
+                    .username
+                    .as_deref()
+                    .or(input.client_id.as_deref())
+                    .unwrap_or(channel.name.as_str());
+                let password = mint_password(ctx.credential_store()).ok_or_else(|| {
+                    retry_later(
+                        "A TURN credential set could not be minted; retry the call".to_string(),
+                    )
+                })?;
+                let issued = IceServerRecord {
+                    uris: turn_uris(channel),
+                    username: ice_username(expires_at, label),
+                    password,
+                    ttl_secs,
+                    issued_at: now,
+                    client_id: input.client_id.clone(),
+                };
+                channel.record_credential(issued).clone()
+            }
+        };
+
+        // `Ttl` reports the lifetime the issuance still HAS (`reportable_ttl_secs`, held
+        // inside the modelled `IceServer$Ttl` range), never the raw stored field: a record
+        // seeded with a lifetime outside that range must not put an out-of-range `Ttl` on
+        // the wire, and a repeat call must not promise a viewer a full lifetime the
+        // registry will stop honouring sooner. An issuance with less than the modelled
+        // minimum left is not re-served at all (see `IceServerRecord::is_reusable_at`), so
+        // what is reported here is always inside the range and always what
+        // `is_valid_at` will still honour. Read before the record's fields move out.
+        let reported_ttl_secs = record.reportable_ttl_secs(now);
+        Ok(GetIceServerConfigOutput {
+            ice_server_list: Some(vec![IceServer {
+                uris: Some(record.uris),
+                username: Some(record.username),
+                password: Some(record.password),
+                ttl: Some(reported_ttl_secs),
+            }]),
+        })
     }
 }

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendAlexaOfferToMaster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendAlexaOfferToMaster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendAlexaOfferToMaster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Delivers an Alexa SDP offer to the master peer of a signaling channel and answers with
+//! the master's SDP answer. The channel is resolved out of [`crate::state`]'s registry,
+//! the offer is appended to that channel's (bounded) offer log, and the answer is read
+//! from the stored offer — never synthesised and never the offer echoed back. An offer no
+//! master can answer is refused and nothing is written.
+//!
+//! WHO CONNECTS A MASTER: nothing in this emulator does yet. A master peer reaches a
+//! signaling channel over the WebSocket endpoint the control plane hands out
+//! (`GetSignalingChannelEndpoint` + the `WSS` role `MASTER`), which no implemented route
+//! serves, so today the only writer of
+//! [`SignalingChannel::master_answer`](crate::state::SignalingChannel::master_answer) is
+//! in-process seeding and every request on this route takes the
+//! `ResourceNotFoundException` branch. That is the honest answer for a channel with no
+//! master, not a stand-in: when the master connection is emulated it sets that field and
+//! this handler needs no change.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +89,34 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{AlexaOffer, ChannelLookupError};
+use std::time::SystemTime;
+
+/// How many characters one base64 quantum encodes to.
+const BASE64_QUANTUM: usize = 4;
+
+/// Whether `payload` really is base64-encoded content, as `MessagePayload` documents.
+///
+/// The codec is `aws_smithy_types::base64` — the standard-alphabet decoder the wire
+/// serializer already uses for every Smithy blob, so the alphabet checked here is exactly
+/// the one the modelled `@pattern` `^[a-zA-Z0-9+/=]+$` names (`+` and `/`, not the
+/// URL-safe `-` and `_`), and no second base64 implementation enters this crate.
+///
+/// That decoder requires a whole number of quanta, while the pattern admits `=` without
+/// mandating it — so an offer encoded WITHOUT padding is content the member allows, and
+/// the missing `=` are supplied here before decoding rather than being refused. A payload
+/// that carries `=` already STATES its own padding and is decoded exactly as given, so
+/// padding that is wrong (`eA=`, one `=` short of its single byte) is refused rather than
+/// repaired, as is padding in the middle or a last quantum holding one character.
+fn is_base64(payload: &str) -> bool {
+    if payload.contains('=') {
+        return ::aws_smithy_types::base64::decode(payload).is_ok();
+    }
+    let missing = (BASE64_QUANTUM - payload.len() % BASE64_QUANTUM) % BASE64_QUANTUM;
+    let padded = format!("{payload}{}", "=".repeat(missing));
+    ::aws_smithy_types::base64::decode(&padded).is_ok()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -114,6 +149,35 @@ pub type SendAlexaOfferToMasterError = crate::scaffolded::Scaffolded<SendAlexaOf
 impl From<SendAlexaOfferToMasterErrorModeled> for SendAlexaOfferToMasterError {
     fn from(modeled: SendAlexaOfferToMasterErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// `InvalidArgumentException` (400) — "The value for this input parameter is invalid."
+fn invalid_argument(message: String) -> SendAlexaOfferToMasterError {
+    SendAlexaOfferToMasterErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `ResourceNotFoundException` (404) — "The specified resource is not found."
+fn not_found(message: String) -> SendAlexaOfferToMasterError {
+    SendAlexaOfferToMasterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// How a channel ARN that did not resolve is answered: a malformed ARN is the caller's
+/// mistake (400), an ARN for a channel that does not exist is a missing resource (404).
+fn unresolved_channel(arn: &str, error: ChannelLookupError) -> SendAlexaOfferToMasterError {
+    match error {
+        ChannelLookupError::MalformedArn => invalid_argument(format!(
+            "ChannelARN is not a Kinesis Video signaling channel ARN: {arn}"
+        )),
+        ChannelLookupError::NotFound => {
+            not_found(format!("No signaling channel exists with ARN {arn}"))
+        }
     }
 }
 
@@ -153,18 +217,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendAlexaOfferToMaster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendAlexaOfferToMasterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendAlexaOfferToMaster"))
+        // Request metadata is not part of this operation's answer: the whole response is
+        // a function of the channel registry and the request body.
+        let _ = ctx;
+        // The channel registry lives in the shared in-memory engine. If this service was
+        // mounted on some other engine there is no registry to read, so the operation
+        // cannot be served at all: that is the scaffold's 501, not a modelled client error.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| SendAlexaOfferToMasterError::not_implemented(Self::NAME))?;
+
+        // `MessagePayload` is documented as "the base64-encoded SDP offer content". The
+        // modelled pattern admits only base64's alphabet, but not every string over that
+        // alphabet decodes (a last quantum of one character, or padding in the middle), so
+        // the payload is decoded here — through [`is_base64`], the codec that pattern
+        // describes — and refused when it does not.
+        if !is_base64(&input.message_payload) {
+            return Err(invalid_argument(format!(
+                "MessagePayload is not base64-encoded SDP content: {} characters that do not decode",
+                input.message_payload.len()
+            )));
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(|error| unresolved_channel(&input.channel_arn, error))?;
+
+        // The answer belongs to the master peer: it is whatever the master connected to
+        // this channel has supplied. No master connected means there is no answer to
+        // deliver, so the offer is refused — rather than answered with something this
+        // emulator made up — and nothing is written: a request that could not be served
+        // leaves no record behind, so a caller cannot fill the channel's log with offers
+        // the service never delivered.
+        let Some(answer) = channel.master_answer.clone() else {
+            return Err(not_found(format!(
+                "No master is connected to signaling channel {}, so the offer from {} cannot be delivered",
+                input.channel_arn, input.sender_client_id
+            )));
+        };
+
+        // Delivered: the offer joins this channel's (bounded) log carrying the answer the
+        // sender was served, and the response is read back out of that stored record.
+        let delivered = channel.record_offer(AlexaOffer {
+            sender_client_id: input.sender_client_id.clone(),
+            message_payload: input.message_payload.clone(),
+            received_at: now,
+            answer: Some(answer),
+        });
+
+        Ok(SendAlexaOfferToMasterOutput {
+            answer: delivered.answer.clone(),
+        })
     }
 }
