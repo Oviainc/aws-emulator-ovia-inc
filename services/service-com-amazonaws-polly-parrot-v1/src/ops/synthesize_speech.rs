@@ -17,8 +17,9 @@
 //! Everything AROUND the synthesis is the service's real behaviour, computed from the
 //! request and from state:
 //!
-//! * every name in `LexiconNames` is resolved in the lexicon store, and a name that
-//!   is not stored is `LexiconNotFoundException` (404);
+//! * every name in `LexiconNames` is resolved in the lexicon store of the Region the
+//!   request was signed for, and a name that Region does not store is
+//!   `LexiconNotFoundException` (404);
 //! * `Engine` and `LanguageCode` are checked against the voice the request names, as
 //!   the voice catalog `DescribeVoices` serves records it, so the two operations
 //!   cannot disagree: an engine the voice does not support is the request-shape
@@ -755,7 +756,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let output_format = input.output_format.as_str();
         let content_type = content_type_for(output_format).ok_or_else(|| {
@@ -828,17 +829,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
-        // Every lexicon the request names must be in the store. This is the one place
-        // synthesis reads state, and it is why an unknown name is a 404 rather than a
-        // silently ignored input.
+        // Every lexicon the request names must be in the store, in the Region this
+        // request was signed for: a lexicon is a regional resource, and
+        // `LexiconNotFoundException` documents "a lexicon that is in a different
+        // region" as one of the things it reports. This is the one place synthesis
+        // reads state, and it is why an unknown name is a 404 rather than a silently
+        // ignored input.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SynthesizeSpeechErrorModeled::ServiceFailureException(
                 crate::service::errors::service_failure(),
             )
         })?;
         if let Some(names) = input.lexicon_names.as_ref() {
+            let region = crate::state::request_region(ctx.parts());
             let guard = state.lock();
-            if names.iter().any(|name| !guard.lexicons.contains_key(name)) {
+            if names
+                .iter()
+                .any(|name| guard.lexicon(&region, name).is_none())
+            {
                 return Err(SynthesizeSpeechErrorModeled::LexiconNotFoundException(
                     crate::service::errors::lexicon_not_found(),
                 )

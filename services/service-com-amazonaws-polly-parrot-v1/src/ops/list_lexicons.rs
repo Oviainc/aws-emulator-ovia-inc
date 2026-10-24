@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLexicons
-//! Lists the stored lexicons, in name order, one page at a time.
+//! Lists the lexicons stored in the Region the call was signed for, in name order, one
+//! page at a time.
 //!
-//! The store is a `BTreeMap` keyed by name, so the order is the name order and a page
-//! is "the next [`LEXICON_PAGE_SIZE`] names after the cursor". `NextToken` is present
+//! The store is a `BTreeMap` keyed by Region and then name, so one Region's entries are
+//! contiguous in name order and a page is "the next [`LEXICON_PAGE_SIZE`] names of this
+//! Region after the cursor". `NextToken` is present
 //! only when a further lexicon exists, and a token this service did not mint is
 //! `InvalidNextTokenException` (400) rather than a silent restart from the first page.
 //!
@@ -146,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A token must be one this service minted; anything else is refused before
         // any state is read, so a garbage token can never read as "first page".
@@ -166,15 +168,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
-        let mut remaining = guard
-            .lexicons
-            .iter()
-            .filter(|(name, _)| after.as_ref().is_none_or(|cursor| *name > cursor));
+        // "Returns a list of pronunciation lexicons stored in an Amazon Web Services
+        // Region": the page is this request's own Region, so a lexicon stored in
+        // another one is not reported here.
+        let region = crate::state::request_region(ctx.parts());
+        let mut remaining = guard.lexicons_in_region(&region, after.as_deref());
         let page: Vec<LexiconDescription> = remaining
             .by_ref()
             .take(LEXICON_PAGE_SIZE)
-            .map(|(name, stored)| LexiconDescription {
-                name: Some(name.clone()),
+            .map(|stored| LexiconDescription {
+                name: Some(stored.name.clone()),
                 attributes: Some(crate::state::lexicon_attributes(stored)),
             })
             .collect();

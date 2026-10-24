@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLexicon
-//! Removes a stored lexicon by name.
+//! Removes a lexicon stored in the Region the call was signed for, by name.
 //!
-//! Deleting is keyed on the name alone, so after it returns `GetLexicon` answers 404
-//! and `ListLexicons` no longer carries the entry. Deleting a name that is not stored
+//! Deleting is keyed on that Region and the name, so after it returns `GetLexicon`
+//! answers 404 and `ListLexicons` no longer carries the entry THERE, while a lexicon
+//! of the same name in another Region is untouched. A name that Region does not store
 //! is `LexiconNotFoundException` (404), not a silent success.
 //!
 //! ## Shape of an operation
@@ -135,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteLexiconErrorModeled::ServiceFailureException(
@@ -143,12 +144,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // `remove` returning `None` is the 404: the name named nothing to delete.
-        state.lock().lexicons.remove(&input.name).ok_or_else(|| {
-            DeleteLexiconErrorModeled::LexiconNotFoundException(
-                crate::service::errors::lexicon_not_found(),
-            )
-        })?;
+        // The delete reaches only the Region this request was signed for: a lexicon of
+        // another Region is not found here, and is left standing.
+        let region = crate::state::request_region(ctx.parts());
+        // `remove_lexicon` returning `None` is the 404: the name named nothing to
+        // delete in this Region.
+        state
+            .lock()
+            .remove_lexicon(&region, &input.name)
+            .ok_or_else(|| {
+                DeleteLexiconErrorModeled::LexiconNotFoundException(
+                    crate::service::errors::lexicon_not_found(),
+                )
+            })?;
 
         Ok(DeleteLexiconOutput {})
     }

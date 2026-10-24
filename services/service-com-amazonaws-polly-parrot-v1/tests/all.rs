@@ -17,6 +17,8 @@ mod error_document_message;
 mod error_message_wording;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
+#[path = "all/lexicon_regions.rs"]
+mod lexicon_regions;
 #[path = "all/lexicons_and_speech.rs"]
 mod lexicons_and_speech;
 #[path = "all/pls_document_validity.rs"]
