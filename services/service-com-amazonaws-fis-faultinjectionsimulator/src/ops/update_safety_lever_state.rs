@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSafetyLeverState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSafetyLeverState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSafetyLeverState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +59,25 @@
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource cannot be found.
 //! * `ValidationException` (HTTP 400) — The specified input is not valid, or fails to satisfy
 //!   the constraints for the request.
+//!
+//! ## What this handler does
+//!
+//! FIS gives an account ONE safety lever, which no API creates, lists or deletes, so `id`
+//! resolves against the account's own id and any other id names no lever (404). The state
+//! the request asks for is persisted on that lever and reported back, so `GetSafetyLever`
+//! reports what this call stored:
+//!
+//! * `engaged` is accepted and then takes effect rather than landing at once — the lever
+//!   reports the modelled `engaging`, the status no `SafetyLeverStatusInput` can ask for,
+//!   until the clock says it has taken effect — and it stops the experiments that are
+//!   running, which is what FIS documents engaging the lever as doing;
+//! * `disengaged` lands immediately: the model declares no transient status on that side.
+//!
+//! `ConflictException` is not reached from here: the lever's own lifecycle has nothing to
+//! conflict with, since a state a caller asks for is accepted whatever state it is in
+//! (engaging it twice neither restarts the span nor takes an engaged lever back to
+//! `engaging`). The conflict an engaged lever DOES cause is a `StartExperiment` refused
+//! while it holds.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -142,18 +152,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSafetyLeverState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSafetyLeverStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSafetyLeverState"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `state.status` is enum-typed, which the boundary validator does not check, and
+        // it is persisted on the lever — so a value `SafetyLeverStatusInput` does not
+        // admit is refused here rather than stored. `engaging` is among the values it
+        // refuses: that is a status the SERVICE reaches, never one a request may ask for.
+        if let Some(refusal) = crate::state::enum_refusal(
+            "state.status",
+            Some(input.state.status.as_str()),
+            SAFETY_LEVER_STATUS_INPUT_VALUES,
+        ) {
+            return Err(UpdateSafetyLeverStateErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The lever this account HAS: an id naming anything else names no lever, which is
+        // decided before the store is touched so a miss persists nothing.
+        if input.id != crate::state::safety_lever_id() {
+            return Err(UpdateSafetyLeverStateErrorModeled::ResourceNotFoundException(
+                crate::state::safety_lever_not_found(&input.id),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let engaging = input.state.status == crate::state::SafetyLeverStatusKind::Engaged.as_wire();
+        // Engaging the lever stops the experiments that are running. Done before the
+        // lever's own state is written, and on the same clock a `StopExperiment` puts an
+        // experiment on, so the lever reports `engaging` exactly while the experiments it
+        // stopped are on their way to `stopped`.
+        if engaging {
+            store.stop_experiments_for_safety_lever(now);
+        }
+        let record = store.settled_safety_lever(now);
+        if engaging {
+            record.engage(&input.state.reason, now);
+        } else {
+            record.disengage(&input.state.reason);
+        }
+
+        Ok(UpdateSafetyLeverStateOutput {
+            safety_lever: Some(record.to_safety_lever(&input.id, &region)),
+        })
     }
 }

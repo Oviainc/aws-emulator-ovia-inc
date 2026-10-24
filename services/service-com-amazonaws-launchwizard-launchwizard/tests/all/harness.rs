@@ -29,6 +29,7 @@ pub struct Reply {
 /// path the production emulator uses.
 pub struct Harness {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Default for Harness {
@@ -44,8 +45,18 @@ impl Harness {
         // Signatures are the emulator's own concern and are not what these suites are
         // about; turn the check off for this router only.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// The ONE engine this router's service reads and writes through — the same store
+    /// every request reaches (see `tests/all/state_roundtrip.rs`).
+    ///
+    /// A suite uses it only to set a record up for an assertion that the API alone
+    /// cannot reach in bounded time; everything a request does is still asserted
+    /// through the router above.
+    pub fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// `POST path` with a JSON body — the shape most of this service's operations

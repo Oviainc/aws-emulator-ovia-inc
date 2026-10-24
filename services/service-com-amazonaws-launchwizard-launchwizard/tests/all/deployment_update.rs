@@ -14,7 +14,9 @@
 //!   reports), and `force` is what applies an update despite those warnings;
 //! * `dryRun` checks the request and persists nothing;
 //! * a deployment that is not there, is going away, or is asked for a version the
-//!   catalogue does not hold, is refused rather than updated.
+//!   catalogue does not hold, is refused rather than updated (the refusal of a
+//!   deployment whose create or update is still IN FLIGHT has its own suite,
+//!   `tests/all/deployment_update_in_flight.rs`).
 //!
 //! Every assertion is made over a TABLE spanning the class rather than over one call:
 //! every workload and deployment pattern the catalogue holds, settings maps of
@@ -22,13 +24,15 @@
 //! published bounds of `DeploymentId`. No name, allowed value or version is written by
 //! hand: each one is read out of what the service itself reports for the pattern.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_launchwizard_launchwizard::ops::types::{
     DEPLOYMENT_STATUS_VALUES, EVENT_STATUS_VALUES,
 };
-use service_com_amazonaws_launchwizard_launchwizard::state::MAX_EVENTS_PER_DEPLOYMENT;
+use service_com_amazonaws_launchwizard_launchwizard::state::{
+    service_state, DeploymentEvent, EVENT_IN_PROGRESS, MAX_EVENTS_PER_DEPLOYMENT,
+};
 
 use crate::deployment_lifecycle::{create, get};
 use crate::harness::{catalogue, walk_pages, Harness};
@@ -38,12 +42,28 @@ use crate::harness::{catalogue, walk_pages, Harness};
 /// waiting for the clock.
 const SETTLE: Duration = Duration::from_millis(1_200);
 
+/// Long enough for every clock-owed step a CREATE schedules to come due (the three
+/// `state::TRANSITION_SPAN`s a create walks, plus slack). A deployment whose create is
+/// still in flight refuses an update — see `tests/all/deployment_update_in_flight.rs`
+/// for the rule — so a suite that means to update a deployment waits this out first.
+const CREATE_SETTLE: Duration = Duration::from_millis(2_100);
+
+/// How many real update cycles the event-log suite drives. Each one costs a
+/// [`SETTLE`], because a deployment that is still applying an update refuses the next
+/// one, so the count is small and the rest of that suite's history is appended to the
+/// stored record.
+const UPDATE_CYCLES: usize = 3;
+
 /// The status an update puts a deployment into, and the one the clock then owes. Both
 /// are members of the model's `DeploymentStatus` enum, which declares them for exactly
 /// this transition.
 const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
 /// See [`UPDATE_IN_PROGRESS`].
 const UPDATE_COMPLETED: &str = "UPDATE_COMPLETED";
+
+/// The `DeploymentStatus` a create walks to and stays in — the resting status from
+/// which a deployment can take an update.
+const CREATED_AT_REST: &str = "COMPLETED";
 
 /// The `WorkloadDeploymentPatternData` the service reports for one pattern — the
 /// source of every specification name, allowed value and version this suite submits.
@@ -140,6 +160,28 @@ pub(crate) fn constrained_field(case: &str, data: &Value) -> String {
 /// whether the stored schema warns about the result.
 type WarningRow = (&'static str, Box<dyn Fn(&mut Map<String, Value>)>, bool);
 
+/// One row of the settings table: the deployment that was created for it, the pattern
+/// it deploys and the settings the update submits.
+struct SettingsRow {
+    case: String,
+    id: String,
+    workload: String,
+    pattern: String,
+    specifications: Map<String, Value>,
+}
+
+/// One workload's version suite: the deployment the refusal rows run against, and one
+/// deployment per accepted row (each accepted update leaves its deployment mid-update,
+/// which is a state that takes no further update).
+struct VersionSuite {
+    case: String,
+    /// The `WorkloadDeploymentPatternData` the versions are read off.
+    data: Value,
+    conforming: Map<String, Value>,
+    refused_on: String,
+    accepted_on: Vec<String>,
+}
+
 /// An `UpdateDeployment` request body.
 pub(crate) fn update_body(id: &str, specifications: &Map<String, Value>) -> Value {
     json!({"deploymentId": id, "specifications": Value::Object(specifications.clone())})
@@ -234,13 +276,42 @@ async fn an_update_replaces_the_settings_and_every_reader_reports_the_record() {
     // One row per deployment pattern the catalogue holds, and the rows alternate
     // between a settings map of only the required fields and one of every published
     // field, so the rule is exercised over maps of different sizes and contents.
-    let mut updated: Vec<(String, String, Map<String, Value>, String)> = Vec::new();
+    //
+    // Every row is created FIRST and waited out once: an update is taken only by a
+    // deployment whose lifecycle is at rest, and one sleep settles every row.
+    let mut rows: Vec<SettingsRow> = Vec::new();
     for (index, (workload, pattern)) in every_pattern(&harness).await.into_iter().enumerate() {
         let case = format!("{workload}/{pattern}");
         let id = create(&harness, &case, &workload, &pattern, &format!("upd-{index}")).await;
         let data = pattern_data(&harness, &case, &workload, &pattern).await;
         let specifications = conforming_specifications(&case, &data, index % 2 == 0);
+        rows.push(SettingsRow {
+            case,
+            id,
+            workload,
+            pattern,
+            specifications,
+        });
+    }
+    std::thread::sleep(CREATE_SETTLE);
+
+    let mut updated: Vec<(String, String, Map<String, Value>, String)> = Vec::new();
+    for SettingsRow {
+        case,
+        id,
+        workload,
+        pattern,
+        specifications,
+    } in rows
+    {
+        let data = pattern_data(&harness, &case, &workload, &pattern).await;
         let created = get(&harness, &case, &id).await;
+        assert_eq!(
+            created["status"].as_str(),
+            Some(CREATED_AT_REST),
+            "case {case:?}: the create must have settled before the update, got {}",
+            created["status"]
+        );
 
         let body = harness
             .ok(&case, "/updateDeployment", update_body(&id, &specifications))
@@ -361,6 +432,11 @@ async fn an_update_replaces_the_settings_and_every_reader_reports_the_record() {
 #[tokio::test]
 async fn settings_the_pattern_warns_about_are_refused_unless_force_is_set() {
     let harness = Harness::new();
+    // Every row gets a deployment of its own, all of them created FIRST and waited out
+    // with ONE sleep: an update is taken only by a deployment whose lifecycle is at
+    // rest, and these rows are about the SETTINGS they submit rather than about the
+    // state of the deployment they name.
+    let mut rows_to_run: Vec<(String, String, Map<String, Value>, bool)> = Vec::new();
     for (workload, pattern) in one_pattern_per_workload(&harness).await {
         let case = format!("{workload}/{pattern}");
         let data = pattern_data(&harness, &case, &workload, &pattern).await;
@@ -408,62 +484,66 @@ async fn settings_the_pattern_warns_about_are_refused_unless_force_is_set() {
             let case = format!("{case} with {label}");
             let name = format!("warn-{}-{index}", workload.to_lowercase());
             let id = create(&harness, &case, &workload, &pattern, &name).await;
-            let stored = get(&harness, &case, &id).await;
             let mut specifications = conforming_specifications(&case, &data, true);
             mutate(&mut specifications);
-            let body = update_body(&id, &specifications);
+            rows_to_run.push((case, id, specifications, warns));
+        }
+    }
+    std::thread::sleep(CREATE_SETTLE);
 
-            if !warns {
-                harness.ok(&case, "/updateDeployment", body.clone()).await;
-                let read = get(&harness, &case, &id).await;
-                assert_eq!(
-                    read["specifications"],
-                    Value::Object(specifications.clone()),
-                    "case {case:?}: settings the schema accepts must be applied without \
-                     force, got {}",
-                    read["specifications"]
-                );
-                continue;
-            }
+    for (case, id, specifications, warns) in rows_to_run {
+        let stored = get(&harness, &case, &id).await;
+        let body = update_body(&id, &specifications);
 
-            // Without `force` the warnings are a refusal, and nothing is persisted.
-            let refused = harness
-                .refused(&case, "/updateDeployment", body.clone(), 400, "ValidationException")
-                .await;
-            let message = error_message(&refused);
-            assert!(
-                !message.is_empty(),
-                "case {case:?}: a refused update must carry a message, got {refused}"
-            );
-            // `DeploymentSpecifications` is @sensitive: the report names the setting so
-            // the caller can fix the request, and never the value it carried.
-            for secret in ["unexpected-setting-value", "not-an-allowed-value"] {
-                assert!(
-                    !message.contains(secret),
-                    "case {case:?}: the report must not echo a submitted value, got \
-                     {message:?}"
-                );
-            }
+        if !warns {
+            harness.ok(&case, "/updateDeployment", body.clone()).await;
             let read = get(&harness, &case, &id).await;
             assert_eq!(
-                read["specifications"], stored["specifications"],
-                "case {case:?}: a refused update must persist nothing, got {}",
+                read["specifications"],
+                Value::Object(specifications.clone()),
+                "case {case:?}: settings the schema accepts must be applied without \
+                 force, got {}",
                 read["specifications"]
             );
+            continue;
+        }
 
-            // `force` applies the same update anyway: the warnings are what it
-            // overrides.
-            harness
-                .ok(&case, "/updateDeployment", with_member(&body, "force", json!(true)))
-                .await;
-            let forced = get(&harness, &case, &id).await;
-            assert_eq!(
-                forced["specifications"],
-                Value::Object(specifications),
-                "case {case:?}: force must apply the update, got {}",
-                forced["specifications"]
+        // Without `force` the warnings are a refusal, and nothing is persisted.
+        let refused = harness
+            .refused(&case, "/updateDeployment", body.clone(), 400, "ValidationException")
+            .await;
+        let message = error_message(&refused);
+        assert!(
+            !message.is_empty(),
+            "case {case:?}: a refused update must carry a message, got {refused}"
+        );
+        // `DeploymentSpecifications` is @sensitive: the report names the setting so
+        // the caller can fix the request, and never the value it carried.
+        for secret in ["unexpected-setting-value", "not-an-allowed-value"] {
+            assert!(
+                !message.contains(secret),
+                "case {case:?}: the report must not echo a submitted value, got \
+                 {message:?}"
             );
         }
+        let read = get(&harness, &case, &id).await;
+        assert_eq!(
+            read["specifications"], stored["specifications"],
+            "case {case:?}: a refused update must persist nothing, got {}",
+            read["specifications"]
+        );
+
+        // `force` applies the same update anyway: the warnings are what it overrides.
+        harness
+            .ok(&case, "/updateDeployment", with_member(&body, "force", json!(true)))
+            .await;
+        let forced = get(&harness, &case, &id).await;
+        assert_eq!(
+            forced["specifications"],
+            Value::Object(specifications),
+            "case {case:?}: force must apply the update, got {}",
+            forced["specifications"]
+        );
     }
 }
 
@@ -482,9 +562,10 @@ async fn a_dry_run_update_checks_the_request_and_persists_nothing() {
     let mut warning = conforming.clone();
     warning.remove(&required_field(&case, &data));
 
-    // Settled first, so the record below is not moving under the clock while the dry
-    // runs are made.
-    std::thread::sleep(SETTLE);
+    // Settled first: the record below is not moving under the clock while the dry runs
+    // are made, and a deployment whose create is still in flight would refuse an
+    // update outright.
+    std::thread::sleep(CREATE_SETTLE);
     let before = get(&harness, &case, &id).await;
 
     // Every row is a dry run that passes its checks: it answers success, reports no
@@ -623,6 +704,9 @@ async fn an_update_of_a_deployment_that_is_absent_or_going_away_is_refused() {
     // does not override it — it overrides validation warnings, not the state of the
     // resource.
     let doomed = create(&harness, &case, &workload, &pattern, "update-while-deleting").await;
+    // Both deployments are at rest before anything is asked of them, so the refusals
+    // below are about the DELETE rather than about a create still in flight.
+    std::thread::sleep(CREATE_SETTLE);
     let before = get(&harness, &case, &doomed).await;
     harness
         .ok(&case, "/deleteDeployment", json!({"deploymentId": doomed}))
@@ -667,21 +751,60 @@ async fn an_update_of_a_deployment_that_is_absent_or_going_away_is_refused() {
     );
 }
 
+/// The labels of the version rows an update may name — one accepted row each, and one
+/// deployment per row, since a row that succeeds leaves its deployment mid-update.
+const VERSION_ROWS: [&str; 4] = [
+    "both versions",
+    "the workload version alone",
+    "the pattern version alone",
+    "no version at all",
+];
+
 #[tokio::test]
 async fn an_update_may_only_name_a_version_the_catalogue_holds() {
     let harness = Harness::new();
+    // Every deployment this test updates is created FIRST and the create lifecycles are
+    // waited out with ONE sleep: an update is taken only by a deployment at rest, and
+    // each accepted row below therefore needs a deployment of its own rather than
+    // reusing the one the previous row left mid-update.
+    let mut suites: Vec<VersionSuite> = Vec::new();
     for (workload, pattern) in one_pattern_per_workload(&harness).await {
         let case = format!("{workload}/{pattern}");
         let data = pattern_data(&harness, &case, &workload, &pattern).await;
         let conforming = conforming_specifications(&case, &data, true);
-        let id = create(
-            &harness,
-            &case,
-            &workload,
-            &pattern,
-            &format!("ver-{}", workload.to_lowercase()),
-        )
-        .await;
+        let slug = workload.to_lowercase();
+        let refused_on = create(&harness, &case, &workload, &pattern, &format!("ver-{slug}")).await;
+        let mut accepted_on = Vec::new();
+        for row in 0..VERSION_ROWS.len() {
+            accepted_on.push(
+                create(
+                    &harness,
+                    &case,
+                    &workload,
+                    &pattern,
+                    &format!("ver-{slug}-{row}"),
+                )
+                .await,
+            );
+        }
+        suites.push(VersionSuite {
+            case,
+            data,
+            conforming,
+            refused_on,
+            accepted_on,
+        });
+    }
+    std::thread::sleep(CREATE_SETTLE);
+
+    for VersionSuite {
+        case,
+        data,
+        conforming,
+        refused_on: id,
+        accepted_on,
+    } in suites
+    {
         let stored = get(&harness, &case, &id).await;
 
         // The versions the catalogue publishes for this pattern are accepted, together
@@ -744,37 +867,19 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
             );
         }
 
-        for (label, body) in [
-            (
-                "both versions",
-                with_member(
-                    &with_member(
-                        &update_body(&id, &conforming),
-                        "workloadVersionName",
-                        json!(workload_version),
-                    ),
+        for (index, label) in VERSION_ROWS.into_iter().enumerate() {
+            let row_id = accepted_on[index].clone();
+            let base = update_body(&row_id, &conforming);
+            let body = match index {
+                0 => with_member(
+                    &with_member(&base, "workloadVersionName", json!(workload_version)),
                     "deploymentPatternVersionName",
                     json!(pattern_version),
                 ),
-            ),
-            (
-                "the workload version alone",
-                with_member(
-                    &update_body(&id, &conforming),
-                    "workloadVersionName",
-                    json!(workload_version),
-                ),
-            ),
-            (
-                "the pattern version alone",
-                with_member(
-                    &update_body(&id, &conforming),
-                    "deploymentPatternVersionName",
-                    json!(pattern_version),
-                ),
-            ),
-            ("no version at all", update_body(&id, &conforming)),
-        ] {
+                1 => with_member(&base, "workloadVersionName", json!(workload_version)),
+                2 => with_member(&base, "deploymentPatternVersionName", json!(pattern_version)),
+                _ => base,
+            };
             let case = format!("{case} naming {label}");
             let answered = harness.ok(&case, "/updateDeployment", body).await;
             assert_eq!(
@@ -786,7 +891,7 @@ async fn an_update_may_only_name_a_version_the_catalogue_holds() {
             // deploys — which is the version it was created against, since each row
             // either names that version or names none, and a row that names none leaves
             // the deployment on the version it already deploys.
-            let described = last_update_description(&events(&harness, &case, &id).await);
+            let described = last_update_description(&events(&harness, &case, &row_id).await);
             for version in [&workload_version, &pattern_version] {
                 assert!(
                     described.contains(version.as_str()),
@@ -810,11 +915,13 @@ async fn the_event_log_of_one_deployment_is_bounded_however_often_it_is_updated(
     let id = create(&harness, &case, &workload, &pattern, "event-log-bound").await;
     let data = pattern_data(&harness, &case, &workload, &pattern).await;
     let conforming = conforming_specifications(&case, &data, true);
+    std::thread::sleep(CREATE_SETTLE);
 
     // An update is repeatable, so a deployment's event log is the one part of its record
-    // a caller can drive the growth of: it is capped at
-    // `state::MAX_EVENTS_PER_DEPLOYMENT`, and a capped log drops its OLDEST events.
-    for call in 0..MAX_EVENTS_PER_DEPLOYMENT + 16 {
+    // a caller can drive the growth of: every update appends the step it takes now and
+    // the step the clock then owes.
+    let created = events(&harness, &case, &id).await.len();
+    for call in 0..UPDATE_CYCLES {
         harness
             .ok(
                 &format!("{case} call {call}"),
@@ -822,10 +929,49 @@ async fn the_event_log_of_one_deployment_is_bounded_however_often_it_is_updated(
                 update_body(&id, &conforming),
             )
             .await;
+        // The next update waits for this one: a deployment that is still applying an
+        // update does not take another.
+        std::thread::sleep(SETTLE);
     }
-    // Waited out so the last clock-owed step has come due before the history is read,
-    // and the log is therefore quiescent while it is paged over.
-    std::thread::sleep(SETTLE);
+    let grown = events(&harness, &case, &id).await;
+    assert_eq!(
+        grown.len(),
+        created + 2 * UPDATE_CYCLES,
+        "case {case:?}: each update must append its two events, got {} after {} updates",
+        grown.len(),
+        UPDATE_CYCLES
+    );
+
+    // The log is capped at `state::MAX_EVENTS_PER_DEPLOYMENT`, and a capped log drops
+    // its OLDEST events. Driving that bound through the API alone would take one
+    // clock-owed update cycle per two events — minutes of real waiting now that a
+    // deployment mid-update refuses the next update — so the remaining history is
+    // appended to the STORED record through `Deployment::append_event`, the one path
+    // every appender (handler and clock-owed step alike) goes through, and the bound is
+    // then observed over the wire like any other read.
+    let filler_marker = "event-log-filler";
+    {
+        let state = service_state(&**harness.engine()).expect("the service's own state store");
+        let mut store = state.lock();
+        let deployment = store
+            .deployments
+            .get_mut(&id)
+            .unwrap_or_else(|| panic!("case {case:?}: the created deployment must be stored"));
+        let newest = deployment
+            .events
+            .last()
+            .map(|event| event.timestamp)
+            .unwrap_or_else(SystemTime::now);
+        for filler in 0..MAX_EVENTS_PER_DEPLOYMENT + 16 {
+            deployment.append_event(DeploymentEvent::new(
+                "DeploymentUpdateInProgress",
+                format!("{filler_marker} {filler}"),
+                EVENT_IN_PROGRESS,
+                newest + Duration::from_millis(filler as u64 + 1),
+            ));
+        }
+    }
+
     let history = walk_pages(
         &harness,
         &case,
@@ -852,10 +998,14 @@ async fn the_event_log_of_one_deployment_is_bounded_however_often_it_is_updated(
         !names.contains(&"DeploymentCreated"),
         "case {case:?}: a capped log must drop its oldest events first, got {names:?}"
     );
+    let newest = history
+        .last()
+        .and_then(|event| event["description"].as_str())
+        .unwrap_or_default();
     assert_eq!(
-        names.last().copied(),
-        Some("DeploymentUpdateCompleted"),
-        "case {case:?}: the newest event must be kept, got {names:?}"
+        newest,
+        format!("{filler_marker} {}", MAX_EVENTS_PER_DEPLOYMENT + 15),
+        "case {case:?}: the newest event must be kept, got {newest:?}"
     );
 
     // One more update still only appends, so the log stays at the cap rather than
@@ -878,5 +1028,14 @@ async fn the_event_log_of_one_deployment_is_bounded_however_often_it_is_updated(
         "case {case:?}: a further update must not grow the log past {}, got {}",
         MAX_EVENTS_PER_DEPLOYMENT,
         after.len()
+    );
+    assert_eq!(
+        after
+            .last()
+            .and_then(|event| event["name"].as_str())
+            .unwrap_or_default(),
+        "DeploymentUpdateInProgress",
+        "case {case:?}: the update's own event must be the newest one kept, got {}",
+        after.last().cloned().unwrap_or(Value::Null)
     );
 }

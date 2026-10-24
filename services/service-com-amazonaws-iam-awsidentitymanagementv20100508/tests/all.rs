@@ -59,6 +59,8 @@ mod role_policy_removal;
 mod role_tags;
 #[path = "all/role_trust_policy.rs"]
 mod role_trust_policy;
+#[path = "all/saml_providers.rs"]
+mod saml_providers;
 #[path = "all/service_linked_roles.rs"]
 mod service_linked_roles;
 #[path = "all/service_provisioned_roles.rs"]

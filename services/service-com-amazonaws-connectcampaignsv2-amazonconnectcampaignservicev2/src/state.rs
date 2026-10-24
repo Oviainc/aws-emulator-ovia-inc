@@ -28,8 +28,8 @@ use crate::ops::types::{
     Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimits,
     CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationSummary,
     EncryptionConfig, EntryLimitsConfig, InstanceConfig, InstanceOnboardingJobStatus,
-    IntegrationConfig, IntegrationSummary, LambdaIntegrationSummary, QConnectIntegrationSummary,
-    Schedule, Source,
+    IntegrationConfig, IntegrationSummary, LambdaIntegrationSummary, OpenHours,
+    QConnectIntegrationSummary, Schedule, Source, TimeWindow, DAY_OF_WEEK_VALUES,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -138,6 +138,52 @@ pub fn communication_limits_violation(
              Member must have length less than or equal to {MAX_COMMUNICATION_LIMITS}"
         )
     })
+}
+
+/// Why a communication-time config is a bad request, or `None` when every day its
+/// windows open is one the model's `DayOfWeek` catalog holds (`DAY_OF_WEEK_VALUES`
+/// in [`crate::ops::types`]).
+///
+/// The one place this service checks a `CommunicationTimeConfig`'s `dailyHours`
+/// keys, so every operation that accepts one (`CreateCampaign`,
+/// `UpdateCampaignCommunicationTime`) refuses a day naming no weekday the same way.
+/// Those keys sit behind the `OpenHours` union, which the centralized constraint
+/// walk does not reach, so without this check a campaign could be stored opening a
+/// day the model does not model. `member` is the request path the refusal names, so
+/// the message is built from the request rather than fixed text.
+pub fn communication_time_violation(
+    member: &str,
+    config: &CommunicationTimeConfig,
+) -> Option<String> {
+    // Every per-channel window `CommunicationTimeConfig` carries, under the member
+    // name a refusal reports it as.
+    let windows: [(&str, Option<&TimeWindow>); 4] = [
+        ("telephony", config.telephony.as_ref()),
+        ("sms", config.sms.as_ref()),
+        ("email", config.email.as_ref()),
+        ("whatsApp", config.whats_app.as_ref()),
+    ];
+    for (channel, window) in windows {
+        let Some(window) = window else {
+            continue;
+        };
+        let OpenHours::dailyHours(daily_hours) = &window.open_hours;
+        // Sorted so a config carrying more than one unmodelled day is always refused
+        // for the same one, however the map happens to iterate.
+        let mut days: Vec<&str> = daily_hours.keys().map(String::as_str).collect();
+        days.sort_unstable();
+        if let Some(day) = days
+            .into_iter()
+            .find(|day| !DAY_OF_WEEK_VALUES.contains(day))
+        {
+            return Some(format!(
+                "Value '{day}' at '{member}.{channel}.openHours.dailyHours' failed to \
+                 satisfy constraint: Member must satisfy enum value set: [{}]",
+                DAY_OF_WEEK_VALUES.join(", ")
+            ));
+        }
+    }
+    None
 }
 
 /// Encode a `ListCampaigns` cursor: the creation sequence number of the last

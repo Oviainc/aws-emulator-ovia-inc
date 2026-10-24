@@ -54,6 +54,11 @@
 //!   a patch that drops a property a stored group names is the call that
 //!   strands that group.
 //!
+//! A component type the SERVICE ships is not a caller's to change: a workspace
+//! is provisioned with the built-ins
+//! ([`crate::state::built_in_component_types`]), so a patch addressed to one is
+//! refused with the modelled `ValidationException` (HTTP 400).
+//!
 //! Authorization is not emulated, so the modelled `AccessDeniedException` is
 //! never returned. No quota applies to a call that creates nothing, so the
 //! modelled `ServiceQuotaExceededException` is not returned either.
@@ -261,6 +266,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+
+        // A built-in component type is the service's own, provisioned with the
+        // workspace: no caller's patch applies to it. Refused AFTER the two
+        // lookups above, so an id in the reserved namespace the store does not
+        // hold is still the 404 it deserves.
+        if crate::state::built_in_component_type_id(&input.component_type_id) {
+            return Err(validation_exception(
+                crate::state::built_in_component_type_not_writable_message(
+                    &input.workspace_id,
+                    &input.component_type_id,
+                ),
+            ));
+        }
 
         // The patch is built on a COPY, so a request refused below leaves the
         // stored record exactly as it was. The clock's transition is applied to

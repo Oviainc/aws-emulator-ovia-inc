@@ -17,19 +17,25 @@
 //!   choice `CreateEntity` makes);
 //! * `componentTypeId` is already taken in the workspace — a
 //!   `ConflictException`;
+//! * `componentTypeId` lies in the namespace the service reserves for the
+//!   component types it SHIPS
+//!   ([`crate::state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]) — a
+//!   `ValidationException`: those are provisioned with the workspace and are
+//!   not a caller's to mint;
 //! * the workspace already holds
-//!   [`crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE`] component types — the
-//!   modelled `ServiceQuotaExceededException`;
+//!   [`crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE`] component types the
+//!   caller created — the modelled `ServiceQuotaExceededException`;
 //! * a property definition of a component type that extends nothing carries no
 //!   `dataType` — a `ValidationException`, because `dataType` is required on
 //!   the `PropertyDefinitionResponse` a read reports and there is no parent
 //!   definition to inherit it from.
 //!
-//! Two deliberate gaps. `extendsFrom` is stored WITHOUT checking that the
-//! parent component types exist: every real workspace carries the service's
-//! built-in component types, and this emulator holds no registry of them, so
-//! refusing an id it cannot resolve would refuse legitimate parents (the same
-//! gap `CreateEntity` documents for a component's `componentTypeId`).
+//! One deliberate gap. `extendsFrom` is stored WITHOUT checking that the
+//! parent component types exist: a real workspace carries more built-in
+//! component types than this emulator models (see
+//! [`crate::state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]), so refusing an id it
+//! cannot resolve would refuse legitimate parents (the same gap `CreateEntity`
+//! documents for a component's `componentTypeId`).
 //! Authorization is not emulated, so the modelled `AccessDeniedException` is
 //! never returned.
 //!
@@ -232,10 +238,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The emulator's declared ceiling on the store, checked AFTER the
-        // identity conflict above so re-creating a taken id in a full workspace
-        // is still the ConflictException the id deserves.
-        if workspace.component_types.len() >= crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE {
+        // The `com.amazon.` namespace is the SERVICE's: the component types in
+        // it are the built-ins every workspace is provisioned with, so a caller
+        // cannot mint one there. Checked AFTER the conflict above, so asking for
+        // a built-in the workspace already holds is still the conflict that id
+        // deserves.
+        if crate::state::built_in_component_type_id(&input.component_type_id) {
+            return Err(CreateComponentTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::reserved_component_type_namespace_message(
+                        &input.component_type_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's declared ceiling on the store, over the component
+        // types the CALLER created: the workspace's built-ins are the service's
+        // own, so they do not spend a caller's quota. Checked AFTER the identity
+        // conflict above so re-creating a taken id in a full workspace is still
+        // the ConflictException the id deserves.
+        if workspace.created_component_types().count()
+            >= crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE
+        {
             return Err(
                 CreateComponentTypeErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -289,6 +315,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // type", which is a question with an answer for every component
             // type, and `false` is the answer for one created without it.
             is_singleton: input.is_singleton.unwrap_or(false),
+            // The API offers no way to declare a component type abstract, so
+            // one created through it is concrete; the abstract ones are the
+            // service's own built-ins. See `crate::state::ComponentType`.
+            is_abstract: false,
             extends_from,
             property_definitions: property_definitions.into_iter().collect(),
             functions: input.functions.unwrap_or_default().into_iter().collect(),
