@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRegexMatchSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRegexMatchSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRegexMatchSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies each `RegexMatchSetUpdate` to the stored `RegexMatchSet` named by
+//! `RegexMatchSetId` — `INSERT` adds the update's `RegexMatchTuple` (the part of a
+//! request to inspect, the transformation to apply first and the `RegexPatternSet` to
+//! search for) to the set's filter collection, `DELETE` removes it — so every later
+//! `GetRegexMatchSet` of that id reports the filters this call wrote. A mutation, as the
+//! operation's own documentation states ("Inserts or deletes RegexMatchTuple objects
+//! (filters) in a RegexMatchSet").
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +159,15 @@ impl From<UpdateRegexMatchSetErrorModeled> for UpdateRegexMatchSetError {
     }
 }
 
+/// The modelled `WAFLimitsExceededException`, the answer to a request that asks for more
+/// updates than one request may carry and to an insert past a set's own filter bound.
+fn limits_exceeded() -> UpdateRegexMatchSetError {
+    UpdateRegexMatchSetErrorModeled::WAFLimitsExceededException(WAFLimitsExceededException {
+        message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateRegexMatchSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -197,18 +204,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRegexMatchSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRegexMatchSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // Everything that depends only on the REQUEST is checked here, before this
+        // service's state is reached, so one request neither holds the shared state
+        // while walking a list it chose the length of nor does work no bound covers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRegexMatchSet"))
+        // The batch cap comes first: `RegexMatchSetUpdates` is modelled `len 1..`, so
+        // nothing upstream bounds how many updates one request may carry.
+        if input.updates.len() > crate::state::MAX_REGEX_MATCH_UPDATES_PER_REQUEST {
+            return Err(limits_exceeded());
+        }
+
+        for update in &input.updates {
+            let field_to_match = &update.regex_match_tuple.field_to_match;
+            // `ChangeAction`, `MatchFieldType` and `TextTransformation` are enum shapes
+            // and `ResourceId`'s length bounds are modelled, so a value outside any of
+            // them is refused before this handler runs. What is NOT modelled is the
+            // pairing of `Type` with `Data`: `Data` names the header or query-string
+            // parameter for `HEADER` and `SINGLE_QUERY_ARG` ("You tried to update a
+            // ByteMatchSet with a Field of HEADER but no value for Data"), and "if the
+            // value of Type is any other value, omit Data". This operation models no
+            // `WAFInvalidParameterException`, so that refusal goes out through the
+            // wrapper's `ValidationException`, naming the member and the constraint it
+            // broke.
+            let takes_data = crate::state::match_field_takes_data(&field_to_match.r#type);
+            if takes_data != field_to_match.data.is_some() {
+                return Err(crate::scaffolded::Scaffolded::validation(if takes_data {
+                    format!(
+                        "RegexMatchTuple.FieldToMatch of Type {} requires Data, naming the \
+                         part of the request to inspect",
+                        field_to_match.r#type
+                    )
+                } else {
+                    format!(
+                        "RegexMatchTuple.FieldToMatch of Type {} takes no Data",
+                        field_to_match.r#type
+                    )
+                }));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateRegexMatchSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The RegexMatchSet is the CONTAINER the filters go into, and the model reserves
+        // `WAFNonexistentContainerException` for exactly this: "You tried to add an
+        // object to or delete an object from another object that doesn't exist."
+        let Some(stored) = state.regex_match_sets.get(&input.regex_match_set_id) else {
+            return Err(
+                UpdateRegexMatchSetErrorModeled::WAFNonexistentContainerException(
+                    WAFNonexistentContainerException {
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_CONTAINER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request that is refused
+        // part-way through leaves the stored RegexMatchSet (and the change token) exactly
+        // as they were. Each step under the lock is one indexed lookup plus a push or a
+        // remove over at most `MAX_REGEX_MATCH_TUPLES` filters.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let tuple = &update.regex_match_tuple;
+            let changed = match update.action.as_str() {
+                crate::state::CHANGE_ACTION_INSERT => {
+                    // The filter POINTS AT a `RegexPatternSet` by id, and this operation
+                    // documents the order: "Create a RegexPatternSet. For more
+                    // information, see CreateRegexPatternSet. […] Submit an
+                    // UpdateRegexMatchSet request to specify […] the identifier of the
+                    // RegexPatternSet". A filter inserted for an id this service holds no
+                    // pattern set under would reference an object that does not exist,
+                    // which is what the modelled `WAFNonexistentItemException` answers
+                    // ("the referenced object doesn't exist"). A `DELETE` names a filter
+                    // the set already holds, so it is about the stored filter rather than
+                    // the pattern set, and is not gated on it.
+                    if !state
+                        .regex_pattern_sets
+                        .contains_key(&tuple.regex_pattern_set_id)
+                    {
+                        return Err(
+                            UpdateRegexMatchSetErrorModeled::WAFNonexistentItemException(
+                                WAFNonexistentItemException {
+                                    message: Some(
+                                        crate::state::MESSAGE_NONEXISTENT_ITEM.to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    // One RegexMatchSet holds at most `MAX_REGEX_MATCH_TUPLES` filters,
+                    // so the filter state a caller can accumulate over many requests is
+                    // bounded, not just the number of updates one request may carry.
+                    if working.tuples.len() >= crate::state::MAX_REGEX_MATCH_TUPLES {
+                        return Err(limits_exceeded());
+                    }
+                    working.insert_tuple(tuple)
+                }
+                crate::state::CHANGE_ACTION_DELETE => working.remove_tuple(tuple),
+                // `ChangeAction` is {INSERT, DELETE} and a value outside it is refused at
+                // the boundary, so this arm is reachable only if the model grows a third
+                // action: an action this operation does not know is refused, never
+                // guessed at as an INSERT or a DELETE.
+                other => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "RegexMatchSetUpdate.Action {other} is not an action this \
+                         operation applies"
+                    )))
+                }
+            };
+            // "The operation failed because there was nothing to do" covers both ways an
+            // update can leave the set as it was: deleting a filter the set does not hold
+            // and inserting one it already holds. "If you want to change a
+            // RegexMatchSetUpdate object, you delete the existing object and add a new
+            // one."
+            if !changed {
+                return Err(UpdateRegexMatchSetErrorModeled::WAFInvalidOperationException(
+                    WAFInvalidOperationException {
+                        message: Some(crate::state::MESSAGE_INVALID_OPERATION.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token, which
+        // must be one `GetChangeToken` minted and no other mutating call has used, since
+        // "each create, update, or delete request must use a unique change token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateRegexMatchSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let regex_match_set_id = working.regex_match_set_id.clone();
+        state.regex_match_sets.insert(regex_match_set_id, working);
+
+        Ok(UpdateRegexMatchSetOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

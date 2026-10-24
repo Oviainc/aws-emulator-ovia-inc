@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegexMatchSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegexMatchSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegexMatchSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Consumes the caller's change token, mints a `RegexMatchSetId` and stores a new,
+//! empty `RegexMatchSet` under it, so `GetRegexMatchSet` and `UpdateRegexMatchSet` both
+//! see the record this call created. Answers the stored record and the change token it
+//! consumed.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegexMatchSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegexMatchSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegexMatchSet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRegexMatchSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Every RegexMatchSet is a stored record, so the number a caller can create is
+        // bounded, as it is on the real service. This gate runs BEFORE the change token
+        // is consumed, so a request refused for the quota leaves the caller's token
+        // usable: the request changed nothing, and `GetChangeToken` documents a token as
+        // consumed by "a create, update, or delete request", which this refusal never
+        // became.
+        if state.regex_match_sets.len() >= crate::state::MAX_REGEX_MATCH_SETS {
+            return Err(CreateRegexMatchSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has used,
+        // since "each create, update, or delete request must use a unique change token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateRegexMatchSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // RegexMatchSets created with the same `Name` are two distinct resources, each
+        // stored under its own `RegexMatchSetId`.
+        let regex_match_set_id = state.mint_id();
+        // "A RegexMatchSet that contains no RegexMatchTuple objects": the filters arrive
+        // through `UpdateRegexMatchSet`.
+        let entry = crate::state::RegexMatchSetEntry::new(regex_match_set_id.clone(), input.name);
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let regex_match_set = entry.to_modelled();
+        state.regex_match_sets.insert(regex_match_set_id, entry);
+
+        Ok(CreateRegexMatchSetOutput {
+            regex_match_set: Some(regex_match_set),
+            change_token: Some(input.change_token),
+        })
     }
 }

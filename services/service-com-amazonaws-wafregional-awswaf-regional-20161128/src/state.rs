@@ -28,6 +28,12 @@
 //! of this file: `CreateGeoMatchSet` stores one and `GetGeoMatchSet` projects it,
 //! through that same id minting and change-token protocol.
 
+//! `RegexMatchSet` records live in the same store as well, under [`RegexMatchSetEntry`]
+//! at the very end of this file: `CreateRegexMatchSet` stores one,
+//! `UpdateRegexMatchSet` writes the `RegexMatchTuple` filters it holds and
+//! `GetRegexMatchSet` projects it, through that same id minting and change-token
+//! protocol.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -49,6 +55,10 @@ use crate::ops::types::{ByteMatchSet, ByteMatchTuple, FieldToMatch};
 // The GeoMatchSet shapes, kept in their own `use` for the same reason: this list stays
 // beside the record that projects them.
 use crate::ops::types::{GeoMatchConstraint, GeoMatchSet};
+
+// The RegexMatchSet shapes, kept in their own `use` for the same reason: this list
+// stays beside the records at the end of this file that project them.
+use crate::ops::types::{RegexMatchSet, RegexMatchTuple};
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
 /// (`INSYNC`, `PENDING`, `PROVISIONED`).
@@ -1017,6 +1027,8 @@ pub const PREDICATE_TYPE_SIZE_CONSTRAINT: &str = "SizeConstraint";
 pub const PREDICATE_TYPE_BYTE_MATCH: &str = "ByteMatch";
 /// The `PredicateType` whose `DataId` names a `GeoMatchSet`.
 pub const PREDICATE_TYPE_GEO_MATCH: &str = "GeoMatch";
+/// The `PredicateType` whose `DataId` names a `RegexMatchSet`.
+pub const PREDICATE_TYPE_REGEX_MATCH: &str = "RegexMatch";
 
 /// One `Predicate` stored on a `Rule`.
 ///
@@ -1377,6 +1389,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// same reason as [`Self::ip_sets`]: one stable order for `ListGeoMatchSets` to page
     /// over. The records themselves are at the end of this file.
     pub geo_match_sets: BTreeMap<String, GeoMatchSetEntry>,
+    /// Every stored `RegexMatchSet`, keyed by its `RegexMatchSetId`. A `BTreeMap` for
+    /// the same reason as [`Self::ip_sets`]: one stable order for `ListRegexMatchSets`
+    /// to page over. The records themselves are at the end of this file.
+    pub regex_match_sets: BTreeMap<String, RegexMatchSetEntry>,
     /// Monotonic counter behind every minted id and change token.
     next_seq: u64,
 }
@@ -1452,10 +1468,11 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
     /// Each `PredicateType` resolves its `DataId` against the store of that condition
     /// kind — `IPMatch` against the `IPSet`s, `SqlInjectionMatch` against the
     /// `SqlInjectionMatchSet`s, `XssMatch` against the `XssMatchSet`s, `SizeConstraint`
-    /// against the `SizeConstraintSet`s, `ByteMatch` against the `ByteMatchSet`s and
-    /// `GeoMatch` against the `GeoMatchSet`s. `RegexMatch` is the one `PredicateType`
-    /// left whose `Create*` is still a scaffold, so this service holds no
-    /// `RegexMatchSet` under any id and no `DataId` of that type can resolve.
+    /// against the `SizeConstraintSet`s, `ByteMatch` against the `ByteMatchSet`s,
+    /// `GeoMatch` against the `GeoMatchSet`s and `RegexMatch` against the
+    /// `RegexMatchSet`s. Every `PredicateType` the model declares now has a store of its
+    /// own kind, so a `DataId` resolves exactly when a set of that kind is stored under
+    /// it.
     pub fn condition_set_exists(&self, kind: &str, data_id: &str) -> bool {
         match kind {
             PREDICATE_TYPE_IP_MATCH => self.ip_sets.contains_key(data_id),
@@ -1466,6 +1483,7 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
             PREDICATE_TYPE_SIZE_CONSTRAINT => self.size_constraint_sets.contains_key(data_id),
             PREDICATE_TYPE_BYTE_MATCH => self.byte_match_sets.contains_key(data_id),
             PREDICATE_TYPE_GEO_MATCH => self.geo_match_sets.contains_key(data_id),
+            PREDICATE_TYPE_REGEX_MATCH => self.regex_match_sets.contains_key(data_id),
             _ => false,
         }
     }
@@ -1948,5 +1966,130 @@ fn permission_policy_actions_are_allowed(action: Option<&::serde_json::Value>) -
             !actions.is_empty() && actions.iter().all(allowed)
         }
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic RegexMatchSet records
+//
+// `CreateRegexMatchSet`, `UpdateRegexMatchSet` and `GetRegexMatchSet` read and write
+// the `regex_match_sets` map of the one state struct above through the record and
+// bounds below. A `RegexMatchTuple` POINTS AT a `RegexPatternSet` by id, so the
+// patterns a filter searches for stay the single copy `regex_pattern_sets` holds.
+// ---------------------------------------------------------------------------
+
+/// The most `RegexMatchSet`s this emulator stores for the account before
+/// `CreateRegexMatchSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for an
+/// account (100 conditions of each condition type, a `RegexMatchSet` being one
+/// condition); with [`MAX_REGEX_MATCH_TUPLES`] bounding each one's contents, it keeps
+/// the RegexMatchSet state a caller can grow bounded. It is the same figure its sibling
+/// condition kinds carry ([`MAX_BYTE_MATCH_SETS`], [`MAX_SQL_INJECTION_MATCH_SETS`]).
+pub const MAX_REGEX_MATCH_SETS: usize = 100;
+
+/// The most `RegexMatchTuple`s one `RegexMatchSet` may hold.
+///
+/// `RegexMatchTuples` carries no modelled bound and no AWS sentence is cited for one, so
+/// this bound is CHOSEN, on the same reasoning as [`MAX_REGEX_PATTERN_SETS`]: it is well
+/// above the handful of filters one condition inspects with, small enough that a test
+/// can reach it, and it bounds the filter state a caller can accumulate over many
+/// `UpdateRegexMatchSet` requests.
+pub const MAX_REGEX_MATCH_TUPLES: usize = 10;
+
+/// The most `RegexMatchSetUpdate`s one `UpdateRegexMatchSet` request may carry.
+///
+/// The model bounds `RegexMatchSetUpdates` only below (`length 1..`), so this bound is
+/// CHOSEN, on the same reasoning as [`MAX_REGEX_PATTERN_SET_UPDATES_PER_REQUEST`]: a
+/// request can at most empty a set ([`MAX_REGEX_MATCH_TUPLES`] deletes) and then fill it
+/// again ([`MAX_REGEX_MATCH_TUPLES`] inserts), since a delete must name a filter the set
+/// holds and an insert one it does not, so no larger request can leave the set in a
+/// state a request of this size cannot. It caps the work one caller can ask for before
+/// the handler takes the shared store's lock.
+pub const MAX_REGEX_MATCH_UPDATES_PER_REQUEST: usize = 2 * MAX_REGEX_MATCH_TUPLES;
+
+/// One `RegexMatchTuple`'s identity: the filter it is ([`MatchFilterKey`] — the part of
+/// the request it inspects and the transformation applied first) together with the
+/// `RegexPatternSet` it points at.
+///
+/// `RegexMatchSetUpdate` documents the identity: "If you specify `DELETE` for the value
+/// of `Action`, the `RegexMatchTuple` values must exactly match the values in the
+/// `RegexMatchTuple` that you want to delete from the `RegexMatchSet`" — so two tuples
+/// are the same tuple exactly when all three of their members are equal, which is what
+/// the derived `Eq`/`Ord` here mean.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegexMatchTupleKey {
+    pub filter: MatchFilterKey,
+    pub regex_pattern_set_id: String,
+}
+
+/// The identity of `tuple` — see [`RegexMatchTupleKey`].
+pub fn regex_match_tuple_key(tuple: &RegexMatchTuple) -> RegexMatchTupleKey {
+    RegexMatchTupleKey {
+        filter: match_filter_key(&tuple.field_to_match, &tuple.text_transformation),
+        regex_pattern_set_id: tuple.regex_pattern_set_id.clone(),
+    }
+}
+
+/// One stored `RegexMatchSet`.
+#[derive(Debug, Clone)]
+pub struct RegexMatchSetEntry {
+    pub regex_match_set_id: String,
+    pub name: String,
+    /// The filters in insertion order, deduplicated by [`RegexMatchTupleKey`]. The
+    /// modelled shape is stored as it was accepted, so a read reports the stored record
+    /// rather than a re-rendering of it.
+    pub tuples: Vec<RegexMatchTuple>,
+    /// Membership index over the [`RegexMatchTupleKey`]s of `tuples`, kept in step with
+    /// it by [`RegexMatchSetEntry::insert_tuple`] and
+    /// [`RegexMatchSetEntry::remove_tuple`], so deduplicating one update costs a lookup
+    /// rather than a scan of the whole set.
+    keys: BTreeSet<RegexMatchTupleKey>,
+}
+
+impl RegexMatchSetEntry {
+    /// A new `RegexMatchSet` record, which holds no filters: `CreateRegexMatchSet`
+    /// documents that it answers "A RegexMatchSet that contains no RegexMatchTuple
+    /// objects", and the filters arrive through `UpdateRegexMatchSet`.
+    pub fn new(regex_match_set_id: String, name: String) -> Self {
+        Self {
+            regex_match_set_id,
+            name,
+            tuples: Vec::new(),
+            keys: BTreeSet::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `RegexMatchSet` shape the Get and Create
+    /// responses carry: the stored record's own fields, never request input. The filter
+    /// list is always present, empty for a set that holds none.
+    pub fn to_modelled(&self) -> RegexMatchSet {
+        RegexMatchSet {
+            regex_match_set_id: Some(self.regex_match_set_id.clone()),
+            name: Some(self.name.clone()),
+            regex_match_tuples: Some(self.tuples.clone()),
+        }
+    }
+
+    /// Add a filter, unless one with the same identity is already stored. Answers
+    /// whether the set changed.
+    pub fn insert_tuple(&mut self, tuple: &RegexMatchTuple) -> bool {
+        if !self.keys.insert(regex_match_tuple_key(tuple)) {
+            return false;
+        }
+        self.tuples.push(tuple.clone());
+        true
+    }
+
+    /// Remove the filter whose identity equals `tuple`'s, if the set holds one. Answers
+    /// whether the set changed.
+    pub fn remove_tuple(&mut self, tuple: &RegexMatchTuple) -> bool {
+        let key = regex_match_tuple_key(tuple);
+        if !self.keys.remove(&key) {
+            return false;
+        }
+        self.tuples
+            .retain(|stored| regex_match_tuple_key(stored) != key);
+        true
     }
 }

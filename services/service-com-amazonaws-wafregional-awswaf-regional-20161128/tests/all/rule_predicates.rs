@@ -134,6 +134,21 @@ async fn create_geo_match_set(router: &MultiServiceRouter, name: &str) -> String
         .to_string()
 }
 
+/// Create a `RegexMatchSet` and return its `RegexMatchSetId`.
+async fn create_regex_match_set(router: &MultiServiceRouter, name: &str) -> String {
+    let token = change_token(router).await;
+    let body = ok_call(
+        router,
+        "CreateRegexMatchSet",
+        &json!({"Name": name, "ChangeToken": token}),
+    )
+    .await;
+    body["RegexMatchSet"]["RegexMatchSetId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateRegexMatchSet returned no RegexMatchSetId: {body}"))
+        .to_string()
+}
+
 /// One `RuleUpdate` on the wire.
 fn update(action: &str, negated: bool, kind: &str, data_id: &str) -> Value {
     json!({
@@ -185,6 +200,7 @@ async fn insert_then_delete_round_trips_a_predicate_of_every_condition_kind() {
     let size_set = create_size_constraint_set(&router, "predicate-size-set").await;
     let byte_set = create_byte_match_set(&router, "predicate-byte-set").await;
     let geo_set = create_geo_match_set(&router, "predicate-geo-set").await;
+    let regex_set = create_regex_match_set(&router, "predicate-regex-set").await;
 
     // (label, PredicateType, the id of a stored set of that kind, Negated) — the
     // `PredicateType` values this service holds a condition store for, each with and
@@ -240,6 +256,18 @@ async fn insert_then_delete_round_trips_a_predicate_of_every_condition_kind() {
             "a negated GeoMatchSet predicate",
             "GeoMatch",
             geo_set.as_str(),
+            true,
+        ),
+        (
+            "a RegexMatchSet predicate",
+            "RegexMatch",
+            regex_set.as_str(),
+            false,
+        ),
+        (
+            "a negated RegexMatchSet predicate",
+            "RegexMatch",
+            regex_set.as_str(),
             true,
         ),
     ];
@@ -404,9 +432,9 @@ async fn insert_refuses_a_predicate_whose_condition_set_does_not_exist() {
             "XssMatch",
             byte_set.as_str(),
         ),
-        // `RegexMatch` is the one condition kind this service stores nothing of (its
-        // `CreateRegexMatchSet` is still a scaffold), so no id resolves for it — not
-        // even one a stored set of another kind carries.
+        // A `RegexMatch` `DataId` resolves against the `RegexMatchSet`s, which
+        // `CreateRegexMatchSet` stores: an id no regex match set was created under does
+        // not resolve — not even one a stored set of another kind carries.
         ("a RegexMatchSet id that was never minted", "RegexMatch", UNKNOWN_ID),
         (
             "a stored ByteMatchSet id used as a RegexMatchSet",
