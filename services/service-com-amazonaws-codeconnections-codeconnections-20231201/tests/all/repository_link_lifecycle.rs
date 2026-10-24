@@ -724,10 +724,6 @@ async fn a_link_reports_its_connections_provider_and_refuses_an_unresolvable_con
             format!("arn:aws:codeconnections:{REGION}:{account}:connection/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"),
         ),
         (
-            "a host ARN, which names no connection",
-            create_host(&router, "not-a-connection", "GitHub").await,
-        ),
-        (
             "another account's connection",
             format!("arn:aws:codeconnections:{REGION}:210987654321:connection/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"),
         ),
@@ -753,6 +749,32 @@ async fn a_link_reports_its_connections_provider_and_refuses_an_unresolvable_con
             .await,
         );
     }
+
+    // An ARN of ANOTHER resource kind is not a connection ARN at all, so it is refused as
+    // an INPUT-CONSTRAINT violation before anything is resolved: the repository-link
+    // surface holds `ConnectionArn` to the connection-scoped expression rather than to
+    // the generic ARN pattern the public model carries, which the loose pattern admits.
+    // The expression and the message are pinned in `validation_message_rules.rs`.
+    assert_error(
+        "a host ARN, which is not a connection ARN",
+        400,
+        "ValidationException",
+        call(
+            &router,
+            "CreateRepositoryLink",
+            create_link_body(
+                &LinkCase {
+                    label: "not a connection ARN",
+                    owner_id: "owner".to_string(),
+                    repository_name: "repo-host-arn".to_string(),
+                    encryption_key_arn: None,
+                    tags: Vec::new(),
+                },
+                &create_host(&router, "not-a-connection", "GitHub").await,
+            ),
+        )
+        .await,
+    );
 }
 
 /// A link a sync configuration still references cannot be deleted: the delete is

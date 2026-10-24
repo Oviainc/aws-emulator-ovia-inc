@@ -41,5 +41,7 @@ mod sync_blocker_summary;
 mod target_prefix_forms;
 #[path = "all/target_probe.rs"]
 mod target_probe;
+#[path = "all/validation_message_rules.rs"]
+mod validation_message_rules;
 #[path = "all/wire_target_routing.rs"]
 mod wire_target_routing;

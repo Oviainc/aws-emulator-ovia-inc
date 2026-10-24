@@ -26,6 +26,10 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex-encodes those digests and the opaque `ListAssets` pagination cursor.
 hex = { workspace = true }
+# `service-common` carries the ONE caller-supplied-ARN parse, which the creates read
+# their ARN-documented members (`SourceArn`, `SourceRoleArn`, the CDN authorization
+# block, a SPEKE role) through rather than splitting a value again here.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

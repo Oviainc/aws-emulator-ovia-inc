@@ -2,8 +2,9 @@
 
 //! @op CreatePackagingConfiguration
 //! IMPLEMENTED: mints a PackagingConfiguration against an existing PackagingGroup.
-//! Refuses a `PackagingGroupId` that resolves to nothing — and a request that does
-//! not carry exactly one package block — as a request-parameter violation,
+//! Refuses a `PackagingGroupId` that resolves to nothing, a request that does
+//! not carry exactly one package block, and a `SpekeKeyProvider$RoleArn` that is not
+//! the ARN of an IAM role — each as a request-parameter violation,
 //! `UnprocessableEntityException` (422); resolves the package block's server-side
 //! defaults ([`crate::state::hls_package_with_defaults`] and its DASH/CMAF/MSS
 //! siblings), persists the resolved block, and answers HTTP 202 with the record just
@@ -204,6 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The `SpekeKeyProvider$RoleArn` of the chosen format's encryption block is
+        // "an IAM role that AWS Elemental MediaPackage will assume when accessing the
+        // key provider service", so it is read as an IAM role ARN before anything is
+        // stored. Read after the one-block rule, so a request carrying several blocks
+        // is still answered by the rule about the request as a whole.
+        crate::state::check_speke_role_arns(
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
         // The group id arrives in the request BODY, so one that resolves to nothing
         // is a violation of that PARAMETER rather than a missing addressed resource.
         // It resolves in this request's Region only: a group of the same `Id` in

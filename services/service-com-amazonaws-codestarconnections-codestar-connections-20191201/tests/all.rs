@@ -15,5 +15,7 @@
 mod connection_lifecycle;
 #[path = "all/host_deletion.rs"]
 mod host_deletion;
+#[path = "all/host_lifecycle.rs"]
+mod host_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

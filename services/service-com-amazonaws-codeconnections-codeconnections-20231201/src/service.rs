@@ -26,8 +26,9 @@
 //!   what the AWS SDK model uses) reaches the same generated operation as one using the
 //!   bare service shape name. See the method for why.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. EDITED HERE: every input-constraint refusal is worded by
+//!   `validation`, this service's one statement of its validation-message dialect.
+//!   See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -41,6 +42,8 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+
+pub(crate) mod validation;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -139,15 +142,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. The wording is NOT written here: it is
+        // `validation::refused`, the one formatter every operation's boundary
+        // validation reaches, so no operation can state a refusal its own way and
+        // a handler enforcing a constraint the model cannot express
+        // (`validation::connection_arn_refusal`) states it in the same envelope.
+        // Both the code and the message come from there, since a client branches
+        // on the code and a message without its matching code is worse than
+        // leaving both alone. A refusal class that module has no wording for keeps
+        // the framework's own sentence.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

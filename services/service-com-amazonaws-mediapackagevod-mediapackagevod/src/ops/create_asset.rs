@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAsset
-//! IMPLEMENTED: ingests an Asset into an existing PackagingGroup. Refuses a
-//! `PackagingGroupId` that resolves to nothing as a request-parameter violation —
-//! `UnprocessableEntityException` (422) attributing it to that member — persists the
+//! IMPLEMENTED: ingests an Asset into an existing PackagingGroup. Reads `SourceArn`
+//! and `SourceRoleArn` as ARNs of the services their documentation names (an S3
+//! object and an IAM role) and refuses a value that is not one, refuses a
+//! `PackagingGroupId` that resolves to nothing — both as request-parameter violations,
+//! `UnprocessableEntityException` (422) attributing each to its member — persists the
 //! asset, and answers with the record just stored plus the `EgressEndpoints` DERIVED
 //! from the packaging configurations attached to that group.
 //!
@@ -176,6 +178,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `SourceArn` is "ARN of the source object in S3" and `SourceRoleArn` "The IAM
+        // role ARN used to access the source S3 bucket": ingest reads that object AS
+        // that role, so neither member can be arbitrary text — a value that is not an
+        // ARN of the documented service names nothing the ingest could reach. Read
+        // BEFORE the store is touched, so a refused create leaves no asset behind and
+        // no later read reports one.
+        crate::state::check_arn_members(&[
+            (
+                "sourceArn",
+                input.source_arn.as_str(),
+                crate::state::S3_OBJECT_ARN,
+            ),
+            (
+                "sourceRoleArn",
+                input.source_role_arn.as_str(),
+                crate::state::IAM_ROLE_ARN,
+            ),
+        ])?;
         // An id in the request BODY that resolves to nothing is a violation of that
         // PARAMETER, not a missing addressed resource: the request addresses
         // `/assets`, which exists. So it is the 422 that names the member, not a 404.
