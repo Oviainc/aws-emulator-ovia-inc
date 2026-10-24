@@ -28,7 +28,14 @@
 //!   untouched, while one that differs in ANY member describes a different control;
 //! * an id no control holds is `NoSuchOriginAccessControl` (404);
 //! * `OriginAccessControlConfig$Name`: "You can specify up to 64 characters", so a longer
-//!   name is refused before anything is stored.
+//!   name is refused before anything is stored;
+//! * the version token the create MINTS ("the version identifier for the current version
+//!   of the origin access control") is the one every later read of that control reports,
+//!   and the `Location` the create reports is the URI that control is read at — a read
+//!   mints nothing and changes nothing a later caller sees;
+//! * "The number of origin access controls in your Amazon Web Services account exceeds the
+//!   maximum allowed" — a create that would take the account past its origin access
+//!   control quota is refused with `TooManyOriginAccessControls` and mints nothing.
 //!
 //! The table rows differ along everything these rules generalise over: every value of
 //! every enum the configuration carries (`SigningProtocol`, `SigningBehavior` and
@@ -47,7 +54,7 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::{
     ORIGIN_ACCESS_CONTROL_SIGNING_PROTOCOLS_VALUES,
 };
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MAX_ITEMS, MAX_ORIGIN_ACCESS_CONTROL_NAME,
+    MAX_ITEMS, MAX_ORIGIN_ACCESS_CONTROLS, MAX_ORIGIN_ACCESS_CONTROL_NAME,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -288,6 +295,72 @@ fn page_ids(answer: &Answer) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Every `OriginAccessControlSummary` the account holds, walking `NextMarker` at `page`
+/// items a page (`None` asks for no page size at all), so a caller of this helper never
+/// depends on the whole collection fitting one page.
+///
+/// The walk is BOUNDED: a listing hands out at most one resume point per stored control,
+/// so a repeated resume point or more pages than the account can hold is a pagination
+/// defect, and this fails on it instead of looping forever.
+async fn all_summaries(router: &MultiServiceRouter, page: Option<usize>) -> Vec<Node> {
+    let mut summaries: Vec<Node> = Vec::new();
+    let mut marker: Option<String> = None;
+    let mut resume_points: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..=MAX_ORIGIN_ACCESS_CONTROLS {
+        let query = match (page, &marker) {
+            (Some(size), Some(value)) => format!("?MaxItems={size}&Marker={value}"),
+            (Some(size), None) => format!("?MaxItems={size}"),
+            (None, Some(value)) => format!("?Marker={value}"),
+            (None, None) => String::new(),
+        };
+        let answer = list_controls(router, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case the whole account: expected HTTP 200 for a listing of {query:?}, got {} \
+             with {}",
+            answer.status, answer.raw
+        );
+        if let Some(items) = answer.root().at("Items") {
+            summaries.extend(
+                items
+                    .children_named("OriginAccessControlSummary")
+                    .into_iter()
+                    .cloned(),
+            );
+        }
+        match answer.root().text_at("NextMarker") {
+            Some(next) => {
+                assert!(
+                    resume_points.insert(next.to_string()),
+                    "case the whole account: the listing handed out the resume point {next} \
+                     twice, so the walk is not advancing: {}",
+                    answer.raw
+                );
+                marker = Some(next.to_string());
+            }
+            None => return summaries,
+        }
+    }
+    panic!(
+        "case the whole account: the walk took more than {MAX_ORIGIN_ACCESS_CONTROLS} pages, \
+         so the listing is not advancing"
+    );
+}
+
+/// One member's text out of every summary the account holds, in listing order, walked at
+/// `page` items a page.
+async fn all_summary_texts(
+    router: &MultiServiceRouter,
+    page: Option<usize>,
+    member: &str,
+) -> Vec<String> {
+    all_summaries(router, page)
+        .await
+        .iter()
+        .map(|summary| summary.text_at(member).unwrap_or_default().to_string())
+        .collect()
 }
 
 /// Whether `value` has the shape of an id this service mints: `E` followed by 13
@@ -836,4 +909,210 @@ async fn a_name_past_the_documented_bound_is_refused() {
         "case refused names: expected only the accepted control to be stored, got {}",
         listed.raw
     );
+}
+
+#[tokio::test]
+async fn the_minted_version_token_and_location_are_what_every_later_read_answers_with() {
+    let router = emulator();
+    let rows = table();
+
+    // What each create minted, so the reads below are checked against the create's own
+    // answer rather than against a token the test made up.
+    let mut minted: Vec<(Control, String, String)> = Vec::new();
+    for row in &rows {
+        let created = create_control(&router, &row.xml()).await;
+        assert_eq!(
+            created.status, 201,
+            "case {}: expected HTTP 201 from CreateOriginAccessControl, got {} with {}",
+            row.case, created.status, created.raw
+        );
+        let id = created
+            .root()
+            .text_at("Id")
+            .unwrap_or_default()
+            .to_string();
+        let etag = created.header("etag").to_string();
+
+        // "The URL of the origin access control": the URI the control is READ at, so a
+        // caller holding only the create's Location reaches the record that was stored.
+        let location = created.header("location").to_string();
+        let path = location
+            .strip_prefix(&format!("https://{HOST}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {}: expected a Location under https://{HOST}, got {location:?}",
+                    row.case
+                )
+            })
+            .to_string();
+        let at_location = call(&router, "GET", &path, None, None).await;
+        assert_eq!(
+            at_location.status, 200,
+            "case {}: expected HTTP 200 reading the control at its own Location {path}, \
+             got {} with {}",
+            row.case, at_location.status, at_location.raw
+        );
+        assert_eq!(
+            at_location.root().text_at("Id"),
+            Some(id.as_str()),
+            "case {}: expected the Location to name the created control {id}, got {}",
+            row.case,
+            at_location.raw
+        );
+
+        minted.push((row.clone(), id, etag));
+    }
+
+    // Reading a control mints nothing: every read answers with the token the create handed
+    // back, however many times it is read, and with the configuration that was stored.
+    for attempt in 1..=3 {
+        for (row, id, etag) in &minted {
+            let read = get_control(&router, id).await;
+            assert_eq!(
+                read.status, 200,
+                "case {} (read {attempt}): expected HTTP 200, got {} with {}",
+                row.case, read.status, read.raw
+            );
+            assert_eq!(
+                read.header("etag"),
+                etag.as_str(),
+                "case {} (read {attempt}): expected the minted version token {etag}, got {:?}",
+                row.case,
+                read.header("etag")
+            );
+            let config = read.root().at("OriginAccessControlConfig").unwrap_or_else(|| {
+                panic!(
+                    "case {} (read {attempt}): no configuration in {}",
+                    row.case, read.raw
+                )
+            });
+            row.assert_matches(config, "a repeated read", &read.raw);
+        }
+    }
+
+    // The tokens are per CONTROL, so two controls never share one.
+    let tokens: BTreeSet<String> = minted
+        .iter()
+        .map(|(_, _, etag)| etag.clone())
+        .collect();
+    assert_eq!(
+        tokens.len(),
+        minted.len(),
+        "case the whole account: expected one distinct version token per control, got \
+         {} for {} controls",
+        tokens.len(),
+        minted.len()
+    );
+}
+
+#[tokio::test]
+async fn a_create_past_the_account_quota_is_refused_and_mints_nothing() {
+    let router = emulator();
+
+    // Fill the account to its origin access control quota, each create describing a
+    // DIFFERENT control (the enum catalogs cycled across the rows, so the configurations
+    // differ in more than their names).
+    let at_quota: Vec<Control> = (0..MAX_ORIGIN_ACCESS_CONTROLS)
+        .map(|index| Control {
+            case: format!("control {index} of the quota"),
+            name: format!("oac-quota-{index}"),
+            description: None,
+            signing_protocol: ORIGIN_ACCESS_CONTROL_SIGNING_PROTOCOLS_VALUES
+                [index % ORIGIN_ACCESS_CONTROL_SIGNING_PROTOCOLS_VALUES.len()]
+            .to_string(),
+            signing_behavior: ORIGIN_ACCESS_CONTROL_SIGNING_BEHAVIORS_VALUES
+                [index % ORIGIN_ACCESS_CONTROL_SIGNING_BEHAVIORS_VALUES.len()]
+            .to_string(),
+            origin_type: ORIGIN_ACCESS_CONTROL_ORIGIN_TYPES_VALUES
+                [index % ORIGIN_ACCESS_CONTROL_ORIGIN_TYPES_VALUES.len()]
+            .to_string(),
+        })
+        .collect();
+    let created = create_all(&router, &at_quota).await;
+    assert_eq!(
+        created.len(),
+        MAX_ORIGIN_ACCESS_CONTROLS,
+        "case filling the quota: expected {MAX_ORIGIN_ACCESS_CONTROLS} controls created"
+    );
+
+    // Walked across pages at a page size well under the quota, so the case is about the
+    // QUOTA rather than about the quota happening to fit one page.
+    let before = all_summary_texts(&router, Some(7), "Id").await;
+    assert_eq!(
+        before.len(),
+        MAX_ORIGIN_ACCESS_CONTROLS,
+        "case filling the quota: expected the account to hold its quota of \
+         {MAX_ORIGIN_ACCESS_CONTROLS} controls, got {}",
+        before.len()
+    );
+
+    // A create that would take the account past the quota is refused — and the refusal is
+    // about the COUNT, so it holds for every configuration, not just one.
+    let past_quota = [
+        Control {
+            case: "one past the quota".to_string(),
+            name: "oac-past-the-quota".to_string(),
+            description: None,
+            signing_protocol: "sigv4".to_string(),
+            signing_behavior: "always".to_string(),
+            origin_type: "s3".to_string(),
+        },
+        Control {
+            case: "one past the quota, described".to_string(),
+            name: "oac-past-the-quota-described".to_string(),
+            description: Some("a control the account has no room for".to_string()),
+            signing_protocol: "sigv4a".to_string(),
+            signing_behavior: "no-override".to_string(),
+            origin_type: "mediastore".to_string(),
+        },
+        Control {
+            case: "a repeat of the first refused create".to_string(),
+            name: "oac-past-the-quota".to_string(),
+            description: None,
+            signing_protocol: "sigv4".to_string(),
+            signing_behavior: "always".to_string(),
+            origin_type: "s3".to_string(),
+        },
+    ];
+    for row in &past_quota {
+        let answer = create_control(&router, &row.xml()).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {}: expected HTTP 400 past the quota, got {} with {}",
+            row.case, answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "TooManyOriginAccessControls",
+            "case {}: expected TooManyOriginAccessControls, got {}",
+            row.case,
+            answer.raw
+        );
+        assert!(
+            answer.root().text_at("Id").is_none(),
+            "case {}: a refused create mints no id, got {}",
+            row.case,
+            answer.raw
+        );
+    }
+
+    // Every refusal minted nothing: the account still holds exactly the controls it held,
+    // and none of them is one of the refused configurations.
+    let after = all_summary_texts(&router, Some(7), "Id").await;
+    assert_eq!(
+        after, before,
+        "case past the quota: a refused create must store nothing"
+    );
+    let names: BTreeSet<String> = all_summary_texts(&router, None, "Name")
+        .await
+        .into_iter()
+        .collect();
+    for row in &past_quota {
+        assert!(
+            !names.contains(&row.name),
+            "case {}: the refused control {} must not be stored, got {names:?}",
+            row.case,
+            row.name
+        );
+    }
 }
