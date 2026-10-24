@@ -29,6 +29,8 @@ mod list_keyspaces;
 mod list_types;
 #[path = "all/multi_region_table_replicas.rs"]
 mod multi_region_table_replicas;
+#[path = "all/replication_region_catalog.rs"]
+mod replication_region_catalog;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/restore_table.rs"]
