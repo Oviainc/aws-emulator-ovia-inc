@@ -92,26 +92,50 @@ pub fn context_seed(context: Option<&HashMap<String, String>>) -> String {
 }
 
 /// Rescale `scores` in place so that they sum to 1.0, as Amazon Personalize does
-/// across the list it returns ("a numeric representation of the model's certainty
-/// that the item will be the next user selection").
+/// across the candidate set it scored ("a numeric representation of the model's
+/// certainty that the item will be the next user selection").
+///
+/// `scores` must be the WHOLE candidate set the request scored — every entry the
+/// resolved resource's catalog holds that the request's filter kept — and never the
+/// slice a caller's result count happens to ask back. The score of one entry is a
+/// property of the resource, the request's personalization inputs and the entry, so
+/// the denominator may not depend on how many entries the caller asked for; a
+/// response that reports a subset of the candidates therefore sums to at most 1.0,
+/// and reports the same score for an entry whatever its result count was.
 ///
 /// Rescaling is strictly positive and uniform, so it cannot change the ordering the
 /// caller is promised. When every score is 0 (a catalog whose entries carry no
-/// popularity) the certainty is spread evenly rather than left at 0, so the returned
-/// list still sums to 1.0.
+/// popularity) the certainty is spread evenly over the candidate set rather than
+/// left at 0.
 pub fn normalize(scores: &mut [f64]) {
-    if scores.is_empty() {
+    normalize_by(scores, |score| score);
+}
+
+/// [`normalize`] over the score field of a scored candidate set, for a caller whose
+/// candidates are tuples or structs: the candidates are normalized IN PLACE, so each
+/// keeps carrying its own share of 1.0 through sorting and selection.
+///
+/// `score` names the field to rescale; the set is walked twice (the sum, then the
+/// rescale) straight over the slice, so nothing is allocated.
+pub fn normalize_by<T>(candidates: &mut [T], score: impl Fn(&mut T) -> &mut f64) {
+    if candidates.is_empty() {
         return;
     }
-    let total: f64 = scores.iter().sum();
+    let mut total = 0.0_f64;
+    for candidate in candidates.iter_mut() {
+        total += *score(candidate);
+    }
     if total > 0.0 {
-        for score in scores.iter_mut() {
+        for candidate in candidates.iter_mut() {
+            let score = score(candidate);
             *score /= total;
         }
     } else {
-        let share = 1.0 / scores.len() as f64;
-        for score in scores.iter_mut() {
-            *score = share;
+        // Every candidate scored 0 (a catalog whose entries carry no popularity), so
+        // the certainty is spread evenly over the set rather than left at 0.
+        let share = 1.0 / candidates.len() as f64;
+        for candidate in candidates.iter_mut() {
+            *score(candidate) = share;
         }
     }
 }

@@ -355,13 +355,16 @@ fn cases() -> Vec<Case> {
             expect_next: false,
         },
         Case {
-            label: "an empty range (startTime == endTime) is empty",
+            // The narrowest range the interval rule allows: `startTime` strictly before
+            // `endTime`. A range whose bounds are EQUAL is not an interval and is
+            // refused (see `requests_outside_the_operation_s_rules_are_refused`).
+            label: "a one-second range reports a window starting inside it",
             receipts: vec![DAY_START],
             period: "PT5M",
-            range: (DAY_START, DAY_START),
+            range: (DAY_START, DAY_START + 1),
             order_by: None,
             max_results: None,
-            expected: Vec::new(),
+            expected: vec![DAY_START],
             expect_next: false,
         },
         Case {
@@ -649,6 +652,17 @@ async fn requests_outside_the_operation_s_rules_are_refused() {
             format!(
                 "?startTime={}&endTime={}&period=PT5M",
                 iso(DAY_START + HOUR),
+                iso(DAY_START)
+            ),
+        ),
+        (
+            // Equal bounds are not an interval either, so they are refused rather than
+            // answered with an empty page; `interval_validation.rs` asserts that rule
+            // across every operation of this service that takes a range.
+            "endTime equal to startTime",
+            format!(
+                "?startTime={}&endTime={}&period=PT5M",
+                iso(DAY_START),
                 iso(DAY_START)
             ),
         ),

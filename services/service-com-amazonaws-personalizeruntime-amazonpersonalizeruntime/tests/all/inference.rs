@@ -9,6 +9,8 @@
 //! `inputList`), and every expected value is computed from the SEEDED catalog rather
 //! than written out, so a test cannot pass against a canned list.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
 use service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state::{
@@ -18,9 +20,9 @@ use service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state::{
 };
 
 use crate::support::{
-    actions, assert_descending_and_normalized, entries, error_code, ids, items,
-    recommendation_id, scores, Emulator, ACTION_RECOMMENDATIONS, COLUMN_GENRE, COLUMN_YEAR,
-    PERSONALIZE_RANKING, RECOMMENDATIONS,
+    actions, assert_descending_and_bounded, assert_sums_to_one, entries, error_code, ids,
+    items, recommendation_id, scores, scores_by_id, Emulator, ACTION_RECOMMENDATIONS,
+    COLUMN_GENRE, COLUMN_YEAR, PERSONALIZE_RANKING, RECOMMENDATIONS,
 };
 
 /// A `USER_PERSONALIZATION` campaign, with metadata in recommendations enabled.
@@ -215,7 +217,13 @@ async fn recommendations_come_from_the_stored_catalog_in_descending_score_order(
             returned.len(),
             "case {case}: the list must not repeat an item, got {returned:?}"
         );
-        assert_descending_and_normalized(case, &scores(&response, "itemList"));
+        let returned_scores = scores(&response, "itemList");
+        if expected == CATALOG_SIZE {
+            // Every candidate is reported, so the whole certainty is reported.
+            assert_sums_to_one(case, &returned_scores);
+        } else {
+            assert_descending_and_bounded(case, &returned_scores);
+        }
         recommendation_id(case, &response);
         // No `metadataColumns` was asked for, so the member is omitted entirely.
         for entry in entries(&response, "itemList") {
@@ -280,7 +288,7 @@ async fn each_user_sees_an_ordering_of_its_own_over_the_same_catalog() {
                 num_results as usize,
                 "case {case}: expected {num_results} items, got {returned:?}"
             );
-            assert_descending_and_normalized(&case, &scores(&response, "itemList"));
+            assert_descending_and_bounded(&case, &scores(&response, "itemList"));
             if num_results == 5 {
                 orderings.push(returned);
             }
@@ -637,7 +645,7 @@ async fn a_filter_expression_removes_exactly_the_items_it_names() {
             )
             .await;
         let mut returned = ids(&response, "itemList", "itemId");
-        assert_descending_and_normalized(case, &scores(&response, "itemList"));
+        assert_sums_to_one(case, &scores(&response, "itemList"));
         returned.sort();
         let mut expected_sorted = expected.clone();
         expected_sorted.sort();
@@ -762,7 +770,7 @@ async fn a_promotion_takes_its_documented_share_of_the_returned_items() {
             num_results,
             "case {case}: expected {num_results} items, got {returned:?}"
         );
-        assert_descending_and_normalized(case, &scores(&response, "itemList"));
+        assert_descending_and_bounded(case, &scores(&response, "itemList"));
 
         let catalog = items(CATALOG_SIZE);
         let promoted: Vec<&Value> = returned
@@ -870,7 +878,7 @@ async fn related_items_recommends_from_the_catalog_but_never_the_queried_item() 
             !returned.iter().any(|returned| returned == item_id),
             "case {item_id}: the queried item must not be recommended, got {returned:?}"
         );
-        assert_descending_and_normalized(item_id, &scores(&response, "itemList"));
+        assert_sums_to_one(item_id, &scores(&response, "itemList"));
     }
 
     let (status, code) = emulator
@@ -1040,8 +1048,266 @@ async fn action_recommendations_come_from_the_stored_action_catalog() {
                 "case {case}: {action_id} is not in the stored action catalog"
             );
         }
-        assert_descending_and_normalized(case, &scores(&response, "actionList"));
+        let returned_scores = scores(&response, "actionList");
+        if expected == ACTION_CATALOG_SIZE {
+            assert_sums_to_one(case, &returned_scores);
+        } else {
+            assert_descending_and_bounded(case, &returned_scores);
+        }
         recommendation_id(case, &response);
+    }
+}
+
+/// Assert that every entry of `reported` carries the score `reference` — the score the
+/// same request computed over the whole candidate set — gives it.
+fn assert_scores_match_the_candidate_set(
+    case: &str,
+    reported: &BTreeMap<String, f64>,
+    reference: &BTreeMap<String, f64>,
+) {
+    for (id, score) in reported {
+        let expected = reference.get(id).unwrap_or_else(|| {
+            panic!("case {case}: {id} is not one of the scored candidates {reference:?}")
+        });
+        assert!(
+            (score - expected).abs() < 1e-12,
+            "case {case}: {id} scores {expected} over the whole candidate set, got {score}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_action_score_does_not_change_with_the_requested_number_of_results() {
+    let emulator = seeded();
+    let catalog = actions(ACTION_CATALOG_SIZE);
+    // `INCLUDE ActionID WHERE Actions.CHANNEL IN ("App")` keeps exactly these.
+    let app_candidates = catalog
+        .iter()
+        .filter(|action| action.attributes.get("CHANNEL").map(String::as_str) == Some("App"))
+        .count();
+
+    // A group is one CANDIDATE SET: the request members that decide which actions are
+    // scored at all (the user the prediction is for, and the filter the request
+    // names). Within a group the rows differ only in how many results the caller asks
+    // back — which bounds the list's length and must leave every reported score, and
+    // the identity of the actions reported, exactly as the whole-candidate-set call
+    // reports them.
+    let groups: [(&str, &str, Option<&str>, usize); 4] = [
+        ("no filter, user-1", "user-1", None, ACTION_CATALOG_SIZE),
+        ("no filter, user-12", "user-12", None, ACTION_CATALOG_SIZE),
+        ("no filter, user-with-a-long-id", "user-with-a-long-id", None, ACTION_CATALOG_SIZE),
+        (
+            "CHANNEL IN (App), user-1",
+            "user-1",
+            Some(FILTER_APP_ACTIONS),
+            app_candidates,
+        ),
+    ];
+    // "The number of results to return. The default is 5. The maximum is 100."
+    let rows: [Option<i32>; 6] = [
+        Some(1),
+        Some(2),
+        Some(3),
+        None,
+        Some(ACTION_CATALOG_SIZE as i32),
+        Some(MAX_NUM_ACTION_RESULTS as i32),
+    ];
+
+    for (group, user_id, filter_arn, candidates) in groups {
+        let request = |num_results: Option<i32>| {
+            let mut body = json!({ "campaignArn": CAMPAIGN_ACTIONS, "userId": user_id });
+            if let Some(filter_arn) = filter_arn {
+                body["filterArn"] = json!(filter_arn);
+            }
+            if let Some(num_results) = num_results {
+                body["numResults"] = json!(num_results);
+            }
+            body
+        };
+
+        // The reference: a request for more actions than the candidate set holds, so
+        // every candidate is reported and the whole certainty with it.
+        let whole = emulator
+            .ok(
+                ACTION_RECOMMENDATIONS,
+                request(Some(MAX_NUM_ACTION_RESULTS as i32)),
+            )
+            .await;
+        let reference = scores_by_id(&whole, "actionList", "actionId");
+        assert_eq!(
+            reference.len(),
+            candidates,
+            "case {group}: expected {candidates} scored candidates, got {reference:?}"
+        );
+        assert_sums_to_one(group, &scores(&whole, "actionList"));
+
+        for num_results in rows {
+            let case = format!("{group} numResults {num_results:?}");
+            let response = emulator.ok(ACTION_RECOMMENDATIONS, request(num_results)).await;
+            let reported = scores_by_id(&response, "actionList", "actionId");
+            let asked = num_results
+                .map(|num_results| num_results as usize)
+                .unwrap_or(registry::DEFAULT_NUM_ACTION_RESULTS);
+            let expected_len = asked.min(candidates);
+            assert_eq!(
+                reported.len(),
+                expected_len,
+                "case {case}: expected {expected_len} actions, got {reported:?}"
+            );
+            assert_scores_match_the_candidate_set(&case, &reported, &reference);
+            assert_descending_and_bounded(&case, &scores(&response, "actionList"));
+
+            let total: f64 = reported.values().sum();
+            if expected_len < candidates {
+                // The certainty the unreported candidates carry stays with them: a
+                // short response reports a share of 1.0, not 1.0 renormalized.
+                assert!(
+                    total < 1.0 - 1e-9,
+                    "case {case}: a response reporting {expected_len} of {candidates} \
+                     candidates must not carry the whole certainty, got {total}"
+                );
+            } else {
+                assert!(
+                    (total - 1.0).abs() < 1e-9,
+                    "case {case}: a response reporting every candidate must sum to 1.0, \
+                     got {total}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_item_score_does_not_change_with_the_requested_number_of_results() {
+    let emulator = seeded();
+    let catalog = items(CATALOG_SIZE);
+    // `INCLUDE ItemID WHERE Items.YEAR >= 2010` keeps exactly these.
+    let recent_candidates = catalog.iter().filter(|item| year(item) >= 2010).count();
+
+    // One group per candidate set, across both resource kinds and both personalization
+    // inputs `GetRecommendations` serves; a `RELATED_ITEMS` candidate set excludes the
+    // queried item.
+    let groups: [(&str, Value, usize); 4] = [
+        (
+            "campaign, no filter",
+            json!({ "campaignArn": CAMPAIGN_USER, "userId": "user-3" }),
+            CATALOG_SIZE,
+        ),
+        (
+            "campaign, YEAR >= 2010",
+            json!({
+                "campaignArn": CAMPAIGN_USER,
+                "userId": "user-3",
+                "filterArn": FILTER_RECENT,
+            }),
+            recent_candidates,
+        ),
+        (
+            "recommender, no filter",
+            json!({ "recommenderArn": RECOMMENDER_TOP_PICKS, "userId": "user-8" }),
+            CATALOG_SIZE,
+        ),
+        (
+            "related items",
+            json!({ "campaignArn": CAMPAIGN_RELATED, "itemId": "item-4" }),
+            CATALOG_SIZE - 1,
+        ),
+    ];
+    // "The number of results to return. The default is 25."
+    let rows: [Option<i32>; 5] = [Some(1), Some(3), Some(10), None, Some(CATALOG_SIZE as i32)];
+
+    for (group, base, candidates) in groups {
+        let request = |num_results: Option<i32>| {
+            let mut body = base.clone();
+            if let Some(num_results) = num_results {
+                body["numResults"] = json!(num_results);
+            }
+            body
+        };
+
+        let whole = emulator
+            .ok(RECOMMENDATIONS, request(Some(CATALOG_SIZE as i32)))
+            .await;
+        let reference = scores_by_id(&whole, "itemList", "itemId");
+        assert_eq!(
+            reference.len(),
+            candidates,
+            "case {group}: expected {candidates} scored candidates, got {reference:?}"
+        );
+        assert_sums_to_one(group, &scores(&whole, "itemList"));
+
+        for num_results in rows {
+            let case = format!("{group} numResults {num_results:?}");
+            let response = emulator.ok(RECOMMENDATIONS, request(num_results)).await;
+            let reported = scores_by_id(&response, "itemList", "itemId");
+            let asked = num_results
+                .map(|num_results| num_results as usize)
+                .unwrap_or(registry::DEFAULT_NUM_RESULTS);
+            let expected_len = asked.min(candidates);
+            assert_eq!(
+                reported.len(),
+                expected_len,
+                "case {case}: expected {expected_len} items, got {reported:?}"
+            );
+            assert_scores_match_the_candidate_set(&case, &reported, &reference);
+            assert_descending_and_bounded(&case, &scores(&response, "itemList"));
+
+            let total: f64 = reported.values().sum();
+            if expected_len < candidates {
+                assert!(
+                    total < 1.0 - 1e-9,
+                    "case {case}: a response reporting {expected_len} of {candidates} \
+                     candidates must not carry the whole certainty, got {total}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_promotion_does_not_change_what_an_item_scores() {
+    let emulator = seeded();
+
+    // A promotion decides WHICH candidates fill the returned slots, not what any of
+    // them scores, so every item a promoted response reports carries the score the
+    // whole-candidate-set response gives it.
+    let whole = emulator
+        .ok(
+            RECOMMENDATIONS,
+            json!({
+                "campaignArn": CAMPAIGN_USER,
+                "userId": "user-9",
+                "numResults": CATALOG_SIZE,
+            }),
+        )
+        .await;
+    let reference = scores_by_id(&whole, "itemList", "itemId");
+
+    for percent in [10, 50, 100] {
+        let case = format!("percentPromotedItems {percent}");
+        let response = emulator
+            .ok(
+                RECOMMENDATIONS,
+                json!({
+                    "campaignArn": CAMPAIGN_USER,
+                    "userId": "user-9",
+                    "numResults": 10,
+                    "promotions": [{
+                        "name": "promo1",
+                        "percentPromotedItems": percent,
+                        "filterArn": FILTER_INCLUDE_GENRE,
+                        "filterValues": { "GENRE": "Comedy" },
+                    }],
+                }),
+            )
+            .await;
+        let reported = scores_by_id(&response, "itemList", "itemId");
+        assert_eq!(
+            reported.len(),
+            10,
+            "case {case}: expected 10 items, got {reported:?}"
+        );
+        assert_scores_match_the_candidate_set(&case, &reported, &reference);
     }
 }
 

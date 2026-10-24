@@ -180,9 +180,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tokens_of(crate::state::TokenScope::DeleteClusterPolicy)
                 .verdict(token, &fingerprint)
             {
-                crate::state::TokenVerdict::Replay(removed_version) => {
+                crate::state::TokenVerdict::Replay(recorded) => {
+                    // The version the FIRST delete removed, kept with the
+                    // token: the retry answers it instead of the 404 an
+                    // independent second delete gets, and removes nothing of its
+                    // own.
+                    let Some(version) = recorded.answered(crate::state::POLICY_VERSION_MEMBER)
+                    else {
+                        // A recorded delete always keeps the version it removed,
+                        // so there is nothing to serve here and nothing this
+                        // request may remove in its place.
+                        return Err(DeleteClusterPolicyErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the recorded result of this request is unavailable"
+                                    .to_string(),
+                                retry_after_seconds: None,
+                            },
+                        )
+                        .into());
+                    };
                     return Ok(DeleteClusterPolicyOutput {
-                        policy_version: removed_version,
+                        policy_version: version.to_string(),
                     });
                 }
                 crate::state::TokenVerdict::Mismatch => {
@@ -234,9 +252,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         cluster.policy = None;
 
         if let Some(token) = input.client_token {
+            // Recorded against the CLUSTER the policy belonged to, with the
+            // removed version as the answer: the token is dropped with that
+            // cluster, and a retry still reports what this call removed.
             state
                 .tokens(crate::state::TokenScope::DeleteClusterPolicy)
-                .record(token, fingerprint, &attached);
+                .record(
+                    token,
+                    fingerprint,
+                    crate::state::RecordedCall::new(&input.identifier)
+                        .answering(crate::state::POLICY_VERSION_MEMBER, &attached),
+                );
         }
         Ok(DeleteClusterPolicyOutput {
             policy_version: attached,

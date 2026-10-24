@@ -95,6 +95,8 @@ mod associated_assets;
 mod batch_get_latest_values;
 #[path = "all/batch_put_timestamp_and_quality.rs"]
 mod batch_put_timestamp_and_quality;
+#[path = "all/dataset_export_jobs.rs"]
+mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]
 mod describe_asset_property;
 #[path = "all/execute_query.rs"]

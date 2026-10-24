@@ -152,8 +152,21 @@ fn requested_window(
         )),
         (Some(start), None, Some(seconds)) => Ok((Some(start), Some(shifted(start, seconds)))),
         (None, Some(end), Some(seconds)) => Ok((Some(shifted(end, -seconds)), Some(end))),
-        // `period` alone (and no bound at all) selects the latest profile.
-        (start, end, _) => Ok((start, end)),
+        // A request that names BOTH bounds names an interval, and a pair of bounds is one
+        // only when the start is strictly before the end — the service-wide rule stated
+        // once in [`crate::state::validate_interval`]. A window completed from `period`
+        // above is increasing by construction, so only the caller-supplied pair is
+        // checked, and it is checked here: ahead of the group lookup, so a request that
+        // names no interval is refused rather than answered about one. `period` alone
+        // (and no bound at all) names no interval and selects the latest profile.
+        (start, end, _) => {
+            if let (Some(start), Some(end)) = (start, end) {
+                if let Err(message) = crate::state::validate_interval(start, end) {
+                    return Err(crate::scaffolded::Scaffolded::validation(message));
+                }
+            }
+            Ok((start, end))
+        }
     }
 }
 

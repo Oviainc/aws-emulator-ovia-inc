@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnforcedGuardrailsConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnforcedGuardrailsConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnforcedGuardrailsConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's enforced guardrail configuration: the single record
+//! `ops/put_enforced_guardrail_configuration.rs` installed, or an EMPTY list while the
+//! account holds none. A read only reads — the operation is `@readonly` and the record
+//! has no transition the clock owes.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +130,33 @@ impl<Eng> ListEnforcedGuardrailsConfiguration<Eng> {
     }
 }
 
+/// The account's stored configuration as the `AccountEnforcedGuardrailOutputConfiguration`
+/// this listing reports.
+fn output_configuration(
+    stored: &crate::state::EnforcedGuardrailConfiguration,
+) -> AccountEnforcedGuardrailOutputConfiguration {
+    AccountEnforcedGuardrailOutputConfiguration {
+        config_id: Some(stored.config_id.clone()),
+        guardrail_arn: Some(stored.guardrail_arn.clone()),
+        guardrail_id: Some(stored.guardrail_id.clone()),
+        // `inputTags` is deprecated, and the input configuration a put carries declares
+        // no member that sets it
+        // (`smithy_query(query="shape",shape="AccountEnforcedGuardrailInferenceInputConfiguration")`),
+        // so no stored configuration has one to report.
+        input_tags: None,
+        selective_content_guarding: stored.selective_content_guarding.clone(),
+        guardrail_version: Some(stored.guardrail_version.clone()),
+        created_at: Some(crate::state::date_time(stored.created_at)),
+        created_by: Some(stored.created_by.clone()),
+        updated_at: Some(crate::state::date_time(stored.updated_at)),
+        updated_by: Some(stored.updated_by.clone()),
+        // The configuration this service installs is the ACCOUNT-level one, which is the
+        // only owner `ConfigurationOwner` names.
+        owner: Some(crate::state::CONFIGURATION_OWNER_ACCOUNT.to_string()),
+        model_enforcement: stored.model_enforcement.clone(),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListEnforcedGuardrailsConfiguration<Eng>
 {
@@ -151,18 +174,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnforcedGuardrailsConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnforcedGuardrailsConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnforcedGuardrailsConfiguration"))
+        // `ctx` carries request metadata this operation has no use for: the configuration
+        // it reports is account-level.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListEnforcedGuardrailsConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "enforced guardrail configuration state is not available on this \
+                             engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An account holds at most one enforced guardrail configuration — the listing is
+        // modelled `@length(min: 0, max: 1)` — so one page holds the whole listing and
+        // this operation issues no continuation token. A `nextToken` is therefore never
+        // one this service handed out, and is refused rather than read as an empty or a
+        // wrong page.
+        if input.next_token.is_some() {
+            return Err(
+                ListEnforcedGuardrailsConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "nextToken is not a pagination token this service issued".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let store = state.lock();
+        Ok(ListEnforcedGuardrailsConfigurationOutput {
+            guardrails_config: store
+                .enforced_guardrail_configuration
+                .iter()
+                .map(output_configuration)
+                .collect(),
+            next_token: None,
+        })
     }
 }

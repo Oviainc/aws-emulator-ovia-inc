@@ -268,3 +268,9 @@ mod store_ceilings;
 // of this file — and this one lost repeated serialized squash merges to exactly that.
 #[path = "all/traffic_mirror_filters.rs"]
 mod traffic_mirror_filters;
+// Declared LAST for the same reason as the two suites above: the sorted region of this file
+// is where every new ec2 suite inserts its lines, and a landing that loses the squash merge
+// has to redo it.
+// Associating a VPC with a local gateway route table, and reading the association back.
+#[path = "all/local_gateway_route_table_vpc_associations.rs"]
+mod local_gateway_route_table_vpc_associations;

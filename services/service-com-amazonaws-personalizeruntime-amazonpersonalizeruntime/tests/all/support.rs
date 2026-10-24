@@ -12,6 +12,7 @@
 //! route, so these tests exercise routing, deserialization, the handler and
 //! serialization together.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -241,6 +242,15 @@ pub fn scores(response: &Value, member: &str) -> Vec<f64> {
         .collect()
 }
 
+/// The `score` each entry of a list member reports, keyed by the entry's id — what a
+/// caller comparing two responses over the same candidate set reads.
+pub fn scores_by_id(response: &Value, member: &str, id_member: &str) -> BTreeMap<String, f64> {
+    ids(response, member, id_member)
+        .into_iter()
+        .zip(scores(response, member))
+        .collect()
+}
+
 /// One entry of a list member, as JSON.
 pub fn entries(response: &Value, member: &str) -> Vec<Value> {
     response
@@ -250,22 +260,41 @@ pub fn entries(response: &Value, member: &str) -> Vec<Value> {
         .clone()
 }
 
-/// Assert that `scores` never increases, and that it sums to 1.0 — the two properties
-/// every one of these operations' lists carries.
-pub fn assert_descending_and_normalized(case: &str, scores: &[f64]) {
+/// Assert the two properties every one of these operations' lists carries: the scores
+/// never increase, and each is a share of the certainty spread over the WHOLE scored
+/// candidate set, so each lies in `[0.0, 1.0]` and the reported list sums to at most
+/// 1.0 (exactly 1.0 only when the response reports every candidate — see
+/// [`assert_sums_to_one`]).
+pub fn assert_descending_and_bounded(case: &str, scores: &[f64]) {
     for pair in scores.windows(2) {
         assert!(
             pair[0] >= pair[1],
             "case {case}: scores must not increase, got {scores:?}"
         );
     }
-    if !scores.is_empty() {
-        let total: f64 = scores.iter().sum();
+    for score in scores {
         assert!(
-            (total - 1.0).abs() < 1e-9,
-            "case {case}: scores must sum to 1.0, got {total} from {scores:?}"
+            (0.0..=1.0).contains(score),
+            "case {case}: every score is a share of 1.0, got {score} in {scores:?}"
         );
     }
+    let total: f64 = scores.iter().sum();
+    assert!(
+        total <= 1.0 + 1e-9,
+        "case {case}: scores must sum to at most 1.0, got {total} from {scores:?}"
+    );
+}
+
+/// [`assert_descending_and_bounded`], plus the sum a response that reports EVERY
+/// scored candidate carries: exactly 1.0.
+pub fn assert_sums_to_one(case: &str, scores: &[f64]) {
+    assert_descending_and_bounded(case, scores);
+    let total: f64 = scores.iter().sum();
+    assert!(
+        (total - 1.0).abs() < 1e-9,
+        "case {case}: a response reporting every candidate must sum to 1.0, got {total} \
+         from {scores:?}"
+    );
 }
 
 /// The `recommendationId` of a response, which must never be empty.

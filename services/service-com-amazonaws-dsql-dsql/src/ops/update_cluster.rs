@@ -250,9 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tokens_of(crate::state::TokenScope::UpdateCluster)
                 .verdict(token, &fingerprint)
             {
-                crate::state::TokenVerdict::Replay(identifier) => {
-                    if let Some(existing) = state.clusters.get(&identifier) {
-                        return Ok(updated_cluster_output(existing));
+                crate::state::TokenVerdict::Replay(recorded) => {
+                    if let Some(existing) = state.clusters.get(&recorded.resource) {
+                        let mut answer = updated_cluster_output(existing);
+                        // The status this call answered: the clock settles the
+                        // cluster back to `ACTIVE` and a later update moves it
+                        // again, neither of which is this request's result.
+                        if let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) {
+                            answer.status = status.to_string();
+                        }
+                        return Ok(answer);
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
@@ -319,7 +326,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             state
                 .tokens(crate::state::TokenScope::UpdateCluster)
-                .record(token, fingerprint, &input.identifier);
+                .record(
+                    token,
+                    fingerprint,
+                    crate::state::RecordedCall::new(&input.identifier)
+                        .answering(crate::state::STATUS_MEMBER, &updated.status),
+                );
         }
         Ok(updated)
     }

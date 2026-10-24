@@ -23,6 +23,8 @@ mod encryption_key_selection;
 mod error_contract;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/idempotent_replay_result.rs"]
+mod idempotent_replay_result;
 #[path = "all/modeled_validation_exception.rs"]
 mod modeled_validation_exception;
 #[path = "all/multi_region_witness.rs"]

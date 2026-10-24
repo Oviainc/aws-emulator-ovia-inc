@@ -18,7 +18,9 @@
 //! 3. Each candidate's score is [`crate::state::scoring::relevance`] of its STORED
 //!    `base_score` and the request's `userId`, so an identical request returns an
 //!    identical ordering (the operation is `@idempotent`), and the list is reported
-//!    descending by score, normalized to sum to 1.0.
+//!    descending by score. The scores are normalized across the whole
+//!    filter-surviving action set BEFORE `numResults` decides how many of them come
+//!    back, so one action's score is the same whatever the request asked for.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -215,16 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (action.action_id.as_str(), score)
             })
             .collect();
+        // The reported score of an action is a property of the (campaign, userId,
+        // action) triple, so the denominator is the WHOLE filter-surviving candidate
+        // set and is settled before `numResults` selects which of them come back. A
+        // response that reports fewer actions reports each of them with the same score
+        // a larger one would, and sums to at most 1.0.
+        scoring::normalize_by(&mut ranked, |(_, score)| score);
         ranked.sort_by(|left, right| scoring::by_score_desc(*left, *right));
         ranked.truncate(num_results);
 
-        let mut scores: Vec<f64> = ranked.iter().map(|(_, score)| *score).collect();
-        scoring::normalize(&mut scores);
-
         let action_list: Vec<PredictedAction> = ranked
             .iter()
-            .zip(&scores)
-            .map(|((action_id, _), score)| PredictedAction {
+            .map(|(action_id, score)| PredictedAction {
                 action_id: Some((*action_id).to_string()),
                 score: Some(*score),
             })

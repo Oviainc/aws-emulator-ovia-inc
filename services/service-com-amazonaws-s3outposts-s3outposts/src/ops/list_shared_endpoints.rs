@@ -176,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let caller = crate::state::caller_account();
         let mut store = state.lock();
 
         if !store.outposts.contains_key(&input.outpost_id) {
@@ -191,12 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut endpoints = Vec::with_capacity(page_size);
         let mut next_token = None;
         for (key, endpoint) in &store.endpoints {
-            // The endpoints of the named Outpost that are shared with this
-            // caller rather than its own: an endpoint of the caller's account
-            // is what `ListEndpoints` reports.
-            if endpoint.outpost_id != input.outpost_id || endpoint.owner_account == caller {
+            // The listing is scoped by the Outpost the request named, and by
+            // nothing else: the model states `OutpostId` as the only scoping
+            // member and documents "all endpoints associated with an Outpost",
+            // so every endpoint on it is reported — the caller's own included,
+            // since `CreateEndpoint`/`DeleteEndpoint` are the related actions
+            // and they operate on exactly those.
+            if endpoint.outpost_id != input.outpost_id {
                 continue;
             }
+            // Resume at the first key at or after the cursor, so a page is
+            // still served when the endpoint the cursor named was deleted
+            // meanwhile.
             if resume.as_ref().is_some_and(|from| key < from) {
                 continue;
             }

@@ -243,9 +243,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tokens_of(crate::state::TokenScope::CreateCluster)
                 .verdict(token, &fingerprint)
             {
-                crate::state::TokenVerdict::Replay(identifier) => {
-                    if let Some(existing) = state.clusters.get(&identifier) {
-                        return Ok(created_cluster_output(existing));
+                crate::state::TokenVerdict::Replay(recorded) => {
+                    if let Some(existing) = state.clusters.get(&recorded.resource) {
+                        let mut answer = created_cluster_output(existing);
+                        // Every other member of the answer is a field of the
+                        // cluster this call minted and cannot change, but its
+                        // status can have moved on since — through the clock or
+                        // a later `UpdateCluster` — and that is not what this
+                        // request answered, so the recorded status stands.
+                        if let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) {
+                            answer.status = status.to_string();
+                        }
+                        return Ok(answer);
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
@@ -320,7 +329,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             state
                 .tokens(crate::state::TokenScope::CreateCluster)
-                .record(token, fingerprint, &identifier);
+                .record(
+                    token,
+                    fingerprint,
+                    crate::state::RecordedCall::new(&identifier)
+                        .answering(crate::state::STATUS_MEMBER, &created.status),
+                );
         }
         Ok(created)
     }
