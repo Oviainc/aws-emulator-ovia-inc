@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
-    ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, EnvironmentTier,
+    ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, CustomAmi, EnvironmentTier,
     EventDescription, MaxAgeRule, MaxCountRule, PlatformBranchSummary, PlatformDescription,
-    PlatformSummary, S3Location, Tag,
+    PlatformFramework, PlatformProgrammingLanguage, PlatformSummary, S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -83,6 +83,49 @@ pub const PLATFORM_STATUS_READY: &str = "Ready";
 /// itself publishes those, so they are owned by the service rather than by an
 /// account (a CUSTOM version reports the account id that created it).
 pub const MANAGED_PLATFORM_OWNER: &str = "AWSElasticBeanstalk";
+
+/// The `Maintainer` a MANAGED platform version reports ("Information about the
+/// maintainer of the platform version"): the address Elastic Beanstalk publishes
+/// as the maintainer of the platforms IT builds, which every recorded
+/// `DescribePlatformVersion` response for an AWS-managed version carries. A
+/// CUSTOM version's maintainer is stated by its own definition archive, which
+/// this service does not read, so none is reported for one.
+pub const MANAGED_PLATFORM_MAINTAINER: &str = "aws-elasticbeanstalk-platforms@amazon.com";
+
+/// The `SupportedAddon` values this service knows, from
+/// `PlatformFilter$Values` ("`SupportedAddon`: `Log/S3` | `Monitoring/Healthd` |
+/// `WorkerDaemon/SQSD`" — a list the model introduces as "valid filter values
+/// for SOME filter attributes", so it is not closed) plus `Log/CloudWatch`, the
+/// CloudWatch Logs streaming add-on the recorded platform-version responses
+/// carry beside those three. Sorted, which is also the order a version reports
+/// them in.
+pub const SUPPORTED_ADDONS: &[&str] = &[
+    ADDON_LOG_CLOUDWATCH,
+    ADDON_LOG_S3,
+    ADDON_MONITORING_HEALTHD,
+    ADDON_WORKER_DAEMON_SQSD,
+];
+
+/// See [`SUPPORTED_ADDONS`].
+pub const ADDON_LOG_CLOUDWATCH: &str = "Log/CloudWatch";
+/// See [`SUPPORTED_ADDONS`].
+pub const ADDON_LOG_S3: &str = "Log/S3";
+/// See [`SUPPORTED_ADDONS`].
+pub const ADDON_MONITORING_HEALTHD: &str = "Monitoring/Healthd";
+/// See [`SUPPORTED_ADDONS`].
+pub const ADDON_WORKER_DAEMON_SQSD: &str = "WorkerDaemon/SQSD";
+
+/// The `CustomAmi$VirtualizationType` values a managed platform version
+/// publishes machine images for: the two EC2 virtualization types, in the order
+/// the recorded `DescribePlatformVersion` responses list them. Elastic Beanstalk
+/// publishes one AMI per virtualization type for a managed platform version, so
+/// this is what makes up its `CustomAmiList`.
+pub const PLATFORM_VIRTUALIZATION_TYPES: &[&str] = &["pv", "hvm"];
+
+/// How many characters a published AMI's id carries after `ami-`: EC2 issues a
+/// machine-image id as `ami-` plus 17 lowercase hexadecimal characters (its long
+/// id form). See [`managed_custom_ami_catalog`].
+const CUSTOM_AMI_ID_BODY_LENGTH: usize = 17;
 
 /// The support life-cycle states a platform branch reports, from
 /// `PlatformBranchSummary$LifecycleState`'s own documentation ("Possible values:
@@ -395,6 +438,23 @@ pub struct SolutionStack {
     /// reported `SolutionStackName`.
     pub platform_version: &'static str,
     pub permitted_file_types: &'static [&'static str],
+    /// The `PlatformCategory` of every version in this branch — "the category of
+    /// platform version", the platform FAMILY the runtime belongs to
+    /// (`Python`, `Docker`, `Tomcat`, `.NET Core`). It is catalog data, not a
+    /// spelling of the branch name: Elastic Beanstalk publishes the .NET-on-Linux
+    /// family as the category `.NET Core` under the platform name `.NET Core on
+    /// Linux`, so the two cannot be derived from each other.
+    pub platform_category: &'static str,
+    /// The `ProgrammingLanguages` this version runs, as `(Name, Version)` pairs.
+    /// Catalog data for the same reason as [`Self::platform_category`]: the
+    /// branch name states the runtime's marketing name (`Corretto 21`), not the
+    /// language and version a client filters and displays. A platform that runs
+    /// no language of its own (Docker runs the image's) states none.
+    pub programming_languages: &'static [(&'static str, &'static str)],
+    /// The `Frameworks` this version runs, as `(Name, Version)` pairs — the
+    /// application server or framework the platform ships (a Tomcat platform's
+    /// `Tomcat`). Most platforms ship none.
+    pub frameworks: &'static [(&'static str, &'static str)],
 }
 
 impl SolutionStack {
@@ -428,12 +488,112 @@ impl SolutionStack {
         )
     }
 
+    /// How this version is keyed in the catalog's per-version tables (its
+    /// published machine images): the resource part of its `PlatformArn`, which
+    /// is `<branch name>/<version>` and so names one catalog row in every
+    /// region.
+    pub fn catalog_key(&self) -> String {
+        format!("{}/{}", self.branch_name, self.platform_version)
+    }
+
+    /// The runtime and the operating system this stack's branch name is built
+    /// from: `<runtime> running on <os>`, e.g. `("Python 3.13", "64bit Amazon
+    /// Linux 2023")`. A branch name not in the published form carries no
+    /// operating system, so nothing is read out of it.
+    fn runtime_and_operating_system(&self) -> Option<(&'static str, &'static str)> {
+        self.branch_name.split_once(" running on ")
+    }
+
+    /// The `Description` of this published version: "`<os> running <runtime>`" —
+    /// its [`Self::name`] without the version component, which is how Elastic
+    /// Beanstalk words a managed platform version's description (`64bit Amazon
+    /// Linux 2023 running Python 3.13`). DERIVED from the branch, like the
+    /// solution stack name, so the two cannot drift apart.
+    pub fn description(&self) -> String {
+        match self.runtime_and_operating_system() {
+            Some((runtime, os)) => format!("{os} running {runtime}"),
+            None => self.branch_name.to_string(),
+        }
+    }
+
+    /// The `OperatingSystemName` and `OperatingSystemVersion` of this version.
+    ///
+    /// Elastic Beanstalk names a branch's operating system inside the branch
+    /// name, as `64bit <name> <version>` (`64bit Amazon Linux 2023`, `64bit
+    /// Windows Server 2019`), so both members are READ OFF the branch rather
+    /// than written out a second time: the width prefix is dropped, a trailing
+    /// numeric component is the version, and what precedes it is the name. An
+    /// operating system named without a version component (`64bit Amazon Linux`)
+    /// reports no version.
+    pub fn operating_system(&self) -> Option<(&'static str, Option<&'static str>)> {
+        let (_, os) = self.runtime_and_operating_system()?;
+        let os = os.strip_prefix("64bit ").unwrap_or(os);
+        match os.rsplit_once(' ') {
+            Some((name, version))
+                if !version.is_empty()
+                    && version
+                        .chars()
+                        .all(|character| character.is_ascii_digit() || character == '.') =>
+            {
+                Some((name, Some(version)))
+            }
+            _ => Some((os, None)),
+        }
+    }
+
+    /// The modelled `ProgrammingLanguages` of this published version. A catalog
+    /// entry that states no version for its language reports the language
+    /// without one rather than an empty version string.
+    pub fn to_programming_languages(&self) -> Vec<PlatformProgrammingLanguage> {
+        self.programming_languages
+            .iter()
+            .map(|(name, version)| PlatformProgrammingLanguage {
+                name: Some((*name).to_string()),
+                version: stated(version),
+            })
+            .collect()
+    }
+
+    /// The names of the programming languages this version runs — the attribute
+    /// a `ListPlatformVersions` filter term of type `ProgrammingLanguageName`
+    /// is applied to.
+    pub fn programming_language_names(&self) -> Vec<String> {
+        self.programming_languages
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect()
+    }
+
+    /// The modelled `Frameworks` of this published version. As in
+    /// [`Self::to_programming_languages`], a version the catalog does not state
+    /// is reported absent.
+    pub fn to_frameworks(&self) -> Vec<PlatformFramework> {
+        self.frameworks
+            .iter()
+            .map(|(name, version)| PlatformFramework {
+                name: Some((*name).to_string()),
+                version: stated(version),
+            })
+            .collect()
+    }
+
     /// The modelled `PlatformDescription` for this published version.
     ///
-    /// What the catalog states is reported; what only a built platform's
-    /// definition carries (its category, maintainer, operating system, languages,
-    /// frameworks, creation dates) is left absent rather than guessed.
-    pub fn to_description(&self, region: &str) -> PlatformDescription {
+    /// Everything the catalog states about the version is projected here, and
+    /// everything the STORE holds about it comes from `store`: the
+    /// [`MANAGED_PLATFORM_BRANCHES`] entry it is a version within — the one place
+    /// its supported tiers and its branch life-cycle state are held, so
+    /// `ListPlatformBranches` and this call cannot disagree about them — the
+    /// machine images the catalog published for it, and when the catalog was
+    /// published. A stack whose branch the store does not hold reports neither
+    /// branch member rather than a guessed one.
+    pub fn to_description(
+        &self,
+        region: &str,
+        store: &ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState,
+    ) -> PlatformDescription {
+        let operating_system = self.operating_system();
+        let branch = store.platform_branch_named(self.branch_name);
         PlatformDescription {
             platform_arn: Some(self.platform_arn(region)),
             platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
@@ -443,21 +603,114 @@ impl SolutionStack {
             solution_stack_name: Some(self.name()),
             // A published version is usable as it stands; nothing is building it.
             platform_status: Some(PLATFORM_STATUS_READY.to_string()),
-            date_created: None,
-            date_updated: None,
-            platform_category: None,
-            description: None,
-            maintainer: None,
-            operating_system_name: None,
-            operating_system_version: None,
-            programming_languages: None,
-            frameworks: None,
-            custom_ami_list: None,
-            supported_tier_list: None,
-            supported_addon_list: None,
-            platform_lifecycle_state: None,
-            platform_branch_lifecycle_state: None,
+            // The catalog is service-owned reference data: it was published when
+            // this store was created and has not been re-published since.
+            date_created: Some(store.platform_catalog_published_at),
+            date_updated: Some(store.platform_catalog_published_at),
+            platform_category: Some(self.platform_category.to_string()),
+            description: Some(self.description()),
+            maintainer: Some(MANAGED_PLATFORM_MAINTAINER.to_string()),
+            operating_system_name: operating_system.map(|(name, _)| name.to_string()),
+            operating_system_version: operating_system
+                .and_then(|(_, version)| version)
+                .map(str::to_string),
+            programming_languages: Some(self.to_programming_languages()),
+            frameworks: Some(self.to_frameworks()),
+            custom_ami_list: Some(
+                store
+                    .platform_custom_amis
+                    .get(&self.catalog_key())
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            supported_tier_list: branch.map(|branch| branch.supported_tiers.clone()),
+            // Both lists follow the BRANCH, so a stack whose branch the store
+            // does not hold reports neither rather than one of the two.
+            supported_addon_list: branch
+                .map(|branch| managed_supported_addons(&branch.supported_tiers)),
+            // The catalog publishes exactly one version per branch, so every
+            // published version IS its branch's recommended one.
+            platform_lifecycle_state: Some(PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
+            platform_branch_lifecycle_state: branch
+                .map(|branch| reported_branch_lifecycle_state(&branch.lifecycle_state)),
         }
+    }
+}
+
+/// A catalog value as a modelled member: the value itself, or no value at all
+/// when the catalog states none (the empty string).
+fn stated(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The `CustomAmiList` the catalog publishes for every managed platform
+/// version, by [`SolutionStack::catalog_key`]: one machine image per
+/// [`PLATFORM_VIRTUALIZATION_TYPES`] value, which is what
+/// `DescribePlatformVersion` reports as "the custom AMIs supported by the
+/// platform version".
+///
+/// The image IDS are SERVER-GENERATED, exactly like an `EnvironmentId`: an
+/// `ImageId` is opaque ("THe ID of the image used to create the custom AMI" and
+/// nothing else), so nothing is derived from a request or from a recording — the
+/// body is random, in the `ami-` long-id form EC2 issues, drawn through the same
+/// uuid-backed helper every other id of this service comes from. They are minted
+/// ONCE, when the store is created, so every read of a platform version reports
+/// the same images and no read mints one.
+fn managed_custom_ami_catalog() -> BTreeMap<String, Vec<CustomAmi>> {
+    SOLUTION_STACKS
+        .iter()
+        .map(|stack| {
+            let images = PLATFORM_VIRTUALIZATION_TYPES
+                .iter()
+                .map(|virtualization_type| CustomAmi {
+                    virtualization_type: Some((*virtualization_type).to_string()),
+                    image_id: Some(format!("ami-{}", random_id_body(CUSTOM_AMI_ID_BODY_LENGTH))),
+                })
+                .collect();
+            (stack.catalog_key(), images)
+        })
+        .collect()
+}
+
+/// The `SupportedAddonList` of a managed platform version whose branch supports
+/// `supported_tiers` — "the additions associated with the platform version".
+///
+/// Every platform version Elastic Beanstalk publishes streams its logs to Amazon
+/// S3 and to CloudWatch Logs and reports enhanced health through the health
+/// daemon; the SQS daemon is what runs a WORKER environment, so it is an
+/// addition only of a version whose branch supports the worker tier. That is the
+/// rule, so the list follows the branch's tiers rather than being written out
+/// per catalog entry.
+pub fn managed_supported_addons(supported_tiers: &[String]) -> Vec<String> {
+    SUPPORTED_ADDONS
+        .iter()
+        .filter(|addon| {
+            **addon != ADDON_WORKER_DAEMON_SQSD
+                || supported_tiers.iter().any(|tier| tier == TIER_WORKER)
+        })
+        .map(|addon| (*addon).to_string())
+        .collect()
+}
+
+/// A platform branch's life-cycle state as a PLATFORM VERSION reports it
+/// (`PlatformSummary$PlatformBranchLifecycleState`,
+/// `PlatformDescription$PlatformBranchLifecycleState`): the branch catalog's own
+/// state, capitalized.
+///
+/// The model spells this value set twice and differently — `PlatformSummary`
+/// documents "`beta` | `supported` | `deprecated` | `retired`" while
+/// `PlatformDescription` documents "`Beta` | `Supported` | `Deprecated` |
+/// `Retired`" — and both cannot describe one attribute. The recorded
+/// platform-version responses of the real service settle it: they carry the
+/// capitalized form on BOTH shapes, so that is the form a platform version
+/// reports. The branch catalog keeps the spelling it holds (`ListPlatformBranches`
+/// reports its own member from it), so this rendering is IDEMPOTENT: a state
+/// already capitalized comes back unchanged.
+pub fn reported_branch_lifecycle_state(state: &str) -> String {
+    let mut characters = state.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }
 
@@ -501,6 +754,19 @@ pub fn solution_stack_named(name: &str) -> Option<&'static SolutionStack> {
 /// `war`, a Java SE (Corretto) platform a `jar`, and every platform accepts a
 /// `zip` source bundle.
 ///
+/// `platform_category`, `programming_languages` and `frameworks` are the
+/// platform FAMILY, the language runtime and the application server Elastic
+/// Beanstalk publishes for each of its platforms (the "Elastic Beanstalk
+/// supported platforms" document: the Python platforms run the application
+/// behind Gunicorn, the Ruby platforms behind Puma, the PHP platforms behind
+/// PHP-FPM, a Tomcat platform on Tomcat and a Windows platform on IIS), carried
+/// here because none of the three can be derived from the branch name: the
+/// .NET-on-Linux family's category is `.NET Core`, a Corretto branch runs the
+/// language `Java`, and a Tomcat branch runs Tomcat ON Java. A platform that
+/// runs no language of its own (Docker runs whatever the image holds) states
+/// none, and a runtime or framework whose version the catalog does not state is
+/// reported without one.
+///
 /// ORDER IS CONTRACTUAL: the operation reports the stacks "with the public
 /// version first and then in reverse chronological order", and the handler
 /// reports this table as it stands, so the table is written newest branch first
@@ -511,120 +777,186 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
         branch_name: ".NET 9 running on 64bit Amazon Linux 2023",
         platform_version: "3.4.0",
         permitted_file_types: &["zip"],
+        platform_category: ".NET Core",
+        programming_languages: &[(".NET", "9")],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: ".NET 8 running on 64bit Amazon Linux 2023",
         platform_version: "3.3.0",
         permitted_file_types: &["zip"],
+        platform_category: ".NET Core",
+        programming_languages: &[(".NET", "8")],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: ".NET Core running on 64bit Amazon Linux 2",
         platform_version: "2.8.0",
         permitted_file_types: &["zip"],
+        platform_category: ".NET Core",
+        programming_languages: &[(".NET Core", "")],
+        frameworks: &[],
     },
     // .NET on Windows Server.
     SolutionStack {
         branch_name: "IIS 10.0 running on 64bit Windows Server 2019",
         platform_version: "2.16.0",
         permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+        frameworks: &[("IIS", "10.0")],
     },
     // Docker.
     SolutionStack {
         branch_name: "Docker running on 64bit Amazon Linux 2023",
         platform_version: "4.2.0",
         permitted_file_types: &["zip"],
+        platform_category: "Docker",
+        programming_languages: &[],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: "Docker running on 64bit Amazon Linux 2",
         platform_version: "3.9.0",
         permitted_file_types: &["zip"],
+        platform_category: "Docker",
+        programming_languages: &[],
+        frameworks: &[],
     },
     // Go.
     SolutionStack {
         branch_name: "Go 1 running on 64bit Amazon Linux 2023",
         platform_version: "3.5.0",
         permitted_file_types: &["zip"],
+        platform_category: "Go",
+        programming_languages: &[("Go", "1")],
+        frameworks: &[],
     },
     // Java SE (Corretto): a Java SE platform deploys a `jar`.
     SolutionStack {
         branch_name: "Corretto 21 running on 64bit Amazon Linux 2023",
         platform_version: "4.4.0",
         permitted_file_types: &["jar", "zip"],
+        platform_category: "Java",
+        programming_languages: &[("Java", "21")],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: "Corretto 17 running on 64bit Amazon Linux 2023",
         platform_version: "4.3.0",
         permitted_file_types: &["jar", "zip"],
+        platform_category: "Java",
+        programming_languages: &[("Java", "17")],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: "Corretto 11 running on 64bit Amazon Linux 2",
         platform_version: "3.7.0",
         permitted_file_types: &["jar", "zip"],
+        platform_category: "Java",
+        programming_languages: &[("Java", "11")],
+        frameworks: &[],
     },
     // Node.js.
     SolutionStack {
         branch_name: "Node.js 22 running on 64bit Amazon Linux 2023",
         platform_version: "6.6.0",
         permitted_file_types: &["zip"],
+        platform_category: "Node.js",
+        programming_languages: &[("Node.js", "22")],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: "Node.js 20 running on 64bit Amazon Linux 2023",
         platform_version: "6.5.0",
         permitted_file_types: &["zip"],
+        platform_category: "Node.js",
+        programming_languages: &[("Node.js", "20")],
+        frameworks: &[],
     },
     SolutionStack {
         branch_name: "Node.js 18 running on 64bit Amazon Linux 2023",
         platform_version: "6.4.0",
         permitted_file_types: &["zip"],
+        platform_category: "Node.js",
+        programming_languages: &[("Node.js", "18")],
+        frameworks: &[],
     },
     // PHP.
     SolutionStack {
         branch_name: "PHP 8.4 running on 64bit Amazon Linux 2023",
         platform_version: "4.5.0",
         permitted_file_types: &["zip"],
+        platform_category: "PHP",
+        programming_languages: &[("PHP", "8.4")],
+        frameworks: &[("PHP-FPM", "")],
     },
     SolutionStack {
         branch_name: "PHP 8.3 running on 64bit Amazon Linux 2023",
         platform_version: "4.4.0",
         permitted_file_types: &["zip"],
+        platform_category: "PHP",
+        programming_languages: &[("PHP", "8.3")],
+        frameworks: &[("PHP-FPM", "")],
     },
     // Python.
     SolutionStack {
         branch_name: "Python 3.13 running on 64bit Amazon Linux 2023",
         platform_version: "4.6.0",
         permitted_file_types: &["zip"],
+        platform_category: "Python",
+        programming_languages: &[("Python", "3.13")],
+        frameworks: &[("Gunicorn", "")],
     },
     SolutionStack {
         branch_name: "Python 3.11 running on 64bit Amazon Linux 2023",
         platform_version: "4.5.0",
         permitted_file_types: &["zip"],
+        platform_category: "Python",
+        programming_languages: &[("Python", "3.11")],
+        frameworks: &[("Gunicorn", "")],
     },
     SolutionStack {
         branch_name: "Python 3.9 running on 64bit Amazon Linux 2023",
         platform_version: "4.4.0",
         permitted_file_types: &["zip"],
+        platform_category: "Python",
+        programming_languages: &[("Python", "3.9")],
+        frameworks: &[("Gunicorn", "")],
     },
     // Ruby.
     SolutionStack {
         branch_name: "Ruby 3.4 running on 64bit Amazon Linux 2023",
         platform_version: "3.5.0",
         permitted_file_types: &["zip"],
+        platform_category: "Ruby",
+        programming_languages: &[("Ruby", "3.4")],
+        frameworks: &[("Puma", "")],
     },
     SolutionStack {
         branch_name: "Ruby 3.2 running on 64bit Amazon Linux 2023",
         platform_version: "3.4.0",
         permitted_file_types: &["zip"],
+        platform_category: "Ruby",
+        programming_languages: &[("Ruby", "3.2")],
+        frameworks: &[("Puma", "")],
     },
     // Tomcat: a Tomcat platform deploys a `war`.
     SolutionStack {
         branch_name: "Tomcat 10.1 with Corretto 21 running on 64bit Amazon Linux 2023",
         platform_version: "5.4.0",
         permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "21")],
+        frameworks: &[("Tomcat", "10.1")],
     },
     SolutionStack {
         branch_name: "Tomcat 9 with Corretto 11 running on 64bit Amazon Linux 2023",
         platform_version: "5.3.0",
         permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "11")],
+        frameworks: &[("Tomcat", "9")],
     },
 ];
 
@@ -1602,7 +1934,9 @@ impl PlatformVersion {
             platform_status: Some(self.status.clone()),
             // Everything below is read off a built platform's definition archive,
             // which this emulator does not read; a platform version it cannot
-            // derive reports no value rather than a guessed one.
+            // derive reports no value rather than a guessed one. A custom version
+            // belongs to no published branch either, so it has no branch name and
+            // no branch life-cycle state.
             platform_category: None,
             operating_system_name: None,
             operating_system_version: None,
@@ -1612,6 +1946,16 @@ impl PlatformVersion {
             platform_version: Some(self.platform_version.clone()),
             platform_branch_name: None,
             platform_branch_lifecycle_state: None,
+        }
+    }
+
+    /// This record as `ListPlatformVersions` reports and filters it. A custom
+    /// version states no programming language: that is read off the platform
+    /// definition archive, which this service does not read.
+    pub fn to_listing(&self) -> ListedPlatformVersion {
+        ListedPlatformVersion {
+            summary: self.to_summary(),
+            programming_language_names: Vec::new(),
         }
     }
 
@@ -2237,11 +2581,15 @@ macro_rules! environment_description {
 
 pub(crate) use environment_description;
 
-/// `PlatformLifecycleState` for the newest version of a branch, as
-/// `PlatformSummary$PlatformLifecycleState` documents it: "Possible values:
-/// `recommended` | empty. If an empty value is returned, the platform version is
-/// supported but isn't the recommended one for its branch."
-pub const PLATFORM_LIFECYCLE_RECOMMENDED: &str = "recommended";
+/// `PlatformLifecycleState` for the newest version of a branch.
+///
+/// The model spells this value twice and differently — `PlatformSummary`
+/// documents "Possible values: `recommended` | empty", `PlatformDescription`
+/// "Possible values: `Recommended` | `null`" — and the recorded
+/// platform-version responses of the real service carry the CAPITALIZED form on
+/// both shapes, so that is the value a platform version reports. A version that
+/// is not its branch's recommended one reports no value at all.
+pub const PLATFORM_LIFECYCLE_RECOMMENDED: &str = "Recommended";
 
 /// Order two version strings, and more generally two platform attribute values.
 ///
@@ -2283,8 +2631,37 @@ fn numeric_components(value: &str) -> Option<Vec<u64>> {
         .collect()
 }
 
-/// The AWS-managed platform versions a request in `region` can list, as the
-/// modelled `PlatformSummary`.
+/// One platform version as `ListPlatformVersions` reports AND filters it: the
+/// modelled `PlatformSummary` the response carries, plus the names of the
+/// programming languages the version runs.
+///
+/// The languages ride alongside because `PlatformFilter$Type` names
+/// `ProgrammingLanguageName` as a platform-version attribute a term may select
+/// on, while `PlatformSummary` models no language member — so a summary alone
+/// cannot answer such a term, and the catalog's languages would be unreachable
+/// to the filter.
+#[derive(Debug, Clone)]
+pub struct ListedPlatformVersion {
+    pub summary: PlatformSummary,
+    pub programming_language_names: Vec<String>,
+}
+
+/// The branch named `branch_name` in `branches`, if the catalog holds it: the
+/// ONE branch-by-name lookup, so a caller holding the catalog map and a caller
+/// holding the whole store
+/// ([`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::platform_branch_named`])
+/// resolve a version's branch the same way. A branch name is unique within the
+/// catalog, so at most one answers.
+pub fn platform_branch_named<'a>(
+    branches: &'a BTreeMap<String, PlatformBranch>,
+    branch_name: &str,
+) -> Option<&'a PlatformBranch> {
+    branches
+        .values()
+        .find(|branch| branch.branch_name == branch_name)
+}
+
+/// The AWS-managed platform versions a request in `region` can list.
 ///
 /// The catalog is the service's own: [`SOLUTION_STACKS`] holds the published
 /// version of every platform branch, and `branches` — the branch catalog the
@@ -2294,36 +2671,44 @@ fn numeric_components(value: &str) -> Option<Vec<u64>> {
 /// rather than copied into the store, where it would go stale against the
 /// region the caller signed for.
 ///
+/// Every member the catalog states is projected — the platform's category, the
+/// operating system it runs on, the add-ons it supports, its branch and the
+/// life-cycle state of version and branch — so a client filtering or displaying
+/// on one of them reads the same value `DescribePlatformVersion` reports.
 /// `PlatformLifecycleState` is [`PLATFORM_LIFECYCLE_RECOMMENDED`] for every
 /// entry because the catalog publishes exactly one version per branch, so each
 /// published version IS its branch's recommended one. A stack whose branch the
 /// store does not hold is not published: a version of a branch nobody can see is
-/// not available to the account either. What only a built platform's definition
-/// archive carries (its category, operating system and addons) is left ABSENT
-/// rather than guessed, exactly as [`SolutionStack::to_description`] leaves it.
-pub fn managed_platform_summaries(
+/// not available to the account either.
+pub fn managed_platform_listings(
     region: &str,
     branches: &BTreeMap<String, PlatformBranch>,
-) -> Vec<PlatformSummary> {
+) -> Vec<ListedPlatformVersion> {
     SOLUTION_STACKS
         .iter()
         .filter_map(|stack| {
-            let branch = branches
-                .values()
-                .find(|branch| branch.branch_name == stack.branch_name)?;
-            Some(PlatformSummary {
-                platform_arn: Some(stack.platform_arn(region)),
-                platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
-                platform_status: Some(PLATFORM_STATUS_READY.to_string()),
-                platform_version: Some(stack.platform_version.to_string()),
-                platform_branch_name: Some(branch.branch_name.clone()),
-                platform_branch_lifecycle_state: Some(branch.lifecycle_state.clone()),
-                supported_tier_list: Some(branch.supported_tiers.clone()),
-                platform_lifecycle_state: Some(PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
-                platform_category: None,
-                operating_system_name: None,
-                operating_system_version: None,
-                supported_addon_list: None,
+            let branch = platform_branch_named(branches, stack.branch_name)?;
+            let operating_system = stack.operating_system();
+            Some(ListedPlatformVersion {
+                summary: PlatformSummary {
+                    platform_arn: Some(stack.platform_arn(region)),
+                    platform_owner: Some(MANAGED_PLATFORM_OWNER.to_string()),
+                    platform_status: Some(PLATFORM_STATUS_READY.to_string()),
+                    platform_version: Some(stack.platform_version.to_string()),
+                    platform_branch_name: Some(branch.branch_name.clone()),
+                    platform_branch_lifecycle_state: Some(reported_branch_lifecycle_state(
+                        &branch.lifecycle_state,
+                    )),
+                    supported_tier_list: Some(branch.supported_tiers.clone()),
+                    platform_lifecycle_state: Some(PLATFORM_LIFECYCLE_RECOMMENDED.to_string()),
+                    platform_category: Some(stack.platform_category.to_string()),
+                    operating_system_name: operating_system.map(|(name, _)| name.to_string()),
+                    operating_system_version: operating_system
+                        .and_then(|(_, version)| version)
+                        .map(str::to_string),
+                    supported_addon_list: Some(managed_supported_addons(&branch.supported_tiers)),
+                },
+                programming_language_names: stack.programming_language_names(),
             })
         })
         .collect()
@@ -2366,6 +2751,19 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// [`MANAGED_PLATFORM_BRANCHES`] when the store is created, so every
     /// platform operation reads one catalog.
     pub platform_branches: BTreeMap<String, PlatformBranch>,
+    /// When the managed platform catalog was published into this store — the
+    /// `DateCreated`/`DateUpdated` a MANAGED platform version reports.
+    ///
+    /// The catalog is service-owned reference data seeded at store creation and
+    /// never re-published, so one instant dates every published version, it is
+    /// the same instant on every read, and no read moves it. A CUSTOM version
+    /// carries its own creation and update instants on its record instead.
+    pub platform_catalog_published_at: ::aws_smithy_types::DateTime,
+    /// The machine images the catalog published for each managed platform
+    /// version, by [`SolutionStack::catalog_key`] — what
+    /// `DescribePlatformVersion` reports in `CustomAmiList`. Seeded with the
+    /// catalog; see [`managed_custom_ami_catalog`].
+    pub platform_custom_amis: BTreeMap<String, Vec<CustomAmi>>,
     /// Source of unique `EnvironmentId` values, of version sequence numbers and
     /// of event sequence numbers.
     pub next_id_counter: u64,
@@ -2389,6 +2787,8 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             // No storage bucket until `CreateStorageLocation` creates one.
             storage_buckets: BTreeSet::new(),
             platform_branches: managed_platform_branch_catalog(),
+            platform_catalog_published_at: now(),
+            platform_custom_amis: managed_custom_ami_catalog(),
             next_id_counter: 0,
         }
     }
@@ -2711,6 +3111,15 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
                 .then(left.branch_name.cmp(&right.branch_name))
         });
         branches
+    }
+
+    /// The published branch named `branch_name`, if the catalog holds it.
+    ///
+    /// A platform version's branch attributes (its supported tiers, its branch
+    /// life-cycle state) are held once, on the branch, so every operation that
+    /// reports them for a version resolves the branch through here.
+    pub fn platform_branch_named(&self, branch_name: &str) -> Option<&PlatformBranch> {
+        platform_branch_named(&self.platform_branches, branch_name)
     }
 
     /// How many environments have not reached `Terminated` — the count the

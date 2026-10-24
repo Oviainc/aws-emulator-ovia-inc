@@ -59,6 +59,8 @@ mod object_default_encryption;
 mod object_encryption;
 #[path = "all/object_listing_and_deletion.rs"]
 mod object_listing_and_deletion;
+#[path = "all/object_listing_encoding.rs"]
+mod object_listing_encoding;
 #[path = "all/object_storage.rs"]
 mod object_storage;
 #[path = "all/object_tagging.rs"]
