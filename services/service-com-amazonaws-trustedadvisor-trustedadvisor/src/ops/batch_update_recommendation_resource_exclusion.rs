@@ -8,9 +8,17 @@
 //! and the recommendation's `resourcesAggregates.excludedCount` counts it.
 //!
 //! Per the model's doc, this operation "supports up to 25 unique recommendation
-//! resource ARNs per request" (the modelled `length 1..25` + `uniqueItems`, both
-//! enforced by the framework) and "currently doesn't support prioritized
-//! recommendation resources". A refusal of one entry is reported as an entry of
+//! resource ARNs per request" and "currently doesn't support prioritized
+//! recommendation resources". The COUNT is the modelled `length 1..25`, enforced
+//! by the framework; UNIQUENESS is per ARN and is enforced here, because the
+//! modelled `uniqueItems` compares whole `RecommendationResourceExclusion`
+//! structures (and the framework's duplicate check only records a list's scalar
+//! leaves at that), so it says nothing about one ARN appearing twice. A list
+//! that names one recommendation-resource ARN more than once asks for two
+//! exclusion states for one resource, which is not a well-formed request: the
+//! WHOLE request is refused with the modelled `ValidationException` (HTTP 400)
+//! and no entry is applied, rather than the last occurrence silently winning.
+//! A refusal of one entry is reported as an entry of
 //! `batchUpdateRecommendationResourceExclusionErrors` rather than as a
 //! top-level error, so the remaining entries still apply: an ARN naming no
 //! stored resource and an ARN whose recommendation is `priority` each come back
@@ -87,6 +95,54 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Every recommendation-resource ARN the entry list names more than once, in the
+/// order in which each one first repeats.
+///
+/// Exact string equality: an ARN identifies one stored resource, and the store is
+/// keyed by that same string, so two entries name the same resource exactly when
+/// their `arn` members are equal. The scan is quadratic in the number of REPEATED
+/// ARNs only, which the modelled `length 1..25` bounds.
+fn repeated_arns(exclusions: &[RecommendationResourceExclusion]) -> Vec<&str> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut repeated: Vec<&str> = Vec::new();
+    for exclusion in exclusions {
+        let arn = exclusion.arn.as_str();
+        if !seen.insert(arn) && !repeated.contains(&arn) {
+            repeated.push(arn);
+        }
+    }
+    repeated
+}
+
+/// The `message` of the refusal a repeated ARN earns, in the sentence this service
+/// builds every input-validation refusal from (see `crate::service::validation`):
+/// the clause count, then one `<subject> at '<member path>' failed to satisfy
+/// constraint: <requirement>` clause per offending value, joined with `; `. The
+/// subject is the repeated ARN itself — the value the caller has to fix — and not
+/// the whole list, so the message stays bounded by the number of distinct
+/// repeated ARNs.
+///
+/// `repeated` must be non-empty: there is no refusal to word otherwise.
+fn repeated_arn_refusal(repeated: &[&str]) -> String {
+    let clauses: Vec<String> = repeated
+        .iter()
+        .map(|arn| {
+            format!(
+                "Value '{arn}' at 'recommendationResourceExclusions' failed to satisfy \
+                 constraint: Member must have unique arn values"
+            )
+        })
+        .collect();
+    match clauses.as_slice() {
+        [only] => format!("1 validation error detected: {only}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
 
 /// One refused entry of the batch: the ARN it names, the modelled error shape a
 /// single-resource operation would refuse it with, and why. Reported per entry
@@ -185,6 +241,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchUpdateRecommendationResourceExclusionErrorModeled::AccessDeniedException(
                     denied,
+                )
+                .into(),
+            );
+        }
+        // Request well-formedness, ahead of every lookup and every write: a list
+        // that names one recommendation-resource ARN twice asks for two exclusion
+        // states for one resource, so the WHOLE request is refused and nothing is
+        // applied — including the entries that name no repeated ARN.
+        let repeated = repeated_arns(&input.recommendation_resource_exclusions);
+        if !repeated.is_empty() {
+            return Err(
+                BatchUpdateRecommendationResourceExclusionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: repeated_arn_refusal(&repeated),
+                    },
                 )
                 .into(),
             );

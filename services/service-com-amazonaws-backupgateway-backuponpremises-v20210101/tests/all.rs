@@ -21,6 +21,8 @@ mod hypervisor_listing;
 mod hypervisor_property_mappings;
 #[path = "all/hypervisor_reads.rs"]
 mod hypervisor_reads;
+#[path = "all/metadata_sync.rs"]
+mod metadata_sync;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
 #[path = "all/state_roundtrip.rs"]

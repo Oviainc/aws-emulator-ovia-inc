@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a device in a global network and stores it, so every later reader answers from
+//! the stored record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The device's own lifecycle state is a function of the clock, never a stored field, so
+//! reading one back never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDevice"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDeviceErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // Three of the free-form descriptors carry a documented maximum the model's own
+        // `ConstrainedString` (len 0..256) does not express, so they are refused here
+        // rather than by the pre-handler constraint walk. `Description` and `Type` carry
+        // no bound beyond the modelled one, so that walk already covers them.
+        for (member, value) in [
+            ("Vendor", &input.vendor),
+            ("Model", &input.model),
+            ("SerialNumber", &input.serial_number),
+        ] {
+            if let Some(problem) = value.as_deref().and_then(descriptor_problem) {
+                return Err(CreateDeviceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!("{member} {problem}"),
+                        reason: Some("FieldValidationFailed".to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: member.to_string(),
+                            message: problem,
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // The same tag rules `TagResource` applies hold for the tags a create carries:
+        // the AWS-reserved key prefix, the documented key/value lengths and the
+        // per-resource tag quota are all refused before anything is stored.
+        if let Err(problem) = crate::state::check_requested_tags(input.tags.as_ref()) {
+            return Err(match problem {
+                crate::state::TagProblem::Invalid(rejection) => {
+                    CreateDeviceErrorModeled::ValidationException(rejection.to_exception())
+                }
+                crate::state::TagProblem::TooMany(requested) => {
+                    CreateDeviceErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: crate::state::too_many_tags_message(requested),
+                            resource_id: None,
+                            resource_type: Some(crate::state::DEVICE_KIND.to_string()),
+                            limit_code: crate::state::LIMIT_TAGS_PER_RESOURCE.to_string(),
+                            service_code: crate::state::SERVICE_CODE.to_string(),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // "Creates a new device in a global network" (`smithy_query query="doc"
+        // shape="CreateDevice"`), so the device's parent is the global network the path
+        // addresses: a `GlobalNetworkId` that names nothing would leave the record with a
+        // dangling back-reference. A create validates the references its input carries
+        // before anything is minted, so an unresolvable one is a FIELD failure on the
+        // member that carried it — `ValidationException` (400) with
+        // `Reason=FieldValidationFailed` and a `Fields` entry naming that member — not the
+        // missing-resource answer an operation acting on an existing resource gives.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(CreateDeviceErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
+                    crate::state::GLOBAL_NETWORK_KIND,
+                ),
+            )
+            .into());
+        }
+
+        // `SiteId` is optional, so a device that names none is an unsited device of the
+        // global network. When the request does carry one it is a reference like any
+        // other, resolved WITHIN the global network the path addresses: a site that never
+        // existed, one that was deleted and one stored under a different global network
+        // all leave it naming nothing, which one lookup answers.
+        if let Some(site_id) = input.site_id.as_deref() {
+            let site_resolves = store
+                .sites
+                .get(site_id)
+                .is_some_and(|site| site.global_network_id == input.global_network_id);
+            if !site_resolves {
+                return Err(CreateDeviceErrorModeled::ValidationException(
+                    crate::state::unknown_reference(
+                        crate::state::FIELD_SITE_ID,
+                        crate::state::SITE_KIND,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // A quota bounds how many devices one global network can be made to hold: at the
+        // cap the create is refused with the modelled quota error and nothing is stored,
+        // so a repeated call cannot grow the store without end.
+        if store.device_count_of(&input.global_network_id)
+            >= crate::state::MAX_DEVICES_PER_GLOBAL_NETWORK
+        {
+            return Err(CreateDeviceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "global network {} already holds the maximum of {} devices",
+                        input.global_network_id,
+                        crate::state::MAX_DEVICES_PER_GLOBAL_NETWORK
+                    ),
+                    resource_id: Some(input.global_network_id.clone()),
+                    resource_type: Some(crate::state::DEVICE_KIND.to_string()),
+                    limit_code: crate::state::LIMIT_DEVICES_PER_GLOBAL_NETWORK.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_id(crate::state::DEVICE_KIND);
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::DeviceRecord {
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+                crate::state::DEVICE_KIND,
+                &id,
+            ),
+            id: id.clone(),
+            global_network_id: input.global_network_id,
+            site_id: input.site_id,
+            aws_location: input.aws_location,
+            description: input.description,
+            device_type: input.r#type,
+            vendor: input.vendor,
+            model: input.model,
+            serial_number: input.serial_number,
+            // A request may carry both a site and a location: "If you specify both a site
+            // ID and a location, the location of the site is used for visualization in the
+            // Network Manager console" (`smithy_query query="doc" shape="CreateDevice"`) —
+            // a console rendering choice, not a change to the record, so the device keeps
+            // the location the request supplied and the two members stay independent.
+            location: input.location,
+            created_at: now,
+            available_at: now + crate::state::SETTLE_DELAY,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let device = record.to_shape(now);
+        store.devices.insert(id, record);
+
+        Ok(CreateDeviceOutput {
+            device: Some(device),
+        })
     }
+}
+
+/// The documented constraint on a device's `Vendor`, `Model` and `SerialNumber` that the
+/// model's `ConstrainedString` (len 0..256) does not carry: "Constraints: Maximum length
+/// of 128 characters" (`smithy_query query="doc" shape="CreateDeviceRequest"
+/// member="Vendor"`, the same sentence for `Model` and `SerialNumber`), counted in
+/// characters by [`crate::state::MAX_DEVICE_DESCRIPTOR_CHARS`].
+///
+/// Answers `None` when `value` satisfies it, otherwise the member-level reason the
+/// refusal reports.
+fn descriptor_problem(value: &str) -> Option<String> {
+    let max = crate::state::MAX_DEVICE_DESCRIPTOR_CHARS;
+    let length = value.chars().count();
+    (length > max).then(|| format!("must be at most {max} characters, but is {length}"))
 }

@@ -297,15 +297,26 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::CodePipeline::CustomActionType",
     "AWS::CodePipeline::Pipeline",
     "AWS::CodePipeline::Webhook",
-    // Amazon Cognito
-    "AWS::Cognito::IdentityPool",
-    "AWS::Cognito::IdentityPoolRoleAttachment",
-    "AWS::Cognito::UserPool",
-    "AWS::Cognito::UserPoolClient",
-    "AWS::Cognito::UserPoolDomain",
-    "AWS::Cognito::UserPoolGroup",
-    "AWS::Cognito::UserPoolUser",
-    "AWS::Cognito::UserPoolUserToGroupAttachment",
+    // Amazon Cognito: the whole published group. Each entry is followed by the operation
+    // of the owning service's own model in this checkout that deploying it calls — the
+    // cross-check that the type names a resource one of the two Amazon Cognito APIs really
+    // creates (`cognito-identity` for the three identity-pool types, `cognito-idp` for the
+    // user-pool ones).
+    "AWS::Cognito::IdentityPool", // CreateIdentityPool
+    "AWS::Cognito::IdentityPoolPrincipalTag", // SetPrincipalTagAttributeMap
+    "AWS::Cognito::IdentityPoolRoleAttachment", // SetIdentityPoolRoles
+    "AWS::Cognito::LogDeliveryConfiguration", // SetLogDeliveryConfiguration
+    "AWS::Cognito::ManagedLoginBranding", // CreateManagedLoginBranding
+    "AWS::Cognito::UserPool",       // CreateUserPool
+    "AWS::Cognito::UserPoolClient", // CreateUserPoolClient
+    "AWS::Cognito::UserPoolDomain", // CreateUserPoolDomain
+    "AWS::Cognito::UserPoolGroup",  // CreateGroup
+    "AWS::Cognito::UserPoolIdentityProvider", // CreateIdentityProvider
+    "AWS::Cognito::UserPoolResourceServer", // CreateResourceServer
+    "AWS::Cognito::UserPoolRiskConfigurationAttachment", // SetRiskConfiguration
+    "AWS::Cognito::UserPoolUICustomizationAttachment", // SetUICustomization
+    "AWS::Cognito::UserPoolUser",   // AdminCreateUser
+    "AWS::Cognito::UserPoolUserToGroupAttachment", // AdminAddUserToGroup
     // Amazon Connect
     "AWS::Connect::ContactFlow",
     "AWS::Connect::HoursOfOperation",

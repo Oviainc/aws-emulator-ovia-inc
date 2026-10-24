@@ -14,8 +14,10 @@
 //! recorded against it
 //! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`])
 //! and the preference's `Version` and `LastUpdateDate` advance with that write, the way
-//! every write of this resource reports them. No plane's verification status moves:
-//! nothing verified the portal connection.
+//! every write of this resource reports them. That count is what the refusal REPORTS: its
+//! message names the attempt that failed and the budget it counts against
+//! ([`MAX_VERIFICATION_ATTEMPTS`]). No plane's verification status moves: nothing
+//! verified the portal connection.
 //!
 //! ## Shape of an operation
 //!
@@ -131,12 +133,40 @@ impl From<VerifyProcurementPortalValidationErrorModeled> for VerifyProcurementPo
     }
 }
 
-/// The sentence a submitted `Code` is refused with: a CONSTANT, the same whatever was
-/// submitted. It states that the code is not the outstanding one WITHOUT reproducing
-/// what the caller sent or revealing what the issued code is — the same rule
+/// How many submissions of a validation code for one preference the refusal counts
+/// against: the budget AWS's recorded refusal states ("Attempt 1 of 3 failed"), which is
+/// what a client driving the OTP flow reads the remaining attempts off.
+///
+/// It is a REPORTING budget: nothing in this service's model or in the recorded bodies
+/// says the service stops accepting submissions once it is spent, so no submission is
+/// refused for exceeding it and the attempt the refusal names is the true count of failed
+/// attempts — never clamped to the budget, which would report an attempt that did not
+/// fail.
+const MAX_VERIFICATION_ATTEMPTS: u32 = 3;
+
+/// The sentence a submitted `Code` is refused with: it states that the code is not valid
+/// and WHICH attempt failed, out of [`MAX_VERIFICATION_ATTEMPTS`], read from the
+/// preference's own failed-attempt count
+/// ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`]).
+///
+/// Recorded behaviour: AWS's refusal reports the failed-attempt number against that
+/// budget, which is what drives a client's "try again or ask for a new code" decision.
+/// It reproduces neither what the caller submitted nor the issued code — the same rule
 /// `crate::service::validation` states for every refusal of this service.
-const INVALID_CODE_MESSAGE: &str =
-    "The validation code is not valid for this procurement portal preference.";
+fn invalid_code_message(failed_attempts: u32) -> String {
+    let budget = MAX_VERIFICATION_ATTEMPTS;
+    if failed_attempts < budget {
+        format!(
+            "The code you entered is invalid. Attempt {failed_attempts} of {budget} failed. \
+             Please try again."
+        )
+    } else {
+        format!(
+            "The code you entered is invalid. Attempt {failed_attempts} of {budget} failed. \
+             Request a new validation code with SendProcurementPortalValidation."
+        )
+    }
+}
 
 /// The `VerifyProcurementPortalValidation` operation.
 ///
@@ -194,7 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 VerifyProcurementPortalValidationErrorModeled::ResourceNotFoundException(
-                    crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                    crate::state::no_such_procurement_portal_preference(
+                        &input.procurement_portal_preference_arn,
+                    ),
                 )
                 .into(),
             );
@@ -220,7 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get_mut(&input.procurement_portal_preference_arn)
                 .ok_or_else(|| {
                     VerifyProcurementPortalValidationErrorModeled::ResourceNotFoundException(
-                        crate::state::no_such_resource(&input.procurement_portal_preference_arn),
+                        crate::state::no_such_procurement_portal_preference(
+                            &input.procurement_portal_preference_arn,
+                        ),
                     )
                 })?;
 
@@ -247,11 +281,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     VerifyProcurementPortalValidationErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(INVALID_CODE_MESSAGE.to_string()),
+                            // Stated from the attempt this submission just made against
+                            // this preference, so the refusal reports WHICH attempt
+                            // failed rather than one constant sentence.
+                            message: Some(invalid_code_message(
+                                stored.failed_verification_attempts,
+                            )),
                             // `invalidInput` is one of the model's
                             // `ValidationExceptionReason` values
                             // (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`).
                             reason: Some("invalidInput".to_string()),
+                            // The procurement-portal plane keys the text as `Message`
+                            // (`crate::ops::types::MessageKey`).
+                            message_key: MessageKey::Capitalised,
                             ..Default::default()
                         },
                     )

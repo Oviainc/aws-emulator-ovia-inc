@@ -1,0 +1,69 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ecr.complete-layer-upload-double-completion-rejected ecr.completed-upload-id-reuse-fails ecr.pull-through-cache-rule-custom-role-arn-persists ecr.update-pull-through-cache-rule-not-found-rejected ecr.delete-repository-creation-template-nonexistent-rejected ecr.repository-creation-template-lifecycle ecr.pull-time-exclusion-window-expires-then-pulls-resume-updates ecr.register-pull-time-exclusion-duplicate-rejected ecr.complete-layer-upload-wrong-digest-rejected ecr.upload-layer-part-noncontiguous-range-rejected ecr.create-repository-invalid-name-rejected ecr.put-signing-configuration-invalid-profile-rejected ecr.start-lifecycle-policy-preview-concurrent-in-progress-rejected
+Issue-Shape-Id: com.amazonaws.ecr#AmazonEC2ContainerRegistry_V20150921
+Issue-Key: ecr.complete-layer-upload-double-completion-rejected|run#19|AssertionError|assert loser_message == loser_messages[loser_code], (
+Issue-Key: ecr.completed-upload-id-reuse-fails|run#12|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: ecr.pull-through-cache-rule-custom-role-arn-persists|run#24|AssertionError|assert describe_error.get("Message") == expected_message, (
+Issue-Key: ecr.update-pull-through-cache-rule-not-found-rejected|run#11|AssertionError|assert message == expected_message, (
+Issue-Key: ecr.delete-repository-creation-template-nonexistent-rejected|run#6|AssertionError|assert err_msg == expected_msg, f"expected message {expected_msg!r}, got {err_msg!r}"
+Issue-Key: ecr.repository-creation-template-lifecycle|run#18|AssertionError|assert message == (
+Issue-Key: ecr|DeregisterPullTimeUpdateExclusion|ExclusionNotFoundException
+Issue-Key: ecr.register-pull-time-exclusion-duplicate-rejected|run#10|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: ecr.complete-layer-upload-wrong-digest-rejected|run#16|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: ecr.upload-layer-part-noncontiguous-range-rejected|run#16|AssertionError|assert message == expected_message, (
+Issue-Key: ecr.create-repository-invalid-name-rejected|run#10|AssertionError|assert message == invalid_name, f"expected message {invalid_name!r}, got {message!r}"
+Issue-Key: ecr.put-signing-configuration-invalid-profile-rejected|run#11|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: ecr.start-lifecycle-policy-preview-concurrent-in-progress-rejected|run#9|AssertionError|assert error == {
+Issue-Commit: 1f316ce023d643c000ad0b8fb7b5799232d706fd
+
+# ECR error messages are emulator-authored instead of AWS's request-derived text, across not-found, layer-upload, parameter-constraint and preview-in-progress errors (4 causes)
+
+> _Note: this issue was identified against the code base at commit `1f316ce023d643c000ad0b8fb7b5799232d706fd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CompleteLayerUpload
+
+## Description
+Four causes. Every one of them returns the correct HTTP status and error CODE; only the message diverges, and in each case the message AWS returns is built from the request (it names the request's repository, registry id, upload id, prefix, principal ARN, byte offsets, or the violated member and its constraint), so that construction is the requirement — not the recorded wording of any one run. Related open issues that do NOT cover these checks: 20261022T234922Z-ecr-policy-lifecycle-document-validation-errors-carry-emulator.md and 20261023T153036Z-ecr-validation-messages-assert-constraints-the-api-model.md.
+
+Cause 1 of 4: resource-not-found and already-exists messages do not follow AWS's "<thing> with <id> ... in the registry with id '<account>'" construction.
+AWS: recorded behavior only for the text; the error shapes are modelled (Smithy: CompleteLayerUpload errors include UploadNotFoundException; ValidatePullThroughCacheRule/UpdatePullThroughCacheRule include PullThroughCacheRuleNotFoundException). AWS phrases them from the request, e.g. UploadNotFoundException: `The upload with id '<uploadId>' in the repository with name '<repo>' in registry with id '<account>' does not exist`; PullThroughCacheRuleNotFoundException: `A pull-through cache rule with repository prefix '<prefix>' does not exist in the registry with id '<account>'`; template not found: `A repository creation template with prefix '<prefix>' is not found in the registry with id '<account>'`; pull-time update exclusion: `The pull time update exclusion for principal arn '<arn>' was not found in registry with id '<account>'` and `... already exists in registry with id '<account>'`.
+Emulator: emits its own sentences with the same facts in a different construction — `Upload not found with ID: '<id>' for repository '<repo>' in the registry with id '<account>'`; `The pull through cache rule was not found. Specify a valid pull through cache rule and try again. No rule with ecrRepositoryPrefix '<prefix>' exists in the registry with id '<account>'`; `The specified repository creation template can't be found. Verify the registry ID and prefix and try again. No template with prefix '<prefix>' exists ...`; `The pull time update exclusion for principal '<arn>' does not exist in the registry with id '<account>'` (drops `arn`, and uses `in the registry` for the duplicate case too).
+Why: tooling that matches ECR failures on message text (CLI wrappers, CI gates, log-based alarms, docker-push retry logic) does not recognise these refusals, even though the code is right.
+Fix: the message construction in the ECR handlers/validation that raise UploadNotFoundException, PullThroughCacheRuleNotFoundException, the repository-creation-template not-found error and the pull-time-update-exclusion not-found/duplicate errors.
+Traces: ecr.complete-layer-upload-double-completion-rejected, ecr.completed-upload-id-reuse-fails, ecr.pull-through-cache-rule-custom-role-arn-persists, ecr.update-pull-through-cache-rule-not-found-rejected, ecr.delete-repository-creation-template-nonexistent-rejected, ecr.repository-creation-template-lifecycle, ecr.pull-time-exclusion-window-expires-then-pulls-resume-updates, ecr.register-pull-time-exclusion-duplicate-rejected.
+
+Cause 2 of 4: layer-upload diagnostics lose the resume information a client needs.
+AWS: recorded behavior only for the text; shapes are modelled (Smithy: CompleteLayerUpload -> InvalidLayerException; UploadLayerPart -> InvalidLayerPartException, whose output also carries lastByteReceived). On a digest mismatch AWS answers InvalidLayerException with `None of the provided layer digests match the calculated layer digest`; on a non-contiguous part AWS answers InvalidLayerPartException naming the rejected first byte and the byte it expected (lastValidByteReceived + 1), e.g. `First byte of the layer part is 136 instead of 128`.
+Emulator: substitutes its own wording — `The layer digests '<sent>' in the request do not match the digest '<computed>' that Amazon ECR calculated for the N bytes received by upload '<id>'`, and `Invalid layer part: partFirstByte 136 is not consecutive to the last byte received by this upload (127)`.
+Why: a docker/ECR client resuming an interrupted upload parses the expected next byte out of the InvalidLayerPartException message; the emulator's wording reports the last byte received instead of the expected next byte in the position the client reads, so resume logic cannot recover.
+Fix: the error construction in the CompleteLayerUpload and UploadLayerPart handlers' validation.
+Traces: ecr.complete-layer-upload-wrong-digest-rejected, ecr.upload-layer-part-noncontiguous-range-rejected.
+
+Cause 3 of 4: parameter-constraint messages quote the model's raw pattern and the full member path instead of AWS's rendering.
+AWS: Smithy: CreateRepository.repositoryName @pattern `^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`, error InvalidParameterException. AWS's message quotes the constraint with a bare `/` (no JSON/regex escape before the slash): `Invalid parameter at 'repositoryName' failed to satisfy constraint: 'must satisfy regular expression '[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*''`. For an ill-formed signing profile ARN AWS names the leaf member and states the constraint in prose: `Invalid parameter at 'signingProfileArn' failed to satisfy constraint: 'The signing profile ARN '<value>' must be well formed'`.
+Emulator: echoes the escaped pattern (`(\/[a-z0-9]+...)`) for repositoryName, and for PutSigningConfiguration names the serializer path `signingConfiguration.rules.1.member.signingProfileArn` and dumps the ARN regex instead of the prose constraint.
+Why: the message is the only machine-readable detail on InvalidParameterException; clients that surface it to users or match on the member name see a path AWS never emits and a regex that differs from AWS's by an escape character.
+Fix: the shared parameter-constraint message renderer used by the ECR CreateRepository and PutSigningConfiguration validation (pattern rendering and member-path naming).
+Traces: ecr.create-repository-invalid-name-rejected, ecr.put-signing-configuration-invalid-profile-rejected.
+
+Cause 4 of 4: LifecyclePolicyPreviewInProgressException is generic and names neither the repository nor the registry.
+AWS: Smithy: StartLifecyclePolicyPreview errors include LifecyclePolicyPreviewInProgressException (HTTP 400). AWS's message is built from the request: `Lifecycle policy preview is already in progress in the repository with name '<repo>' in the registry with id '<account>', please wait until it completes to start a new one`.
+Emulator: returns the right code with the fixed sentence `The previous lifecycle policy preview request has not completed. Wait and try again.` — no repository name, no registry id.
+Why: a caller previewing policies across many repositories concurrently cannot tell which repository blocked, so it cannot target its retry.
+Fix: the StartLifecyclePolicyPreview handler's in-progress rejection path.
+Traces: ecr.start-lifecycle-policy-preview-concurrent-in-progress-rejected.
+
+## Evidence
+Cause 1 — expected `The upload with id '6f736d90-...' in the repository with name 'sim2real-cluca2c28f2d2953' in registry with id '000000000000' does not exist`, got `Upload not found with ID: '6f736d90-...' for repository 'sim2real-cluca2c28f2d2953' in the registry with id '000000000000'`; expected `A pull-through cache rule with repository prefix 's2reb038e86b2' does not exist in the registry with id '000000000000'`, got `The pull through cache rule was not found. Specify a valid pull through cache rule and try again. No rule with ecrRepositoryPrefix 's2reb038e86b2' exists in the registry with id '000000000000'` (Code PullThroughCacheRuleNotFoundException in both); expected `A repository creation template with prefix '...' is not found in the registry with id '000000000000'`, got `The specified repository creation template can't be found. Verify the registry ID and prefix and try again. No template with prefix '...' exists in the registry with id '000000000000'`; expected `The pull time update exclusion for principal arn 'arn:aws:iam::000000000000:role/...' was not found in registry with id '000000000000'`, got `... for principal 'arn:aws:iam::000000000000:role/...' does not exist in the registry with id '000000000000'`.
+Cause 2 — expected `None of the provided layer digests match the calculated layer digest`, got `The layer digests 'sha256:12cf2f...' in the request do not match the digest 'sha256:a8eec9...' that Amazon ECR calculated for the 41 bytes received by upload 'f7fba52a-...'`; expected `First byte of the layer part is 136 instead of 128`, got `Invalid layer part: partFirstByte 136 is not consecutive to the last byte received by this upload (127)`.
+Cause 3 — expected constraint rendering `...(/[a-z0-9]+...)...`, got `...(\/[a-z0-9]+...)...`; expected `Invalid parameter at 'signingProfileArn' failed to satisfy constraint: 'The signing profile ARN 'not-a-valid-signer-profile-arn' must be well formed'`, got `Invalid parameter at 'signingConfiguration.rules.1.member.signingProfileArn' failed to satisfy constraint: 'must satisfy regular expression 'arn:aws(-[a-z]+)*:signer:[a-z0-9-]+:[0-9]{12}:\/signing-profiles\/[a-zA-Z0-9_]{2,}''`.
+Cause 4 — got {'Code': 'LifecyclePolicyPreviewInProgressException', 'Message': 'The previous lifecycle policy preview request has not completed. Wait and try again.'}; expected the same Code with `Lifecycle policy preview is already in progress in the repository with name '<repo>' in the registry with id '000000000000', please wait until it completes to start a new one`.
+
+## Steps to Reproduce
+Cause 1: (a) InitiateLayerUpload/UploadLayerPart/CompleteLayerUpload, then CompleteLayerUpload again with the same uploadId -> read the UploadNotFoundException message; (b) DescribePullThroughCacheRules/UpdatePullThroughCacheRule for a deleted prefix; (c) DeleteRepositoryCreationTemplate for an absent prefix; (d) register the same pull-time update exclusion twice, and query one that was never registered.
+Cause 2: CompleteLayerUpload with a layerDigest that does not match the uploaded bytes; UploadLayerPart with partFirstByte != lastByteReceived+1 (e.g. 136 after 127 bytes received).
+Cause 3: CreateRepository(repositoryName='Invalid_Name!'); PutSigningConfiguration with signingConfiguration.rules[0].signingProfileArn='not-a-valid-signer-profile-arn'.
+Cause 4: StartLifecyclePolicyPreview on a repository, confirm GetLifecyclePolicyPreview reports IN_PROGRESS, then call StartLifecyclePolicyPreview again on the same repository.

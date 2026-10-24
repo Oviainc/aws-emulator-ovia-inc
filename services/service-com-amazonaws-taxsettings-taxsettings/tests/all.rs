@@ -17,5 +17,9 @@ mod country_requirements;
 mod fidelity_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/supplemental_tax_registrations.rs"]
+mod supplemental_tax_registrations;
+#[path = "all/tax_exemption_types.rs"]
+mod tax_exemption_types;
 #[path = "all/tax_registration_lifecycle.rs"]
 mod tax_registration_lifecycle;

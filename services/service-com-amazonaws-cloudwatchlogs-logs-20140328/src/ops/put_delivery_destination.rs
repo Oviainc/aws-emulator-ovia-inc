@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDeliveryDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDeliveryDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDeliveryDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or REPLACES the named delivery destination in this account's state and reports
+//! the stored record: "If you use this operation to update an existing delivery destination,
+//! all the current delivery destination parameters are overwritten with the new parameter
+//! values that you specify."
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +186,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDeliveryDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDeliveryDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The ARN of the logical object this call creates names the Region the request was
+        // signed for, so it is read off the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: String| {
+            PutDeliveryDestinationError::from(
+                PutDeliveryDestinationErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                }),
+            )
+        };
+
+        // What kind of destination this is: a property of the RESOURCE being represented,
+        // so it is read off `destinationResourceArn` when the request configures one
+        // (`deliveryDestinationType` "Displays whether this delivery destination is
+        // CloudWatch Logs, Amazon S3, Firehose, or X-Ray"), exactly as a delivery reports
+        // the type of the destination it is paired with
+        // (`crate::state::delivery_destination_type_for_arn`). A request that configures no
+        // resource must say which kind it is, and only a trace destination may:
+        // "deliveryDestinationConfiguration is required for CloudWatch Logs, Amazon S3,
+        // Firehose log delivery destinations and not required for X-Ray trace delivery
+        // destinations. deliveryDestinationType is needed for X-Ray trace delivery
+        // destinations but not required for other logs delivery destinations."
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDeliveryDestination"))
+        // A put that configures a resource AND states a type is therefore judged by the
+        // resource: the stated type is not what the destination IS, so it is deliberately
+        // not stored — a destination would otherwise report a vendor its own
+        // `destinationResourceArn` contradicts, and every later reader (a delivery paired
+        // with it included) derives the vendor from that ARN.
+        let destination_type = match input.delivery_destination_configuration.as_ref() {
+            Some(configuration) => {
+                crate::state::check_destination_resource_arn(&configuration.destination_resource_arn)
+                    .map_err(invalid)?
+                    .to_string()
+            }
+            None => {
+                let named = input.delivery_destination_type.as_deref().ok_or_else(|| {
+                    invalid(
+                        "deliveryDestinationConfiguration is required for CloudWatch Logs, \
+                         Amazon S3, and Firehose log delivery destinations"
+                            .to_string(),
+                    )
+                })?;
+                if named != crate::state::TRACE_DELIVERY_DESTINATION_TYPE {
+                    return Err(invalid(format!(
+                        "deliveryDestinationConfiguration is required for a {named} delivery \
+                         destination"
+                    )));
+                }
+                named.to_string()
+            }
+        };
+
+        // "The ARN of an IAM role in your account that CloudWatch Logs assumes to deliver to
+        // this delivery destination. [...] This parameter is supported only for X-Ray trace
+        // delivery destinations."
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if let Some(message) = crate::state::unparsable_arn_message("roleArn", role_arn) {
+                return Err(invalid(message));
+            }
+            if destination_type != crate::state::TRACE_DELIVERY_DESTINATION_TYPE {
+                return Err(invalid(format!(
+                    "roleArn is supported only for {} trace delivery destinations",
+                    crate::state::TRACE_DELIVERY_DESTINATION_TYPE
+                )));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDeliveryDestinationError::from(
+                PutDeliveryDestinationErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A put under a name already stored UPDATES that destination, so only a put that
+        // would ADD one can exceed the number this emulator holds.
+        if !store.delivery_destinations.contains_key(&input.name)
+            && store.delivery_destinations.len() >= crate::state::MAX_DELIVERY_DESTINATIONS
+        {
+            return Err(
+                PutDeliveryDestinationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "an account can have up to {} delivery destinations",
+                            crate::state::MAX_DELIVERY_DESTINATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "all the current delivery destination parameters are overwritten with the new
+        // parameter values that you specify": the record is REBUILT from this request, so a
+        // parameter an earlier put named and this one omits is absent afterwards rather than
+        // inherited.
+        let mut record = crate::state::DeliveryDestinationRecord::new(
+            &region,
+            &input.name,
+            Some(&destination_type),
+        );
+        record.output_format = input.output_format.clone();
+        record.destination_resource_arn = input
+            .delivery_destination_configuration
+            .as_ref()
+            .map(|configuration| configuration.destination_resource_arn.clone());
+        // `roleArn` is kept only where the model reports it: "This field is present only for
+        // X-Ray trace delivery destinations that were created with a role."
+        record.role_arn = record
+            .is_trace_destination()
+            .then(|| input.role_arn.clone())
+            .flatten();
+        // The tag set is the RESOURCE's, not one of the delivery parameters the sentence
+        // above overwrites: `tags` is "An optional list of key-value pairs to associate with
+        // the resource", so a put that names tags assigns exactly those, and a put that
+        // names none leaves the destination's tags as they were.
+        record.tags = match input.tags.as_ref() {
+            Some(tags) => tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            None => store
+                .delivery_destinations
+                .get(&input.name)
+                .map(|stored| stored.tags.clone())
+                .unwrap_or_default(),
+        };
+        store.delivery_destinations.insert(input.name.clone(), record);
+
+        Ok(PutDeliveryDestinationOutput {
+            // "A structure containing information about the delivery destination that you
+            // just created or updated" — read back out of the store, so what this call
+            // reports is what `GetDeliveryDestination` reports afterwards.
+            delivery_destination: store
+                .delivery_destinations
+                .get(&input.name)
+                .map(crate::state::DeliveryDestinationRecord::reported),
+        })
     }
 }

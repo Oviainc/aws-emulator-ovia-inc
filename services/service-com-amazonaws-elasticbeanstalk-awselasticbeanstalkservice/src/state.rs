@@ -290,6 +290,11 @@ pub fn environment_tier_with_defaults(requested: Option<&EnvironmentTier>) -> En
 /// The default `EnvironmentTier$Name`, from its own documentation ("For
 /// Standard-mode EC2-based web server — `WebServer`").
 pub const TIER_NAME_WEB_SERVER: &str = "WebServer";
+/// The `EnvironmentTier$Name` of the WORKER tier, from the same documentation
+/// ("For Standard-mode EC2-based backend application with Amazon SQS —
+/// `Worker`"): the tier whose environment takes its work from an Amazon SQS
+/// queue, which is what gives it a queue among its resources.
+pub const TIER_NAME_WORKER: &str = "Worker";
 /// The default `EnvironmentTier$Type`, from its own documentation ("For Web
 /// server tier — `Standard`").
 pub const TIER_TYPE_STANDARD: &str = "Standard";
@@ -2355,12 +2360,280 @@ fn due_date() -> ::aws_smithy_types::DateTime {
     )
 }
 
+// ---------------------------------------------------------------------------
+// The Amazon Web Services resources an environment runs on
+//
+// `CreateEnvironment` "launches an environment for the specified application",
+// which is what provisions them; `DescribeEnvironmentResources` reports them
+// ("Describes the Amazon Web Services resources in use by this environment");
+// `RebuildEnvironment` "deletes and recreates all of the Amazon Web Services
+// resources … for a specified environment", which REPLACES every one of them;
+// and an environment the clock has moved to `Terminated` ("Environment is not
+// running") has none left.
+//
+// The inventory is STORED on the environment rather than derived per call: the
+// names and ids the real service reports are server-generated, so two reads of
+// one environment have to report the same ones, and a rebuild is what changes
+// them. Which KINDS of resource an environment has is derived from the
+// environment's tier and its configuration options (below), so the inventory
+// follows what the caller asked to launch.
+// ---------------------------------------------------------------------------
+
+/// The configuration-option namespace Elastic Beanstalk's published
+/// configuration-option reference puts the environment-wide options in, and the
+/// option in it that says whether the environment is load balanced
+/// ("`EnvironmentType`: Set to `SingleInstance` to launch one EC2 instance with
+/// no load balancer"; the documented default is `LoadBalanced`).
+const NAMESPACE_ENVIRONMENT: &str = "aws:elasticbeanstalk:environment";
+/// See [`NAMESPACE_ENVIRONMENT`].
+const OPTION_ENVIRONMENT_TYPE: &str = "EnvironmentType";
+
+/// The `aws:elasticbeanstalk:environment` / `EnvironmentType` value that
+/// launches "one EC2 instance with no load balancer".
+pub const ENVIRONMENT_TYPE_SINGLE_INSTANCE: &str = "SingleInstance";
+/// The other value of that option, and its documented DEFAULT: an environment
+/// behind a load balancer, whose Auto Scaling group scales between its
+/// configured bounds.
+pub const ENVIRONMENT_TYPE_LOAD_BALANCED: &str = "LoadBalanced";
+
+/// The Auto Scaling namespace of that same reference, and the option in it that
+/// gives "the minimum number of instances you want in your Auto Scaling group"
+/// — which is how many Amazon EC2 instances a freshly launched environment
+/// runs, nothing having scaled it yet.
+const NAMESPACE_AUTOSCALING_ASG: &str = "aws:autoscaling:asg";
+/// See [`NAMESPACE_AUTOSCALING_ASG`].
+const OPTION_MIN_SIZE: &str = "MinSize";
+
+/// `aws:autoscaling:asg` / `MinSize`'s documented default, and the number of
+/// instances a `SingleInstance` environment runs ("one EC2 instance").
+pub const DEFAULT_MIN_SIZE: usize = 1;
+
+/// How many instances one environment's inventory can hold here.
+///
+/// The option is a free-form string in the API, so a request can ask for an
+/// Auto Scaling minimum the real service would refuse against an account's
+/// Amazon EC2 quota. This bound is CHOSEN — it is what keeps one environment's
+/// stored inventory bounded — and a larger `MinSize` is held down to it rather
+/// than materialised.
+pub const MAX_ENVIRONMENT_INSTANCES: usize = 20;
+
+/// The logical id of the Auto Scaling group in the Amazon CloudFormation stack
+/// Elastic Beanstalk provisions an environment's resources through, as that
+/// stack names it. Every environment has one: a `SingleInstance` environment's
+/// group is simply bounded at one instance.
+pub const STACK_RESOURCE_AUTO_SCALING_GROUP: &str = "AWSEBAutoScalingGroup";
+/// The logical id of the environment's load balancer in that stack. Present
+/// only for a load-balanced web-server environment.
+pub const STACK_RESOURCE_LOAD_BALANCER: &str = "AWSEBLoadBalancer";
+/// The logical ids of the Auto Scaling triggers in that stack — the
+/// scale-up/scale-down alarms a group that can scale is driven by, which is why
+/// a `SingleInstance` environment has none.
+pub const STACK_RESOURCE_TRIGGERS: &[&str] =
+    &["AWSEBCloudwatchAlarmHigh", "AWSEBCloudwatchAlarmLow"];
+/// The logical id of the worker environment's Amazon SQS queue in that stack —
+/// the queue the `Worker` tier's daemon reads, which a `WebServer` environment
+/// does not have.
+pub const STACK_RESOURCE_WORKER_QUEUE: &str = "AWSEBWorkerQueue";
+
+/// How many characters the random suffix a stack resource's physical name ends
+/// in carries. Upper-case, as the stack's own physical names are.
+const STACK_RESOURCE_SUFFIX_LENGTH: usize = 13;
+
+/// How many characters an Amazon EC2 resource id's body carries: `i-` or `lt-`
+/// followed by 17 lowercase hexadecimal characters is the form Amazon EC2
+/// issues an instance id and a launch template id in.
+pub const EC2_RESOURCE_ID_BODY_LENGTH: usize = 17;
+
+/// The id prefix of an Amazon EC2 instance.
+pub const EC2_INSTANCE_ID_PREFIX: &str = "i";
+/// The id prefix of an Amazon EC2 launch template.
+pub const EC2_LAUNCH_TEMPLATE_ID_PREFIX: &str = "lt";
+
+/// The Amazon CloudFormation stack an environment's Amazon Web Services
+/// resources are created in: `awseb-<environment id>-stack`, the prefix every
+/// one of those resources' own names then carries.
+pub fn environment_stack_name(environment_id: &str) -> String {
+    format!("awseb-{environment_id}-stack")
+}
+
+/// The physical name of the `logical_id` resource of `stack`:
+/// `<stack>-<logical id>-<suffix>`, the form a stack's resource is named in.
+///
+/// The suffix is random, the way the real one is: it identifies THAT resource,
+/// so the resource a rebuild creates in place of an old one carries a different
+/// name — which is what makes "deletes and recreates all of the Amazon Web
+/// Services resources" observable.
+fn stack_resource_name(stack: &str, logical_id: &str) -> String {
+    format!(
+        "{stack}-{logical_id}-{}",
+        random_id_body(STACK_RESOURCE_SUFFIX_LENGTH).to_ascii_uppercase()
+    )
+}
+
+/// A fresh Amazon EC2 resource id with `prefix`: `<prefix>-<17 lowercase
+/// hexadecimal characters>`. Random, like the stack resource names above and
+/// for the same reason.
+fn ec2_resource_id(prefix: &str) -> String {
+    format!("{prefix}-{}", random_id_body(EC2_RESOURCE_ID_BODY_LENGTH))
+}
+
+/// The URL of the Amazon SQS queue `queue_name` in `region`:
+/// `https://sqs.<region>.amazonaws.com/<account>/<queue name>`, the form Amazon
+/// SQS reports a queue's URL in.
+///
+/// This is the queue Elastic Beanstalk's own stack holds for the environment, so
+/// the URL is the one the control plane reports for it; nothing here registers
+/// that queue with the emulated Amazon SQS, which would be a cross-service
+/// provisioning step of its own.
+pub fn queue_url(region: &str, queue_name: &str) -> String {
+    format!(
+        "https://sqs.{region}.amazonaws.com/{}/{queue_name}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The value of the `namespace` / `option_name` configuration option in
+/// `settings`, if the environment carries one. A namespace and an option name
+/// together identify one option, so the first match is the only match.
+fn option_value<'a>(
+    settings: &'a [ConfigurationOptionSetting],
+    namespace: &str,
+    option_name: &str,
+) -> Option<&'a str> {
+    settings
+        .iter()
+        .find(|setting| {
+            setting.namespace.as_deref() == Some(namespace)
+                && setting.option_name.as_deref() == Some(option_name)
+        })
+        .and_then(|setting| setting.value.as_deref())
+}
+
+/// Whether the environment these options configure sits behind a load balancer:
+/// every value of `EnvironmentType` other than `SingleInstance` does, and so
+/// does an environment that sets the option at all (`LoadBalanced` is the
+/// option's documented default).
+fn is_load_balanced(settings: &[ConfigurationOptionSetting]) -> bool {
+    option_value(settings, NAMESPACE_ENVIRONMENT, OPTION_ENVIRONMENT_TYPE)
+        .is_none_or(|environment_type| environment_type != ENVIRONMENT_TYPE_SINGLE_INSTANCE)
+}
+
+/// Whether `tier` is the worker tier — the tier whose environment "pulls tasks
+/// from an Amazon SQS queue", and so the only one with a queue. Decided on
+/// `EnvironmentTier$Name`, which is the member that names the tier
+/// ([`TIER_NAME_WORKER`]); `Type` carries the transport.
+fn is_worker_tier(tier: Option<&EnvironmentTier>) -> bool {
+    tier.and_then(|tier| tier.name.as_deref()) == Some(TIER_NAME_WORKER)
+}
+
+/// How many Amazon EC2 instances an environment with these options runs: its
+/// Auto Scaling minimum, held inside `1..=`[`MAX_ENVIRONMENT_INSTANCES`]. A
+/// `SingleInstance` environment runs exactly one whatever the option says,
+/// since that environment type IS one instance.
+///
+/// A value that is not a count at all (a word, a negative number) is treated as
+/// the option's own default, the same as not setting it: validating one
+/// configuration option's syntax belongs to the operations that TAKE option
+/// settings (`ValidateConfigurationSettings`, `UpdateEnvironment`), not to the
+/// report that reads the environment they stored.
+fn instance_count(load_balanced: bool, settings: &[ConfigurationOptionSetting]) -> usize {
+    if !load_balanced {
+        return DEFAULT_MIN_SIZE;
+    }
+    option_value(settings, NAMESPACE_AUTOSCALING_ASG, OPTION_MIN_SIZE)
+        .and_then(|min_size| min_size.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_SIZE)
+        .clamp(DEFAULT_MIN_SIZE, MAX_ENVIRONMENT_INSTANCES)
+}
+
+/// One Amazon SQS queue an environment uses: "the name of the queue" and "the
+/// URL of the queue", the two members `Queue` carries.
+#[derive(Debug, Clone)]
+pub struct EnvironmentQueue {
+    pub name: String,
+    pub url: String,
+}
+
+/// The Amazon Web Services resources Elastic Beanstalk has provisioned for one
+/// environment — what `DescribeEnvironmentResources` reports.
+///
+/// Every live environment has an Auto Scaling group, the Amazon EC2 launch
+/// template that group launches from, and its instances. The rest depends on
+/// what was launched: a load-balanced environment also has the Auto Scaling
+/// triggers its group scales on, a load-balanced WEB SERVER environment a load
+/// balancer, and a WORKER environment the queue its daemon reads.
+///
+/// There is no launch CONFIGURATION: Amazon EC2 Auto Scaling no longer creates
+/// them, and the platform branches this service publishes
+/// ([`SOLUTION_STACKS`]) are the Amazon Linux 2023 ones Elastic Beanstalk
+/// launches from a launch TEMPLATE.
+#[derive(Debug, Clone)]
+pub struct EnvironmentResources {
+    pub auto_scaling_group: String,
+    pub launch_template_id: String,
+    pub instances: Vec<String>,
+    pub triggers: Vec<String>,
+    pub load_balancer: Option<String>,
+    pub queues: Vec<EnvironmentQueue>,
+}
+
+impl EnvironmentResources {
+    /// Provision a fresh set of resources for the environment `environment_id`
+    /// in `region`, for the tier and the configuration options it was launched
+    /// with. Called when the environment is created and again whenever a
+    /// rebuild recreates them, so the two cannot disagree about what an
+    /// environment is made of.
+    pub fn provision(
+        environment_id: &str,
+        region: &str,
+        tier: Option<&EnvironmentTier>,
+        option_settings: &[ConfigurationOptionSetting],
+    ) -> Self {
+        let stack = environment_stack_name(environment_id);
+        let load_balanced = is_load_balanced(option_settings);
+        let worker = is_worker_tier(tier);
+        Self {
+            auto_scaling_group: stack_resource_name(&stack, STACK_RESOURCE_AUTO_SCALING_GROUP),
+            launch_template_id: ec2_resource_id(EC2_LAUNCH_TEMPLATE_ID_PREFIX),
+            instances: (0..instance_count(load_balanced, option_settings))
+                .map(|_| ec2_resource_id(EC2_INSTANCE_ID_PREFIX))
+                .collect(),
+            // A group bounded at one instance never scales, so it is driven by
+            // no trigger.
+            triggers: if load_balanced {
+                STACK_RESOURCE_TRIGGERS
+                    .iter()
+                    .map(|logical_id| stack_resource_name(&stack, logical_id))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            // A worker environment takes its work from its queue rather than
+            // from a load balancer, so it has none either.
+            load_balancer: (load_balanced && !worker)
+                .then(|| stack_resource_name(&stack, STACK_RESOURCE_LOAD_BALANCER)),
+            queues: if worker {
+                let name = stack_resource_name(&stack, STACK_RESOURCE_WORKER_QUEUE);
+                vec![EnvironmentQueue {
+                    url: queue_url(region, &name),
+                    name,
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
 /// A stored environment.
 #[derive(Debug, Clone)]
 pub struct Environment {
     pub environment_id: String,
     pub environment_name: String,
     pub arn: String,
+    /// The region the request that created this environment was addressed to —
+    /// the one its ARN, its CNAME and its resources' own names are built in.
+    pub region: String,
     pub application_name: String,
     pub version_label: Option<String>,
     pub solution_stack_name: Option<String>,
@@ -2383,6 +2656,11 @@ pub struct Environment {
     pub date_terminated: Option<::aws_smithy_types::DateTime>,
     pub tags: Vec<Tag>,
     pub pending_status: Option<PendingStatus>,
+    /// The Amazon Web Services resources Elastic Beanstalk has provisioned for
+    /// this environment, which `DescribeEnvironmentResources` reports. `None`
+    /// once the environment has reached `Terminated`: "Environment is not
+    /// running", so there is nothing left for it to be made of.
+    pub resources: Option<EnvironmentResources>,
     /// Creation order within this emulator. An `EnvironmentId` is an OPAQUE
     /// random id, so the store's key order is not the order the environments
     /// were created in; this is, which is what `DescribeEnvironments` reports
@@ -2395,6 +2673,23 @@ impl Environment {
     /// DescribeEnvironments hides unless the caller asks for deleted ones.
     pub fn is_terminated(&self) -> bool {
         self.status == STATUS_TERMINATED
+    }
+
+    /// Provision a FRESH set of Amazon Web Services resources for this
+    /// environment, replacing whatever it held.
+    ///
+    /// The launch `CreateEnvironment` starts provisions them, and the rebuild
+    /// `RebuildEnvironment` starts — which "deletes and recreates all of the
+    /// Amazon Web Services resources … for a specified environment" — provisions
+    /// them again, so both reach the inventory the same way and a resource a
+    /// rebuild replaced is reported under its new name.
+    pub fn provision_resources(&mut self) {
+        self.resources = Some(EnvironmentResources::provision(
+            &self.environment_id,
+            &self.region,
+            self.tier.as_ref(),
+            &self.option_settings,
+        ));
     }
 
     /// Whether this environment is in the one status the model documents as
@@ -2449,6 +2744,11 @@ impl Environment {
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
         self.date_updated = now();
+        // "Deletes and recreates all of the Amazon Web Services resources (for
+        // example: the Auto Scaling group, load balancer, etc.) for a specified
+        // environment": every resource the environment reported is replaced by
+        // the one created in its place.
+        self.provision_resources();
         self.pending_status = Some(PendingStatus::completion_to_ready(
             request_id,
             "rebuildEnvironment completed successfully.",
@@ -2520,6 +2820,10 @@ impl Environment {
         self.date_updated = pending.due_date;
         if self.status == STATUS_TERMINATED {
             self.date_terminated = Some(pending.due_date);
+            // The termination the clock has now completed deleted the
+            // environment's Amazon Web Services resources with it, so there are
+            // none left to report.
+            self.resources = None;
         }
         Some(CompletedTransition {
             request_id: pending.request_id,
@@ -2568,8 +2872,13 @@ macro_rules! environment_description {
             abortable_operation_in_progress: Some(env.abortable_operation_in_progress),
             health: Some(env.health.clone()),
             health_status: env.health_status.clone(),
-            // No load balancer or EC2 instance is provisioned here, so there are
-            // no environment resources and no environment links to report.
+            // `EnvironmentDescription$Resources` carries the environment's load
+            // balancer by its DNS `Domain` and its `Listeners`, which this
+            // emulator serves no traffic on and so reports no `EndpointURL` for
+            // either; the resources the environment is MADE of are what
+            // `DescribeEnvironmentResources` reports, from the inventory on this
+            // same record. Nothing links environments here, so there are no
+            // environment links to report.
             resources: None,
             tier: env.tier.clone(),
             environment_links: None,

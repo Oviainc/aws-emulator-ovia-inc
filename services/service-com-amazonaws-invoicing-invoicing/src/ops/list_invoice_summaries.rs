@@ -151,7 +151,9 @@ fn decode_next_token(
     token: Option<&str>,
 ) -> Result<Option<String>, ListInvoiceSummariesErrorModeled> {
     crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token).map_err(|_| {
-        ListInvoiceSummariesErrorModeled::ValidationException(crate::state::invalid_next_token())
+        ListInvoiceSummariesErrorModeled::ValidationException(crate::state::invalid_next_token(
+            MessageKey::ModelMemberName,
+        ))
     })
 }
 

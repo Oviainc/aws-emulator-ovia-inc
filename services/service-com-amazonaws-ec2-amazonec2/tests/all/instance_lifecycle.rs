@@ -15,6 +15,8 @@ use std::time::Duration;
 use service_com_amazonaws_ec2_amazonec2::state::{MAX_INSTANCES_PER_RUN, TRANSITION_DELAY};
 
 use super::ec2_query;
+// The entries of an ec2Query set, from the one shared definition.
+use super::wire::set_items;
 
 /// The Region every call here is signed for; the zone names and the private DNS
 /// hostnames the assertions expect are derived from it.
@@ -207,12 +209,6 @@ fn child_text(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
 
 fn nested_text(node: roxmltree::Node<'_, '_>, outer: &str, inner: &str) -> Option<String> {
     child_text(child(node, outer)?, inner)
-}
-
-fn set_items<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Vec<roxmltree::Node<'a, 'i>> {
-    child(node, name)
-        .map(|set| set.children().filter(roxmltree::Node::is_element).collect())
-        .unwrap_or_default()
 }
 
 // --- launch helpers ---------------------------------------------------------

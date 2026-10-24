@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: REPORTS the recommendations a session has available, from the
+//! feed persisted on that session ([`crate::state::RecommendationFeed`]),
+//! together with the triggers that produced the reported page. The operation is
+//! `@readonly`, so a read never consumes an entry: only an acknowledgement
+//! does.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A session with nothing available answers a successful EMPTY list — what the
+//! modelled contract says a wait that expires with no recommendation returns —
+//! and a short poll (`waitTimeSeconds` 0, the modelled default) answers at once.
+//! A longer `waitTimeSeconds` is the wait the CALLER asked for: the call waits
+//! up to that long for a recommendation to be made available, and returns as
+//! soon as one is.
+//!
+//! A label this account holds no ASSISTANT under is the operation's modelled
+//! `ResourceNotFoundException`: the assistant is the control-plane resource the
+//! route addresses. A session the named assistant does not hold is NOT a
+//! refusal — it has nothing available, so it answers the same empty list (the
+//! recorded unit `wisdom.get-recommendations-nonexistent-session-rejected`
+//! shows the endpoint answering exactly that).
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +99,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest wait `waitTimeSeconds` can ask for, from the model's
+/// `WaitTimeSeconds` shape (`range 0..20`,
+/// `smithy_query(query="shape",shape="WaitTimeSeconds")`). The boundary
+/// validator refuses anything outside it before this handler runs; the handler
+/// clamps to it as well, so the wait is bounded however it is reached.
+const MAX_WAIT_TIME_SECONDS: i32 = 20;
+
+/// How often a waiting call re-reads the session's feed.
+///
+/// It bounds how long after a recommendation is made available a waiting call
+/// answers. It is this emulator's own choice of granularity — nothing AWS
+/// publishes — kept well under a second so that even the shortest non-zero wait
+/// the model allows (one second) re-reads the feed several times.
+const POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(25);
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +184,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to read,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetRecommendations"));
+        };
+
+        // `maxResults` is modelled `range 1..100`, which the boundary validator
+        // has already enforced; the only choice left here is the page size for a
+        // caller who named none, which is the modelled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_PAGE_SIZE))
+            .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+            .max(1);
+
+        // The wait the caller asked for, from the modelled `waitTimeSeconds`
+        // (`range 0..20`, default 0 — a short poll).
+        let wait = ::std::time::Duration::from_secs(
+            u64::try_from(input.wait_time_seconds.clamp(0, MAX_WAIT_TIME_SECONDS)).unwrap_or(0),
+        );
+        let deadline = ::std::time::Instant::now() + wait;
+
+        loop {
+            // The guard is taken AND dropped inside this scope, so whatever makes
+            // a recommendation available can write to the feed while this call
+            // waits below.
+            let remaining = {
+                let state = state.lock();
+                // The assistant is the control-plane resource the route addresses, so a
+                // label this account holds no assistant under is the operation's
+                // modelled not-found.
+                if state.assistant(&input.assistant_id).is_none() {
+                    return Err(GetRecommendationsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("No assistant {} found.", input.assistant_id)),
+                            resource_name: Some(input.assistant_id.clone()),
+                        },
+                    )
+                    .into());
+                }
+                // A session is reachable only through its parent, and a session this
+                // assistant does not hold simply has NOTHING available: the recorded
+                // unit `wisdom.get-recommendations-nonexistent-session-rejected` shows
+                // the endpoint answering such a call with a successful empty list,
+                // which is the "no recommendations available" case the operation
+                // documents — not a refusal.
+                let (recommendations, triggers) = state
+                    .session(&input.assistant_id, &input.session_id)
+                    .map(|session| session.recommendations.page(page_size))
+                    .unwrap_or_default();
+                let now = ::std::time::Instant::now();
+                if !recommendations.is_empty() || now >= deadline {
+                    // Either a recommendation is available — then the call returns
+                    // sooner than the wait — or the wait expired, which answers
+                    // successfully with the empty list the contract describes.
+                    return Ok(GetRecommendationsOutput {
+                        recommendations,
+                        triggers: Some(triggers),
+                    });
+                }
+                deadline.saturating_duration_since(now)
+            };
+            ::tokio::time::sleep(remaining.min(POLL_INTERVAL)).await;
+        }
     }
 }

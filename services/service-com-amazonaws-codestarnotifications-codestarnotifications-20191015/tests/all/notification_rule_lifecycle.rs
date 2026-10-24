@@ -18,12 +18,15 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The emulated service behind the router that mounts it, exactly as the production
 /// front door assembles it: one shared engine, one registered service.
-struct Emulator {
+///
+/// `pub(crate)` so the sibling suites in this test target drive the emulator through
+/// this ONE harness rather than each building their own.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's, not this service's: switch it off so
@@ -34,7 +37,7 @@ impl Emulator {
     }
 
     /// POST one restJson1 request, signed for `region`, and return its status and body.
-    async fn post_in(&self, region: &str, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post_in(&self, region: &str, path: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDTESTFIXTURE/20260101/{region}/codestar-notifications/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
@@ -70,12 +73,12 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         self.post_in("us-east-1", path, body).await
     }
 
     /// POST a request that must succeed, and return its body.
-    async fn ok(&self, case: &str, path: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, path: &str, body: &Value) -> Value {
         let (status, parsed) = self.post(path, body).await;
         assert_eq!(
             status, 200,
@@ -86,7 +89,7 @@ impl Emulator {
 }
 
 /// The wire error code of a failed call.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__errorType")
         .and_then(Value::as_str)
         .or_else(|| body.get("__type").and_then(Value::as_str))
@@ -94,7 +97,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn string(body: &Value, member: &str) -> String {
+pub(crate) fn string(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -274,7 +277,8 @@ async fn a_created_rule_describes_exactly_what_was_created() {
             case.label
         );
 
-        // Tags: reported exactly as stored, and absent entirely when none were given.
+        // Tags: reported exactly as stored (an untagged rule reports an empty map; see
+        // the Tags suite in `describe_notification_rule_fidelity.rs`).
         let described_tags = tags_of(&described);
         let expected_tags: BTreeMap<String, String> = case
             .tags
@@ -319,8 +323,8 @@ async fn a_created_rule_describes_exactly_what_was_created() {
             );
             assert_eq!(
                 string(found, "TargetStatus"),
-                "PENDING",
-                "case {:?}: a target whose activation is not due yet is PENDING, got {found}",
+                "ACTIVE",
+                "case {:?}: a subscribed target is ACTIVE, got {found}",
                 case.label
             );
         }
@@ -385,26 +389,26 @@ async fn every_catalogued_event_type_resolves_to_its_service_and_resource_type()
         (
             "codecommit-repository-branches-and-tags-created",
             "CodeCommit",
-            "repository",
-            "Branches and tags created",
+            "Repository",
+            "Branches and tags: Created",
         ),
         (
             "codebuild-project-build-phase-success",
             "CodeBuild",
-            "project",
-            "Build phase success",
+            "Project",
+            "Build phase: Success",
         ),
         (
             "codedeploy-application-deployment-started",
             "CodeDeploy",
-            "application",
-            "Deployment started",
+            "Application",
+            "Deployment: Started",
         ),
         (
             "codepipeline-pipeline-manual-approval-needed",
             "CodePipeline",
-            "pipeline",
-            "Manual approval needed",
+            "Pipeline",
+            "Manual approval: Needed",
         ),
     ];
 
@@ -494,10 +498,12 @@ async fn every_catalogued_event_type_resolves_to_its_service_and_resource_type()
             entry.event_type_id,
             entry.resource_type
         );
-        assert!(
-            !string(&summary, "EventTypeName").is_empty(),
-            "case {:?}: every catalogued event type has a name, got {summary}",
-            entry.event_type_id
+        assert_eq!(
+            string(&summary, "EventTypeName"),
+            entry.event_type_name,
+            "case {:?}: expected EventTypeName {:?}, got {summary}",
+            entry.event_type_id,
+            entry.event_type_name
         );
     }
 }
@@ -559,7 +565,7 @@ fn assert_arn(case: &str, arn: &str, region: &str) {
     );
 }
 
-fn tags_of(body: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(body: &Value) -> BTreeMap<String, String> {
     body.get("Tags")
         .and_then(Value::as_object)
         .map(|map| {
@@ -1288,7 +1294,7 @@ fn event_type_ids_of(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn target_addresses_of(body: &Value) -> Vec<String> {
+pub(crate) fn target_addresses_of(body: &Value) -> Vec<String> {
     body.get("Targets")
         .and_then(Value::as_array)
         .map(|list| {
@@ -1470,11 +1476,11 @@ async fn delete_removes_the_rule_from_the_store() {
     }
 }
 
-/// A target starts `PENDING` and the clock — not a later call — makes it `ACTIVE`: the
-/// transition is due [`codestar::state::TARGET_ACTIVATION_DELAY`] after the
-/// subscription, so a caller describing the rule straight away still sees `PENDING`.
+/// A target the service subscribes is `ACTIVE` as soon as it exists: the association
+/// is usable when the call that created it returns, so there is no transient status for
+/// a later read to settle.
 #[tokio::test]
-async fn a_target_becomes_active_when_the_clock_makes_it_due() {
+async fn a_subscribed_target_is_active_from_the_first_read() {
     let emulator = Emulator::new();
     let created = emulator
         .ok("activation", "/createNotificationRule", &RULE_CASES[0].request())
@@ -1486,22 +1492,21 @@ async fn a_target_becomes_active_when_the_clock_makes_it_due() {
         .await;
     assert_eq!(
         target_statuses_of(&described),
-        vec!["PENDING".to_string()],
-        "case \"immediately after create\": expected PENDING, got {described}"
+        vec!["ACTIVE".to_string()],
+        "case \"immediately after create\": expected ACTIVE, got {described}"
     );
 
-    tokio::time::sleep(codestar::state::TARGET_ACTIVATION_DELAY + std::time::Duration::from_millis(100)).await;
-
+    // Reading it again changes nothing: the status is terminal, not settled by a read.
     let described = emulator
         .ok("activation", "/describeNotificationRule", &json!({ "Arn": arn }))
         .await;
     assert_eq!(
         target_statuses_of(&described),
         vec!["ACTIVE".to_string()],
-        "case \"after the activation came due\": expected ACTIVE, got {described}"
+        "case \"a second read\": expected ACTIVE, got {described}"
     );
 
-    // A target subscribed later starts PENDING again, while the first one stays ACTIVE.
+    // A target subscribed later is ACTIVE straight away too.
     emulator
         .ok(
             "activation",
@@ -1517,12 +1522,12 @@ async fn a_target_becomes_active_when_the_clock_makes_it_due() {
         .await;
     assert_eq!(
         target_statuses_of(&described),
-        vec!["ACTIVE".to_string(), "PENDING".to_string()],
-        "case \"a newly subscribed target\": expected the new one PENDING, got {described}"
+        vec!["ACTIVE".to_string(), "ACTIVE".to_string()],
+        "case \"a newly subscribed target\": expected both ACTIVE, got {described}"
     );
 }
 
-fn target_statuses_of(body: &Value) -> Vec<String> {
+pub(crate) fn target_statuses_of(body: &Value) -> Vec<String> {
     body.get("Targets")
         .and_then(Value::as_array)
         .map(|list| {
@@ -1628,8 +1633,69 @@ async fn the_rule_store_is_bounded_per_account() {
     );
 }
 
+/// The store is bounded by a figure that does NOT depend on a request-controlled key:
+/// the region a rule lands in comes from the caller's own credential scope, so a client
+/// that varies it must not be able to open a fresh per-region budget forever. Once the
+/// whole store is at `MAX_RULES_TOTAL`, a create in a region that holds NO rules at all
+/// is still refused with the modelled `LimitExceededException`.
+#[tokio::test]
+async fn the_rule_store_is_bounded_across_every_region() {
+    let emulator = Emulator::new();
+    let per_region = codestar::state::MAX_RULES_PER_REGION;
+    let total = codestar::state::MAX_RULES_TOTAL;
+    // Each region takes the per-region cap, so filling the global cap takes this many
+    // of them — and the next region after that holds nothing.
+    let regions = total / per_region;
+
+    for region_index in 0..regions {
+        let region = format!("eu-region-{region_index}");
+        for index in 0..per_region {
+            let (status, parsed) = emulator
+                .post_in(
+                    &region,
+                    "/createNotificationRule",
+                    &json!({
+                        "Name": format!("spread-{index}"),
+                        "Resource": "arn:aws:codecommit:us-east-1:123456789012:MyRepo",
+                        "DetailType": "BASIC",
+                        "EventTypeIds": ["codecommit-repository-pull-request-created"],
+                        "Targets": [],
+                    }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case \"rule {index} in {region}\": expected 200, got {status} with {parsed}"
+            );
+        }
+    }
+
+    let (status, parsed) = emulator
+        .post_in(
+            "eu-region-empty",
+            "/createNotificationRule",
+            &json!({
+                "Name": "one-region-too-many",
+                "Resource": "arn:aws:codecommit:us-east-1:123456789012:MyRepo",
+                "DetailType": "BASIC",
+                "EventTypeIds": ["codecommit-repository-pull-request-created"],
+                "Targets": [],
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"a fresh region past the global cap of {total}\": expected 400, got {status} with {parsed}"
+    );
+    assert_eq!(
+        error_code(&parsed),
+        "LimitExceededException",
+        "case \"a fresh region past the global cap of {total}\": got {parsed}"
+    );
+}
+
 /// An address no rule subscribes to any more is released, so a later subscription to it
-/// is a NEW subscription that starts `PENDING` again.
+/// is a NEW subscription — reported, with its own status, by the rule that made it.
 #[tokio::test]
 async fn a_target_is_released_when_its_last_rule_goes_away() {
     let emulator = Emulator::new();
@@ -1646,8 +1712,6 @@ async fn a_target_is_released_when_its_last_rule_goes_away() {
         .ok("recycled", "/createNotificationRule", &request)
         .await;
     let arn = string(&created, "Arn");
-    tokio::time::sleep(codestar::state::TARGET_ACTIVATION_DELAY + std::time::Duration::from_millis(100))
-        .await;
     let described = emulator
         .ok("recycled", "/describeNotificationRule", &json!({ "Arn": arn }))
         .await;
@@ -1671,9 +1735,14 @@ async fn a_target_is_released_when_its_last_rule_goes_away() {
         )
         .await;
     assert_eq!(
+        target_addresses_of(&described),
+        vec![address.to_string()],
+        "case \"a fresh subscription to a released address\": expected the address back, got {described}"
+    );
+    assert_eq!(
         target_statuses_of(&described),
-        vec!["PENDING".to_string()],
-        "case \"a fresh subscription to a released address\": expected PENDING, got {described}"
+        vec!["ACTIVE".to_string()],
+        "case \"a fresh subscription to a released address\": expected ACTIVE, got {described}"
     );
 }
 

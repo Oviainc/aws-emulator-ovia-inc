@@ -105,8 +105,8 @@ use crate::ops::types::{
     InstanceRequirements, Layer, LayerVersionContentOutput, LayerVersionsListItem, LoggingConfig,
     PropagateTags, ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object,
     RuntimeVersionConfig, ScalingConfig, SelfManagedEventSource, SelfManagedKafkaEventSourceConfig,
-    SnapStartResponse, SourceAccessConfiguration,
-    TenancyConfig, TracingConfigResponse, VpcConfig, VpcConfigResponse,
+    SnapStartResponse, SourceAccessConfiguration, TenancyConfig, TracingConfigResponse, VpcConfig,
+    VpcConfigResponse,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -2527,12 +2527,21 @@ pub fn function_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("function:{name}"))
 }
 
+/// The ARN resource type a code-signing configuration carries, from the model's
+/// `CodeSigningConfigArn` pattern (`…:code-signing-config:csc-[a-z0-9]{17}`). The ARN is
+/// minted from it and the tagging surface reads it back by it, so the two cannot drift.
+pub const CODE_SIGNING_CONFIG_RESOURCE_TYPE: &str = "code-signing-config";
+
 /// The ARN of a code-signing configuration:
 /// `arn:aws:lambda:<region>:<account>:code-signing-config:<id>`, as the model's
 /// `CodeSigningConfigArn` pattern requires.
 #[must_use]
 pub fn code_signing_config_arn(region: &str, id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("code-signing-config:{id}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{CODE_SIGNING_CONFIG_RESOURCE_TYPE}:{id}"),
+    )
 }
 
 /// A fresh code-signing configuration id.
@@ -2910,9 +2919,10 @@ fn name_and_qualifier(value: &str, was_arn: bool) -> Option<FunctionReference> {
 /// (`smithy_query(query="operation", operation="ListTags")`): a function, optionally
 /// qualified by a published version or an alias, a layer, a code-signing configuration, an
 /// event source mapping, a capacity provider and a network connector. A function, a
-/// capacity provider and an event source mapping are the ones this store holds records of;
-/// the rest are reported by their resource type and answered as what is true of them here
-/// — a resource of that type this account does not have.
+/// capacity provider, an event source mapping and a code-signing configuration are the
+/// ones this store holds records of; the rest are reported by their resource type and
+/// answered as what is true of them here — a resource of that type this account does not
+/// have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggableResourceRef {
     /// `…:function:<name>` — one function, whose tag set is
@@ -2933,6 +2943,10 @@ pub enum TaggableResourceRef {
     /// `…:event-source-mapping:<uuid>` — one event source mapping, whose tag set is
     /// [`EventSourceMappingRecord::tags`].
     EventSourceMapping(String),
+    /// `…:code-signing-config:<id>` — one code-signing configuration, whose tag set is
+    /// [`CodeSigningConfigRecord::tags`]. The store keys a configuration by its ARN, so
+    /// this carries the whole ARN rather than the bare id.
+    CodeSigningConfig(String),
     /// Another Lambda resource type the pattern admits, by its ARN resource type.
     Other(String),
 }
@@ -2955,10 +2969,10 @@ pub enum TaggableResourceRef {
 /// `service_common::arn::parse_of` for the fields when it does.
 ///
 /// [`TaggableResourceRef::Other`] is only a resource TYPE because this store holds no
-/// records of those types yet — whoever implements `CreateCodeSigningConfig` or the
-/// network-connector operations has to carry the type's id through here and turn the tag
-/// handlers' `Other` branch into a real lookup against the new records, the way a
-/// capacity provider and an event source mapping are resolved here.
+/// records of those types yet — whoever implements the network-connector operations has
+/// to carry the type's id through here and turn the tag handlers' `Other` branch into a
+/// real lookup against the new records, the way a capacity provider, an event source
+/// mapping and a code signing configuration are resolved here.
 #[must_use]
 pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
     let arn = service_common::arn::parse_of(value, ARN_NAMESPACE)?;
@@ -2980,6 +2994,13 @@ pub fn parse_taggable_resource(value: &str) -> Option<TaggableResourceRef> {
         let uuid = service_common::arn::resource_id_of_type(value, resource_type)?;
         return (!uuid.is_empty())
             .then(|| TaggableResourceRef::EventSourceMapping(uuid.to_string()));
+    }
+    // A code-signing configuration is named by `…:code-signing-config:<id>`, and this
+    // store keys one record per configuration BY THAT ARN (the identifier every modelled
+    // operation on one binds), so the whole value is what names the record.
+    if resource_type == CODE_SIGNING_CONFIG_RESOURCE_TYPE {
+        let id = service_common::arn::resource_id_of_type(value, resource_type)?;
+        return (!id.is_empty()).then(|| TaggableResourceRef::CodeSigningConfig(value.to_string()));
     }
     if resource_type != "function" {
         return Some(TaggableResourceRef::Other(resource_type.to_string()));
@@ -3025,13 +3046,13 @@ pub enum TagResolveFailure {
 ///
 /// A function's tags live on [`FunctionRecord::tags`] (where `CreateFunction` persists
 /// the `Tags` of its request and `GetFunction` reads the `Tags` it reports), a capacity
-/// provider's on [`CapacityProviderRecord::tags`] and an event source mapping's on
-/// [`EventSourceMappingRecord::tags`]. A function ARN carrying a qualifier names no tag
+/// provider's on [`CapacityProviderRecord::tags`], an event source mapping's on
+/// [`EventSourceMappingRecord::tags`] and a code signing configuration's on
+/// [`CodeSigningConfigRecord::tags`]. A function ARN carrying a qualifier names no tag
 /// set — `Resource`'s own documentation says "Lambda does not support adding tags to
-/// function aliases or versions" — and a resource type this store holds no records of
-/// (a code-signing configuration, a network connector) names no resource at all until
-/// whoever implements its create carries its records through
-/// [`parse_taggable_resource`].
+/// function aliases or versions" — and a resource type this store holds no records of (a
+/// network connector) names no resource at all until whoever implements its create
+/// carries its records through [`parse_taggable_resource`].
 ///
 /// The borrow is mutable because that is what a tag write needs; a reporting caller takes
 /// it too and simply does not write. The function branch goes through
@@ -3088,6 +3109,15 @@ pub fn resolve_resource_tags<'a>(
                 ))
             })?;
             record.materialize(now);
+            Ok(&mut record.tags)
+        }
+        TaggableResourceRef::CodeSigningConfig(arn) => {
+            let record = store.code_signing_configs.get_mut(&arn).ok_or_else(|| {
+                TagResolveFailure::NotFound(format!(
+                    "The resource you requested does not exist: no code signing \
+                     configuration is held for '{resource}'"
+                ))
+            })?;
             Ok(&mut record.tags)
         }
         TaggableResourceRef::Other(resource_type) => Err(TagResolveFailure::NotFound(format!(
@@ -3279,8 +3309,10 @@ mod tests {
             ),
             (
                 "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0123456789abcdefg",
-                Some(TaggableResourceRef::Other(
-                    "code-signing-config".to_string(),
+                Some(TaggableResourceRef::CodeSigningConfig(
+                    "arn:aws:lambda:us-east-1:000000000000:code-signing-config:\
+                     csc-0123456789abcdefg"
+                        .to_string(),
                 )),
             ),
             (

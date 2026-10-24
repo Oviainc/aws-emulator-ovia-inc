@@ -70,11 +70,29 @@ pub async fn call_at(
     path: &str,
     body: Vec<u8>,
 ) -> (u16, Bytes) {
+    let (status, _headers, body) = call_with_headers(engine, host, method, path, body).await;
+    (status, body)
+}
+
+/// As [`call_at`], and also the RESPONSE HEADERS.
+///
+/// A restJson1 client reads two of them off a failure before it looks at the body: the
+/// `content-type` it decodes the envelope with, and the `x-amzn-errortype` it resolves
+/// the error SHAPE from. They are part of the answer, so a suite that pins the envelope
+/// needs them — see `connection_error_envelope`.
+pub async fn call_with_headers(
+    engine: &Arc<InMemoryEngine>,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, http::HeaderMap, Bytes) {
     let response = router(engine)
         .dispatch(request(host, method, path, body))
         .await;
     let status = response.status().as_u16();
-    (status, response.into_body())
+    let headers = response.headers().clone();
+    (status, headers, response.into_body())
 }
 
 /// The `__type` discriminator of a restJson1 error body (`{"__type":"<Code>", …}`).

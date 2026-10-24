@@ -271,6 +271,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The built-in `default` user belongs to the built-in `open-access` ACL and to
+        // no other, so an addition naming it is refused before the membership moves —
+        // the same rule `CreateACL` reads for the membership it persists. (An update of
+        // the built-in ACL itself was refused just above, whatever it asked for.)
+        if let Some(message) = crate::state::default_user_membership_rejection(
+            &acl_name,
+            to_add.iter().map(String::as_str),
+        ) {
+            return Err(UpdateACLErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // The stored membership as a SET, so each of the comparisons below costs one
         // logarithmic lookup per named name rather than a scan of the membership.
         let current: std::collections::BTreeSet<&str> =

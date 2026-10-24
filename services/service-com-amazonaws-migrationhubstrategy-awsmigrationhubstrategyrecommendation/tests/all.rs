@@ -29,6 +29,9 @@ mod recommendation_report;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 
+#[path = "all/server_config.rs"]
+mod server_config;
+
 #[path = "all/server_inventory.rs"]
 mod server_inventory;
 

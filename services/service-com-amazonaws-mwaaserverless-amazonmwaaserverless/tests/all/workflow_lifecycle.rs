@@ -96,6 +96,25 @@ impl Harness {
             .get(workflow_arn)
             .map_or(0, |workflow| workflow.runs.len())
     }
+
+    /// The `(WorkflowVersion, IsLatestVersion)` pairs the STORE holds for a workflow,
+    /// in the order the versions were appended — the only way to show which single
+    /// version is flagged latest while `ListWorkflowVersions` is still a stub.
+    pub(crate) fn stored_versions(&self, workflow_arn: &str) -> Vec<(String, bool)> {
+        self.engine
+            .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>()
+            .lock()
+            .workflows
+            .get(workflow_arn)
+            .map(|workflow| {
+                workflow
+                    .versions
+                    .iter()
+                    .map(|record| (record.version.clone(), record.is_latest))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// `arn:aws:airflow-serverless:<region>:<account>:workflow/<name>-<10 alnum>`, written
@@ -1050,9 +1069,9 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
     // `DeleteWorkflowRequest.WorkflowVersion` is documented as "Optional. The specific
     // version of the workflow to delete. If not specified, all versions of the workflow
     // are deleted." The rule is defined over the SET of a workflow's versions, so each
-    // row below has two of them. No modelled operation mints a second version yet
-    // (`UpdateWorkflow` is still a 501 stub), so the second version is written straight
-    // into the store the handlers read.
+    // row below has two of them. The second one is written straight into the store the
+    // handlers read, rather than minted by `UpdateWorkflow`, so the row fixes both its
+    // identifier and its `created_at` and can name the version it deletes exactly.
     let second = "b".repeat(32);
     for (case, delete_the_latest) in [("delete the latest", true), ("delete the older", false)] {
         let harness = Harness::new("us-west-2");

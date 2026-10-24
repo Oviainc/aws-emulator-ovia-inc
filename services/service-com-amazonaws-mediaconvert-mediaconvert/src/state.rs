@@ -36,6 +36,10 @@
 //!   instant, and does a CONSTANT amount of work per record it drains. It costs
 //!   O(k log n) in the number k of records actually due, which is zero on the
 //!   overwhelming majority of calls; it is never a sweep of the job set.
+//! * `job_engine_versions` is NOT caller-driven at all: the account's Job engine version
+//!   catalogue is seeded once, at state construction, with exactly
+//!   [`JOB_ENGINE_VERSION_COUNT`] records, and no request path adds, removes or rewrites
+//!   one — so what `ListVersions` reports is stable across reads.
 //! * `ListJobs` orders the jobs, over at most `MAX_JOBS` records, and returns at most
 //!   one page of twenty, through [`page_of_jobs`]. `StartJobsQuery` walks the same record
 //!   set ONCE, when the query is started, evaluating at most [`MAX_JOBS_QUERY_TERMS`]
@@ -59,9 +63,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccelerationSettings, HopDestination, Job, JobMessages, JobSettings, JobTemplate,
-    JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue, ReservationPlan,
-    ReservationPlanSettings, Timing,
+    AccelerationSettings, HopDestination, Job, JobEngineVersion, JobMessages, JobSettings,
+    JobTemplate, JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue,
+    ReservationPlan, ReservationPlanSettings, Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -301,6 +305,34 @@ pub const MAX_ENDPOINTS: usize = 100;
 /// bare `__integer` in the model, so nothing refuses an out-of-window value before the
 /// handler runs.
 pub const MAX_ENDPOINT_RESULTS: i32 = 20;
+
+/// How many Job engine versions the account's catalogue carries.
+///
+/// A CHOSEN count: `ListVersions` ("Retrieve a JSON array of all available Job engine
+/// versions and the date they expire") documents that an account has a catalogue of them
+/// and the model carries no list of its entries, so the SIZE of the seeded catalogue is
+/// the emulator's own, as [`SYSTEM_JOB_TEMPLATES`] is for job templates. Four is well
+/// inside one page of the operation's `__integerMin1Max20` `MaxResults`.
+pub const JOB_ENGINE_VERSION_COUNT: usize = 4;
+
+/// How far apart two consecutive Job engine versions of that catalogue are released.
+///
+/// A CHOSEN span, not a documented one: `JobEngineVersion$Version` says only that the
+/// versions "represent periodically grouped MediaConvert releases" and "are in a
+/// YYYY-MM-DD format" — that they are periodic, never what the period is. Ninety days
+/// puts consecutive releases on distinct calendar dates, which is what makes the
+/// `YYYY-MM-DD` label of each entry unique.
+pub const JOB_ENGINE_VERSION_INTERVAL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// How long after its release a Job engine version expires.
+///
+/// A CHOSEN span, not a documented one: `JobEngineVersion$ExpirationDate` ("The date that
+/// this Job engine version expires. Requests to create jobs with an expired version result
+/// in a regular job") documents THAT a version expires, never how long it lasts. A year,
+/// which is longer than the whole seeded catalogue spans
+/// (`JOB_ENGINE_VERSION_COUNT - 1` intervals), so every entry of a freshly constructed
+/// account's catalogue is still available.
+pub const JOB_ENGINE_VERSION_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// The term of a reserved queue's pricing plan. `PricingPlan`'s own documentation:
 /// "Reserved pricing requires a 12-month commitment", and `Commitment` models exactly
@@ -1339,6 +1371,140 @@ pub fn page_of_queues<'a>(
     }
 }
 
+/// One Job engine version of the account's catalogue: "periodically grouped MediaConvert
+/// releases", each with "the date that this Job engine version expires".
+///
+/// Both instants are stored, so the `version` label and the `ExpirationDate` a caller
+/// reads are the ones the catalogue was built with rather than values recomputed per
+/// request. Nothing on a request path writes a record of this kind.
+#[derive(Debug, Clone)]
+pub struct JobEngineVersionRecord {
+    /// The release date in the `YYYY-MM-DD` form `JobEngineVersion$Version` documents, and
+    /// this catalogue's key.
+    pub version: String,
+    /// When the version was released — the instant `version` labels, and half of the
+    /// ordering key a paged listing resumes on.
+    pub released_at: SystemTime,
+    /// When it expires, as `ExpirationDate` reports it.
+    pub expires_at: SystemTime,
+}
+
+impl JobEngineVersionRecord {
+    /// The catalogue entry for a version released at `released_at`: its label is that
+    /// date, and it expires a [`JOB_ENGINE_VERSION_LIFETIME`] later.
+    ///
+    /// `checked_add` rather than `+`, so an instant near the end of the representable
+    /// range cannot panic; it falls back to the release instant, which simply makes the
+    /// entry already expired.
+    pub fn released(released_at: SystemTime) -> Self {
+        Self {
+            version: job_engine_version_label(released_at),
+            released_at,
+            expires_at: released_at
+                .checked_add(JOB_ENGINE_VERSION_LIFETIME)
+                .unwrap_or(released_at),
+        }
+    }
+
+    /// Whether this version is still one of the "available Job engine versions"
+    /// `ListVersions` reports at `now` — an expired one is past the date it expires.
+    pub fn is_available_at(&self, now: SystemTime) -> bool {
+        self.expires_at > now
+    }
+
+    /// The modelled `JobEngineVersion`.
+    pub fn view(&self) -> JobEngineVersion {
+        JobEngineVersion {
+            expiration_date: Some(epoch_seconds(self.expires_at)),
+            version: Some(self.version.clone()),
+        }
+    }
+
+    /// The pair a paged listing orders this version on: its release instant and its label,
+    /// which is this catalogue's key, so the pair is a total order.
+    pub fn ordering_key(&self) -> (u128, &str) {
+        (epoch_nanos(self.released_at), self.version.as_str())
+    }
+
+    /// This version's [`encode_cursor`] token.
+    pub fn cursor(&self) -> String {
+        encode_cursor(self.released_at, &self.version)
+    }
+}
+
+/// A Job engine version's label: the release date in the `YYYY-MM-DD` form
+/// `JobEngineVersion$Version` documents ("Job engine versions are in a YYYY-MM-DD
+/// format").
+///
+/// The calendar conversion is the LIBRARY's, never hand-rolled date arithmetic:
+/// `DateTime::fmt(Format::DateTime)` renders an instant as RFC 3339 in UTC
+/// (`YYYY-MM-DDThh:mm:ssZ`), whose first ten ASCII characters are exactly that calendar
+/// date. A rendering that somehow came back shorter is taken whole, so there is nothing
+/// to unwrap.
+fn job_engine_version_label(at: SystemTime) -> String {
+    let rendered = epoch_seconds(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    rendered.get(..10).unwrap_or(&rendered).to_string()
+}
+
+/// One page of Job engine versions and the cursor that resumes after it.
+#[derive(Debug)]
+pub struct JobEngineVersionPage<'a> {
+    pub versions: Vec<&'a JobEngineVersionRecord>,
+    /// The [`encode_cursor`] token of the last version of the page, and only when a
+    /// further page exists.
+    pub next_token: Option<String>,
+}
+
+/// The page of Job engine versions `ListVersions` reports.
+///
+/// The version catalogue's own [`page_of_queues`]: ONE place that owns the ordering, the
+/// cursor and the page size. `ListVersions` models neither a sort key nor an `Order`, so
+/// the one ordering is CHOSEN — chronological by release, oldest first, with the label
+/// breaking ties so the order is total and a page boundary cannot repeat or skip an entry.
+///
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
+/// decodes to nothing is refused by the handler that read it, with its modelled
+/// `BadRequestException`, so there is no failure left to answer here.
+pub fn page_of_versions<'a>(
+    versions: impl Iterator<Item = &'a JobEngineVersionRecord>,
+    resume_from: Option<&(u128, String)>,
+    max_results: Option<i32>,
+) -> JobEngineVersionPage<'a> {
+    let mut matching: Vec<&JobEngineVersionRecord> = versions.collect();
+    matching.sort_by(|left, right| left.ordering_key().cmp(&right.ordering_key()));
+
+    let start = match resume_from {
+        None => 0,
+        Some((nanos, version)) => {
+            let anchor = (*nanos, version.as_str());
+            // Resume at the first version strictly past the anchor key. The anchor itself
+            // need not still be listed, so a version that expired between two pages is
+            // skipped rather than failing the token.
+            matching
+                .iter()
+                .position(|record| record.ordering_key() > anchor)
+                .unwrap_or(matching.len())
+        }
+    };
+
+    // `maxResults` carries the model's own 1..20 range, so the framework has already
+    // refused anything outside it; the fallback only covers the absent case.
+    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
+    let page = &matching[start.min(matching.len())..];
+    let page = &page[..page_size.min(page.len())];
+    // A token only when there is a further page to fetch.
+    let next_token = (start + page.len() < matching.len())
+        .then(|| page.last().map(|record| record.cursor()))
+        .flatten();
+    JobEngineVersionPage {
+        versions: page.to_vec(),
+        next_token,
+    }
+}
+
 /// The account's input policy: the decision the caller stated for each kind of job
 /// input, and nothing more.
 ///
@@ -1578,6 +1744,13 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// Jobs queries by `Id`, as `StartJobsQuery` stored them and
     /// `GetJobsQueryResults` reads them back. At most [`MAX_JOBS_QUERIES`] entries.
     pub jobs_queries: BTreeMap<String, JobsQueryRecord>,
+    /// The account's Job engine version catalogue by `Version` label, as `ListVersions`
+    /// reports it. Seeded with [`JOB_ENGINE_VERSION_COUNT`] entries when the account comes
+    /// up — the service publishes these versions, no caller creates one — and never
+    /// written by a request path, so the catalogue a caller reads is the one that was
+    /// persisted. Keyed by the label, which is unique because consecutive releases are a
+    /// [`JOB_ENGINE_VERSION_INTERVAL`] apart.
+    pub job_engine_versions: BTreeMap<String, JobEngineVersionRecord>,
     /// `ClientRequestToken` -> the job it created, so `CreateJob` is idempotent for
     /// [`IDEMPOTENCY_WINDOW`]. One entry per stored job at most, so it is bounded by
     /// [`MAX_JOBS`].
@@ -1649,6 +1822,19 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             endpoints: BTreeMap::new(),
             // No jobs query exists until a caller starts one.
             jobs_queries: BTreeMap::new(),
+            // The service's own Job engine versions: the newest released now and the rest
+            // one interval apart behind it, so every entry of a fresh account's catalogue
+            // is inside its lifetime and none is dated in the future. `checked_sub` rather
+            // than `-`, so an instant near the start of the representable range cannot
+            // panic — it simply yields a shorter catalogue.
+            job_engine_versions: (0..JOB_ENGINE_VERSION_COUNT)
+                .filter_map(|index| {
+                    let age = JOB_ENGINE_VERSION_INTERVAL
+                        .checked_mul(u32::try_from(index).ok()?)?;
+                    let record = JobEngineVersionRecord::released(now.checked_sub(age)?);
+                    Some((record.version.clone(), record))
+                })
+                .collect(),
             idempotency: BTreeMap::new(),
             pending: BTreeSet::new(),
             pending_queries: BTreeSet::new(),

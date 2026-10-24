@@ -175,7 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|_| {
             ListProcurementPortalPreferencesErrorModeled::ValidationException(
-                crate::state::invalid_next_token(),
+                // This plane keys the refusal's text as `Message` (see
+                // `crate::ops::types::MessageKey`).
+                crate::state::invalid_next_token(MessageKey::Capitalised),
             )
         })?;
         // The boundary validator already refused a `MaxResults` outside `@range(1..100)`

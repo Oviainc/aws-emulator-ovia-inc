@@ -9,10 +9,11 @@
 //! `src/ops/` keeps a store of its own.
 
 //! Every collection here is BOUNDED, because all three grow from caller requests:
-//! `workflows` is capped at [`MAX_WORKFLOWS`] and a workflow's `runs` at
-//! [`MAX_RUNS_PER_WORKFLOW`] (a create or a run start past the ceiling is refused with the
-//! modelled `ServiceQuotaExceededException`, so the workflows x runs product is finite and
-//! so is the caller-supplied data each record holds); `workflow_names` holds exactly one
+//! `workflows` is capped at [`MAX_WORKFLOWS`], a workflow's `runs` at
+//! [`MAX_RUNS_PER_WORKFLOW`] and its `versions` at [`MAX_VERSIONS_PER_WORKFLOW`] (a
+//! create, a run start or an update past the ceiling is refused with the modelled
+//! `ServiceQuotaExceededException`, so the workflows x runs and workflows x versions
+//! products are finite and so is the caller-supplied data each record holds); `workflow_names` holds exactly one
 //! key per stored workflow, released by the delete that removes the record; and the
 //! idempotency ledger is capped and evicted on its own terms (see [`IdempotencyLedger`]).
 //! A listing's response is bounded too, by the modelled `MaxResults` range.
@@ -82,6 +83,16 @@ pub const MAX_WORKFLOWS: usize = 1_000;
 /// [`MAX_WORKFLOWS`] this bounds the whole run store, including the caller-supplied
 /// `OverrideParameters` each run holds.
 pub const MAX_RUNS_PER_WORKFLOW: usize = 1_000;
+
+/// How many immutable versions this emulator will hold for ONE workflow.
+///
+/// `UpdateWorkflow` appends a version per call ("automatically creates a new version with
+/// the updated configuration"), so the version list is caller-driven growth holding a
+/// whole configuration snapshot each; past this ceiling an update is refused with the
+/// `ServiceQuotaExceededException` the operation already models. Same reasoning as
+/// [`MAX_WORKFLOWS`]: the number is the emulator's own ceiling, not a claim about the
+/// published quota.
+pub const MAX_VERSIONS_PER_WORKFLOW: usize = 1_000;
 
 /// The most `@idempotencyToken` entries this service remembers.
 ///

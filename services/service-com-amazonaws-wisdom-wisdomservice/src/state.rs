@@ -8,13 +8,13 @@
 //! to the one stored record. Handlers read and write ONLY through these structures,
 //! so every response is computed from what a previous call persisted.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
     AssistantAssociationData, AssistantAssociationOutputData, AssistantData, AssistantSummary,
-    KnowledgeBaseAssociationData, KnowledgeBaseData, RenderingConfiguration,
-    ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
+    KnowledgeBaseAssociationData, KnowledgeBaseData, RecommendationData, RecommendationTrigger,
+    RenderingConfiguration, ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
 };
 
 /// The ARN namespace Wisdom resources carry (`awsService.arnNamespace` in the
@@ -123,6 +123,107 @@ pub const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exis
 /// is refused with the modelled `ValidationException`.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The most recommendations one session's feed holds at once, and the most
+/// triggers kept beside them.
+///
+/// A recommendation stays available until something acknowledges it
+/// (`NotifyRecommendationsReceived`, still a scaffold stub with its own issue),
+/// so an unbounded feed would let a session nobody acknowledges grow this
+/// process's heap without limit: the cap is the bound on that growth. It is a
+/// resource guard this emulator owns, NOT an AWS-published quota, and it equals
+/// the largest page `GetRecommendations` can serve ([`MAX_PAGE_SIZE`], the
+/// model's `maxResults` ceiling), so a full feed can still fill any page the
+/// model allows. Publishing past it forgets the OLDEST entry, the way a live
+/// feed drops what nobody collected rather than refusing new material.
+pub const MAX_PENDING_RECOMMENDATIONS_PER_SESSION: usize = MAX_PAGE_SIZE as usize;
+
+/// The recommendations one session has available, oldest first, with the
+/// triggers that produced them.
+///
+/// `GetRecommendations` REPORTS this feed — the operation is `@readonly` — so a
+/// read never consumes an entry: two reads of an unchanged feed answer alike,
+/// and only an acknowledgement removes one. Nothing in THIS model's implemented
+/// surface publishes a recommendation (real Wisdom makes them available out of
+/// band, from the contact's detected intent), so a session's feed is empty
+/// until something calls [`RecommendationFeed::publish`] — which is exactly the
+/// "no recommendations available" case the operation documents: the call
+/// returns successfully with an empty list.
+#[derive(Debug, Clone, Default)]
+pub struct RecommendationFeed {
+    /// The available recommendations, oldest first: the order
+    /// `GetRecommendations` serves a page in, and the order the cap evicts in.
+    pub recommendations: VecDeque<RecommendationData>,
+    /// The triggers that produced them, each naming the `recommendationId`s it
+    /// produced (`RecommendationTrigger.recommendationIds`). A trigger is kept
+    /// only while the feed still holds a recommendation it names, so a trigger
+    /// that names none is not kept and not reported.
+    pub triggers: Vec<RecommendationTrigger>,
+}
+
+impl RecommendationFeed {
+    /// Make one recommendation available on this session, with the trigger that
+    /// produced it (if any).
+    ///
+    /// Bounded by [`MAX_PENDING_RECOMMENDATIONS_PER_SESSION`]: the oldest
+    /// recommendation is forgotten first, and a trigger no held recommendation
+    /// names is forgotten with it.
+    pub fn publish(
+        &mut self,
+        recommendation: RecommendationData,
+        trigger: Option<RecommendationTrigger>,
+    ) {
+        self.recommendations.push_back(recommendation);
+        if let Some(trigger) = trigger {
+            self.triggers.push(trigger);
+        }
+        while self.recommendations.len() > MAX_PENDING_RECOMMENDATIONS_PER_SESSION {
+            self.recommendations.pop_front();
+        }
+        let held: BTreeSet<String> = self
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.recommendation_id.clone())
+            .collect();
+        self.triggers.retain(|trigger| {
+            trigger
+                .recommendation_ids
+                .iter()
+                .any(|id| held.contains(id))
+        });
+        while self.triggers.len() > MAX_PENDING_RECOMMENDATIONS_PER_SESSION {
+            self.triggers.remove(0);
+        }
+    }
+
+    /// The page of at most `max_results` available recommendations, oldest
+    /// first, together with the triggers that produced the recommendations IN
+    /// that page.
+    pub fn page(&self, max_results: usize) -> (Vec<RecommendationData>, Vec<RecommendationTrigger>) {
+        let recommendations: Vec<RecommendationData> = self
+            .recommendations
+            .iter()
+            .take(max_results)
+            .cloned()
+            .collect();
+        let paged: BTreeSet<&str> = recommendations
+            .iter()
+            .map(|recommendation| recommendation.recommendation_id.as_str())
+            .collect();
+        let triggers: Vec<RecommendationTrigger> = self
+            .triggers
+            .iter()
+            .filter(|trigger| {
+                trigger
+                    .recommendation_ids
+                    .iter()
+                    .any(|id| paged.contains(id.as_str()))
+            })
+            .cloned()
+            .collect();
+        (recommendations, triggers)
+    }
+}
+
 /// A persisted Wisdom assistant, plus the sessions created under it.
 #[derive(Debug, Clone)]
 pub struct Assistant {
@@ -158,6 +259,11 @@ pub struct Session {
     /// When this session was created. `SessionData` models no timestamp member,
     /// so nothing renders it; see [`Assistant::created_at`].
     pub created_at: SystemTime,
+    /// The recommendations available on this session, which
+    /// `GetRecommendations` reports. It lives ON the session, so the delete of
+    /// the owning assistant reclaims it with the session rather than leaving an
+    /// orphan feed behind in a map beside the sessions.
+    pub recommendations: RecommendationFeed,
 }
 
 /// A persisted association between an assistant and a knowledge base.
@@ -485,6 +591,30 @@ impl ComAmazonawsWisdomWisdomserviceState {
             session_label.to_string()
         };
         self.assistants.get(&assistant_id)?.sessions.get(&session_id)
+    }
+
+    /// The same session as [`Self::session`], for a caller that writes to it —
+    /// the seam a producer of recommendations ([`RecommendationFeed::publish`])
+    /// reaches a session's feed through.
+    pub fn session_mut(
+        &mut self,
+        assistant_label: &str,
+        session_label: &str,
+    ) -> Option<&mut Session> {
+        let assistant_id = self.resolve_assistant_id(assistant_label)?;
+        let session_id = if session_label.starts_with("arn:") {
+            let (owner, session_id) = self.session_arn_index.get(session_label)?;
+            if *owner != assistant_id {
+                return None;
+            }
+            session_id.clone()
+        } else {
+            session_label.to_string()
+        };
+        self.assistants
+            .get_mut(&assistant_id)?
+            .sessions
+            .get_mut(&session_id)
     }
 
     /// Whether this store already holds [`MAX_ASSISTANTS`] assistants, i.e.

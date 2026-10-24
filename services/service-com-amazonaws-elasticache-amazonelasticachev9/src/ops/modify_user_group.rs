@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyUserGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyUserGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyUserGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reads and writes this service's state and no
+//! longer answers 501, so it carries no `SCAFFOLDED, NOT IMPLEMENTED:` marker line
+//! (that line is the machine-readable census of the operations that are still stubs,
+//! `grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`). This is still the ONLY
+//! file to touch for `ModifyUserGroup`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,273 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyUserGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyUserGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A mutation: "Changes the list of users that belong to the user group."
+        // The request names the change; the stored group is the ONE copy of the
+        // membership it is made to.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // "Modifies the engine listed in a user group. The options are valkey or
+        // redis" — the same set a user is created for, so one implementation
+        // decides it (`crate::state::normalize_user_engine`).
+        let engine = match input.engine.as_deref() {
+            Some(requested) => match crate::state::normalize_user_engine(requested) {
+                Ok(engine) => Some(engine),
+                Err(message) => {
+                    return Err(ModifyUserGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let to_add = input.user_ids_to_add.clone().unwrap_or_default();
+        let to_remove = input.user_ids_to_remove.clone().unwrap_or_default();
+
+        // A modify has to ask for something: with no member named and no engine
+        // given there is no change to make, and a 200 would report a
+        // modification that never happened.
+        if engine.is_none() && to_add.is_empty() && to_remove.is_empty() {
+            return Err(
+                ModifyUserGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            "No modifications were requested: name Engine, UserIdsToAdd or \
+                             UserIdsToRemove."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `UserId` is stored as a lowercase string, so every id a request names
+        // resolves — and is compared with every other — lowercased.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyUserGroup"))
+        // CC-02 growth bound: both lists are caller-chosen and the model bounds
+        // NEITHER (`UserIdsToAdd` / `UserIdsToRemove` are `@length(min: 1)` with
+        // no maximum), so the length is refused here, before anything walks
+        // them: no legal change can name more distinct users than the account
+        // can hold, which `crate::state::USER_QUOTA` bounds. Every comparison
+        // below is then a set lookup, so the work is linear in a bounded length.
+        for (member, ids) in [
+            ("UserIdsToAdd", &to_add),
+            ("UserIdsToRemove", &to_remove),
+        ] {
+            if ids.len() > crate::state::USER_QUOTA {
+                return Err(ModifyUserGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value for {member}: {} user ids were named; an account holds \
+                             at most {} users.",
+                            ids.len(),
+                            crate::state::USER_QUOTA
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let add_keys: Vec<String> = to_add.iter().map(|id| id.to_ascii_lowercase()).collect();
+        let remove_keys: Vec<String> = to_remove.iter().map(|id| id.to_ascii_lowercase()).collect();
+
+        // One user cannot be both added and removed by one call: the two members
+        // ask for opposite ends of the same membership.
+        let removed_keys: ::std::collections::BTreeSet<&str> =
+            remove_keys.iter().map(String::as_str).collect();
+        if let Some(both) = to_add
+            .iter()
+            .zip(&add_keys)
+            .find(|(_, key)| removed_keys.contains(key.as_str()))
+            .map(|(requested, _)| requested)
+        {
+            return Err(
+                ModifyUserGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "User {both} is named in both UserIdsToAdd and UserIdsToRemove."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A list that names one user twice asks for the same change twice, which
+        // is what `DuplicateUserNameFault` answers — the rule `CreateUserGroup`
+        // already applies to a repeated member of `UserIds`. One pass per list,
+        // over the ids already seen.
+        for (member, ids, keys) in [
+            ("UserIdsToAdd", &to_add, &add_keys),
+            ("UserIdsToRemove", &to_remove, &remove_keys),
+        ] {
+            let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+            if let Some(repeated) = ids
+                .iter()
+                .zip(keys)
+                .find(|(_, key)| !seen.insert(key.as_str()))
+                .map(|(id, _)| id)
+            {
+                return Err(ModifyUserGroupErrorModeled::DuplicateUserNameFault(
+                    DuplicateUserNameFault {
+                        message: Some(format!(
+                            "User {repeated} is named more than once in {member}."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A user whose deletion has fallen due is gone, so it is no longer a
+        // member a group can gain; a group whose change has fallen due is
+        // `active` again and can take another one. Both were owed at this
+        // instant whether or not anybody called.
+        store.settle_users(now);
+        store.settle_user_groups(now);
+
+        let Some(group) = store.user_groups.get(&input.user_group_id) else {
+            return Err(ModifyUserGroupErrorModeled::UserGroupNotFoundFault(
+                UserGroupNotFoundFault {
+                    message: Some(format!("User group {} not found.", input.user_group_id)),
+                },
+            )
+            .into());
+        };
+        // `InvalidUserGroupStateFault` is "the user group is not in an active
+        // state": a group still being created, already carrying a change the
+        // clock has not applied, or on its way out takes no further change.
+        if let Some(message) = crate::state::user_group_state_refusal(group) {
+            return Err(ModifyUserGroupErrorModeled::InvalidUserGroupStateFault(
+                InvalidUserGroupStateFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let members = group.user_ids.clone();
+
+        // Every id added has to name a user this account holds, and one already
+        // in the group cannot be added again.
+        //
+        // CC-02 growth bound: each addition must resolve to a stored user and no
+        // user may be named twice or already be a member, so the membership this
+        // call leaves is at most as long as the user store, which
+        // `crate::state::USER_QUOTA` bounds.
+        let mut additions: Vec<String> = Vec::new();
+        for (requested, key) in to_add.iter().zip(&add_keys) {
+            let Some(user) = store.users.get(key) else {
+                return Err(ModifyUserGroupErrorModeled::UserNotFoundFault(
+                    UserNotFoundFault {
+                        message: Some(format!("User {requested} not found.")),
+                    },
+                )
+                .into());
+            };
+            if members.contains(&user.user_id) {
+                return Err(ModifyUserGroupErrorModeled::DuplicateUserNameFault(
+                    DuplicateUserNameFault {
+                        message: Some(format!(
+                            "User {} is already a member of user group {}.",
+                            user.user_name, input.user_group_id
+                        )),
+                    },
+                )
+                .into());
+            }
+            additions.push(user.user_id.clone());
+        }
+        // An id removed has to name a user, and that user has to be in the
+        // group: a membership that is not there cannot be withdrawn.
+        let mut removals: Vec<String> = Vec::new();
+        for (requested, key) in to_remove.iter().zip(&remove_keys) {
+            let Some(user) = store.users.get(key) else {
+                return Err(ModifyUserGroupErrorModeled::UserNotFoundFault(
+                    UserNotFoundFault {
+                        message: Some(format!("User {requested} not found.")),
+                    },
+                )
+                .into());
+            };
+            if !members.contains(&user.user_id) {
+                return Err(ModifyUserGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {requested} for UserIdsToRemove: it is not a member of \
+                             user group {}.",
+                            input.user_group_id
+                        )),
+                    },
+                )
+                .into());
+            }
+            removals.push(user.user_id.clone());
+        }
+        // "A user group must contain the default user", so the membership this
+        // change leaves behind has to keep it — see
+        // `crate::state::DEFAULT_USER_ID`.
+        if removals.iter().any(|id| id == crate::state::DEFAULT_USER_ID) {
+            return Err(ModifyUserGroupErrorModeled::DefaultUserRequired(
+                DefaultUserRequired {
+                    message: Some(format!(
+                        "A user group must contain the {} user.",
+                        crate::state::DEFAULT_USER_ID
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(group) = store.user_groups.get_mut(&input.user_group_id) else {
+            return Err(ModifyUserGroupErrorModeled::UserGroupNotFoundFault(
+                UserGroupNotFoundFault {
+                    message: Some(format!("User group {} not found.", input.user_group_id)),
+                },
+            )
+            .into());
+        };
+        // The engine a group is listed for has NO pending-value member on the
+        // `UserGroup` shape to be reported through, so it is applied at the
+        // call; the MEMBERSHIP has one (`UserGroup$PendingChanges`, "the updates
+        // being applied to the user group"), so it is carried on the record and
+        // applied by the clock — which is why this answer still reports the
+        // members the group has now.
+        if let Some(engine) = engine {
+            group.engine = engine;
+        }
+        group.pending_user_ids_to_add = additions;
+        group.pending_user_ids_to_remove = removals;
+        // `UserGroup$Status` "can be creating, active, modifying, deleting": the
+        // group is modifying from here, and the clock owes it `active` — with the
+        // membership change applied — a span later.
+        group.status = crate::state::STATUS_MODIFYING.to_string();
+        group.pending_status = crate::state::user_group_transition(now);
+
+        // Read back out of the store, so the answer is the persisted group rather
+        // than the request echoed. `UserGroup` is generated once per operation,
+        // so the stored group's ONE modelled view is remapped onto this
+        // operation's copy of that shape rather than built a second time.
+        let modified = group.to_modeled();
+        Ok(ModifyUserGroupOutput {
+            user_group_id: modified.user_group_id,
+            status: modified.status,
+            engine: modified.engine,
+            user_ids: modified.user_ids,
+            minimum_engine_version: modified.minimum_engine_version,
+            pending_changes: modified.pending_changes,
+            replication_groups: modified.replication_groups,
+            serverless_caches: modified.serverless_caches,
+            arn: modified.arn,
+        })
     }
 }
