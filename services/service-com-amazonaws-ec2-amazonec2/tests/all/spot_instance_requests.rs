@@ -1590,13 +1590,15 @@ async fn a_request_the_service_cannot_accept_is_refused_and_stores_nothing() {
             400,
             // A value outside a MODELLED enum is refused by the boundary validator, before
             // the handler runs — which is why the handler's own catalog check for it is a
-            // backstop rather than the first line of defence.
+            // backstop rather than the first line of defence, and why the code is the
+            // boundary's rather than the handler's.
             "ValidationError",
         ),
         (
             "a request type outside the modelled catalog",
             [one_request(), vec![p("Type", "forever")]].concat(),
             400,
+            // The same boundary refusal as the row above, so the same code.
             "ValidationError",
         ),
         (

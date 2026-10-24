@@ -571,7 +571,7 @@ async fn create_transit_gateway_refuses_a_value_outside_a_published_range_or_enu
             vec![param("Options.DnsSupport", "enabled")],
             // Refused by the boundary validator, which reads the model's own enum: the
             // member is a `DnsSupportValue`, so a value outside it never reaches the
-            // handler. Its code is EC2's `ValidationError`, not `InvalidParameterValue`.
+            // handler, and the code is the boundary's rather than the handler's.
             "ValidationError",
         ),
         (

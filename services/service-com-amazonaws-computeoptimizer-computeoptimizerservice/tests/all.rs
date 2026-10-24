@@ -23,6 +23,8 @@ mod ebs_volume_recommendations;
 mod ebs_volume_recommendations_export;
 #[path = "all/ecs_service_recommendations.rs"]
 mod ecs_service_recommendations;
+#[path = "all/ecs_service_recommendations_export.rs"]
+mod ecs_service_recommendations_export;
 #[path = "all/enrollment_and_preferences.rs"]
 mod enrollment_and_preferences;
 #[path = "all/harness.rs"]

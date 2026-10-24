@@ -510,8 +510,8 @@ async fn a_create_the_service_cannot_satisfy_is_refused_and_stores_nothing() {
         ),
         (
             // The modelled `InternetGatewayExclusionMode` enum is refused at the boundary,
-            // before the handler runs, so the code is the validator's rather than EC2's
-            // own `InvalidParameterValue`.
+            // before the handler runs, so the code is the boundary's rather than the
+            // handler's.
             "a mode outside the modelled catalog",
             create_params(Target::Vpc, &vpc_id, "allow-nothing", &[]),
             "ValidationError",

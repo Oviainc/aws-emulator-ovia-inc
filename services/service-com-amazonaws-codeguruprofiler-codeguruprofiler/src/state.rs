@@ -189,6 +189,14 @@ pub const MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP: usize = 64;
 /// first, so caller-chosen token strings cannot accumulate without limit.
 pub const MAX_RETAINED_PROFILE_TOKENS_PER_GROUP: usize = 64;
 
+/// How many anomaly-feedback submissions one profiling group retains, one per anomaly
+/// instance it has been given feedback about. Emulator-chosen, like
+/// [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`]: an anomaly instance id is caller-supplied,
+/// so an in-memory store must bound how many distinct ones it accumulates; the group's
+/// least recently submitted feedback is dropped first by
+/// [`ProfilingGroup::submit_anomaly_feedback`].
+pub const MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP: usize = 64;
+
 /// The hex-digit group lengths a `RevisionId` carries, as the model's `RevisionId`
 /// pattern (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`) spells them
 /// out: 32 lowercase hex characters in five hyphen-separated groups.
@@ -593,6 +601,30 @@ impl NotificationChannel {
     }
 }
 
+/// One user feedback submission about one anomaly instance, as `SubmitFeedback` filed it
+/// against a profiling group.
+///
+/// `anomaly_instance_id` is the key the submission is filed under, so the latest
+/// submission about one anomaly instance is the one this group holds — the real service
+/// reports it on that instance's `userFeedback`, whose modelled `UserFeedback` carries a
+/// single `type`, i.e. ONE feedback per instance rather than a history.
+///
+/// `comment` keeps the `@optional` member as sent (absent when the request carried none);
+/// the modelled `UserFeedback` has no member for it, so it is stored and never reported.
+#[derive(Debug, Clone)]
+pub struct AnomalyFeedback {
+    /// The `AnomalyInstanceId` the feedback is about — the request's own, whose modelled
+    /// pattern (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`) the
+    /// boundary walk has already enforced by the time it is stored.
+    pub anomaly_instance_id: String,
+    /// The modelled `FeedbackType` submitted: `Positive` or `Negative`.
+    pub feedback_type: String,
+    /// The optional free-text comment the submission carried.
+    pub comment: Option<String>,
+    /// When this submission was filed.
+    pub submitted_at: DateTime,
+}
+
 /// One recommendation ("findings") report: the result of analysing ONE profile window
 /// of one group, which `ListFindingsReports` and `GetFindingsReportAccountSummary`
 /// summarise as a `FindingsReportSummary`.
@@ -696,6 +728,13 @@ pub struct ProfilingGroup {
     /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_findings_report`],
     /// which is the only writer.
     pub findings_reports: VecDeque<FindingsReport>,
+    /// The anomaly feedback submitted against this group, least recently submitted
+    /// FIRST and at most one entry per anomaly instance. Bounded at
+    /// [`MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP`] by
+    /// [`ProfilingGroup::submit_anomaly_feedback`], which is the only writer. It lives ON
+    /// the group — the feedback is about an anomaly of THIS group's analysis — so
+    /// deleting the group takes it with it and a re-created group starts with none.
+    pub anomaly_feedback: VecDeque<AnomalyFeedback>,
 }
 
 impl ProfilingGroup {
@@ -868,6 +907,44 @@ impl ProfilingGroup {
         self.notification_channels
             .retain(|channel| channel.id != id);
         self.notification_channels.len() != before
+    }
+
+    /// The feedback this group holds about one anomaly instance, or `None` when none has
+    /// been submitted about it (or the submission has since been evicted).
+    ///
+    /// No operation reports stored feedback yet: the modelled `UserFeedback` is reported on
+    /// an `AnomalyInstance`, and this emulator detects no anomalies (see
+    /// `crate::ops::get_recommendations`), so this is the store's reader for inspecting
+    /// what a submission left behind and the seam such reporting would read — not a handler
+    /// anyone forgot to write.
+    pub fn feedback_about(&self, anomaly_instance_id: &str) -> Option<&AnomalyFeedback> {
+        self.anomaly_feedback
+            .iter()
+            .find(|feedback| feedback.anomaly_instance_id == anomaly_instance_id)
+    }
+
+    /// File `feedback` against this group, superseding what it held about that anomaly
+    /// instance.
+    ///
+    /// One anomaly instance carries one feedback — the modelled `UserFeedback` reported on
+    /// an `AnomalyInstance` has a single `type` — so a further submission about the same
+    /// instance replaces the one stored rather than accumulating beside it, and becomes
+    /// this group's most recent submission. The only writer, so the group never holds two
+    /// submissions about one instance, nor more than
+    /// [`MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP`] of them: once past that bound the least
+    /// recently submitted is dropped, never the submission just filed.
+    pub fn submit_anomaly_feedback(&mut self, feedback: AnomalyFeedback) {
+        if let Some(at) = self
+            .anomaly_feedback
+            .iter()
+            .position(|stored| stored.anomaly_instance_id == feedback.anomaly_instance_id)
+        {
+            self.anomaly_feedback.remove(at);
+        }
+        self.anomaly_feedback.push_back(feedback);
+        while self.anomaly_feedback.len() > MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP {
+            self.anomaly_feedback.pop_front();
+        }
     }
 
     /// The start instants of the aggregated profiles this group holds for an

@@ -65,9 +65,9 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// EC2's error code for a `Cidr` that reached the handler empty.
 const MISSING_PARAMETER: &str = "MissingParameter";
 
-/// The code the boundary validator refuses a request with that carries no `Cidr` member at
-/// all, before any handler logic runs — `Cidr` is modelled `@required`.
-const MALFORMED_INPUT: &str = "MalformedInput";
+/// The code the BOUNDARY answers for a `@required` member the request left out, before any
+/// handler of this service runs.
+const BOUNDARY_MISSING_MEMBER: &str = "MalformedInput";
 
 /// EC2's error code for a `DryRun` request that would have been served.
 const DRY_RUN_OPERATION: &str = "DryRunOperation";
@@ -293,8 +293,13 @@ async fn a_cidr_that_is_not_an_address_range_is_refused_before_any_lookup() {
         ),
         ("an empty Cidr", vec![p("Cidr", "")], MISSING_PARAMETER),
         // `Cidr` is modelled `@required`, so a request that carries no `Cidr` member at
-        // all is refused by the boundary validator before any handler logic runs.
-        ("no Cidr parameter at all", Vec::new(), MALFORMED_INPUT),
+        // all is refused by the boundary validator before any handler logic runs, with the
+        // boundary's own code rather than the handler's.
+        (
+            "no Cidr parameter at all",
+            Vec::new(),
+            BOUNDARY_MISSING_MEMBER,
+        ),
     ];
 
     let (router, engine) = emulator();

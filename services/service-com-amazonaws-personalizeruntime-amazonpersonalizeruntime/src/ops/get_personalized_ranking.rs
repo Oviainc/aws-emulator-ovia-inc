@@ -23,7 +23,10 @@
 //!    entry the catalog holds is scored by [`crate::state::scoring::relevance`] from
 //!    its stored `base_score` and the request's `userId`/`context`; an entry the
 //!    catalog does not hold "is appended to the end of the reranked list", with no
-//!    relevance score for the user.
+//!    relevance score for the user. The reported score is the entry's share of the
+//!    certainty over the WHOLE stored catalog scored for this request, so an item
+//!    carries the same score however long `inputList` is and whatever `filterArn`
+//!    removed — a ranking of part of the catalog simply sums to less than 1.0.
 //! 4. With no `filterArn`, the result is therefore a PERMUTATION of `inputList`: same
 //!    cardinality, same item ids, ordered by score descending. With a `filterArn`
 //!    ("a filter you created to include items or exclude items from recommendations
@@ -225,11 +228,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 3. Score the entries the catalog holds, and collect the ones it does not.
-        //    An entry with no catalog record carries no stored attributes, so the
-        //    request's filter decides on an empty attribute set: an INCLUDE filter
-        //    cannot keep it, an EXCLUDE filter cannot remove it.
+        // 4. Score the WHOLE stored catalog for this request, and settle each entry's
+        //    share of the certainty over it. The reported score of an item is the
+        //    model's certainty for the (campaign, userId, context, item) tuple, so the
+        //    denominator is the catalog — never the entries this `inputList` happened
+        //    to name, nor the ones the request's `filterArn` kept. Re-ranking the same
+        //    user over a longer list, or with a filter, therefore reports an item with
+        //    the same score, and a ranking of part of the catalog sums to at most 1.0.
         let context_seed = scoring::context_seed(input.context.as_ref());
+        let mut catalog_shares: Vec<f64> = campaign
+            .items
+            .iter()
+            .map(|item| {
+                scoring::relevance(
+                    item.base_score,
+                    &[
+                        &campaign.arn,
+                        &input.user_id,
+                        &context_seed,
+                        &item.item_id,
+                    ],
+                )
+            })
+            .collect();
+        scoring::normalize(&mut catalog_shares);
+
+        // 5. Report the entries `inputList` names, and collect the ones the catalog
+        //    does not hold. An entry with no catalog record carries no stored
+        //    attributes, so the request's filter decides on an empty attribute set: an
+        //    INCLUDE filter cannot keep it, an EXCLUDE filter cannot remove it.
         let no_attributes: BTreeMap<String, String> = BTreeMap::new();
         let mut ranked: Vec<(usize, f64, usize)> = Vec::new();
         let mut appended: Vec<String> = Vec::new();
@@ -247,11 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     {
                         continue;
                     }
-                    let score = scoring::relevance(
-                        item.base_score,
-                        &[&campaign.arn, &input.user_id, &context_seed, item_id],
-                    );
-                    ranked.push((index, score, position));
+                    ranked.push((index, catalog_shares[index], position));
                 }
                 None => {
                     if request_filter
@@ -274,13 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.2.cmp(&right.2))
         });
 
-        let mut scores: Vec<f64> = ranked.iter().map(|(_, score, _)| *score).collect();
-        scoring::normalize(&mut scores);
-
         let mut personalized_ranking: Vec<PredictedItem> = ranked
             .iter()
-            .zip(&scores)
-            .map(|((index, _, _), score)| {
+            .map(|(index, score, _)| {
                 let item = &campaign.items[*index];
                 PredictedItem {
                     item_id: Some(item.item_id.clone()),

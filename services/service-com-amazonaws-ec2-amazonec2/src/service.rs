@@ -117,17 +117,40 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // The framework refused a value against a rule the model declares — an absent
+            // `@required` member, or a value outside a declared `@range`, `@length`,
+            // `@pattern` or enum catalog. EC2 declares no error SHAPES at all
+            // (`smithy_query(query="operation", …)` reports `errors: []` for every
+            // operation), so what it answers is a CODE, and this service states that code
+            // only where EC2's own words for the refusal are known: a value outside a
+            // modelled catalog this service has recorded wording for is EC2's
+            // `InvalidParameterValue` with the sentence EC2 words for that parameter TYPE
+            // ([`ec2_value_refusal`]).
+            //
+            // Every other framework refusal answers `None`, which keeps the framework's own
+            // code and its request-built clause in AWS's validation envelope
+            // ([`aws_smithy_schema_server::envelope`]) rather than inventing a second
+            // dialect for a parameter whose EC2 wording this service does not know. Which
+            // code EC2 answers for each of those, and how it words them, is one rule for the
+            // whole service and is recorded as its own issue
+            // (`issues/.../20261023T102725Z-ec2-answers-parameter-rejections-with-generic-validationerror-and.md`),
+            // to be stated here once when that issue is fixed. The refusals this service's
+            // HANDLERS give for the rules the model cannot express are a different path and
+            // already carry EC2's own codes (`crate::state`).
+            Refusal::Invalid(violations) => {
+                // EC2 reports ONE parameter at a time, so a request that also failed other
+                // constraints is still refused with this parameter's own sentence.
+                let message = violations.iter().find_map(ec2_value_refusal)?;
+                Some(Refused {
+                    code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                    message,
+                })
+            }
+            // Authentication is the framework's answer to give, not this service's, and a
+            // refusal carrying no violation has nothing for this service to name.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -433,3 +456,30 @@ impl ServerProtocol for Ec2QueryEnvelope {
         Ok(response)
     }
 }
+
+/// EC2's own sentence for a value this service knows how EC2 refuses, or `None` when the
+/// refusal has no recorded EC2 wording.
+///
+/// EC2 words a refused value per parameter TYPE rather than as a validation clause —
+/// "`<value>` is not a valid value for RoleType. Specify either odcr-owner or
+/// unused-reservation-billing-owner." for a value outside the `CallerRole` catalog. The
+/// wording lives with the type it belongs to ([`crate::state::caller_role_refusal_message`]),
+/// keyed on the value set the constraint walk reports, so every operation that carries that
+/// member is refused in the same words and nothing here keys on an operation or a request's
+/// shape. A type whose EC2 wording this service has not recorded answers `None` and keeps
+/// the framework's own clause.
+fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<String> {
+    use aws_smithy_schema_server::ViolationKind;
+
+    match &violation.kind {
+        ViolationKind::EnumValue(allowed) if crate::state::is_caller_role_catalog(allowed) => {
+            // Already elided to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot
+            // amplify a request into an arbitrarily long response.
+            Some(crate::state::caller_role_refusal_message(
+                violation.value.as_deref().unwrap_or_default(),
+            ))
+        }
+        _ => None,
+    }
+}
+
