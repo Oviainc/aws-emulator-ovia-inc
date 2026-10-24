@@ -11,11 +11,16 @@
 //! cancel that is admitted puts the task into the non-terminal `cancelling` state and the
 //! clock owes it `cancelled` ([`crate::state::ExportTaskRecord`]).
 //!
-//! `ExportVmTaskId` carries no modelled pattern and EC2 publishes no `.Malformed` code for
-//! one, so an id the account holds no export task for is answered the one way there is:
-//! `InvalidExportTaskID.NotFound`. `CreateInstanceExportTask`, which is what starts a task,
-//! is still a scaffold, so a fresh account holds none — and that is the answer every id gets
-//! until one is started.
+//! `ExportVmTaskId` carries no modelled pattern, so the id form is the one the operations
+//! that MINT an export task id use — `export-i-<hex>` and `export-ami-<hex>`, the
+//! `CreateInstanceExportTask` and `ExportImage` ids the member documents as its sources
+//! ([`export_task_id_is_well_formed`], this file's own, since this is the only operation
+//! that reads an export task id). An id outside that form is not an EC2 resource id at all,
+//! so it is refused `InvalidID` BEFORE any lookup, and only an id EC2 could have issued that
+//! resolves to nothing is answered `InvalidExportTaskID.NotFound`.
+//! `CreateInstanceExportTask`, which is what starts a task, is still a scaffold, so a fresh
+//! account holds none — and that is the answer every well-formed id gets until one is
+//! started.
 //!
 //! This operation models no `DryRun` member, so there is no permission probe to answer.
 //!
@@ -120,6 +125,61 @@ impl From<CancelExportTaskErrorModeled> for CancelExportTaskError {
     }
 }
 
+/// The id prefix an INSTANCE export task is minted with: `ExportTask$ExportTaskId` as
+/// `CreateInstanceExportTask` issues one, the first source
+/// `CancelExportTaskRequest$ExportTaskId` names for the ids it takes.
+pub const INSTANCE_EXPORT_TASK_ID_PREFIX: &str = "export-i";
+
+/// The id prefix an IMAGE export task is minted with: `ExportImageResult$ExportImageTaskId`
+/// as `ExportImage` issues one, the other source `CancelExportTaskRequest$ExportTaskId` names
+/// ("This is the ID returned by the CreateInstanceExportTask and ExportImage operations").
+pub const IMAGE_EXPORT_TASK_ID_PREFIX: &str = "export-ami";
+
+/// Every id prefix an export task id EC2 issued can carry
+/// ([`INSTANCE_EXPORT_TASK_ID_PREFIX`], [`IMAGE_EXPORT_TASK_ID_PREFIX`]).
+pub const EXPORT_TASK_ID_PREFIXES: &[&str] =
+    &[INSTANCE_EXPORT_TASK_ID_PREFIX, IMAGE_EXPORT_TASK_ID_PREFIX];
+
+/// Whether `id` is a well-formed export task id — one EC2 could have ISSUED for an export
+/// task, under either prefix [`EXPORT_TASK_ID_PREFIXES`] holds and in the usual
+/// `<prefix>-<hex>` resource-id form, which is the crate's one reader of that form
+/// ([`crate::state::prefixed_id_is_well_formed`]).
+///
+/// `ExportVmTaskId` publishes no `@pattern`
+/// (`smithy_query(query="shape",shape="ExportVmTaskId")` is a plain `String`), so the form is
+/// the one the operations that MINT the id use — the same two the member documents as its
+/// sources, and the one `crate::state::ComAmazonawsEc2Amazonec2State::next_id` mints here. An
+/// id outside it is not an EC2 resource id at all, which is why it is answered
+/// [`crate::scaffolded::Scaffolded::invalid_id`] rather than
+/// `crate::state::invalid_export_task_id_not_found`: there is nothing to look up.
+///
+/// The lowercase-hexadecimal suffix is this crate's MINT convention (the one
+/// `prefixed_id_is_well_formed` enforces for every resource whose `@pattern` the model does
+/// not publish), not a pattern EC2 publishes: the ids EC2 itself issued before the long-id
+/// form were `export-i-` followed by eight alphanumerics. Every export task this emulator
+/// holds is one `next_id` minted, so the two agree here; an id carried in from a real account
+/// would read as malformed.
+///
+/// It lives beside the handler rather than in `crate::state` because this is the only
+/// operation the model gives an export task id to — `CreateInstanceExportTask` and
+/// `ExportImage` should mint through these same constants once they are implemented.
+pub fn export_task_id_is_well_formed(id: &str) -> bool {
+    EXPORT_TASK_ID_PREFIXES
+        .iter()
+        .any(|prefix| crate::state::prefixed_id_is_well_formed(prefix, id))
+}
+
+/// Refuse a request whose export task id is not one EC2 could have issued: HTTP 400
+/// `InvalidID` ([`crate::scaffolded::Scaffolded::invalid_id`]), answered BEFORE the id is
+/// looked up so a caller can tell "not an export task id" from "no such export task".
+fn require_well_formed_export_task_id(export_task_id: &str) -> Result<(), CancelExportTaskError> {
+    if export_task_id_is_well_formed(export_task_id) {
+        Ok(())
+    } else {
+        Err(crate::scaffolded::Scaffolded::invalid_id(export_task_id))
+    }
+}
+
 /// The `CancelExportTask` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,6 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An export task carries no Region member of its own, so nothing here depends on the
         // Region the request was signed for.
         let _ = ctx;
+
+        // An id that is not one EC2 issues for an export task names no resource to look up,
+        // so it is refused before the store is reached.
+        require_well_formed_export_task_id(&input.export_task_id)?;
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
