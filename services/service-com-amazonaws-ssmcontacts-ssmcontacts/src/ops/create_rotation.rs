@@ -24,6 +24,11 @@
 //!    rotation" — must name stored contacts; the first that does not answers the modelled
 //!    `ResourceNotFoundException` (HTTP 404).
 //!
+//! `StartTime` is optional on the request but NOT on the rotation: the create assigns the
+//! rotation's effective start time — the named instant, or the instant it is stored when
+//! the request names none — and persists it, so `GetRotation` (whose `StartTime` is
+//! modelled required) and `ListRotations` report the same single value for one rotation.
+//!
 //! `TimeZoneId` is stored as given: the model constrains it by length and pattern and
 //! documents only the IANA format of the value, not the set of zone names the service
 //! accepts, so refusing a name here would refuse requests AWS admits.
@@ -294,16 +299,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.name,
             sequence,
         );
+        // The rotation's effective start time is assigned HERE, once, and persisted: the
+        // create's own `StartTime` is optional while `GetRotation$StartTime` is required
+        // (`smithy_query(query="operation",operation="CreateRotation,GetRotation")`), so a
+        // rotation created without one goes into effect the instant it is stored. Every
+        // reader then reports that single stored value instead of deriving its own.
+        let created_at = ::std::time::SystemTime::now();
         let record = RotationRecord {
             arn: arn.clone(),
             name: input.name.clone(),
             contact_ids: input.contact_ids.clone(),
-            start_time: input.start_time,
+            start_time: input
+                .start_time
+                .unwrap_or_else(|| ::aws_smithy_types::DateTime::from(created_at)),
             time_zone_id: input.time_zone_id.clone(),
             recurrence: input.recurrence.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             sequence,
-            created_at: ::std::time::SystemTime::now(),
+            created_at,
         };
         state.rotations.insert(arn.clone(), record);
         state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &arn);

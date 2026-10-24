@@ -17,10 +17,14 @@ mod api_endpoint_scheme;
 mod api_import;
 #[path = "all/api_lifecycle.rs"]
 mod api_lifecycle;
+#[path = "all/api_update.rs"]
+mod api_update;
 #[path = "all/authorizer_lifecycle.rs"]
 mod authorizer_lifecycle;
 #[path = "all/cors_configuration.rs"]
 mod cors_configuration;
+#[path = "all/constraint_refusal.rs"]
+mod constraint_refusal;
 #[path = "all/deployment_lifecycle.rs"]
 mod deployment_lifecycle;
 #[path = "all/deployment_pagination.rs"]
@@ -39,6 +43,10 @@ mod integration_deletion;
 mod integration_lifecycle;
 #[path = "all/integration_pagination.rs"]
 mod integration_pagination;
+#[path = "all/integration_update.rs"]
+mod integration_update;
+#[path = "all/integration_validation.rs"]
+mod integration_validation;
 #[path = "all/model_lifecycle.rs"]
 mod model_lifecycle;
 #[path = "all/model_template.rs"]
@@ -59,6 +67,8 @@ mod route_request_parameter;
 mod route_response_lifecycle;
 #[path = "all/route_update.rs"]
 mod route_update;
+#[path = "all/route_validation.rs"]
+mod route_validation;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/stage_lifecycle.rs"]

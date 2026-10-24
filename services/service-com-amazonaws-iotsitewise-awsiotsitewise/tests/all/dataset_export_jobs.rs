@@ -21,7 +21,13 @@
 //!   `InvalidRequestException` and starts NO job, and one naming a dataset the
 //!   store does not hold is the modelled not-found refusal;
 //! * a retried create carrying the same `clientToken` replays the job the first
-//!   one started rather than starting a second.
+//!   one started rather than starting a second, whatever else that retry names,
+//!   and rewrites nothing on the job it replays — while the same token in another
+//!   workspace is a different call and starts a job of its own;
+//! * a create answers in the workspace its request names, whatever form that name
+//!   takes within the modelled constraint, and the store bounds how many jobs one
+//!   workspace holds, past which the create is the modelled refusal and starts no
+//!   job.
 //!
 //! The HTTP harness (`call`, `router`, `error_code`, `is_modelled_id`) is the one
 //! the asset suite already has; this suite reuses it rather than growing a second.
@@ -31,7 +37,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{service_state, EXPORT_JOB_STEP};
+use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
+    service_state, EXPORT_JOB_STEP, MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE,
+};
 
 use super::asset_lifecycle::{call, error_code, is_modelled_id, router, router_with_engine};
 
@@ -56,6 +64,13 @@ const DESTINATION: &str = "s3://sitewise-exports/clips/";
 /// The same member's error-report form, so a response reporting one in place of
 /// the other cannot pass.
 const ERROR_REPORT: &str = "s3://sitewise-exports/errors/";
+
+/// The destination a RETRY names, so a replay that reported the retry's request
+/// instead of the job's own cannot pass.
+const OTHER_DESTINATION: &str = "s3://sitewise-exports/other-clips/";
+
+/// The error report location a RETRY names, for the same reason.
+const OTHER_ERROR_REPORT: &str = "s3://sitewise-exports/other-errors/";
 
 /// The `DatasetExportJobStatus` values, from the enum itself (smithy_query
 /// query="shape" shape="DatasetExportJobStatus").
@@ -107,9 +122,20 @@ async fn describe(router: &MultiServiceRouter, workspace: &str, job_id: &str) ->
 /// The body a create sends: the destination, the error report location, the
 /// processing input, and `clientToken` only when the row carries one.
 fn create_body(input: &Value, token: Option<&str>) -> Value {
+    create_body_from(DESTINATION, ERROR_REPORT, input, token)
+}
+
+/// The same, with every member a row may vary spelled out, so a retry can send a
+/// request that differs from the one it retries.
+fn create_body_from(
+    destination: &str,
+    error_report: &str,
+    input: &Value,
+    token: Option<&str>,
+) -> Value {
     let mut body = json!({
-        "destinationS3Uri": DESTINATION,
-        "errorReportLocation": { "s3Uri": ERROR_REPORT },
+        "destinationS3Uri": destination,
+        "errorReportLocation": { "s3Uri": error_report },
         "input": input.clone(),
     });
     if let Some(token) = token {
@@ -118,6 +144,15 @@ fn create_body(input: &Value, token: Option<&str>) -> Value {
             .insert("clientToken".to_string(), json!(token));
     }
     body
+}
+
+/// How many jobs the store holds, across every workspace — the only way to
+/// observe that a refused or replayed create wrote nothing, since no reader
+/// enumerates a workspace's jobs yet.
+fn jobs_held(engine: &engine::InMemoryEngine) -> usize {
+    let state = service_state(engine).expect("the service store");
+    let store = state.lock();
+    store.dataset_export_jobs.len()
 }
 
 /// Create a dataset through `CreateDataset` and answer its id, so the rows whose
@@ -548,11 +583,7 @@ async fn an_input_that_breaks_a_rule_the_shapes_state_starts_no_job() {
 
         // A refused create writes NOTHING. The store is the only place that shows
         // it: no reader enumerates a workspace's jobs yet.
-        let held = {
-            let state = service_state(&*engine).expect("the service store");
-            let store = state.lock();
-            store.dataset_export_jobs.len()
-        };
+        let held = jobs_held(&engine);
         assert_eq!(
             held, 0,
             "case {label:?}: a refused create must start no job, the store holds {held}"
@@ -621,13 +652,198 @@ async fn a_retried_create_carrying_the_same_client_token_replays_the_first_job()
 
     // Three jobs: the one the token started, and the two creates that were not
     // retries of it.
-    let held = {
-        let state = service_state(&*engine).expect("the service store");
-        let store = state.lock();
-        store.dataset_export_jobs.len()
-    };
+    let held = jobs_held(&engine);
     assert_eq!(
         held, 3,
         "the two replays must have written nothing, the store holds {held}"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_replays_the_first_request_and_rewrites_nothing_on_the_job() {
+    let (router, engine) = router_with_engine();
+    let dataset_id = create_dataset(&router, "Export source").await;
+    let first_input = json!({ "timeseries": [{ "timeSeriesId": ASSOCIATED_SERIES }] });
+    let token = "66666666-6666-6666-6666-666666666666";
+
+    let (status, first) = create(&router, WORKSPACE, create_body(&first_input, Some(token))).await;
+    assert_eq!(status, 202, "the first create got {status} {first}");
+    let job_id = first["jobId"].as_str().unwrap_or("").to_string();
+
+    // (case, the whole body the retry sends) — the retry carries the token the
+    // first create carried and differs in every other member in turn: the answer
+    // is the cached result of that first call, so the job it reports is the one
+    // the first request started and the rest of the retry changes nothing.
+    let retries: Vec<(&str, Value)> = vec![
+        ("the same request again", create_body(&first_input, Some(token))),
+        (
+            "another destination",
+            create_body_from(OTHER_DESTINATION, ERROR_REPORT, &first_input, Some(token)),
+        ),
+        (
+            "another error report location",
+            create_body_from(DESTINATION, OTHER_ERROR_REPORT, &first_input, Some(token)),
+        ),
+        (
+            "another processing input",
+            create_body(&json!({ "dataset": { "datasetId": dataset_id } }), Some(token)),
+        ),
+    ];
+
+    for (label, body) in retries {
+        let (status, replayed) = create(&router, WORKSPACE, body).await;
+        assert_eq!(
+            status, 202,
+            "case {label:?}: expected 202, got {status} {replayed}"
+        );
+        assert_eq!(
+            replayed["jobId"].as_str().unwrap_or(""),
+            job_id,
+            "case {label:?}: a retry must replay the job the first create started, got {replayed}"
+        );
+
+        let (status, described) = describe(&router, WORKSPACE, &job_id).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: the read of the replayed job got {status} {described}"
+        );
+        assert_eq!(
+            described["destinationS3Uri"].as_str().unwrap_or(""),
+            DESTINATION,
+            "case {label:?}: a retry must not rewrite the job's destination, got {described}"
+        );
+        assert_eq!(
+            described["errorReportLocation"],
+            json!({ "s3Uri": ERROR_REPORT }),
+            "case {label:?}: a retry must not rewrite the job's error report location, \
+             got {described}"
+        );
+        assert_eq!(
+            described["input"], first_input,
+            "case {label:?}: a retry must not rewrite the job's processing input, got {described}"
+        );
+    }
+
+    // A token makes a call a retry of the call it repeats, and a create names the
+    // workspace it creates in: the same token in ANOTHER workspace is a different
+    // call, so it starts a job of its own there.
+    let (status, elsewhere) =
+        create(&router, "other-floor", create_body(&first_input, Some(token))).await;
+    assert_eq!(
+        status, 202,
+        "the same token in another workspace got {status} {elsewhere}"
+    );
+    assert_ne!(
+        elsewhere["jobId"].as_str().unwrap_or(""),
+        job_id,
+        "a create in another workspace must start a job of its own, got {elsewhere}"
+    );
+    assert_eq!(
+        elsewhere["workspaceName"].as_str().unwrap_or(""),
+        "other-floor",
+        "unexpected workspaceName in {elsewhere}"
+    );
+
+    // Two jobs: the one the first create started and the one the other workspace
+    // got. The four retries wrote nothing.
+    let held = jobs_held(&engine);
+    assert_eq!(
+        held, 2,
+        "the four retries must have written nothing, the store holds {held}"
+    );
+}
+
+#[tokio::test]
+async fn a_job_is_created_in_the_workspace_the_request_names_whatever_its_form() {
+    let router = router();
+    let input = json!({ "timeseries": [{ "timeSeriesId": DISASSOCIATED_SERIES }] });
+
+    // The forms `WorkspaceName` admits (len 1..64, pattern ^[a-zA-Z0-9_-]+$ —
+    // smithy_query query="shape" shape="WorkspaceName"): the shortest name, a
+    // digit-only one, one spanning every character class, and the longest.
+    let longest = "w".repeat(64);
+    let workspaces: [&str; 4] = ["a", "0", "Plant_Floor-7", longest.as_str()];
+
+    let mut minted: Vec<String> = Vec::new();
+    for workspace in workspaces {
+        let (status, created) = create(&router, workspace, create_body(&input, None)).await;
+        assert_eq!(
+            status, 202,
+            "case {workspace:?}: expected 202, got {status} {created}"
+        );
+        let job_id = created["jobId"].as_str().unwrap_or("");
+        assert!(
+            is_modelled_id(job_id),
+            "case {workspace:?}: jobId must have the modelled form, got {created}"
+        );
+        assert_eq!(
+            created["workspaceName"].as_str().unwrap_or(""),
+            workspace,
+            "case {workspace:?}: a create answers the workspace it was asked for, got {created}"
+        );
+
+        let (status, described) = describe(&router, workspace, job_id).await;
+        assert_eq!(
+            status, 200,
+            "case {workspace:?}: the read got {status} {described}"
+        );
+        assert_eq!(
+            described["workspaceName"].as_str().unwrap_or(""),
+            workspace,
+            "case {workspace:?}: unexpected workspaceName in {described}"
+        );
+        assert_eq!(
+            described["input"], input,
+            "case {workspace:?}: unexpected processing input in {described}"
+        );
+        minted.push(job_id.to_string());
+    }
+
+    for (at, job_id) in minted.iter().enumerate() {
+        assert!(
+            !minted[at + 1..].contains(job_id),
+            "case {:?}: every create mints a job id of its own, {job_id} was minted twice",
+            workspaces[at]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_workspace_holds_no_more_jobs_than_the_store_bounds_it_to() {
+    let (router, engine) = router_with_engine();
+    let input = json!({ "timeseries": [{ "propertyAlias": "/plant/line-1/rate" }] });
+
+    for at in 0..MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE {
+        let (status, body) = create(&router, WORKSPACE, create_body(&input, None)).await;
+        assert_eq!(
+            status, 202,
+            "job {at} of the bound: expected 202, got {status} {body}"
+        );
+    }
+
+    // One past the bound the create is the modelled refusal, and it starts no job.
+    let (status, refused) = create(&router, WORKSPACE, create_body(&input, None)).await;
+    assert_eq!(
+        status, 429,
+        "one past the bound: expected 429, got {status} {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ThrottlingException",
+        "one past the bound: unexpected error code in {refused}"
+    );
+
+    // The bound is per workspace, so another workspace still accepts a create.
+    let (status, accepted) = create(&router, "other-floor", create_body(&input, None)).await;
+    assert_eq!(
+        status, 202,
+        "a create in another workspace got {status} {accepted}"
+    );
+
+    let held = jobs_held(&engine);
+    assert_eq!(
+        held,
+        MAX_DATASET_EXPORT_JOBS_PER_WORKSPACE + 1,
+        "the refused create must have started no job, the store holds {held}"
     );
 }

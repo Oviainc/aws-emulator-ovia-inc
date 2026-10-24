@@ -111,6 +111,27 @@ async fn create_authorizer(
     as_str(&created, "authorizerId")
 }
 
+/// Create one MOCK integration under `api_id` and answer its `IntegrationId`.
+///
+/// A route's `Target` has to address an integration its OWN api holds, so a test that
+/// stores a target names an integration it created here rather than a literal id.
+/// `MOCK` "lets API Gateway return a response without sending the request further to
+/// the backend", so it needs no endpoint of its own.
+async fn create_integration(emulator: &MultiServiceRouter, case: &str, api_id: &str) -> String {
+    let (status, created) = call(
+        emulator,
+        "POST",
+        &format!("/v2/apis/{api_id}/integrations"),
+        Some(json!({ "integrationType": "MOCK" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateIntegration, got {status} {created}"
+    );
+    as_str(&created, "integrationId")
+}
+
 /// Read one route back and answer `(status, body)`.
 async fn get_route(
     emulator: &MultiServiceRouter,
@@ -155,10 +176,10 @@ fn patched_record(created: &Value, patch: &Value) -> Value {
 
 /// The route every patch row starts from: a WebSocket route carrying every member the
 /// service stores, so a row can replace any one of them.
-fn base_route(authorizer_id: &str) -> Value {
+fn base_route(integration_id: &str, authorizer_id: &str) -> Value {
     json!({
         "routeKey": "sendmessage",
-        "target": "integrations/abc1234",
+        "target": format!("integrations/{integration_id}"),
         "authorizationType": "CUSTOM",
         "authorizerId": authorizer_id,
         "apiKeyRequired": true,
@@ -218,7 +239,9 @@ fn patch_rows() -> Vec<PatchRow> {
         },
         PatchRow {
             case: "the target",
-            patch: json!({ "target": "integrations/zzz9999" }),
+            // The id is substituted below: a target has to name an integration the api
+            // actually holds.
+            patch: json!({ "target": "integrations/substituted" }),
         },
         PatchRow {
             case: "the authorization type drops to open access",
@@ -262,7 +285,17 @@ async fn update_route_replaces_the_members_it_names_and_keeps_the_rest() {
         )
         .await;
         let authorizer_id = create_authorizer(&emulator, row.case, &api_id, "WEBSOCKET").await;
-        let route_id = create_route(&emulator, row.case, &api_id, &base_route(&authorizer_id)).await;
+        // Two integrations: the one the route starts out targeting, and the one the
+        // target-patch row moves it to.
+        let integration_id = create_integration(&emulator, row.case, &api_id).await;
+        let other_integration_id = create_integration(&emulator, row.case, &api_id).await;
+        let route_id = create_route(
+            &emulator,
+            row.case,
+            &api_id,
+            &base_route(&integration_id, &authorizer_id),
+        )
+        .await;
         let (status, created) = get_route(&emulator, &api_id, &route_id).await;
         assert_eq!(
             status, 200,
@@ -270,13 +303,17 @@ async fn update_route_replaces_the_members_it_names_and_keeps_the_rest() {
             row.case
         );
 
-        let (status, updated) = update_route(&emulator, &api_id, &route_id, &row.patch).await;
+        let mut patch = row.patch.clone();
+        if patch.get("target").is_some() {
+            patch["target"] = json!(format!("integrations/{other_integration_id}"));
+        }
+        let (status, updated) = update_route(&emulator, &api_id, &route_id, &patch).await;
         assert_eq!(
             status, 200,
             "case {:?}: expected 200 from UpdateRoute, got {status} {updated}",
             row.case
         );
-        let expected = patched_record(&created, &row.patch);
+        let expected = patched_record(&created, &patch);
         assert_eq!(
             updated, expected,
             "case {:?}: UpdateRoute must report the patched record; expected {expected}, got {updated}",

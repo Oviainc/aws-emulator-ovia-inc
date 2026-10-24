@@ -265,10 +265,13 @@ async fn an_empty_tag_map_in_a_request_is_refused() {
 #[tokio::test]
 async fn an_outpost_reports_both_availability_zone_identities() {
     let outposts = Outposts::new();
-    let site = outposts.create_site(&json!({ "Name": "zone site" })).await;
-    let site_id = text(&site, "SiteId");
 
     for (region, abbreviation) in REGIONS {
+        // An Outpost is placed on a site of its OWN region, and is readable only
+        // through that region, so each region's rows get a site of their own there.
+        let site_id = outposts
+            .site_id_in(region, &format!("zone site {region}"))
+            .await;
         for index in 1..=MAX_ZONE_INDEX {
             let letter = char::from(b'a' + u8::try_from(index - 1).unwrap_or(0));
             let zone = format!("{region}{letter}");
@@ -302,11 +305,11 @@ async fn an_outpost_reports_both_availability_zone_identities() {
                 );
                 let projections = [
                     ("CreateOutpost", outpost.clone()),
-                    ("GetOutpost", outposts.get_outpost(&outpost_id).await),
+                    ("GetOutpost", outposts.get_outpost_in(region, &outpost_id).await),
                     (
                         "ListOutposts",
                         entry(
-                            &outposts.list_outposts(&filtered).await,
+                            &outposts.list_outposts_in(region, &filtered).await,
                             "Outposts",
                             &outpost_id,
                         ),
@@ -339,14 +342,15 @@ async fn an_outpost_reports_both_availability_zone_identities() {
 #[tokio::test]
 async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
     let outposts = Outposts::new();
-    let site = outposts
-        .create_site(&json!({ "Name": "unresolvable zone site" }))
-        .await;
-    let site_id = text(&site, "SiteId");
     // The region every row below is addressed to, and whose zones they name: its
     // final segment is not the single digit an `AvailabilityZoneId` abbreviation ends
     // in, so the name <-> id mapping has nothing to map it through.
     let region = "zz-testing-12";
+    // The site is created in that region too: an Outpost is placed on a site of its
+    // OWN region.
+    let site_id = outposts
+        .site_id_in(region, "unresolvable zone site")
+        .await;
 
     let cases: Vec<(&str, &str, &str)> = vec![
         (
@@ -379,7 +383,9 @@ async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
             "case {case:?}: {other} must stay absent rather than be invented, got {outpost:?}"
         );
         // The read-back agrees with the create, so nothing filled the gap later.
-        let read = outposts.get_outpost(&text(&outpost, "OutpostId")).await;
+        let read = outposts
+            .get_outpost_in(region, &text(&outpost, "OutpostId"))
+            .await;
         assert_eq!(
             read.get(other),
             None,

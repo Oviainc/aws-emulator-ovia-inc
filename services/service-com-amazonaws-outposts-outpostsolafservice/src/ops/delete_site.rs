@@ -137,12 +137,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteSiteErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a site is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved — one region's endpoint cannot delete another region's site.
+        let region = crate::state::request_region(ctx.parts());
         // `SiteId` accepts the bare id or the full site ARN; both name the same
         // stored record.
         let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
@@ -152,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        if !store.sites.contains_key(&site_id) {
+        if store.site(&region, &site_id).is_none() {
             return Err(DeleteSiteErrorModeled::NotFoundException(NotFoundException {
                 // The identifier echo, of the value AS SUPPLIED — not of
                 // `site_id`, which is the bare id an ARN resolved to.
@@ -169,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // site being in some transient state, so it is the modelled
         // `ValidationException` (400) — `ConflictException` (409) would tell an SDK
         // retry policy and a client's conflict branch that waiting might help.
-        if store.outpost_at_site(&site_id).is_some() {
+        if store.outpost_at_site(&region, &site_id).is_some() {
             return Err(DeleteSiteErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -179,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.sites.remove(&site_id);
+        store.remove_site(&region, &site_id);
 
         Ok(DeleteSiteOutput {})
     }

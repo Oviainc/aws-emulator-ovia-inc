@@ -117,6 +117,8 @@ mod asset_property_update;
 mod associated_assets;
 #[path = "all/batch_get_latest_values.rs"]
 mod batch_get_latest_values;
+#[path = "all/batch_property_value_history.rs"]
+mod batch_property_value_history;
 #[path = "all/batch_put_timestamp_and_quality.rs"]
 mod batch_put_timestamp_and_quality;
 #[path = "all/dataset_export_jobs.rs"]

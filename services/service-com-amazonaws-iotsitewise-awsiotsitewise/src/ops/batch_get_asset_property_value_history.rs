@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetAssetPropertyValueHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetAssetPropertyValueHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetAssetPropertyValueHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the stored samples of every asset property an
+//! entry names, each windowed, quality-filtered and ordered as that entry asks, read
+//! from the shared engine store (`crate::state`) and paginated across the entries by
+//! data points; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +160,334 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Request metadata only; this read is identified entirely by the entries of
+        // its body, so nothing on the request parts is needed.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetAssetPropertyValueHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetAssetPropertyValueHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetAssetPropertyValueHistory"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetAssetPropertyValueHistoryError::Modeled(
+                BatchGetAssetPropertyValueHistoryErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        // "You can specify up to 16 entries per request" — and a batch that names no
+        // entry at all asks for nothing, so both ends of the range are refused. The
+        // model carries no `@length` for `entries`, so the bound is enforced here; it
+        // is a bound on the input shape, hence the 400 the runtime's own constraint
+        // checks answer with rather than a quota error.
+        if input.entries.is_empty() || input.entries.len() > MAX_ENTRIES {
+            return Err(invalid_request(format!(
+                "A request carries 1 to {MAX_ENTRIES} entries, but this one carries {}.",
+                input.entries.len()
+            )));
+        }
+        // "The number of data points in the result set is equal to the value of
+        // maxResults. The maximum value of maxResults is 20000." The modelled range is
+        // 1.., which the runtime checks before this handler runs, so only the
+        // documented ceiling is left to enforce. With no `maxResults` the result set is
+        // bounded only by that ceiling.
+        let max_results = match input.max_results {
+            Some(requested) if requested > MAX_RESULTS => {
+                return Err(invalid_request(format!(
+                    "maxResults is at most {MAX_RESULTS}, but this request asks for {requested}."
+                )))
+            }
+            Some(requested) => requested as usize,
+            None => MAX_RESULTS as usize,
+        };
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => crate::state::BatchCursor::decode(token).ok_or_else(invalid_token)?,
+            None => crate::state::BatchCursor::START,
+        };
+        if cursor.entry >= input.entries.len() {
+            return Err(invalid_token());
+        }
+
+        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let mut error_entries = Vec::new();
+        let mut success_entries = Vec::new();
+        let mut skipped_entries = Vec::new();
+        let mut next_token = None;
+        // The budget this response has left, in data points. An entry that fails to
+        // resolve spends none of it: it reports an error rather than a result.
+        let mut remaining = max_results;
+
+        for (at, entry) in input.entries.iter().enumerate() {
+            // The same entry resolves the same way on every page, so an entry a
+            // previous page already finished is recognised without storing anything
+            // about that page beyond the cursor.
+            let resolved = resolve_entry(&store, entry);
+
+            if at < cursor.entry {
+                // "entries that were not processed by this batch request, because
+                // these entries had been completely processed by previous paginated
+                // requests."
+                skipped_entries.push(BatchGetAssetPropertyValueHistorySkippedEntry {
+                    entry_id: entry.entry_id.clone(),
+                    completion_status: if resolved.is_ok() {
+                        COMPLETION_SUCCESS
+                    } else {
+                        COMPLETION_ERROR
+                    }
+                    .to_string(),
+                    error_info: resolved.as_ref().err().map(|(code, _)| {
+                        BatchGetAssetPropertyValueHistoryErrorInfo {
+                            error_code: (*code).to_string(),
+                            error_timestamp: crate::state::to_date_time(now),
+                        }
+                    }),
+                });
+                continue;
+            }
+
+            let (stream, query) = match resolved {
+                Ok(resolved) => resolved,
+                Err((code, message)) => {
+                    error_entries.push(BatchGetAssetPropertyValueHistoryErrorEntry {
+                        error_code: code.to_string(),
+                        error_message: message,
+                        entry_id: entry.entry_id.clone(),
+                    });
+                    continue;
+                }
+            };
+
+            let history = crate::state::history_values(&store, &stream, &query);
+            // The first entry of a resumed page starts where the previous one
+            // stopped; every later entry starts at its first data point.
+            let from = if at == cursor.entry {
+                // A resume point past the end of this entry's answer is a token this
+                // request's entries cannot have produced, so it is refused rather
+                // than clamped: a clamped offset would silently repeat or drop data
+                // points. A series trimmed at `MAX_SAMPLES_PER_SERIES` between two
+                // pages can also land here, and refusing is the right answer for that
+                // too — the enumeration the token named no longer exists.
+                if cursor.value > history.len() {
+                    return Err(invalid_token());
+                }
+                cursor.value
+            } else {
+                0
+            };
+            let available = history.len() - from;
+
+            if available > remaining {
+                // This entry still has data points the budget cannot carry, so the
+                // page ends inside it and `nextToken` names where to resume.
+                if remaining > 0 {
+                    success_entries.push(BatchGetAssetPropertyValueHistorySuccessEntry {
+                        entry_id: entry.entry_id.clone(),
+                        asset_property_value_history: history[from..from + remaining].to_vec(),
+                    });
+                }
+                next_token = Some(
+                    crate::state::BatchCursor {
+                        entry: at,
+                        value: from + remaining,
+                    }
+                    .encode(),
+                );
+                break;
+            }
+
+            remaining -= available;
+            // An entry whose property holds no sample in the queried window still gets
+            // a success entry, with an empty `assetPropertyValueHistory`: the entry WAS
+            // processed, and reporting it as an error would claim a failure that did
+            // not happen.
+            success_entries.push(BatchGetAssetPropertyValueHistorySuccessEntry {
+                entry_id: entry.entry_id.clone(),
+                asset_property_value_history: history[from..].to_vec(),
+            });
+        }
+
+        Ok(BatchGetAssetPropertyValueHistoryOutput {
+            error_entries,
+            success_entries,
+            skipped_entries,
+            // "The token for the next set of results, or null if there are no
+            // additional results."
+            next_token,
+        })
     }
+}
+
+/// How many entries one request carries, from the model doc on
+/// `BatchGetAssetPropertyValueHistoryRequest$entries`: "You can specify up to 16
+/// entries per request."
+const MAX_ENTRIES: usize = 16;
+
+/// The ceiling on `maxResults`, and the data-point budget a request that names
+/// none gets, from the model doc on
+/// `BatchGetAssetPropertyValueHistoryRequest$maxResults`: "The maximum value of
+/// maxResults is 20000."
+///
+/// The other documented stop — "the size of the result set is equal to 4 MB" — is
+/// a response-size bound this emulator does not model, the same reading
+/// `GetAssetPropertyValueHistory` takes of the identical sentence on its own
+/// member.
+const MAX_RESULTS: i32 = 20_000;
+
+/// `BatchEntryCompletionStatus` value a skipped entry that resolves reports.
+const COMPLETION_SUCCESS: &str = "SUCCESS";
+
+/// `BatchEntryCompletionStatus` value a skipped entry that does not resolve
+/// reports.
+const COMPLETION_ERROR: &str = "ERROR";
+
+/// `BatchGetAssetPropertyValueHistoryErrorCode` value for an entry naming no
+/// stored data stream.
+const ERROR_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// `BatchGetAssetPropertyValueHistoryErrorCode` value for an entry whose own
+/// members cannot be answered as written.
+const ERROR_INVALID_REQUEST: &str = "InvalidRequestException";
+
+/// Resolve one entry to the stored data stream it names and the history query it
+/// asks of that stream, or to the
+/// `BatchGetAssetPropertyValueHistoryErrorCode` and message the entry should
+/// report.
+///
+/// Every check lives here, so an entry is judged identically whether this page
+/// answers it (an error entry) or a previous page already did (a skipped entry
+/// carrying the same code).
+fn resolve_entry<'a>(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    entry: &'a BatchGetAssetPropertyValueHistoryEntry,
+) -> Result<(crate::state::SeriesKey, crate::state::HistoryQuery<'a>), (&'static str, String)> {
+    // A stream is named either by the asset and property ids of the property it is
+    // associated with or by its alias; exactly one of the two forms identifies it.
+    let stream = match (
+        entry.asset_id.as_deref(),
+        entry.property_id.as_deref(),
+        entry.property_alias.as_deref(),
+    ) {
+        (Some(asset_label), Some(property_id), None) => {
+            // The shared resolver every other handler uses, so one asset is named
+            // one way across the service.
+            let asset_id = store.resolve_asset_id(asset_label).ok_or_else(|| {
+                (
+                    ERROR_NOT_FOUND,
+                    crate::state::not_found_message(crate::state::RESOURCE_ASSET, asset_label),
+                )
+            })?;
+            let has_property = store.assets.get(&asset_id).is_some_and(|asset| {
+                asset
+                    .properties
+                    .iter()
+                    .any(|property| property.id == property_id)
+            });
+            if !has_property {
+                return Err((
+                    ERROR_NOT_FOUND,
+                    format!("The asset {asset_label} has no property {property_id}."),
+                ));
+            }
+            crate::state::SeriesKey::Property(asset_id, property_id.to_string())
+        }
+        // An alias names ONE data stream, whether an asset property is associated
+        // with it or not: the shared resolver reaches the property's stream, or the
+        // disassociated one standing under that alias.
+        (None, None, Some(alias)) => store.resolve_alias_series(alias).ok_or_else(|| {
+            (
+                ERROR_NOT_FOUND,
+                crate::state::not_found_message(crate::state::RESOURCE_TIME_SERIES, alias),
+            )
+        })?,
+        _ => {
+            return Err((
+                ERROR_INVALID_REQUEST,
+                "Each entry must specify either assetId and propertyId, or propertyAlias."
+                    .to_string(),
+            ))
+        }
+    };
+
+    // Every catalogue checked below is the GENERATED one from the model
+    // (`super::types`), so a hand-kept copy cannot drift from the enum the model
+    // declares.
+    //
+    // `Qualities` is modelled with length 1..1, so the runtime already refuses a
+    // list of any other length; an entry that names none asks for every sample,
+    // since a history read reports the samples themselves.
+    match entry.qualities.as_deref() {
+        None | Some([]) => {}
+        Some([only]) => {
+            if !QUALITY_VALUES.contains(&only.as_str()) {
+                return Err((
+                    ERROR_INVALID_REQUEST,
+                    format!(
+                        "The quality {only} is none of {}.",
+                        crate::state::catalog_names(QUALITY_VALUES.iter().copied())
+                    ),
+                ));
+            }
+        }
+        Some(many) => {
+            return Err((
+                ERROR_INVALID_REQUEST,
+                format!(
+                    "An entry filters on exactly one quality, but this one names {}.",
+                    many.len()
+                ),
+            ))
+        }
+    }
+
+    // ASCENDING is the documented default for the member; anything the generated
+    // `TimeOrdering` catalogue does not name is refused.
+    let descending = match entry.time_ordering.as_deref() {
+        None => false,
+        Some(asked) if TIME_ORDERING_VALUES.contains(&asked) => asked == ORDER_DESCENDING,
+        Some(other) => {
+            return Err((
+                ERROR_INVALID_REQUEST,
+                format!(
+                    "The timeOrdering {other} is none of {}.",
+                    crate::state::catalog_names(TIME_ORDERING_VALUES.iter().copied())
+                ),
+            ))
+        }
+    };
+
+    // The window is checked by the one constructor that can build a query, so a
+    // range whose end precedes its start cannot reach the series.
+    let query = crate::state::HistoryQuery::new(
+        entry.start_date.as_ref(),
+        entry.end_date.as_ref(),
+        entry.qualities.as_deref(),
+        descending,
+    )
+    .ok_or((
+        ERROR_INVALID_REQUEST,
+        "endDate must not precede startDate.".to_string(),
+    ))?;
+
+    Ok((stream, query))
+}
+
+/// The `TimeOrdering` value that reports the newest sample first. Source:
+/// `smithy_query(query="shape", shape="TimeOrdering")` — ASCENDING | DESCENDING,
+/// with ASCENDING the documented default.
+const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued
+/// for these entries.
+fn invalid_token() -> BatchGetAssetPropertyValueHistoryError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> BatchGetAssetPropertyValueHistoryError {
+    BatchGetAssetPropertyValueHistoryError::Modeled(
+        BatchGetAssetPropertyValueHistoryErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
 }

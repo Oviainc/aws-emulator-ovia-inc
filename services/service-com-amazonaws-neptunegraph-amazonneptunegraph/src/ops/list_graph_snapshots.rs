@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGraphSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGraphSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGraphSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the stored snapshots of the Region the request was signed
+//! for, narrowed to one source graph when the request names one.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGraphSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGraphSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGraphSnapshots"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGraphSnapshotsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not issue names no page, so it is refused rather
+        // than treated as the start of the listing. This operation models
+        // `ValidationException`, so the refusal is that modelled 400.
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListGraphSnapshotsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "nextToken '{token}' is not a pagination token this service issued"
+                    ),
+                    reason: Some("ILLEGAL_ARGUMENT".to_string()),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+
+        // A snapshot lives in exactly one Region, so this listing reports the snapshots
+        // of the Region the request was signed for and no others.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // Reporting only (`@readonly`): the sole write is materialising the CREATING ->
+        // AVAILABLE transitions the clock already made due.
+        store.settle_all(now);
+
+        // `graphIdentifier` is optional: absent, the listing spans every snapshot of
+        // the Region; present, it has to name a graph of this Region, because a listing
+        // of the snapshots of a graph that does not exist is a failed lookup rather
+        // than an empty page.
+        let of_graph = match input.graph_identifier.as_deref() {
+            Some(identifier) => {
+                let Some(graph) = store.settled_graph(identifier, &region, now) else {
+                    return Err(ListGraphSnapshotsErrorModeled::ResourceNotFoundException(
+                        crate::state::graph_not_found(identifier),
+                    )
+                    .into());
+                };
+                Some(graph.id.clone())
+            }
+            None => None,
+        };
+
+        // `snapshots` is a BTreeMap, so one stable total order underlies every page and
+        // a token can name a position in it.
+        let mut remaining = store.snapshots_in(&region, of_graph.as_deref(), start_after.as_deref());
+        let graph_snapshots: Vec<GraphSnapshotSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(GraphSnapshotSummary::from)
+            .collect();
+        // A token only when snapshots remain, and it resumes after the last one
+        // reported, so a resumed page returns the remainder without repeats.
+        let next_token = if remaining.next().is_some() {
+            graph_snapshots
+                .last()
+                .map(|summary| encode_page_token(&summary.id))
+        } else {
+            None
+        };
+
+        Ok(Self::Output {
+            graph_snapshots,
+            next_token,
+        })
     }
 }
+
+/// The page size when `maxResults` is absent: the largest the member allows
+/// (`smithy_query(query="operation",operation="ListGraphSnapshots")` -> `maxResults`
+/// range 1..100), so an unpaginated caller sees as much as one page can carry.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// A pagination token naming the last snapshot id of the page just returned. Hex keeps
+/// the token opaque to a client and within `PaginationToken`'s 1..8192 length, the same
+/// encoding `ListGraphs` pages its own id space with.
+fn encode_page_token(last_returned_id: &str) -> String {
+    hex::encode(last_returned_id)
+}
+
+/// The snapshot id a token resumes after, or `None` when the token is not one
+/// [`encode_page_token`] produced.
+///
+/// A decoded value that does not name a position in the snapshot-id space (the modelled
+/// `SnapshotId` pattern) is rejected rather than treated as the start of the list.
+/// Membership in the store is deliberately NOT required: a snapshot deleted between two
+/// pages must still leave its successors reachable, which is what resuming from a
+/// position, rather than from a row, gives.
+fn decode_page_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    crate::state::is_snapshot_id(&decoded).then_some(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_page_token, encode_page_token};
+
+    /// A token round-trips to the id it was minted from, and a token this service never
+    /// issued is rejected rather than silently treated as the first page.
+    #[test]
+    fn page_tokens_round_trip_and_reject_foreign_tokens() {
+        for id in ["gs-0000000000", "gs-abcdefghij", "gs-zz99zz99zz"] {
+            let token = encode_page_token(id);
+            let decoded = decode_page_token(&token);
+            assert_eq!(
+                decoded.as_deref(),
+                Some(id),
+                "case {id:?}: token {token:?} did not round-trip, got {decoded:?}"
+            );
+        }
+        for foreign in [
+            "not-a-token",
+            "zz",
+            "abc",
+            // Decodes cleanly, but names no position in the snapshot-id space.
+            &hex::encode("not-a-snapshot-id"),
+            &hex::encode("gs-short"),
+            // A graph id is a position in the OTHER id space.
+            &hex::encode("g-0123456789"),
+        ] {
+            let decoded = decode_page_token(foreign);
+            assert!(
+                decoded.is_none(),
+                "case {foreign:?}: expected rejection, got {decoded:?}"
+            );
+        }
+    }
+}
+

@@ -206,6 +206,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
+        // The `tags` a create carries are held to the same AWS tag rules as a
+        // later `TagResource` write (`crate::state::tag_map_breach`), so a
+        // create cannot store a tag the tagging path would refuse. `TagKey` and
+        // `TagValue` carry lengths and no pattern, so the handler is where the
+        // rules are applied.
+        if let Some(breach) = input.tags.as_ref().and_then(crate::state::tag_map_breach) {
+            return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "tags",
+                    &breach.reason(),
+                )),
+            })
+            .into());
+        }
+
         // "You must specify a single-element list containing one customPlugin
         // object" — the `plugins` member's own documentation. The model declares
         // no list length, so the framework cannot refuse this one.

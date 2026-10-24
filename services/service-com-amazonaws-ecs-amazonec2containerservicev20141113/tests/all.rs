@@ -31,6 +31,8 @@ mod container_instances;
 mod ecs_wire;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/list_service_deployments.rs"]
+mod list_service_deployments;
 #[path = "all/list_services.rs"]
 mod list_services;
 #[path = "all/list_task_definitions.rs"]

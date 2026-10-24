@@ -288,6 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "RouteKey is part of quick create and requires a Target.",
             ));
         }
+        // A CORS document the api could never serve is refused rather than stored (see
+        // `crate::state::validate_cors_configuration`).
+        if let Some(cors) = input.cors_configuration.as_ref() {
+            if let Err(message) = crate::state::validate_cors_configuration(cors) {
+                return Err(bad_request(&message));
+            }
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator: the router builds one shared
@@ -389,9 +396,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::Integration {
                     integration_id: integration_id.clone(),
                     integration_type: if is_function_arn {
-                        AWS_PROXY_INTEGRATION_TYPE
+                        crate::state::AWS_PROXY_INTEGRATION_TYPE
                     } else {
-                        HTTP_PROXY_INTEGRATION_TYPE
+                        crate::state::HTTP_PROXY_INTEGRATION_TYPE
                     }
                     .to_string(),
                     // The target IS the integration's endpoint: "For a Lambda
@@ -415,9 +422,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // Lambda proxy carries the later of the two values it supports.
                     payload_format_version: Some(
                         if is_function_arn {
-                            LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION
+                            crate::state::LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION
                         } else {
-                            ONLY_PAYLOAD_FORMAT_VERSION
+                            crate::state::ONLY_PAYLOAD_FORMAT_VERSION
                         }
                         .to_string(),
                     ),
@@ -523,23 +530,5 @@ const DEFAULT_ROUTE_KEY: &str = "$default";
 /// not: the one thing that tells quick create's two documented forms of `Target`
 /// apart ("For HTTP integrations, specify a fully qualified URL. For Lambda
 /// integrations, specify a function ARN", `CreateApi$Target`).
-const ARN_SCHEME_PREFIX: &str = "arn:";
+pub(crate) const ARN_SCHEME_PREFIX: &str = "arn:";
 
-/// The `IntegrationType` quick create gives a `Target` that is a function ARN, from
-/// `INTEGRATION_TYPE_VALUES`: "The type of the integration will be HTTP_PROXY or
-/// AWS_PROXY, respectively" (`CreateApi$Target`).
-const AWS_PROXY_INTEGRATION_TYPE: &str = "AWS_PROXY";
-
-/// The `IntegrationType` quick create gives a `Target` that is a fully qualified URL
-/// (`CreateApi$Target`, as above).
-const HTTP_PROXY_INTEGRATION_TYPE: &str = "HTTP_PROXY";
-
-/// The later of the two `PayloadFormatVersion` values a Lambda proxy integration
-/// supports: "Supported values for Lambda proxy integrations are 1.0 and 2.0"
-/// (`Integration$PayloadFormatVersion`).
-const LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION: &str = "2.0";
-
-/// The one `PayloadFormatVersion` every other integration type supports: "For all
-/// other integrations, 1.0 is the only supported value"
-/// (`Integration$PayloadFormatVersion`).
-const ONLY_PAYLOAD_FORMAT_VERSION: &str = "1.0";

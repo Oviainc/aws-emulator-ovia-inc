@@ -1527,6 +1527,59 @@ pub fn validate_tag_merge(
     Ok(())
 }
 
+/// The request member a tag REMOVAL names its keys in — `tagKeys` on `UntagResource`
+/// (`smithy_query(query="operation", operation="UntagResource")`), the removal's
+/// counterpart to [`TAGS_PARAMETER`].
+pub const TAG_KEYS_PARAMETER: &str = "tagKeys";
+
+/// Refuse a tag-key list that names a key AWS's platform-wide tagging rules do not let a
+/// caller hold, with the modelled `InvalidParameterException` (HTTP 431) naming the
+/// [`TAG_KEYS_PARAMETER`] member.
+///
+/// The REMOVAL counterpart of [`validate_tags`]: one set of rules decides which keys are
+/// a caller's, so a key a caller may not set is a key it may not remove either — a key in
+/// the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace in any letter case
+/// ([`is_reserved_tag_key`]), which names a tag AWS itself maintains, or a key past
+/// [`TAG_KEY_CHARS`]'s ceiling, which no tag of a resource can be spelled with. The floor
+/// on a key and the length of the list are MODELLED (`smithy_query(query="shape",
+/// shape="TagKeys")` — a `0..500` list of `length min 1` members), so the boundary
+/// validator has already refused an empty key and an over-long list before this runs.
+///
+/// Judged from the request alone, before any ARN is resolved and before anything is
+/// removed, so one illegal key costs the whole call and every tag stays as it was —
+/// including the keys of the same request that ARE the caller's to remove. Keys are
+/// walked in the order the request wrote them, so the same list is always refused for the
+/// same reason.
+///
+/// The status (431) and the error code are the contract; the text names the member and the
+/// constraint it failed, built from the request.
+pub fn validate_tag_keys(keys: &[String]) -> Result<(), InvalidParameterException> {
+    let (_, max_key) = TAG_KEY_CHARS;
+    for key in keys {
+        if is_reserved_tag_key(key) {
+            return Err(invalid_parameter(
+                TAG_KEYS_PARAMETER,
+                format!(
+                    "Tag key '{key}' at '{TAG_KEYS_PARAMETER}' uses the reserved \
+                     '{RESERVED_TAG_KEY_PREFIX}' prefix, whose tags only AWS may change."
+                ),
+            ));
+        }
+        let key_chars = key.chars().count();
+        if key_chars > max_key {
+            return Err(invalid_parameter(
+                TAG_KEYS_PARAMETER,
+                format!(
+                    "Tag key '{key}' at '{TAG_KEYS_PARAMETER}' is {key_chars} characters long; a \
+                     tag key must be at most {max_key} characters."
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// The message every operation addressed at a config by its `(configType, configId)`
 /// pair carries when that pair names no config — built from the two `@httpLabel`
 /// members of the request, id before type, which is the rule the recorded corpus shows

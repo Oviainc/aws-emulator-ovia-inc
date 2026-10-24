@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKeyRotationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKeyRotationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKeyRotationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +198,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKeyRotationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKeyRotationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKeyRotationStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetKeyRotationStatusErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // A REPORTING operation: it reads the key's rotation schedule and writes
+        // nothing, so two reads of an untouched key answer the same.
+        let state = state.lock();
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::MalformedArn => {
+                return Err(GetKeyRotationStatusErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(GetKeyRotationStatusErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Every key has a rotation status, including one whose automatic rotation
+        // could never be enabled: this operation "provides detailed information about
+        // the rotation status for a KMS key", so a key that carries no schedule is
+        // reported as not rotating rather than refused. The key state cases the doc
+        // names are values too, not errors — a disabled key keeps the status it had,
+        // and a key awaiting deletion reports none; both follow from
+        // `reported_rotation_schedule`.
+        let schedule = key.reported_rotation_schedule();
+
+        Ok(GetKeyRotationStatusOutput {
+            key_rotation_enabled: schedule.is_some(),
+            // KMS answers with the key ARN, not the identifier the request used — the
+            // way every other operation in this service reports the key it acted on.
+            key_id: Some(key.arn.clone()),
+            // The period and the next rotation date describe a schedule, so they are
+            // reported exactly when there is one, and both are read from it: the
+            // period the schedule was configured with, and the instant one period
+            // after the call that configured it.
+            rotation_period_in_days: schedule.map(|schedule| schedule.period_in_days),
+            next_rotation_date: schedule
+                .map(|schedule| crate::state::date_time(schedule.next_rotation_date())),
+            // "Identifies the date and time that an IN PROGRESS on-demand rotation
+            // was initiated ... once the on-demand rotation is complete, KMS removes
+            // this field from the response": `RotateKeyOnDemand` here completes the
+            // rotation it performs before it answers, so no key ever has one in
+            // progress and no start date is manufactured for a completed one. The
+            // dates of completed rotations are what `ListKeyRotations` reports.
+            on_demand_rotation_start_date: None,
+        })
     }
 }

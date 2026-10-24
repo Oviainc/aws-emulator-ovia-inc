@@ -135,12 +135,44 @@ impl Outposts {
         path: &str,
         body: Option<&Value>,
     ) -> Reply {
+        self.dispatch(Some(region), method, path, body).await
+    }
+
+    /// The same, with NO `Authorization` header at all — an anonymous call, which
+    /// carries no credential scope for the service to read a region from.
+    pub(crate) async fn call_unsigned(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Reply {
+        self.dispatch(None, method, path, body).await
+    }
+
+    /// Dispatch one restJson1 request whose credential scope names `scope`, or that
+    /// carries no `Authorization` header at all for `None`.
+    async fn dispatch(
+        &self,
+        scope: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Reply {
         let payload = body.map(Value::to_string).unwrap_or_default();
-        let request = http::Request::builder()
+        // The host names a region too, but what the service reads is the credential
+        // scope; an unsigned call is addressed to the host every SDK default would
+        // resolve to.
+        let host_region = scope.unwrap_or(HOME_REGION);
+        let mut builder = http::Request::builder()
             .method(method)
-            .uri(format!("https://outposts.{region}.amazonaws.com{path}"))
-            .header("content-type", "application/json")
-            .header("authorization", authorization(region))
+            .uri(format!(
+                "https://outposts.{host_region}.amazonaws.com{path}"
+            ))
+            .header("content-type", "application/json");
+        if let Some(region) = scope {
+            builder = builder.header("authorization", authorization(region));
+        }
+        let request = builder
             .body(bytes::Bytes::from(payload))
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
@@ -199,7 +231,23 @@ impl Outposts {
 
     /// `CreateSite`, returning the `Site` it answered with.
     pub(crate) async fn create_site(&self, request: &Value) -> Value {
-        self.ok("POST", "/sites", Some(request)).await["Site"].clone()
+        self.create_site_in(HOME_REGION, request).await
+    }
+
+    /// `CreateSite` addressed to `region`, returning the `Site` it answered with.
+    ///
+    /// A site belongs to the region it was created in, so a case that works in
+    /// another region creates its site there too — an Outpost can only be placed on
+    /// a site of its own region.
+    pub(crate) async fn create_site_in(&self, region: &str, request: &Value) -> Value {
+        self.ok_in(region, "POST", "/sites", Some(request)).await["Site"].clone()
+    }
+
+    /// A site created in `region` and named `name`, as its `SiteId` — what a case
+    /// that places Outposts in `region` names in `SiteId`.
+    pub(crate) async fn site_id_in(&self, region: &str, name: &str) -> String {
+        let site = self.create_site_in(region, &json!({ "Name": name })).await;
+        text(&site, "SiteId")
     }
 
     /// `CreateOutpost`, returning the `Outpost` it answered with.
@@ -240,19 +288,44 @@ impl Outposts {
 
     /// `GetOutpost`, returning the `Outpost` it answered with.
     pub(crate) async fn get_outpost(&self, identifier: &str) -> Value {
-        self.ok("GET", &format!("/outposts/{}", segment(identifier)), None)
-            .await["Outpost"]
+        self.get_outpost_in(HOME_REGION, identifier).await
+    }
+
+    /// `GetOutpost` addressed to `region`, returning the `Outpost` it answered with.
+    /// An Outpost is only readable through the region it was created in.
+    pub(crate) async fn get_outpost_in(&self, region: &str, identifier: &str) -> Value {
+        self.ok_in(
+            region,
+            "GET",
+            &format!("/outposts/{}", segment(identifier)),
+            None,
+        )
+        .await["Outpost"]
             .clone()
     }
 
     /// `ListOutposts` with the given query string, returning the whole output.
     pub(crate) async fn list_outposts(&self, query: &str) -> Value {
-        self.ok("GET", &format!("/outposts{query}"), None).await
+        self.list_outposts_in(HOME_REGION, query).await
+    }
+
+    /// `ListOutposts` addressed to `region`, returning the whole output — that
+    /// region's own inventory.
+    pub(crate) async fn list_outposts_in(&self, region: &str, query: &str) -> Value {
+        self.ok_in(region, "GET", &format!("/outposts{query}"), None)
+            .await
     }
 
     /// `ListSites` with the given query string, returning the whole output.
     pub(crate) async fn list_sites(&self, query: &str) -> Value {
-        self.ok("GET", &format!("/sites{query}"), None).await
+        self.list_sites_in(HOME_REGION, query).await
+    }
+
+    /// `ListSites` addressed to `region`, returning the whole output — that region's
+    /// own inventory.
+    pub(crate) async fn list_sites_in(&self, region: &str, query: &str) -> Value {
+        self.ok_in(region, "GET", &format!("/sites{query}"), None)
+            .await
     }
 
     /// Dispatch every [`Refusal`] in a table and require the status and wire error

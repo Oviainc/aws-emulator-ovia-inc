@@ -795,6 +795,18 @@ pub const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another ac
      this is an organization account, request the management account to enable service \
      access.";
 
+/// Whether `account_id` — an id a request named, or the account field of an ARN it carried
+/// — names an account OTHER than the one this service answers for.
+///
+/// This emulator presents exactly one standalone account ([`engine::emulator_account_id`])
+/// and records no organization, so a resource owned by any other account is one no request
+/// can be answered about: a reader refuses it with [`CROSS_ACCOUNT_MESSAGE`] rather than
+/// resolving an answer under that other account. ONE test for the whole crate, so an
+/// account id and the account field of an ARN are judged by the same rule.
+pub fn is_foreign_account(account_id: &str) -> bool {
+    account_id != ::engine::emulator_account_id()
+}
+
 /// The account whose analysis a read request asks about — the one id `accountIds` carries,
 /// or the caller's own account when it carries none — or, as `Err`, why the request cannot
 /// be answered at all.
@@ -829,7 +841,7 @@ pub fn requested_account_id(account_ids: Option<&[String]>) -> Result<String, St
              12-digit Amazon Web Services account ID."
         ));
     }
-    if account_id != ::engine::emulator_account_id() {
+    if is_foreign_account(account_id) {
         return Err(CROSS_ACCOUNT_MESSAGE.to_string());
     }
     Ok(account_id.clone())
@@ -854,7 +866,10 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// read: the account that owns the resource and the `ResourceType` it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedResourceArn<'a> {
-    /// The ARN's account-id field, which an `AccountId`-scoped preference must match.
+    /// The ARN's account-id field: the account that owns the resource. A reader compares it
+    /// with the account this service answers for ([`is_foreign_account`]) and refuses an
+    /// ARN naming any other account's resource; it is never what an `AccountId`-scoped
+    /// preference is matched against, because only this account's resources are resolved.
     pub account_id: &'a str,
     /// The `ResourceType` the ARN names.
     pub resource_type: &'static str,
@@ -5723,12 +5738,21 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 
     /// The stored records that apply to `resource_arn`, MOST SPECIFIC FIRST, so a caller
     /// resolving an effective value takes the first record that sets the field it wants.
+    ///
+    /// The ACCOUNT whose account-level records apply is the one this service answers for
+    /// ([`engine::emulator_account_id`]), never the ARN's own account field: a resource of
+    /// any other account is refused by the reader that took the ARN
+    /// ([`is_foreign_account`]), so a record scoped to another account applies to nothing.
     pub fn records_applying_to(
         &self,
         resource_arn: &str,
         arn: ParsedResourceArn<'_>,
     ) -> Vec<&PreferenceRecord> {
-        self.records_applying_to_resource(resource_arn, arn.resource_type, arn.account_id)
+        self.records_applying_to_resource(
+            resource_arn,
+            arn.resource_type,
+            ::engine::emulator_account_id(),
+        )
     }
 
     /// The stored records that apply to one resource of `resource_type` owned by
@@ -6017,12 +6041,20 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// The ONE resolution in this service: `GetEffectiveRecommendationPreferences` reports
     /// it and every recommendation reader states the preferences it was generated under
     /// from it, so the two cannot disagree.
+    ///
+    /// The account-level records considered are those of the account this service answers
+    /// for ([`engine::emulator_account_id`]), not of the ARN's own account field — see
+    /// [`records_applying_to`](Self::records_applying_to).
     pub fn effective_preferences(
         &self,
         resource_arn: &str,
         arn: ParsedResourceArn<'_>,
     ) -> EffectivePreferences {
-        self.effective_preferences_for(resource_arn, arn.resource_type, arn.account_id)
+        self.effective_preferences_for(
+            resource_arn,
+            arn.resource_type,
+            ::engine::emulator_account_id(),
+        )
     }
 
     /// The preferences in force for one resource of `resource_type` owned by `account_id` —

@@ -24,10 +24,14 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The account that owns every resource the suites name. A `Scope` of `AccountId` must be
-/// a 12-digit account id (the model's `Scope$value` doc), and an account-level preference
-/// applies to the resources of that account.
-pub(crate) const ACCOUNT: &str = "111122223333";
+/// The one account this service answers for, and so the account that owns every resource
+/// the suites name: this emulator presents exactly ONE standalone account
+/// (`engine::emulator_account_id`) and records no organization, so a request naming another
+/// account's resource — in `accountIds`, in a resource ARN, or in an `AccountId` scope — is
+/// refused rather than answered. A `Scope` of `AccountId` must be a 12-digit account id
+/// (the model's `Scope$value` doc), and an account-level preference applies to the resources
+/// of that account.
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// An EC2 instance ARN — one of the two ARN forms the preference API accepts.
 pub(crate) fn instance_arn(instance_id: &str) -> String {

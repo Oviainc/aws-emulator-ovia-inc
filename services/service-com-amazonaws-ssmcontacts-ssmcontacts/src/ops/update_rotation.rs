@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rotation.contact_ids = contact_ids.clone();
         }
         if let Some(start_time) = input.start_time {
-            rotation.start_time = Some(start_time);
+            rotation.start_time = start_time;
         }
         if let Some(time_zone_id) = &input.time_zone_id {
             rotation.time_zone_id = time_zone_id.clone();

@@ -197,6 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             site_id,
             crate::state::SiteRecord {
                 sequence,
+                // The site belongs to the region this request was addressed to: the
+                // one its ARN names, and the only one it is reachable through.
+                region,
                 site: site.clone(),
                 operating_address: input.operating_address,
                 shipping_address: input.shipping_address,

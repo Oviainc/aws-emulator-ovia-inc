@@ -130,6 +130,8 @@ pub const SERVICE_DEPENDENTS_TOKEN_TAG: &str = "service-dependents/1/";
 pub const AUDIT_FINDINGS_TOKEN_TAG: &str = "audit-findings/1/";
 /// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServices`.
 pub const SERVICES_TOKEN_TAG: &str = "services/1/";
+/// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListEntityEvents`.
+pub const ENTITY_EVENTS_TOKEN_TAG: &str = "entity-events/1/";
 /// [`SERVICE_OPERATIONS_TOKEN_TAG`], for `ListServiceStates`.
 pub const SERVICE_STATES_TOKEN_TAG: &str = "service-states/1/";
 
@@ -1069,19 +1071,34 @@ pub const ENTITY_TYPES: [&str; 5] = [
 /// pins the entity down ([`attributes_contain`]).
 ///
 /// Shared so the reads that take this member as the entity to report on — `GetService`,
-/// `ListServiceOperations`, `ListServiceDependencies` and `ListServiceDependents` — cannot
-/// disagree about which identities are serviceable. The member is NOT the same rule
+/// `ListServiceOperations`, `ListServiceDependencies`, `ListServiceDependents` and
+/// `ListEntityEvents` (whose `Entity` is "the entity for which to retrieve change events")
+/// — cannot disagree about which identities are serviceable. The member is NOT the same rule
 /// everywhere it appears: `ListServiceLevelObjectives` takes an OPTIONAL filter whose doc
 /// drops the "must specify" sentence, and an SLO's own `KeyAttributes` records the object
 /// the SLO relates to, so neither is an entity lookup.
 pub fn entity_identity_refusal(key_attributes: &HashMap<String, String>) -> Option<String> {
-    let clause = match key_attributes.get(TYPE_ATTRIBUTE) {
+    entity_identity_refusal_at(KEY_ATTRIBUTES_MEMBER_PATH, key_attributes)
+}
+
+/// [`entity_identity_refusal`], for an operation that takes the entity to report on under a
+/// DIFFERENTLY NAMED member: `ListEntityEvents` takes it as `Entity`
+/// ([`ENTITY_MEMBER_PATH`]).
+///
+/// The rule is the member's, not the name's, so it is one function; the NAME is a parameter
+/// because a refusal states the member the request carries, and naming a member the request
+/// never sent would leave a client with nothing to fix.
+pub fn entity_identity_refusal_at(
+    member_path: &str,
+    attributes: &HashMap<String, String>,
+) -> Option<String> {
+    let clause = match attributes.get(TYPE_ATTRIBUTE) {
         None => constraint_clause(
-            KEY_ATTRIBUTES_MEMBER_PATH,
+            member_path,
             &format!("Member must contain the entity type attribute '{TYPE_ATTRIBUTE}'"),
         ),
         Some(entity_type) if !ENTITY_TYPES.contains(&entity_type.as_str()) => constraint_clause(
-            &format!("{KEY_ATTRIBUTES_MEMBER_PATH}.{TYPE_ATTRIBUTE}"),
+            &format!("{member_path}.{TYPE_ATTRIBUTE}"),
             &format!(
                 "Member must satisfy enum value set: [{}]",
                 ENTITY_TYPES.join(", ")
@@ -1096,6 +1113,10 @@ pub fn entity_identity_refusal(key_attributes: &HashMap<String, String>) -> Opti
 /// casing this service's `ValidationException` envelope states a member with, as the
 /// framework-level refusal of the same member's modelled bounds already does.
 const KEY_ATTRIBUTES_MEMBER_PATH: &str = "keyAttributes";
+
+/// [`KEY_ATTRIBUTES_MEMBER_PATH`], for the `Entity` member `ListEntityEvents` takes the
+/// entity to report on under.
+pub const ENTITY_MEMBER_PATH: &str = "entity";
 
 /// Whether two `DependencyConfig`s name the same dependency. The shape carries no
 /// `PartialEq`, so the comparison is written out over its two members.
@@ -1311,9 +1332,11 @@ pub fn same_exclusion_window(left: &ExclusionWindow, right: &ExclusionWindow) ->
 ///
 /// The comparison is STRICT, because that is the rule the message states: a window whose
 /// start equals its end spans no time at all, so it is refused with the same wording as an
-/// inverted one rather than reporting over an empty period.
+/// inverted one rather than reporting over an empty period. It is made on the same instant
+/// key every window comparison in this module uses ([`instant_nanos`]), so a pair this
+/// refuses and a pair a projection reports over are ordered by one rule.
 pub fn time_range_refusal(start_time: &DateTime, end_time: &DateTime) -> Option<String> {
-    if start_time.as_secs_f64() < end_time.as_secs_f64() {
+    if instant_nanos(start_time) < instant_nanos(end_time) {
         return None;
     }
     Some(format!(
@@ -1455,12 +1478,14 @@ const STANDARD_METRICS: [(&str, &str); 3] = [
 /// environment it runs in, and the far end contributes either the remote service it is or
 /// the remote resource it identifies — which is why the two sides map the same attributes
 /// to different dimensions.
-const NEAR_END_DIMENSIONS: [(&str, &str); 2] =
-    [("Environment", "Environment"), ("Name", "Service")];
+const NEAR_END_DIMENSIONS: [(&str, &str); 2] = [
+    (ENVIRONMENT_ATTRIBUTE, "Environment"),
+    (NAME_ATTRIBUTE, "Service"),
+];
 
 /// [`NEAR_END_DIMENSIONS`], for the far end of a call.
 const FAR_END_DIMENSIONS: [(&str, &str); 3] = [
-    ("Name", "RemoteService"),
+    (NAME_ATTRIBUTE, "RemoteService"),
     ("ResourceType", "RemoteResourceType"),
     ("Identifier", "RemoteResourceIdentifier"),
 ];
@@ -1983,22 +2008,25 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// rather than re-derived, so the instant reported here is one `GetServiceLevelObjective`
     /// reports for the same SLO. Only an instant INSIDE the window counts: the window is the
     /// period the caller asks about, so a change before it is not news in it and a change
-    /// after it has not happened yet.
+    /// after it has not happened yet. The bounds are compared the way every window in this
+    /// module is ([`instant_nanos`]), so this read and `ListEntityEvents` cannot disagree
+    /// about whether a change falls inside one.
     fn last_changed_in_window(
         &self,
         identity: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
     ) -> Option<DateTime> {
+        let (window_start, window_end) = (instant_nanos(window_start), instant_nanos(window_end));
         self.slos
             .values()
             .filter(|slo| names_same_service(entity_of(slo).key_attributes.as_ref(), identity))
             .flat_map(|slo| [slo.created_time, slo.last_updated_time])
             .filter(|at| {
-                window_start.as_secs_f64() <= at.as_secs_f64()
-                    && at.as_secs_f64() <= window_end.as_secs_f64()
+                let at = instant_nanos(at);
+                window_start <= at && at <= window_end
             })
-            .max_by(|left, right| left.as_secs_f64().total_cmp(&right.as_secs_f64()))
+            .max_by_key(instant_nanos)
     }
 
     /// The state of each service this emulator observed over the window, as
@@ -2042,16 +2070,12 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                     self.last_changed_in_window(&summary.key_attributes, window_start, window_end)?;
                 Some(ServiceState {
                     attribute_filters: applied.clone(),
-                    latest_change_events: vec![ChangeEvent {
-                        timestamp: changed_at,
-                        account_id: ::engine::emulator_account_id().to_string(),
-                        region: region.to_string(),
-                        entity: summary.key_attributes.clone(),
-                        change_event_type: CONFIGURATION_CHANGE_EVENT.to_string(),
-                        event_id: UNRECORDED_EVENT_ID.to_string(),
-                        user_name: None,
-                        event_name: None,
-                    }],
+                    latest_change_events: vec![change_event(
+                        changed_at,
+                        &summary.key_attributes,
+                        region,
+                        None,
+                    )],
                     service: summary.key_attributes,
                 })
             })
@@ -3462,5 +3486,217 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             ));
         }
         Some(removed)
+    }
+}
+
+// =============================================================================
+// The change events this service holds a record of for an entity
+// =============================================================================
+
+/// The [`ENTITY_TYPES`] value designating a service entity — the kind of object an
+/// instrumentation configuration's `Service`/`Environment` pair names, and the `Type` of the
+/// service identity the member doc spells out: `{ "Type": "Service", "Name":
+/// "visits-service", "Environment": "petclinic-test" }` (same member doc).
+pub const SERVICE_ENTITY_TYPE: &str = "Service";
+
+/// The `EventName` of the event a stored SLO's `CreatedTime` is the record of.
+///
+/// `EventName` is "The name or description of this change event"
+/// (`smithy_query(query="doc", shape="ChangeEvent", member="EventName")`), so it says WHICH
+/// change the event reports. Each dated member a record carries is written by exactly one
+/// operation — `CreatedTime` by the create, `LastUpdatedTime` by the update — so naming that
+/// operation describes the change without claiming anything the record does not hold.
+const SLO_CREATED_EVENT_NAME: &str = "CreateServiceLevelObjective";
+
+/// [`SLO_CREATED_EVENT_NAME`], for the `LastUpdatedTime` of an SLO that has been updated
+/// since it was created.
+const SLO_UPDATED_EVENT_NAME: &str = "UpdateServiceLevelObjective";
+
+/// [`SLO_CREATED_EVENT_NAME`], for the `CreatedAt` of a stored instrumentation
+/// configuration.
+const INSTRUMENTATION_CREATED_EVENT_NAME: &str = "CreateInstrumentationConfiguration";
+
+/// The service entity an instrumentation configuration's `Service` and `Environment` name,
+/// as an `Attributes` identity.
+///
+/// A configuration is applied to the service it names in the environment it names, and that
+/// pair IS a service entity's identity in the form the `Entity` member documents (`{ "Type":
+/// "Service", "Name": …, "Environment": … }`), so the configuration's own record is what the
+/// identity is read from.
+pub fn service_entity_attributes(service: &str, environment: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (TYPE_ATTRIBUTE.to_string(), SERVICE_ENTITY_TYPE.to_string()),
+        (NAME_ATTRIBUTE.to_string(), service.to_string()),
+        (ENVIRONMENT_ATTRIBUTE.to_string(), environment.to_string()),
+    ])
+}
+
+/// One instant as a count of nanoseconds since the epoch, which is the precision a
+/// [`DateTime`] holds.
+///
+/// Instants are compared through this rather than through `DateTime::as_secs_f64`, whose
+/// resolution at present epoch values is around a hundred nanoseconds: the window bounds are
+/// INCLUSIVE, so a comparison that cannot tell two instants apart would make the bound
+/// approximate, and two distinct instants would order as equal.
+///
+/// The seconds and the nanoseconds within them are read through
+/// [`status_event_instant`], the module's one reader of an instant's parts, so a comparison
+/// here and the chronology a status-event token carries cannot disagree about what instant a
+/// `Timestamp` denotes.
+fn instant_nanos(at: &DateTime) -> i128 {
+    let (secs, subsec_nanos) = status_event_instant(at);
+    i128::from(secs) * i128::from(NANOS_PER_SECOND) + i128::from(subsec_nanos)
+}
+
+/// The Region a stored record was written in: the one its own ARN carries, read through
+/// `service_common::arn` so it comes out of the ARN's REGION field rather than out of a
+/// substring match.
+///
+/// `ChangeEvent.Region` is "The Amazon Web Services region where this change event
+/// occurred", and the change this event reports is the write of that record, so the Region
+/// is the record's own rather than the reader's. A record whose ARN carries no Region label
+/// falls back to the emulator's default Region, exactly as [`region_of`] does for a minted
+/// ARN.
+fn record_region(arn: &str) -> &str {
+    ::service_common::arn::region_of(arn, SIGNING_NAME).unwrap_or(DEFAULT_REGION)
+}
+
+/// One change event: the dated change `event_name` describes — nothing, where the record
+/// says only THAT it changed — to the entity `entity` identifies, in `region`.
+///
+/// The ONE place this service builds a [`ChangeEvent`], so the two reads that report one —
+/// `ListEntityEvents` through
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::entity_change_events`] and
+/// `ListServiceStates` through
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::observed_service_states`] —
+/// cannot differ on what an event of this emulator carries: the only kind of change it
+/// records ([`CONFIGURATION_CHANGE_EVENT`]), the documented id of an event it did not read
+/// off a CloudTrail record ([`UNRECORDED_EVENT_ID`]), and this store's account
+/// (`engine::emulator_account_id()`, the account every ARN it mints carries), in which the
+/// record the event is derived from is held. `UserName` ("the name of the user who initiated
+/// this change event, if available") stays absent, because no record this service keeps holds
+/// the identity that wrote it.
+fn change_event(
+    at: DateTime,
+    entity: &HashMap<String, String>,
+    region: &str,
+    event_name: Option<&str>,
+) -> ChangeEvent {
+    ChangeEvent {
+        timestamp: at,
+        account_id: ::engine::emulator_account_id().to_string(),
+        region: region.to_string(),
+        entity: entity.clone(),
+        change_event_type: CONFIGURATION_CHANGE_EVENT.to_string(),
+        event_id: UNRECORDED_EVENT_ID.to_string(),
+        user_name: None,
+        event_name: event_name.map(ToString::to_string),
+    }
+}
+
+impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// The change events this service holds a record of for the entity `entity` identifies,
+    /// as `ListEntityEvents` reports them: those whose instant falls in the requested period,
+    /// most recent first.
+    ///
+    /// A change event is a DATED CHANGE this emulator has a record of, and the records it
+    /// holds against an entity are the stored SLOs configured on it (dated by the
+    /// `CreatedTime` of the create and the `LastUpdatedTime` of an update that followed it)
+    /// and the instrumentation configurations applied to it (dated by their `CreatedAt`).
+    /// Each event is read out of one such record, so an event is reported exactly when the
+    /// store is evidence of the change it describes — and a record this service no longer
+    /// holds leaves no event behind, since the store keeps no tombstone for a deletion.
+    ///
+    /// The entity is matched the way every other entity read matches it ([`attributes_contain`]):
+    /// as few as one of an entity's up to four `Attributes` entries identifies it, so a
+    /// record matches when its own identity holds every entry the request named. The
+    /// REPORTED `Entity` is the record's identity rather than the request's, so a caller
+    /// that named an entity partially is told the full identity the change was recorded
+    /// against.
+    ///
+    /// The period is inclusive at both ends: an event at the instant the window begins or
+    /// ends falls within it. Nothing else bounds the set — a window entirely in the future
+    /// selects no event because no record is dated after now.
+    ///
+    /// The order is newest first, which is the order a history is read in, with the record's
+    /// ARN and the event's name breaking a tie between two events at the same instant: the
+    /// order has to be TOTAL for a page cursor into it to be a stable boundary.
+    ///
+    /// `ListServiceStates` reads the same SLO instants ([`Self::last_changed_in_window`]) but
+    /// answers a different question — the ONE latest change of each DISCOVERED service,
+    /// matching identities symmetrically ([`names_same_service`]) because the service it
+    /// reports is one this emulator discovered rather than one a request named — so neither
+    /// read can be expressed as the other; both build their event through [`change_event`],
+    /// which is where what an event of this emulator carries is stated once.
+    pub fn entity_change_events(
+        &self,
+        entity: &HashMap<String, String>,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<ChangeEvent> {
+        // `(instant, tie-break key, event)`: the sort key is kept beside the event rather
+        // than re-derived in the comparator, so the order cannot drift from the key.
+        let mut dated: Vec<(i128, String, ChangeEvent)> = Vec::new();
+        let (window_start, window_end) = (instant_nanos(window_start), instant_nanos(window_end));
+        let mut collect = |at: DateTime,
+                           attributes: &HashMap<String, String>,
+                           arn: &str,
+                           event_name: &str| {
+            let at_nanos = instant_nanos(&at);
+            if at_nanos < window_start || at_nanos > window_end {
+                return;
+            }
+            dated.push((
+                at_nanos,
+                format!("{arn}\u{1d}{event_name}"),
+                change_event(at, attributes, record_region(arn), Some(event_name)),
+            ));
+        };
+
+        for slo in self.slos.values() {
+            let Some(attributes) = entity_of(slo).key_attributes else {
+                continue;
+            };
+            // `ChangeEvent.Entity` is `@required` with `length 1..4`, so a record whose
+            // indicator names no entity at all is the record of a change to nothing and
+            // could not be reported: this guards the OUTPUT constraint, not the match.
+            if attributes.is_empty() || !attributes_contain(Some(&attributes), entity) {
+                continue;
+            }
+            collect(
+                slo.created_time,
+                &attributes,
+                &slo.arn,
+                SLO_CREATED_EVENT_NAME,
+            );
+            // A record that has never been updated carries its create instant in both
+            // members, which is ONE change, not two.
+            if instant_nanos(&slo.last_updated_time) > instant_nanos(&slo.created_time) {
+                collect(
+                    slo.last_updated_time,
+                    &attributes,
+                    &slo.arn,
+                    SLO_UPDATED_EVENT_NAME,
+                );
+            }
+        }
+
+        for (scope, set) in &self.instrumentation_configurations {
+            let attributes = service_entity_attributes(&scope.service, &scope.environment);
+            if !attributes_contain(Some(&attributes), entity) {
+                continue;
+            }
+            for stored in set.configurations.values() {
+                collect(
+                    stored.created_at,
+                    &attributes,
+                    &stored.arn,
+                    INSTRUMENTATION_CREATED_EVENT_NAME,
+                );
+            }
+        }
+
+        dated.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        dated.into_iter().map(|(_, _, event)| event).collect()
     }
 }
