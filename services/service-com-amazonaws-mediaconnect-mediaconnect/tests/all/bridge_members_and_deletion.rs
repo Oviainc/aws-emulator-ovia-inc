@@ -891,10 +891,11 @@ async fn delete_bridge_removes_the_bridge_from_the_store() {
 /// Put the stored bridge `arn` into `bridge_state`, the way the operation that moves a
 /// bridge into it would.
 ///
-/// The states no implemented operation reaches yet (UpdateBridgeState is still scaffolded)
-/// are still values of the modelled `BridgeState` enum a stored bridge can carry, so the
-/// table below covers the whole enum from the store rather than leaving most of it
-/// unasserted.
+/// UpdateBridgeState reaches the settled ones a caller asks for (ACTIVE, STANDBY, DELETED —
+/// see `tests/all/update_bridge_state.rs`, which drives the delete precondition below
+/// through it), but the rest are still values of the modelled `BridgeState` enum a stored
+/// bridge can carry, so the table below covers the whole enum from the store rather than
+/// leaving most of it unasserted.
 fn force_bridge_state(emulator: &Emulator, arn: &str, bridge_state: &str) {
     let state = emulator
         .engine
@@ -912,15 +913,13 @@ fn force_bridge_state(emulator: &Emulator, arn: &str, bridge_state: &str) {
 /// "Before you can delete a bridge, you must stop the bridge": every value of the
 /// modelled `BridgeState` enum (`smithy_query(query="shape",shape="BridgeState")`), and
 /// whether a bridge carrying it has been stopped. The states a bridge reaches by being
-/// STARTED — or while moving to or from being started — are the ones a delete refuses;
-/// `DELETING` and `DELETED` are named as literals because no handler of this crate
-/// produces them.
+/// STARTED — or while moving to or from being started — are the ones a delete refuses.
 const EVERY_BRIDGE_STATE: [(&str, bool); 12] = [
     (mc::BRIDGE_STATE_CREATING, true),
     (mc::BRIDGE_STATE_STANDBY, true),
     (mc::BRIDGE_STATE_START_FAILED, true),
-    ("DELETING", true),
-    ("DELETED", true),
+    (mc::BRIDGE_STATE_DELETING, true),
+    (mc::BRIDGE_STATE_DELETED, true),
     (mc::BRIDGE_STATE_STARTING, false),
     (mc::BRIDGE_STATE_START_PENDING, false),
     (mc::BRIDGE_STATE_DEPLOYING, false),
