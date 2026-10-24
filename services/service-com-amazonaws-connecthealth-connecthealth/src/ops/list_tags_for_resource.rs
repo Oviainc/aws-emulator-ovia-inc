@@ -156,7 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ListTagsForResource could not reach this service's store",
             ));
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the ARN has to name a resource of the
+        // Region the request was signed for.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -165,13 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly as it does for every other handler.
         store.purge_due_deletions(now);
 
-        // The ARN has to name a resource this service HOLDS — the same resolution
-        // `TagResource` applies to the same label. Reporting an empty map instead would
-        // answer "this resource exists and carries no tags" for a resource that does not
-        // exist. Holding the record is the whole test: a resource whose deletion is in
-        // flight is still one the service holds and still reports its tags, exactly as
-        // its own reader still reports the record, until the purge drops both.
-        if !store.holds_resource_arn(&input.resource_arn) {
+        // The ARN has to name a resource this service HOLDS, in THIS REGION — the same
+        // resolution and Region scope `TagResource` applies to the same label. Reporting
+        // an empty map instead would answer "this resource exists and carries no tags"
+        // for a resource this endpoint does not serve. Holding the record is the whole
+        // test: a resource whose deletion is in flight is still one the service holds and
+        // still reports its tags, exactly as its own reader still reports the record,
+        // until the purge drops both.
+        if !store.holds_resource_arn(&region, &input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::resource_not_found_message(

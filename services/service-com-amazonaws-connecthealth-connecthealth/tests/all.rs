@@ -25,6 +25,8 @@ mod error_detail_member;
 mod list_tags_for_resource;
 #[path = "all/patient_insights_job_lifecycle.rs"]
 mod patient_insights_job_lifecycle;
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

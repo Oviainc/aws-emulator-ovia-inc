@@ -6,11 +6,14 @@
 //! Four rules, each asserted over a TABLE of inputs rather than the one case the issue
 //! recorded:
 //!
-//! 1. `CreateDomain` is capped per ACCOUNT: once the account holds
-//!    `state::MAX_DOMAINS_PER_ACCOUNT` Domains the next create is refused with HTTP 400
+//! 1. `CreateDomain` is capped per ACCOUNT per REGION: once the account holds
+//!    `state::MAX_DOMAINS_PER_ACCOUNT` Domains in the Region the create is addressed to,
+//!    the next create there is refused with HTTP 400
 //!    `ValidationException`, whose text names the account and the cap. The cap is a LIVE
 //!    count, so a Domain whose deletion has been applied frees its slot and the retry
-//!    succeeds with status `ACTIVE`.
+//!    succeeds with status `ACTIVE`. (That the count is per Region rather than
+//!    cross-Region is asserted in `tests/all/region_scoping.rs`; every row here is signed
+//!    for one Region.)
 //! 2. `DeleteDomain` separates an id this service ALLOCATED — whose Domain is simply
 //!    gone, the modelled 404 `ResourceNotFoundException` — from a well-formed id with no
 //!    allocation history at all, which the front door answers with
@@ -526,7 +529,7 @@ fn seed_session(
     let store = state::service_state(&**emulator.engine()).expect("this service's own store");
     let mut store = store.lock();
     let subscription = store
-        .live_subscription_mut(domain_id, subscription_id)
+        .live_subscription_mut(emulator.region(), domain_id, subscription_id)
         .unwrap_or_else(|| panic!("case {:?}: a live subscription to seed", case.case));
     subscription
         .scribe_sessions

@@ -612,7 +612,7 @@ fn seed_job(
     let store = state::service_state(&**emulator.engine()).expect("this service's own store");
     let mut store = store.lock();
     let domain = store
-        .live_domain_mut(domain_id)
+        .live_domain_mut(emulator.region(), domain_id)
         .unwrap_or_else(|| panic!("case {case:?}: a live domain to seed"));
     let job = PatientInsightsJob {
         job_id: job_id.to_string(),

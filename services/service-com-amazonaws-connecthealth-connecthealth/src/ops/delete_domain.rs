@@ -318,13 +318,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so one created in another Region is not found here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         store.purge_due_deletions(now);
 
-        let Some(domain) = store.domains.get_mut(&input.domain_id) else {
+        let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
             // Which failure this is depends on whether the id was ever ALLOCATED, and
             // BOTH halves are recorded. An id this service once minted names a domain
             // that is gone, which is the modelled 404 — the recording for a domain that
@@ -336,6 +338,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // sees (`connecthealth.delete-domain-not-found`) — a configuration fault,
             // not a resource that was deleted. Keeping the two apart is what lets a
             // client tell a benign idempotent delete from a request that was never valid.
+            // An id this service minted for a domain of ANOTHER Region does have an
+            // allocation history, so it takes the 404 branch: the id is one this service
+            // issued, and THIS Region simply holds no domain under it.
             if !store.has_allocated_domain(&input.domain_id) {
                 return Err(DeleteDomainError::AuthorizerConfiguration(
                     AuthorizerConfigurationException,

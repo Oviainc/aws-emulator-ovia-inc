@@ -163,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so a domain of another Region is not found here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         // Absent `maxResults` means a full page. A value outside the bound is REFUSED
@@ -216,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The SAME liveness rule the single-subscription readers use, so a
         // subscription a caller can enumerate here is one it can also read.
-        let Some(domain) = store.live_domain(&input.domain_id) else {
+        let Some(domain) = store.live_domain(&region, &input.domain_id) else {
             return Err(ListSubscriptionsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(
