@@ -65,19 +65,64 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
-/// The clause ECR states for one refused input member: the member at fault and the
+/// The clause ECR states for one refused input member: the parameter at fault and the
 /// constraint it failed.
 ///
-/// ECR words a parameter it will not accept as `Invalid parameter at '<member>' failed
-/// to satisfy constraint: '<requirement>'`. Both halves are built from the request and
-/// the model — the member the walk found at fault ([`member_at_fault`]) and the
-/// constraint it fell outside of — so they are reproduced from the violation here rather
-/// than written out per member. A violation kind this list does not know (the enum is
-/// `#[non_exhaustive]`) keeps the framework's own clause, which states the same two facts
-/// in its own words.
+/// ECR words every such clause `Invalid parameter at '<parameter>' failed to satisfy
+/// constraint: '<constraint>'` and fills both halves from the request and the model, so
+/// they are reproduced from the violation here rather than written out per member. WHICH
+/// validator caught the value decides how each half is SPELLED, and the recorded corpus
+/// shows ECR using both spellings:
+///
+/// * a parameter ECR validates ITSELF is named by its API label alone
+///   ([`member_at_fault`]) and its constraint is stated in ECR's own words: the
+///   expression as ECR publishes it (`… at 'repositoryName' … 'must satisfy regular
+///   expression '[a-z0-9]+…''`), or prose for an ARN-valued member (`… at
+///   'signingProfileArn' … 'The signing profile ARN '<value>' must be well formed''`).
+///   That is every parameter the request CARRIES — a top-level member, or an element of
+///   one of its collections, which is a value of that same parameter — plus an ARN
+///   wherever the request carries it, because ECR checks an ARN's form itself.
+/// * a value the MODEL-DRIVEN walk caught inside a NESTED structure keeps that walk's own
+///   rendering: the dotted path it descended, collection steps included, and the
+///   `@pattern` exactly as the model declares it, anchors and all — `… at
+///   'signingConfiguration.rules.1.member.repositoryFilters.1.member.filter' failed to
+///   satisfy constraint: 'Member must satisfy regular expression pattern: ^(?:[a-z0-9*]+…$'`.
+///
+/// Only a `@pattern` is worded differently by the two: every other constraint is "Member
+/// must …" either way, so only the parameter label can differ for it.
+///
+/// A violation kind neither wording knows (the enum is `#[non_exhaustive]`) keeps the
+/// framework's own clause, which states the same two facts in its own words.
 fn clause(violation: &Violation) -> String {
     let member = member_at_fault(&violation.path);
-    let requirement = match &violation.kind {
+    // ECR checks an ARN's form in its own code, wherever the request carries it, and
+    // states the kind of ARN and the value that is not one — so this branch is taken
+    // before the position of the member is even looked at.
+    if let ViolationKind::Pattern(pattern) = &violation.kind {
+        if let Some(prose) = arn_constraint(member, pattern, violation.value.as_deref()) {
+            return stated(member, &prose);
+        }
+    }
+    let by_ecr = carried_parameter(&violation.path);
+    let Some(requirement) = requirement(&violation.kind, by_ecr) else {
+        return violation.message();
+    };
+    let parameter = if by_ecr { member } else { &violation.path };
+    stated(parameter, &requirement)
+}
+
+/// The clause itself, the one place its template is written.
+fn stated(parameter: &str, constraint: &str) -> String {
+    format!("Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'")
+}
+
+/// The constraint half of a clause. `by_ecr` is whether ECR's own validation caught the
+/// value, which changes the wording of ONE constraint: a `@pattern` ECR checks itself is
+/// stated as the expression ECR publishes ([`as_stated`]), while the model-driven walk
+/// states the model's own pattern in the framework's wording. `None` for a kind neither
+/// states, so the caller can keep the framework's whole clause.
+fn requirement(kind: &ViolationKind, by_ecr: bool) -> Option<String> {
+    Some(match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
             format!("Member must have length greater than or equal to {min}")
@@ -91,33 +136,48 @@ fn clause(violation: &Violation) -> String {
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
         }
-        // The one requirement NOT worded "Member must …": ECR states a pattern failure
-        // by naming the expression a value has to satisfy — except for an ARN-valued
-        // member, which it states in prose instead ([`arn_constraint`]). Deliberate — do
-        // not "align" either with the arms around it.
+        // The one requirement NOT worded "Member must …": a parameter ECR validates
+        // itself has its expression stated the way ECR publishes it. Deliberate — do not
+        // "align" it with the arms around it.
+        ViolationKind::Pattern(pattern) if by_ecr => {
+            format!("must satisfy regular expression '{}'", as_stated(pattern))
+        }
         ViolationKind::Pattern(pattern) => {
-            arn_constraint(member, pattern, violation.value.as_deref()).unwrap_or_else(|| {
-                format!("must satisfy regular expression '{}'", as_stated(pattern))
-            })
+            format!("Member must satisfy regular expression pattern: {pattern}")
         }
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
-        _ => return violation.message(),
-    };
-    format!("Invalid parameter at '{member}' failed to satisfy constraint: '{requirement}'")
+        _ => return None,
+    })
 }
 
-/// The member a refusal names: the member at fault ITSELF, not the path the validating
-/// walk descended to reach it.
+/// Whether `path` names a parameter the request CARRIES, which is what ECR validates in
+/// its own code: a top-level member (`repositoryName`), or an element of a top-level
+/// collection (`repositoryNames.2.member`), which is one value of that same parameter.
+/// A member of a structure NESTED in the request is not — nothing of ECR's own names it,
+/// and the model-driven walk reports it under the path it descended.
+fn carried_parameter(path: &str) -> bool {
+    !named_member(path).contains('.')
+}
+
+/// The member a refusal names when ECR's own validation caught the value: the member at
+/// fault ITSELF, not the path the validating walk descended to reach it
+/// (`signingProfileArn`, not `signingConfiguration.rules.1.member.signingProfileArn`).
 ///
-/// The framework builds a dotted path — `signingConfiguration.rules.1.member.signingProfileArn`
-/// for the signing profile of a rule — because it has to say which element carried the
-/// value. ECR names the member alone: `Invalid parameter at 'signingProfileArn' …`. So
-/// the steps from a collection into an element are dropped off the end first, which leaves
-/// the COLLECTION named when the refused value is itself an element (`repositoryNames`
-/// rather than `repositoryNames.2.member`), and what remains is the last named member.
+/// The steps from a collection into an element are dropped off the end first
+/// ([`named_member`]), which leaves the COLLECTION named when the refused value is itself
+/// an element (`repositoryNames` rather than `repositoryNames.2.member`), and what remains
+/// is the last named member.
+fn member_at_fault(path: &str) -> &str {
+    let remaining = named_member(path);
+    remaining.rsplit('.').next().unwrap_or(remaining)
+}
+
+/// `path` with the steps from a collection into an element dropped off the end, so what
+/// is left ends in a MEMBER name: `repositoryNames.2.member` -> `repositoryNames`, and
+/// `signingConfiguration.rules.1.member.filter` -> itself.
 ///
 /// The element step is recognised through [`::service_common::validation::list_of_element`],
 /// the one place in the tree that spells it, so this cannot disagree with the walk about
@@ -127,17 +187,17 @@ fn clause(violation: &Violation) -> String {
 ///
 /// A path with no named member left in it keeps its own spelling: there is nothing in it
 /// to prefer.
-fn member_at_fault(path: &str) -> &str {
+fn named_member(path: &str) -> &str {
     let mut remaining = path;
     while let Some(collection) = ::service_common::validation::list_of_element(remaining) {
         remaining = collection;
     }
-    remaining.rsplit('.').next().unwrap_or(remaining)
+    remaining
 }
 
-/// A `@pattern` expression as AWS STATES it, which differs from how the model spells it
-/// in two ways — both of them about spelling the same expression, neither about what it
-/// matches:
+/// A `@pattern` expression as ECR'S OWN validation states it, which differs from how the
+/// model spells it in two ways — both of them about spelling the same expression, neither
+/// about what it matches:
 ///
 /// * the `^` / `$` the model anchors with are dropped ([`unanchored`]): AWS states the
 ///   expression a value must satisfy, not the anchoring that makes the match total;
