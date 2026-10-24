@@ -108,7 +108,7 @@ async fn sagemaker_queue(batch: &Batch, name: &str, environment: &str) -> String
 
 /// One service environment and one `SAGEMAKER_TRAINING` queue over it; answers the
 /// queue's name and ARN.
-async fn environment_and_queue(batch: &Batch) -> (String, String) {
+pub(crate) async fn environment_and_queue(batch: &Batch) -> (String, String) {
     let environment = service_environment(batch, "se-jobs").await;
     let queue_arn = sagemaker_queue(batch, "q-service-jobs", &environment).await;
     ("q-service-jobs".to_string(), queue_arn)
@@ -120,7 +120,7 @@ async fn submit(batch: &Batch, body: Value) -> (u16, Value) {
 }
 
 /// `SubmitServiceJob`, requiring the 200.
-async fn submitted(batch: &Batch, case: &str, body: Value) -> Value {
+pub(crate) async fn submitted(batch: &Batch, case: &str, body: Value) -> Value {
     let (status, decoded) = submit(batch, body).await;
     assert_eq!(
         status, 200,
