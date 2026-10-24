@@ -233,8 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // The names a graph reserves are released when its deletion completes, so the
+        // deletions the clock has already made due are materialised before the name is
+        // looked up: the index this check reads is the one a read taken at this instant
+        // would see.
+        store.reap_deleted_graphs(now);
+
         // `graphName` is unique: a second graph by the same name conflicts with the
-        // stored one.
+        // stored one — including one that is still DELETING, which holds its name
+        // until the deletion finishes.
         if let Some(existing) = store.graph_names.get(&input.graph_name) {
             return Err(CreateGraphErrorModeled::ConflictException(ConflictException {
                 message: format!(
@@ -298,6 +305,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source_snapshot_id: None,
             build_number: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Nothing has deleted this graph.
+            deletes_at: None,
         };
 
         // Report the record that was stored, so this response cannot drift from what a

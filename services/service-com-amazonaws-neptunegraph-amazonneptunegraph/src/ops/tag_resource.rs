@@ -160,6 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // A graph whose deletion has already fallen due is no longer a resource this
+        // service holds, so its record is reclaimed before the ARN is resolved: tagging
+        // it answers the same 404 as tagging an ARN that never named anything.
+        store.reap_deleted_graphs(::std::time::Instant::now());
         let Some(tags) = store.tags_of_mut(&input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&input.resource_arn),

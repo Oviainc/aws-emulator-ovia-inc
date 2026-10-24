@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{MAX_GRAPHS, PROVISIONING_SPAN};
+use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
+    DELETION_SPAN, MAX_GRAPHS, PROVISIONING_SPAN,
+};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -766,7 +768,55 @@ async fn delete_graph_removes_the_graph_unless_deletion_protection_holds_it() {
         deleted["status"]
     );
 
-    // It is gone: GetGraph 404s, ListGraphs omits it, and a second delete 404s.
+    // It is on its way out, not gone: while the deletion the clock owes is in flight
+    // GetGraph answers 200 DELETING, ListGraphs still shows it, its name is still
+    // reserved and a second delete conflicts with the one already running.
+    let (get_status, get_body) = get(&router, &id).await;
+    assert_eq!(
+        get_status, 200,
+        "case deleting graph: expected 200, got {get_status}: {get_body}"
+    );
+    assert_eq!(
+        get_body["status"],
+        json!("DELETING"),
+        "case deleting graph: expected DELETING, got {}",
+        get_body["status"]
+    );
+    let (_, listed) = call(&router, "GET", "/graphs", None).await;
+    let ids: Vec<&str> = listed["graphs"]
+        .as_array()
+        .expect("graphs is a list")
+        .iter()
+        .map(|summary| summary["id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        ids.contains(&id.as_str()) && ids.contains(&keeper.as_str()),
+        "case deleting graph: ListGraphs must still show it, got {listed}"
+    );
+    let (reuse_status, reuse_body) = create(
+        &router,
+        json!({"graphName": "deletable-graph", "provisionedMemory": 16}),
+    )
+    .await;
+    assert_eq!(
+        reuse_status, 409,
+        "case name of a deleting graph: expected 409, got {reuse_status}: {reuse_body}"
+    );
+    let (again_status, again_body) =
+        call(&router, "DELETE", &format!("/graphs/{id}?skipSnapshot=true"), None).await;
+    assert_eq!(
+        again_status, 409,
+        "case second delete while deleting: expected 409, got {again_status}: {again_body}"
+    );
+    assert_eq!(
+        error_code(&again_body),
+        "ConflictException",
+        "case second delete while deleting: unexpected error code in {again_body}"
+    );
+
+    // Once the deletion falls due it is gone: GetGraph 404s, ListGraphs omits it, and a
+    // delete of it 404s.
+    tokio::time::sleep(DELETION_SPAN + Duration::from_millis(150)).await;
     let (get_status, get_body) = get(&router, &id).await;
     assert_eq!(get_status, 404, "case deleted graph: expected 404, got {get_status}: {get_body}");
     let (_, listed) = call(&router, "GET", "/graphs", None).await;
@@ -801,8 +851,9 @@ async fn delete_graph_removes_the_graph_unless_deletion_protection_holds_it() {
     .await;
     assert_eq!(status, 201, "case recreate under the freed name: expected 201, got {status}: {body}");
 
-    // A delete that asks for a final snapshot is refused as unimplemented rather than
-    // silently dropping the snapshot: snapshots are their own (still scaffolded) slice.
+    // A delete that asks for a FINAL snapshot is served the same way: 200 with the
+    // graph reporting DELETING. What it mints and how that snapshot is named is covered
+    // by `graph_deletion`.
     let (status, body) = call(
         &router,
         "DELETE",
@@ -810,16 +861,12 @@ async fn delete_graph_removes_the_graph_unless_deletion_protection_holds_it() {
         None,
     )
     .await;
-    assert_eq!(status, 501, "case skipSnapshot=false: expected 501, got {status}: {body}");
-    assert!(
-        body["message"].as_str().unwrap_or_default().contains("skipSnapshot=false"),
-        "case skipSnapshot=false: the refusal must name the unimplemented final snapshot, \
-         got {body}"
-    );
-    let (keeper_status, _) = get(&router, &keeper).await;
+    assert_eq!(status, 200, "case skipSnapshot=false: expected 200, got {status}: {body}");
     assert_eq!(
-        keeper_status, 200,
-        "case skipSnapshot=false: the graph must survive a refused delete, got {keeper_status}"
+        body["status"],
+        json!("DELETING"),
+        "case skipSnapshot=false: expected DELETING, got {}",
+        body["status"]
     );
 }
 
@@ -935,6 +982,9 @@ async fn create_graph_stops_at_the_bound_on_how_far_the_store_may_grow() {
     )
     .await;
     assert_eq!(status, 200, "case free a slot: expected 200, got {status}: {body}");
+    // The slot is freed by the DELETION, which the clock owes — not by the call that
+    // accepted it.
+    tokio::time::sleep(DELETION_SPAN + Duration::from_millis(150)).await;
     let (status, body) = create(
         &router,
         json!({"graphName": "one-graph-too-many", "provisionedMemory": 16}),
