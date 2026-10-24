@@ -23,6 +23,8 @@ mod hosted_zone_config;
 mod hosted_zone_records;
 #[path = "all/hosted_zones_by_vpc.rs"]
 mod hosted_zones_by_vpc;
+#[path = "all/private_zone_creation.rs"]
+mod private_zone_creation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
