@@ -15,11 +15,20 @@
 //!    call required for that kind are required, and the other kind's members are refused;
 //! 3. `DescribeVerifiedAccessTrustProviders` narrows by `VerifiedAccessTrustProviderIds`
 //!    and by every filter it answers, and pages by `MaxResults`/`NextToken`;
-//! 4. one `ClientToken` names one trust provider.
+//! 4. one `ClientToken` names one trust provider;
+//! 5. a `DryRun` reports the outcome the request would have had and WRITES NOTHING;
+//! 6. the SSE block the response carries reports the encryption the request configured,
+//!    and the Amazon Web Services owned key when it configured none;
+//! 7. the idempotency token is bounded in CHARACTERS, not bytes;
+//! 8. a create past either ceiling the store keeps — its record count and its
+//!    caller-chosen byte budget — is refused, stores nothing, and leaves a store that
+//!    still answers a read.
 //!
 //! Each table row is a distinct input along what the rule generalises over — the trust
 //! provider kind and every value of its sub-type enum, which filter, how many values a
-//! filter carries, which page size — so no row is the specification. The kind catalogs are
+//! filter carries, which page size, which refusal a dry run would have met, which SSE
+//! configuration, how long a token is and in which characters, which ceiling — so no row is
+//! the specification. The kind catalogs are
 //! the model's own `TRUST_PROVIDER_TYPE_VALUES`, `USER_TRUST_PROVIDER_TYPE_VALUES` and
 //! `DEVICE_TRUST_PROVIDER_TYPE_VALUES`, so every published kind is covered.
 
@@ -147,6 +156,21 @@ fn kind_params(trust_provider_type: &str, sub_type: &str) -> Params {
     params
 }
 
+/// One whole create request: the parameters the kind needs, the policy reference name the
+/// case gives it, and whatever else the case carries. The ONE place a create's parameters
+/// are assembled, for the cases that send it and the cases that only need the parameters.
+fn create_params(
+    trust_provider_type: &str,
+    sub_type: &str,
+    policy_reference: &str,
+    extra: Params,
+) -> Params {
+    let mut params = kind_params(trust_provider_type, sub_type);
+    params.push(p("PolicyReferenceName", policy_reference));
+    params.extend(extra);
+    params
+}
+
 /// Create one trust provider of `trust_provider_type`/`sub_type` with `policy_reference`
 /// and whatever extra parameters the case needs.
 async fn create_provider(
@@ -156,9 +180,7 @@ async fn create_provider(
     policy_reference: &str,
     extra: Params,
 ) -> (u16, String) {
-    let mut params = kind_params(trust_provider_type, sub_type);
-    params.push(p("PolicyReferenceName", policy_reference));
-    params.extend(extra);
+    let params = create_params(trust_provider_type, sub_type, policy_reference, extra);
     create(router, &params).await
 }
 
@@ -1070,4 +1092,362 @@ async fn one_client_token_names_one_trust_provider() {
         expected,
         "a replayed create stores nothing new"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The WRITE side of the create: what it does when told not to write, what it reports for
+// server side encryption, and the bounds it refuses past.
+// ---------------------------------------------------------------------------
+
+/// The emulator with the engine behind it, for the cases that read the store the handler
+/// writes rather than only the API's answer.
+fn emulator_with_engine() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
+    super::ec2_query::emulator()
+}
+
+/// How many trust providers the store holds.
+fn held(engine: &std::sync::Arc<engine::InMemoryEngine>) -> usize {
+    engine
+        .state::<ec2::state::ComAmazonawsEc2Amazonec2State>()
+        .lock()
+        .verified_access_trust_providers
+        .len()
+}
+
+/// Every published kind of trust provider, as `(trust provider type, sub-type)`, from the
+/// model's own catalogs through [`sub_types`].
+fn published_kinds() -> Vec<(&'static str, &'static str)> {
+    TRUST_PROVIDER_TYPE_VALUES
+        .iter()
+        .flat_map(|trust_provider_type| {
+            sub_types(trust_provider_type)
+                .iter()
+                .map(move |sub_type| (*trust_provider_type, *sub_type))
+        })
+        .collect()
+}
+
+/// RULE 5: "Checks whether you have the required permissions for the action, without
+/// actually making the request, and provides an error response"
+/// (`CreateVerifiedAccessTrustProviderRequest$DryRun`) — a `DryRun` is answered with the
+/// outcome the request would have had, 412 `DryRunOperation` for one that would have
+/// succeeded and the refusal itself for one that would have been refused, and writes
+/// nothing either way.
+///
+/// The rows are every published kind (each of which WOULD have succeeded) plus one row per
+/// kind of refusal a create can meet, so the rule is asserted across the outcomes it
+/// generalises over rather than on one request.
+#[tokio::test]
+async fn a_dry_run_reports_the_outcome_and_writes_nothing() {
+    // `(case, the parameters under test, the HTTP status, the error code)`.
+    let mut rows: Vec<(String, Params, u16, &'static str)> = Vec::new();
+    for (trust_provider_type, sub_type) in published_kinds() {
+        rows.push((
+            format!("a {trust_provider_type}/{sub_type} create that would have succeeded"),
+            create_params(
+                trust_provider_type,
+                sub_type,
+                "refdry",
+                vec![p("DryRun", "true")],
+            ),
+            412,
+            "DryRunOperation",
+        ));
+    }
+    rows.push((
+        "a user provider with no userTrustProviderType".to_string(),
+        vec![
+            p("TrustProviderType", TRUST_PROVIDER_TYPE_USER),
+            p("PolicyReferenceName", "refdry"),
+            p("DryRun", "true"),
+        ],
+        400,
+        "MissingParameter",
+    ));
+    rows.push((
+        "a device provider carrying the user provider's OIDC options".to_string(),
+        create_params(
+            "device",
+            "jamf",
+            "refdry",
+            vec![
+                p("OidcOptions.Issuer", "https://idp.example.test/"),
+                p("DryRun", "true"),
+            ],
+        ),
+        400,
+        "InvalidParameterCombination",
+    ));
+    rows.push((
+        "a tag specification naming another resource type".to_string(),
+        create_params(
+            TRUST_PROVIDER_TYPE_USER,
+            USER_TRUST_PROVIDER_TYPE_OIDC,
+            "refdry",
+            vec![
+                p("TagSpecification.1.ResourceType", "verified-access-instance"),
+                p("TagSpecification.1.Tag.1.Key", "Name"),
+                p("TagSpecification.1.Tag.1.Value", "nope"),
+                p("DryRun", "true"),
+            ],
+        ),
+        400,
+        "InvalidParameterValue",
+    ));
+
+    let (router, engine) = emulator_with_engine();
+    for (case, params, expected_status, expected_code) in rows {
+        let (status, body) = create(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected the {expected_code} code, got body {body}"
+        );
+        assert_eq!(
+            held(&engine),
+            0,
+            "case {case:?}: a dry run must store nothing, but the store holds {} provider(s)",
+            held(&engine)
+        );
+        let (status, body) = describe(&router, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the describe, got {status} with body {body}"
+        );
+        assert!(
+            !body.contains("<verifiedAccessTrustProviderId>"),
+            "case {case:?}: the describe must report no provider after a dry run, got {body}"
+        );
+    }
+}
+
+/// RULE 6: the response's SSE block reports the encryption the request configured —
+/// "Enable or disable the use of customer managed KMS keys for server side encryption"
+/// (`VerifiedAccessSseSpecificationRequest$CustomerManagedKeyEnabled`) and the key it named
+/// (`KmsKeyArn`) read back as given, and a request that named no specification at all
+/// reports the Amazon Web Services owned key: not customer managed, no key ARN
+/// (`smithy_query(query="shape",shape="VerifiedAccessSseSpecificationResponse")`).
+///
+/// A key named with the flag left OFF is deliberately NOT a row: the model says nothing
+/// about that combination, so pinning either answer would fix behaviour no rule states.
+#[tokio::test]
+async fn the_sse_specification_is_reported_as_the_request_configured_it() {
+    // A KMS key ARN is `arn:aws:kms:<region>:<account>:key/<id>`; the key is a value the
+    // request carries, so its Region is part of that value rather than of the call.
+    let key_arn = "arn:aws:kms:us-west-2:123456789012:key/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    // `(case, the SSE parameters, the reported flag, the reported key ARN)`.
+    let rows: Vec<(&str, Params, &str, Option<String>)> = vec![
+        ("no specification at all", Vec::new(), "false", None),
+        (
+            "customer managed keys switched off",
+            vec![p("SseSpecification.CustomerManagedKeyEnabled", "false")],
+            "false",
+            None,
+        ),
+        (
+            "customer managed keys switched on, with the key named",
+            vec![
+                p("SseSpecification.CustomerManagedKeyEnabled", "true"),
+                p("SseSpecification.KmsKeyArn", key_arn),
+            ],
+            "true",
+            Some(key_arn.to_string()),
+        ),
+    ];
+
+    let router = emulator();
+    for (index, (case, sse_params, expected_flag, expected_key)) in rows.into_iter().enumerate() {
+        let id = seed(
+            &router,
+            case,
+            TRUST_PROVIDER_TYPE_USER,
+            USER_TRUST_PROVIDER_TYPE_OIDC,
+            &format!("refsse{index}"),
+            sse_params,
+        )
+        .await;
+        // The create's own answer, and then the store's, must agree member for member.
+        let (status, read_back) =
+            describe(&router, &indexed("VerifiedAccessTrustProviderId", &[&id])).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the describe, got {status} with body {read_back}"
+        );
+        assert_eq!(
+            element(&read_back, "customerManagedKeyEnabled").as_deref(),
+            Some(expected_flag),
+            "case {case:?}: expected customerManagedKeyEnabled {expected_flag:?}, \
+             got body {read_back}"
+        );
+        assert_eq!(
+            element(&read_back, "kmsKeyArn"),
+            expected_key,
+            "case {case:?}: expected kmsKeyArn {expected_key:?}, got body {read_back}"
+        );
+    }
+}
+
+/// RULE 7: the idempotency token is bounded in CHARACTERS, not bytes. A token of at most
+/// `MAX_CLIENT_TOKEN_CHARS` is accepted whether its characters are one byte each or two;
+/// one character past the bound is refused with `InvalidParameterValue` and stores nothing.
+///
+/// The rows walk the bound — well inside it, exactly on it, one past it — in ASCII and in
+/// multi-byte characters, so a byte-counting bound fails the multi-byte rows instead of
+/// passing by accident.
+#[tokio::test]
+async fn the_client_token_bound_is_counted_in_characters() {
+    use ec2::state::MAX_CLIENT_TOKEN_CHARS;
+
+    // `(case, the token, the HTTP status)`.
+    let rows: Vec<(String, String, u16)> = vec![
+        ("one character".to_string(), "t".to_string(), 200),
+        (
+            format!("{MAX_CLIENT_TOKEN_CHARS} ASCII characters"),
+            "a".repeat(MAX_CLIENT_TOKEN_CHARS),
+            200,
+        ),
+        (
+            format!("{MAX_CLIENT_TOKEN_CHARS} multi-byte characters"),
+            "é".repeat(MAX_CLIENT_TOKEN_CHARS),
+            200,
+        ),
+        (
+            "one ASCII character past the bound".to_string(),
+            "b".repeat(MAX_CLIENT_TOKEN_CHARS + 1),
+            400,
+        ),
+        (
+            "one multi-byte character past the bound".to_string(),
+            "ñ".repeat(MAX_CLIENT_TOKEN_CHARS + 1),
+            400,
+        ),
+    ];
+
+    let (router, engine) = emulator_with_engine();
+    let mut accepted = 0usize;
+    for (index, (case, token, expected_status)) in rows.into_iter().enumerate() {
+        let (status, body) = create_provider(
+            &router,
+            TRUST_PROVIDER_TYPE_USER,
+            USER_TRUST_PROVIDER_TYPE_OIDC,
+            &format!("reftokenbound{index}"),
+            vec![p("ClientToken", token)],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        if expected_status == 200 {
+            accepted += 1;
+        } else {
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValue",
+                "case {case:?}: expected InvalidParameterValue, got body {body}"
+            );
+        }
+        assert_eq!(
+            held(&engine),
+            accepted,
+            "case {case:?}: expected the store to hold the {accepted} accepted create(s), got {}",
+            held(&engine)
+        );
+    }
+}
+
+/// RULE 8: a create past either ceiling this store keeps — how many trust providers it
+/// holds and how many caller-chosen bytes — is refused with EC2's `<Resource>LimitExceeded`
+/// code, stores nothing, and leaves a store that still answers a read.
+///
+/// The rows are the two ceilings, each reached by seeding the store the handler reads
+/// rather than by making a million calls.
+#[tokio::test]
+async fn a_create_past_either_store_ceiling_is_refused() {
+    use ec2::ops::types::VerifiedAccessTrustProvider;
+    use ec2::state::{
+        ComAmazonawsEc2Amazonec2State as Ec2State, MAX_STORED_BYTES,
+        MAX_VERIFIED_ACCESS_TRUST_PROVIDERS,
+    };
+
+    // `(case, how the store is taken to its ceiling)`.
+    type Fill = fn(&mut Ec2State);
+    let rows: Vec<(&str, Fill)> = vec![
+        ("the record ceiling", |store: &mut Ec2State| {
+            while store.verified_access_trust_providers.len() < MAX_VERIFIED_ACCESS_TRUST_PROVIDERS
+            {
+                let nth = store.verified_access_trust_providers.len();
+                store.insert_verified_access_trust_provider(
+                    VerifiedAccessTrustProvider {
+                        trust_provider_type: Some(TRUST_PROVIDER_TYPE_USER.to_string()),
+                        user_trust_provider_type: Some("iam-identity-center".to_string()),
+                        policy_reference_name: Some(format!("seeded{nth}")),
+                        ..VerifiedAccessTrustProvider::default()
+                    },
+                    None,
+                );
+            }
+        }),
+        ("the caller-chosen byte budget", |store: &mut Ec2State| {
+            store.add_stored_bytes(MAX_STORED_BYTES);
+        }),
+    ];
+
+    for (case, fill) in rows {
+        let (router, engine) = emulator_with_engine();
+        // One create through the API first, so the case proves the CEILING refuses the next
+        // one and not something about the request.
+        let (status, body) = create_provider(
+            &router,
+            TRUST_PROVIDER_TYPE_USER,
+            USER_TRUST_PROVIDER_TYPE_OIDC,
+            "refbelow",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 below the ceiling, got {status} with body {body}"
+        );
+
+        fill(&mut engine.state::<Ec2State>().lock());
+        let held_before = held(&engine);
+
+        let (status, body) = create_provider(
+            &router,
+            TRUST_PROVIDER_TYPE_USER,
+            USER_TRUST_PROVIDER_TYPE_OIDC,
+            "refpast",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 past the ceiling, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "VerifiedAccessTrustProviderLimitExceeded",
+            "case {case:?}: expected the limit-exceeded code, got body {body}"
+        );
+        assert_eq!(
+            held(&engine),
+            held_before,
+            "case {case:?}: a refused create must store nothing, expected {held_before} \
+             provider(s), got {}",
+            held(&engine)
+        );
+
+        // The ceiling refuses the create; it does not break the reader.
+        let (status, body) = describe(&router, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the describe at the ceiling, \
+             got {status} with body {body}"
+        );
+    }
 }
