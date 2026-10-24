@@ -31,6 +31,14 @@ use super::job_template_crud::settings as template_settings;
 /// A queue the fixtures create, so a hop destination can reference a real queue.
 const FIXTURE_QUEUE: &str = "hop-queue";
 
+/// The queue the hop-destination rows submit their job to.
+///
+/// A third queue, neither [`FIXTURE_QUEUE`] nor the account's built-in `Default`, because
+/// `HopDestination$Queue` "cannot be the original queue to which the job is submitted" and
+/// a hop that names no queue moves the job to the default queue: submitting from here
+/// leaves both of those a real destination.
+const HOP_SOURCE_QUEUE: &str = "hop-source-queue";
+
 /// One output group, the same shape the job fixture builds, so a row that needs outputs
 /// without inputs does not hand-roll a second graph.
 fn one_output_group() -> Value {
@@ -559,14 +567,14 @@ fn hop_rows() -> Vec<Hop> {
 #[tokio::test]
 async fn a_hop_destination_queue_must_resolve_to_a_stored_queue() {
     let emulator = Emulator::new();
-    let queue = emulator
-        .create_queue(json!({ "name": FIXTURE_QUEUE }))
-        .await;
-    assert_eq!(
-        queue.status, 201,
-        "the fixture queue must be created: got {} with body {}",
-        queue.status, queue.body
-    );
+    for name in [FIXTURE_QUEUE, HOP_SOURCE_QUEUE] {
+        let queue = emulator.create_queue(json!({ "name": name })).await;
+        assert_eq!(
+            queue.status, 201,
+            "the fixture queue {name:?} must be created: got {} with body {}",
+            queue.status, queue.body
+        );
+    }
     let target = emulator
         .create_job_template(json!({ "name": "hops-here", "settings": template_settings(1, 1) }))
         .await;
@@ -592,6 +600,9 @@ async fn a_hop_destination_queue_must_resolve_to_a_stored_queue() {
         let job = emulator
             .create_job(json!({
                 "role": ROLE,
+                // Submitted to its own queue, so every accepted row's destination differs
+                // from it — a hop cannot name the queue the job was submitted to.
+                "queue": HOP_SOURCE_QUEUE,
                 "hopDestinations": hops.clone(),
                 "settings": job_settings("s3://example-bucket/in/a.mp4", "_a")
             }))
