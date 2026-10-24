@@ -27,8 +27,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Configuration, ConfigurationOverrides, ContainerProvider, Endpoint, JobDriver, JobRun,
-    JobTemplate, JobTemplateData, ParametricConfigurationOverrides, RetryPolicyConfiguration,
+    Configuration, ConfigurationOverrides, ContainerInfo, ContainerProvider, Endpoint, JobDriver,
+    JobRun, JobTemplate, JobTemplateData, ParametricConfigurationOverrides,
+    RetryPolicyConfiguration,
     SchedulerConfiguration, SchedulerStatus, SecurityConfiguration, SecurityConfigurationData,
     TemplateParameterConfiguration, VirtualCluster,
 };
@@ -456,6 +457,17 @@ impl PendingTransition {
             due_at_millis: now_millis() + i64::try_from(TRANSITION_SPAN.as_millis()).unwrap_or(0),
             next_state,
         }
+    }
+}
+
+/// The Kubernetes namespace a `ContainerProvider` names, when it names one.
+///
+/// `ContainerProvider$info` targets the `ContainerInfo` union, whose only member is
+/// `eksInfo`, and `EksInfo$namespace` is itself optional, so a provider may carry no
+/// namespace at all — and then names none to map a virtual cluster onto.
+pub fn provider_namespace(provider: &ContainerProvider) -> Option<&str> {
+    match provider.info.as_ref()? {
+        ContainerInfo::eksInfo(eks_info) => eks_info.namespace.as_deref(),
     }
 }
 
@@ -1496,6 +1508,31 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub fn virtual_cluster_view(&self, id: &str) -> Option<VirtualCluster> {
         let record = self.virtual_clusters.get(id)?;
         Some(record.to_virtual_cluster(self.cluster_scheduler_status(id)))
+    }
+
+    /// The virtual cluster this container provider's `namespace` is already mapped onto,
+    /// if one holds it.
+    ///
+    /// A virtual cluster "is a Kubernetes namespace that Amazon EMR is registered with",
+    /// and "a single virtual cluster maps to a single Kubernetes namespace"
+    /// (`CreateVirtualCluster`), so one namespace of one container cluster carries at most
+    /// one virtual cluster at a time. A TERMINATED cluster is no longer registered with
+    /// its namespace and so holds nothing: the namespace is free for a new mapping once
+    /// its cluster has been torn down.
+    ///
+    /// Read out of the stored records rather than out of a second index beside them, so
+    /// the mapping a create resolves against and the one every read reports can never
+    /// disagree. The walk is bounded by [`MAX_VIRTUAL_CLUSTERS`].
+    pub fn cluster_mapped_to_namespace(
+        &self,
+        container_provider_id: &str,
+        namespace: &str,
+    ) -> Option<&VirtualClusterRecord> {
+        self.virtual_clusters.values().find(|record| {
+            record.state != CLUSTER_TERMINATED
+                && record.container_provider.id == container_provider_id
+                && provider_namespace(&record.container_provider) == Some(namespace)
+        })
     }
 
     /// Whether this store holds the resource `arn` names.

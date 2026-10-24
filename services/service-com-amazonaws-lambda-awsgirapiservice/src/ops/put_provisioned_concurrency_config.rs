@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutProvisionedConcurrencyConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutProvisionedConcurrencyConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutProvisionedConcurrencyConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one provisioned concurrency configuration on the function record
+//! [`crate::state`] holds, keyed by the qualifier the call addressed, so
+//! `GetProvisionedConcurrencyConfig` answers from the one record this call persisted and
+//! nothing is echoed back out of the request without being stored first.
+//!
+//! The configuration belongs to the QUALIFIER: the operation "Adds a provisioned
+//! concurrency configuration to a function's alias or version", so an alias and the
+//! version it invokes each hold their own, setting one again replaces it, and the
+//! unpublished version — which is neither an alias nor a published version — is refused
+//! with the modelled 400.
+//!
+//! The allocation is not instant: `Status` is "the status of the allocation process", so
+//! this call stores the configuration `IN_PROGRESS` with nothing allocated yet and the
+//! move to `READY` is owed by the clock (see
+//! [`crate::state::PROVISIONED_CONCURRENCY_ALLOCATION_DELAY`]); nothing here sleeps for
+//! it.
+//!
+//! Provisioned concurrency is capacity the account commits, so the two documented quotas
+//! on it are enforced here and a request past either stores nothing: a function that
+//! reserves concurrency allocates its provisioned concurrency out of that reservation,
+//! and the account has to keep at least
+//! [`crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS`] simultaneous executions
+//! unreserved.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +184,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutProvisionedConcurrencyConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutProvisionedConcurrencyConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutProvisionedConcurrencyConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(service_error("Lambda state is not reachable on this engine"));
+        };
+
+        // "Adds a provisioned concurrency configuration to a function's ALIAS OR
+        // VERSION", and the unpublished version is neither: `CreateFunction` documents
+        // `$LATEST` as the version "a function has" before any is published, and a
+        // configuration is attached to the alias or published version it was added to.
+        if input.qualifier == crate::state::VERSION_LATEST {
+            return Err(invalid_parameter(
+                crate::state::PROVISIONED_CONCURRENCY_CANNOT_APPLY_TO_LATEST_MESSAGE.to_string(),
+            ));
+        }
+
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, name:qualifier, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let requested = input.provisioned_concurrent_executions;
+        let mut store = state.lock();
+
+        // The alias or version has to exist before any concurrency can be provisioned for
+        // it, and resolution is what brings the record up to whatever the clock already
+        // made due. The label it answers is the one the request addressed — an alias name
+        // or a published version number — which is what the configuration is keyed by.
+        let (qualifier, reserved, provisioned_on_other_qualifiers) = {
+            let (record, qualifier) = crate::state::resolve_function(
+                &mut store,
+                &input.function_name,
+                Some(&input.qualifier),
+                &region,
+                now,
+            )
+            .map_err(|failure| match failure {
+                crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                crate::state::ResolveFailure::NotFound(message) => not_found(message),
+            })?;
+
+            // "When the code is Creating, you can't invoke or modify the function" (the
+            // model's own `StateReasonCode` documentation), and a function that is still
+            // being provisioned is in exactly that state.
+            if record.state == crate::state::STATE_PENDING {
+                return Err(resource_conflict(format!(
+                    "The operation cannot be performed at this time. The function is \
+                     currently in the following state: {}",
+                    record.state
+                )));
+            }
+
+            // This call REPLACES whatever the addressed qualifier holds, so the other
+            // qualifiers' allocations are what stand beside the requested one.
+            let provisioned_elsewhere = record.provisioned_concurrency_except(Some(&qualifier));
+            (
+                qualifier,
+                record.reserved_concurrent_executions,
+                provisioned_elsewhere,
+            )
+        };
+
+        // "Concurrency settings apply to the function as a whole, including all published
+        // versions and the unpublished version" (`PutFunctionConcurrency`), so a function
+        // that reserves capacity has its provisioned concurrency allocated out of that
+        // reservation and cannot have more of it allocated than it reserved.
+        if let Some(reserved) = reserved {
+            let total = provisioned_on_other_qualifiers.saturating_add(requested);
+            if total > reserved {
+                return Err(invalid_parameter(format!(
+                    "Specified ConcurrentExecutions for function is greater than the \
+                     function's reserved concurrency of [{reserved}]"
+                )));
+            }
+        }
+
+        // Provisioned concurrency is capacity the account commits, so it answers to the
+        // same documented floor a reservation does: "You can reserve concurrency for as
+        // many functions as you like, as long as you leave at least 100 simultaneous
+        // executions unreserved for functions that aren't configured with a per-function
+        // limit."
+        let committed_elsewhere = store.reserved_concurrency_except(None).saturating_add(
+            store.unreserved_provisioned_concurrency_except(Some((&reference.name, &qualifier))),
+        );
+        // A function that reserves capacity has already committed it, and the check above
+        // keeps this allocation inside that reservation; one that reserves none commits
+        // the requested capacity itself.
+        let committed = if reserved.is_some() {
+            committed_elsewhere
+        } else {
+            committed_elsewhere.saturating_add(requested)
+        };
+        if crate::state::CONCURRENT_EXECUTIONS_LIMIT.saturating_sub(committed)
+            < crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS
+        {
+            return Err(invalid_parameter(format!(
+                "Specified ConcurrentExecutions for function decreases account's \
+                 UnreservedConcurrentExecution below its minimum value of [{floor}]",
+                floor = crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS
+            )));
+        }
+
+        let Some(record) = store.functions.get_mut(&reference.name) else {
+            return Err(service_error(
+                "Lambda lost the function record between resolving it and provisioning \
+                 concurrency for it",
+            ));
+        };
+
+        // "The status of the allocation process": the environments this asks for are not
+        // initialised at the instant the call is accepted, so the configuration is stored
+        // `IN_PROGRESS` with nothing allocated, and the move to `READY` is owed by the
+        // clock at `ready_due`. Nothing waits for it here.
+        record.provisioned_concurrency_configs.insert(
+            qualifier.clone(),
+            crate::state::ProvisionedConcurrencyRecord {
+                requested,
+                status: crate::state::PROVISIONED_CONCURRENCY_IN_PROGRESS.to_string(),
+                ready_due: Some(now + crate::state::PROVISIONED_CONCURRENCY_ALLOCATION_DELAY),
+                last_modified: crate::state::iso8601(now),
+            },
+        );
+
+        // Answered by reading the stored record back, so the response reports what is
+        // held rather than what the request carried.
+        let stored = record
+            .provisioned_concurrency_configs
+            .get(&qualifier)
+            .ok_or_else(|| {
+                service_error("Lambda lost the provisioned concurrency configuration it stored")
+            })?;
+        Ok(configuration(stored.reported()))
     }
+}
+
+/// The one `ProvisionedConcurrencyConfig` response the model declares, in this
+/// operation's own generated shape of it.
+///
+/// [`crate::state::ProvisionedConcurrencyRecord::reported`] builds it as
+/// `GetProvisionedConcurrencyConfigOutput`, so the members are carried across one for one
+/// rather than rebuilt from state a second time.
+fn configuration(
+    reported: GetProvisionedConcurrencyConfigOutput,
+) -> PutProvisionedConcurrencyConfigOutput {
+    PutProvisionedConcurrencyConfigOutput {
+        requested_provisioned_concurrent_executions: reported
+            .requested_provisioned_concurrent_executions,
+        allocated_provisioned_concurrent_executions: reported
+            .allocated_provisioned_concurrent_executions,
+        available_provisioned_concurrent_executions: reported
+            .available_provisioned_concurrent_executions,
+        status: reported.status,
+        status_reason: reported.status_reason,
+        last_modified: reported.last_modified,
+    }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> PutProvisionedConcurrencyConfigError {
+    PutProvisionedConcurrencyConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a name and qualifier that name no alias or published version.
+fn not_found(message: String) -> PutProvisionedConcurrencyConfigError {
+    PutProvisionedConcurrencyConfigErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 409 for a call made while the function is still being provisioned.
+fn resource_conflict(message: String) -> PutProvisionedConcurrencyConfigError {
+    PutProvisionedConcurrencyConfigErrorModeled::ResourceConflictException(
+        ResourceConflictException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 500 for a failure of the store itself.
+fn service_error(message: &str) -> PutProvisionedConcurrencyConfigError {
+    PutProvisionedConcurrencyConfigErrorModeled::ServiceException(ServiceException {
+        r#type: None,
+        message: Some(message.to_string()),
+    })
+    .into()
 }
