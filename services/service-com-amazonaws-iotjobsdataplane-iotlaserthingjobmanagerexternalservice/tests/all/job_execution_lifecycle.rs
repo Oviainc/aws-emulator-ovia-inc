@@ -15,7 +15,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::ops::types::JOB_EXECUTION_STATUS_VALUES;
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
-    command_registry, MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING, MAX_STATUS_DETAIL_NAME_LEN,
+    command_registry, iot_commands::CommandFacts, MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING,
+    MAX_STATUS_DETAIL_NAME_LEN,
     MAX_STATUS_DETAIL_PAIRS, MAX_STATUS_DETAIL_VALUE_LEN, MAX_TERMINAL_EXECUTIONS_PER_THING,
 };
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
@@ -64,7 +65,7 @@ impl Emulator {
         command_registry(&*engine)
             .expect("the shared IoT command index")
             .lock()
-            .register(COMMAND_ARN)
+            .register(COMMAND_ARN, CommandFacts::default())
             .expect("register the command these tests start");
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not request signing.

@@ -556,6 +556,19 @@ pub fn resolve_taggable(resource_arn: &str) -> Result<ResourceRef, TagArnRefusal
 /// `package-version` and `repository`; see `RESOURCE_TYPE_VALUES` in `ops::types`.)
 pub const REPOSITORY_RESOURCE_TYPE: &str = "repository";
 
+/// The `package` value of the modelled `ResourceType` enum — what a refusal reports for a
+/// package COORDINATE (`(format, namespace, name)`), the other two members of the same
+/// enum this service's package-scoped reads name.
+pub const PACKAGE_RESOURCE_TYPE: &str = "package";
+
+/// The `package-version` value of the modelled `ResourceType` enum, reported beside the
+/// fully-qualified [`package_version_resource_id`] of the version a refusal is about.
+pub const PACKAGE_VERSION_RESOURCE_TYPE: &str = "package-version";
+
+/// The `asset` value of the modelled `ResourceType` enum, reported for one asset of a
+/// package version.
+pub const ASSET_RESOURCE_TYPE: &str = "asset";
+
 /// The `resourceType` a modelled error reports for a resolved resource.
 ///
 /// `None` for a package group: `ResourceType` declares no value for one, so the member is
@@ -1539,6 +1552,24 @@ fn sha256_hex(content: &[u8]) -> String {
 /// another repository's listing (or in a domain or repository listing).
 pub fn package_cursor_scope(domain: &str, repository: &str) -> String {
     format!("packages/{domain}/{repository}")
+}
+
+/// The cursor scope of `ListPackageVersionAssets` for one package version. Scoped per
+/// repository AND per package-version coordinate ([`package_key`] carries the format and
+/// the namespace), so a cursor minted while listing one version's assets cannot resolve as
+/// an asset name in another version's listing, nor as a key in any other listing.
+pub fn asset_cursor_scope(
+    domain: &str,
+    repository: &str,
+    format: &str,
+    namespace: Option<&str>,
+    package: &str,
+    version: &str,
+) -> String {
+    format!(
+        "assets/{domain}/{repository}/{}/{version}",
+        package_key(format, namespace, package)
+    )
 }
 
 /// The cursor scope of `ListAllowedRepositoriesForGroup` for one package group's
