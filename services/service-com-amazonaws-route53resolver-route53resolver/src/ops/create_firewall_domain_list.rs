@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewallDomainList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFirewallDomainList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFirewallDomainList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The DNS Firewall domain-list slice
+//! (`CreateFirewallDomainList`, `GetFirewallDomainList`) computes every response
+//! from the records in [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFirewallDomainList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFirewallDomainListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFirewallDomainList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateFirewallDomainListErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Name`'s pattern (`^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`) admits only
+        // letters, digits, hyphens, underscores, apostrophes and spaces, and at
+        // least one of them, and excludes a name made of digits alone. Its
+        // negative lookahead is outside what the boundary validator's regex
+        // engine accepts, so the rule is enforced here, with the
+        // `ValidationException` this operation models, before the store is
+        // locked — so nothing is written.
+        if !crate::state::name_satisfies_pattern(&input.name) {
+            return Err(CreateFirewallDomainListErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "Name must carry at least one letter, digit, hyphen, underscore, \
+                         apostrophe or space, and cannot consist of only digits"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // `CreatorRequestId` is "a unique string that identifies the request and
+        // that allows you to retry failed requests without the risk of running
+        // the operation twice": a repeat of a request id that already created a
+        // domain list resolves to THAT list and creates nothing.
+        if let Some(existing_id) = store
+            .firewall_domain_list_creator_request_ids
+            .get(&input.creator_request_id)
+        {
+            if let Some(record) = store.firewall_domain_lists.get(existing_id) {
+                return Ok(CreateFirewallDomainListOutput {
+                    firewall_domain_list: Some(record.to_domain_list()),
+                });
+            }
+        }
+
+        // The store is bounded: a new list past the cap is refused with the
+        // `LimitExceededException` this operation models, BEFORE anything is
+        // written. The retry path above is unaffected — it allocates no record.
+        if !store.can_store_another_firewall_domain_list() {
+            return Err(CreateFirewallDomainListErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} firewall domain lists; delete one before creating another",
+                        crate::state::MAX_STORED_FIREWALL_DOMAIN_LISTS
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let timestamp = crate::state::now_rfc3339();
+        let seq = store.next_seq();
+        let id = crate::state::mint_firewall_domain_list_id(seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("firewall-domain-list/{id}"),
+        );
+
+        let record = crate::state::FirewallDomainListRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            name: input.name.clone(),
+            creator_request_id: input.creator_request_id.clone(),
+            // "Creates an EMPTY firewall domain list": the domains arrive later,
+            // through `ImportFirewallDomains` or `UpdateFirewallDomains`, so a
+            // list that was just created reports `DomainCount` 0.
+            domains: Vec::new(),
+            status: crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string(),
+            // `StatusMessage` is "additional information about the status of the
+            // list, IF AVAILABLE", and the model states no text for it; a list
+            // that reached its settled status with nothing to report adds
+            // nothing, so it is left unset rather than carrying an invented
+            // sentence.
+            status_message: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: timestamp.clone(),
+            modification_time: timestamp,
+        };
+
+        let domain_list = record.to_domain_list();
+        store
+            .firewall_domain_list_creator_request_ids
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.firewall_domain_lists.insert(id, record);
+
+        Ok(CreateFirewallDomainListOutput {
+            firewall_domain_list: Some(domain_list),
+        })
     }
 }
