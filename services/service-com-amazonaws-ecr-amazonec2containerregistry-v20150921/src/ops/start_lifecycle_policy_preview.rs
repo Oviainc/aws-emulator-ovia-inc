@@ -222,14 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartLifecyclePolicyPreviewErrorModeled::LifecyclePolicyPreviewInProgressException(
                     LifecyclePolicyPreviewInProgressException {
-                        // The sentence the model states for this error, verbatim: unlike
-                        // the not-found failures around it, nothing in it is built from
-                        // the request.
-                        message: Some(
-                            "The previous lifecycle policy preview request has not \
-                             completed. Wait and try again."
-                                .to_string(),
-                        ),
+                        // Built from the request, like the not-found failures around it:
+                        // a caller previewing policies across many repositories at once
+                        // has to be able to tell WHICH one refused.
+                        message: Some(crate::state::lifecycle_preview_in_progress_message(
+                            &repo.name,
+                        )),
                     },
                 )
                 .into(),

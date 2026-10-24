@@ -180,11 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RegisterPullTimeUpdateExclusionErrorModeled::ExclusionAlreadyExistsException(
                     ExclusionAlreadyExistsException {
-                        message: Some(format!(
-                            "The pull time update exclusion for principal '{principal_arn}' \
-                             already exists in the registry with id '{}'",
-                            crate::state::registry_id()
-                        )),
+                        // One construction for both halves of the record's lifecycle,
+                        // built from the request — see
+                        // `crate::state::pull_time_update_exclusion_already_exists_message`.
+                        message: Some(
+                            crate::state::pull_time_update_exclusion_already_exists_message(
+                                &principal_arn,
+                            ),
+                        ),
                     },
                 )
                 .into(),
