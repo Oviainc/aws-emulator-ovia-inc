@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/activity_lifecycle.rs"]
 mod activity_lifecycle;
+#[path = "all/activity_tasks.rs"]
+mod activity_tasks;
 #[path = "all/arn_validation.rs"]
 mod arn_validation;
 #[path = "all/client_error_wrappers.rs"]

@@ -30,7 +30,7 @@
 //!
 //! ## What the clock owes
 //!
-//! Two transitions here are owed to the clock rather than applied in the call that
+//! Three transitions here are owed to the clock rather than applied in the call that
 //! starts them, because that is what the service reports:
 //!
 //! * an execution starts `RUNNING` and reaches its terminal status later. The run is
@@ -38,6 +38,11 @@
 //!   `RedriveExecution`, which re-runs the same definition over the same input — and
 //!   parked in [`PendingOutcome`], owed at
 //!   `<the attempt's start> + EXECUTION_SETTLE_DELAY + <every Wait>`.
+//! * an execution whose walk reached an ACTIVITY task has no outcome at all yet: the
+//!   task is queued under its activity's ARN as an [`ActivityTask`], a worker claims
+//!   it with `GetActivityTask`, and the clock closes it — failing the execution — if
+//!   the `TimeoutSeconds` or `HeartbeatSeconds` of the scheduling state runs out
+//!   first.
 //! * `DeleteStateMachine` is documented as asynchronous: it "sets the state machine's
 //!   status to `DELETING` and begins the deletion process", so the record moves to
 //!   `DELETING` now and is removed once [`DELETE_SETTLE_DELAY`] has passed.
@@ -339,6 +344,73 @@ pub const EXECUTION_SETTLE_DELAY: Duration = Duration::from_millis(500);
 /// it "sets the state machine's status to DELETING and begins the deletion
 /// process", with no published duration.
 pub const DELETE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+// ---------------------------------------------------------------------------
+// Activity tasks
+//
+// An activity is "a worker — a program — that you host": a `Task` state whose
+// `Resource` is an activity ARN SCHEDULES a task, which stays outstanding until a
+// worker claims it with `GetActivityTask` and answers it. Everything one needs is
+// in [`ActivityTask`], keyed by the token the claim hands the worker.
+// ---------------------------------------------------------------------------
+
+/// How long `GetActivityTask` holds a poll open before answering with no task.
+///
+/// EMULATOR-CHOSEN, well inside the service's published maximum: "the maximum time
+/// the service holds on to the request before responding is 60 seconds", and it
+/// "responds as soon as a task becomes available", so a poll may answer at any point
+/// inside that maximum. This is a third of it — long enough that a worker's poll is a
+/// LONG poll rather than a busy loop, which is what the service's own guidance on
+/// avoiding latency when polling asks of a worker, and far enough inside the 65
+/// seconds the service asks a client to allow its socket that no answer arrives late.
+pub const ACTIVITY_POLL_HOLD: Duration = Duration::from_secs(20);
+
+/// How often a held poll looks again for a task.
+///
+/// EMULATOR-CHOSEN: short enough that a task scheduled while a worker is polling is
+/// answered promptly, long enough that holding a poll is not a busy loop on the
+/// store's lock. A task that is already there is answered by the look this operation
+/// makes BEFORE it holds anything, so this is the delay of a task that arrives
+/// mid-poll and never of one that is waiting.
+pub const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The most workers that may hold a poll of ONE activity at the same time, refused
+/// with the modelled `ActivityWorkerLimitExceeded`.
+///
+/// Emulator resource guard: each open poll holds a request for up to
+/// [`ACTIVITY_POLL_HOLD`], so this bounds how many of them one activity can tie up.
+/// It sits below the quota Step Functions publishes for open activity pollers per
+/// activity ARN (1,000).
+pub const MAX_ACTIVITY_POLLERS: usize = 100;
+
+/// The most polls the WHOLE store may hold open at the same time, refused with the
+/// same modelled error.
+///
+/// Emulator resource guard, for the reason every other cap here is on the whole
+/// store: a per-activity cap alone is multiplied by the number of activities, and a
+/// held poll is a request — and a connection — kept open for up to
+/// [`ACTIVITY_POLL_HOLD`]. With this, the requests this operation holds are bounded
+/// however many activities a caller creates.
+pub const MAX_OPEN_ACTIVITY_POLLS: usize = 1_000;
+
+/// The ASL error name an activity task that ran out of time fails its execution
+/// with.
+///
+/// The Amazon States Language states it for both bounds a `Task` state declares:
+/// "TimeoutSeconds ... If the task runs longer than the specified seconds, this
+/// state fails with a States.Timeout error name", and "HeartbeatSeconds ... If more
+/// time than the specified seconds elapses between heartbeats from the task, this
+/// state fails with a States.Timeout error name."
+pub const TASK_TIMEOUT_ERROR: &str = asl::TIMEOUT_ERROR;
+
+/// The history event a `Task` state writes when a worker claims its task.
+pub const EVENT_ACTIVITY_STARTED: &str = "ActivityStarted";
+
+/// The history event an activity task that ran out of time writes.
+pub const EVENT_ACTIVITY_TIMED_OUT: &str = "ActivityTimedOut";
+
+/// The history event an execution that one of its states failed ends on.
+pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -705,6 +777,160 @@ impl Activity {
     }
 }
 
+/// One activity task an execution scheduled: outstanding from the instant the walk
+/// reached the `Task` state to the instant a worker's reply — or the clock — closes
+/// it.
+///
+/// The record is keyed by the `taskToken` a claim hands the worker, because that is
+/// the only name the worker has for it: "a token that identifies the scheduled task.
+/// This token must be copied and included in subsequent calls to SendTaskHeartbeat,
+/// SendTaskSuccess or SendTaskFailure."
+#[derive(Debug, Clone)]
+pub struct ActivityTask {
+    pub token: String,
+    /// The activity this task is queued under, which is the `activityArn` a worker
+    /// polls with.
+    pub activity_arn: String,
+    /// The execution waiting on it, and the state it is waiting at, so a reply
+    /// resumes exactly that state of exactly that execution.
+    pub execution_arn: String,
+    pub state_name: String,
+    /// "The string that contains the JSON input data for the task": the effective
+    /// input the scheduling state computed.
+    pub input: String,
+    /// When a poll may first claim it: the instant the execution's walk REACHED the
+    /// state, which is its start plus every `Wait` before it. Nothing sleeps for
+    /// those waits, so this is what makes them observable to a worker.
+    pub available_at: SystemTime,
+    /// The `workerName` of the poll that claimed it, when one has — "an arbitrary
+    /// name in order to identify the worker that the task is assigned to".
+    pub worker_name: Option<String>,
+    /// When it was claimed; `None` while it is still queued.
+    pub started_at: Option<SystemTime>,
+    /// When the heartbeat window last restarted: the claim, and then each heartbeat.
+    /// `None` while the task is queued, because a task nobody holds misses no
+    /// heartbeat.
+    pub heartbeat_at: Option<SystemTime>,
+    /// The scheduling state's `TimeoutSeconds` and `HeartbeatSeconds`, in seconds;
+    /// `None` where the state declares none, which is a task with no such bound.
+    pub timeout_seconds: Option<u64>,
+    pub heartbeat_seconds: Option<u64>,
+    /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
+    /// by [`ComAmazonawsSfnAwsstepfunctionsState::schedule_activity_task`] exactly as
+    /// [`StateMachine::retained_bytes`] is.
+    pub retained_bytes: usize,
+}
+
+impl ActivityTask {
+    /// Whether no worker holds this task yet, so a poll may claim it.
+    pub fn is_queued(&self) -> bool {
+        self.started_at.is_none()
+    }
+
+    /// When this task's `TimeoutSeconds` makes it due to close.
+    ///
+    /// Measured from the instant the state scheduled it, which is when the task's own
+    /// clock starts: the span is "how long the task runs", and a task nobody polls
+    /// for still runs out of it.
+    fn timeout_due_at(&self) -> Option<SystemTime> {
+        self.timeout_seconds
+            .map(|seconds| after(self.available_at, Duration::from_secs(seconds)))
+    }
+
+    /// When this task's `HeartbeatSeconds` makes it due to close: that span after the
+    /// last heartbeat, which the claim starts. A task no worker holds has no heartbeat
+    /// window open.
+    fn heartbeat_due_at(&self) -> Option<SystemTime> {
+        let since = self.heartbeat_at?;
+        self.heartbeat_seconds
+            .map(|seconds| after(since, Duration::from_secs(seconds)))
+    }
+
+    /// The instant the clock closes this task at: whichever of its two bounds comes
+    /// first, or `None` for a task the state bounded neither way, which stays
+    /// outstanding until a worker answers it.
+    pub fn closes_at(&self) -> Option<SystemTime> {
+        match (self.timeout_due_at(), self.heartbeat_due_at()) {
+            (Some(timeout), Some(heartbeat)) => Some(timeout.min(heartbeat)),
+            (timeout, heartbeat) => timeout.or(heartbeat),
+        }
+    }
+
+    /// Why the clock closes this task: its heartbeat window rather than the whole
+    /// task's timeout. Reads the same two instants [`ActivityTask::closes_at`] chose
+    /// between, so the reason cannot disagree with the instant.
+    fn closed_by_heartbeat(&self) -> bool {
+        match (self.heartbeat_due_at(), self.timeout_due_at()) {
+            (Some(heartbeat), Some(timeout)) => heartbeat <= timeout,
+            (heartbeat, _) => heartbeat.is_some(),
+        }
+    }
+
+    /// The bytes this record would retain; see [`StateMachine::measure`].
+    ///
+    /// The `workerName` a later claim may write is RESERVED rather than counted (see
+    /// [`WORKER_NAME_RESERVE_BYTES`]), so a claim moves nothing: the bytes a task
+    /// retains are fixed when it is scheduled, which is when the store admitted them.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.token.len()
+            + self.activity_arn.len()
+            + self.execution_arn.len()
+            + self.state_name.len()
+            + self.input.len()
+            + WORKER_NAME_RESERVE_BYTES
+    }
+}
+
+/// What a task's record reserves for the `workerName` a claim may write: the maximum
+/// the modelled `Name` shape carries (len 1..80), reserved when the task is
+/// scheduled for the reason a running execution reserves what a stop may write (see
+/// [`STOP_RESERVE_BYTES`]).
+const WORKER_NAME_RESERVE_BYTES: usize = 80;
+
+/// The activity task a planned run scheduled, with the walk's offsets turned into
+/// instants.
+///
+/// This is what [`plan_run`] reports for a run that SUSPENDED, and what
+/// [`ComAmazonawsSfnAwsstepfunctionsState::schedule_activity_task`] stores once the
+/// execution it belongs to has been admitted — the token is minted there, so no two
+/// tasks can be handed the same one.
+#[derive(Debug, Clone)]
+pub struct PlannedActivityTask {
+    pub activity_arn: String,
+    pub state_name: String,
+    pub input: String,
+    pub available_at: SystemTime,
+    pub timeout_seconds: Option<u64>,
+    pub heartbeat_seconds: Option<u64>,
+}
+
+impl PlannedActivityTask {
+    /// The bytes the task this plans will retain, so the execution that schedules it
+    /// is admitted against its own bytes AND these: admission stays the only place
+    /// the store grows.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<ActivityTask>()
+            + TASK_TOKEN_CHARS
+            + WORKER_NAME_RESERVE_BYTES
+            + ACTIVITY_TASK_EVENT_RESERVE_BYTES
+            + self.activity_arn.len()
+            + self.state_name.len()
+            + self.input.len()
+    }
+}
+
+/// The characters a minted `taskToken` carries (one version-4 UUID), reserved by
+/// [`PlannedActivityTask::measure`] before the token itself is minted.
+const TASK_TOKEN_CHARS: usize = 36;
+
+/// What a scheduled task reserves for the history events its own life appends to the
+/// execution waiting on it: the `ActivityStarted` a claim writes, and the two a
+/// closure by the clock writes. Reserved where the task is admitted, so those writes
+/// cannot take the store past [`MAX_STORE_BYTES`] either.
+const ACTIVITY_TASK_EVENT_RESERVE_BYTES: usize =
+    3 * (std::mem::size_of::<HistoryEvent>() + "ActivityTimedOut".len());
+
 /// The bytes a tag set holds, so a tag write can move the store's total by what it
 /// changed instead of re-measuring a record whose definition is up to 1 MiB.
 fn tags_bytes(tags: &[Tag]) -> usize {
@@ -949,7 +1175,7 @@ impl Execution {
         now: SystemTime,
         client_token: Option<&str>,
         opening: Vec<HistoryEvent>,
-        pending: PendingOutcome,
+        pending: Option<PendingOutcome>,
     ) {
         self.status = EXECUTION_STATUS_RUNNING.to_string();
         self.stop_date = None;
@@ -975,7 +1201,7 @@ impl Execution {
             }
             self.history.push(event);
         }
-        self.pending = Some(pending);
+        self.pending = pending;
     }
 }
 
@@ -1019,6 +1245,21 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     pub executions: BTreeMap<String, Execution>,
     /// One state machine's execution ARNs in start order.
     pub executions_by_sm: HashMap<String, Vec<String>>,
+    /// Every outstanding activity task, keyed by the `taskToken` that names it — the
+    /// one name the worker holding it has, and what `SendTaskHeartbeat`,
+    /// `SendTaskSuccess` and `SendTaskFailure` resolve it by.
+    pub activity_tasks: BTreeMap<String, ActivityTask>,
+    /// One activity's outstanding task tokens in SCHEDULE order, so a poll claims the
+    /// task that has waited longest and two executions' tasks cannot cross.
+    pub activity_tasks_by_activity: HashMap<String, Vec<String>>,
+    /// How many workers are holding a poll of each activity, against
+    /// [`MAX_ACTIVITY_POLLERS`]. Counted up while a poll is held and back down when
+    /// it ends, however it ends (see [`ActivityPoll`]).
+    activity_pollers: HashMap<String, usize>,
+    /// How many polls are held open across every activity, against
+    /// [`MAX_OPEN_ACTIVITY_POLLS`]: the same count summed, kept here so the whole
+    /// store's bound does not depend on walking the map.
+    open_activity_polls: usize,
     /// The execution ARNs that still carry a [`PendingOutcome`], so settling is
     /// proportional to what is actually owed rather than to the whole store.
     pending_executions: Vec<String>,
@@ -1039,10 +1280,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     ///
     /// This is the ONE write a reporting operation performs, and it is owed whether
     /// or not anybody called: an execution whose outcome came due is reported
-    /// terminal, and a state machine whose deletion came due is gone. Executions
-    /// settle before deletions, so an outcome owed before the machine disappeared is
-    /// still recorded.
+    /// terminal, an activity task that ran out of time is closed and the execution
+    /// waiting at it has failed, and a state machine whose deletion came due is gone.
+    /// Tasks settle before executions and executions before deletions, so an outcome
+    /// owed before the machine disappeared is still recorded.
     pub fn settle(&mut self, now: SystemTime) {
+        self.settle_activity_tasks(now);
         let mut still_pending = Vec::with_capacity(self.pending_executions.len());
         for arn in std::mem::take(&mut self.pending_executions) {
             let Some(execution) = self.executions.get_mut(&arn) else {
@@ -1075,6 +1318,191 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             self.remove_state_machine(&arn);
         }
         self.deleting_state_machines = still_deleting;
+    }
+
+    // -----------------------------------------------------------------------
+    // Activity tasks
+    // -----------------------------------------------------------------------
+
+    /// Close every outstanding activity task the clock has made due, and drop every
+    /// one no execution is waiting on any more.
+    ///
+    /// Both are owed whether or not anybody called: a task whose `TimeoutSeconds` or
+    /// `HeartbeatSeconds` ran out has failed its execution at the instant it ran out,
+    /// and a task whose execution was stopped — or went with the state machine it ran
+    /// on — can never be answered, so no later poll may claim it.
+    fn settle_activity_tasks(&mut self, now: SystemTime) {
+        // ONE scan over the outstanding tasks, which collects only the tokens this
+        // instant changes something for.
+        let mut timed_out: Vec<(String, SystemTime)> = Vec::new();
+        let mut orphaned: Vec<String> = Vec::new();
+        for task in self.activity_tasks.values() {
+            if self
+                .executions
+                .get(&task.execution_arn)
+                .is_none_or(Execution::is_terminal)
+            {
+                orphaned.push(task.token.clone());
+                continue;
+            }
+            if let Some(due) = task.closes_at().filter(|due| *due <= now) {
+                timed_out.push((task.token.clone(), due));
+            }
+        }
+        for token in orphaned {
+            self.discard_activity_task(&token);
+        }
+        for (token, due) in timed_out {
+            self.time_out_activity_task(&token, due);
+        }
+    }
+
+    /// Store the task a planned run scheduled for `execution_arn`, minting the
+    /// `taskToken` that names it, and answer that token.
+    ///
+    /// Called once the execution has been ADMITTED, against bytes that already
+    /// include this task's ([`PlannedActivityTask::measure`]).
+    pub fn schedule_activity_task(
+        &mut self,
+        execution_arn: &str,
+        planned: PlannedActivityTask,
+    ) -> String {
+        let token = self.fresh_uuid();
+        let mut task = ActivityTask {
+            token: token.clone(),
+            activity_arn: planned.activity_arn,
+            execution_arn: execution_arn.to_string(),
+            state_name: planned.state_name,
+            input: planned.input,
+            available_at: planned.available_at,
+            worker_name: None,
+            started_at: None,
+            heartbeat_at: None,
+            timeout_seconds: planned.timeout_seconds,
+            heartbeat_seconds: planned.heartbeat_seconds,
+            retained_bytes: 0,
+        };
+        task.retained_bytes = task.measure();
+        self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);
+        self.activity_tasks_by_activity
+            .entry(task.activity_arn.clone())
+            .or_default()
+            .push(token.clone());
+        self.activity_tasks.insert(token.clone(), task);
+        token
+    }
+
+    /// Hand the longest-waiting available task of `activity_arn` to a worker, and
+    /// report the task as it now stands — or `None` when the activity has none to
+    /// hand out.
+    ///
+    /// This is the one write `GetActivityTask` makes: the operation exists to assign
+    /// a task to a worker ("you can provide an arbitrary name in order to identify
+    /// the worker that the task is assigned to"), so the task moves from scheduled to
+    /// started, its heartbeat window opens, and the execution's history records it.
+    /// A task already handed out is never handed out twice, and one whose execution
+    /// has not reached its state yet (every `Wait` before it is still owed) is not
+    /// available.
+    pub fn claim_activity_task(
+        &mut self,
+        activity_arn: &str,
+        worker_name: Option<&str>,
+        now: SystemTime,
+    ) -> Option<ActivityTask> {
+        let queue = self.activity_tasks_by_activity.get(activity_arn)?;
+        let token = queue
+            .iter()
+            .find(|token| {
+                self.activity_tasks
+                    .get(*token)
+                    .is_some_and(|task| task.is_queued() && task.available_at <= now)
+            })
+            .cloned()?;
+        let task = self.activity_tasks.get_mut(&token)?;
+        task.worker_name = worker_name.map(str::to_string);
+        task.started_at = Some(now);
+        // The claim starts the heartbeat window: a worker that has just been handed a
+        // task has not missed a heartbeat.
+        task.heartbeat_at = Some(now);
+        let claimed = task.clone();
+        if let Some(execution) = self.executions.get_mut(&claimed.execution_arn) {
+            let before = execution.retained_bytes;
+            execution.push_event(EVENT_ACTIVITY_STARTED, now);
+            execution.retained_bytes = execution.measure();
+            let after = execution.retained_bytes;
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_add(after)
+                .saturating_sub(before);
+        }
+        Some(claimed)
+    }
+
+    /// Drop the task `token` names, giving back what its record retained, and report
+    /// it. `None` when the store holds no task under that token.
+    pub fn discard_activity_task(&mut self, token: &str) -> Option<ActivityTask> {
+        let task = self.activity_tasks.remove(token)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(task.retained_bytes);
+        if let Some(queue) = self.activity_tasks_by_activity.get_mut(&task.activity_arn) {
+            queue.retain(|queued| queued != token);
+            if queue.is_empty() {
+                self.activity_tasks_by_activity.remove(&task.activity_arn);
+            }
+        }
+        Some(task)
+    }
+
+    /// Close `token`'s task at `due`, the instant its own bound made it due, and fail
+    /// the execution waiting at it with the error the Amazon States Language names
+    /// for a task that ran out of time.
+    ///
+    /// `due` is the instant the bound was reached, not the instant somebody looked:
+    /// two callers reading afterwards see the same `stopDate`.
+    fn time_out_activity_task(&mut self, token: &str, due: SystemTime) {
+        let Some(task) = self.discard_activity_task(token) else {
+            return;
+        };
+        let cause = activity_task_timeout_cause(&task);
+        let Some(execution) = self.executions.get_mut(&task.execution_arn) else {
+            return;
+        };
+        if execution.is_terminal() {
+            return;
+        }
+        let before = execution.retained_bytes;
+        execution.pending = None;
+        execution.status = EXECUTION_STATUS_FAILED.to_string();
+        execution.stop_date = Some(due);
+        execution.error = Some(TASK_TIMEOUT_ERROR.to_string());
+        execution.cause = Some(cause);
+        execution.push_event(EVENT_ACTIVITY_TIMED_OUT, due);
+        execution.push_event(EVENT_EXECUTION_FAILED, due);
+        // The record is re-measured exactly as a stop re-measures it: the execution
+        // is terminal now, so the bytes a stop had reserved are given back and the
+        // events written here are counted.
+        execution.retained_bytes = execution.measure();
+        let after = execution.retained_bytes;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        let execution_arn = task.execution_arn;
+        self.pending_executions
+            .retain(|pending| pending != &execution_arn);
+    }
+
+    /// Drop every outstanding task of the executions `arns` names, for a removal that
+    /// takes those executions with it.
+    fn discard_tasks_of_executions(&mut self, arns: &[String]) {
+        let tokens: Vec<String> = self
+            .activity_tasks
+            .values()
+            .filter(|task| arns.contains(&task.execution_arn))
+            .map(|task| task.token.clone())
+            .collect();
+        for token in tokens {
+            self.discard_activity_task(&token);
+        }
     }
 
     /// The bytes every stored record holds together, against [`MAX_STORE_BYTES`].
@@ -1690,6 +2118,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             if let Some(execution) = self.executions.remove(&execution_arn) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(execution.retained_bytes);
             }
+            // An outstanding activity task names the execution it belongs to, so it
+            // goes with it: no token is left for a worker to answer against an
+            // execution that no longer exists.
+            self.discard_tasks_of_executions(&[execution_arn]);
         }
         Some(machine)
     }
@@ -1877,13 +2309,17 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// its `redriveCount` and `redriveDate` move, and `client_token` — when the
     /// caller supplied one — is remembered so a repeat answers the same
     /// `redriveDate`. Answers the `redriveDate` the redrive carries.
+    ///
+    /// `task_bytes` is what the activity task the re-run stopped at will retain, so a
+    /// redrive is admitted against the whole of what it adds.
     pub fn redrive_execution(
         &mut self,
         arn: &str,
         now: SystemTime,
         client_token: Option<&str>,
         opening: Vec<HistoryEvent>,
-        pending: PendingOutcome,
+        pending: Option<PendingOutcome>,
+        task_bytes: usize,
     ) -> Result<SystemTime, RedriveRejection> {
         let Some(execution) = self.executions.get(arn) else {
             return Err(RedriveRejection::NotFound);
@@ -1896,7 +2332,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         let mut candidate = execution.clone();
         candidate.apply_redrive(now, client_token, opening, pending);
         let after = candidate.measure();
-        if after > before && !self.has_room_for(after - before) {
+        if after + task_bytes > before && !self.has_room_for(after + task_bytes - before) {
             return Err(RedriveRejection::NoRoom);
         }
         candidate.retained_bytes = after;
@@ -1905,9 +2341,13 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_add(after)
             .saturating_sub(before);
         // The re-run's outcome is owed to the clock, so this execution joins the
-        // settle queue again; it left the queue when its first attempt settled.
+        // settle queue again; it left the queue when its first attempt settled. A
+        // re-run that SUSPENDED at an activity task owes the clock nothing, so it
+        // does not rejoin it.
         self.pending_executions.retain(|pending| pending != arn);
-        self.pending_executions.push(arn.to_string());
+        if candidate.pending.is_some() {
+            self.pending_executions.push(arn.to_string());
+        }
         self.executions.insert(arn.to_string(), candidate);
         Ok(now)
     }
@@ -1945,6 +2385,93 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 .then_with(|| left.arn.cmp(&right.arn))
         });
         executions
+    }
+}
+
+/// Why the clock closed an activity task, for the `cause` the execution it failed
+/// reports.
+///
+/// The error NAME is the language's own ([`TASK_TIMEOUT_ERROR`]); this says which of
+/// the scheduling state's two bounds ran out and what that bound was, which is built
+/// from the definition rather than from any one request.
+fn activity_task_timeout_cause(task: &ActivityTask) -> String {
+    if task.closed_by_heartbeat() {
+        let seconds = task.heartbeat_seconds.unwrap_or_default();
+        return format!(
+            "state '{}' sent no heartbeat for its activity task within the {seconds} seconds its \
+             'HeartbeatSeconds' allows",
+            task.state_name
+        );
+    }
+    let seconds = task.timeout_seconds.unwrap_or_default();
+    format!(
+        "state '{}' ran its activity task for longer than the {seconds} seconds its \
+         'TimeoutSeconds' allows",
+        task.state_name
+    )
+}
+
+/// One worker's open poll of an activity, counted against [`MAX_ACTIVITY_POLLERS`].
+///
+/// That count is what the modelled `ActivityWorkerLimitExceeded` reports — "the
+/// maximum number of workers concurrently polling for activity tasks has been
+/// reached" — so it has to fall again however the poll ends: this gives it back when
+/// it is DROPPED, which covers the answer, every early return and a caller that went
+/// away while its poll was held.
+pub struct ActivityPoll {
+    state: ::engine::ServiceState<ComAmazonawsSfnAwsstepfunctionsState>,
+    activity_arn: String,
+}
+
+impl ActivityPoll {
+    /// Count one more open poll of `activity_arn`, or answer `None` when
+    /// [`MAX_ACTIVITY_POLLERS`] are already open on it — or
+    /// [`MAX_OPEN_ACTIVITY_POLLS`] across the whole store.
+    pub fn open(
+        state: &::engine::ServiceState<ComAmazonawsSfnAwsstepfunctionsState>,
+        activity_arn: &str,
+    ) -> Option<Self> {
+        {
+            let mut store = state.lock();
+            let open = store
+                .activity_pollers
+                .get(activity_arn)
+                .copied()
+                .unwrap_or_default();
+            if open >= MAX_ACTIVITY_POLLERS
+                || store.open_activity_polls >= MAX_OPEN_ACTIVITY_POLLS
+            {
+                return None;
+            }
+            store
+                .activity_pollers
+                .insert(activity_arn.to_string(), open + 1);
+            store.open_activity_polls = store.open_activity_polls.saturating_add(1);
+        }
+        Some(Self {
+            state: state.clone(),
+            activity_arn: activity_arn.to_string(),
+        })
+    }
+}
+
+impl Drop for ActivityPoll {
+    fn drop(&mut self) {
+        let mut store = self.state.lock();
+        store.open_activity_polls = store.open_activity_polls.saturating_sub(1);
+        let open = store
+            .activity_pollers
+            .get(&self.activity_arn)
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(1);
+        if open == 0 {
+            store.activity_pollers.remove(&self.activity_arn);
+        } else {
+            store
+                .activity_pollers
+                .insert(self.activity_arn.clone(), open);
+        }
     }
 }
 
@@ -2039,6 +2566,18 @@ fn activity_resource<'a>(
     Ok(name.to_string())
 }
 
+/// Whether `arn` is an activity ARN of this service, in WHATEVER region it names.
+///
+/// A `Task` state's `Resource` names its activity by that activity's own full ARN,
+/// which carries the region the activity lives in, and a definition is INTERPRETED
+/// with no request endpoint in hand — so the region is read from the ARN itself here
+/// rather than compared with an endpoint's. The task is then queued under that same
+/// ARN, so a `Resource` naming a region this emulator holds no activity in queues a
+/// task that no poll of this endpoint's ARNs can claim, which is what the store says.
+pub fn names_an_activity(arn: &str) -> bool {
+    read_activity_arn(arn, &arn_region(arn)).is_ok()
+}
+
 /// The activity NAME `arn` names, read as an activity ARN of this service in
 /// `endpoint_region`, or the message the modelled `InvalidArn` carries.
 pub fn read_activity_arn(arn: &str, endpoint_region: &str) -> Result<String, String> {
@@ -2057,6 +2596,22 @@ pub fn read_activity_arn(arn: &str, endpoint_region: &str) -> Result<String, Str
 /// resource under, so every operation words that refusal the same way.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("could not find the resource {resource_arn}")
+}
+
+/// What the modelled `ActivityWorkerLimitExceeded` says: the activity whose pollers
+/// are all open, and the number of them.
+///
+/// The error reports a LIMIT rather than a value of the request, which is why it is
+/// worded here rather than through [`resource_error_message`] — the same way
+/// `ExecutionLimitExceeded` and `StateMachineLimitExceeded` are. It names the
+/// activity because a worker polling several of them needs to know which poll was
+/// refused.
+pub fn activity_worker_limit_message(activity_arn: &str) -> String {
+    format!(
+        "activity {activity_arn} already has the maximum of {MAX_ACTIVITY_POLLERS} workers \
+         polling it, or this emulator is holding the {MAX_OPEN_ACTIVITY_POLLS} polls it holds at \
+         once"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3201,12 +3756,13 @@ fn uuid_v4(high: u64, low: u64) -> String {
 /// Interpret `definition` against `input` and schedule what the clock owes.
 ///
 /// The run happens HERE, in the call that starts it: [`asl::run`] walks the states
-/// and the result is parked in a [`PendingOutcome`] due at
-/// `start + EXECUTION_SETTLE_DELAY + <every Wait the walk passed>`. Returns the event
-/// the attempt opens its history with, and that outcome.
+/// and what it reached is reported as a [`Planned`] — a terminal outcome parked in a
+/// [`PendingOutcome`] due at `start + EXECUTION_SETTLE_DELAY + <every Wait the walk
+/// passed>`, or the activity task the walk SUSPENDED on, which the execution waits
+/// at until a worker answers it.
 ///
-/// `opening` is that event's type — [`EVENT_EXECUTION_STARTED`] for a
-/// `StartExecution`, [`EVENT_EXECUTION_REDRIVEN`] for a `RedriveExecution` — and
+/// `opening` is the event the attempt opens its history with — [`EVENT_EXECUTION_STARTED`]
+/// for a `StartExecution`, [`EVENT_EXECUTION_REDRIVEN`] for a `RedriveExecution` — and
 /// `previous_event_id` the last id the execution's history already holds, so a
 /// redrive's events CONTINUE the existing numbering instead of restarting it.
 ///
@@ -3220,7 +3776,7 @@ pub fn plan_run(
     context: &asl::Context,
     opening: &str,
     previous_event_id: i64,
-) -> (Vec<HistoryEvent>, PendingOutcome) {
+) -> Planned {
     plan_run_settling_after(
         definition,
         input,
@@ -3230,6 +3786,24 @@ pub fn plan_run(
         previous_event_id,
         EXECUTION_SETTLE_DELAY,
     )
+}
+
+/// What one planned run of a definition left for the store to record.
+///
+/// Exactly one of `pending` and `waiting` is set: a walk either reached a terminal
+/// outcome the clock owes, or stopped at an activity task the execution is waiting
+/// for.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// The events the attempt has ALREADY produced: the opening event, and — for a
+    /// run that suspended — the events of the states it walked up to the task it is
+    /// waiting at, which have happened and are therefore history rather than
+    /// something the clock still owes.
+    pub opening: Vec<HistoryEvent>,
+    /// The terminal outcome the walk computed, owed to the clock.
+    pub pending: Option<PendingOutcome>,
+    /// The activity task the walk suspended on.
+    pub waiting: Option<PlannedActivityTask>,
 }
 
 /// As [`plan_run`], with the delay after which the outcome settles stated by the
@@ -3250,7 +3824,7 @@ pub fn plan_run_settling_after(
     opening: &str,
     previous_event_id: i64,
     settle: Duration,
-) -> (Vec<HistoryEvent>, PendingOutcome) {
+) -> Planned {
     let run = asl::run(definition, input, start, context);
     let started = HistoryEvent {
         id: previous_event_id + 1,
@@ -3282,17 +3856,39 @@ pub fn plan_run_settling_after(
             state_name: step.state_name,
         })
         .collect();
-    (
-        vec![started],
-        PendingOutcome {
+    // A walk that SUSPENDED computed no outcome: what it produced is the task it is
+    // waiting at, available to a worker once the clock reaches the offset the walk
+    // got to — every `Wait` before the state is still owed, and nothing slept for
+    // them. The events of the states it walked are history, so they are recorded now
+    // rather than parked.
+    if let Some(waiting) = run.waiting {
+        let mut history = vec![started];
+        history.extend(events);
+        return Planned {
+            opening: history,
+            pending: None,
+            waiting: Some(PlannedActivityTask {
+                activity_arn: waiting.activity_arn,
+                state_name: waiting.state_name,
+                input: waiting.input.to_string(),
+                available_at: after(start, waiting.at),
+                timeout_seconds: waiting.timeout_seconds,
+                heartbeat_seconds: waiting.heartbeat_seconds,
+            }),
+        };
+    }
+    Planned {
+        opening: vec![started],
+        pending: Some(PendingOutcome {
             due_at,
             status: run.status.to_string(),
             output: run.output,
             error: run.error,
             cause: run.cause,
             events,
-        },
-    )
+        }),
+        waiting: None,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,13 @@
 //! `ItemsPath`, `ResultSelector`, `ResultPath`, `OutputPath`), the context object
 //! (`$$`), the intrinsic functions, `Retry` and `Catch`.
 //!
+//! A `Task` state whose `Resource` is an ACTIVITY ARN is also RUN, as far as this
+//! process can run it: the work belongs to a worker that polls this emulator, so the
+//! state SCHEDULES a task carrying the state's effective input and the walk SUSPENDS
+//! there ([`Run::waiting`]), which is the execution waiting for a worker exactly as it
+//! does on the real service. `GetActivityTask` hands that task out; the worker's reply
+//! closes it.
+//!
 //! What is NOT executed is what cannot be executed inside this process:
 //!
 //! * a `Task` state's service integration, which calls another service;
@@ -283,8 +290,14 @@ pub const MAX_CAUSE_BYTES: usize = 32_768;
 pub const MAX_WAIT_SECONDS: u64 = 31_622_400;
 
 /// The state types this emulator executes.
-pub const EXECUTED_STATE_TYPES: &[&str] =
-    &["Choice", "Fail", "Map", "Parallel", "Pass", "Succeed", "Wait"];
+///
+/// `Task` is one of them for the ONE kind of task whose work this emulator can carry:
+/// an activity task, which a worker polls for. A `Task` state naming any other
+/// `Resource` still ends the execution with [`RUNTIME_ERROR`], because the
+/// integration it names is a call to another service.
+pub const EXECUTED_STATE_TYPES: &[&str] = &[
+    "Choice", "Fail", "Map", "Parallel", "Pass", "Succeed", "Task", "Wait",
+];
 
 /// The query language this interpreter evaluates. ASL's `QueryLanguage` member
 /// selects between it and JSONata; a JSONata definition is not run.
@@ -362,6 +375,31 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Cause",
             "CausePath",
         ],
+        // An ACTIVITY task's own work is done by a worker, so the members below are
+        // the ones that decide what is scheduled for it and what the state does with
+        // the reply. `Retry` and `Catch` are deliberately absent: they decide what
+        // happens when the task FAILS or times out, and this emulator does not yet
+        // re-schedule a task or hand a failure to a catcher, so a state that declares
+        // one is not run rather than run as though it declared none. `Credentials` is
+        // absent for the same reason it is on every other type: it changes who the
+        // invocation is made as.
+        "Task" => &[
+            "Type",
+            "Comment",
+            "QueryLanguage",
+            "Resource",
+            "InputPath",
+            "Parameters",
+            "TimeoutSeconds",
+            "TimeoutSecondsPath",
+            "HeartbeatSeconds",
+            "HeartbeatSecondsPath",
+            "ResultSelector",
+            "ResultPath",
+            "OutputPath",
+            "Next",
+            "End",
+        ],
         // `ItemReader`, `ItemBatcher` and `ResultWriter` are deliberately absent:
         // each one reads or writes an S3 dataset, which is outside this process.
         "Map" => &[
@@ -432,7 +470,9 @@ pub struct Step {
 /// What one walk of a definition produced.
 #[derive(Debug, Clone)]
 pub struct Run {
-    /// `SUCCEEDED`, `FAILED` or `TIMED_OUT`.
+    /// `SUCCEEDED`, `FAILED` or `TIMED_OUT` — or `RUNNING`, when the walk reached an
+    /// activity task and [`Run::waiting`] carries it: the execution has no outcome
+    /// yet, because the next thing that happens to it is a worker's reply.
     pub status: &'static str,
     pub output: Option<String>,
     pub error: Option<String>,
@@ -441,6 +481,35 @@ pub struct Run {
     /// The offset into the run at which the outcome became due: the total of every
     /// `Wait` the walk passed.
     pub elapsed: Duration,
+    /// The activity task the walk SUSPENDED on, when it reached one. A run that
+    /// carries this reached no terminal status: the task is what the execution is
+    /// waiting for.
+    pub waiting: Option<ScheduledActivity>,
+}
+
+/// The activity task a `Task` state scheduled, as the walk computed it.
+///
+/// The offsets are into the RUN (the total of every `Wait` the walk passed before the
+/// state), so the caller that parks this turns them into instants against the
+/// execution's own start — the walk never sleeps.
+#[derive(Debug, Clone)]
+pub struct ScheduledActivity {
+    /// The activity ARN the state's `Resource` named, which is the queue a worker
+    /// polls with `GetActivityTask`.
+    pub activity_arn: String,
+    /// The state that scheduled it, so the reply resumes the execution there.
+    pub state_name: String,
+    /// "The string that contains the JSON input data for the task": the state's
+    /// effective input, after `InputPath` and the `Parameters` payload template.
+    pub input: Value,
+    /// How far into the run the state scheduled the task.
+    pub at: Duration,
+    /// `TimeoutSeconds`: "If the task runs longer than the specified seconds, this
+    /// state fails with a States.Timeout error name."
+    pub timeout_seconds: Option<u64>,
+    /// `HeartbeatSeconds`: "If more time than the specified seconds elapses between
+    /// heartbeats from the task, this state fails with a States.Timeout error name."
+    pub heartbeat_seconds: Option<u64>,
 }
 
 /// What the context object (`$$`) reports about the run being interpreted.
@@ -548,6 +617,10 @@ enum Next {
     Named(String),
     /// Nowhere: this branch (or the execution) ends with the state's output.
     EndBranch,
+    /// Nowhere YET: the state scheduled an activity task
+    /// ([`Interpreter::waiting`]), so the walk stops there and the execution waits
+    /// for the worker that polls for it.
+    Suspended,
 }
 
 /// What one walk of a state list produced.
@@ -1803,6 +1876,7 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         steps: Vec::new(),
         start,
         base_context: context.value(&input_value, start),
+        waiting: None,
     };
     let branch = interpreter.walk(
         states,
@@ -1811,6 +1885,7 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         Duration::ZERO,
         &Scope::default(),
     );
+    let waiting = interpreter.waiting.take();
     let steps = interpreter.steps;
 
     // A definition-level `TimeoutSeconds` bounds the whole execution: a run that got
@@ -1832,6 +1907,25 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
                 )),
             );
         }
+    }
+
+    // An execution that SUSPENDED reached no outcome: the walk stopped at an activity
+    // task, and what happens next is a worker's reply, so the run reports the task it
+    // is waiting for and no terminal event is written. Two checks come FIRST, so a run
+    // that cannot reach the task is not reported as waiting for it: the
+    // definition-level timeout above, which a run's own `Wait` states can already have
+    // spent, and the branch's outcome, which is a FAILURE where the document the task
+    // would carry outgrew what a state may produce.
+    if let (Some(waiting), true) = (waiting, branch.outcome.is_ok()) {
+        return Run {
+            status: super::EXECUTION_STATUS_RUNNING,
+            output: None,
+            error: None,
+            cause: None,
+            steps,
+            elapsed: branch.end,
+            waiting: Some(waiting),
+        };
     }
 
     match branch.outcome {
@@ -1948,6 +2042,8 @@ fn terminal(
         cause,
         steps,
         elapsed,
+        // A run that reached a terminal event is waiting for nothing.
+        waiting: None,
     }
 }
 
@@ -2042,6 +2138,10 @@ struct Interpreter {
     /// against.
     start: SystemTime,
     base_context: Value,
+    /// The activity task a `Task` state scheduled, which SUSPENDED the walk: the
+    /// execution waits at that state until a worker answers it. Set at most once,
+    /// because the walk stops at the state that set it.
+    waiting: Option<ScheduledActivity>,
 }
 
 impl Interpreter {
@@ -2150,6 +2250,17 @@ impl Interpreter {
             }
             match step.next {
                 Next::EndBranch => {
+                    return Branch {
+                        outcome: Ok(current),
+                        end: at,
+                    };
+                }
+                // The state scheduled an activity task: the walk stops here, and
+                // `run` reports the task rather than an outcome. Only a TOP-LEVEL
+                // state suspends (see [`Interpreter::activity_task_state`]), so no
+                // enclosing `Map` iteration or `Parallel` branch can be left holding
+                // a half-finished walk.
+                Next::Suspended => {
                     return Branch {
                         outcome: Ok(current),
                         end: at,
@@ -2292,8 +2403,114 @@ impl Interpreter {
                 Err(Failure { error, cause }.at(at))
             }
             "Map" => self.map_state(name, state, raw, effective, &context, at),
+            "Task" => self.activity_task_state(name, state, effective, &context, at),
             // `Parallel` is the only type left: the list above is exhaustive.
             _ => self.parallel_state(name, state, raw, effective, &context, at),
+        }
+    }
+
+    /// A `Task` state whose `Resource` names an ACTIVITY: the state SCHEDULES a task
+    /// for that activity and the walk suspends, because what happens next is a
+    /// worker's reply.
+    ///
+    /// "An activity is a worker — a program — that you host", which "polls Step
+    /// Functions using the GetActivityTask API action and responds using SendTask*
+    /// API actions": the task carries the state's effective input, and the state's
+    /// own `TimeoutSeconds`/`HeartbeatSeconds` bound how long it may stay
+    /// outstanding. A `Resource` naming any OTHER integration is a call to another
+    /// service, which this process does not make.
+    fn activity_task_state(
+        &mut self,
+        name: &str,
+        state: &Map<String, Value>,
+        effective: Value,
+        context: &Value,
+        at: Duration,
+    ) -> Result<StateStep, Fault> {
+        let resource = state.get("Resource").and_then(Value::as_str).unwrap_or_default();
+        if !super::names_an_activity(resource) {
+            return Err(runtime(format!(
+                "state '{name}' invokes '{}', a service integration this emulator does not make, \
+                 so nothing was run for it",
+                echoed(resource)
+            ))
+            .at(at));
+        }
+        // A nested state list is walked to its own end inside the enclosing state's
+        // turn, so there is nowhere for one of its states to wait: a `Map` iteration
+        // or a `Parallel` branch that schedules a task is not run, rather than run as
+        // though the task had already answered.
+        if self.depth > 0 {
+            return Err(runtime(format!(
+                "state '{name}' schedules an activity task inside a 'Map' iteration or a \
+                 'Parallel' branch, which this emulator does not wait at, so nothing was run \
+                 for it"
+            ))
+            .at(at));
+        }
+        // Both bounds are read from the state's effective INPUT, which is what their
+        // `*Path` forms are reference paths into — not from the `Parameters` document
+        // built below.
+        let timeout_seconds = self
+            .task_seconds(state, "TimeoutSeconds", &effective, context)
+            .map_err(|failure| failure.at(at))?;
+        let heartbeat_seconds = self
+            .task_seconds(state, "HeartbeatSeconds", &effective, context)
+            .map_err(|failure| failure.at(at))?;
+        // "Parameters ... Used to create a collection of key-value pairs that will be
+        // passed as input": the document the template builds IS what the worker is
+        // handed, and without one the state's effective input is.
+        let input = match state.get("Parameters") {
+            Some(template) => {
+                payload_template(template, &effective, context).map_err(|failure| failure.at(at))?
+            }
+            None => effective,
+        };
+        self.push("TaskStateEntered", name, at);
+        self.push("ActivityScheduled", name, at);
+        self.waiting = Some(ScheduledActivity {
+            activity_arn: resource.to_string(),
+            state_name: name.to_string(),
+            input: input.clone(),
+            at,
+            timeout_seconds,
+            heartbeat_seconds,
+        });
+        Ok(StateStep {
+            value: input,
+            at,
+            next: Next::Suspended,
+        })
+    }
+
+    /// A `Task` state's `TimeoutSeconds` or `HeartbeatSeconds`, from the literal
+    /// member or from the `<member>Path` reference path into the state's input.
+    ///
+    /// Both are "a positive integer" of seconds, so a value that is not one is a
+    /// defect in the definition rather than a bound to be guessed at.
+    fn task_seconds(
+        &self,
+        state: &Map<String, Value>,
+        member: &str,
+        input: &Value,
+        context: &Value,
+    ) -> Result<Option<u64>, Failure> {
+        let path_member = format!("{member}Path");
+        let declared = match (state.get(member), state.get(path_member.as_str())) {
+            (Some(declared), _) => Some(declared.clone()),
+            (None, Some(Value::String(path))) => Some(expression(path, input, context)?),
+            (None, Some(other)) => {
+                return Err(runtime(format!(
+                    "'{path_member}' must be a JSONPath string, not {other}"
+                )))
+            }
+            (None, None) => return Ok(None),
+        };
+        match declared.as_ref().and_then(Value::as_u64) {
+            Some(seconds) if seconds > 0 => Ok(Some(seconds)),
+            _ => Err(runtime(format!(
+                "'{member}' must be a positive whole number of seconds"
+            ))),
         }
     }
 
@@ -4570,6 +4787,9 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         steps: Vec::new(),
         start: test.start,
         base_context,
+        // `TestState` tests ONE state, with no execution around it to wait: a state
+        // whose work is an invocation is tested through its `mock`.
+        waiting: None,
     };
     interpreter.trial(test, &raw, inspection)
 }

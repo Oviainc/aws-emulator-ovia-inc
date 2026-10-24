@@ -1,0 +1,787 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for ACTIVITY TASKS: what a `Task` state whose `Resource` is an
+//! activity ARN schedules, and what `GetActivityTask` hands a polling worker, driven
+//! over this service's own wire protocol (`awsJson1_0`, `POST /` with
+//! `X-Amz-Target: AWSStepFunctions.<Operation>`) through the production
+//! `MultiServiceRouter`.
+//!
+//! The rules under test:
+//!
+//! 1. a `Task` state whose `Resource` is an activity ARN SCHEDULES one task under
+//!    that activity, carrying the state's effective input (`InputPath`, then the
+//!    `Parameters` payload template), and the execution waits at that state: it stays
+//!    `RUNNING` with no outcome until the task is answered or the clock closes it;
+//! 2. `GetActivityTask` hands the longest-waiting unclaimed task of the activity it
+//!    names to the poll, ONCE — the `taskToken` that identifies it and that stored
+//!    input — and answers an empty token when the activity has no task to hand out,
+//!    after holding the poll open;
+//! 3. a poll is judged in two steps, as every other activity read is: an
+//!    `activityArn` that is not an activity ARN of this service in this endpoint's
+//!    region is `InvalidArn` (400) before any lookup, and an ARN the store holds no
+//!    activity under is `ActivityDoesNotExist` (400);
+//! 4. a task the scheduling state BOUNDED is closed by the clock when that bound runs
+//!    out — `TimeoutSeconds` from the instant the state scheduled it, `HeartbeatSeconds`
+//!    from the instant a worker took it — and the execution waiting at it then reports
+//!    the language's own `States.Timeout`;
+//! 5. a `Task` state that names any other integration schedules nothing: it is the
+//!    call to another service this emulator does not make, so the execution ends
+//!    `FAILED` with `States.Runtime` and no worker is handed anything.
+//!
+//! The harness (`Emulator`, `string`, `create_machine`, `start_execution`,
+//! `describe_execution`) is the one `state_machine_lifecycle` builds; `tests/all.rs`
+//! is this binary's crate root, so it is reached through
+//! `crate::state_machine_lifecycle`.
+
+use std::time::{Duration, Instant, SystemTime};
+
+use serde_json::{json, Value};
+
+use service_com_amazonaws_sfn_awsstepfunctions::state::{
+    asl::{DATA_LIMIT_ERROR, MAX_PAYLOAD_BYTES, RUNTIME_ERROR, TIMEOUT_ERROR},
+    ACTIVITY_POLL_HOLD,
+};
+
+use crate::state_machine_lifecycle::{
+    create_machine, describe_execution, start_execution, string, Emulator, ACCOUNT,
+    PAST_THE_EXECUTION_DELAY, REGION,
+};
+
+/// The longest a `taskToken` may be: the modelled `TaskToken` length (1..2048).
+const MAX_TASK_TOKEN_CHARS: usize = 2048;
+
+/// Long enough that a one-second bound the scheduling state declared has run out.
+const PAST_A_ONE_SECOND_BOUND: Duration = Duration::from_millis(1_300);
+
+/// The ARN an activity of `name` carries in the region every request here signs for.
+fn activity_arn(name: &str) -> String {
+    format!("arn:aws:states:{REGION}:{ACCOUNT}:activity:{name}")
+}
+
+/// Create an activity that must succeed, and return its ARN.
+async fn create_activity(emulator: &Emulator, name: &str) -> String {
+    let created = emulator.ok("CreateActivity", &json!({ "name": name })).await;
+    string(&created, "activityArn")
+}
+
+/// A one-state definition whose `Task` state polls `activity_arn`, plus whatever
+/// other members `extra` declares for that state.
+fn activity_definition(activity_arn: &str, extra: Value) -> String {
+    let Value::Object(extra) = extra else {
+        panic!("expected an object of state members, got {extra:?}")
+    };
+    let mut state = json!({ "Type": "Task", "Resource": activity_arn, "End": true });
+    let members = state.as_object_mut().expect("the state is an object");
+    for (member, value) in extra {
+        members.insert(member, value);
+    }
+    json!({ "StartAt": "Work", "States": { "Work": state } }).to_string()
+}
+
+/// Poll `activity_arn` once, requiring a 200, and return the body.
+async fn poll(emulator: &Emulator, activity_arn: &str, worker: Option<&str>) -> Value {
+    let mut request = json!({ "activityArn": activity_arn });
+    if let Some(worker) = worker {
+        request
+            .as_object_mut()
+            .expect("the request is an object")
+            .insert("workerName".to_string(), json!(worker));
+    }
+    emulator.ok("GetActivityTask", &request).await
+}
+
+/// The `(taskToken, input)` a poll that must have been handed a task answered.
+async fn claimed(emulator: &Emulator, case: &str, activity_arn: &str, worker: Option<&str>) -> (String, Value) {
+    let answer = poll(emulator, activity_arn, worker).await;
+    let token = answer
+        .get("taskToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a taskToken, got {answer:?}"))
+        .to_string();
+    assert!(
+        !token.is_empty() && token.chars().count() <= MAX_TASK_TOKEN_CHARS,
+        "case {case:?}: expected a taskToken within the modelled 1..{MAX_TASK_TOKEN_CHARS}, got \
+         {token:?}"
+    );
+    let input = answer
+        .get("input")
+        .and_then(Value::as_str)
+        .map(|text| {
+            serde_json::from_str(text)
+                .unwrap_or_else(|error| panic!("case {case:?}: expected JSON input, got {error}"))
+        })
+        .unwrap_or_else(|| panic!("case {case:?}: expected an input, got {answer:?}"));
+    (token, input)
+}
+
+/// Whether a poll's answer carries no task at all, which is what "the poll returns a
+/// taskToken with a null string" is on the wire.
+fn is_empty_answer(answer: &Value) -> bool {
+    answer.get("taskToken").is_none_or(Value::is_null)
+        && answer.get("input").is_none_or(Value::is_null)
+}
+
+/// How many tasks the store holds for `activity_arn`, and how many of those a poll
+/// could be handed right now.
+///
+/// Read from the STORE rather than by polling, because a poll with nothing to hand
+/// out is HELD open for [`ACTIVITY_POLL_HOLD`] — the one rule asserted on the wire,
+/// by the one test below that waits a hold out. Every other assertion here is about
+/// what the store holds, so it reads the store, the way `sync_execution` does for a
+/// record no operation of this API reports.
+fn queued_tasks(emulator: &Emulator, activity_arn: &str) -> (usize, usize) {
+    let state = emulator.store();
+    let store = state.lock();
+    let now = SystemTime::now();
+    let mine = store
+        .activity_tasks
+        .values()
+        .filter(|task| task.activity_arn == activity_arn);
+    let mut held = 0;
+    let mut claimable = 0;
+    for task in mine {
+        held += 1;
+        if task.is_queued() && task.available_at <= now {
+            claimable += 1;
+        }
+    }
+    (held, claimable)
+}
+
+// ---------------------------------------------------------------------------
+// What the scheduling state queues, and what the poll is handed
+// ---------------------------------------------------------------------------
+
+/// One task is scheduled per execution, carrying the state's EFFECTIVE input, and the
+/// poll is handed exactly that — over a table whose rows differ along the input's
+/// shape and size and along the data-flow members the state applies to it.
+#[tokio::test]
+async fn get_activity_task_hands_out_the_input_the_state_scheduled() {
+    let emulator = Emulator::new();
+
+    // Each row: the execution input, the extra members of the `Task` state, and the
+    // document the worker must be handed.
+    let blob = "x".repeat(4_096);
+    let blob_input = format!(r#"{{"blob":"{blob}"}}"#);
+    let cases: Vec<(&str, &str, Value, Value)> = vec![
+        (
+            "the empty object a start with no input runs on",
+            "{}",
+            json!({}),
+            json!({}),
+        ),
+        (
+            "an object the state passes through untouched",
+            r#"{"order":"A-1","items":2}"#,
+            json!({}),
+            json!({ "order": "A-1", "items": 2 }),
+        ),
+        (
+            "an array input, which is a JSON document like any other",
+            r#"[1,2,3]"#,
+            json!({}),
+            json!([1, 2, 3]),
+        ),
+        (
+            "a nested document",
+            r#"{"a":{"b":{"c":[true,null,"x"]}}}"#,
+            json!({}),
+            json!({ "a": { "b": { "c": [true, null, "x"] } } }),
+        ),
+        (
+            "characters outside ASCII, which the payload carries verbatim",
+            r#"{"who":"wörker-日本"}"#,
+            json!({}),
+            json!({ "who": "wörker-日本" }),
+        ),
+        (
+            "a larger payload than one request's worth of members",
+            &blob_input,
+            json!({}),
+            json!({ "blob": blob }),
+        ),
+        (
+            "InputPath, which selects the part of the input the task gets",
+            r#"{"keep":{"id":7},"drop":"everything else"}"#,
+            json!({ "InputPath": "$.keep" }),
+            json!({ "id": 7 }),
+        ),
+        (
+            "InputPath null, which discards the input: 'the effective input is {}'",
+            r#"{"ignored":true}"#,
+            json!({ "InputPath": null }),
+            json!({}),
+        ),
+        (
+            "Parameters, which BUILDS what the worker is handed",
+            r#"{"order":"A-1"}"#,
+            json!({ "Parameters": { "id.$": "$.order", "fixed": 1 } }),
+            json!({ "id": "A-1", "fixed": 1 }),
+        ),
+        (
+            "Parameters reading the context object, which is this execution's own",
+            r#"{"order":"A-1"}"#,
+            json!({ "Parameters": { "state.$": "$$.State.Name" } }),
+            json!({ "state": "Work" }),
+        ),
+        (
+            "InputPath and Parameters together, in that order",
+            r#"{"keep":{"order":"A-2"},"drop":1}"#,
+            json!({ "InputPath": "$.keep", "Parameters": { "id.$": "$.order" } }),
+            json!({ "id": "A-2" }),
+        ),
+        (
+            "the bounds the state may declare, which do not change what is scheduled",
+            r#"{"order":"A-3"}"#,
+            json!({ "TimeoutSeconds": 300, "HeartbeatSeconds": 60 }),
+            json!({ "order": "A-3" }),
+        ),
+    ];
+
+    let mut tokens: Vec<String> = Vec::with_capacity(cases.len());
+    for (index, (case, input, extra, expected)) in cases.into_iter().enumerate() {
+        let activity = create_activity(&emulator, &format!("worker-{index}")).await;
+        let definition = activity_definition(&activity, extra);
+        let machine = create_machine(&emulator, &format!("machine-{index}"), &definition).await;
+        let execution = start_execution(&emulator, &machine, "only", input).await;
+
+        let (token, scheduled) = claimed(&emulator, case, &activity, Some("w-1")).await;
+        assert_eq!(
+            scheduled, expected,
+            "case {case:?}: expected the task input {expected}, got {scheduled}"
+        );
+        assert!(
+            !tokens.contains(&token),
+            "case {case:?}: expected a token no other task carries, got {token:?}"
+        );
+        tokens.push(token);
+
+        // The execution WAITS at the state: nothing the clock owed turned it
+        // terminal, because what happens next is the worker's reply.
+        std::thread::sleep(PAST_THE_EXECUTION_DELAY);
+        let described = describe_execution(&emulator, &execution).await;
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("RUNNING"),
+            "case {case:?}: expected the execution to wait at its activity task, got {described:?}"
+        );
+        assert!(
+            described.get("output").is_none_or(Value::is_null)
+                && described.get("stopDate").is_none_or(Value::is_null),
+            "case {case:?}: an execution waiting at a task has no outcome, got {described:?}"
+        );
+    }
+}
+
+/// A task is handed out ONCE, and the tasks of one activity are handed out in the
+/// order they were scheduled, whichever execution scheduled them.
+#[tokio::test]
+async fn each_task_is_handed_to_one_worker_in_schedule_order() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "shared").await;
+    let definition = activity_definition(&activity, json!({}));
+    let machine = create_machine(&emulator, "shared-machine", &definition).await;
+
+    // Two executions of the SAME activity: two tasks, queued in start order.
+    let first = start_execution(&emulator, &machine, "first", r#"{"n":1}"#).await;
+    let second = start_execution(&emulator, &machine, "second", r#"{"n":2}"#).await;
+    assert_ne!(
+        first, second,
+        "the two executions must be different records, got {first} twice"
+    );
+
+    let (first_token, first_input) = claimed(&emulator, "the first poll", &activity, Some("w-1")).await;
+    let (second_token, second_input) =
+        claimed(&emulator, "the second poll", &activity, Some("w-2")).await;
+    assert_eq!(
+        (first_input, second_input),
+        (json!({ "n": 1 }), json!({ "n": 2 })),
+        "expected the tasks in the order they were scheduled"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "expected two tokens, got {first_token} twice"
+    );
+
+    // Both tasks are out with workers, so there is nothing left to hand out.
+    let (held, claimable) = queued_tasks(&emulator, &activity);
+    assert_eq!(
+        (held, claimable),
+        (2, 0),
+        "expected both tasks to be out with a worker, got {held} held and {claimable} claimable"
+    );
+}
+
+/// A poll of an activity that has nothing scheduled answers an empty token, and a
+/// task scheduled afterwards is handed to the next poll.
+///
+/// This is the one test that waits a whole [`ACTIVITY_POLL_HOLD`] out, which is why
+/// every other assertion about "nothing to hand out" reads the store instead.
+#[tokio::test]
+async fn a_poll_with_nothing_scheduled_answers_an_empty_token() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "idle").await;
+
+    let began = Instant::now();
+    let answer = poll(&emulator, &activity, None).await;
+    let held = began.elapsed();
+    assert!(
+        is_empty_answer(&answer),
+        "expected an empty answer from an activity with no task, got {answer:?}"
+    );
+    assert!(
+        held >= ACTIVITY_POLL_HOLD,
+        "expected the poll to be held for {ACTIVITY_POLL_HOLD:?}, it answered after {held:?}"
+    );
+
+    // The same activity, once an execution has scheduled a task for it.
+    let definition = activity_definition(&activity, json!({}));
+    let machine = create_machine(&emulator, "idle-machine", &definition).await;
+    start_execution(&emulator, &machine, "only", r#"{"ready":true}"#).await;
+    let (_, scheduled) = claimed(&emulator, "after a task is scheduled", &activity, None).await;
+    assert_eq!(
+        scheduled,
+        json!({ "ready": true }),
+        "expected the task the execution scheduled, got {scheduled}"
+    );
+}
+
+/// A task scheduled after every `Wait` the definition declares is not available
+/// before the clock reaches it: the walk accumulates those waits instead of sleeping
+/// for them.
+#[tokio::test]
+async fn a_task_behind_a_wait_state_is_not_available_yet() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "delayed").await;
+    // One `Wait` of 30 seconds in front of the task: far longer than a poll is held,
+    // so no poll in this test can be handed it.
+    let definition = json!({
+        "StartAt": "Hold",
+        "States": {
+            "Hold": { "Type": "Wait", "Seconds": 30, "Next": "Work" },
+            "Work": { "Type": "Task", "Resource": activity, "End": true },
+        },
+    })
+    .to_string();
+    let machine = create_machine(&emulator, "delayed-machine", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", "{}").await;
+
+    let (held, claimable) = queued_tasks(&emulator, &activity);
+    assert_eq!(
+        (held, claimable),
+        (1, 0),
+        "expected the task to be queued but not yet available, got {held} held and {claimable} \
+         claimable"
+    );
+    let described = describe_execution(&emulator, &execution).await;
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("RUNNING"),
+        "expected the execution to still be running, got {described:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two refusals: the ARN, then the resource
+// ---------------------------------------------------------------------------
+
+/// An `activityArn` that is not an activity ARN of this service in this endpoint's
+/// region is `InvalidArn` (400) — before any lookup — and a well-formed one the store
+/// holds no activity under is `ActivityDoesNotExist` (400).
+#[tokio::test]
+async fn a_poll_is_refused_for_an_arn_and_then_for_the_resource() {
+    let emulator = Emulator::new();
+    let machine = create_machine(
+        &emulator,
+        "machine",
+        r#"{"StartAt":"Hello","States":{"Hello":{"Type":"Pass","End":true}}}"#,
+    )
+    .await;
+    create_activity(&emulator, "present").await;
+    create_activity(&emulator, "doomed").await;
+
+    // The rows differ along WHICH component of the ARN is wrong.
+    let invalid: Vec<(&str, String)> = vec![
+        ("text that is not an ARN at all", "present".to_string()),
+        (
+            "an ARN of another service",
+            format!("arn:aws:lambda:{REGION}:{ACCOUNT}:activity:present"),
+        ),
+        (
+            "an ARN of another region",
+            format!("arn:aws:states:eu-west-1:{ACCOUNT}:activity:present"),
+        ),
+        ("a state machine ARN", machine.clone()),
+        (
+            "an activity ARN with no name",
+            format!("arn:aws:states:{REGION}:{ACCOUNT}:activity:"),
+        ),
+        (
+            "an activity ARN carrying a qualifier",
+            format!("arn:aws:states:{REGION}:{ACCOUNT}:activity:present:1"),
+        ),
+        (
+            "an ARN with no partition",
+            format!("arn::states:{REGION}:{ACCOUNT}:activity:present"),
+        ),
+    ];
+    for (case, arn) in invalid {
+        let (status, code) = emulator
+            .err("GetActivityTask", &json!({ "activityArn": arn }))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidArn"),
+            "case {case:?}: expected a 400 InvalidArn for {arn}, got {status} {code}"
+        );
+    }
+
+    emulator
+        .ok(
+            "DeleteActivity",
+            &json!({ "activityArn": activity_arn("doomed") }),
+        )
+        .await;
+    let elsewhere = Emulator::in_region_on(&emulator, "eu-west-1");
+    create_activity(&elsewhere, "abroad").await;
+
+    let absent: Vec<(&str, String)> = vec![
+        ("a name never created", activity_arn("ghost")),
+        ("an activity that was deleted", activity_arn("doomed")),
+        (
+            "a name created only against another region's endpoint",
+            activity_arn("abroad"),
+        ),
+        (
+            "a name that only a state machine carries",
+            activity_arn("machine"),
+        ),
+    ];
+    for (case, arn) in absent {
+        let (status, code) = emulator
+            .err("GetActivityTask", &json!({ "activityArn": arn }))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ActivityDoesNotExist"),
+            "case {case:?}: expected a 400 ActivityDoesNotExist for {arn}, got {status} {code}"
+        );
+    }
+
+    // The refusals created nothing: the activity that is there holds no task.
+    let (held, _) = queued_tasks(&emulator, &activity_arn("present"));
+    assert_eq!(
+        held, 0,
+        "expected the surviving activity to hold no task, got {held}"
+    );
+}
+
+/// An activity DELETED while its task is outstanding orphans that task: the worker's
+/// poll is refused for the activity that is gone, and the execution is still waiting.
+#[tokio::test]
+async fn deleting_an_activity_orphans_its_outstanding_task() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "mid-flight").await;
+    let definition = activity_definition(&activity, json!({}));
+    let machine = create_machine(&emulator, "mid-flight-machine", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", r#"{"n":1}"#).await;
+    let (token, _) = claimed(&emulator, "before the delete", &activity, Some("w-1")).await;
+    assert!(!token.is_empty(), "expected a token, got {token:?}");
+
+    emulator
+        .ok("DeleteActivity", &json!({ "activityArn": activity }))
+        .await;
+    let (status, code) = emulator
+        .err("GetActivityTask", &json!({ "activityArn": activity }))
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "ActivityDoesNotExist"),
+        "expected a poll of the deleted activity to be refused, got {status} {code}"
+    );
+    let described = describe_execution(&emulator, &execution).await;
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("RUNNING"),
+        "expected the execution to still be waiting at its task, got {described:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the clock owes a task
+// ---------------------------------------------------------------------------
+
+/// A task the scheduling state BOUNDED is closed when that bound runs out, and the
+/// execution waiting at it fails with the language's own `States.Timeout`: the
+/// task's own timeout runs from the instant it was scheduled, the heartbeat window
+/// from the instant a worker took it.
+#[tokio::test]
+async fn a_bound_the_state_declared_closes_the_task_and_fails_the_execution() {
+    let emulator = Emulator::new();
+
+    // Each row: the bounds the state declares, and whether a worker claims the task
+    // before the bound is waited out.
+    let cases: Vec<(&str, Value, bool)> = vec![
+        (
+            "TimeoutSeconds, which runs whether or not anybody polls",
+            json!({ "TimeoutSeconds": 1 }),
+            false,
+        ),
+        (
+            "TimeoutSeconds, with the task out with a worker",
+            json!({ "TimeoutSeconds": 1 }),
+            true,
+        ),
+        (
+            "HeartbeatSeconds, which runs from the claim",
+            json!({ "HeartbeatSeconds": 1 }),
+            true,
+        ),
+        (
+            "both bounds, the heartbeat window being the shorter",
+            json!({ "TimeoutSeconds": 300, "HeartbeatSeconds": 1 }),
+            true,
+        ),
+    ];
+
+    for (index, (case, bounds, claim)) in cases.into_iter().enumerate() {
+        let activity = create_activity(&emulator, &format!("bounded-{index}")).await;
+        let definition = activity_definition(&activity, bounds);
+        let machine = create_machine(&emulator, &format!("bounded-machine-{index}"), &definition).await;
+        let execution = start_execution(&emulator, &machine, "only", "{}").await;
+        if claim {
+            claimed(&emulator, case, &activity, Some("w-1")).await;
+        }
+
+        std::thread::sleep(PAST_A_ONE_SECOND_BOUND);
+        let described = describe_execution(&emulator, &execution).await;
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("FAILED"),
+            "case {case:?}: expected the execution to have failed, got {described:?}"
+        );
+        assert_eq!(
+            described.get("error").and_then(Value::as_str),
+            Some(TIMEOUT_ERROR),
+            "case {case:?}: expected the error {TIMEOUT_ERROR}, got {described:?}"
+        );
+        assert!(
+            described
+                .get("cause")
+                .and_then(Value::as_str)
+                .is_some_and(|cause| !cause.is_empty()),
+            "case {case:?}: expected a cause saying which bound ran out, got {described:?}"
+        );
+        // The task went with it: there is nothing left for a worker to be handed.
+        let (held, _) = queued_tasks(&emulator, &activity);
+        assert_eq!(
+            held, 0,
+            "case {case:?}: expected the closed task to be gone, got {held} still held"
+        );
+    }
+}
+
+/// A task bounded only by a heartbeat window stays claimable while nobody holds it:
+/// the window opens at the CLAIM, so an unclaimed task misses no heartbeat.
+#[tokio::test]
+async fn an_unclaimed_task_misses_no_heartbeat() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "heartbeat-only").await;
+    let definition = activity_definition(&activity, json!({ "HeartbeatSeconds": 1 }));
+    let machine = create_machine(&emulator, "heartbeat-machine", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", r#"{"late":true}"#).await;
+
+    std::thread::sleep(PAST_A_ONE_SECOND_BOUND);
+    let described = describe_execution(&emulator, &execution).await;
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("RUNNING"),
+        "expected an unclaimed task to leave its execution running, got {described:?}"
+    );
+    let (_, scheduled) = claimed(&emulator, "after the window would have closed", &activity, None).await;
+    assert_eq!(
+        scheduled,
+        json!({ "late": true }),
+        "expected the task to still be claimable, got {scheduled}"
+    );
+}
+
+/// An execution that was STOPPED is waiting for nothing, so its outstanding task is
+/// not handed to any worker.
+#[tokio::test]
+async fn stopping_an_execution_withdraws_its_task() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "stopped").await;
+    let definition = activity_definition(&activity, json!({}));
+    let machine = create_machine(&emulator, "stopped-machine", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", "{}").await;
+
+    emulator
+        .ok(
+            "StopExecution",
+            &json!({ "executionArn": execution, "error": "ByHand", "cause": "the test" }),
+        )
+        .await;
+    let described = describe_execution(&emulator, &execution).await;
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("ABORTED"),
+        "expected the stopped execution to report ABORTED, got {described:?}"
+    );
+    let (held, _) = queued_tasks(&emulator, &activity);
+    assert_eq!(
+        held, 0,
+        "expected a stopped execution's task to be withdrawn, got {held} still held"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What is NOT an activity task
+// ---------------------------------------------------------------------------
+
+/// A `Task` state that names any other integration schedules nothing: it is a call to
+/// another service, which this emulator does not make, so the execution ends `FAILED`
+/// with `States.Runtime` and no poll of any activity is handed anything.
+#[tokio::test]
+async fn a_task_state_that_is_not_an_activity_schedules_nothing() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "untouched").await;
+
+    // Each row is a `Resource` that is not an activity ARN of this service, or an
+    // activity task somewhere the walk cannot wait at.
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a Lambda function ARN",
+            activity_definition(
+                &format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:f"),
+                json!({}),
+            ),
+        ),
+        (
+            "an optimised service integration",
+            activity_definition("arn:aws:states:::lambda:invoke", json!({})),
+        ),
+        (
+            "a state machine ARN, which is not an activity",
+            activity_definition(
+                &format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:other"),
+                json!({}),
+            ),
+        ),
+        (
+            "an activity task inside a Map iteration, which has nowhere to wait",
+            json!({
+                "StartAt": "Each",
+                "States": {
+                    "Each": {
+                        "Type": "Map",
+                        "Items": [1, 2],
+                        "ItemProcessor": {
+                            "StartAt": "Work",
+                            "States": {
+                                "Work": { "Type": "Task", "Resource": activity, "End": true },
+                            },
+                        },
+                        "End": true,
+                    },
+                },
+            })
+            .to_string(),
+        ),
+    ];
+
+    let mut started = Vec::new();
+    for (index, (case, definition)) in cases.into_iter().enumerate() {
+        let machine = create_machine(&emulator, &format!("other-{index}"), &definition).await;
+        started.push((case, start_execution(&emulator, &machine, "only", "{}").await));
+    }
+    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
+
+    for (case, execution) in started {
+        let described = describe_execution(&emulator, &execution).await;
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("FAILED"),
+            "case {case:?}: expected FAILED, got {described:?}"
+        );
+        assert_eq!(
+            described.get("error").and_then(Value::as_str),
+            Some(RUNTIME_ERROR),
+            "case {case:?}: expected the error {RUNTIME_ERROR}, got {described:?}"
+        );
+    }
+
+    let (held, _) = queued_tasks(&emulator, &activity);
+    assert_eq!(
+        held, 0,
+        "expected no task queued for any activity, got {held}"
+    );
+}
+
+/// A task whose input outgrew what one state may produce is NOT scheduled: the
+/// execution ends with the language's own data-limit error instead, so no worker is
+/// handed a document the service could not carry.
+#[tokio::test]
+async fn a_task_input_past_what_a_state_may_carry_is_not_scheduled() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "outsized").await;
+    // Two copies of a document that is itself inside the limit: the template builds
+    // what the worker would be handed, so that is what is measured.
+    let definition = activity_definition(
+        &activity,
+        json!({ "Parameters": { "one.$": "$.blob", "two.$": "$.blob" } }),
+    );
+    let machine = create_machine(&emulator, "outsized-machine", &definition).await;
+    let input = json!({ "blob": "x".repeat(MAX_PAYLOAD_BYTES * 2 / 3) }).to_string();
+    let execution = start_execution(&emulator, &machine, "only", &input).await;
+
+    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
+    let described = describe_execution(&emulator, &execution).await;
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("FAILED"),
+        "expected the execution to have failed, got {described:?}"
+    );
+    assert_eq!(
+        described.get("error").and_then(Value::as_str),
+        Some(DATA_LIMIT_ERROR),
+        "expected the error {DATA_LIMIT_ERROR}, got {described:?}"
+    );
+    let (held, _) = queued_tasks(&emulator, &activity);
+    assert_eq!(
+        held, 0,
+        "expected nothing queued for a task that could not be scheduled, got {held}"
+    );
+}
+
+/// The worker-poll limit is a bound on OPEN polls, not on polls ever made: a poll
+/// that has answered gives its place back, so a worker polling in a loop is never
+/// refused.
+#[tokio::test]
+async fn a_poll_that_answered_gives_its_place_back() {
+    let emulator = Emulator::new();
+    let activity = create_activity(&emulator, "serial").await;
+    let definition = activity_definition(&activity, json!({}));
+    let machine = create_machine(&emulator, "serial-machine", &definition).await;
+
+    // More polls in a row than one, each of which held its place while it ran: a
+    // leak would refuse the later ones with ActivityWorkerLimitExceeded. The guard
+    // leaves room for more than one worker ([`MAX_ACTIVITY_POLLERS`]), so a refusal
+    // here could only be a place that was not given back.
+    for index in 0..3 {
+        start_execution(&emulator, &machine, &format!("run-{index}"), &format!(r#"{{"n":{index}}}"#))
+            .await;
+        let (_, scheduled) = claimed(
+            &emulator,
+            "one of a worker's repeated polls",
+            &activity,
+            Some("looping-worker"),
+        )
+        .await;
+        assert_eq!(
+            scheduled,
+            json!({ "n": index }),
+            "case {index}: expected the task that run scheduled, got {scheduled}"
+        );
+    }
+}

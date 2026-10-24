@@ -324,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .await
         };
-        let Ok((opening, pending)) = interpreted else {
+        let Ok(planned) = interpreted else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::INTERPRETER_UNAVAILABLE,
             ));
@@ -367,16 +367,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let waiting = planned.waiting;
+        let task_bytes = waiting
+            .as_ref()
+            .map_or(0, crate::state::PlannedActivityTask::measure);
         match store.redrive_execution(
             &input.execution_arn,
             now,
             input.client_token.as_deref(),
-            opening,
-            pending,
+            planned.opening,
+            planned.pending,
+            task_bytes,
         ) {
-            Ok(redrive_date) => Ok(RedriveExecutionOutput {
-                redrive_date: crate::state::to_date_time(redrive_date),
-            }),
+            Ok(redrive_date) => {
+                // The re-run reached an activity task: it is queued for a worker to
+                // claim exactly as a first attempt's is.
+                if let Some(waiting) = waiting {
+                    store.schedule_activity_task(&input.execution_arn, waiting);
+                }
+                Ok(RedriveExecutionOutput {
+                    redrive_date: crate::state::to_date_time(redrive_date),
+                })
+            }
             Err(crate::state::RedriveRejection::NotFound) => {
                 Err(RedriveExecutionErrorModeled::ExecutionDoesNotExist(
                     ExecutionDoesNotExist {

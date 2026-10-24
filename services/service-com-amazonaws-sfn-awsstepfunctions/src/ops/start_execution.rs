@@ -3,7 +3,9 @@
 //! @op StartExecution
 //! IMPLEMENTED: stores an Execution record and RUNS the state machine's Amazon
 //! States Language definition through [`crate::state::asl`], parking the terminal
-//! outcome the walk computed until the clock makes it due.//!
+//! outcome the walk computed until the clock makes it due — or, where the walk
+//! reached an activity task, queueing that task for a worker to claim with
+//! `GetActivityTask` and leaving the execution waiting at that state.//!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
 //!
@@ -366,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .await
         };
-        let Ok((history, pending)) = interpreted else {
+        let Ok(planned) = interpreted else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::INTERPRETER_UNAVAILABLE,
             ));
@@ -389,8 +391,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),
-            history,
-            pending: Some(pending),
+            history: planned.opening,
+            pending: planned.pending,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
         };
@@ -458,8 +460,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store's caps are in records AND in bytes: an execution retains its
         // `input` (caller-sized up to the modelled 256 KiB), the outcome the walk
         // computed and that run's history, so a record count alone would not bound
-        // the memory.
-        if let Some(why) = store.execution_rejection(&machine_arn, candidate.measure()) {
+        // the memory. A run that stopped at an activity task retains that task too,
+        // so it is admitted against both records together and the schedule below
+        // cannot grow the store past what was admitted.
+        let waiting = planned.waiting;
+        let task_bytes = waiting
+            .as_ref()
+            .map_or(0, crate::state::PlannedActivityTask::measure);
+        if let Some(why) =
+            store.execution_rejection(&machine_arn, candidate.measure() + task_bytes)
+        {
             return Err(
                 StartExecutionErrorModeled::ExecutionLimitExceeded(ExecutionLimitExceeded {
                     message: Some(why),
@@ -469,6 +479,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.insert_execution(candidate);
+        // The walk reached an activity task: it is queued under its activity's ARN
+        // for a worker to claim with `GetActivityTask`, and the execution waits at
+        // that state until one answers it.
+        if let Some(waiting) = waiting {
+            store.schedule_activity_task(&arn, waiting);
+        }
 
         Ok(StartExecutionOutput {
             execution_arn: arn,

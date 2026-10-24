@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetActivityTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetActivityTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: hands the longest-waiting task of the activity the request names to
+//! the polling worker — the `taskToken` that identifies it and the input the
+//! scheduling state computed — and holds the poll open for
+//! [`crate::state::ACTIVITY_POLL_HOLD`] when the activity has none yet. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetActivityTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of its own modelled
+//! errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +167,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetActivityTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetActivityTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetActivityTask"))
+        // `activityArn` (1..256) and `workerName` (1..80) are modelled, so the
+        // centralized walk has already refused anything outside them. `workerName` is
+        // "an arbitrary name in order to identify the worker", so nothing else is
+        // asked of it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE the store is consulted: a malformed ARN, an ARN of
+        // another service, of another region or of another resource type is a defect
+        // in the REQUEST, which `InvalidArn` reports, not an activity that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_activity_arn(&input.activity_arn, &endpoint_region)
+        {
+            return Err(GetActivityTaskErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        // First look: a task already waiting is answered without holding anything.
+        {
+            let now = crate::state::now();
+            let mut store = state.lock();
+            store.settle(now);
+            require_activity(&store, &input.activity_arn)?;
+            if let Some(task) =
+                store.claim_activity_task(&input.activity_arn, input.worker_name.as_deref(), now)
+            {
+                return Ok(answered(task));
+            }
+        }
+
+        // "This initiates a long poll, where the service holds the HTTP connection
+        // open and responds as soon as a task becomes available." Holding one is what
+        // the worker limit counts, so a slot is taken for exactly as long as this poll
+        // is held and given back however the poll ends.
+        let Some(_poll) = crate::state::ActivityPoll::open(&state, &input.activity_arn) else {
+            return Err(GetActivityTaskErrorModeled::ActivityWorkerLimitExceeded(
+                ActivityWorkerLimitExceeded {
+                    message: Some(crate::state::activity_worker_limit_message(
+                        &input.activity_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let until = crate::state::after(crate::state::now(), crate::state::ACTIVITY_POLL_HOLD);
+        while crate::state::now() < until {
+            tokio::time::sleep(crate::state::ACTIVITY_POLL_INTERVAL).await;
+            let now = crate::state::now();
+            let mut store = state.lock();
+            store.settle(now);
+            // An activity can be deleted while a worker is polling it: there is then
+            // no queue to poll, which is the same refusal as polling one that was
+            // never created.
+            require_activity(&store, &input.activity_arn)?;
+            if let Some(task) =
+                store.claim_activity_task(&input.activity_arn, input.worker_name.as_deref(), now)
+            {
+                return Ok(answered(task));
+            }
+        }
+
+        // "If no task is available within [the time the service holds the request],
+        // the poll returns a taskToken with a null string": an empty answer, which a
+        // worker's polling loop treats as "nothing to do yet" and polls again for.
+        Ok(GetActivityTaskOutput {
+            task_token: None,
+            input: None,
+        })
+    }
+}
+
+/// Refuse the poll when the store holds no activity under the ARN it names: "the
+/// specified activity does not exist" — never created, deleted since, or created
+/// against another region's endpoint.
+fn require_activity(
+    store: &crate::state::ComAmazonawsSfnAwsstepfunctionsState,
+    activity_arn: &str,
+) -> Result<(), GetActivityTaskError> {
+    if store.activities.contains_key(activity_arn) {
+        return Ok(());
+    }
+    Err(
+        GetActivityTaskErrorModeled::ActivityDoesNotExist(ActivityDoesNotExist {
+            message: Some(crate::state::resource_error_message(
+                crate::state::ACTIVITY_DOES_NOT_EXIST,
+                activity_arn,
+            )),
+        })
+        .into(),
+    )
+}
+
+/// What a poll that claimed `task` answers: the token that identifies it and the
+/// input the scheduling state computed for the worker.
+///
+/// Both come from the STORED task, so a worker is handed what the execution really
+/// scheduled and never a value of its own request.
+fn answered(task: crate::state::ActivityTask) -> GetActivityTaskOutput {
+    GetActivityTaskOutput {
+        task_token: Some(task.token),
+        input: Some(task.input),
     }
 }
