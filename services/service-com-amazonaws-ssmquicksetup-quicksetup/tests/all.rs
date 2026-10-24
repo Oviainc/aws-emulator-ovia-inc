@@ -15,6 +15,8 @@
 mod configuration_definitions;
 #[path = "all/configuration_managers.rs"]
 mod configuration_managers;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_settings_and_types.rs"]

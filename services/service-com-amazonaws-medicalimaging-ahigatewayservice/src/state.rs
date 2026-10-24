@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use smithy_server_runtime::{Violation, ViolationKind};
 
-use crate::ops::types::ImportConfiguration;
+use crate::ops::types::{DICOMTags, ImportConfiguration};
 
 /// How long after `CreateDatastore` the data store leaves `CREATING` for `ACTIVE`.
 ///
@@ -72,8 +72,8 @@ pub const IMAGE_SET_DELETION_DELAY: Duration = Duration::from_millis(500);
 pub const FIRST_IMAGE_SET_VERSION_ID: u32 = 1;
 
 /// The smallest page a listing will serve — the model's `maxResults` minimum, which is
-/// the same 1..50 range on both listings that declare one
-/// (`smithy_query(query="operation",operation="ListDatastores,ListDICOMImportJobs")`).
+/// the same 1..50 range on every paginated operation that declares one
+/// (`smithy_query(query="operation",operation="ListDatastores,ListDICOMImportJobs,SearchImageSets")`).
 pub const MIN_LIST_PAGE_SIZE: usize = 1;
 
 /// The largest page a listing will serve — the model's `maxResults` maximum, and
@@ -887,6 +887,12 @@ pub struct PendingImageSetTransition {
     /// on its source. Nothing is readable through `GetImageFrame` before the transition
     /// that delivers it falls due, because nothing holds it yet.
     pub delivered_image_frames: Option<HashMap<String, ImageFrame>>,
+    /// The DICOM attributes this transition DELIVERS when it lands, by the same rule as
+    /// [`PendingImageSetTransition::delivered_image_frames`]: a copy carries its
+    /// source's DICOM content to its destination, so the destination answers a search
+    /// over those attributes exactly when the copy that delivered them completed, and
+    /// not before.
+    pub delivered_dicom_tags: Option<DICOMTags>,
     /// Whether this transition RETIRES the image set — the landing of the delete a
     /// `DeleteImageSet` call started. The record stays readable afterwards, because
     /// `deletedAt` ("the timestamp when the image set properties were deleted") is a
@@ -917,6 +923,12 @@ pub struct ImageSet {
     pub image_frames: HashMap<String, ImageFrame>,
     /// Whether this image set is in the primary DICOM hierarchy (`isPrimary`).
     pub is_primary: bool,
+    /// The DICOM attributes of the patient, study and series this image set holds —
+    /// what `SearchImageSets` filters on and reports in each
+    /// `ImageSetsMetadataSummary`. Every member is absent (and the two study counts
+    /// zero) for an image set nothing has delivered DICOM content to yet, exactly as it
+    /// holds no pixel data: an attribute is searchable only once something stored it.
+    pub dicom_tags: DICOMTags,
     pub created_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
     /// What the clock owes the latest version, if anything.
@@ -955,6 +967,8 @@ impl ImageSet {
             // once something has delivered it (the copy that completes, an import).
             image_frames: HashMap::new(),
             is_primary,
+            // No DICOM content either, for the same reason the frame map is empty.
+            dicom_tags: DICOMTags::default(),
             created_at: now,
             deleted_at: None,
             pending: None,
@@ -1060,6 +1074,12 @@ impl ImageSet {
         // its pixel data, so the two cannot disagree.
         if let Some(delivered) = pending.delivered_image_frames {
             self.image_frames.extend(delivered);
+        }
+        // The DICOM attributes the transition owed land with it too, so what
+        // `SearchImageSets` filters on and reports for this image set only ever
+        // describes content the image set already holds.
+        if let Some(delivered) = pending.delivered_dicom_tags {
+            self.dicom_tags = delivered;
         }
         // A deletion the clock owed lands the same way, at the DUE instant rather than at
         // `now`, so `deletedAt` does not move between reads — and the pixel data this
@@ -1519,6 +1539,41 @@ pub fn decode_ordinal_page_token(marker: &str, token: &str) -> Option<u32> {
     }
     let ordinal: u32 = payload.parse().ok()?;
     (ordinal > 0).then_some(ordinal)
+}
+
+/// Encode the sort key the next page starts at as an opaque `nextToken`, for a listing
+/// whose order the CALLER chooses — a search, where the field and the direction the walk
+/// follows come from the request, so the key's text is that field's own (an instant for
+/// one field, a DICOM date and time for another) and only the caller's own operation
+/// knows how to read it back.
+///
+/// A sibling of [`encode_page_token`] and [`encode_ordinal_page_token`] rather than a use
+/// of either, for the same reason those two are siblings: the key is neither an instant
+/// nor an ordinal. All three spell a token the same way — hex, so it stays inside
+/// `NextToken`'s `^\p{ASCII}{0,8192}$` pattern and is plainly not a resource identifier —
+/// and all three take the COLLECTION's `marker`, which for a caller-ordered listing names
+/// the order too: a position in one order is not a position in another, so a token minted
+/// under a different sort is refused rather than honoured.
+pub fn encode_keyed_page_token(marker: &str, key: &str, resource_id: &str) -> String {
+    ::hex::encode(format!("{marker}{key}:{resource_id}").as_bytes())
+}
+
+/// Decode a token [`encode_keyed_page_token`] produced for the collection and order
+/// `marker` names, as the key's own text and the identifier that broke its tie, or `None`
+/// when it was not one — a string that is not hex, does not decode to UTF-8, carries
+/// another collection's or another order's marker (or none), or holds no identifier.
+///
+/// Split at the LAST `:`, because every identifier this service pages over is `[0-9a-z]+`
+/// and so cannot contain one, while a key's text may.
+pub fn decode_keyed_page_token(marker: &str, token: &str) -> Option<(String, String)> {
+    let bytes = ::hex::decode(token).ok()?;
+    let decoded = String::from_utf8(bytes).ok()?;
+    let payload = decoded.strip_prefix(marker)?;
+    let (key, resource_id) = payload.rsplit_once(':')?;
+    if !is_resource_id(resource_id) {
+        return None;
+    }
+    Some((key.to_string(), resource_id.to_string()))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

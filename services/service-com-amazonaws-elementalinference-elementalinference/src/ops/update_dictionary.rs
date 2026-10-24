@@ -163,8 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateDictionaryErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -190,14 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = std::time::Instant::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
         state.settle_due_transitions(now);
 
         // The feeds that reference this dictionary, derived from the feed store, which
         // is also what decides whether the updated dictionary reports REFERENCED.
-        let references = state.feeds_referencing(&input.id);
+        let references = state.feeds_referencing(&region, &input.id);
 
-        let Some(dictionary) = state.dictionaries.get_mut(&input.id) else {
+        // The dictionary is resolved WITHIN the request's Region: the service is
+        // regional, so a dictionary created through another Region's endpoint is not
+        // this endpoint's to mutate.
+        let Some(dictionary) = state.dictionary_mut(&region, &input.id) else {
             return Err(UpdateDictionaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

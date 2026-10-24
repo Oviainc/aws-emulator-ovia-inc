@@ -45,12 +45,20 @@ pub const INGESTION_STATE_DISABLED: &str = "disabled";
 /// used when a caller names none.
 pub const MAX_PAGE_SIZE: usize = 100;
 
-/// The emulator's ceiling on stored app bundles.
+/// The app bundles ONE account may hold in ONE Region.
+///
+/// AppFabric's published, non-adjustable service quota: an account holds at most
+/// one app bundle per Region, so a second `CreateAppBundle` in a Region whose
+/// bundle still exists is refused with the `ServiceQuotaExceededException` the
+/// operation models, and succeeds again once `DeleteAppBundle` has removed it.
+pub const MAX_APP_BUNDLES_PER_REGION: usize = 1;
+
+/// The emulator's ceiling on stored app bundles ACROSS every Region.
 ///
 /// A RESOURCE GUARD, not an AWS-published quota: the store lives in the
-/// emulator's process, so a caller must not be able to grow it without bound.
-/// Past the ceiling `CreateAppBundle` refuses with the `ServiceQuotaExceededException`
-/// it models, which is how a real account at its limit answers.
+/// emulator's process and serves every Region a caller may sign for, so the
+/// per-Region quota above alone does not bound it. Past the ceiling
+/// `CreateAppBundle` refuses with the same `ServiceQuotaExceededException`.
 pub const MAX_APP_BUNDLES: usize = 1_000;
 
 /// The same guard for the ingestions one app bundle may hold.
@@ -159,6 +167,10 @@ pub struct AppBundleRecord {
     /// forms `appBundleIdentifier` accepts.
     pub id: String,
     pub arn: String,
+    /// The Region the create call was signed for: the Region this bundle lives
+    /// in, whose quota it counts against (see [`MAX_APP_BUNDLES_PER_REGION`]),
+    /// and the one its [`arn`](Self::arn) carries.
+    pub region: String,
     pub customer_managed_key_arn: Option<String>,
     pub tags: Vec<Tag>,
     pub created_at: SystemTime,
@@ -699,6 +711,19 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
                 sequence,
             },
         );
+    }
+
+    /// How many app bundles this account holds in `region`.
+    ///
+    /// An app bundle belongs to the Region its create call was signed for, and
+    /// AppFabric's quota is per account per Region, so this — not the size of
+    /// the whole store — is what `CreateAppBundle` weighs against
+    /// [`MAX_APP_BUNDLES_PER_REGION`].
+    pub fn bundles_in_region(&self, region: &str) -> usize {
+        self.app_bundles
+            .values()
+            .filter(|bundle| bundle.region == region)
+            .count()
     }
 
     /// App bundles in creation order.

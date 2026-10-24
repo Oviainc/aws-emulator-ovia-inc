@@ -58,8 +58,9 @@ struct Reader {
 }
 
 /// Every operation of this service whose handler resolves an ARN against stored state.
-/// `DeleteDashboard` is absent because it models no not-found error at all and answers
-/// its modelled `ValidationException` instead (pinned by `dashboard_lifecycle`).
+/// `DeleteDashboard` is absent because it models no not-found error at all: it reports the
+/// post-condition and answers an absent ARN with a 200 no-op (pinned by
+/// `dashboard_lifecycle` and `delete_dashboard_idempotency`).
 const READERS: &[Reader] = &[
     Reader {
         operation: "GetDashboard",

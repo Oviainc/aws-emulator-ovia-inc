@@ -23,12 +23,18 @@
 //! refused before any node is looked at — as a `ValidationException` whose message names
 //! the key the caller submitted and the member it filled, which is what the recorded
 //! service answers for one (`InstancePropertyStringFilter$Key` is modelled as free text,
-//! so the refusal is the service's own rather than the modelled boundary's). For the
+//! so the refusal is the service's own rather than the modelled boundary's). A tag filter
+//! ANDed with a filter on a property of a node is refused the same way: both keys are
+//! keys this operation accepts, so what is invalid is their COMBINATION ("Tag filters
+//! can't be combined with other filter types"), which two tag filters and two property
+//! filters do not trip ([`crate::state::tag_filter_combination_rejection`]). For the
 //! operators that compare a whole value, a value outside the set the model publishes for
 //! its key is the modelled `InvalidInstancePropertyFilterValue` ("The specified filter
 //! value isn't valid"), and a node id that is not shaped like one is the modelled
-//! `InvalidInstanceId`. [`crate::state`] holds the key set, the value sets and the
-//! operator comparison, so the describes over the same nodes cannot disagree about them.
+//! `InvalidInstanceId`, carrying the constraint it violated
+//! ([`crate::state::MANAGED_NODE_ID_PATTERN`]). [`crate::state`] holds the key set, the
+//! value sets, the combination rule and the operator comparison, so the describes over
+//! the same nodes cannot disagree about them.
 //!
 //! ## Nodes nobody registered
 //!
@@ -232,19 +238,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for filter in &filters {
+            if !crate::state::is_node_filter_key(filter.key) {
+                // A key that names no property of a node is refused before any node is
+                // looked at, and the refusal is built from the request: it names the key
+                // the caller submitted and the member it filled.
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::filter_key_rejection(filter.key),
+                ));
+            }
+        }
+
+        // "Tag filters can't be combined with other filter types." Every key above is one
+        // this operation accepts, so a tag filter beside a filter on a property of a node
+        // is a combination the request may not express, whichever of the two lists carries
+        // them — a validation of the request, not a key the operation does not know.
+        if let Some(why) =
+            crate::state::tag_filter_combination_rejection(filters.iter().map(|filter| filter.key))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        for filter in &filters {
             let RequestFilter {
                 key,
                 values,
                 operator,
             } = filter;
-            if !crate::state::is_node_filter_key(key) {
-                // A key that names no property of a node is refused before any node is
-                // looked at, and the refusal is built from the request: it names the key
-                // the caller submitted and the member it filled.
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::filter_key_rejection(key),
-                ));
-            }
             // A value belongs to a published set only where the operator compares the
             // WHOLE value. `BeginWith`, `LessThan` and `GreaterThan` are satisfied by a
             // prefix of, or a bound on, such a value, so a set membership test there
@@ -273,20 +292,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     );
                 }
             }
-            if *key == "InstanceIds" {
-                if let Some(rejected) = values
+            if *key == "InstanceIds"
+                && values
                     .iter()
-                    .find(|value| !crate::state::managed_node_id_is_well_formed(value))
-                {
-                    return Err(DescribeInstancePropertiesErrorModeled::InvalidInstanceId(
-                        InvalidInstanceId {
-                            message: Some(format!(
-                                "Value '{rejected}' for filter key '{key}' isn't a managed node id"
-                            )),
-                        },
-                    )
-                    .into());
-                }
+                    .any(|value| !crate::state::managed_node_id_is_well_formed(value))
+            {
+                // The refusal reports the constraint the value violated — the member a
+                // node id fills and its modelled pattern — rather than describing the
+                // id's shape in prose.
+                return Err(DescribeInstancePropertiesErrorModeled::InvalidInstanceId(
+                    InvalidInstanceId {
+                        message: Some(crate::state::managed_node_id_constraint_violation()),
+                    },
+                )
+                .into());
             }
         }
 

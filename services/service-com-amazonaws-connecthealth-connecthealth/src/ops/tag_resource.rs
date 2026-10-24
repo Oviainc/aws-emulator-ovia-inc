@@ -183,7 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "TagResource could not reach this service's store",
             ));
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the ARN has to name a resource of the
+        // Region the request was signed for.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -191,11 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ARN of a resource whose deletion has fallen due no longer resolves here.
         store.purge_due_deletions(now);
 
-        // The ARN has to name a resource this service HOLDS: tags live beside the
-        // resource, so there is nothing to attach them to otherwise. The same resolution
+        // The ARN has to name a resource this service HOLDS, in THIS REGION: tags live
+        // beside the resource, so there is nothing to attach them to otherwise, and a
+        // resource of another Region is not this endpoint's to tag. The same resolution
         // `ListTagsForResource` reads through, so the write and the read never disagree
         // about whether the ARN names a resource.
-        if !store.holds_resource_arn(&input.resource_arn) {
+        if !store.holds_resource_arn(&region, &input.resource_arn) {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::resource_not_found_message(

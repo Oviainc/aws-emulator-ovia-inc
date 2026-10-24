@@ -4,14 +4,19 @@
 //!
 //! Removes the stored dashboard — the record and everything stored on it, including its
 //! tags — and returns the ARN it removed, so a following `GetDashboard` answers
-//! `ResourceNotFoundException` and `ListDashboards` no longer lists it. This operation
-//! models no not-found error, and answering 200 for an ARN nothing was stored under
-//! would report a deletion that never happened, so an unknown ARN is refused with the
+//! `ResourceNotFoundException` and `ListDashboards` no longer lists it.
+//!
+//! The delete is IDEMPOTENT: this operation models no not-found error, so an ARN that
+//! satisfies `DashboardArn`'s modelled constraints and resolves to no stored record is a
+//! 200 no-op echoing the requested ARN — the post-condition the caller asked for (that
+//! ARN holds no dashboard) already holds, so a client retrying a delete whose first
+//! answer it never saw gets the same answer as the first. An ARN that does NOT satisfy
+//! those constraints never reaches this handler: boundary validation refuses it with the
 //! modelled `ValidationException` (400).
 //!
 //! Being state-changing — and destructive — it emits the audit record
 //! `crate::state::record_state_change` writes (timestamp, source, presented access key
-//! id, operation, resource, outcome) on both the success and the refusal path.
+//! id, operation, resource, outcome).
 //!
 //! ## Shape of an operation
 //!
@@ -156,31 +161,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the dashboard store is unavailable".to_string(),
             })
         })?;
-        let mut state = state.lock();
-
-        // Removing the record removes the widgets and tags stored on it, since they
-        // all live on the one record.
-        let Some(removed) = state.dashboards.remove(&input.arn) else {
-            crate::state::record_state_change(
-                ctx,
-                Self::NAME,
-                &input.arn,
-                "ValidationException",
-            );
-            return Err(DeleteDashboardErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Member must identify an existing dashboard: arn {}",
-                        input.arn
-                    ),
-                },
-            )
-            .into());
-        };
+        // Removing the record removes the widgets, tags and resource policy stored on it,
+        // since they all live on the one record. A miss is not an error: the delete is
+        // idempotent, so the requested ARN is echoed either way.
+        state.lock().dashboards.remove(&input.arn);
 
         // The record this call changed state, for the audit stream.
-        crate::state::record_state_change(ctx, Self::NAME, &removed.arn, "SUCCESS");
+        crate::state::record_state_change(ctx, Self::NAME, &input.arn, "SUCCESS");
 
-        Ok(DeleteDashboardOutput { arn: removed.arn })
+        Ok(DeleteDashboardOutput { arn: input.arn })
     }
 }

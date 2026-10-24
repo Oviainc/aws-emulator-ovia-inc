@@ -7,6 +7,13 @@
 //! ARN plus the owning instance and its identity store. This is the ONLY file to touch
 //! for this operation.
 //!
+//! The application this operation creates is an OAuth 2.0 CUSTOMER MANAGED one, so the
+//! `ApplicationProviderArn` has to name a published provider that backs such an
+//! application: a provider that federates over SAML 2.0, and an Amazon Web Services
+//! managed provider whose applications the owning service creates on the customer's
+//! behalf, are refused with the modelled `ValidationException` (400), while an ARN naming
+//! no published provider at all is a `ResourceNotFoundException` (404).
+//!
 //! `ApplicationArn` is server-generated here; `Name`, `Description`, `PortalOptions`,
 //! `Status` and `Tags` are the caller's input, persisted so `DescribeApplication` reads
 //! back the same values, and `CreatedFrom` is the Region of this request.
@@ -233,18 +240,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service publishes, and an ARN naming no provider of that catalog resolves to
         // nothing — the same `ResourceNotFoundException` `DescribeApplicationProvider`
         // answers an unknown provider ARN with.
-        //
-        // Which provider it is does not narrow the create further: AWS documents the
-        // operation as creating "an OAuth 2.0 customer managed application … for the given
-        // application provider" and publishes no refusal for any particular provider of
-        // the catalog, so none is invented here.
-        if crate::state::built_in_application_provider(&input.application_provider_arn).is_none() {
-            return Err(CreateApplicationErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Could not find ApplicationProvider with arn {}.",
-                        input.application_provider_arn
+        let provider = crate::state::built_in_application_provider(
+            &input.application_provider_arn,
+        )
+        .ok_or_else(|| {
+            CreateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "Could not find ApplicationProvider with arn {}.",
+                    input.application_provider_arn
+                )),
+                reason: None,
+            })
+        })?;
+
+        // Which provider it is NARROWS the create: this API makes "an OAuth 2.0 customer
+        // managed application", and "does not support creating SAML 2.0 customer managed
+        // applications or Amazon Web Services managed applications". So a published
+        // provider that cannot back a customer managed OAuth 2.0 application — one that
+        // federates over SAML 2.0, or an AWS managed provider whose applications the
+        // owning service creates on the customer's behalf — is refused on the modelled
+        // 400 channel rather than minting an application AWS would not let exist. A
+        // provider that backs no create is still described and enumerated.
+        if !provider.accepts_customer_managed_application() {
+            return Err(CreateApplicationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::application_provider_unsupported_message(
+                        &input.application_provider_arn,
                     )),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
                     reason: None,
                 },
             )

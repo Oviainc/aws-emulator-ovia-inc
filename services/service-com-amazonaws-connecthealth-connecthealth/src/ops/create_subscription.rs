@@ -162,7 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so one created in another Region is not found here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -179,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A subscription can only be created in a domain that is live: one already
         // being deleted is on its way out, so it is reported as not found.
-        let Some(domain) = store.live_domain(&input.domain_id) else {
+        let Some(domain) = store.live_domain(&region, &input.domain_id) else {
             return Err(not_found());
         };
         // Bound the store BEFORE minting, so a refused request advances nothing.
@@ -197,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let subscription_id = store.mint_subscription_id(&input.domain_id);
-        let Some(domain) = store.live_domain_mut(&input.domain_id) else {
+        let Some(domain) = store.live_domain_mut(&region, &input.domain_id) else {
             return Err(not_found());
         };
         let subscription = crate::state::Subscription {

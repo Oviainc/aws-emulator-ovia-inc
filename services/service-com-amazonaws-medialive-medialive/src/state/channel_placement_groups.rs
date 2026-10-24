@@ -619,11 +619,12 @@ fn channel_placement_group_token_key(cluster_id: &str, token: &str) -> String {
 /// identical per-operation flat group output shapes
 /// (`CreateChannelPlacementGroupOutput`,
 /// `DescribeChannelPlacementGroupOutput`, `UpdateChannelPlacementGroupOutput`,
-/// and the delete's when its own issue lands).
+/// the listing's own `DescribeChannelPlacementGroupSummary`, and the delete's
+/// when its own issue lands).
 ///
 /// One macro rather than a hand-written copy of the same seven-member move per
-/// operation, so a create, an update and the read that follows either cannot
-/// report the same stored group differently.
+/// operation, so a create, an update, the listing and the read that follows any
+/// of them cannot report the same stored group differently.
 macro_rules! channel_placement_group_output {
     ($out:ident, $group:expr) => {{
         let group: $crate::state::ChannelPlacementGroupDescription = $group;

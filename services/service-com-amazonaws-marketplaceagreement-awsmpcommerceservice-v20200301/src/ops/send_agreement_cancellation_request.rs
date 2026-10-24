@@ -280,6 +280,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // validator refused anything else before this handler ran.
             reason_code: input.reason_code,
             description: input.description,
+            // This call is the seller's ("Allows sellers (proposers) to submit a
+            // cancellation request"), so the account that made it is the
+            // cancellation request's proposer — which is what the seller side of
+            // a `partyType` selects on.
+            proposer_account_id: ::engine::emulator_account_id().to_string(),
             client_token: input.client_token,
             created_at: now,
             updated_at: now,

@@ -200,7 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let _ = ctx;
+        // This service's endpoint is regional: the domain is resolved in the Region the
+        // request was signed for, so a domain of another Region is not found here.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -212,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A job can only be started in a domain that is live: one already being deleted
         // is on its way out, so it is reported as not found.
-        let Some(domain) = store.live_domain(&input.domain_id) else {
+        let Some(domain) = store.live_domain(&region, &input.domain_id) else {
             return Err(
                 StartPatientInsightsJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -291,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let job_id = store.mint_patient_insights_job_id(&input.domain_id);
-        let Some(domain) = store.live_domain_mut(&input.domain_id) else {
+        let Some(domain) = store.live_domain_mut(&region, &input.domain_id) else {
             return Err(
                 StartPatientInsightsJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

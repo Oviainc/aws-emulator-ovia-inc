@@ -289,6 +289,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `AutoAssociate` elects the ONE group that automatically associates the
+        // accounts newly joining the consolidated billing family, so turning it on here
+        // is refused when another group already holds that election — the same
+        // state-wide cap `CreateBillingGroup` applies, decided through the same state
+        // method. The addressed group's own enablement does not count, so a request
+        // restating the flag it already has is served.
+        if input
+            .account_grouping
+            .as_ref()
+            .and_then(|grouping| grouping.auto_associate)
+            .unwrap_or(false)
+        {
+            let holders = state.other_auto_associate_billing_groups(&group_arn);
+            if holders.len() >= crate::state::MAX_AUTO_ASSOCIATE_BILLING_GROUPS {
+                return Err(UpdateBillingGroupErrorModeled::ValidationException(
+                    crate::state::too_many_auto_associate_billing_groups(
+                        "AccountGrouping.AutoAssociate",
+                        &holders,
+                    ),
+                )
+                .into());
+            }
+        }
+
         // A member the request carries replaces the stored one; a member it omits keeps
         // what state holds. Nothing else about the group — its membership, its primary
         // account, its tags, its creation time — is this operation's to change.

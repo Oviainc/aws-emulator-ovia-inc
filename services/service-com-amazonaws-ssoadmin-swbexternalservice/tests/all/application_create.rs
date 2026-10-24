@@ -40,13 +40,16 @@ use crate::ssoadmin_permission_sets::{
     seeded_instance_arn, with_store, TEST_REGION, UNKNOWN_INSTANCE_ARN,
 };
 
-/// Application providers an application is created under, spanning both forms of the
-/// published catalog.
+/// Application providers, spanning both forms of the published catalog.
 ///
 /// SOURCE: `state::BUILT_IN_APPLICATION_PROVIDERS`, the catalog
-/// `ListApplicationProviders` / `DescribeApplicationProvider` report — the AWS MANAGED
-/// providers, whose id is a service slug, and the APPLICATION CATALOG, whose id is
-/// `catalog/<Name>`. These are entries the issue did not cite.
+/// `ListApplicationProviders` / `DescribeApplicationProvider` report — the custom
+/// provider, under which a customer managed OAuth 2.0 application is created; the AWS
+/// MANAGED providers, whose id is a service slug and whose applications the owning
+/// service creates on the customer's behalf; and the APPLICATION CATALOG, whose id is
+/// `catalog/<Name>` and whose applications are SAML 2.0 ones. Only the first backs a
+/// create — `application_create_providers.rs` owns that rule's own table. These are
+/// entries the issue did not cite.
 const PROVIDER_CUSTOM: &str = "arn:aws:sso::aws:applicationProvider/custom";
 const PROVIDER_GLUE: &str = "arn:aws:sso::aws:applicationProvider/glue";
 const PROVIDER_S3: &str = "arn:aws:sso::aws:applicationProvider/s3";
@@ -122,8 +125,7 @@ impl Row {
 ///
 /// They differ along what rules 1 and 2 generalise over: the Region the create is signed
 /// for (two, three and four segment Region names, all inside `RegionName`'s
-/// `^([a-z]+-){2,3}\d$`), the provider the application runs under (both forms of the
-/// published catalog), the length of `Name` at both published bounds (`len 1..100`,
+/// `^([a-z]+-){2,3}\d$`), the length of `Name` at both published bounds (`len 1..100`,
 /// `^[\S\s]*$`, so spaces and punctuation are admitted), whether `Description`
 /// (`len 1..128`, asserted at both bounds) and `Status` (`ENABLED | DISABLED`) are sent,
 /// the shape of `PortalOptions` (absent, `Visibility` only, each `SignInOrigin`) and the
@@ -144,8 +146,8 @@ fn rows() -> Vec<Row> {
             region: TEST_REGION,
         },
         Row {
-            label: "every member set, from another Region, under an AWS managed provider",
-            provider_arn: PROVIDER_GLUE,
+            label: "every member set, from another Region",
+            provider_arn: PROVIDER_CUSTOM,
             // `Name` at its upper length bound (100), spanning spaces and punctuation.
             name: format!("Data lake (prod) - {}", "x".repeat(81)),
             // `Description` at its upper length bound (128).
@@ -163,7 +165,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             label: "a DISABLED application hidden from the portal, from a third Region",
-            provider_arn: PROVIDER_S3,
+            provider_arn: PROVIDER_CUSTOM,
             name: "disabled-app".to_string(),
             // `Description` at its lower length bound (1).
             description: Some("d".to_string()),
@@ -174,7 +176,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             label: "IDENTITY_CENTER sign-in origin, from a four-segment Region",
-            provider_arn: PROVIDER_CATALOG_DATABRICKS,
+            provider_arn: PROVIDER_CUSTOM,
             name: "identity center origin".to_string(),
             description: None,
             status: None,
@@ -183,10 +185,10 @@ fn rows() -> Vec<Row> {
             region: "us-gov-east-1",
         },
         Row {
-            label: "a catalog provider, no portal options, one tag",
-            provider_arn: PROVIDER_CATALOG_GITHUB,
+            label: "no portal options, one tag, from a fifth Region",
+            provider_arn: PROVIDER_CUSTOM,
             name: "catalog-app".to_string(),
-            description: Some("created under a pre-integrated catalog provider".to_string()),
+            description: Some("created under the custom application provider".to_string()),
             status: Some("DISABLED"),
             portal_options: None,
             tags: vec![("single", "tag")],
@@ -512,7 +514,7 @@ async fn a_refused_create_stores_nothing() {
             "an APPLICATION sign-in origin with no ApplicationUrl",
             json!({
                 "InstanceArn": instance_arn,
-                "ApplicationProviderArn": PROVIDER_GLUE,
+                "ApplicationProviderArn": PROVIDER_CUSTOM,
                 "Name": "no-application-url",
                 "PortalOptions": {"SignInOptions": {"Origin": "APPLICATION"}},
             }),
@@ -522,7 +524,7 @@ async fn a_refused_create_stores_nothing() {
             "an APPLICATION sign-in origin on an otherwise complete request",
             json!({
                 "InstanceArn": instance_arn,
-                "ApplicationProviderArn": PROVIDER_CATALOG_GITHUB,
+                "ApplicationProviderArn": PROVIDER_CUSTOM,
                 "Name": "no-application-url-either",
                 "Description": "a complete request but for the sign-in URL",
                 "Status": "DISABLED",
@@ -531,6 +533,47 @@ async fn a_refused_create_stores_nothing() {
                     "Visibility": "DISABLED",
                 },
                 "Tags": [{"Key": "owner", "Value": "platform"}],
+            }),
+            "ValidationException",
+        ),
+        (
+            "an AWS managed provider, whose applications this API does not create",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": PROVIDER_GLUE,
+                "Name": "aws-managed-provider",
+            }),
+            "ValidationException",
+        ),
+        (
+            "another AWS managed provider, on an otherwise complete request",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": PROVIDER_S3,
+                "Name": "aws-managed-provider-too",
+                "Description": "a complete request but for the provider",
+                "Status": "ENABLED",
+                "PortalOptions": {"Visibility": "DISABLED"},
+                "Tags": [{"Key": "team", "Value": "identity"}],
+            }),
+            "ValidationException",
+        ),
+        (
+            "a pre-integrated SAML 2.0 catalog application",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": PROVIDER_CATALOG_GITHUB,
+                "Name": "saml-catalog-provider",
+            }),
+            "ValidationException",
+        ),
+        (
+            "another pre-integrated SAML 2.0 catalog application",
+            json!({
+                "InstanceArn": instance_arn,
+                "ApplicationProviderArn": PROVIDER_CATALOG_DATABRICKS,
+                "Name": "saml-catalog-provider-too",
+                "PortalOptions": {"SignInOptions": {"Origin": "IDENTITY_CENTER"}},
             }),
             "ValidationException",
         ),

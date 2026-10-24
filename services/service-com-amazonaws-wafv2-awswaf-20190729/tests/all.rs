@@ -27,6 +27,8 @@ mod regex_pattern_set_lifecycle;
 mod response_members;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
+#[path = "all/sampled_requests.rs"]
+mod sampled_requests;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/top_path_statistics.rs"]

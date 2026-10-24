@@ -16,16 +16,45 @@ use serde_json::{json, Value};
 use service_com_amazonaws_appfabric_fabricfrontendservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 credential scope naming this service, which is how the router picks
-/// the claiming service. No authenticator is registered, so the signature itself
-/// is never checked.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/us-east-1/appfabric/aws4_request, \
-     SignedHeaders=host;x-amz-date, Signature=deadbeef";
-
-/// The region the `AUTHORIZATION` scope above signs for, which is therefore the
-/// region every ARN the emulator mints under it carries.
+/// The region every call below signs for unless it names another, and therefore
+/// the region every ARN the emulator mints under it carries.
 const REGION: &str = "us-east-1";
+
+/// A SigV4 credential scope naming this service and `region`, which is how the
+/// router picks the claiming service and how the emulator reads the Region of a
+/// request. No authenticator is registered, so the signature itself is never
+/// checked.
+fn authorization_for(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/appfabric/aws4_request, \
+         SignedHeaders=host;x-amz-date, Signature=deadbeef"
+    )
+}
+
+/// The Region the `index`th app bundle of a multi-bundle fixture is created in.
+///
+/// AppFabric allows ONE app bundle per account per Region, so a fixture that
+/// needs several bundles AT ONCE signs each create for its own Region. The first
+/// rows are Regions AppFabric is served in (the first of them [`REGION`], so a
+/// single-bundle fixture keeps the default scope); a fixture larger than that
+/// list gets distinct synthesised scope Regions, which is all the emulator reads
+/// a request's Region from.
+pub(crate) fn fixture_region(index: usize) -> String {
+    const REGIONS: &[&str] = &[
+        REGION,
+        "us-west-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-central-1",
+        "ap-northeast-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ca-central-1",
+    ];
+    REGIONS
+        .get(index)
+        .map_or_else(|| format!("emu-region-{index}"), ToString::to_string)
+}
 
 /// The account segment of every ARN a generated emulator emits.
 const ACCOUNT: &str = "000000000000";
@@ -80,13 +109,26 @@ impl Emulator {
     }
 
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+        self.call_in_region(REGION, method, uri, body).await
+    }
+
+    /// The same call, signed for `region`: the Region the emulator reads out of
+    /// the credential scope, and therefore the Region the resource it mints
+    /// belongs to.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(&value).expect("a serializable request body")
         });
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
-            .header("authorization", AUTHORIZATION)
+            .header("authorization", authorization_for(region))
             .header("content-type", "application/json")
             .body(Bytes::from(payload))
             .expect("a well-formed request");
@@ -102,7 +144,29 @@ impl Emulator {
     }
 
     pub(crate) async fn create_app_bundle(&self, body: Value) -> Answer {
-        self.call("POST", "/appbundles", Some(body)).await
+        self.create_app_bundle_in_region(REGION, body).await
+    }
+
+    /// `CreateAppBundle` signed for `region` — the Region whose one-bundle quota
+    /// the created bundle counts against.
+    pub(crate) async fn create_app_bundle_in_region(&self, region: &str, body: Value) -> Answer {
+        self.call_in_region(region, "POST", "/appbundles", Some(body))
+            .await
+    }
+
+    /// The `index`th app bundle of a fixture that needs several AT ONCE, as its
+    /// ARN: each is created in its own Region (see [`fixture_region`]), because a
+    /// Region holds only one.
+    pub(crate) async fn fixture_bundle(&self, index: usize) -> String {
+        let created = self
+            .create_app_bundle_in_region(&fixture_region(index), json!({}))
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "fixture bundle {index}: expected HTTP 201, got {} with body {}",
+            created.status, created.body
+        );
+        arn_of(&created.body, "appBundle")
     }
 
     async fn get_app_bundle(&self, identifier: &str) -> Answer {
@@ -274,8 +338,6 @@ pub(crate) fn uuid_of(arn: &str) -> String {
 /// by ARN, no tags, and several tags.
 #[tokio::test]
 async fn an_app_bundle_round_trips_by_arn_and_by_uuid() {
-    let emulator = Emulator::new();
-
     // (case, request body, expected customerManagedKeyArn)
     let cases: Vec<(&str, Value, Option<String>)> = vec![
         ("no optional members", json!({}), None),
@@ -307,6 +369,8 @@ async fn an_app_bundle_round_trips_by_arn_and_by_uuid() {
     ];
 
     for (case, body, expected_key_arn) in cases {
+        // A fresh store per row: this Region may hold only one app bundle.
+        let emulator = Emulator::new();
         let created = emulator.create_app_bundle(body).await;
         assert_eq!(
             created.status, 201,
@@ -435,9 +499,13 @@ async fn list_app_bundles_pages_through_every_bundle_once() {
     for (case, total, max_results) in cases {
         let emulator = Emulator::new();
         let mut created: Vec<String> = Vec::new();
-        for _ in 0..total {
+        // One bundle per Region, because a Region holds only one.
+        for index in 0..total {
             created.push(arn_of(
-                &emulator.create_app_bundle(json!({})).await.body,
+                &emulator
+                    .create_app_bundle_in_region(&fixture_region(index), json!({}))
+                    .await
+                    .body,
                 "appBundle",
             ));
         }
@@ -556,12 +624,16 @@ async fn a_token_this_service_did_not_issue_is_refused() {
 async fn a_token_from_another_listing_is_refused() {
     let emulator = Emulator::new();
 
-    // Two bundles, each with two ingestions, so every listing below has more
-    // records than the page size and therefore really does issue a token.
+    // Two bundles, each in its own Region (a Region holds one) and each with two
+    // ingestions, so every listing below has more records than the page size and
+    // therefore really does issue a token.
     let mut bundles: Vec<String> = Vec::new();
-    for _ in 0..2 {
+    for bundle_index in 0..2 {
         let bundle = arn_of(
-            &emulator.create_app_bundle(json!({})).await.body,
+            &emulator
+                .create_app_bundle_in_region(&fixture_region(bundle_index), json!({}))
+                .await
+                .body,
             "appBundle",
         );
         for index in 0..2 {
@@ -703,9 +775,13 @@ async fn every_minted_id_is_a_distinct_version_4_uuid() {
     let mut ids: BTreeSet<String> = BTreeSet::new();
     let mut minted = 0_usize;
 
-    for _ in 0..8 {
+    for bundle_index in 0..8 {
+        // Each bundle in its own Region, because a Region holds only one.
         let bundle = arn_of(
-            &emulator.create_app_bundle(json!({})).await.body,
+            &emulator
+                .create_app_bundle_in_region(&fixture_region(bundle_index), json!({}))
+                .await
+                .body,
             "appBundle",
         );
         let bundle_id = uuid_of(&bundle);
@@ -756,14 +832,8 @@ async fn every_minted_id_is_a_distinct_version_4_uuid() {
 #[tokio::test]
 async fn an_ingestion_belongs_only_to_its_own_bundle() {
     let emulator = Emulator::new();
-    let first = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
-    let second = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
+    let first = emulator.fixture_bundle(0).await;
+    let second = emulator.fixture_bundle(1).await;
 
     // `app` values from the model's CreateIngestionRequest$app doc ("Valid values
     // are: SLACK ASANA JIRA M365 M365AUDITLOGS ZOOM ZENDESK OKTA GOOGLE DROPBOX
@@ -1035,8 +1105,10 @@ async fn an_idempotency_token_replays_instead_of_creating_again() {
     ];
 
     let mut arns: BTreeSet<String> = BTreeSet::new();
-    for (case, first, replayed, must_match) in cases {
-        let created = emulator.create_app_bundle(first).await;
+    for (index, (case, first, replayed, must_match)) in cases.into_iter().enumerate() {
+        // Each distinct token mints a bundle, so each case takes its own Region.
+        let region = fixture_region(index);
+        let created = emulator.create_app_bundle_in_region(&region, first).await;
         assert_eq!(
             created.status, 201,
             "case {case:?}: expected HTTP 201, got {} with body {}",
@@ -1048,7 +1120,9 @@ async fn an_idempotency_token_replays_instead_of_creating_again() {
             "case {case:?}: a distinct clientToken must mint a distinct ARN, got {arn:?} twice"
         );
 
-        let replay = emulator.create_app_bundle(replayed).await;
+        let replay = emulator
+            .create_app_bundle_in_region(&region, replayed)
+            .await;
         if must_match {
             assert_eq!(
                 replay.status, 201,
@@ -1104,14 +1178,8 @@ async fn deleting_an_app_bundle_removes_it_and_its_ingestions() {
     // on which form the caller used.
     for case in ["by arn", "by uuid"] {
         let emulator = Emulator::new();
-        let kept = arn_of(
-            &emulator.create_app_bundle(json!({})).await.body,
-            "appBundle",
-        );
-        let doomed = arn_of(
-            &emulator.create_app_bundle(json!({})).await.body,
-            "appBundle",
-        );
+        let kept = emulator.fixture_bundle(0).await;
+        let doomed = emulator.fixture_bundle(1).await;
         let ingestion = arn_of(
             &emulator
                 .create_ingestion(
@@ -1188,14 +1256,8 @@ async fn deleting_an_app_bundle_removes_it_and_its_ingestions() {
 #[tokio::test]
 async fn an_ingestion_token_is_scoped_to_its_parent_bundle() {
     let emulator = Emulator::new();
-    let first = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
-    let second = arn_of(
-        &emulator.create_app_bundle(json!({})).await.body,
-        "appBundle",
-    );
+    let first = emulator.fixture_bundle(0).await;
+    let second = emulator.fixture_bundle(1).await;
     let body = |token: &str| {
         json!({"app": "SLACK", "tenantId": "t-1", "ingestionType": "auditLog",
                "clientToken": token})
@@ -1275,17 +1337,20 @@ async fn an_ingestion_token_is_scoped_to_its_parent_bundle() {
     }
 }
 
-/// RULE: the store is BOUNDED — once it holds the emulator's ceiling of records a
+/// RULE: the store is BOUNDED — the store serves every Region a caller may sign
+/// for, so once it holds the emulator's ceiling of app bundles ACROSS Regions a
 /// further create is refused with the modelled `ServiceQuotaExceededException`
-/// (HTTP 402), the way an account at its limit answers, rather than growing the
-/// process without bound.
+/// (HTTP 402), rather than growing the process without bound.
 #[tokio::test]
 async fn a_create_past_the_store_ceiling_is_refused() {
     use service_com_amazonaws_appfabric_fabricfrontendservice::state::MAX_APP_BUNDLES;
 
     let emulator = Emulator::new();
+    // One bundle per Region, so the per-Region quota is never what refuses these.
     for index in 0..MAX_APP_BUNDLES {
-        let created = emulator.create_app_bundle(json!({})).await;
+        let created = emulator
+            .create_app_bundle_in_region(&fixture_region(index), json!({}))
+            .await;
         assert_eq!(
             created.status, 201,
             "bundle {index}: expected HTTP 201 below the ceiling, got {} with body {}",
@@ -1293,7 +1358,9 @@ async fn a_create_past_the_store_ceiling_is_refused() {
         );
     }
 
-    let refused = emulator.create_app_bundle(json!({})).await;
+    let refused = emulator
+        .create_app_bundle_in_region(&fixture_region(MAX_APP_BUNDLES), json!({}))
+        .await;
     assert_eq!(
         refused.status, 402,
         "expected HTTP 402 at the ceiling of {MAX_APP_BUNDLES}, got {} with body {}",

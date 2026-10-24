@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNotificationChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNotificationChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNotificationChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the SNS notification channel `PutNotificationChannel` designated, so
+//! `GetNotificationChannel` no longer reports one. A MUTATING operation: there
+//! is ONE channel per account/Region and this request names nothing, so the
+//! channel it removes is that one.
+//!
+//! The channel is a resource of this service like any other, so a delete that
+//! finds none to remove is the modelled `ResourceNotFoundException` — the same
+//! refusal `GetNotificationChannel` answers with no channel configured, and the
+//! same one every other Firewall Manager delete in this crate answers for a
+//! resource it cannot resolve. A refused delete removes nothing, so repeating it
+//! answers identically.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the delete is refused by
+//! [`crate::state::require_administrator`] BEFORE the channel is looked up, so a
+//! refused call leaves the channel exactly as it was and the refusal says the
+//! same thing whether or not a channel is configured.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +166,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNotificationChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNotificationChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNotificationChannel"))
+        // `DeleteNotificationChannel` takes no members: the channel it removes is
+        // the one the account/Region has.
+        let _ = &input;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteNotificationChannelErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the channel is looked up or touched.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // Taking the channel out of the store IS the delete: that record is the
+        // only copy, so a following `GetNotificationChannel` finds nothing. With
+        // no channel stored there is no channel resource to remove, which is
+        // `ResourceNotFoundException` — and `take()` on an empty slot leaves the
+        // store untouched, so the refusal writes nothing.
+        if store.notification_channel.take().is_none() {
+            return Err(
+                DeleteNotificationChannelErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        }
+        Ok(DeleteNotificationChannelOutput)
     }
 }

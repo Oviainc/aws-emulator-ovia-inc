@@ -42,19 +42,42 @@ const ARN_NAMESPACE: &str = "health-agent";
 /// [`Domain::deletion_completes_in_call`].
 pub const DOMAIN_DELETION_SPAN: Duration = Duration::from_millis(500);
 
-/// The most `Domain` records ONE ACCOUNT holds at a time — the account-wide Domain cap
+/// The most `Domain` records ONE ACCOUNT holds at a time IN ONE REGION — the cap
 /// `CreateDomain` is subject to.
 ///
 /// RECORDED behaviour: `CreateDomain` past the cap is refused with a
 /// `ValidationException` whose text names the account and this number
 /// ("Account <accountId> has reached the maximum limit of 10 domains."). The cap is a
-/// LIVE count of the domains the account currently holds, not a monotonic counter, so a
-/// `DeleteDomain` frees a slot for the next create.
+/// LIVE count of the domains the account currently holds in the Region the create is
+/// addressed to, not a monotonic counter and not a cross-Region total, so a
+/// `DeleteDomain` frees a slot for the next create and a domain in another Region
+/// consumes none of this Region's quota.
 ///
-/// It is also what bounds this store's growth: every `Domain` carries the account that
-/// owns it, so the records held are at most this many per account and a caller looping
-/// a create cannot grow the shared store without limit.
+/// It is a quota, NOT this store's growth bound: the Region a record is filed under is
+/// read from the request, so a count per Region is a count per value a caller chose.
+/// [`MAX_DOMAINS_HELD`] is what bounds the store.
 pub const MAX_DOMAINS_PER_ACCOUNT: usize = 10;
+
+/// How many distinct Regions this store files `Domain` records under.
+///
+/// The EMULATOR's own ceiling, not a rule of the service: it is set above the number of
+/// Regions AWS operates, so no use of the emulator across real Regions reaches it.
+pub const MAX_DOMAIN_REGIONS: usize = 64;
+
+/// The most `Domain` records this store holds at once, across every account and every
+/// Region: [`MAX_DOMAINS_PER_ACCOUNT`] in each of [`MAX_DOMAIN_REGIONS`] Regions.
+///
+/// THIS is what bounds the store's growth, and it is an absolute count rather than a
+/// count per key read off the request: a caller looping `CreateDomain` cannot grow the
+/// shared store past it whatever Region, and however many Regions, it signs for. It
+/// bounds everything held UNDER a domain with it, since a domain holds at most
+/// [`MAX_SUBSCRIPTIONS_PER_DOMAIN`] subscriptions and
+/// [`MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN`] jobs, and a tag entry is keyed by the ARN of
+/// one of those records.
+///
+/// Enforced in `CreateDomain`, the one operation that adds a `Domain`, which refuses
+/// with the `ServiceQuotaExceededException` its model declares once the store is full.
+pub const MAX_DOMAINS_HELD: usize = MAX_DOMAINS_PER_ACCOUNT * MAX_DOMAIN_REGIONS;
 
 /// How many `domainId`s this service remembers having allocated, beyond the domains it
 /// currently holds.
@@ -243,6 +266,17 @@ pub struct Domain {
     /// Stored on the record, so every response projects the domain's own account
     /// rather than recomputing one per read.
     pub account_id: String,
+    /// The REGION this domain lives in: the Region the create was signed for, and the
+    /// region segment of [`Domain::arn`].
+    ///
+    /// This service's endpoint is REGIONAL (`smithy_query(query="service_info")` reports
+    /// `endpointPrefix`/`arnNamespace` `health-agent` with standard regional endpoints,
+    /// and every modelled ARN pattern carries a region segment), so a domain is part of
+    /// exactly one Region's inventory. Every lookup in this module matches on it, so a
+    /// resource created in one Region cannot be listed, read, mutated or deleted through
+    /// another Region's endpoint, and the per-Region quotas count only that Region's
+    /// records.
+    pub region: String,
     /// The provisioning generation this domain was onboarded through.
     pub onboarding_generation: OnboardingGeneration,
     pub name: String,
@@ -563,7 +597,10 @@ impl Subscription {
 /// cursor into it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsConnecthealthConnecthealthState {
-    /// Every live `Domain`, keyed by `domainId`.
+    /// Every live `Domain`, keyed by `domainId` (ids are minted unique across the whole
+    /// store, so one key never names two domains). The Region each one belongs to is on
+    /// the record (`Domain::region`) and every lookup matches it, so this one map holds a
+    /// separate inventory per Region.
     pub domains: BTreeMap<String, Domain>,
     /// The ONE tag store, keyed by resource ARN so domain and subscription ARNs both
     /// work. `CreateDomain` seeds it and `TagResource` merges into it;
@@ -607,15 +644,26 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
-    /// How many `Domain` records `account_id` currently holds — the LIVE count the
-    /// account-wide cap is measured against, which a purge of a deleted domain lowers
-    /// again. Every record carries its owning account, so the count is of that
-    /// account's domains alone.
-    pub fn domains_held_by(&self, account_id: &str) -> usize {
-        self.domains
-            .values()
+    /// How many `Domain` records `account_id` currently holds IN `region` — the LIVE
+    /// count the account's per-Region cap is measured against, which a purge of a deleted
+    /// domain lowers again. Every record carries its owning account and its Region, so
+    /// the count is of that account's domains in that Region alone and a domain in
+    /// another Region consumes nothing here.
+    pub fn domains_held_by(&self, region: &str, account_id: &str) -> usize {
+        self.domains_in(region)
             .filter(|domain| domain.account_id == account_id)
             .count()
+    }
+
+    /// Every `Domain` record `region` holds, whatever its status, in `domainId` order.
+    ///
+    /// The ONE place the Region scope of this store is expressed: a reader that
+    /// enumerates domains goes through here, so an enumeration and a point lookup
+    /// ([`Self::held_domain`]) can never disagree about which Region holds what.
+    pub fn domains_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Domain> + 'a {
+        self.domains
+            .values()
+            .filter(move |domain| domain.region == region)
     }
 
     /// Remember that `domain_id` was allocated, dropping the oldest remembered id once
@@ -723,10 +771,11 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// `GetPatientInsightsJob` gives: `ResourceNotFoundException`.
     pub fn patient_insights_job(
         &self,
+        region: &str,
         domain_id: &str,
         job_id: &str,
     ) -> Option<&PatientInsightsJob> {
-        self.live_domain(domain_id)?
+        self.live_domain(region, domain_id)?
             .patient_insights_jobs
             .get(job_id)
     }
@@ -747,25 +796,30 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         self.tags_for(arn).into_iter().collect()
     }
 
-    /// Whether `arn` names a resource this service currently holds: the ARN of a
-    /// `Domain` record still in this store, or of a live `Subscription` under one.
+    /// Whether `arn` names a resource this service currently holds IN `region`: the ARN
+    /// of a `Domain` record this Region still holds, or of a live `Subscription` under
+    /// one.
     ///
     /// Holding a record is what makes a resource addressable, NOT the lifecycle status
     /// that record reports: a `Domain` whose deletion is in flight is a resource the
-    /// service still holds — its own reader answers it ([`Self::domains`] is what
-    /// `GetDomain` looks it up in, and `ListDomains` lists it under its non-terminal
+    /// service still holds — its own reader answers it ([`Self::held_domain`] is what
+    /// `GetDomain` looks it up through, and `ListDomains` lists it under its non-terminal
     /// status) — so its ARN resolves for exactly as long as the record does. The one
     /// place an ARN stops resolving is [`Self::purge_due_deletions`], which drops the
     /// record together with the tag entries keyed by its ARN. An ARN this resolves is
     /// therefore always one some reader resolves too, and the ARN-addressed operations
     /// and the resource's own reader never disagree about whether it exists.
     ///
+    /// The Region scope is the readers' as well ([`Self::domains_in`]): an ARN rooted in
+    /// another Region resolves nowhere here, exactly as the domain it names resolves
+    /// through no other Region's endpoint.
+    ///
     /// A `Subscription` is resolved through its own reader's liveness
     /// ([`Self::live_subscription`]): a subscription already `DELETED` is gone for that
     /// reader and gone here, which covers every subscription of a domain being deleted —
     /// `DeleteDomain` marks them all `DELETED` as it records the deletion.
-    pub fn holds_resource_arn(&self, arn: &str) -> bool {
-        self.domains.values().any(|domain| {
+    pub fn holds_resource_arn(&self, region: &str, arn: &str) -> bool {
+        self.domains_in(region).any(|domain| {
             domain.arn == arn
                 || (domain.status == DomainStatus::Active
                     && domain
@@ -805,23 +859,45 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
-    /// The live domain `domain_id` names, for reading.
+    /// The live domain `domain_id` names IN `region`, for reading.
     ///
-    /// `None` when it is absent or no longer `ACTIVE` — the cases every operation on a
-    /// domain's subscriptions answers with `ResourceNotFoundException`. ONE liveness
-    /// rule, so a subscription a caller can enumerate is one it can also read.
-    pub fn live_domain(&self, domain_id: &str) -> Option<&Domain> {
-        self.domains
-            .get(domain_id)
+    /// `None` when `region` holds no such domain (it is absent, or it belongs to another
+    /// Region) or when the one it holds is no longer `ACTIVE` — the cases every operation
+    /// on a domain's subscriptions answers with `ResourceNotFoundException`. ONE liveness
+    /// rule and ONE Region scope, so a subscription a caller can enumerate is one it can
+    /// also read.
+    pub fn live_domain(&self, region: &str, domain_id: &str) -> Option<&Domain> {
+        self.held_domain(region, domain_id)
             .filter(|domain| domain.status == DomainStatus::Active)
     }
 
-    /// The live domain `domain_id` names, for writing. Liveness is exactly
+    /// The live domain `domain_id` names in `region`, for writing. Liveness is exactly
     /// [`Self::live_domain`]'s.
-    pub fn live_domain_mut(&mut self, domain_id: &str) -> Option<&mut Domain> {
+    pub fn live_domain_mut(&mut self, region: &str, domain_id: &str) -> Option<&mut Domain> {
+        self.held_domain_mut(region, domain_id)
+            .filter(|domain| domain.status == DomainStatus::Active)
+    }
+
+    /// The domain `region` holds under `domain_id`, WHATEVER its status — the reader a
+    /// reporting operation uses when a non-`ACTIVE` domain is still something it reports
+    /// (`GetDomain` on a domain that is `DELETING`).
+    ///
+    /// `None` when this Region holds no such domain, whether because the id names
+    /// nothing at all or because the domain it names belongs to ANOTHER Region: a
+    /// regional endpoint sees only its own Region's inventory, so both are the same miss
+    /// and both answer `ResourceNotFoundException`.
+    pub fn held_domain(&self, region: &str, domain_id: &str) -> Option<&Domain> {
+        self.domains
+            .get(domain_id)
+            .filter(|domain| domain.region == region)
+    }
+
+    /// The domain `region` holds under `domain_id`, for writing. The scope is exactly
+    /// [`Self::held_domain`]'s.
+    pub fn held_domain_mut(&mut self, region: &str, domain_id: &str) -> Option<&mut Domain> {
         self.domains
             .get_mut(domain_id)
-            .filter(|domain| domain.status == DomainStatus::Active)
+            .filter(|domain| domain.region == region)
     }
 
     /// The live subscription `subscription_id` carries under `domain_id`, for reading.
@@ -831,10 +907,11 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// `ResourceNotFoundException`.
     pub fn live_subscription(
         &self,
+        region: &str,
         domain_id: &str,
         subscription_id: &str,
     ) -> Option<&Subscription> {
-        self.live_domain(domain_id)?
+        self.live_domain(region, domain_id)?
             .subscriptions
             .get(subscription_id)
             .filter(|subscription| subscription.is_live())
@@ -849,11 +926,12 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// `GetMedicalScribeListeningSession` gives: `ResourceNotFoundException`.
     pub fn live_scribe_session(
         &self,
+        region: &str,
         domain_id: &str,
         subscription_id: &str,
         session_id: &str,
     ) -> Option<&ScribeSession> {
-        self.live_subscription(domain_id, subscription_id)?
+        self.live_subscription(region, domain_id, subscription_id)?
             .scribe_sessions
             .get(session_id)
     }
@@ -862,10 +940,11 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// Liveness is exactly [`Self::live_subscription`]'s.
     pub fn live_subscription_mut(
         &mut self,
+        region: &str,
         domain_id: &str,
         subscription_id: &str,
     ) -> Option<&mut Subscription> {
-        self.live_domain_mut(domain_id)?
+        self.live_domain_mut(region, domain_id)?
             .subscriptions
             .get_mut(subscription_id)
             .filter(|subscription| subscription.is_live())
@@ -973,15 +1052,25 @@ pub fn web_app_url(region: &str, domain_id: &str) -> String {
     format!("https://{domain_id}.{ARN_NAMESPACE}.{region}.on.aws")
 }
 
+/// The longest credential-scope region field this service files a record under.
+///
+/// Every region code AWS publishes is far shorter; the bound exists because the field is
+/// read off the request, so without it one request could file a record under a key of
+/// arbitrary size. A longer field names no region this service serves, and is treated
+/// exactly like a scope that names none at all.
+const MAX_REGION_LEN: usize = 32;
+
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it names none.
 ///
-/// Constrained to the `[a-z0-9-]+` segment every ARN pattern in this model declares, so
-/// a request signed for a nonsense region cannot mint an ARN that fails its own pattern.
+/// Constrained to the `[a-z0-9-]+` segment every ARN pattern in this model declares and
+/// to [`MAX_REGION_LEN`], so a request signed for a nonsense region cannot mint an ARN
+/// that fails its own pattern, nor file a record under a key of its own choosing.
 pub fn region_of(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
         .filter(|region| {
             !region.is_empty()
+                && region.len() <= MAX_REGION_LEN
                 && region
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')

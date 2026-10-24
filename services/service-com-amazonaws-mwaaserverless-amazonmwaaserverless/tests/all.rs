@@ -31,6 +31,8 @@ mod workflow_deletion_teardown;
 mod workflow_lifecycle;
 #[path = "all/workflow_run_listing.rs"]
 mod workflow_run_listing;
+#[path = "all/workflow_run_listing_order.rs"]
+mod workflow_run_listing_order;
 #[path = "all/workflow_update_versions.rs"]
 mod workflow_update_versions;
 #[path = "all/workflow_version_listing.rs"]

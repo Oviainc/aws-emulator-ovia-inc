@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! IMPLEMENTED: one `DomainSummary` per PERSISTED domain, filtered by the `status`
-//! query parameter when present, paged by `maxResults` with an opaque `nextToken` that
-//! resumes exactly after the last domain the previous page returned.
+//! IMPLEMENTED: one `DomainSummary` per domain PERSISTED IN THE REGION the request was
+//! signed for, filtered by the `status` query parameter when present, paged by
+//! `maxResults` with an opaque `nextToken` that resumes exactly after the last domain the
+//! previous page returned.
 //!
 //! ## Shape of an operation
 //!
@@ -145,7 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ListDomains could not reach this service's store",
             ));
         };
-        let _ = ctx;
+        // This service's endpoint is regional, so the inventory this call enumerates is
+        // the Region the request was signed for, and no other.
+        let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
         // `status` is a modelled enum, so an unknown value is refused at the boundary;
@@ -205,8 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.purge_due_deletions(now);
 
         let mut matching = store
-            .domains
-            .values()
+            .domains_in(&region)
             .filter(|domain| wanted.is_none_or(|status| domain.status == status))
             .filter(|domain| {
                 resume_after

@@ -72,15 +72,33 @@ impl Emulator {
         &self.engine
     }
 
+    /// The region every [`Emulator::send`] of this emulator is signed for.
+    pub(crate) fn region(&self) -> &str {
+        &self.region
+    }
+
     /// Dispatch one request and return its status and parsed JSON body.
     pub(crate) async fn send(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+        self.send_in(&self.region, method, path, body).await
+    }
+
+    /// Dispatch one request SIGNED FOR `region`, against this same emulator and its one
+    /// shared store — the way to address a second Region's endpoint without standing up a
+    /// second emulator (which would have a store of its own and so could prove nothing
+    /// about Region scoping).
+    pub(crate) async fn send_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
         let payload = body
             .map(|body| serde_json::to_vec(body).expect("a serializable body"))
             .unwrap_or_default();
         let credential = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/health-agent/aws4_request, \
-             SignedHeaders=host, Signature=0000",
-            self.region
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/health-agent/aws4_request, \
+             SignedHeaders=host, Signature=0000"
         );
         let request = http::Request::builder()
             .method(method)
@@ -102,8 +120,16 @@ impl Emulator {
 
     /// `CreateDomain`, asserting it was accepted, and the created domain's id.
     pub(crate) async fn create_domain(&self, body: &Value) -> Value {
-        let (status, created) = self.send("POST", "/domain", Some(body)).await;
-        assert_eq!(status, 201, "CreateDomain {body}: got {created:?}");
+        self.create_domain_in(&self.region, body).await
+    }
+
+    /// `CreateDomain` SIGNED FOR `region`, asserting it was accepted.
+    pub(crate) async fn create_domain_in(&self, region: &str, body: &Value) -> Value {
+        let (status, created) = self.send_in(region, "POST", "/domain", Some(body)).await;
+        assert_eq!(
+            status, 201,
+            "CreateDomain in {region} {body}: got {created:?}"
+        );
         created
     }
 }

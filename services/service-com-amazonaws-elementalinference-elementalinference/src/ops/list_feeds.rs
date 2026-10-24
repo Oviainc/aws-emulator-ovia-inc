@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFeeds
-//! IMPLEMENTED: enumerates the persisted feeds as `FeedSummary` items in stable id
-//! order, one page at a time. Reporting only: it materialises the feed transitions
-//! the clock already owes (they were due at this instant whether or not anybody
-//! called) and writes nothing else.
+//! IMPLEMENTED: enumerates the persisted feeds OF THE REQUEST'S REGION as `FeedSummary`
+//! items in stable id order, one page at a time. Reporting only: it materialises the feed
+//! transitions the clock already owes (they were due at this instant whether or not
+//! anybody called) and writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -195,8 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for, which is the
+        // endpoint whose feeds a list reports.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListFeedsErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -235,15 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions(std::time::Instant::now());
 
         // BTreeMap order, so paging is stable and resuming after an id that has
-        // since been deleted still continues at the next feed.
-        let mut remaining = state.feeds.iter().filter(|(id, _)| match &resume_after {
-            Some(after) => id.as_str() > after.as_str(),
+        // since been deleted still continues at the next feed. "Feeds that belong to
+        // this AWS account" are the feeds of the Region this request was signed for:
+        // the service is regional, so a feed created through another Region's endpoint
+        // is not one this endpoint reports.
+        let mut remaining = state.feeds_in(&region).filter(|feed| match &resume_after {
+            Some(after) => feed.id.as_str() > after.as_str(),
             None => true,
         });
         let feeds: Vec<FeedSummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, feed)| feed.summary())
+            .map(crate::state::Feed::summary)
             .collect();
         // A token only when a further feed is actually there to be fetched.
         let next_token = match (remaining.next(), feeds.last()) {

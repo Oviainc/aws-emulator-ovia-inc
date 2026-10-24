@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one Outpost-server installation connection from this service's store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The connection a caller started with `StartConnection` is reported here from the
+//! record that call persisted: this operation is a pure report and writes nothing,
+//! so what it answers is what a later caller sees too.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConnectionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+
+        // A pure report: the connection is answered from what `StartConnection`
+        // persisted, and nothing here writes, so a later caller sees exactly what
+        // this one did. `ConnectionId` has ONE form, the opaque id the start minted,
+        // so there is nothing to resolve before the lookup.
+        let store = state.lock();
+        let record = store.connections.get(&input.connection_id).ok_or_else(|| {
+            GetConnectionErrorModeled::NotFoundException(NotFoundException {
+                // The identifier echo, of the value as supplied.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::CONNECTION_ID_MEMBER,
+                    &input.connection_id,
+                )),
+            })
+        })?;
+
+        Ok(GetConnectionOutput {
+            // The STORED id: the record is the one thing that says what this
+            // connection is, so the answer is read off it rather than echoed.
+            connection_id: Some(record.connection_id.clone()),
+            // The tunnel the start handed out, reported field for field.
+            connection_details: Some(record.details.clone()),
+        })
     }
 }

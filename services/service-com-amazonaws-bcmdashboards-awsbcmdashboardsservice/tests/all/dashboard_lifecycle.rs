@@ -914,17 +914,14 @@ async fn delete_dashboard_removes_the_record() {
         "ListDashboards must list exactly the surviving dashboards: {listed}"
     );
 
-    // The record is gone, so deleting it again cannot report a deletion: this
-    // operation models no not-found error, so it is refused as invalid input.
-    let (status, body) = call(&router, "DeleteDashboard", &json!({"arn": doomed})).await;
+    // The record is gone, and this operation models no not-found error: deleting it
+    // again reports the same post-condition, a 200 echoing the requested arn (the whole
+    // class is covered by `tests/all/delete_dashboard_idempotency.rs`).
+    let repeated = ok_call(&router, "DeleteDashboard", &json!({"arn": doomed})).await;
     assert_eq!(
-        status, 400,
-        "deleting an absent dashboard must not answer 200, got {status}: {body}"
-    );
-    assert!(
-        error_code(&body).contains("ValidationException"),
-        "expected ValidationException, got {}",
-        error_code(&body)
+        repeated["arn"].as_str(),
+        Some(doomed.as_str()),
+        "a repeated delete must answer the requested arn: {repeated}"
     );
 
     // Updating it is a not-found, which that operation does model.
@@ -945,7 +942,9 @@ async fn delete_dashboard_removes_the_record() {
     );
 }
 
-/// An ARN that names no dashboard is a not-found; an ARN that is not a `DashboardArn`
+/// An ARN that names no dashboard is a not-found for every operation that has to resolve
+/// one (`DeleteDashboard`, which models no not-found error, is the exception — see
+/// `tests/all/delete_dashboard_idempotency.rs`); an ARN that is not a `DashboardArn`
 /// at all is a validation failure. Both answer HTTP 400 (see
 /// `tests/all/resource_not_found.rs` for why a not-found is 400 here), so the two are
 /// told apart by the wire error code, which is what a client branches on.

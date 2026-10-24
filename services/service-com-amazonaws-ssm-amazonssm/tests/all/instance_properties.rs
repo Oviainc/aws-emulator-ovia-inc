@@ -477,7 +477,17 @@ async fn filters_select_the_nodes_the_store_holds() {
             "both filter lists are ANDed",
             json!({
                 "InstancePropertyFilterList": [{ "key": "ResourceType", "valueSet": ["EC2Instance"] }],
-                "FiltersWithOperator": [{ "Key": "tag-key", "Values": ["Owner"] }],
+                "FiltersWithOperator": [{ "Key": "PingStatus", "Values": ["Online"] }],
+            }),
+            vec![LINUX],
+        ),
+        (
+            "two tag filters are ANDed (tag filters combine with each other)",
+            json!({
+                "FiltersWithOperator": [
+                    { "Key": "tag-key", "Values": ["Owner"] },
+                    { "Key": "tag:Purpose", "Values": ["Test"] },
+                ]
             }),
             vec![LINUX],
         ),
