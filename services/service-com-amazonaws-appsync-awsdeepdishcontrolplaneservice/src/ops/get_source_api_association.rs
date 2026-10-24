@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSourceApiAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSourceApiAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: answers with the stored association `associationId` names under the
+//! Merged API `mergedApiIdentifier` names (see [`crate::state`]), the same projection
+//! `AssociateMergedGraphqlApi` answered with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSourceApiAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A report, not a modification: the only write it makes is materialising a merge the
+//! CLOCK already made due ([`crate::state::MERGE_SPAN`]), which was owed at the same
+//! instant whether or not anybody read the association.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSourceApiAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSourceApiAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSourceApiAssociation"))
+        // Nothing in the answer depends on this request's metadata: the association is
+        // reported from the store, so `ctx` is unused here.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSourceApiAssociationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An identifier that is neither an API id nor an ARN names no API at all, so
+        // the request is malformed rather than pointed at a missing resource (see
+        // `crate::state::is_api_identifier`).
+        if !crate::state::is_api_identifier(&input.merged_api_identifier) {
+            return Err(GetSourceApiAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(
+                        &input.merged_api_identifier,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+
+        // The ONLY write a read makes: apply the merge the clock already owes, which
+        // was due at the same instant whether or not this call ever happened.
+        guard.settle_associations(std::time::SystemTime::now());
+
+        let Some(merged) =
+            crate::state::api_by_identifier(&guard.graphql_apis, &input.merged_api_identifier)
+        else {
+            return Err(GetSourceApiAssociationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        let merged_api_id = merged.api_id.clone();
+
+        // An `associationId` names an association OF the Merged API addressed, so one
+        // that belongs to another Merged API is not found under this one.
+        let Some(association) = guard
+            .source_api_associations
+            .get(&input.association_id)
+            .filter(|association| association.merged_api_id == merged_api_id)
+        else {
+            return Err(GetSourceApiAssociationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::ASSOCIATION_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSourceApiAssociationOutput {
+            source_api_association: Some(association.to_source_api_association()),
+        })
     }
 }
