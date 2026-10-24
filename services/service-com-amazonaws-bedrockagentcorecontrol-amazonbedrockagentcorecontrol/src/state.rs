@@ -33,8 +33,9 @@ use crate::ops::types::{
     CertificateConfiguration, CreateGatewayOutput, CreateGatewayTargetOutput,
     CredentialProviderConfiguration, CustomTransformConfiguration, FilesystemConfiguration,
     GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
-    GatewayProtocolConfiguration, GetGatewayOutput, GetGatewayTargetOutput, Harness,
-    HarnessAgentCoreRuntimeEnvironment, HttpTargetConfiguration, InferenceTargetConfiguration,
+    GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
+    Harness, HarnessAgentCoreRuntimeEnvironment, HttpTargetConfiguration,
+    InferenceTargetConfiguration,
     HarnessAgentCoreRuntimeEnvironmentRequest, HarnessEnvironmentArtifact,
     HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest, HarnessHook,
     HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill, HarnessSystemContentBlock,
@@ -498,6 +499,22 @@ impl GatewayRecord {
             exception_level: created.exception_level,
             web_acl_arn: created.web_acl_arn,
             waf_configuration: created.waf_configuration,
+        }
+    }
+
+    /// This gateway as one entry of a gateway listing (`GatewaySummary`), with the
+    /// status the clock owes it at `now` — the same status `GetGateway` reports,
+    /// off the same record, so a listing cannot drift from a read.
+    pub fn summary(&self, now: SystemTime) -> GatewaySummary {
+        GatewaySummary {
+            gateway_id: self.gateway_id.clone(),
+            name: self.name.clone(),
+            status: self.status_at(now).to_string(),
+            description: self.description.clone(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            authorizer_type: self.authorizer_type.clone(),
+            protocol_type: self.protocol_type.clone(),
         }
     }
 }
@@ -1412,6 +1429,62 @@ pub fn encode_page_token(key: &str) -> String {
 /// own modelled `ValidationException`.
 pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
+}
+
+/// How many entries one page of a listing holds: the caller's `maxResults`, or
+/// `modelled_max` (that member's own modelled ceiling) when the caller names
+/// none, clamped into the modelled range.
+///
+/// The boundary walk already refuses a `maxResults` outside the modelled range
+/// before a handler runs, so the clamp is defensive: it keeps every listing
+/// correct on its own terms rather than on that walk, and a page size of zero
+/// would be a silent dead end.
+pub fn page_size(requested: Option<i32>, modelled_max: i32) -> usize {
+    let ceiling = modelled_max.max(1);
+    let size = requested.unwrap_or(ceiling).clamp(1, ceiling);
+    usize::try_from(size).unwrap_or(1)
+}
+
+/// One page of a listing over a key-ordered store: the summaries of at most
+/// `page_size` records that sort after `resume_after`, and the `nextToken` that
+/// resumes where the page ended — `None` when nothing is left over.
+///
+/// The store is a [`BTreeMap`], so its iteration order IS ascending key order;
+/// that is what makes "resume strictly after the key the last page ended on" a
+/// sound cursor, and why the skip below compares keys rather than counting.
+/// Shared by every `@paginated` listing of this service so two of them cannot
+/// page by different rules, with the per-operation parts — which token it
+/// refuses and with which modelled error, and which record it summarises — left
+/// to the handler.
+///
+/// `summarise` is fallible: a record that has no summary to report (every
+/// version of it deleted, say) is passed over without consuming a page slot.
+pub fn page_over<R, T>(
+    records: &BTreeMap<String, R>,
+    resume_after: Option<&str>,
+    page_size: usize,
+    summarise: impl Fn(&R) -> Option<T>,
+) -> (Vec<T>, Option<String>) {
+    let mut items = Vec::new();
+    let mut next_token = None;
+    let mut last_included: Option<&str> = None;
+    for (key, record) in records {
+        if resume_after.is_some_and(|last| key.as_str() <= last) {
+            continue;
+        }
+        let Some(summary) = summarise(record) else {
+            continue;
+        };
+        if items.len() >= page_size {
+            // At least one record is left over, so hand back a token that
+            // resumes exactly where this page ended.
+            next_token = last_included.map(encode_page_token);
+            break;
+        }
+        items.push(summary);
+        last_included = Some(key.as_str());
+    }
+    (items, next_token)
 }
 
 /// A stored instant as the wire timestamp (`DateTimestamp`, `date-time`).
