@@ -267,8 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN is qualified with a version: a version is its own stored record, so it
         // is reported from that record and not from the state machine, whose
         // configuration may have moved on since the version was published. A
-        // qualifier that is not a version names an ALIAS, which this emulator does
-        // not store yet, so no record answers for it.
+        // qualifier that is not a version names an ALIAS, which this operation does
+        // not resolve yet — reporting the version an alias points at is work this
+        // operation still owes — so no record here answers for one.
         if let Some(qualifier) = parsed.qualifier.as_deref() {
             if crate::state::qualifier_version(qualifier).is_none() {
                 return Err(not_found().into());

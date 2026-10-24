@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStateMachineAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStateMachineAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStateMachineAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an alias of a state machine, pointing at one or two of its published
+//! versions, and stores it under its own qualified ARN — this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +173,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStateMachineAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStateMachineAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStateMachineAlias"))
+        // `name` (1..80), `description` (0..256), the routing configuration's length
+        // (1..2) and each `weight`'s range (0..100) are modelled, so the centralized
+        // walk has already refused anything outside them. What the model does NOT
+        // enforce is checked here: the character rule on `name` — a `@pattern` whose
+        // lookahead the boundary's regex engine cannot compile — and every rule about
+        // what a routing configuration may point at.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if !crate::state::is_valid_alias_name(&input.name) {
+            return Err(CreateStateMachineAliasErrorModeled::InvalidName(InvalidName {
+                message: Some(crate::state::resource_error_message(
+                    crate::state::INVALID_NAME,
+                    &input.name,
+                )),
+            })
+            .into());
+        }
+
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let created = crate::state::now();
+
+        let mut store = state.lock();
+        // Materialise what the clock already owes before anything is read: an alias
+        // cannot be created on a state machine whose deletion has already happened.
+        store.settle(created);
+
+        // This operation takes NO `stateMachineArn`: the state machine an alias
+        // belongs to is the one its routing configuration's versions belong to, so
+        // reading that configuration is also what resolves the alias's own ARN.
+        let state_machine_arn =
+            match store.read_routing_configuration(&input.routing_configuration, &endpoint_region) {
+                Ok(arn) => arn,
+                Err(crate::state::RoutingRejection::InvalidArn(message)) => {
+                    return Err(CreateStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into())
+                }
+                Err(crate::state::RoutingRejection::InvalidRouting(message)) => {
+                    return Err(CreateStateMachineAliasErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            // `ValidationExceptionReason` names the class of
+                            // rejection, and this is its member for a routing
+                            // configuration that cannot be applied.
+                            reason: Some(
+                                crate::state::VALIDATION_REASON_INVALID_ROUTING_CONFIGURATION
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+                Err(crate::state::RoutingRejection::VersionNotFound(version_arn)) => {
+                    return Err(CreateStateMachineAliasErrorModeled::ResourceNotFound(
+                        ResourceNotFound {
+                            message: Some(crate::state::resource_not_found_message(&version_arn)),
+                            resource_name: Some(version_arn),
+                        },
+                    )
+                    .into())
+                }
+                Err(crate::state::RoutingRejection::Deleting(machine_arn)) => {
+                    return Err(CreateStateMachineAliasErrorModeled::StateMachineDeleting(
+                        StateMachineDeleting {
+                            message: Some(crate::state::resource_error_message(
+                                crate::state::STATE_MACHINE_DELETING,
+                                &machine_arn,
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        // An alias's ARN is a total function of its state machine and its name, so
+        // the ARN this request would mint IS the lookup for a name already in use.
+        let arn = crate::state::state_machine_alias_arn(&state_machine_arn, &input.name);
+        if let Some(existing) = store.state_machine_aliases.get(&arn) {
+            // "CreateStateMachineAlias is an idempotent API [...] Requests that
+            // contain the same values for these parameters return a successful
+            // idempotent response without creating a duplicate resource." A repeat
+            // therefore answers the FIRST response — the alias's ARN and the instant
+            // it was created — and writes nothing.
+            if existing.was_created_with(input.description.as_deref(), &input.routing_configuration)
+            {
+                return Ok(CreateStateMachineAliasOutput {
+                    state_machine_alias_arn: existing.arn.clone(),
+                    creation_date: crate::state::to_date_time(existing.creation_date),
+                });
+            }
+            // A create naming an alias that exists under OTHER parameters is not
+            // that idempotent repeat: it would have to repoint an alias clients may
+            // already be running executions through, which is what
+            // `UpdateStateMachineAlias` is for.
+            return Err(CreateStateMachineAliasErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_ALIAS_ALREADY_EXISTS,
+                        &existing.arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let candidate = crate::state::StateMachineAlias {
+            arn: arn.clone(),
+            state_machine_arn,
+            name: input.name,
+            description: input.description,
+            routing_configuration: input.routing_configuration,
+            creation_date: created,
+            // "The date the state machine alias was last updated. For a newly
+            // created state machine, this is the same as the creation date."
+            update_date: created,
+            // Measured and counted by `insert_state_machine_alias`.
+            retained_bytes: 0,
+        };
+
+        // "You can create up to 100 aliases for each state machine", and the store's
+        // byte ceiling bounds what every record retains together: a create past
+        // either is the modelled quota error rather than a store that grows.
+        if let Some(why) = store.alias_rejection(&candidate.state_machine_arn, candidate.measure())
+        {
+            return Err(
+                CreateStateMachineAliasErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        store.insert_state_machine_alias(candidate);
+
+        Ok(CreateStateMachineAliasOutput {
+            state_machine_alias_arn: arn,
+            creation_date: crate::state::to_date_time(created),
+        })
     }
 }

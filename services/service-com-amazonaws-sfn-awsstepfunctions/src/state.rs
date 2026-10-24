@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-sfn-awsstepfunctions service.
 //!
-//! Four resources live here, and every operation answers from them:
+//! Five resources live here, and every operation answers from them:
 //!
 //! * a **state machine**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:stateMachine:<name>`). That ARN is a total
@@ -14,6 +14,10 @@
 //!   configuration taken when `publish` was set, keyed by its own qualified ARN
 //!   (`<stateMachineArn>:<version>`), so one state machine's versions sit
 //!   contiguously under its ARN and go with it when it is deleted;
+//! * a **state machine alias**, a name that points at one or two versions of ONE
+//!   state machine, keyed by its own qualified ARN (`<stateMachineArn>:<aliasName>`)
+//!   so one state machine's aliases sit contiguously under its ARN and go with it
+//!   when it is deleted, exactly as its versions do;
 //! * an **activity**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:activity:<name>`). That ARN is the same total
 //!   function of the region and the name, so the ARN-keyed map IS the name index
@@ -56,8 +60,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    EncryptionConfiguration, LoggingConfiguration, Tag, TracingConfiguration,
-    ENCRYPTION_TYPE_VALUES,
+    EncryptionConfiguration, LoggingConfiguration, RoutingConfigurationListItem, Tag,
+    TracingConfiguration, ENCRYPTION_TYPE_VALUES,
 };
 
 /// The ARN service namespace, sigv4 signing name and endpoint prefix of this
@@ -107,6 +111,11 @@ pub const VALIDATION_REASON_LABELED_ARN: &str = "API_DOES_NOT_SUPPORT_LABELED_AR
 /// `ValidationExceptionReason`'s member for a request that left out a parameter the
 /// operation requires, from the same enum.
 pub const VALIDATION_REASON_MISSING_PARAMETER: &str = "MISSING_REQUIRED_PARAMETER";
+
+/// `ValidationExceptionReason`'s member for a routing configuration an alias cannot
+/// point at, from the same enum.
+pub const VALIDATION_REASON_INVALID_ROUTING_CONFIGURATION: &str =
+    "INVALID_ROUTING_CONFIGURATION";
 
 /// What the modelled `ValidationException` says about a map-run labeled state
 /// machine ARN, on every operation that documents refusing one. It names nothing
@@ -213,6 +222,13 @@ pub const INCLUDED_DATA_METADATA_ONLY: &str = "METADATA_ONLY";
 
 /// `IncludedData`'s every-member value, which reports the definition in full.
 pub const INCLUDED_DATA_ALL_DATA: &str = "ALL_DATA";
+
+/// What the weights of ONE routing configuration must add up to.
+///
+/// From `RoutingConfigurationListItem`'s `weight` documentation: "The percentage of
+/// traffic you want to route to a state machine version. The sum of the weights in
+/// the routing configuration must be equal to 100."
+pub const ROUTING_WEIGHT_TOTAL: i32 = 100;
 
 /// What a metadata-only read reports for a state machine `definition`.
 ///
@@ -372,6 +388,23 @@ pub const MAX_EXECUTIONS_PER_STATE_MACHINE: usize = 1_000;
 /// [`MAX_STATE_MACHINES`]: a per-state-machine cap alone is multiplied by the
 /// number of state machines.
 pub const MAX_EXECUTIONS: usize = 10_000;
+
+/// The most aliases one state machine may carry, refused with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// An AWS-PUBLISHED quota rather than an emulator guard, from
+/// `CreateStateMachineAlias`'s own documentation: "You can create up to 100 aliases
+/// for each state machine. You must delete unused aliases using the
+/// DeleteStateMachineAlias API action."
+pub const MAX_ALIASES_PER_STATE_MACHINE: usize = 100;
+
+/// The fewest characters a state machine alias name may carry, from the modelled
+/// `CharacterRestrictedName` length (1..80). See [`is_valid_alias_name`].
+pub const MIN_ALIAS_NAME_CHARS: usize = 1;
+
+/// The most characters a state machine alias name may carry, from the same modelled
+/// length.
+pub const MAX_ALIAS_NAME_CHARS: usize = 80;
 
 /// The most activities the WHOLE store holds, refused with the modelled
 /// `ActivityLimitExceeded`.
@@ -565,6 +598,84 @@ impl StateMachineVersion {
             + self.revision_id.as_ref().map_or(0, String::len)
             + self.description.as_ref().map_or(0, String::len)
     }
+}
+
+/// One stored state machine alias: "an alias for a state machine that points to one
+/// or two versions of the same state machine", under its own qualified ARN
+/// (`<stateMachineArn>:<aliasName>`).
+///
+/// The alias is a pointer, not a snapshot: it holds the routing configuration the
+/// caller gave, so the versions it routes to are resolved through their own records
+/// and an alias never answers for a configuration a version no longer holds.
+#[derive(Debug, Clone)]
+pub struct StateMachineAlias {
+    pub arn: String,
+    pub state_machine_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub routing_configuration: Vec<RoutingConfigurationListItem>,
+    pub creation_date: SystemTime,
+    /// "The date the state machine alias was last updated. For a newly created
+    /// state machine, this is the same as the creation date."
+    pub update_date: SystemTime,
+    /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
+    /// by [`ComAmazonawsSfnAwsstepfunctionsState::insert_state_machine_alias`].
+    pub retained_bytes: usize,
+}
+
+impl StateMachineAlias {
+    /// The bytes this record would retain; see [`StateMachine::measure`].
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.arn.len()
+            + self.state_machine_arn.len()
+            + self.name.len()
+            + self.description.as_ref().map_or(0, String::len)
+            + routing_bytes(&self.routing_configuration)
+    }
+
+    /// Whether a create carrying `description` and `routing_configuration` is the
+    /// SAME request as the one that minted this alias.
+    ///
+    /// "CreateStateMachineAlias is an idempotent API. Step Functions bases the
+    /// idempotency check on the stateMachineArn, description, name, and
+    /// routingConfiguration parameters." The ARN this record is keyed by is a total
+    /// function of the state machine and the name, so what is left to compare is the
+    /// description and the routing configuration — the latter entry by entry, since
+    /// two configurations that give one version a different weight are different
+    /// parameters.
+    pub fn was_created_with(
+        &self,
+        description: Option<&str>,
+        routing_configuration: &[RoutingConfigurationListItem],
+    ) -> bool {
+        self.description.as_deref() == description
+            && same_routing(&self.routing_configuration, routing_configuration)
+    }
+}
+
+/// Whether two routing configurations name the same versions at the same weights, in
+/// the same order.
+fn same_routing(
+    left: &[RoutingConfigurationListItem],
+    right: &[RoutingConfigurationListItem],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.state_machine_version_arn == right.state_machine_version_arn
+                && left.weight == right.weight
+        })
+}
+
+/// The bytes one routing configuration holds.
+fn routing_bytes(routing: &[RoutingConfigurationListItem]) -> usize {
+    routing
+        .iter()
+        .map(|item| {
+            std::mem::size_of::<RoutingConfigurationListItem>()
+                + item.state_machine_version_arn.len()
+        })
+        .sum()
 }
 
 /// One stored activity: every member `DescribeActivity` reports, plus the tag set
@@ -890,6 +1001,16 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// is one lookup, and `ListStateMachines` — which reports state machines, not
     /// versions — still walks `state_machines` alone.
     pub state_machine_versions: BTreeMap<String, StateMachineVersion>,
+    /// Every state machine alias, keyed by its own qualified ARN
+    /// (`<stateMachineArn>:<aliasName>`). A `BTreeMap` for the same reason as the
+    /// versions: one state machine's aliases sit contiguously under the
+    /// `<stateMachineArn>:` prefix and go with it when it is removed.
+    ///
+    /// Aliases live in their OWN map rather than beside the versions, because an
+    /// alias name and a version number share the qualifier slot of the ARN: keeping
+    /// them apart means a lookup of either resolves in one map and never answers
+    /// with a record of the other kind.
+    pub state_machine_aliases: BTreeMap<String, StateMachineAlias>,
     /// Every activity, keyed by its ARN. A `BTreeMap` for the same reasons the state
     /// machines are in one: one stable, total order for a paged list, and the ARN
     /// key doubling as the name index `CreateActivity`'s idempotency check reads.
@@ -1321,6 +1442,145 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .collect()
     }
 
+    // -----------------------------------------------------------------------
+    // Aliases
+    // -----------------------------------------------------------------------
+
+    /// Store a newly created state machine alias under its own ARN, counting what it
+    /// retains.
+    pub fn insert_state_machine_alias(&mut self, mut alias: StateMachineAlias) {
+        alias.retained_bytes = alias.measure();
+        self.retained_bytes = self.retained_bytes.saturating_add(alias.retained_bytes);
+        self.state_machine_aliases.insert(alias.arn.clone(), alias);
+    }
+
+    /// The aliases of one state machine, in ARN order — which is alias-name order,
+    /// since every one of those ARNs differs only in the name.
+    ///
+    /// Every alias ARN of one state machine begins with its ARN and a colon, so this
+    /// is a range scan over a contiguous block rather than a filter over every alias
+    /// in the store, exactly as [`Self::versions_unordered`] is.
+    pub fn aliases_of(&self, state_machine_arn: &str) -> Vec<&StateMachineAlias> {
+        let prefix = format!("{state_machine_arn}:");
+        self.state_machine_aliases
+            .range(prefix.clone()..)
+            .take_while(|(arn, _)| arn.starts_with(&prefix))
+            .map(|(_, alias)| alias)
+            .collect()
+    }
+
+    /// Why the store cannot take one more alias of `bytes` for `state_machine_arn`,
+    /// or `None` when it can — the modelled `ServiceQuotaExceededException`.
+    pub fn alias_rejection(&self, state_machine_arn: &str, bytes: usize) -> Option<String> {
+        let held = self.aliases_of(state_machine_arn).len();
+        if held >= MAX_ALIASES_PER_STATE_MACHINE {
+            return Some(format!(
+                "state machine {state_machine_arn} already holds the maximum of \
+                 {MAX_ALIASES_PER_STATE_MACHINE} aliases"
+            ));
+        }
+        if !self.has_room_for(bytes) {
+            return Some(format!(
+                "this state machine alias would take the store past the {MAX_STORE_BYTES} bytes \
+                 this emulator retains"
+            ));
+        }
+        None
+    }
+
+    /// The state machine every version of `routing` belongs to, or why that routing
+    /// configuration cannot be pointed at.
+    ///
+    /// The ONE place the routing-configuration rules live, so every operation that
+    /// takes one judges it identically: each entry names a state machine VERSION of
+    /// this service in the endpoint's region, "if you specify the ARN of a second
+    /// version, it must belong to the same state machine as the first version", "the
+    /// sum of the weights in the routing configuration must be equal to 100", and a
+    /// version the store does not hold is a resource that cannot be found. The ARNs
+    /// are judged BEFORE the store is consulted, like every other ARN here, so a
+    /// defect in an ARN is never reported as a version that is absent.
+    pub fn read_routing_configuration(
+        &self,
+        routing: &[RoutingConfigurationListItem],
+        endpoint_region: &str,
+    ) -> Result<String, RoutingRejection> {
+        let mut owner: Option<String> = None;
+        for item in routing {
+            let arn = item.state_machine_version_arn.as_str();
+            let parsed =
+                read_state_machine_arn(arn, endpoint_region).map_err(RoutingRejection::InvalidArn)?;
+            // A routing configuration routes to VERSIONS: an unqualified ARN, a
+            // map-run labeled one and an alias ARN each name something that is not
+            // a version, so none of them is a configuration this can be applied to.
+            let version = parsed
+                .qualifier
+                .as_deref()
+                .filter(|_| parsed.label().is_none())
+                .and_then(qualifier_version);
+            if version.is_none() {
+                return Err(RoutingRejection::InvalidRouting(format!(
+                    "{arn} is not the ARN of a state machine version"
+                )));
+            }
+            // The version's own state machine is its ARN without the qualifier the
+            // reader above just took off the end.
+            let machine = arn
+                .rsplit_once(':')
+                .map(|(machine, _)| machine.to_string())
+                .unwrap_or_default();
+            match owner.as_deref() {
+                Some(first) if first != machine => {
+                    return Err(RoutingRejection::InvalidRouting(format!(
+                        "every version of a routing configuration must belong to one state \
+                         machine, got {first} and {machine}"
+                    )))
+                }
+                Some(_) => {}
+                None => owner = Some(machine),
+            }
+        }
+        let Some(owner) = owner else {
+            // UNREACHABLE through the wire: `routingConfiguration` is modelled
+            // 1..2, so the centralized walk has already refused an empty list.
+            return Err(RoutingRejection::InvalidRouting(
+                "routingConfiguration must name at least one state machine version".to_string(),
+            ));
+        };
+
+        let total = routing
+            .iter()
+            .map(|item| item.weight)
+            .fold(0_i32, i32::saturating_add);
+        if total != ROUTING_WEIGHT_TOTAL {
+            return Err(RoutingRejection::InvalidRouting(format!(
+                "the weights of a routing configuration must add up to {ROUTING_WEIGHT_TOTAL}, \
+                 got {total}"
+            )));
+        }
+
+        for item in routing {
+            if !self
+                .state_machine_versions
+                .contains_key(&item.state_machine_version_arn)
+            {
+                return Err(RoutingRejection::VersionNotFound(
+                    item.state_machine_version_arn.clone(),
+                ));
+            }
+        }
+        // A version is removed with the state machine it belongs to, so by here the
+        // state machine is stored; one whose deletion has begun can take no more
+        // configuration.
+        if self
+            .state_machines
+            .get(&owner)
+            .is_some_and(StateMachine::is_deleting)
+        {
+            return Err(RoutingRejection::Deleting(owner));
+        }
+        Ok(owner)
+    }
+
     /// Apply `update` to the state machine `arn` names: every member the update
     /// carries replaces the stored one, and every member it leaves out keeps the
     /// value the state machine holds.
@@ -1396,12 +1656,13 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         true
     }
 
-    /// Remove a state machine, its versions and its executions.
+    /// Remove a state machine, its versions, its aliases and its executions.
     ///
     /// The executions go with it, so no execution ARN is left naming a state machine
     /// that no longer exists, and so do its published versions: "when you delete a
     /// state machine, its versions are deleted too", and a version ARN that outlived
-    /// its state machine would answer for a resource that is gone.
+    /// its state machine would answer for a resource that is gone. An alias points at
+    /// versions of this one state machine, so it cannot outlive them either.
     pub fn remove_state_machine(&mut self, arn: &str) -> Option<StateMachine> {
         let machine = self.state_machines.remove(arn)?;
         self.retained_bytes = self.retained_bytes.saturating_sub(machine.retained_bytes);
@@ -1413,6 +1674,16 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         for version_arn in version_arns {
             if let Some(version) = self.state_machine_versions.remove(&version_arn) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(version.retained_bytes);
+            }
+        }
+        let alias_arns: Vec<String> = self
+            .aliases_of(arn)
+            .into_iter()
+            .map(|alias| alias.arn.clone())
+            .collect();
+        for alias_arn in alias_arns {
+            if let Some(alias) = self.state_machine_aliases.remove(&alias_arn) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(alias.retained_bytes);
             }
         }
         for execution_arn in self.executions_by_sm.remove(arn).unwrap_or_default() {
@@ -1855,6 +2126,17 @@ pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
 /// `StateMachineAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
 pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
 
+/// The condition a second `CreateStateMachineAlias` of an alias that already exists
+/// with DIFFERENT parameters reports, for [`resource_error_message`].
+///
+/// The error's own condition name under the rule above, not a recorded message: the
+/// operation is idempotent only for "requests that contain the same values for these
+/// parameters", so a create naming an alias that exists under another description or
+/// routing configuration is the modelled `ConflictException` — "updating or deleting
+/// a resource can cause an inconsistent state" — against the alias that exists, and
+/// the value it quotes is that alias's ARN.
+pub const STATE_MACHINE_ALIAS_ALREADY_EXISTS: &str = "State Machine Alias Already Exists";
+
 /// `ActivityDoesNotExist`'s, for [`resource_error_message`]. The error's own name
 /// under the rule above — the condition in spaced Title Case, then the ARN the
 /// request named — not a recorded message.
@@ -1944,6 +2226,28 @@ pub enum TagWriteRejection {
     NoRoom,
 }
 
+/// Why a routing configuration cannot be pointed at; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::read_routing_configuration`]. Each variant
+/// is one of the modelled errors the alias operations declare, carrying what that
+/// error reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingRejection {
+    /// An entry whose `stateMachineVersionArn` is not an ARN of this service in the
+    /// endpoint's region at all — the modelled `InvalidArn`, carrying its message.
+    InvalidArn(String),
+    /// A configuration whose entries are well-formed ARNs but cannot be pointed at:
+    /// an ARN that names no version, versions of two different state machines, or
+    /// weights that do not add up — the modelled `ValidationException` with the
+    /// `INVALID_ROUTING_CONFIGURATION` reason, carrying its message.
+    InvalidRouting(String),
+    /// A version the store does not hold — the modelled `ResourceNotFound`, naming
+    /// that version's ARN.
+    VersionNotFound(String),
+    /// The state machine those versions belong to is being deleted — the modelled
+    /// `StateMachineDeleting`, naming its ARN.
+    Deleting(String),
+}
+
 /// The parts of a state machine ARN this service reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateMachineArn {
@@ -2004,6 +2308,49 @@ pub fn state_machine_arn_prefix(region: &str) -> String {
 /// [`parse_state_machine_arn`] reads back as a `qualifier`.
 pub fn state_machine_version_arn(state_machine_arn: &str, version: u32) -> String {
     format!("{state_machine_arn}:{version}")
+}
+
+/// The ARN of the alias `alias_name` of the state machine `state_machine_arn` names.
+///
+/// From `StateMachineAliasListItem`'s own documentation: "The alias ARN is a
+/// combination of state machine ARN and the alias name separated by a colon (:).
+/// For example, `stateMachineARN:PROD`." So an alias is reached through a QUALIFIED
+/// state machine ARN, exactly as a version is — the qualifier is the alias name
+/// rather than the version number.
+pub fn state_machine_alias_arn(state_machine_arn: &str, alias_name: &str) -> String {
+    format!("{state_machine_arn}:{alias_name}")
+}
+
+/// The `(stateMachineArn, aliasName)` `arn` names, read as a state machine ALIAS ARN
+/// of this service in `endpoint_region`, or the message the modelled `InvalidArn`
+/// carries.
+///
+/// An alias ARN is a state machine ARN qualified with the alias name, so text that
+/// carries no qualifier, a map-run label, or a qualifier outside the alias name rule
+/// ([`is_valid_alias_name`]) does not name an alias at all — a defect in the ARN,
+/// which is what `InvalidArn` reports, rather than an alias that is absent. A
+/// qualifier of nothing but digits is a VERSION ([`qualifier_version`]) and the alias
+/// name rule refuses it for exactly that reason, so a version ARN never resolves to
+/// an alias.
+pub fn read_state_machine_alias_arn(
+    arn: &str,
+    endpoint_region: &str,
+) -> Result<(String, String), String> {
+    let parsed = read_state_machine_arn(arn, endpoint_region)?;
+    let not_an_alias =
+        || invalid_arn_message(format!("Invalid ARN {STATE_MACHINE_RESOURCE} alias: {arn}"));
+    let Some(qualifier) = parsed.qualifier.as_deref() else {
+        return Err(not_an_alias());
+    };
+    if parsed.label().is_some() || !is_valid_alias_name(qualifier) {
+        return Err(not_an_alias());
+    }
+    // The state machine is the ARN without the qualifier, which is its last
+    // colon-delimited field — and the name rule above admits no colon into it.
+    let Some((state_machine_arn, _)) = arn.rsplit_once(':') else {
+        return Err(not_an_alias());
+    };
+    Ok((state_machine_arn.to_string(), qualifier.to_string()))
 }
 
 /// The version number a state machine ARN's qualifier names, or `None` when the
@@ -2292,6 +2639,34 @@ pub fn is_valid_name(name: &str) -> bool {
             || FORBIDDEN_NAME_CHARS.contains(&character)
             || matches!(u32::from(character), 0x0000..=0x001F | 0x007F..=0x009F | 0xFFFE | 0xFFFF)
     })
+}
+
+/// Whether `name` is an acceptable state machine ALIAS name.
+///
+/// The whole modelled `CharacterRestrictedName` rule, and the one implementation of
+/// it: the length bound (1..80) and the pattern
+/// `^(?=.*[a-zA-Z_\-\.])[a-zA-Z0-9_\-\.]+$` — both from
+/// `smithy_query(query="operation",operation="CreateStateMachineAlias")` — so ASCII
+/// letters, digits, `_`, `-` and `.`, with at least one character that is not a
+/// digit. That last clause is what keeps an alias name from reading as a version
+/// number, which the `name` member states as "to avoid conflict with version ARNs,
+/// don't use an integer in the name of the alias".
+///
+/// The length is judged here as well as by the centralized walk, because an alias
+/// name also arrives as the QUALIFIER of an ARN
+/// ([`read_state_machine_alias_arn`]), where no modelled constraint reaches it.
+///
+/// A refusal is reported through the modelled `InvalidName`, whose message states the
+/// condition and the rejected name — see [`resource_error_message`] with
+/// [`INVALID_NAME`], the same wording every other name refusal here carries.
+pub fn is_valid_alias_name(name: &str) -> bool {
+    (MIN_ALIAS_NAME_CHARS..=MAX_ALIAS_NAME_CHARS).contains(&name.chars().count())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && name
+            .bytes()
+            .any(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 /// Why `role_arn` is not the ARN of an IAM role, or `None` when it is — the

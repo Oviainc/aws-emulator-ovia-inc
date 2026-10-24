@@ -75,7 +75,14 @@ async fn update_published(emulator: &Emulator, arn: &str, definition: &str) -> S
 /// Version 1 comes from the create and every later one from an update that
 /// publishes in the same action, so the rows below span both of the calls that
 /// publish.
-async fn machine_with_versions(emulator: &Emulator, name: &str, versions: u32) -> String {
+///
+/// `pub(crate)`, not private: `tests/all/state_machine_aliases.rs` points aliases at
+/// the versions this builds rather than carrying a second copy of the publish path.
+pub(crate) async fn machine_with_versions(
+    emulator: &Emulator,
+    name: &str,
+    versions: u32,
+) -> String {
     if versions == 0 {
         return crate::state_machine_lifecycle::create_machine(emulator, name, HELLO_DEFINITION)
             .await;

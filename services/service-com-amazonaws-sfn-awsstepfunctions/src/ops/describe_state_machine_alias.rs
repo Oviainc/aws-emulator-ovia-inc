@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStateMachineAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStateMachineAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStateMachineAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a state machine alias from its own stored record — this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +142,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStateMachineAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStateMachineAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStateMachineAlias"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE the lookup: text that is not an alias ARN of this
+        // service in the endpoint's region — a malformed ARN, another service's, an
+        // unqualified state machine ARN, a version ARN — is a defect in the REQUEST,
+        // which `InvalidArn` reports, not an alias that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_state_machine_alias_arn(
+            &input.state_machine_alias_arn,
+            &endpoint_region,
+        ) {
+            return Err(
+                DescribeStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Materialising a deletion the clock already owes is the one write a report
+        // may make: it was due at the same instant whether or not anybody called,
+        // and an alias does not outlive the state machine it belongs to.
+        store.settle(crate::state::now());
+
+        let Some(alias) = store
+            .state_machine_aliases
+            .get(&input.state_machine_alias_arn)
+        else {
+            return Err(DescribeStateMachineAliasErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.state_machine_alias_arn,
+                    )),
+                    resource_name: Some(input.state_machine_alias_arn.clone()),
+                },
+            )
+            .into());
+        };
+
+        // Every member comes from the ONE stored record, so what a create or an
+        // update wrote is what this reports — the routing configuration included,
+        // entry for entry and in the order it was given, since the weights belong to
+        // the versions they were paired with.
+        Ok(DescribeStateMachineAliasOutput {
+            state_machine_alias_arn: Some(alias.arn.clone()),
+            name: Some(alias.name.clone()),
+            description: alias.description.clone(),
+            routing_configuration: Some(alias.routing_configuration.clone()),
+            creation_date: Some(crate::state::to_date_time(alias.creation_date)),
+            update_date: Some(crate::state::to_date_time(alias.update_date)),
+        })
     }
 }
