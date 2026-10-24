@@ -76,7 +76,12 @@ fn license_server_settings(secret_id: &str) -> Value {
 }
 
 /// A `RegisterIdentityProvider` body for `directory_id` and `product`.
-fn registration(directory_id: &str, product: &str, subnets: &[&str], tags: Option<Value>) -> Value {
+pub(crate) fn registration(
+    directory_id: &str,
+    product: &str,
+    subnets: &[&str],
+    tags: Option<Value>,
+) -> Value {
     let mut body = json!({
         "IdentityProvider": provider_union(directory_id),
         "Product": product,
@@ -88,11 +93,11 @@ fn registration(directory_id: &str, product: &str, subnets: &[&str], tags: Optio
     body
 }
 
-async fn associate(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn associate(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/AssociateUser", body).await
 }
 
-async fn disassociate(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn disassociate(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/DisassociateUser", body).await
 }
 
@@ -127,7 +132,7 @@ fn encoded(arn: &str) -> String {
     encoded_label(arn)
 }
 
-async fn list_tags(h: &Harness, arn: &str) -> Reply {
+pub(crate) async fn list_tags(h: &Harness, arn: &str) -> Reply {
     send(h, "GET", &format!("/tags/{}", encoded(arn)), None).await
 }
 
@@ -146,7 +151,7 @@ async fn untag(h: &Harness, arn: &str, tag_keys: &[&str]) -> Reply {
     .await
 }
 
-async fn tag(h: &Harness, arn: &str, tags: &Value) -> Reply {
+pub(crate) async fn tag(h: &Harness, arn: &str, tags: &Value) -> Reply {
     send(
         h,
         "PUT",
@@ -159,7 +164,7 @@ async fn tag(h: &Harness, arn: &str, tags: &Value) -> Reply {
 /// Every fail-closed refusal looks the same: HTTP 400, the `UnauthorizedException` code
 /// an SDK dispatches on, the fixed sentence, and a body that says nothing about the
 /// identifier it was asked about.
-fn assert_fails_closed(case: &str, identifier: &str, reply: &Reply) {
+pub(crate) fn assert_fails_closed(case: &str, identifier: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: expected HTTP 400, got {} with body {:?}",
@@ -208,7 +213,7 @@ fn assert_identity_provider_not_valid(case: &str, reply: &Reply) {
 }
 
 /// Every refusal of a tagging `ResourceArn` that names no resource.
-fn assert_invalid_resource_arn(case: &str, reply: &Reply) {
+pub(crate) fn assert_invalid_resource_arn(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: expected HTTP 400, got {} with body {:?}",
@@ -230,7 +235,7 @@ fn assert_invalid_resource_arn(case: &str, reply: &Reply) {
 }
 
 /// An instance id the account's EC2 fleet holds, so an association on it is authorized.
-fn held_instance(index: usize) -> String {
+pub(crate) fn held_instance(index: usize) -> String {
     seed_account_instances()[index].0.clone()
 }
 
@@ -825,8 +830,9 @@ impl Association {
 /// RULE: an association is computed from, and persisted in, state — it is minted in the
 /// non-terminal `ASSOCIATING` status with a minted ARN, re-associating the same user is
 /// the stored association (`@idempotent`), the `ASSOCIATED` transition the clock owes is
-/// materialised on a later read, and a disassociation removes it so the same identifiers
-/// fail closed afterwards.
+/// materialised on a later read, and a disassociation answers the non-terminal
+/// `DISASSOCIATING` — which a repeat call answers again — until the teardown the clock
+/// owes removes it and the same identifiers fail closed.
 #[tokio::test]
 async fn user_associations_round_trip_and_disassociation_removes_them() {
     let h = harness();
@@ -950,7 +956,25 @@ async fn user_associations_round_trip_and_disassociation_removes_them() {
             row.case
         );
 
-        // Removed means removed: the same identifiers now fail closed, by either form.
+        // `@idempotent`: the disassociation is ASYNCHRONOUS, so a repeat call answers the
+        // association as it stands — still `DISASSOCIATING`, with the instant it ended
+        // unchanged — rather than restarting or re-stamping anything.
+        let again = disassociate(&h, &json!({ "InstanceUserArn": arn })).await;
+        let repeated = again.ok(row.case)["InstanceUserSummary"].clone();
+        assert_eq!(
+            repeated, summary,
+            "case {:?}: a repeat disassociation must answer the stored association \
+             unchanged, got {repeated:?}",
+            row.case
+        );
+    }
+
+    // The teardown the `DISASSOCIATING` status announces is what finally removes the
+    // association: once the clock owes it, the same identifiers fail closed, by either
+    // form.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    for (row, arn) in &minted {
         assert_fails_closed(
             &format!("{} (by ARN, after removal)", row.case),
             arn,
@@ -1216,7 +1240,8 @@ async fn license_server_endpoints_round_trip_and_deletion_removes_them() {
 /// RULE: a user association is also what brings an EC2 instance into this service's view
 /// — `ListInstances` reports exactly the instances state holds, with the products the
 /// association's directory is registered for, and an instance leaves the view with the
-/// last association that names it.
+/// last association that names it, once the teardown that disassociation starts has
+/// completed.
 #[tokio::test]
 async fn an_association_brings_its_instance_into_the_instance_list() {
     let h = harness();
@@ -1315,7 +1340,9 @@ async fn an_association_brings_its_instance_into_the_instance_list() {
         );
     }
 
-    // The instance with two associations stays in view until the second one goes.
+    // Disassociating every association starts a teardown each: while those run, the
+    // instances are still configured for user-based subscriptions, so they are still in
+    // view — and they leave it when the teardowns the clock owes have completed.
     for (row, (_, instance, directory_id, _)) in rows.iter().enumerate() {
         disassociate(
             &h,
@@ -1328,6 +1355,17 @@ async fn an_association_brings_its_instance_into_the_instance_list() {
         .await
         .ok("disassociating");
     }
+    let listed = call(&h, "/instance/ListInstances", &json!({})).await;
+    assert_eq!(
+        listed.ok("while every association is disassociating")["InstanceSummaries"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "an instance stays in view while a user is still being disassociated from it, got {:?}",
+        listed.body
+    );
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
     let listed = call(&h, "/instance/ListInstances", &json!({})).await;
     assert_eq!(
         listed.ok("after every association was removed")["InstanceSummaries"]
@@ -1385,7 +1423,9 @@ async fn the_instance_view_is_recomputed_from_the_associations_that_remain() {
         "both directories' products are reported while both associations exist"
     );
 
-    // Dropping one association drops the product only that directory provided.
+    // Dropping one association drops the product only that directory provided — once the
+    // teardown that disassociation starts has completed. While it runs, the association is
+    // still one state holds, so the product it provides is still reported.
     disassociate(
         &h,
         &json!({
@@ -1396,6 +1436,14 @@ async fn the_instance_view_is_recomputed_from_the_associations_that_remain() {
     )
     .await
     .ok("dropping the second directory's association");
+    let listed = call(&h, "/instance/ListInstances", &json!({})).await;
+    assert_eq!(
+        products(&listed, "while the second association is disassociating"),
+        vec![PRODUCTS[0].to_string(), PRODUCTS[4].to_string()],
+        "a product stays reported while the association behind it is still being torn down"
+    );
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
     let listed = call(&h, "/instance/ListInstances", &json!({})).await;
     assert_eq!(
         products(&listed, "one directory left"),
@@ -1522,10 +1570,13 @@ async fn a_request_cannot_buy_unbounded_work_or_state() {
             .cloned()
             .expect("the association is in the store");
         while guard.instance_users.len() < MAX_RESOURCES_PER_KIND {
-            let arn = format!("{}filler{}", arn_prefix("instance-user"), guard.instance_users.len());
+            // Written through the one association writer, so every index the store keeps
+            // of an association agrees with the records this filler adds.
+            let filler_number = guard.instance_users.len();
             let mut filler = template.clone();
-            filler.arn = arn.clone();
-            guard.instance_users.insert(arn, filler);
+            filler.arn = format!("{}filler{filler_number}", arn_prefix("instance-user"));
+            filler.username = format!("filler.user{filler_number}");
+            guard.insert_instance_user(filler);
         }
     }
 

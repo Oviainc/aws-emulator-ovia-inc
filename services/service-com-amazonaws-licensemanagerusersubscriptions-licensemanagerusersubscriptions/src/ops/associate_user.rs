@@ -39,7 +39,10 @@
 //! `ASSOCIATED` transition is owed by the clock (see `crate::state::materialise_due`)
 //! and materialises on any later read. The operation is `@idempotent`, so associating a
 //! user that is already associated to the same instance answers the stored association
-//! rather than minting a second one.
+//! rather than minting a second one. An association whose disassociation has been
+//! accepted still occupies that triple while it is `DISASSOCIATING`, and is the modelled
+//! `ConflictException` instead: the user is still being torn down from that instance, so
+//! there is no association to answer with and none to mint.
 //!
 //! The association is also what brings an EC2 instance into this service's view, which
 //! is what `ListInstances` reports: see [`crate::state::InstanceRecord`] and
@@ -225,6 +228,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&index_key)
             .and_then(|arn| state.instance_users.get(arn))
         {
+            // Unless that association is still being torn down: a disassociation the
+            // service has not finished yet still occupies the triple, so associating the
+            // user with that instance again conflicts with the state the association is
+            // in rather than minting a second one or resurrecting this one.
+            if crate::state::disassociation_started(&existing.status) {
+                return Err(AssociateUserErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "user {} is still being disassociated from instance {}",
+                            existing.username, existing.instance_id
+                        )),
+                    },
+                )
+                .into());
+            }
             return Ok(AssociateUserOutput {
                 instance_user_summary: crate::state::instance_user_summary(existing),
             });
@@ -260,14 +278,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             association_date: Some(crate::state::iso8601(now)),
             disassociation_date: None,
             associated_due_at: crate::state::association_due_at(now),
+            // Nothing is being torn down: a fresh association owes the clock its
+            // `ASSOCIATED` transition, not a teardown.
+            disassociated_due_at: None,
         };
 
         if let Some(tags) = input.tags.as_ref() {
             state.merge_tags(&arn, tags).map_err(into_error)?;
         }
-        state.instance_users.insert(arn.clone(), record.clone());
-        state.instance_user_order.push(arn);
-        state.instance_user_index.insert(index_key, record.arn.clone());
+        // The ONE writer of an association: it stores the record and every index that
+        // reaches it, so no two views of the same association can disagree.
+        state.insert_instance_user(record.clone());
         // The `ASSOCIATING` -> `ASSOCIATED` transition the clock now owes.
         state.schedule_transition(record.associated_due_at);
         // The association is also how an instance enters this service's view, which is
