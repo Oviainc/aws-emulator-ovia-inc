@@ -228,6 +228,121 @@ pub fn quick_setup_type_rejection(member: &str, value: &str) -> Option<String> {
     ))
 }
 
+/// The `Parameters` key naming the Regions a configuration definition is deployed to.
+///
+/// Documented on `ConfigurationDefinitionInput$Parameters` for every configuration
+/// type the service offers as a comma separated list of the Regions to deploy the
+/// configuration to (`smithy_query(query="doc",
+/// shape="ConfigurationDefinitionInput", member="Parameters")`).
+pub const PARAMETER_TARGET_REGIONS: &str = "TargetRegions";
+
+/// The `Parameters` key naming the accounts a configuration definition is deployed
+/// to, documented on the same member as the ID of the account to deploy the
+/// configuration to.
+pub const PARAMETER_TARGET_ACCOUNTS: &str = "TargetAccounts";
+
+/// How many account-and-Region deployments ONE configuration definition may fan out
+/// to.
+///
+/// Both target lists are caller-sized text inside a parameter value, and each pair
+/// they name becomes a stored configuration, so the product is bounded here rather
+/// than letting one create grow the store without bound. Emulator resource guard, NOT
+/// a published AWS quota; far above the number of Regions AWS publishes.
+pub const MAX_DEPLOYMENT_TARGETS: usize = 100;
+
+/// Digits in an Amazon Web Services account id, the form a `TargetAccounts` entry
+/// takes.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// One place a configuration definition is deployed: the account and the Region the
+/// deployed configuration reports as `ConfigurationSummary$Account` / `$Region`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeploymentTarget {
+    pub account: String,
+    pub region: String,
+}
+
+/// The entries of one comma-separated parameter value: each trimmed, empty entries
+/// dropped, repeats dropped, and the order the caller wrote them kept.
+pub fn comma_separated(value: Option<&str>) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for entry in value.unwrap_or_default().split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() || entries.iter().any(|seen| seen == entry) {
+            continue;
+        }
+        entries.push(entry.to_string());
+    }
+    entries
+}
+
+/// Where a configuration definition whose parameters name `target_regions` and
+/// `target_accounts` is deployed: ONE target per targeted account and Region pair.
+///
+/// A Quick Setup configuration definition names where it is deployed through its
+/// parameters, and the service deploys one configuration per targeted account and
+/// Region, which is what that configuration reports as the account and Region it was
+/// deployed in. A definition naming no Region is deployed in the Region of the
+/// manager that owns it, and one naming no account is deployed in `local_account` —
+/// the single account this emulator serves, which is also the only account the
+/// organizational units a definition may target instead could resolve to here.
+pub fn deployment_targets(
+    target_regions: Option<&str>,
+    target_accounts: Option<&str>,
+    local_account: &str,
+    local_region: &str,
+) -> Vec<DeploymentTarget> {
+    let mut regions = comma_separated(target_regions);
+    if regions.is_empty() {
+        regions.push(local_region.to_string());
+    }
+    let mut accounts = comma_separated(target_accounts);
+    if accounts.is_empty() {
+        accounts.push(local_account.to_string());
+    }
+    accounts
+        .iter()
+        .flat_map(|account| {
+            regions.iter().map(move |region| DeploymentTarget {
+                account: account.clone(),
+                region: region.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Why the deployment targets a configuration definition's parameters name cannot be
+/// served, or `None` when they can.
+///
+/// `ConfigurationParametersMap` bounds each key and value but says nothing about what
+/// a value means, so both rules live here: a targeted account is named by its account
+/// id, and the number of account-and-Region deployments one definition fans out to is
+/// bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a create
+/// and an update refuse the same target sets.
+pub fn deployment_targets_rejection(
+    member: &str,
+    target_regions: Option<&str>,
+    target_accounts: Option<&str>,
+) -> Option<String> {
+    let accounts = comma_separated(target_accounts);
+    if let Some(malformed) = accounts.iter().find(|account| {
+        account.len() != ACCOUNT_ID_DIGITS || !account.bytes().all(|b| b.is_ascii_digit())
+    }) {
+        return Some(format!(
+            "{member}.{PARAMETER_TARGET_ACCOUNTS} must be a comma separated list of \
+             {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account IDs, got '{}'",
+            echoed_value(malformed)
+        ));
+    }
+    let targets = comma_separated(target_regions).len().max(1) * accounts.len().max(1);
+    (targets > MAX_DEPLOYMENT_TARGETS).then(|| {
+        format!(
+            "{member} names {targets} account and Region deployments, more than the \
+             {MAX_DEPLOYMENT_TARGETS} this service deploys for one configuration definition"
+        )
+    })
+}
+
 /// The settings Quick Setup holds for ONE account and region: what the last
 /// successful `UpdateServiceSettings` wrote there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +507,10 @@ impl ConfigurationDefinitionRecord {
 #[derive(Debug, Clone)]
 pub struct ConfigurationManagerRecord {
     pub manager_arn: String,
+    /// The Region this manager was created in, the one its ARN carries: where a
+    /// configuration definition of this manager that names no target Region of its
+    /// own is deployed.
+    pub region: String,
     pub name: Option<String>,
     pub description: Option<String>,
     pub created_at: SystemTime,
@@ -454,6 +573,40 @@ pub struct ConfigurationRecord {
 }
 
 impl ConfigurationRecord {
+    /// The configuration ONE deployment of `definition` is: the definition's own
+    /// values, in the account and Region `target` names, submitted for deployment at
+    /// `now`. The one place a deployed configuration is built, so a create and an
+    /// update that changes a definition's targets deploy the same record.
+    pub fn deployed(
+        id: String,
+        manager_arn: &str,
+        definition: &ConfigurationDefinitionRecord,
+        target: &DeploymentTarget,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            manager_arn: manager_arn.to_string(),
+            configuration_definition_id: definition.id.clone(),
+            type_: definition.type_.clone(),
+            type_version: definition.type_version.clone(),
+            account: target.account.clone(),
+            region: target.region.clone(),
+            created_at: now,
+            last_modified_at: now,
+            parameters: definition.parameters.clone(),
+            status_summaries: vec![StatusSummaryRecord::deployment(now)],
+        }
+    }
+
+    /// The account and Region this configuration is deployed in.
+    pub fn target(&self) -> DeploymentTarget {
+        DeploymentTarget {
+            account: self.account.clone(),
+            region: self.region.clone(),
+        }
+    }
+
     /// The modelled `ConfigurationSummary` for this record.
     pub fn to_summary(&self) -> ConfigurationSummary {
         ConfigurationSummary {
@@ -543,6 +696,55 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
     pub fn fresh_definition_id(&mut self) -> String {
         self.next_definition_id = self.next_definition_id.saturating_add(1);
         self.next_definition_id.to_string()
+    }
+
+    /// Deploy `definition` of the manager `manager_arn` to exactly `targets`: one
+    /// configuration per targeted account and Region, each carrying the definition's
+    /// current values.
+    ///
+    /// A target the definition is already deployed to keeps its configuration, and
+    /// with it the service-generated id a caller may already hold, so only what the
+    /// definition now says changes and the deployment is submitted again; a target it
+    /// is no longer deployed to keeps no configuration; a newly targeted one gains a
+    /// fresh configuration. The one place the fan-out lives, so a create and an update
+    /// that changes a definition's targets leave the same deployed set.
+    pub fn deploy_definition(
+        &mut self,
+        manager_arn: &str,
+        definition: &ConfigurationDefinitionRecord,
+        targets: &[DeploymentTarget],
+        now: SystemTime,
+    ) {
+        let owns = |configuration: &ConfigurationRecord| {
+            configuration.manager_arn == manager_arn
+                && configuration.configuration_definition_id == definition.id
+        };
+        self.configurations.retain(|_, configuration| {
+            !owns(configuration) || targets.contains(&configuration.target())
+        });
+        let mut deployed: Vec<DeploymentTarget> = Vec::new();
+        for configuration in self.configurations.values_mut() {
+            if !owns(configuration) {
+                continue;
+            }
+            configuration.type_ = definition.type_.clone();
+            configuration.type_version = definition.type_version.clone();
+            configuration.parameters = definition.parameters.clone();
+            // Monotonic: the stamp never moves backwards, whatever the host clock does.
+            configuration.last_modified_at = now.max(configuration.last_modified_at);
+            restart_deployment(&mut configuration.status_summaries, now);
+            deployed.push(configuration.target());
+        }
+        for target in targets {
+            if deployed.contains(target) {
+                continue;
+            }
+            let id = self.fresh_uuid();
+            let configuration =
+                ConfigurationRecord::deployed(id, manager_arn, definition, target, now);
+            self.configurations
+                .insert(configuration.id.clone(), configuration);
+        }
     }
 
     /// Materialise every status change the clock already owes, so a reporting
