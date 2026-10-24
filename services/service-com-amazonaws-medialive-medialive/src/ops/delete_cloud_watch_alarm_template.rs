@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCloudWatchAlarmTemplate
+//! Removes the cloudwatch alarm template its `Identifier` names and answers an
+//! empty 204, releasing the group membership the template held.
 //!
 //! ## Shape of an operation
 //!
@@ -170,8 +172,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Deletes a cloudwatch alarm template": the record LEAVES the store, so
         // `GetCloudWatchAlarmTemplate` misses from here on, the name the template
-        // held is free again and the group that held it no longer counts it. The
-        // operation documents no precondition, so the miss is the only refusal.
+        // held is free again and the group that held it no longer counts it — so
+        // a group whose last template is deleted is empty and
+        // `DeleteCloudWatchAlarmTemplateGroup` has nothing left to refuse over.
+        // The operation documents no precondition, so the miss is the only
+        // refusal.
         state
             .delete_alarm_template(&region, &input.identifier)
             .ok_or_else(|| not_found(&input.identifier))?;

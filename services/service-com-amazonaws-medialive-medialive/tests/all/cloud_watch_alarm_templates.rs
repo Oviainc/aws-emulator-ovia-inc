@@ -146,6 +146,16 @@ fn number(case: &str, body: &Value, name: &str) -> f64 {
     })
 }
 
+/// The value of `name` in `body`, falling back to the value of `fallback` when
+/// `body` carries no `name` — the shape of an optional member whose unset value
+/// is implied by another member the request did carry.
+fn member_or(body: &Value, name: &str, fallback: &str) -> Value {
+    match body.get(name) {
+        Some(value) => value.clone(),
+        None => member(body, fallback),
+    }
+}
+
 /// Rule: a create mints the resource's id, builds its ARN from the request's
 /// region and that id, resolves its parent by either identifier form the model
 /// allows, stores every member the request supplied verbatim, and the reporting
@@ -281,12 +291,15 @@ async fn a_created_alarm_template_is_read_back_by_its_id_and_by_its_name() {
             "case {case:?}: expected the description the request supplied, got {:?}",
             created["description"]
         );
-        // `DatapointsToAlarm` is optional on the request, so a template created
-        // without one reports it absent rather than inventing a value.
+        // `DatapointsToAlarm` is the M of the template's "M out of N" alarm: the
+        // request's value when it supplied one, and otherwise the
+        // `EvaluationPeriods` its N is, which is the alarm that trips when every
+        // evaluated period breaches. Either way the stored template carries one,
+        // so the member is never absent from a response.
         assert_eq!(
             member(&created, "datapointsToAlarm"),
-            member(&request, "datapointsToAlarm"),
-            "case {case:?}: expected the datapointsToAlarm the request supplied, got {:?}",
+            member_or(&request, "datapointsToAlarm", "evaluationPeriods"),
+            "case {case:?}: expected the datapointsToAlarm the request supplied, or its evaluationPeriods, got {:?}",
             created["datapointsToAlarm"]
         );
         // `Tags` is always reported, as the map it is modelled as: a template
