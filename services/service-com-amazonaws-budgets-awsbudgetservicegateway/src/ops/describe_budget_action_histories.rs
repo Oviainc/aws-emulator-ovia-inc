@@ -4,8 +4,12 @@
 //!
 //! Reads the history of one budget action back out of the store, oldest record first:
 //! every event recorded against the action, optionally narrowed to the `TimePeriod` the
-//! caller asked for, one `MaxResults`-sized page at a time. Reporting only — nothing is
-//! written.
+//! caller asked for, one `MaxResults`-sized page at a time. Reporting only, except for
+//! the one change the CLOCK already owed: an action whose `*_IN_PROGRESS` work has
+//! reached its settle instant takes its settled status
+//! ([`crate::state::StoredAction::settle_due`]), which also records that
+//! system-generated status change against the history — both were due at that instant
+//! whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -187,11 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The lookup materialises any settle the clock had already made due, so the
+        // history this read reports holds the system-generated record of that status
+        // change too — a history whose newest record is a status the action no longer
+        // carries would contradict `DescribeBudgetAction`.
         let held = store
             .budgets
-            .get(&(input.account_id.clone(), input.budget_name.clone()))
-            .and_then(|stored| crate::state::find_action(stored, &input.action_id))
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .and_then(|stored| crate::state::find_action_mut(stored, &input.action_id, now))
             .ok_or_else(|| {
                 DescribeBudgetActionHistoriesErrorModeled::NotFoundException(NotFoundException {
                     message: Some(format!(
