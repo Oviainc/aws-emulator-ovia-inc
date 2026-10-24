@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCustomLineItemVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCustomLineItemVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCustomLineItemVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the version history of ONE custom line item: the generations of it this
+//! store has persisted, oldest first, filtered to the billing periods the request
+//! names and paged.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +77,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::CustomLineItemVersion;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -116,6 +112,115 @@ impl From<ListCustomLineItemVersionsErrorModeled> for ListCustomLineItemVersions
     fn from(modeled: ListCustomLineItemVersionsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The billing period a generation stops applying at, EXCLUSIVE, as this operation
+/// reports it.
+///
+/// A generation applies until the earlier of the end its own write named and the
+/// billing period the generation that replaced it took effect in: once a later version
+/// of the item is in effect for a period, the earlier version is not. The generation in
+/// effect NOW has no successor, so it ends only where its own range does — absent for
+/// an item whose range is open-ended.
+fn end_billing_period(
+    version: &CustomLineItemVersion,
+    successor: Option<&CustomLineItemVersion>,
+) -> Option<String> {
+    let own = version.exclusive_end_billing_period.clone();
+    let next = successor.map(|successor| successor.start_billing_period.clone());
+    match (own, next) {
+        (Some(own), Some(next)) => {
+            // Two spellings of one month are one billing period, so which bound comes
+            // first is decided on the period's order rather than on its text.
+            let keys = (
+                crate::state::billing_period_key(&own),
+                crate::state::billing_period_key(&next),
+            );
+            match keys {
+                (Some(own_key), Some(next_key)) if next_key < own_key => Some(next),
+                _ => Some(own),
+            }
+        }
+        (own, next) => own.or(next),
+    }
+}
+
+/// Is a generation in effect anywhere inside the billing periods the request's filter
+/// names?
+///
+/// The filter is the span of billing periods the versions "are applied" in, and its
+/// member names carry no inclusive/exclusive marker — unlike the half-open
+/// `CustomLineItemBillingPeriodRange` a write carries, whose members spell both out —
+/// so both of its bounds are read as INCLUSIVE and an absent bound as open. A
+/// generation is selected when its own half-open span shares at least one billing
+/// period with that span; a generation superseded inside its own start period applies
+/// in no billing period at all and so is selected by no filter.
+fn in_filter(
+    start_billing_period: &str,
+    end_billing_period: Option<&str>,
+    filter: Option<&ListCustomLineItemVersionsBillingPeriodRangeFilter>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let start = crate::state::billing_period_key(start_billing_period);
+    let end = end_billing_period.and_then(crate::state::billing_period_key);
+    let not_after_filter = filter
+        .end_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key)
+        .is_none_or(|filter_end| start.is_none_or(|start| start <= filter_end));
+    let not_before_filter = filter
+        .start_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key)
+        .is_none_or(|filter_start| end.is_none_or(|end| end > filter_start));
+    not_after_filter && not_before_filter
+}
+
+/// One generation of the item, as this operation reports a version.
+///
+/// Every value comes from the generation the store holds — `CurrencyCode` from the
+/// partition of the item's ARN, exactly as `ListCustomLineItems` derives it — so a
+/// version read reports what the item WAS, and its newest element what the item is.
+fn element(
+    item_arn: &str,
+    version: &CustomLineItemVersion,
+    end_billing_period: Option<String>,
+) -> CustomLineItemVersionListElement {
+    CustomLineItemVersionListElement {
+        name: Some(version.name.clone()),
+        charge_details: Some(version.charge_details.clone()),
+        currency_code: Some(crate::state::custom_line_item_currency_code(item_arn).to_string()),
+        description: Some(version.description.clone()),
+        // Nothing in this service's surface sets a product code — neither
+        // `CreateCustomLineItem` nor `UpdateCustomLineItem` models a `ProductCode`
+        // member — so it is reported absent rather than invented.
+        product_code: None,
+        billing_group_arn: Some(version.billing_group_arn.clone()),
+        creation_time: version.creation_time_millis,
+        last_modified_time: version.last_modified_time_millis,
+        association_size: version.association_size,
+        start_billing_period: Some(version.start_billing_period.clone()),
+        end_billing_period,
+        arn: Some(item_arn.to_string()),
+        start_time: version.start_time_millis,
+        account_id: version.account_id.clone(),
+        computation_rule: version.computation_rule.clone(),
+        presentation_details: version
+            .presentation_service
+            .clone()
+            .map(|service| PresentationObject { service }),
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`, naming
+/// the `ValidationExceptionReason` the model enumerates and the member at fault.
+fn validation(reason: &str, field: &str, message: String) -> ListCustomLineItemVersionsError {
+    ListCustomLineItemVersionsErrorModeled::ValidationException(
+        crate::state::validation_exception(reason, field, message),
+    )
+    .into()
 }
 
 /// The `ListCustomLineItemVersions` operation.
@@ -154,18 +259,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCustomLineItemVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCustomLineItemVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCustomLineItemVersions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListCustomLineItemVersionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the billingconductor store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // "The Amazon Resource Name (ARN) for the custom line item." The
+        // `CustomLineItemArn` pattern accepts the full ARN as well as the bare
+        // 10-character id, so both spellings resolve to the one record the store is
+        // keyed by.
+        let item_arn = crate::state::normalize_custom_line_item_arn(&input.arn);
+
+        // This operation models no `ResourceNotFoundException`, so an `Arn` that names
+        // no stored item is refused with the modelled `ValidationException` and the
+        // reason `ValidationExceptionReason` enumerates for exactly that
+        // (`MISSING_CUSTOMLINEITEM`) — the answer `DeleteCustomLineItem`, which models
+        // the same error set, gives too.
+        let Some(item) = state.custom_line_items.get(&item_arn) else {
+            return Err(validation(
+                "MISSING_CUSTOMLINEITEM",
+                "Arn",
+                format!("the custom line item {item_arn} does not exist"),
+            ));
+        };
+
+        let filter = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.billing_period_range.as_ref());
+        // Both bounds of the filter are inclusive (see [`in_filter`]), so a range whose
+        // end comes before its start names no billing period at all.
+        if let Some(range) = filter {
+            let bounds = (
+                range
+                    .start_billing_period
+                    .as_deref()
+                    .and_then(crate::state::billing_period_key),
+                range
+                    .end_billing_period
+                    .as_deref()
+                    .and_then(crate::state::billing_period_key),
+            );
+            if let (Some(start), Some(end)) = bounds {
+                if start > end {
+                    return Err(validation(
+                        "ILLEGAL_BILLING_PERIOD_RANGE",
+                        "Filters.BillingPeriodRange.EndBillingPeriod",
+                        "the end billing period must not be earlier than the start billing \
+                         period"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Oldest generation first, the order the history was written in, so a
+        // `NextToken` names the same cut point on the next call.
+        let versions = item.versions();
+        let mut selected: Vec<(String, CustomLineItemVersionListElement)> = Vec::new();
+        for (index, version) in versions.iter().enumerate() {
+            let end = end_billing_period(version, versions.get(index + 1));
+            if !in_filter(&version.start_billing_period, end.as_deref(), filter) {
+                continue;
+            }
+            // The pagination key is the generation's position in that order, written
+            // fixed-width so it orders as a string the way it orders as a number.
+            selected.push((format!("{index:010}"), element(&item_arn, version, end)));
+        }
+
+        let (custom_line_item_versions, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+
+        Ok(ListCustomLineItemVersionsOutput {
+            custom_line_item_versions: Some(custom_line_item_versions),
+            next_token,
+        })
     }
 }

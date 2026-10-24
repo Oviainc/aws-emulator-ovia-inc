@@ -131,7 +131,10 @@ fn cases() -> Vec<Case> {
                     "inputs": [{ "fileInput": "s3://example-bucket/in/three.mp4" }],
                     "outputGroups": [{
                         "name": "My Group",
-                        "outputs": [{ "nameModifier": "_mine" }],
+                        "outputs": [{
+                            "nameModifier": "_mine",
+                            "containerSettings": { "container": "MP4" }
+                        }],
                         "outputGroupSettings": {
                             "type": "FILE_GROUP_SETTINGS",
                             "fileGroupSettings": { "destination": "s3://example-bucket/mine/" }

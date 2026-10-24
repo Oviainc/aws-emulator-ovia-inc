@@ -18,9 +18,9 @@ use std::time::{Duration, SystemTime};
 pub mod network;
 
 use crate::ops::types::{
-    Action, AvailabilityZone, Certificate, Listener, LoadBalancer, LoadBalancerAddress,
-    LoadBalancerState, Matcher, TargetDescription, TargetGroup, TargetGroupAttribute, TargetHealth,
-    TargetHealthDescription, TrustStore,
+    Action, AvailabilityZone, Certificate, Listener, ListenerAttribute, LoadBalancer,
+    LoadBalancerAddress, LoadBalancerState, Matcher, Rule, TargetDescription, TargetGroup,
+    TargetGroupAttribute, TargetHealth, TargetHealthDescription, TrustStore,
 };
 
 /// How long after the call that starts it a load balancer owes its move out of
@@ -343,6 +343,315 @@ pub fn target_group_selection_not_found_message() -> String {
     "One or more target groups not found".to_string()
 }
 
+/// The message Elastic Load Balancing answers a `ListenerNotFound` with for an
+/// operation that addresses ONE listener through its own required `ListenerArn` —
+/// `ModifyListener`, `DeleteListener`, the certificate writes and the attribute read and
+/// write.
+///
+/// Built from the request: the identifier it names is the only thing the caller can act
+/// on, and the recorded answers to a `ModifyListener` and a `DescribeListenerAttributes`
+/// of an absent listener quote that ARN back under the singular noun.
+pub fn listener_not_found_message(arn: &str) -> String {
+    format!("Listener '{arn}' not found")
+}
+
+/// The message Elastic Load Balancing answers a `ListenerNotFound` with for a read over
+/// a LIST of listeners, or over the rules or certificates of one: there the refusal is
+/// about the selection the request asked for rather than one listener the call
+/// addresses.
+///
+/// The service names no value there — the same shape of message its sibling target
+/// group reads answer ([`target_group_selection_not_found_message`]), and what the
+/// recorded `DescribeListeners`, `DescribeListenerCertificates` and `DescribeRules` of
+/// an absent listener answer.
+pub fn listener_selection_not_found_message() -> String {
+    "One or more listeners not found".to_string()
+}
+
+/// The message Elastic Load Balancing answers a `RuleNotFound` with for a read over a
+/// LIST of rule identifiers (`DescribeRules`, whose `RuleArns` is a list): the selection
+/// the request asked for is what could not be resolved, and the service names no value
+/// in it, exactly as its sibling list reads do.
+pub fn rule_selection_not_found_message() -> String {
+    "One or more rules not found".to_string()
+}
+
+/// The published maximum length of a load balancer name, from `CreateLoadBalancer`'s
+/// `Name` documentation: "can have a maximum of 32 characters".
+pub const LOAD_BALANCER_NAME_MAX_LENGTH: usize = 32;
+
+/// Whether `name` is a load balancer NAME this service can address, as the model's
+/// `CreateLoadBalancerInput$Name` documentation states the rule: "can have a maximum of
+/// 32 characters, must contain only alphanumeric characters or hyphens, must not begin
+/// or end with a hyphen".
+///
+/// Read by [`check_listener_arn`]: a load balancer name this service could never have
+/// minted is not a name any ARN of this service can carry.
+pub fn is_load_balancer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= LOAD_BALANCER_NAME_MAX_LENGTH
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+/// The ARN segments [`load_balancer_type_code`] mints, which are the only load balancer
+/// type codes an Elastic Load Balancing ARN carries.
+pub const LOAD_BALANCER_TYPE_CODES: &[&str] = &["app", "net", "gwy"];
+
+/// Whether `value` is a resource id of the form every load balancer, listener and rule
+/// ARN of this service carries: the 16 hex characters
+/// `ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State::mint_id` produces.
+fn is_resource_id(value: &str) -> bool {
+    value.len() == 16 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Whether `arn` is a well-formed LISTENER ARN — one this API could address at all —
+/// and, when it is not, the refusal naming the value, which is the only thing the caller
+/// can act on.
+///
+/// A listener ARN is `listener/<type>/<load-balancer-name>/<load-balancer-id>/<id>` with
+/// a type code this service mints ([`LOAD_BALANCER_TYPE_CODES`]), a load balancer name
+/// that satisfies the documented name rule ([`is_load_balancer_name`]) and two resource
+/// ids of the form every ARN here carries. A value that breaks any of those names no
+/// listener this API can have, whatever the store holds, and is refused as an invalid
+/// ARN rather than reported as a missing listener — while a well-formed ARN that simply
+/// names nothing is the `ListenerNotFound` of the operation that was called. The
+/// partition, Region and account are deliberately NOT checked: an ARN of another Region
+/// is well formed and simply names no listener this store holds.
+pub fn check_listener_arn(arn: &str) -> Result<(), String> {
+    let malformed = || Err(format!("'{arn}' is not a valid listener ARN"));
+    let Some(parsed) = ::service_common::arn::parse_of(arn, SERVICE_NAMESPACE) else {
+        return malformed();
+    };
+    let Some(resource_id) = parsed.resource.strip_prefix("listener/") else {
+        return malformed();
+    };
+    let segments: Vec<&str> = resource_id.split('/').collect();
+    let [type_code, name, load_balancer_id, listener_id] = segments[..] else {
+        return malformed();
+    };
+    if !LOAD_BALANCER_TYPE_CODES.contains(&type_code)
+        || !is_load_balancer_name(name)
+        || !is_resource_id(load_balancer_id)
+        || !is_resource_id(listener_id)
+    {
+        return malformed();
+    }
+    Ok(())
+}
+
+/// The listener protocols that terminate TLS at the load balancer, and so are the ones
+/// the model brackets the certificate and security-policy members for.
+///
+/// From this model's own documentation of `CreateListenerInput$Certificates` — "[HTTPS
+/// and TLS listeners] The default certificate for the listener. You must provide exactly
+/// one certificate." — and of `SslPolicy`, bracketed the same way. `ProtocolEnum`'s other
+/// values (GENEVE, HTTP, QUIC, TCP, TCP_QUIC, TCP_UDP, UDP) are outside that bracket, as
+/// is a listener that names no protocol at all — the model: "You can't specify a protocol
+/// for a Gateway Load Balancer".
+pub const TLS_TERMINATING_PROTOCOLS: &[&str] = &["HTTPS", "TLS"];
+
+/// Whether a listener on `protocol` terminates TLS, which is what decides whether it
+/// carries a default certificate, a certificate list and a security policy at all.
+pub fn terminates_tls(protocol: Option<&str>) -> bool {
+    protocol.is_some_and(|value| TLS_TERMINATING_PROTOCOLS.contains(&value))
+}
+
+/// How many certificates one listener's certificate list holds before
+/// `AddListenerCertificates` refuses with the modelled `TooManyCertificatesException`.
+/// The emulator's own bound, as [`LOAD_BALANCER_QUOTA`]: the list lives on the listener
+/// record, so it is released with the listener.
+pub const CERTIFICATES_PER_LISTENER: usize = 25;
+
+/// Every listener attribute this service models, with the load balancer families whose
+/// listeners carry it, the values it accepts and its documented default — each one a
+/// sentence of the model's own `ListenerAttribute$Key` documentation
+/// (`smithy_query(query="doc",shape="ListenerAttribute",member="Key")`), which is the
+/// only catalog of them; the Smithy shape itself is an unconstrained key/value pair, so
+/// nothing else in the model lists them.
+pub static LISTENER_ATTRIBUTES: &[ListenerAttributeSpec] = &[
+    // "The following attribute is supported by Network Load Balancers, and Gateway Load
+    // Balancers: tcp.idle_timeout.seconds - The tcp idle timeout value, in seconds. The
+    // valid range is 60-6000 seconds. The default is 350 seconds."
+    ListenerAttributeSpec {
+        key: "tcp.idle_timeout.seconds",
+        domain: AttributeDomain::Integer { min: 60, max: 6000 },
+        families: &[LoadBalancerFamily::Network, LoadBalancerFamily::Gateway],
+        default: Some("350"),
+    },
+    // "The following attribute is only supported by Gateway Load Balancers:
+    // send_tcp_reset.on_idle_timeout.enabled – ... The value is true or false. The
+    // default is false."
+    ListenerAttributeSpec {
+        key: "send_tcp_reset.on_idle_timeout.enabled",
+        domain: AttributeDomain::Boolean,
+        families: &[LoadBalancerFamily::Gateway],
+        default: Some("false"),
+    },
+    // "The following attributes are only supported by Application Load Balancers": the
+    // mutual-TLS and TLS request header names, each of which the documentation describes
+    // as a header NAME the caller chooses, so the model states no domain and no default
+    // for any of them — they are reported once a caller has set one.
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_mtls_clientcert_serial_number.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_mtls_clientcert_issuer.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_mtls_clientcert_subject.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_mtls_clientcert_validity.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_mtls_clientcert_leaf.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_mtls_clientcert.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_tls_version.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.request.x_amzn_tls_cipher_suite.header_name",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    // "routing.http.response.server.enabled - Enables you to allow or remove the HTTP
+    // response server header." Allowed or removed: the two states the sentence names.
+    ListenerAttributeSpec {
+        key: "routing.http.response.server.enabled",
+        domain: AttributeDomain::Boolean,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    // The response header VALUES, each documented as the value of one HTTP response
+    // header — again a caller's string, with no domain or default in the model.
+    ListenerAttributeSpec {
+        key: "routing.http.response.strict_transport_security.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.access_control_allow_origin.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.access_control_allow_methods.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.access_control_allow_headers.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.access_control_allow_credentials.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.access_control_expose_headers.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    // "Specifies how long the results of a preflight request can be cached, in seconds."
+    ListenerAttributeSpec {
+        key: "routing.http.response.access_control_max_age.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.content_security_policy.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.x_content_type_options.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+    ListenerAttributeSpec {
+        key: "routing.http.response.x_frame_options.header_value",
+        domain: AttributeDomain::Text,
+        families: &[LoadBalancerFamily::Application],
+        default: None,
+    },
+];
+
+/// One listener attribute: which listeners carry it, what it accepts, and the value it
+/// reports until something sets it.
+#[derive(Debug)]
+pub struct ListenerAttributeSpec {
+    pub key: &'static str,
+    pub domain: AttributeDomain,
+    /// The load balancer families whose listeners carry the attribute, as the model's
+    /// `ListenerAttribute$Key` documentation groups them.
+    pub families: &'static [LoadBalancerFamily],
+    /// The documented default, or `None` for an attribute the model documents no default
+    /// for — which is then reported only once a caller has set it.
+    pub default: Option<&'static str>,
+}
+
+impl ListenerAttributeSpec {
+    /// Whether a listener of a load balancer in `family` carries this attribute.
+    pub fn applies_to(&self, family: LoadBalancerFamily) -> bool {
+        self.families.contains(&family)
+    }
+}
+
+/// The attribute `key` names, or `None` when no listener attribute carries that name.
+pub fn listener_attribute(key: &str) -> Option<&'static ListenerAttributeSpec> {
+    LISTENER_ATTRIBUTES.iter().find(|spec| spec.key == key)
+}
+
+/// Which family of load balancer a `Type` names, which is what decides WHICH listener
+/// attributes its listeners carry. The pairing is the model's own `LoadBalancerTypeEnum`
+/// (`application`, `network`, `gateway`), as [`load_balancer_type_code`] reads it.
+pub fn load_balancer_family(lb_type: &str) -> LoadBalancerFamily {
+    match lb_type {
+        "network" => LoadBalancerFamily::Network,
+        "gateway" => LoadBalancerFamily::Gateway,
+        // `application` is the modelled default for `Type`.
+        _ => LoadBalancerFamily::Application,
+    }
+}
+
 /// The message Elastic Load Balancing answers a `LoadBalancerNotFound` with for a read
 /// over a LIST of identifiers (`DescribeLoadBalancers`, whose `LoadBalancerArns` and
 /// `Names` are both lists).
@@ -358,6 +667,19 @@ pub fn load_balancers_not_found_message<'a>(
 ) -> String {
     let named: Vec<&str> = identifiers.into_iter().collect();
     format!("Load balancers '[{}]' not found", named.join(", "))
+}
+
+/// The message Elastic Load Balancing answers a `LoadBalancerNotFound` with for a read
+/// that selected by ARN (`DescribeLoadBalancers`' `LoadBalancerArns`).
+///
+/// The same read's two selectors are refused in different words: a selection by NAME
+/// lists the names that did not resolve ([`load_balancers_not_found_message`]), while a
+/// selection by ARN names no value at all — the shape of message this service's sibling
+/// list reads answer ([`listener_selection_not_found_message`],
+/// [`target_group_selection_not_found_message`]), and what the recorded answer to a
+/// `DescribeLoadBalancers(LoadBalancerArns=[...])` of an absent ARN carries.
+pub fn load_balancer_selection_not_found_message() -> String {
+    "One or more load balancers not found".to_string()
 }
 
 /// Whether a protocol carries HTTP semantics, which is what decides whether a health
@@ -475,12 +797,16 @@ pub fn protocol_family(protocol: Option<&str>) -> LoadBalancerFamily {
     }
 }
 
-/// The set of values one target group attribute accepts, as its own documentation
-/// states it (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")`).
+/// The set of values one attribute accepts, as its own documentation states it
+/// (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")` for a target
+/// group's, `shape="ListenerAttribute"` for a listener's).
 #[derive(Debug, Clone, Copy)]
 pub enum AttributeDomain {
     /// "The value is `true` or `false`."
     Boolean,
+    /// Any string: what the documentation describes as a name or a header value the
+    /// caller chooses, stating no set of values to check it against.
+    Text,
     /// An integer in the documented inclusive range.
     Integer { min: i64, max: i64 },
     /// The literal `off`, or an integer in the documented inclusive range.
@@ -513,6 +839,9 @@ impl AttributeDomain {
                 "true" | "false" => Ok(()),
                 _ => Err("'true' or 'false'".to_string()),
             },
+            // Nothing to check: the documentation states no domain for it, so refusing
+            // a value here would be this emulator's own rule rather than the service's.
+            Self::Text => Ok(()),
             Self::Integer { min, max } => integer(min, max),
             Self::IntegerOrOff { min, max } => {
                 if value == "off" {
@@ -1114,11 +1443,25 @@ pub struct ListenerRecord {
     pub port: Option<i32>,
     pub protocol: Option<String>,
     pub ssl_policy: Option<String>,
+    /// The listener's DEFAULT certificate — "[HTTPS and TLS listeners] The default
+    /// certificate for the listener. You must provide exactly one certificate." — which
+    /// is the one `CreateListener` and `ModifyListener` set and the only one a `Listener`
+    /// shape reports.
     pub certificate_arns: Vec<String>,
+    /// The listener's CERTIFICATE LIST: the additional certificates
+    /// `AddListenerCertificates` puts on an HTTPS or TLS listener for SNI, in the order
+    /// they were added. Separate from the default certificate above, because the two are
+    /// managed by different operations and `DescribeListenerCertificates` reports them
+    /// apart (`Certificate$IsDefault`).
+    pub list_certificate_arns: Vec<String>,
     pub default_actions: Vec<Action>,
     pub alpn_policy: Vec<String>,
     pub attributes: HashMap<String, String>,
     pub tags: HashMap<String, String>,
+    /// The resource id of this listener's DEFAULT rule, minted with the listener: every
+    /// listener has one, it carries the listener's default actions, and it is what
+    /// `DescribeRules` reports for a listener nothing else has added a rule to.
+    pub default_rule_id: String,
     pub rule_arns: Vec<String>,
 }
 
@@ -1145,7 +1488,10 @@ impl ListenerRecord {
                     .iter()
                     .map(|arn| Certificate {
                         certificate_arn: Some(arn.clone()),
-                        is_default: Some(true),
+                        // `Certificate$IsDefault`: "This value is not included in the
+                        // output when describing a listener, but is included when
+                        // describing listener certificates."
+                        is_default: None,
                     })
                     .collect(),
             ),
@@ -1154,6 +1500,93 @@ impl ListenerRecord {
             alpn_policy: Some(self.alpn_policy.clone()),
             mutual_authentication: None,
         }
+    }
+
+    /// Whether this listener terminates TLS, and so carries certificates at all.
+    pub fn terminates_tls(&self) -> bool {
+        terminates_tls(self.protocol.as_deref())
+    }
+
+    /// What `DescribeListenerCertificates` reports: the default certificate, then the
+    /// certificate list.
+    ///
+    /// The operation is documented as describing "the default certificate and the
+    /// certificate list for the specified HTTPS or TLS listener", and `IsDefault`
+    /// distinguishes them, so a certificate that is in both appears twice — once as the
+    /// default and once as a list entry — rather than being collapsed.
+    pub fn certificate_shapes(&self) -> Vec<Certificate> {
+        self.certificate_arns
+            .iter()
+            .map(|arn| Certificate {
+                certificate_arn: Some(arn.clone()),
+                is_default: Some(true),
+            })
+            .chain(self.list_certificate_arns.iter().map(|arn| Certificate {
+                certificate_arn: Some(arn.clone()),
+                is_default: Some(false),
+            }))
+            .collect()
+    }
+
+    /// The ARN of this listener's default rule.
+    ///
+    /// A listener rule's ARN is its listener's with the resource type `listener-rule` and
+    /// the rule's own id appended — the segments this service's ARNs carry
+    /// (`listener/<type>/<name>/<lb-id>/<id>` and
+    /// `listener-rule/<type>/<name>/<lb-id>/<listener-id>/<id>`), so it is derived from
+    /// the stored listener ARN rather than rebuilt from parts.
+    pub fn default_rule_arn(&self) -> String {
+        format!(
+            "{}/{}",
+            self.arn.replacen(":listener/", ":listener-rule/", 1),
+            self.default_rule_id
+        )
+    }
+
+    /// This listener's default rule: the rule that forwards everything the listener's
+    /// own rules do not match, which is why its actions ARE the listener's default
+    /// actions and it matches on no condition.
+    pub fn default_rule(&self) -> Rule {
+        Rule {
+            rule_arn: Some(self.default_rule_arn()),
+            // The one priority AWS reports for a default rule; every other rule's is a
+            // number.
+            priority: Some("default".to_string()),
+            conditions: Some(Vec::new()),
+            actions: Some(self.default_actions.clone()),
+            is_default: Some(true),
+            transforms: None,
+        }
+    }
+
+    /// Every attribute a listener of a load balancer in `family` reports: the value
+    /// stored for it, else the default its documentation states, and nothing for an
+    /// attribute this family's listeners do not carry or whose default the model does
+    /// not state.
+    pub fn effective_attributes(&self, family: LoadBalancerFamily) -> Vec<(String, String)> {
+        LISTENER_ATTRIBUTES
+            .iter()
+            .filter(|spec| spec.applies_to(family))
+            .filter_map(|spec| {
+                let value = self
+                    .attributes
+                    .get(spec.key)
+                    .cloned()
+                    .or_else(|| spec.default.map(str::to_string))?;
+                Some((spec.key.to_string(), value))
+            })
+            .collect()
+    }
+
+    /// [`Self::effective_attributes`] as the modelled shapes a describe answers with.
+    pub fn attribute_shapes(&self, family: LoadBalancerFamily) -> Vec<ListenerAttribute> {
+        self.effective_attributes(family)
+            .into_iter()
+            .map(|(key, value)| ListenerAttribute {
+                key: Some(key),
+                value: Some(value),
+            })
+            .collect()
     }
 }
 
@@ -1299,6 +1732,10 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
         self.load_balancers.values().any(|lb| lb.id == id)
             || self.target_groups.keys().any(|arn| arn.ends_with(&suffix))
             || self.listeners.keys().any(|arn| arn.ends_with(&suffix))
+            || self
+                .listeners
+                .values()
+                .any(|listener| listener.default_rule_id == id)
             || self.trust_stores.keys().any(|arn| arn.ends_with(&suffix))
     }
 
@@ -1402,6 +1839,86 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
             group.load_balancer_arns.retain(|lb| lb != arn);
         }
         true
+    }
+
+    /// Remove ONE listener — from the store, from its load balancer's listener list and
+    /// from every target group no remaining listener of that load balancer forwards to —
+    /// answering whether it was there.
+    pub fn remove_listener(&mut self, arn: &str) -> bool {
+        let Some(removed) = self.listeners.remove(arn) else {
+            return false;
+        };
+        let load_balancer_arn = removed.load_balancer_arn.clone();
+        if let Some(load_balancer) = self.load_balancers.get_mut(&load_balancer_arn) {
+            load_balancer.listener_arns.retain(|listener| listener != arn);
+        }
+        self.refresh_target_group_associations(&load_balancer_arn);
+        true
+    }
+
+    /// Make every target group's `LoadBalancerArns` agree with the listeners this store
+    /// holds for `load_balancer_arn`: a target group some listener of it forwards to
+    /// lists it, and one no listener forwards to does not.
+    ///
+    /// Called after a listener's actions change or a listener goes away, so the
+    /// association a target group reports is derived from the listeners that exist
+    /// rather than accumulated. The association is dropped only when nothing else keeps
+    /// it: a second listener of the same load balancer still forwarding there does.
+    pub fn refresh_target_group_associations(&mut self, load_balancer_arn: &str) {
+        let forwarded: Vec<String> = self
+            .listeners
+            .values()
+            .filter(|listener| listener.load_balancer_arn == load_balancer_arn)
+            .flat_map(|listener| action_target_group_arns(&listener.default_actions))
+            .collect();
+        for (arn, group) in &mut self.target_groups {
+            let holds = group
+                .load_balancer_arns
+                .iter()
+                .any(|lb| lb == load_balancer_arn);
+            if forwarded.contains(arn) {
+                if !holds {
+                    group.load_balancer_arns.push(load_balancer_arn.to_string());
+                }
+            } else if holds {
+                group.load_balancer_arns.retain(|lb| lb != load_balancer_arn);
+            }
+        }
+    }
+
+    /// The load balancer family of the listener `arn` names, or `None` when the store
+    /// holds no such listener. Which attributes a listener carries follows from it.
+    pub fn listener_family(&self, arn: &str) -> Option<LoadBalancerFamily> {
+        let listener = self.listeners.get(arn)?;
+        let load_balancer = self.load_balancers.get(&listener.load_balancer_arn)?;
+        Some(load_balancer_family(&load_balancer.lb_type))
+    }
+
+    /// Every rule of one listener, in the order a paginated read walks them.
+    ///
+    /// A listener's rules are its DEFAULT rule plus the ones a caller added, and the
+    /// default rule is the last AWS reports. `CreateRule` — which mints the others onto
+    /// `ListenerRecord::rule_arns` — is still a scaffold stub with its own issue, so
+    /// every stored listener's rules are its default rule alone today; the rules that
+    /// operation persists join the walk here rather than in a second place.
+    pub fn rules_of(&self, listener: &ListenerRecord) -> Vec<Rule> {
+        vec![listener.default_rule()]
+    }
+
+    /// The rule `arn` names, or `None` when no listener in this store holds it.
+    ///
+    /// ONE lookup, never a scan: a rule ARN is its listener's with the resource type
+    /// `listener-rule` and the rule's own id appended
+    /// ([`ListenerRecord::default_rule_arn`]), so the owning listener is a pure string
+    /// transform of the value asked for and the cost of resolving one does not grow with
+    /// the number of listeners the store holds.
+    pub fn rule_by_arn(&self, arn: &str) -> Option<Rule> {
+        let (listener_part, _rule_id) = arn.rsplit_once('/')?;
+        let listener_arn = listener_part.replacen(":listener-rule/", ":listener/", 1);
+        let listener = self.listeners.get(&listener_arn)?;
+        self.rules_of(listener)
+            .into_iter()
+            .find(|rule| rule.rule_arn.as_deref() == Some(arn))
     }
 }
 

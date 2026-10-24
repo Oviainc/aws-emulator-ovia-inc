@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the rules of the listener `ListenerArn` names, or the rules `RuleArns` names
+//! — "You must specify either a listener or rules", so a request naming neither is
+//! refused — in one page walked by `Marker`/`PageSize`.
+//!
+//! Every listener has a DEFAULT rule, minted with the listener: the rule that carries
+//! the listener's default actions, matches on no condition and reports the priority
+//! `default`. It is what this read answers for a listener, and the rule store it walks is
+//! the listener record itself, so a rule reported here is the one `CreateListener`
+//! persisted. (`CreateRule`, which adds the non-default rules, is still a scaffold stub
+//! with its own issue; the rules it stores join the walk below.)
+//!
+//! A reporting operation: it reads the store and writes nothing to it. An ARN this store
+//! holds no listener for is the modelled `ListenerNotFoundException`, and a `RuleArns`
+//! entry naming no rule is `RuleNotFoundException`. The selector itself is deduplicated
+//! and bounded ([`MAX_RULES_PER_CALL`]), and a rule ARN resolves through one lookup
+//! rather than a scan, so the work one request can ask for is capped.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +83,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many rules one call may select through `RuleArns`.
+///
+/// The model declares no length constraint for that member, so nothing bounds what one
+/// request can ask this read to resolve: this is the emulator's own bound on the
+/// selector, far above any workflow it serves (AWS publishes a quota of 100 rules per
+/// Application Load Balancer), and it is what stops one request's work growing without
+/// end.
+const MAX_RULES_PER_CALL: usize = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +163,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeRules")
+        })?;
+
+        // The selector is bounded and deduplicated BEFORE any per-entry work and before
+        // the store is reached: the bound is read off the list the request carried, the
+        // membership test is a set rather than a scan, and the shared state guard is
+        // taken only once there is a bounded selector to resolve.
+        let carried = input.rule_arns.as_deref().unwrap_or_default();
+        if carried.len() > MAX_RULES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "RuleArns can name at most {MAX_RULES_PER_CALL} rules in a single call, got {}",
+                carried.len()
+            )));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut requested: Vec<&str> = Vec::with_capacity(carried.len());
+        for arn in carried {
+            // Repeating an ARN asks for the same rule, so it is resolved once.
+            if seen.insert(arn.as_str()) {
+                requested.push(arn.as_str());
+            }
+        }
+        let requested_set = &seen;
+
+        let guard = state.lock();
+
+        let selected: Vec<Rule> = match input.listener_arn.as_deref() {
+            Some(listener_arn) => {
+                // A value that is no listener ARN at all names no listener this API can
+                // have: an invalid ARN rather than a missing listener.
+                crate::state::check_listener_arn(listener_arn)
+                    .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+                let Some(listener) = guard.listeners.get(listener_arn) else {
+                    return Err(DescribeRulesErrorModeled::ListenerNotFoundException(
+                        ListenerNotFoundException {
+                            message: Some(crate::state::listener_selection_not_found_message()),
+                        },
+                    )
+                    .into());
+                };
+                let rules = guard.rules_of(listener);
+                if requested.is_empty() {
+                    rules
+                } else {
+                    // A request naming both a listener and rules asks for those rules OF
+                    // that listener, so a rule the listener does not have is as absent
+                    // as one no listener has.
+                    let selected: Vec<Rule> = rules
+                        .into_iter()
+                        .filter(|rule| {
+                            rule.rule_arn
+                                .as_deref()
+                                .is_some_and(|arn| requested_set.contains(arn))
+                        })
+                        .collect();
+                    let resolved: std::collections::HashSet<&str> = selected
+                        .iter()
+                        .filter_map(|rule| rule.rule_arn.as_deref())
+                        .collect();
+                    if requested.iter().any(|arn| !resolved.contains(arn)) {
+                        return Err(rule_not_found());
+                    }
+                    selected
+                }
+            }
+            None if !requested.is_empty() => {
+                let mut selected = Vec::with_capacity(requested.len());
+                for arn in &requested {
+                    let Some(rule) = guard.rule_by_arn(arn) else {
+                        return Err(rule_not_found());
+                    };
+                    selected.push(rule);
+                }
+                selected
+            }
+            // The operation's own documented requirement: "You must specify either a
+            // listener or rules." The model declares no error shape for breaking it, so
+            // this is the service's own `ValidationError` naming the two members.
+            None => {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "You must specify either ListenerArn or RuleArns",
+                ));
+            }
+        };
+
+        let (page, next_marker) =
+            crate::state::paginate(selected, input.marker.as_deref(), input.page_size).map_err(
+                |_| {
+                    crate::scaffolded::Scaffolded::validation(
+                        "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+                    )
+                },
+            )?;
+
+        Ok(DescribeRulesOutput {
+            rules: Some(page),
+            next_marker,
+        })
     }
+}
+
+/// The refusal for a `RuleArns` entry this store holds no rule for. The selection the
+/// request asked for is what could not be resolved, and the service names no value in it
+/// — the same shape of message its sibling list reads answer.
+fn rule_not_found() -> DescribeRulesError {
+    DescribeRulesErrorModeled::RuleNotFoundException(RuleNotFoundException {
+        message: Some(crate::state::rule_selection_not_found_message()),
+    })
+    .into()
 }

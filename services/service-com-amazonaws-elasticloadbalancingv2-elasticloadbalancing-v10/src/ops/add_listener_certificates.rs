@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddListenerCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddListenerCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddListenerCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds certificates to the CERTIFICATE LIST of the listener `ListenerArn` names — the
+//! SNI certificates an HTTPS or TLS listener serves beside its default one, which
+//! `ModifyListener` owns — and reports the list it leaves behind.
+//!
+//! Adding a certificate already in the list changes nothing: the list is a set of
+//! certificates, so a repeat of the same call is the same list.
+//!
+//! An ARN this store holds no listener for is the modelled `ListenerNotFoundException`,
+//! and a list past this store's own bound on it is `TooManyCertificatesException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +149,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddListenerCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddListenerCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddListenerCertificates"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("AddListenerCertificates")
+        })?;
+
+        // A value that is no listener ARN at all names no listener this API can have:
+        // an invalid ARN rather than a missing listener.
+        crate::state::check_listener_arn(&input.listener_arn)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // The REQUEST is read, bounded and deduplicated before the store is reached: one
+        // call cannot name more certificates than a listener's list holds, the
+        // membership test is a set rather than a scan, and the shared state guard is
+        // taken only once there is a bounded set of certificates to add.
+        if input.certificates.len() > crate::state::CERTIFICATES_PER_LISTENER {
+            return Err(too_many_certificates());
+        }
+        let mut requested: Vec<String> = Vec::with_capacity(input.certificates.len());
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for certificate in &input.certificates {
+            let Some(arn) = certificate
+                .certificate_arn
+                .as_deref()
+                .filter(|arn| !arn.is_empty())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "CertificateArn must be set on each certificate to add",
+                ));
+            };
+            // Naming one certificate twice adds it once: the list is a set.
+            if seen.insert(arn) {
+                requested.push(arn.to_string());
+            }
+        }
+
+        let mut guard = state.lock();
+        let Some(listener) = guard.listeners.get_mut(&input.listener_arn) else {
+            return Err(AddListenerCertificatesErrorModeled::ListenerNotFoundException(
+                ListenerNotFoundException {
+                    message: Some(crate::state::listener_not_found_message(&input.listener_arn)),
+                },
+            )
+            .into());
+        };
+
+        // A certificate list belongs to the listeners the model brackets certificates
+        // for, and only to those: the model declares no error shape for the bracket, so
+        // the refusal is this service's own `ValidationError` naming the protocol it
+        // judged — the same rule `CreateListener` enforces on the default certificate.
+        if !listener.terminates_tls() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Certificates cannot be added to a listener whose protocol is {}: a \
+                 certificate list applies only to {} listeners",
+                listener.protocol.as_deref().unwrap_or("unset"),
+                crate::state::TLS_TERMINATING_PROTOCOLS.join(" and ")
+            )));
+        }
+
+        // What the call actually adds: the requested certificates the list does not hold
+        // already. Both sides are bounded by `CERTIFICATES_PER_LISTENER`, and the whole
+        // request is checked before the first write, so a refused call adds nothing.
+        let added: Vec<String> = requested
+            .into_iter()
+            .filter(|arn| !listener.list_certificate_arns.contains(arn))
+            .collect();
+        if listener.list_certificate_arns.len() + added.len()
+            > crate::state::CERTIFICATES_PER_LISTENER
+        {
+            return Err(too_many_certificates());
+        }
+        listener.list_certificate_arns.extend(added);
+
+        // "Information about the certificates in the certificate list": the list this
+        // call leaves behind, each entry flagged as what it is — a list certificate, not
+        // the listener's default one.
+        Ok(AddListenerCertificatesOutput {
+            certificates: Some(
+                listener
+                    .list_certificate_arns
+                    .iter()
+                    .map(|arn| Certificate {
+                        certificate_arn: Some(arn.clone()),
+                        is_default: Some(false),
+                    })
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// The modelled refusal for a call that would take a listener's certificate list past
+/// the bound this store holds it to — whether the request alone names more certificates
+/// than the list can hold, or the ones it adds would.
+fn too_many_certificates() -> AddListenerCertificatesError {
+    AddListenerCertificatesErrorModeled::TooManyCertificatesException(
+        TooManyCertificatesException {
+            message: Some(format!(
+                "This emulator holds at most {} certificates in a listener's certificate list",
+                crate::state::CERTIFICATES_PER_LISTENER
+            )),
+        },
+    )
+    .into()
 }

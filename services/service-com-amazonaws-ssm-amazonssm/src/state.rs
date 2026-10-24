@@ -44,9 +44,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
-    InstanceInformation, InstanceProperty, Parameter, Tag, ASSOCIATION_STATUS_NAME_VALUES,
-    INSTANCE_INFORMATION_FILTER_KEY_VALUES, INSTANCE_PROPERTY_FILTER_KEY_VALUES,
-    PING_STATUS_VALUES, PLATFORM_TYPE_VALUES, RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
+    InstanceInformation, InstanceProperty, Parameter, ParameterHistory, ParameterInlinePolicy, Tag,
+    ASSOCIATION_STATUS_NAME_VALUES, INSTANCE_INFORMATION_FILTER_KEY_VALUES,
+    INSTANCE_PROPERTY_FILTER_KEY_VALUES, PING_STATUS_VALUES, PLATFORM_TYPE_VALUES,
+    RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
 };
 
 /// The signing name, endpoint prefix and ARN namespace of this service, all three
@@ -128,6 +129,41 @@ pub const POLICY_TYPES: &[&str] = &[
 /// number of allowed policies for the parameter. The maximum is 10" (the
 /// `PoliciesLimitExceededException` doc).
 pub const MAX_POLICIES: usize = 10;
+
+/// The status a stored parameter policy is reported in: "Pending (the policy hasn't
+/// been enforced or applied yet)" (the `ParameterInlinePolicy$PolicyStatus` doc).
+///
+/// `PutParameter` validates a policy document and persists it with the version; nothing
+/// here enforces an expiration or raises a notification, so a stored policy has not been
+/// applied and is reported as pending rather than as work nothing did.
+pub const POLICY_STATUS_PENDING: &str = "Pending";
+
+/// The policies a stored `Policies` document carries, as the modelled
+/// `ParameterInlinePolicy` list: one entry per policy in the document, carrying "the
+/// JSON text of the policy" and the type that text declares.
+///
+/// `None` for a version that carries no policy document, so a read reports no policy
+/// list rather than an empty one. `PutParameter` refuses anything that is not a JSON
+/// array of policy objects before it is stored, so the arms that give up on a document
+/// here are backstops.
+pub fn inline_policies(policies: Option<&str>) -> Option<Vec<ParameterInlinePolicy>> {
+    let document = policies.filter(|policies| !policies.trim().is_empty())?;
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document).ok()?;
+    let entries = parsed.as_array()?;
+    Some(
+        entries
+            .iter()
+            .map(|entry| ParameterInlinePolicy {
+                policy_text: Some(entry.to_string()),
+                policy_type: entry
+                    .get("Type")
+                    .and_then(::serde_json::Value::as_str)
+                    .map(str::to_string),
+                policy_status: Some(POLICY_STATUS_PENDING.to_string()),
+            })
+            .collect(),
+    )
+}
 
 /// The `DataType` values Parameter Store supports: "The following data type values are
 /// supported. text aws:ec2:image aws:ssm:integration" (`PutParameter`'s `DataType`
@@ -356,6 +392,40 @@ impl ParameterVersionRecord {
             source_result: None,
             last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
             arn: Some(record.arn()),
+            data_type: Some(self.data_type.clone()),
+        }
+    }
+
+    /// The modelled `ParameterHistory` for this version of `record`.
+    ///
+    /// Every member is read off the version it reports: the history of a parameter is
+    /// the sequence of its retained versions, so an entry carries the value, type, key,
+    /// description, pattern, tier, policies and labels THAT version was created with
+    /// rather than the newest one's.
+    pub fn to_parameter_history(&self, record: &ParameterRecord) -> ParameterHistory {
+        ParameterHistory {
+            name: Some(record.name.clone()),
+            r#type: Some(self.type_.clone()),
+            // "The alias of the Key Management Service (KMS) key used to encrypt the
+            // parameter. Applies to SecureString parameters only", so only a version
+            // stored under one carries it.
+            key_id: self.key_id.clone(),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(self.last_modified_date)),
+            // "Amazon Resource Name (ARN) of the Amazon Web Services user who last
+            // changed the parameter": a request carries a SigV4 credential scope, not a
+            // caller identity, so nothing recorded which user wrote this version and no
+            // user is reported for it rather than one being invented.
+            last_modified_user: None,
+            description: self.description.clone(),
+            value: Some(self.value.clone()),
+            allowed_pattern: self.allowed_pattern.clone(),
+            version: self.version,
+            // "Labels assigned to the parameter version", whose modelled list length is
+            // 1..10: a version carrying none reports no list rather than an empty one.
+            labels: Some(self.labels.iter().cloned().collect::<Vec<String>>())
+                .filter(|labels| !labels.is_empty()),
+            tier: Some(self.tier.clone()),
+            policies: inline_policies(self.policies.as_deref()),
             data_type: Some(self.data_type.clone()),
         }
     }
@@ -929,18 +999,51 @@ pub const MIN_PARAMETERS_BY_PATH_PAGE_SIZE: i32 = 1;
 /// request naming none is served up to the modelled maximum.
 pub const MAX_PARAMETERS_BY_PATH_PAGE_SIZE: i32 = 10;
 
-/// The page size a hierarchy read serves, or the refusal message for a `MaxResults`
-/// outside the modelled range — which the protocol's boundary validator already
-/// refuses, so this is a backstop rather than the first line of defence.
-pub fn parameters_by_path_page_size(max_results: Option<i32>) -> Result<usize, String> {
-    let requested = max_results.unwrap_or(MAX_PARAMETERS_BY_PATH_PAGE_SIZE);
-    if !(MIN_PARAMETERS_BY_PATH_PAGE_SIZE..=MAX_PARAMETERS_BY_PATH_PAGE_SIZE).contains(&requested) {
+/// The page size a read bounded by `MaxResults` serves, or the refusal message for one
+/// outside the modelled range — which the protocol's boundary validator already refuses,
+/// so this is a backstop rather than the first line of defence.
+///
+/// A request naming no `MaxResults` is served up to `maximum`: "the maximum number of
+/// items to return for this call" bounds a page the caller asked to be bounded, so a
+/// caller asking for no bound is served the whole page the operation allows. The
+/// bounds differ per operation, so each read passes its own modelled range.
+fn page_size(max_results: Option<i32>, minimum: i32, maximum: i32) -> Result<usize, String> {
+    let requested = max_results.unwrap_or(maximum);
+    if !(minimum..=maximum).contains(&requested) {
         return Err(format!(
             "Value '{requested}' at 'maxResults' failed to satisfy constraint: Member must be \
-             between {MIN_PARAMETERS_BY_PATH_PAGE_SIZE} and {MAX_PARAMETERS_BY_PATH_PAGE_SIZE}"
+             between {minimum} and {maximum}"
         ));
     }
     Ok(requested as usize)
+}
+
+/// The page size a hierarchy read serves (see [`page_size`]).
+pub fn parameters_by_path_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    page_size(
+        max_results,
+        MIN_PARAMETERS_BY_PATH_PAGE_SIZE,
+        MAX_PARAMETERS_BY_PATH_PAGE_SIZE,
+    )
+}
+
+/// The lower bound the modelled `MaxResults` of a parameter-history read carries
+/// (`GetParameterHistoryRequest$MaxResults`, range 1..50).
+pub const MIN_PARAMETER_HISTORY_PAGE_SIZE: i32 = 1;
+
+/// The upper bound of the same member. It is also the page size a request that names no
+/// `MaxResults` gets: "The maximum number of items to return for this call" bounds a page
+/// the caller asked to be bounded, so a caller asking for no bound is served up to the
+/// modelled maximum.
+pub const MAX_PARAMETER_HISTORY_PAGE_SIZE: i32 = 50;
+
+/// The page size a parameter-history read serves (see [`page_size`]).
+pub fn parameter_history_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    page_size(
+        max_results,
+        MIN_PARAMETER_HISTORY_PAGE_SIZE,
+        MAX_PARAMETER_HISTORY_PAGE_SIZE,
+    )
 }
 
 /// The hierarchy a read's `Path` names, canonical (no leading and no trailing `/`), or

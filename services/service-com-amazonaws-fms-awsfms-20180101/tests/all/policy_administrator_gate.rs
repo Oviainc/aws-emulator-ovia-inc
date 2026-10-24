@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the administrator gate in front of Firewall Manager's
-//! POLICY operations — `PutPolicy`, `GetPolicy`, `DeletePolicy` and
-//! `ListPolicies`.
+//! organisation-scoped POLICY operations — `PutPolicy` and `ListPolicies`.
+//!
+//! The id-keyed `GetPolicy` and `DeletePolicy` are NOT gated: they are decided
+//! by the `PolicyId` lookup alone, which the `policy_identifier_lookup` suite
+//! asserts.
 //!
 //! Every test drives the service the way a client does: an awsJson1_1 `POST /`
 //! through the wire harness in [`crate::policy_lifecycle`], with the
@@ -10,19 +13,19 @@
 //! deserialize → handle → serialize walk runs and the assertions are about the
 //! WIRE response.
 //!
-//! The rule under test is one sentence: policy management is organisation-scoped,
-//! so each of these operations decides authorization FIRST — with no active
-//! Firewall Manager default-administrator association in the account/Region it
-//! answers HTTP 400 `AccessDeniedException`, naming the calling account and the
-//! Region the request was signed for, before any identifier is looked up, any
-//! payload validated or any state read, written or removed; with an association
-//! it judges the request on its own merits.
+//! The rule under test is one sentence: writing a policy and enumerating the
+//! organisation's policies are organisation-scoped, so each decides
+//! authorization FIRST — with no active Firewall Manager default-administrator
+//! association in the account/Region it answers HTTP 400 `AccessDeniedException`,
+//! naming the calling account and the Region the request was signed for, before
+//! any identifier is looked up, any payload validated or any state written; with
+//! an association it judges the request on its own merits.
 //!
 //! The table in [`policy_calls`] is the class that rule ranges over: the rows
 //! differ in operation, in payload form (a create with no identifier, an update
-//! of a known and of an unknown id, an id-keyed read and delete, a list with no
-//! members, with a page bound and with a foreign pagination token) and in whether
-//! the identifier they name exists — and every row is asserted in three Regions.
+//! of a known and of an unknown id, a list with no members, with a page bound and
+//! with a foreign pagination token) and in whether the identifier they name
+//! exists — and every row is asserted in three Regions.
 
 use serde_json::{json, Value};
 
@@ -79,10 +82,10 @@ struct PolicyCall {
 
 /// Every policy operation, in the payload forms the rule ranges over.
 ///
-/// `known_policy_id` is a policy the store actually holds, so a row that names it
-/// differs from the otherwise identical row naming [`UNKNOWN_POLICY_ID`] ONLY in
-/// whether the lookup would have found something — which is what shows the gate
-/// runs before the lookup.
+/// `known_policy_id` is a policy the store actually holds, so the update row that
+/// names it differs from the otherwise identical row naming [`UNKNOWN_POLICY_ID`]
+/// ONLY in whether the lookup would have found something — which is what shows
+/// the gate runs before the lookup.
 fn policy_calls(known_policy_id: &str) -> Vec<PolicyCall> {
     let mut update_known = policy_document("gated-update-of-a-stored-policy");
     update_known["PolicyId"] = json!(known_policy_id);
@@ -114,26 +117,6 @@ fn policy_calls(known_policy_id: &str) -> Vec<PolicyCall> {
             case: "PutPolicy updating an id that names nothing".to_string(),
             operation: "PutPolicy",
             body: json!({ "Policy": update_unknown }),
-        },
-        PolicyCall {
-            case: format!("GetPolicy reading the stored {known_policy_id}"),
-            operation: "GetPolicy",
-            body: json!({ "PolicyId": known_policy_id }),
-        },
-        PolicyCall {
-            case: "GetPolicy reading an id that names nothing".to_string(),
-            operation: "GetPolicy",
-            body: json!({ "PolicyId": UNKNOWN_POLICY_ID }),
-        },
-        PolicyCall {
-            case: format!("DeletePolicy deleting the stored {known_policy_id}"),
-            operation: "DeletePolicy",
-            body: json!({ "PolicyId": known_policy_id, "DeleteAllPolicyResources": true }),
-        },
-        PolicyCall {
-            case: "DeletePolicy deleting an id that names nothing".to_string(),
-            operation: "DeletePolicy",
-            body: json!({ "PolicyId": UNKNOWN_POLICY_ID }),
         },
         PolicyCall {
             case: "ListPolicies with no members".to_string(),
@@ -173,19 +156,21 @@ async fn create_policy(router: &smithy_server_runtime::MultiServiceRouter, name:
         .to_string()
 }
 
-/// With policies in the store but NO administrator association, every policy
-/// operation answers the authorization refusal — whatever its payload, whichever
-/// Region it is signed for, and whether or not the id it names exists — and the
-/// refusal's message is composed from the request.
+/// With policies in the store but NO administrator association, every
+/// organisation-scoped policy operation answers the authorization refusal —
+/// whatever its payload, whichever Region it is signed for, and whether or not
+/// the id it names exists — and the refusal's message is composed from the
+/// request.
 #[tokio::test]
 async fn no_administrator_association_refuses_every_policy_operation() {
     let (router, engine) = emulator_with_engine();
-    // A stored policy, so the gate is shown to run BEFORE the lookup: the known
-    // and the unknown id are refused identically, and the list has something to
-    // report and still reports nothing. Writing it is organisation-scoped too, so
-    // it is created with an administrator associated and the association is then
-    // removed through the store seam — which is exactly the precondition the rule
-    // is about: a store that holds policies but no administrator.
+    // A stored policy, so the gate is shown to run BEFORE the lookup: the update
+    // of a known and of an unknown id are refused identically, and the list has
+    // something to report and still reports nothing. Writing it is
+    // organisation-scoped too, so it is created with an administrator associated
+    // and the association is then removed through the store seam — which is
+    // exactly the precondition the rule is about: a store that holds policies but
+    // no administrator.
     associate_admin(&router).await;
     let known = create_policy(&router, "stored-before-the-gate-closed").await;
     with_store(&engine, |store| store.admin_account = None);
@@ -252,13 +237,13 @@ async fn no_administrator_association_refuses_every_policy_operation() {
         "a refused policy call must not touch the tag index, it holds {arns} entries"
     );
 
-    // And the surviving policy is readable again once the gate is open, which is
-    // what says the refused calls changed nothing a client can see.
+    // And the surviving policy is still readable, which is what says the refused
+    // calls changed nothing a client can see.
     associate_admin(&router).await;
     let (status, body) = call(&router, "GetPolicy", &json!({ "PolicyId": known })).await;
     assert_eq!(
         status, 200,
-        "the refused DeletePolicy must have deleted nothing, got {status} with {body}"
+        "the refused policy calls must have removed nothing, got {status} with {body}"
     );
 }
 
