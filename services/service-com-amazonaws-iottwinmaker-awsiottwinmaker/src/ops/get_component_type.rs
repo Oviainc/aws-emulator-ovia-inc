@@ -290,13 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             creation_date_time: crate::state::timestamp(component_type.creation_date_time),
             update_date_time: crate::state::timestamp(component_type.update_date_time),
-            // `isAbstract` is not a member of `CreateComponentTypeRequest` and
-            // not derivable from one that is: the API offers no way to declare
-            // a component type abstract, and the service's own abstract base
-            // types are built in, none of which this emulator holds. Every
-            // component type it stores was created through this API, so every
-            // one of them is concrete.
-            is_abstract: Some(false),
+            // `isAbstract` is derived from the stored record by
+            // `ComponentType::is_abstract`, which is also what a
+            // `ListComponentTypes` `isAbstract` filter selects on, so the read
+            // and the listing cannot disagree: no component type created
+            // through this API is abstract.
+            is_abstract: Some(component_type.is_abstract()),
             // "Whether the component type has a schema initializer and that the
             // schema initializer has run" — see
             // `ComponentType::is_schema_initialized`.

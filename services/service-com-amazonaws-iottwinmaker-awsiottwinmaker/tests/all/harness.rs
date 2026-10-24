@@ -227,6 +227,17 @@ impl Emulator {
         .await
     }
 
+    /// `ListComponentTypes`: POST /workspaces/{workspaceId}/component-types-list,
+    /// with the page and filter members carried in the body.
+    pub(crate) async fn list_component_types(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/component-types-list"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `DeleteComponentType`: DELETE on the component type's own path, with both
     /// ids carried as `@httpLabel`s and no body.
     pub(crate) async fn delete_component_type(

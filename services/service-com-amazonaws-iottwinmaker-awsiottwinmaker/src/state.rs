@@ -806,6 +806,25 @@ impl ComponentType {
     pub fn is_schema_initialized(&self) -> bool {
         self.functions.contains_key(SCHEMA_INITIALIZER_FUNCTION) && self.state == STATE_ACTIVE
     }
+
+    /// Whether the component type is ABSTRACT — a base type an entity cannot
+    /// hold a component of.
+    ///
+    /// False for every component type this service stores, and derived HERE
+    /// rather than at each reader so the value `GetComponentType` reports and
+    /// the set a `ListComponentTypes` `isAbstract` filter selects cannot drift
+    /// apart. `isAbstract` is not a member of `CreateComponentTypeRequest` and
+    /// not derivable from one that is: the API offers no way to declare a
+    /// component type abstract, and the service's own abstract base types are
+    /// built in, of which this emulator holds no registry. Every component type
+    /// it stores was created through this API, so every one of them is concrete.
+    ///
+    /// Takes `&self` though today's answer does not depend on the record: a
+    /// writer that ever persists abstractness has exactly one place to make
+    /// every reader of it agree.
+    pub fn is_abstract(&self) -> bool {
+        false
+    }
 }
 
 /// The modelled `Status` of a resource in `state`.

@@ -1,15 +1,60 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponentTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponentTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the component types of ONE workspace — "Lists all component types in
+//! a workspace" — in `componentTypeId` order, a page at a time, each row built
+//! from the STORED component type record the create persisted, so a summary says
+//! about a component type exactly what `GetComponentType` says about it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponentTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The workspace is the listing's scope: a request naming a workspace this
+//! service does not hold is refused with the `ValidationException` (HTTP 400)
+//! this operation models — it declares no `ResourceNotFoundException`, so a
+//! missing scope is reported through the only client error it has, the same
+//! choice `ListEntities` makes.
+//!
+//! `filters` accepts AT MOST ONE object ("Only one object is accepted as a valid
+//! input" — the filter union's own documentation), and each of its three members
+//! selects on what this service STORES:
+//!
+//! * `extendsFrom` — the component types whose reported `extendsFrom` names that
+//!   id. Membership is tested against the parents the create declared, which are
+//!   exactly what `GetComponentType` reports, so the filter and the read agree on
+//!   what one component type extends. DIRECT extension only, for that reason: a
+//!   component type's stored parents are the ones its create named, and this
+//!   service resolves no inheritance chain beyond them (`GetComponentType`
+//!   reports every member `isInherited: false` for the same reason), so a
+//!   grandchild is not selected by its grandparent's id.
+//! * `namespace` — the component types that BELONG to that namespace. A
+//!   `componentTypeId` is a dotted name (`^[a-zA-Z_\.\-0-9:]+$`) whose namespace
+//!   is its dotted prefix, so a type is in the namespace when its id starts with
+//!   the namespace followed by a `.`; an id carrying no such prefix belongs to no
+//!   namespace and is selected by no `namespace` filter.
+//! * `isAbstract` — every component type this emulator stores was created
+//!   through `CreateComponentType`, which offers no way to declare one abstract,
+//!   so [`crate::state::ComponentType::is_abstract`] — the accessor
+//!   `GetComponentType` reports from too — answers `false` for each of them. The
+//!   filter therefore selects every stored component type for `false` and none
+//!   for `true`, rather than inventing an abstractness the create never
+//!   persisted.
+//!
+//! `maxResults` caps the page: its documented default is 25 and its documented
+//! minimum 1, so an omitted value serves 25 rows and an explicit zero is refused.
+//! (The modelled `range` on the member admits 0, so that refusal is this
+//! handler's, applied on the strength of the member's own documentation.) The
+//! service never serves more than [`crate::state::MAX_PAGE_SIZE`] rows whatever
+//! is asked for, and the response reports the page size it actually served in its
+//! own `maxResults` ("Specifies the maximum number of results to display"). The
+//! opaque `nextToken` resumes at the next `componentTypeId` rather than at an
+//! offset, so a page boundary survives a component type being created or deleted
+//! between two pages; it is bound to the workspace it was minted for, and a token
+//! this listing did not mint is refused with the same `ValidationException`.
+//!
+//! This is a REPORTING operation. The only thing it writes is the lifecycle
+//! transition the CLOCK already made due: a component type is stored in the
+//! non-terminal `CREATING`/`UPDATING` until its `settles_at` passes, and that
+//! transition was owed at that instant whether or not anybody called, so each
+//! component type is settled before it is reported — exactly what
+//! `GetComponentType` does for the one it reads.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +198,220 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponentTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponentTypes"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListComponentTypes",
+            workspace_id = %input.workspace_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListComponentTypesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let invalid = |message: String| {
+            ListComponentTypesErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        // The SCOPE is resolved before the request's own members, so a listing
+        // of a workspace this service does not hold is refused for the workspace
+        // whatever else the request carries — the order `ListEntities` resolves
+        // them in. The mutable borrow is taken here because reporting a
+        // component type settles it (below); nothing between here and there
+        // writes.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(invalid(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
+            .into());
+        };
+
+        // "Only one object is accepted as a valid input" — the
+        // `ListComponentTypesFilter` union's own documentation.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > 1 {
+            return Err(invalid(format!(
+                "filters accepts at most one object, got {}",
+                filters.len()
+            ))
+            .into());
+        }
+        let filter = filters.first();
+
+        // A `nextToken` carries the `componentTypeId` the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives a component
+        // type being created or deleted between two pages. It is bound to the
+        // workspace it was minted for, so a token from another listing — or from
+        // this listing taken over another workspace — is refused rather than
+        // silently resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.workspace_id).ok_or_else(|| {
+                    // The token itself is NOT echoed back: it is opaque to the
+                    // caller and modelled up to 17880 characters, so the refusal
+                    // names the member and what is wrong with it rather than
+                    // copying an arbitrary request string into the response.
+                    invalid("nextToken is not a token this listing minted".to_string())
+                })?,
+            ),
+        };
+
+        // The page size served. `maxResults` documents a minimum of 1 and a
+        // default of 25, so an explicit zero is refused and a request that names
+        // none is served the documented default — never the whole workspace.
+        // Whatever is asked for, the service serves at most
+        // `crate::state::MAX_PAGE_SIZE`, so the page this call BUILDS is bounded
+        // by this code and not only by the boundary validator.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            Some(requested) if requested < 1 => {
+                return Err(invalid(
+                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
+                )
+                .into())
+            }
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // The clock, not this call, is what moves a component type on: the
+        // transition was due at `settles_at`, so reporting the stored state
+        // without materialising it would report a state that stopped being true
+        // before the request arrived. Done for every component type of the
+        // workspace rather than only the reported page, so two callers reading
+        // different pages cannot disagree about one component type's state.
+        // This pass is therefore O(the workspace's component types) under the
+        // lock — deliberately, for that consistency — and bounded by
+        // `crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE`, the ceiling the
+        // create enforces, rather than by the page size.
+        let now = ::std::time::SystemTime::now();
+        for component_type in workspace.component_types.values_mut() {
+            component_type.settle(now);
+        }
+
+        // `component_types` is keyed by `componentTypeId`, so iterating the map
+        // IS id order and resuming is a `range` from the token's key: the page
+        // starts at the first id at or past it without walking what came before.
+        let mut matching = match &resume_at {
+            Some(from) => workspace.component_types.range(from.clone()..),
+            None => workspace.component_types.range::<String, _>(..),
+        }
+        .map(|(_, component_type)| component_type)
+        .filter(|component_type| matches_filter(component_type, filter));
+
+        let mut component_type_summaries = Vec::new();
+        for component_type in matching.by_ref().take(page_size) {
+            component_type_summaries.push(ComponentTypeSummary {
+                arn: component_type.arn.clone(),
+                component_type_id: component_type.component_type_id.clone(),
+                creation_date_time: crate::state::timestamp(component_type.creation_date_time),
+                update_date_time: crate::state::timestamp(component_type.update_date_time),
+                // Reported exactly as stored, which is how `GetComponentType`
+                // reports them: a component type that was created without a
+                // description or a name carries neither, and the member is
+                // omitted rather than served as an empty string.
+                description: component_type.description.clone(),
+                component_type_name: component_type.component_type_name.clone(),
+                // Carries BOTH its modelled members: the stored state (settled
+                // above) and the `error` structure every reported status
+                // carries.
+                status: Some(component_type.status()),
+            });
+        }
+        // The token the next call resumes at: the first component type this page
+        // left over. Absent on the last page, which is how a caller knows to
+        // stop.
+        let next_token = matching
+            .next()
+            .map(|component_type| {
+                encode_next_token(&input.workspace_id, &component_type.component_type_id)
+            });
+
+        Ok(ListComponentTypesOutput {
+            workspace_id: input.workspace_id.clone(),
+            // Required by the model, so present even for a workspace holding no
+            // component type (or one whose filter selects none): an empty list
+            // says there is none.
+            component_type_summaries,
+            next_token,
+            // "Specifies the maximum number of results to display" — the page
+            // size this call actually served at, which is what the caller asked
+            // for once the service's own ceiling and the documented default have
+            // been applied.
+            max_results: i32::try_from(page_size).ok(),
+        })
     }
+}
+
+/// Whether `component_type` is in the list the single accepted filter selects.
+/// With no filter every component type of the workspace is.
+fn matches_filter(
+    component_type: &crate::state::ComponentType,
+    filter: Option<&ListComponentTypesFilter>,
+) -> bool {
+    match filter {
+        None => true,
+        // "The component type that the component types in the list extend":
+        // the parents the create declared, which are exactly the ones
+        // `GetComponentType` reports for this component type.
+        Some(ListComponentTypesFilter::extendsFrom(parent)) => component_type
+            .extends_from
+            .iter()
+            .any(|declared| declared == parent),
+        // "The namespace to which the component types in the list belong": a
+        // `componentTypeId` is a dotted name whose namespace is its dotted
+        // prefix, so the type belongs to the namespace when its id continues it
+        // with a `.`.
+        Some(ListComponentTypesFilter::Namespace(namespace)) => component_type
+            .component_type_id
+            .strip_prefix(namespace.as_str())
+            .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1),
+        // Every component type this service stores was created through
+        // `CreateComponentType`, which cannot declare one abstract, so each is
+        // concrete. Read through `ComponentType::is_abstract`, the same
+        // accessor `GetComponentType` reports from, so the filter and the read
+        // cannot drift apart if a writer ever persists abstractness.
+        Some(ListComponentTypesFilter::isAbstract(is_abstract)) => {
+            component_type.is_abstract() == *is_abstract
+        }
+    }
+}
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, for another workspace, or by
+/// hand — is recognisably not one of ours. The token itself is the shape every
+/// paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the workspace whose page it
+/// is.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:componentTypes:1:";
+
+/// The top of the `maxResults` member's modelled `range` (0..200).
+///
+/// The response reports the page size it served in its own `maxResults`, so the
+/// page size the service is willing to serve may never leave the range the model
+/// admits. Checked at COMPILE time, so raising this service's own ceiling past
+/// what the model allows fails the build instead of serialising an out-of-range
+/// value.
+const MODELLED_MAX_RESULTS: usize = 200;
+const _: () = assert!(crate::state::MAX_PAGE_SIZE <= MODELLED_MAX_RESULTS);
+const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
+
+/// The opaque `nextToken` for a page of `workspace_id` starting at
+/// `component_type_id`.
+fn encode_next_token(workspace_id: &str, component_type_id: &str) -> String {
+    crate::state::encode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], component_type_id)
+}
+
+/// The component type id inside a `nextToken` minted for `workspace_id`, or
+/// `None` when the token is not one this listing minted for that workspace.
+fn decode_next_token(token: &str, workspace_id: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[workspace_id], token)
 }

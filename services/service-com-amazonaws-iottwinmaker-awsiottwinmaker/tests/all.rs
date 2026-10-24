@@ -17,6 +17,9 @@ mod component_type_delete;
 #[path = "all/component_type_lifecycle.rs"]
 mod component_type_lifecycle;
 
+#[path = "all/component_type_listing.rs"]
+mod component_type_listing;
+
 #[path = "all/component_type_update.rs"]
 mod component_type_update;
 

@@ -467,8 +467,8 @@ async fn a_created_integration_is_reported_back_exactly_as_it_was_configured() {
 }
 
 /// The status a read reports is the one the CLOCK has made due, and reading changes nothing:
-/// two reads of the same integration report the same thing, and no read creates or removes
-/// one.
+/// two reads of the same integration report the same thing — save for the transition the
+/// clock itself owes between them — and no read creates or removes one.
 #[tokio::test]
 async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
     let logs = Logs::new();
@@ -524,6 +524,8 @@ async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
             })
             .to_string();
         if second_status == status {
+            // The clock owed nothing between the two reads, so they must agree byte for
+            // byte: reading changes nothing.
             assert_eq!(
                 second, first,
                 "case {case:?}: reading twice must report the same thing, expected {first}, got \
@@ -551,6 +553,25 @@ async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
                 "case {case:?}: a read may only move the status forward over the clock's \
                  own transition, got {status:?} then {second_status:?}"
             );
+            // Every OpenSearch resource is reported in the status the settled integration
+            // owes it, not left behind in the provisioning one.
+            for (resource, detail) in second["integrationDetails"]
+                ["openSearchIntegrationDetails"]
+                .as_object()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: an OpenSearch integration carries its details, got \
+                         {second}"
+                    )
+                })
+            {
+                assert_eq!(
+                    detail["status"]["status"].as_str(),
+                    Some(expected_resource_status(&second_status)),
+                    "case {case:?}: {resource} must be reported in the status an \
+                     {second_status} integration owes it, got {detail}"
+                );
+            }
         }
     }
 
