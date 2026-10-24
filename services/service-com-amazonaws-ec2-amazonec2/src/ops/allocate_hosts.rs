@@ -437,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 allocation_time: Some(allocation_time),
                 // "The time that the Dedicated Host was released" (`Host$ReleaseTime`):
                 // this host is held, not released. `ReleaseHosts` is the operation that
-                // would set it, and it is still a stub.
+                // sets it.
                 release_time: None,
                 host_properties: Some(HostProperties {
                     // "If the host supports multiple instance types, no instanceType is

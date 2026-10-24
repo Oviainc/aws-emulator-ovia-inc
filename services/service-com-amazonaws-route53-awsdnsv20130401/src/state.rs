@@ -26,6 +26,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
     ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, NoSuchHostedZone, NoSuchTrafficPolicy,
     ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
@@ -1072,6 +1073,20 @@ pub fn resource_location(
 pub fn no_such_hosted_zone(requested_id: &str) -> NoSuchHostedZone {
     NoSuchHostedZone {
         message: Some(format!("No hosted zone found with ID: {requested_id}")),
+    }
+}
+
+/// The modelled `NoSuchChange` (HTTP 404) for a change id that names no change
+/// in this store.
+///
+/// The ONE place this service words that refusal, beside
+/// [`no_such_hosted_zone`]. Route 53 reports an id that resolves to no change
+/// through its generic resource-lookup wording, built FROM the request — it
+/// names the id the request asked about, as the request wrote it:
+/// `Could not find resource with ID: <the requested id>`.
+pub fn no_such_change(requested_id: &str) -> NoSuchChange {
+    NoSuchChange {
+        message: Some(format!("Could not find resource with ID: {requested_id}")),
     }
 }
 

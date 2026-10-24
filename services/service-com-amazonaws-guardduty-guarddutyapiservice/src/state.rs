@@ -3675,6 +3675,38 @@ impl ThreatIntelSetRecord {
         self.deleted_at_millis = Some(now);
         true
     }
+
+    /// Start the transition `Activate` asks for, from whatever status this list
+    /// currently has: [`THREAT_INTEL_SET_ACTIVATING`] then
+    /// [`THREAT_INTEL_SET_ACTIVE`] when it asks for the list to be used,
+    /// [`THREAT_INTEL_SET_DEACTIVATING`] then [`THREAT_INTEL_SET_INACTIVE`] when it
+    /// asks for it to stop.
+    ///
+    /// Asking for the status the list has already settled on, or is already
+    /// transitioning to, owes nothing, so a repeated request leaves the status and
+    /// the instant the clock owes it exactly where they are rather than re-opening
+    /// a transition. Asking for the other one replaces whatever was owed, so a
+    /// request that reverses a transition still running turns it around instead of
+    /// queueing behind it.
+    ///
+    /// The transition is never immediate: the clock owes the settled status
+    /// [`THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS`] later, and only
+    /// [`Self::settle`] materialises it.
+    pub fn set_activation(&mut self, activate: bool, now: i64) {
+        let (settled, transitional) = if activate {
+            (THREAT_INTEL_SET_ACTIVE, THREAT_INTEL_SET_ACTIVATING)
+        } else {
+            (THREAT_INTEL_SET_INACTIVE, THREAT_INTEL_SET_DEACTIVATING)
+        };
+        if self.status == settled || self.status == transitional {
+            return;
+        }
+        self.status = transitional.to_string();
+        self.pending_status = Some((
+            settled.to_string(),
+            now.saturating_add(THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS),
+        ));
+    }
 }
 
 /// How many ThreatIntelSets one detector may hold.
@@ -3707,10 +3739,17 @@ pub const THREAT_INTEL_SET_INACTIVE: &str = "INACTIVE";
 pub const THREAT_INTEL_SET_ACTIVATING: &str = "ACTIVATING";
 /// The status an activated list reports once its activation is due.
 pub const THREAT_INTEL_SET_ACTIVE: &str = "ACTIVE";
+/// The TRANSIENT status a list asked to stop being used reports until that change
+/// comes due — the counterpart of [`THREAT_INTEL_SET_ACTIVATING`]
+/// (`smithy_query(shape="ThreatIntelSetStatus")` carries both). See
+/// [`ThreatIntelSetRecord::set_activation`].
+pub const THREAT_INTEL_SET_DEACTIVATING: &str = "DEACTIVATING";
 
-/// How long a list the create asked to activate spends in
-/// [`THREAT_INTEL_SET_ACTIVATING`] before the clock owes it
-/// [`THREAT_INTEL_SET_ACTIVE`].
+/// How long a list asked to activate spends in [`THREAT_INTEL_SET_ACTIVATING`]
+/// before the clock owes it [`THREAT_INTEL_SET_ACTIVE`], and — the change being
+/// the same one in reverse — how long a list asked to stop being used spends in
+/// [`THREAT_INTEL_SET_DEACTIVATING`] before the clock owes it
+/// [`THREAT_INTEL_SET_INACTIVE`].
 ///
 /// AWS documents no duration for ingesting and activating a threat list, so this
 /// span is CHOSEN: non-zero, so a caller reading straight after the create still

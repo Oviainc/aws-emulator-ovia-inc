@@ -14,9 +14,11 @@
 //! after, so resuming means "the first account strictly greater than it" — well
 //! defined because the store is ordered.
 //!
-//! The page size is the SERVER's decision: `maxResults` when the request names
-//! one, [`crate::state::DEFAULT_PAGE_SIZE`] when it does not, capped at
-//! [`crate::state::MAX_PAGE_SIZE`]. A request that names no page size therefore
+//! The page size is the SERVER's decision, and this operation's own
+//! documentation states its bounds (up to 100 in one call, default 50 —
+//! [`crate::state::TAX_REGISTRATIONS_PAGE_BOUNDS`]): `maxResults` when the
+//! request names one, the documented default when it does not, capped at the
+//! documented ceiling either way. A request that names no page size therefore
 //! cannot ask for the whole store in one response, and the work done while the
 //! state lock is held is bounded by the page, not by the store.
 //!
@@ -164,13 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The page size is the server's decision: what `maxResults` asked for,
-        // else the emulator's default, and never more than its ceiling. The
-        // request's own 1..=1000 range is a modelled constraint the boundary
-        // already refused outside, but a request that names NO page size must
-        // still get a bounded page — otherwise one small request would serialise
-        // the whole store into one response.
-        let page_size = crate::state::page_size(input.max_results);
+        // The page size is the server's decision, under THIS operation's
+        // documented bounds: what `maxResults` asked for, else the documented
+        // default, and never more than the documented ceiling. The request's own
+        // 1..=1000 range is what the wire admits, not what one page carries, so a
+        // `maxResults` above the ceiling is served a capped page and a cursor,
+        // and a request that names no page size still gets a bounded page.
+        let page_size = crate::state::TAX_REGISTRATIONS_PAGE_BOUNDS.page_size(input.max_results);
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(
                 crate::state::decode_page_token(token)

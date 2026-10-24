@@ -171,15 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A delete only removes the registration, so its only precondition is
+        // that the ARN names one: an application still onboarding is deleted
+        // like any other.
         let Some(position) = store.qev2_idc_application_position(&input.qev2_idc_application_arn)
         else {
             return Err(
                 DeleteQev2IdcApplicationErrorModeled::Qev2IdcApplicationNotExistsFault(
                     Qev2IdcApplicationNotExistsFault {
-                        message: Some(format!(
-                            "Amazon Redshift Query Editor (QEV2) IAM Identity Center application not found: {}",
-                            input.qev2_idc_application_arn
-                        )),
+                        message: Some(st::QEV2_IDC_APPLICATION_NOT_EXISTS.to_string()),
                     },
                 )
                 .into(),

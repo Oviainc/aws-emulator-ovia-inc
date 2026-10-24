@@ -58,13 +58,17 @@ pub(crate) fn unenrolled_emulator_with_engine() -> (MultiServiceRouter, Arc<engi
 ///
 /// A test PRECONDITION, written where `UpdateEnrollmentConfiguration` writes it,
 /// because a harness is not `async`; that operation's own wire path is covered
-/// by the enrollment cases in this suite and in [`crate::enrollment_gate`].
+/// by the enrollment cases in this suite and in [`crate::enrollment_gate`]. It
+/// stamps the update instant for the same reason that operation does: a stored
+/// configuration is always one some call wrote, and the call that wrote it
+/// records when.
 pub(crate) fn enroll_caller(engine: &Arc<engine::InMemoryEngine>) {
     let state = state::service_state(&**engine).expect("the engine bears this service's state");
     state.lock().enrollments.insert(
         state::caller_account_id(),
         state::EnrollmentConfig {
             status: state::ENROLLED_STATUS.to_string(),
+            last_updated_timestamp: Some(state::now()),
             ..state::EnrollmentConfig::default()
         },
     );

@@ -340,10 +340,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ```
 ///
 /// so this describe refuses the request as a whole, naming every id it could not resolve,
-/// instead of reporting the hosts it did find. The message is built from the request, in
-/// that recorded form.
+/// instead of reporting the hosts it did find. The message is built from the request by the
+/// shared [`crate::state::unresolvable_host_ids_message`], so every operation that reports
+/// an unresolvable host id words it the same way.
 ///
-/// It lives HERE rather than in `crate::state` because the policy is this operation's own:
+/// The POLICY lives HERE rather than in `crate::state` because it is this operation's own:
 /// `DescribeMacHosts` keeps `crate::state::unresolvable_host_id`'s
 /// malformed-before-unknown split, which is the contract recorded for THAT operation, and
 /// a shared module holding two divergent id-refusal policies would invite a later caller
@@ -352,10 +353,10 @@ fn require_describable_hosts(
     store: &crate::state::ComAmazonawsEc2Amazonec2State,
     host_ids: &[String],
 ) -> Result<(), DescribeHostsError> {
-    let unresolvable: Vec<String> = host_ids
+    let unresolvable: Vec<&str> = host_ids
         .iter()
         .filter(|host_id| !store.dedicated_hosts.contains_key(*host_id))
-        .map(|host_id| format!("'{host_id}'"))
+        .map(String::as_str)
         .collect();
     if unresolvable.is_empty() {
         return Ok(());
@@ -363,10 +364,7 @@ fn require_describable_hosts(
     Err(crate::scaffolded::Scaffolded::service_error(
         crate::state::INVALID_HOST_ID_MALFORMED,
         400,
-        format!(
-            "The specified Dedicated host IDs [{}] are not valid.",
-            unresolvable.join(", ")
-        ),
+        crate::state::unresolvable_host_ids_message(unresolvable),
     ))
 }
 

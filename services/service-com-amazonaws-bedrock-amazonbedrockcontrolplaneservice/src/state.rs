@@ -259,14 +259,37 @@ pub const MAX_MODEL_IMPORT_JOBS_PER_ACCOUNT: usize = 100;
 /// (`smithy_query(query="shape",shape="EvaluationJobStatus")`). An accepted evaluation job
 /// runs asynchronously, so this is the status it carries from the call that starts it.
 ///
-/// It is also the only status `CreateEvaluationJob` mints, and no clock transition moves
-/// it: the other five report an outcome of work this emulator does not perform. Reaching
-/// `Completed` or `Failed` means the inference and the metric computation over the
-/// caller's dataset ran and the results were written to the request's
-/// `outputDataConfig`, and `Stopping`/`Stopped`/`Deleting` are reached only by a caller's
-/// own `StopEvaluationJob` or `BatchDeleteEvaluationJob` — so none of them is owed by the
-/// clock here.
+/// It is also the only status `CreateEvaluationJob` mints. Reaching `Completed` or
+/// `Failed` means the inference and the metric computation over the caller's dataset ran
+/// and the results were written to the request's `outputDataConfig` — work this emulator
+/// does not perform, so no call here mints either, and no clock transition leads to them.
+/// `Stopping` and `Stopped` are reached by a caller's own `StopEvaluationJob` (see
+/// [`EVALUATION_JOB_STATUS_STOPPING`]) and `Deleting` by `BatchDeleteEvaluationJob`.
 pub const EVALUATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `EvaluationJobStatus` — the job is winding down because a caller stopped it.
+///
+/// The status `StopEvaluationJob` moves a running job to: stopping a job is asynchronous,
+/// so this is the non-terminal status the job carries from the call that asks for the stop
+/// until the stop has taken effect. See [`EVALUATION_JOB_STATUS_IN_PROGRESS`] for the
+/// value list.
+pub const EVALUATION_JOB_STATUS_STOPPING: &str = "Stopping";
+
+/// `EvaluationJobStatus` once the stop has taken effect — the terminal status the
+/// non-terminal [`EVALUATION_JOB_STATUS_STOPPING`] is owed its move to, after
+/// [`EVALUATION_JOB_STOPPED_AFTER`].
+pub const EVALUATION_JOB_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `StopEvaluationJob` a job's `Stopping` status is owed its move to
+/// [`EVALUATION_JOB_STATUS_STOPPED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for stopping an evaluation job (the
+/// real stop has to wind down inference that is already in flight), so this is the
+/// emulator's span. It is non-zero, so a caller that reads the job straight after stopping
+/// it still observes the `Stopping` status the real service reports; and it is materialised
+/// from the stored due instant on the next call that touches the record rather than waited
+/// on, so no handler sleeps.
+pub const EVALUATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(500);
 
 /// `EvaluationJobType` — the job computes metrics itself.
 ///
@@ -776,10 +799,53 @@ pub struct EvaluationJobRecord {
     pub job_type: &'static str,
     /// `EvaluationJobStatus`.
     pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`EVALUATION_JOB_STATUS_STOPPED`], or
+    /// `None` while no stop is in flight.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`ModelImportJobRecord::completed_due_at`] is one.
+    pub stopped_due_at: Option<SystemTime>,
     pub created_at: SystemTime,
     /// When the job last changed, which is the creation instant until something changes
     /// it.
     pub last_modified_at: SystemTime,
+}
+
+impl EvaluationJobRecord {
+    /// Whether this job is one a stop may be asked for: it is still running.
+    ///
+    /// "Stops an evaluation job that is current being created or running"
+    /// (`smithy_query(query="operation",operation="StopEvaluationJob")`), so a job in any
+    /// other status has nothing left to stop.
+    #[must_use]
+    pub fn is_stoppable(&self) -> bool {
+        self.status == EVALUATION_JOB_STATUS_IN_PROGRESS
+    }
+
+    /// Move this job to [`EVALUATION_JOB_STATUS_STOPPING`] and record when the stop is owed
+    /// its move to [`EVALUATION_JOB_STATUS_STOPPED`].
+    ///
+    /// The caller's own write, asked for by `StopEvaluationJob` — not a clock transition:
+    /// [`Self::settle`] is what materialises the one the clock owes.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.status = EVALUATION_JOB_STATUS_STOPPING;
+        self.stopped_due_at = Some(now + EVALUATION_JOB_STOPPED_AFTER);
+        self.last_modified_at = now;
+    }
+
+    /// Materialise the move to [`EVALUATION_JOB_STATUS_STOPPED`] the clock has already made
+    /// due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the job reports as its last modification.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.stopped_due_at.filter(|due| now >= *due) {
+            self.status = EVALUATION_JOB_STATUS_STOPPED;
+            self.stopped_due_at = None;
+            self.last_modified_at = due;
+        }
+    }
 }
 
 /// One stored Provisioned Throughput: the identity `CreateProvisionedModelThroughput`
@@ -1260,13 +1326,17 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         minted_id(self.minted_imported_models, now)
     }
 
-    /// The evaluation job an `EvaluationJobIdentifier` names.
-    ///
-    /// A borrow rather than a mutable one: an evaluation job has no transition the clock
-    /// owes (see [`EVALUATION_JOB_STATUS_IN_PROGRESS`]), so a read of one writes nothing.
-    #[must_use]
-    pub fn evaluation_job(&self, identifier: &str) -> Option<&EvaluationJobRecord> {
-        self.evaluation_jobs.get(identifier)
+    /// The evaluation job an `EvaluationJobIdentifier` names, with any status transition
+    /// the clock has made due at `now` materialised first — so every caller reads the
+    /// status it holds at `now`, whichever operation asked.
+    pub fn evaluation_job(
+        &mut self,
+        identifier: &str,
+        now: SystemTime,
+    ) -> Option<&mut EvaluationJobRecord> {
+        let job = self.evaluation_jobs.get_mut(identifier)?;
+        job.settle(now);
+        Some(job)
     }
 
     /// Mint a fresh evaluation job id: the resource half of an `evaluation-job/<id>` ARN,

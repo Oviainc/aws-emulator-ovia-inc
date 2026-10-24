@@ -6,6 +6,11 @@
 //! `CreateScan` writes and `ListTagsForResource` reads (`state::Scan::tags`): a key the
 //! scan already carries takes the new value, every other key is added.
 //!
+//! A key in the reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`],
+//! matched however it is cased) is not a key a caller may set, so a request naming one
+//! is refused with the modelled `ValidationException` (HTTP 400) and the scan's tag map
+//! is left as it was.
+//!
 //! A `resourceArn` label that is not a scan ARN never reaches here — the boundary
 //! validator refuses it against the `ScanNameArn` `@pattern`, and `crate::service`
 //! answers that refusal with HTTP 400 `BadRequestException`, the ARN parser's own code
@@ -154,6 +159,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The `aws:` tag-key namespace belongs to the tags AWS applies itself, so a
+        // request that names one of those keys is refused before anything is written —
+        // a rule about the REQUEST, judged before the resource it names is resolved.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_key_refusal("tags", reserved),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {

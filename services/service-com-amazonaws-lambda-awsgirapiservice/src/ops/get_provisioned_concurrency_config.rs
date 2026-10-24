@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProvisionedConcurrencyConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProvisionedConcurrencyConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProvisionedConcurrencyConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one provisioned concurrency configuration the function record
+//! [`crate::state`] holds for the qualifier the request addressed, so what it answers is
+//! what a `PutProvisionedConcurrencyConfig` call persisted and nothing is invented here.
+//!
+//! The configuration belongs to the QUALIFIER — it "is added to a function's alias or
+//! version" — so an alias and the version it invokes are read separately, and a
+//! qualifier that names an alias or version holding none is refused with the modelled
+//! `ProvisionedConcurrencyConfigNotFoundException` ("The specified configuration does not
+//! exist") rather than reported as an empty one.
+//!
+//! This is a REPORTING operation (`@readonly`): the only thing it writes is the
+//! transition the CLOCK already made due — an allocation whose warm-up instant has passed
+//! is `READY`, which it would have been at that instant even if nobody had called (see
+//! [`crate::state::ProvisionedConcurrencyRecord::materialize`]).
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +173,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProvisionedConcurrencyConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProvisionedConcurrencyConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProvisionedConcurrencyConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetProvisionedConcurrencyConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A configuration "is added to a function's alias or version", and the
+        // unpublished version is neither, so `$LATEST` is not a qualifier one can be read
+        // from either: the pair names no configuration that could ever exist, which is a
+        // bad request rather than a configuration that has not been added yet.
+        if input.qualifier == crate::state::VERSION_LATEST {
+            return Err(
+                GetProvisionedConcurrencyConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(
+                            crate::state::PROVISIONED_CONCURRENCY_QUALIFIER_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The name and qualifier have to name an alias or version of a stored function
+        // before it can hold a configuration, and resolution is what brings the record up
+        // to whatever the clock already made due — including the warm-up of every
+        // allocation under way.
+        let (record, qualifier) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            Some(&input.qualifier),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetProvisionedConcurrencyConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetProvisionedConcurrencyConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        // A qualifier nobody has added a configuration to holds none: "The specified
+        // configuration does not exist" is the modelled 404 for exactly that, and it is
+        // not the same answer as a name that resolves to no alias or version at all.
+        let Some(stored) = record.provisioned_concurrency_configs.get(&qualifier) else {
+            return Err(
+                GetProvisionedConcurrencyConfigErrorModeled::ProvisionedConcurrencyConfigNotFoundException(
+                    ProvisionedConcurrencyConfigNotFoundException {
+                        r#type: None,
+                        message: Some(
+                            crate::state::PROVISIONED_CONCURRENCY_CONFIG_NOT_FOUND_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(stored.reported())
     }
 }

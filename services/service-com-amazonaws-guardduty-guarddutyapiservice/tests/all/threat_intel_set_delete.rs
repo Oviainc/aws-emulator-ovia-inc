@@ -63,13 +63,13 @@ const DELETED: &str = "DELETED";
 const SETTLE_MARGIN_MILLIS: u64 = 150;
 
 /// Long enough that an activated list's `ACTIVATING` -> `ACTIVE` transition is due.
-fn past_activation() -> Duration {
+pub(crate) fn past_activation() -> Duration {
     let span = u64::try_from(state::THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS).unwrap_or_default();
     Duration::from_millis(span + SETTLE_MARGIN_MILLIS)
 }
 
 /// Long enough that a deleted list's `DELETE_PENDING` -> `DELETED` transition is due.
-fn past_deletion() -> Duration {
+pub(crate) fn past_deletion() -> Duration {
     let span = u64::try_from(state::THREAT_INTEL_SET_DELETION_SPAN_MILLIS).unwrap_or_default();
     Duration::from_millis(span + SETTLE_MARGIN_MILLIS)
 }

@@ -14,7 +14,8 @@
 //! 3. `UpdateFHIRDatastore` applies its members to the stored record while that
 //!    record is `ACTIVE`. What a mutation on a record that is NOT `ACTIVE`
 //!    answers is the resource-state rule, pinned over every status and every
-//!    mutation in `tests/all/datastore_state_conflict.rs`.
+//!    shape of update in `tests/all/datastore_update_not_active.rs` and, for
+//!    `DeleteFHIRDatastore`, in `tests/all/datastore_state_conflict.rs`.
 //!
 //! Every call goes through [`MultiServiceRouter::dispatch`] by way of the shared
 //! harness in `fhir_datastore_lifecycle`, so routing, deserialization, the

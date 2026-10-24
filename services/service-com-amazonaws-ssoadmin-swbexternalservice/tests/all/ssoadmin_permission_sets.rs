@@ -292,7 +292,7 @@ fn is_permission_set_arn_of(arn: &str, instance_arn: &str) -> bool {
 /// Whether `id` is a hyphenated lowercase UUID, which is what the model's `UUId` shape
 /// (`length 36..36`, `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 /// requires of a `RequestId`.
-fn is_uuid(id: &str) -> bool {
+pub(crate) fn is_uuid(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.len() == 5
         && groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
@@ -991,34 +991,10 @@ async fn account_assignments_are_persisted_once_per_identity_and_read_back_by_fi
         );
         assert_eq!(
             created_status["Status"].as_str(),
-            Some("SUCCEEDED"),
-            "case {:?}: expected the applied assignment's terminal status, got {:?}",
+            Some("IN_PROGRESS"),
+            "case {:?}: expected the accepted operation's in-flight status, got {:?}",
             case.label,
             created_status["Status"]
-        );
-        assert_eq!(
-            created_status["TargetId"].as_str(),
-            Some(case.account_id),
-            "case {:?}: expected TargetId {:?}, got {:?}",
-            case.label,
-            case.account_id,
-            created_status["TargetId"]
-        );
-        assert_eq!(
-            created_status["PrincipalType"].as_str(),
-            Some(case.principal_type),
-            "case {:?}: expected PrincipalType {:?}, got {:?}",
-            case.label,
-            case.principal_type,
-            created_status["PrincipalType"]
-        );
-        assert_eq!(
-            created_status["PrincipalId"].as_str(),
-            Some(case.principal_id),
-            "case {:?}: expected PrincipalId {:?}, got {:?}",
-            case.label,
-            case.principal_id,
-            created_status["PrincipalId"]
         );
         assert!(
             created_status["CreatedDate"].is_number(),

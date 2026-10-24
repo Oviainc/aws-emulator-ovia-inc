@@ -1217,6 +1217,28 @@ impl Repository {
         self.commits.get(specifier)
     }
 
+    /// The BRANCH a reference specifier names, in the same order
+    /// [`Repository::resolve_commit`] resolves one: a branch of that literal
+    /// name, then the fully qualified reference form (`refs/heads/<branch>`),
+    /// then `HEAD` (the repository's default branch).
+    ///
+    /// `None` where the specifier names no branch of this repository — a commit
+    /// id and a tag reference name a commit without naming a branch — so an
+    /// operation that has to MOVE a reference can tell which one the caller
+    /// named.
+    pub fn resolve_branch(&self, specifier: &str) -> Option<&str> {
+        if let Some(branch) = self.branches.get(specifier) {
+            return Some(branch.name.as_str());
+        }
+        let referenced = match specifier {
+            "HEAD" => self.default_branch.as_deref(),
+            other => other.strip_prefix(HEADS_PREFIX),
+        };
+        referenced
+            .and_then(|name| self.branches.get(name))
+            .map(|branch| branch.name.as_str())
+    }
+
     /// The object this name addresses.
     pub fn object(&self, id: &str) -> Option<&Object> {
         self.objects.get(id)

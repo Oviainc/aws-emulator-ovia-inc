@@ -33,8 +33,9 @@ const ON: &str = "on";
 
 /// `released`, the `AllocationState` member a host the account has given back carries
 /// ("Dedicated Hosts that have recently been released are listed with the state
-/// released", `DescribeHosts`). `ReleaseHosts` is what would move a host into it, and that
-/// operation is still a stub, so no host here is in it.
+/// released", `DescribeHosts`). `ReleaseHosts` is what moves a host into it, and no call of
+/// this suite releases one, so no host here is in it — what a release does to a host is
+/// covered by the `release_hosts` suite.
 const STATE_RELEASED: &str = "released";
 
 /// One `(key, value)` request parameter.

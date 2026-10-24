@@ -33,9 +33,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, DEFAULT_PAGE_SIZE, ERROR_CODE_FIELD_VALIDATION_FAILED,
-    ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, MAX_PAGE_SIZE,
-    SETTLED_REGISTRATION_STATUS, STATUS_PENDING, SUPPLEMENTAL_TRN_COUNTRIES,
+    ComAmazonawsTaxsettingsTaxsettingsState, ERROR_CODE_FIELD_VALIDATION_FAILED,
+    ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, SETTLED_REGISTRATION_STATUS,
+    STATUS_PENDING, SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS, SUPPLEMENTAL_TRN_COUNTRIES,
 };
 
 use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, Answer};
@@ -537,8 +537,9 @@ async fn seed(
 /// issues a resume cursor on every page but the last.
 ///
 /// The server-decided size is `maxResults` when the request names one (its
-/// modelled range is 1..=1000, so 1 and 1000 are its published bounds), and
-/// `DEFAULT_PAGE_SIZE` when it does not — never the whole store.
+/// modelled range is 1..=1000, so 1 and 1000 are its published bounds), and this
+/// operation's own default when it does not
+/// ([`SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS`]) — never the whole store.
 #[tokio::test]
 async fn paging_emits_every_supplemental_registration_exactly_once_in_order() {
     // (stored registrations, requested page size).
@@ -557,8 +558,11 @@ async fn paging_emits_every_supplemental_registration_exactly_once_in_order() {
         // More records than the default page size, so the clamp on a request
         // that names none is observable: it must still page rather than return
         // everything at once.
-        (DEFAULT_PAGE_SIZE + 5, None),
-        (DEFAULT_PAGE_SIZE + 5, Some(1000)),
+        (SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS.default_size + 5, None),
+        (
+            SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS.default_size + 5,
+            Some(1000),
+        ),
     ];
     for (count, page_size) in shapes.iter().copied() {
         let case = format!("{count} supplemental registrations, page size {page_size:?}");
@@ -568,10 +572,8 @@ async fn paging_emits_every_supplemental_registration_exactly_once_in_order() {
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         let mut pages = 0usize;
-        let bound = page_size
-            .and_then(|size| usize::try_from(size).ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .min(MAX_PAGE_SIZE);
+        let bound = SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS
+            .page_size(page_size.and_then(|size| i32::try_from(size).ok()));
         loop {
             let mut request = serde_json::Map::new();
             if let Some(size) = page_size {

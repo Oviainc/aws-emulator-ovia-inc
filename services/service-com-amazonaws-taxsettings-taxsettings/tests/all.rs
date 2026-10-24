@@ -21,6 +21,8 @@ mod country_requirements;
 mod country_rules;
 #[path = "all/fidelity_rules.rs"]
 mod fidelity_rules;
+#[path = "all/listing_page_bounds.rs"]
+mod listing_page_bounds;
 #[path = "all/missing_resource_errors.rs"]
 mod missing_resource_errors;
 #[path = "all/pending_trn_conflict.rs"]

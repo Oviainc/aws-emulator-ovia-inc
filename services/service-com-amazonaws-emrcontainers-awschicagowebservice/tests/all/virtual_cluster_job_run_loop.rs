@@ -290,6 +290,24 @@ struct ClusterCase {
 #[tokio::test]
 async fn a_created_virtual_cluster_is_described_from_state() {
     let emr = Emr::new();
+    // `securityConfigurationId` is a REFERENCE to a security configuration this service
+    // stores, so the row that carries one names a configuration that really exists (the
+    // refusal of one that does not is `crate::virtual_cluster_references`' rule).
+    let security_configuration = text(
+        emr.send(
+            "POST",
+            "/securityconfigurations",
+            Some(json!({
+                "name": "vc-loop-config",
+                "clientToken": "tok-vc-loop-config",
+                "securityConfigurationData": {},
+            })),
+        )
+        .await
+        .ok("a security configuration for the cluster to reference"),
+        "/id",
+        "a security configuration for the cluster to reference",
+    );
     let cases = vec![
         ClusterCase {
             label: "only the required members",
@@ -325,7 +343,7 @@ async fn a_created_virtual_cluster_is_described_from_state() {
                 },
                 "tags": {"only": "one"},
                 "sessionEnabled": false,
-                "securityConfigurationId": "sec123",
+                "securityConfigurationId": security_configuration,
                 "schedulerConfiguration": {"maxConcurrentJobRuns": 7, "maxInQueueJobRuns": 250},
             }),
         },

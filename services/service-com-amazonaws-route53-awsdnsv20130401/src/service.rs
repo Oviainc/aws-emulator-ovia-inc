@@ -24,8 +24,8 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Route 53 states every such refusal under the
+//!   `InvalidInput` code its model declares; see the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -56,6 +56,11 @@ use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The wire error code Route 53 refuses an input it cannot use with — the
+/// `InvalidInput` (HTTP 400) its model declares, which is the code a client
+/// branches on for every input-level refusal this service answers.
+const INVALID_INPUT: &str = "InvalidInput";
 
 /// The `com-amazonaws-route53-awsdnsv20130401` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -115,17 +120,42 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal — a member
+        // the shape requires that the request left out, or a value outside a
+        // constraint the model declares (an enum's value set, a `@length` bound) —
+        // to let this service state it in its own terms.
+        //
+        // Route 53's model declares ONE client-input error for an input it cannot
+        // use: `InvalidInput`, HTTP 400 ("The input is not valid"), which every
+        // operation that can refuse an input lists
+        // (`smithy_query(query="operation",operation="ListHostedZones")`). It
+        // declares no shape of any other name for that class — there is no
+        // `ValidationException` in this model at all
+        // (`smithy_query(query="shape",shape="ValidationException")` finds none) —
+        // so the framework's generic code names an error no Route 53 client can
+        // catch. Every refusal the model's own rules produce therefore comes back
+        // under `InvalidInput`, whatever operation and member it was about.
+        //
+        // The MESSAGE is the one the framework already renders and the one the
+        // service answers: the per-member envelope `N validation error(s)
+        // detected: Value '<value>' at '<member path>' failed to satisfy
+        // constraint: <requirement>`, built from the request. Only the code a
+        // client branches on is this service's to choose, so the envelope is
+        // taken from the framework rather than restated here.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_INPUT.to_string(),
+                // `None` when there are no violations to state, which keeps the
+                // framework's own wording rather than answering an empty message.
+                message: aws_smithy_schema_server::envelope(violations)?,
+            }),
+            // An unauthenticated caller is not an input problem at all: keep the
+            // framework's 403 code and wording.
+            Refusal::Unauthenticated => None,
+            // A refusal class this crate does not know about keeps the
+            // framework's own wording (`Refusal` is `#[non_exhaustive]`).
+            _ => None,
+        }
     }
 
     fn override_routing_error(

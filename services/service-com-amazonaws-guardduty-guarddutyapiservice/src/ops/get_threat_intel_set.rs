@@ -4,7 +4,7 @@
 //! IMPLEMENTED: reports the ThreatIntelSet the create stored, off the detector named
 //! in the URI. Implemented here with `CreateThreatIntelSet` because a create is only
 //! observable through its reader; `ListThreatIntelSets`, `UpdateThreatIntelSet` and
-//! `DeleteThreatIntelSet` keep their own stub issues.
+//! `DeleteThreatIntelSet` live in their own files.
 //!
 //! A REPORT: the only write is materialising the `ACTIVATING` -> `ACTIVE` transition
 //! the clock has already made due

@@ -87,7 +87,11 @@ pub(crate) fn unescaped(text: &str) -> String {
 }
 
 /// Create a target group named `name` with `fields` beside it, and answer its ARN.
-async fn create_target_group(
+///
+/// `pub(crate)` because `all/target_group_attribute_writes.rs` creates target groups of
+/// every load balancer family the same way: ONE creator for the crate, so the two suites
+/// cannot drift on how a group is made.
+pub(crate) async fn create_target_group(
     router: &MultiServiceRouter,
     name: &str,
     fields: &[(&str, &str)],
@@ -122,7 +126,10 @@ fn attribute_pairs(body: &str) -> BTreeMap<String, String> {
 }
 
 /// What `DescribeTargetGroupAttributes` reports for `arn`.
-async fn described_attributes(
+///
+/// `pub(crate)` for the reason [`create_target_group`] gives: the sibling write suite
+/// reads a group's whole attribute set back through the same reader.
+pub(crate) async fn described_attributes(
     router: &MultiServiceRouter,
     arn: &str,
 ) -> BTreeMap<String, String> {

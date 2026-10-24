@@ -23,6 +23,7 @@
 //! deserialization and the modelled constraints are exercised too.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_healthlake_healthlake::state::DATASTORE_NOT_ACTIVE_MESSAGE;
 
 use crate::fhir_datastore_lifecycle::{error_code, error_message, HealthLake, PAST_TRANSITION};
 
@@ -383,7 +384,7 @@ async fn a_data_store_being_updated_still_serves_its_fhir_endpoint() {
 }
 
 #[tokio::test]
-async fn a_second_update_while_the_first_is_in_flight_is_refused_as_a_conflict() {
+async fn a_second_update_while_the_first_is_in_flight_is_refused_as_not_active() {
     let service = HealthLake::new();
     let (id, _) = service.create(&baseline_create()).await;
     tokio::time::sleep(PAST_TRANSITION).await;
@@ -405,15 +406,18 @@ async fn a_second_update_while_the_first_is_in_flight_is_refused_as_a_conflict()
         status, 400,
         "a mutation of a data store in transition must be refused, got {status}: {payload}"
     );
+    // A record applying an earlier change is not `ACTIVE`, so it takes the same
+    // refusal as every other non-`ACTIVE` status; the rule over all of them is
+    // pinned in `tests/all/datastore_update_not_active.rs`.
     assert_eq!(
         error_code(&payload),
-        "ConflictException",
-        "a data store in a transition state must answer ConflictException, got {payload}"
+        "AccessDeniedException",
+        "a data store that is not ACTIVE must answer AccessDeniedException, got {payload}"
     );
     let message = error_message(&payload);
-    assert!(
-        message.contains("UPDATING"),
-        "the conflict sentence must state the status the record is in, got {message:?}"
+    assert_eq!(
+        message, DATASTORE_NOT_ACTIVE_MESSAGE,
+        "expected {DATASTORE_NOT_ACTIVE_MESSAGE:?}, got {message:?}"
     );
 
     // The refused second update wrote nothing, and the first one still settles.

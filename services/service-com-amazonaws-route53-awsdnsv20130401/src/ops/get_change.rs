@@ -65,7 +65,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::normalize_change_id;
+use crate::state::{no_such_change, normalize_change_id};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,11 +148,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ChangeInfo handed it back; both name the same change.
         let id = normalize_change_id(&input.id);
         let store = state.lock();
-        let change = store.changes.get(id).ok_or_else(|| {
-            GetChangeErrorModeled::NoSuchChange(NoSuchChange {
-                message: Some(format!("no change exists with the ID {}", input.id)),
-            })
-        })?;
+        // The refusal is worded in the one place this service words a
+        // not-found: `crate::state::no_such_change`, which names the id the
+        // request asked about in Route 53's resource-lookup form.
+        let change = store
+            .changes
+            .get(id)
+            .ok_or_else(|| GetChangeErrorModeled::NoSuchChange(no_such_change(&input.id)))?;
 
         // Reporting only: the PENDING -> INSYNC transition is computed from the
         // clock the submission started, so reading a change never advances it.

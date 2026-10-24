@@ -39,8 +39,8 @@ use crate::ops::types::{
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
-    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InvalidPaginationTokenException,
-    JWTOptionsOutput, LogPublishingOption,
+    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InstanceTypeDetails,
+    InvalidPaginationTokenException, JWTOptionsOutput, LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
@@ -1779,6 +1779,276 @@ fn seed_reserved_instance_offerings() -> BTreeMap<String, ReservedInstanceOfferi
         }
     }
     catalog
+}
+
+// ---------------------------------------------------------------------------
+// The instance-type catalog
+//
+// Which instance types an engine version offers, and which features each of them
+// supports, is content published BY the service: no caller creates an instance
+// type, and the answer depends only on the version asked about. So the catalog is
+// DERIVED from the model's published instance-type enum and the version, rather
+// than stored per account — which is what makes two reads of one version report the
+// same types, in the same order, with the same features.
+// ---------------------------------------------------------------------------
+
+/// `InstanceTypeDetails$InstanceRole` for an instance that holds the domain's data,
+/// from that member's own documentation: "whether the instance acts as a data node, a
+/// dedicated master node, or an UltraWarm node".
+pub const INSTANCE_ROLE_DATA: &str = "data";
+
+/// `InstanceTypeDetails$InstanceRole` for an instance that can serve as the cluster's
+/// dedicated master node.
+pub const INSTANCE_ROLE_MASTER: &str = "master";
+
+/// `InstanceTypeDetails$InstanceRole` for an instance that serves the UltraWarm
+/// storage tier.
+pub const INSTANCE_ROLE_ULTRAWARM: &str = "ultrawarm";
+
+/// An `EngineVersion` read apart: the engine it names and its `X.Y` release numbers,
+/// which is what every version gate in this section is expressed against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineVersion {
+    /// The `EngineType` the version names: [`ENGINE_TYPE_OPENSEARCH`] or
+    /// [`ENGINE_TYPE_ELASTICSEARCH`], as [`engine_type_of`] derives it.
+    pub engine: &'static str,
+    /// The major release number (the `X` of `X.Y`).
+    pub major: u32,
+    /// The minor release number (the `Y` of `X.Y`).
+    pub minor: u32,
+}
+
+impl EngineVersion {
+    /// Whether this version runs the OpenSearch engine rather than the legacy
+    /// Elasticsearch one.
+    pub fn is_opensearch(self) -> bool {
+        self.engine == ENGINE_TYPE_OPENSEARCH
+    }
+
+    /// Whether this version is at or past an `X.Y` release OF THE ENGINE IT NAMES.
+    pub fn at_least(self, (major, minor): (u32, u32)) -> bool {
+        (self.major, self.minor) >= (major, minor)
+    }
+
+    /// Whether a capability introduced in an Elasticsearch release is available here.
+    ///
+    /// OpenSearch 1.0 forked from Elasticsearch 7.10, so an OpenSearch version
+    /// carries every capability an Elasticsearch release up to that fork introduced —
+    /// which each gate in this section is — and an Elasticsearch version carries it
+    /// from the release it arrived in.
+    pub fn since_elasticsearch(self, release: (u32, u32)) -> bool {
+        self.is_opensearch() || self.at_least(release)
+    }
+
+    /// Whether this version is an OpenSearch release at or past `X.Y` — the gate for
+    /// a capability that never existed on Elasticsearch.
+    pub fn opensearch_at_least(self, release: (u32, u32)) -> bool {
+        self.is_opensearch() && self.at_least(release)
+    }
+}
+
+/// An `EngineVersion` read apart, or `None` for a value that is not
+/// `Elasticsearch_X.Y` or `OpenSearch_X.Y`.
+///
+/// `VersionString`'s pattern
+/// `^Elasticsearch_[0-9]{1}\.[0-9]{1,2}$|^OpenSearch_[0-9]{1,2}\.[0-9]{1,2}$` allows
+/// nothing else, but the request boundary enforces only that shape's LENGTH bound, so
+/// an operation that reads a version apart checks the form itself rather than
+/// treating an unreadable value as a version.
+pub fn parse_engine_version(engine_version: &str) -> Option<EngineVersion> {
+    let engine = engine_type_of(engine_version)?;
+    let (_, release) = engine_version.split_once('_')?;
+    let (major, minor) = release.split_once('.')?;
+    Some(EngineVersion {
+        engine,
+        major: major.parse().ok()?,
+        minor: minor.parse().ok()?,
+    })
+}
+
+/// The Elasticsearch release both encryption features `InstanceTypeDetails$Encryption\
+/// Enabled` covers are available from. That member is "whether encryption at rest AND
+/// node-to-node encryption are supported for the instance type", so the gate is the
+/// LATER of the two: node-to-node encryption arrived in Elasticsearch 6.0, encryption
+/// at rest before it.
+const ENCRYPTION_SINCE_ELASTICSEARCH: (u32, u32) = (6, 0);
+
+/// The Elasticsearch release Amazon Cognito authentication for Dashboards is
+/// available from (`InstanceTypeDetails$CognitoEnabled`).
+const COGNITO_SINCE_ELASTICSEARCH: (u32, u32) = (5, 1);
+
+/// The Elasticsearch release publishing application logs to CloudWatch Logs is
+/// available from (`InstanceTypeDetails$AppLogsEnabled`), which is also the release
+/// the `LogPublishingOptions` container appeared with.
+const APP_LOGS_SINCE_ELASTICSEARCH: (u32, u32) = (5, 1);
+
+/// The Elasticsearch release fine-grained access control is available from
+/// (`InstanceTypeDetails$AdvancedSecurityEnabled`).
+const ADVANCED_SECURITY_SINCE_ELASTICSEARCH: (u32, u32) = (6, 7);
+
+/// The Elasticsearch release UltraWarm storage is available from
+/// (`InstanceTypeDetails$WarmEnabled`), which is also the release the UltraWarm
+/// instance family was introduced for.
+const ULTRAWARM_SINCE_ELASTICSEARCH: (u32, u32) = (6, 8);
+
+/// The Elasticsearch release the Graviton instance families are offered from.
+const GRAVITON_SINCE_ELASTICSEARCH: (u32, u32) = (7, 9);
+
+/// The OpenSearch release the OpenSearch-optimized instance family is offered from.
+/// It is an OpenSearch-only family, so this gate is not an Elasticsearch one.
+const OPENSEARCH_OPTIMIZED_SINCE: (u32, u32) = (2, 11);
+
+/// The instance families neither encryption at rest nor node-to-node encryption is
+/// available on, whatever the engine version
+/// (`InstanceTypeDetails$EncryptionEnabled`). Fine-grained access control requires
+/// both, so it is unavailable on them too.
+const UNENCRYPTED_FAMILIES: [&str; 2] = ["m3", "t2"];
+
+/// The burstable instance families. UltraWarm cannot be attached to a cluster whose
+/// hot tier runs on one of them, so `InstanceTypeDetails$WarmEnabled` is off for
+/// them.
+const BURSTABLE_FAMILIES: [&str; 3] = ["t2", "t3", "t4g"];
+
+/// The instance family that serves the UltraWarm tier: its instances act as UltraWarm
+/// nodes rather than as data or master nodes, which is the `InstanceRole` they carry.
+const ULTRAWARM_FAMILY: &str = "ultrawarm1";
+
+/// The Graviton instance families, offered from
+/// [`GRAVITON_SINCE_ELASTICSEARCH`] onwards.
+const GRAVITON_FAMILIES: [&str; 5] = ["c6g", "m6g", "r6g", "r6gd", "t4g"];
+
+/// The OpenSearch-optimized instance families: offered from
+/// [`OPENSEARCH_OPTIMIZED_SINCE`] onwards, and usable as data nodes only, so an
+/// instance of one is never master-eligible.
+const OPENSEARCH_OPTIMIZED_FAMILIES: [&str; 1] = ["or1"];
+
+/// The family token of an `OpenSearchPartitionInstanceType`, which is
+/// `<family>.<size>.search`; `None` for a value carrying no family at all.
+pub fn instance_family(instance_type: &str) -> Option<&str> {
+    instance_type
+        .split('.')
+        .next()
+        .filter(|family| !family.is_empty())
+}
+
+/// Whether `version` offers `instance_type` at all.
+///
+/// An instance family introduced for a later engine release is not offered on an
+/// earlier one; every other family the model publishes is offered on every version.
+pub fn offers_instance_type(version: EngineVersion, instance_type: &str) -> bool {
+    let Some(family) = instance_family(instance_type) else {
+        return false;
+    };
+    if family == ULTRAWARM_FAMILY {
+        return version.since_elasticsearch(ULTRAWARM_SINCE_ELASTICSEARCH);
+    }
+    if GRAVITON_FAMILIES.contains(&family) {
+        return version.since_elasticsearch(GRAVITON_SINCE_ELASTICSEARCH);
+    }
+    if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
+        return version.opensearch_at_least(OPENSEARCH_OPTIMIZED_SINCE);
+    }
+    true
+}
+
+/// Every instance type `version` offers, in the order the model publishes them.
+///
+/// `OpenSearchPartitionInstanceType` is the model's record of which instance types
+/// exist, so it is what the catalog spans — the same enum the Reserved Instance
+/// offering catalog above is built over. The order is that enum's, which is stable,
+/// so a paged read of the catalog resumes where the previous page stopped.
+pub fn offered_instance_types(version: EngineVersion) -> Vec<&'static str> {
+    OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES
+        .iter()
+        .copied()
+        .filter(|instance_type| offers_instance_type(version, instance_type))
+        .collect()
+}
+
+/// What `instance_type` supports on `version`, as `InstanceTypeDetails`.
+///
+/// Each feature member is a conjunction of two things: the engine release the feature
+/// is available from, and whether the instance family can serve it at all. The roles
+/// come from the family: the UltraWarm family serves the warm tier, an
+/// OpenSearch-optimized instance is a data node only, and every other family is both
+/// a data node and master-eligible.
+///
+/// `availability_zones` is reported only when the caller asked for it, so a request
+/// that did not carries no `AvailabilityZones` member rather than an empty list.
+pub fn instance_type_details(
+    version: EngineVersion,
+    instance_type: &str,
+    availability_zones: Option<Vec<String>>,
+) -> InstanceTypeDetails {
+    let family = instance_family(instance_type).unwrap_or(instance_type);
+    let encryption = !UNENCRYPTED_FAMILIES.contains(&family)
+        && version.since_elasticsearch(ENCRYPTION_SINCE_ELASTICSEARCH);
+    let instance_role = if family == ULTRAWARM_FAMILY {
+        vec![INSTANCE_ROLE_ULTRAWARM.to_string()]
+    } else if OPENSEARCH_OPTIMIZED_FAMILIES.contains(&family) {
+        vec![INSTANCE_ROLE_DATA.to_string()]
+    } else {
+        vec![
+            INSTANCE_ROLE_DATA.to_string(),
+            INSTANCE_ROLE_MASTER.to_string(),
+        ]
+    };
+    InstanceTypeDetails {
+        instance_type: Some(instance_type.to_string()),
+        encryption_enabled: Some(encryption),
+        cognito_enabled: Some(version.since_elasticsearch(COGNITO_SINCE_ELASTICSEARCH)),
+        app_logs_enabled: Some(version.since_elasticsearch(APP_LOGS_SINCE_ELASTICSEARCH)),
+        // Fine-grained access control requires both encryption features, so it is
+        // available only where they are.
+        advanced_security_enabled: Some(
+            encryption && version.since_elasticsearch(ADVANCED_SECURITY_SINCE_ELASTICSEARCH),
+        ),
+        warm_enabled: Some(
+            version.since_elasticsearch(ULTRAWARM_SINCE_ELASTICSEARCH)
+                && !BURSTABLE_FAMILIES.contains(&family),
+        ),
+        instance_role: Some(instance_role),
+        availability_zones,
+    }
+}
+
+/// How many Availability Zones of a Region the instance-type catalog reports an
+/// instance type as offered in: the most zones a domain can be spread across, which
+/// is the top of [`ZONE_COUNT_RANGE`] (`ZoneAwarenessConfig$AvailabilityZoneCount`:
+/// "Valid values are `2` and `3`").
+pub const CATALOG_AVAILABILITY_ZONES: usize = 3;
+
+/// The Availability Zones of `region` an instance type is offered in: the Region's
+/// first [`CATALOG_AVAILABILITY_ZONES`] zones, named by [`zone_name`] so a zone has
+/// one name across this service.
+pub fn region_availability_zones(region: &str) -> Vec<String> {
+    (0..CATALOG_AVAILABILITY_ZONES)
+        .filter_map(|index| zone_name(region, index))
+        .collect()
+}
+
+/// The `ValidationException` payload for a member that must carry an engine version
+/// and does not. It names the member and the value that could not be read as one, so
+/// the caller can tell which input it was.
+pub fn malformed_engine_version(member: &str, value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} must be Elasticsearch_X.Y or OpenSearch_X.Y: {value}"
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a member that must name an instance type the
+/// service publishes and does not.
+///
+/// `InstanceTypeString`'s pattern `^.*\..*\.search$` admits any value of that shape,
+/// so a value outside `OpenSearchPartitionInstanceType` — the model's record of which
+/// instance types exist — names no instance type at all, which is a malformed request
+/// rather than a listing with nothing in it.
+pub fn unknown_instance_type(member: &str, value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("{member} is not a known instance type: {value}")),
+    }
 }
 
 /// Per-service state for com-amazonaws-opensearch-amazonopensearchservice. A handler reaches it through [`service_state`].

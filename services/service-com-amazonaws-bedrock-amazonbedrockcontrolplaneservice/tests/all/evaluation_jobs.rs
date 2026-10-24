@@ -29,6 +29,18 @@
 //!    under a human configuration are accepted.
 //! 8. **More than `MAX_TAGS_PER_RESOURCE` tags is refused** with 400 `ValidationException`,
 //!    and nothing is stored.
+//! 9. **`StopEvaluationJob` stops a running job**: it answers the modelled 200 with a body
+//!    carrying no members, and the stored job is reported `Stopping` from that call onwards
+//!    — over jobs differing in evaluation configuration, inference configuration, region
+//!    and name length.
+//! 10. **The `Stopping` status is owed its move to `Stopped` by the CLOCK**: once
+//!     `EVALUATION_JOB_STOPPED_AFTER` has passed the next read reports `Stopped`, stamped
+//!     at the instant the move was owed, while a job nobody stopped is still `InProgress`
+//!     after that same span.
+//! 11. **A job that is not running cannot be stopped**, so a stop of a stopping or stopped
+//!     job is refused with 400 `ValidationException` (the refusal the corpus records for a
+//!     stop of a job that is already stopped), and a stop of an identifier no stored job
+//!     answers to with 404 `ResourceNotFoundException`.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="CreateEvaluationJob,GetEvaluationJob")` /
@@ -76,6 +88,16 @@ const TASK_TYPES: &[&str] = &["Summarization", "QuestionAndAnswer", "Custom"];
 /// `EvaluationJobStatus` is `[InProgress, Completed, Failed, Stopping, Stopped, Deleting]`
 /// (`smithy_query(query="shape",shape="EvaluationJobStatus")`); an accepted job runs.
 const IN_PROGRESS: &str = "InProgress";
+
+/// The two further `EvaluationJobStatus` values of that same list a stop walks a job
+/// through: the non-terminal one `StopEvaluationJob` moves it to, and the terminal one the
+/// clock owes it.
+const STOPPING: &str = "Stopping";
+const STOPPED: &str = "Stopped";
+
+/// How long after a stop the job's move to [`STOPPED`] is owed, as the handler holds it.
+const STOP_SPAN: std::time::Duration =
+    service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::EVALUATION_JOB_STOPPED_AFTER;
 
 /// `EvaluationJobType` is `[Human, Automated]`
 /// (`smithy_query(query="shape",shape="EvaluationJobType")`).
@@ -192,6 +214,33 @@ async fn get(emu: &Emulator, identifier: &str) -> Reply {
         None,
     )
     .await
+}
+
+async fn get_in_region(emu: &Emulator, region: &str, identifier: &str) -> Reply {
+    emu.call_in_region(
+        region,
+        "GET",
+        &format!("/evaluation-jobs/{}", label(identifier)),
+        None,
+    )
+    .await
+}
+
+/// `StopEvaluationJob` is bound to `POST /evaluation-job/{jobIdentifier}/stop`
+/// (`smithy_query(query="operation",operation="StopEvaluationJob")`) and its request
+/// carries no member beside that label, so the call sends no body.
+async fn stop_in_region(emu: &Emulator, region: &str, identifier: &str) -> Reply {
+    emu.call_in_region(
+        region,
+        "POST",
+        &format!("/evaluation-job/{}/stop", label(identifier)),
+        None,
+    )
+    .await
+}
+
+async fn stop(emu: &Emulator, identifier: &str) -> Reply {
+    stop_in_region(emu, REGION, identifier).await
 }
 
 // ---------------------------------------------------------------------------------------
@@ -973,4 +1022,378 @@ async fn more_tags_than_a_resource_may_carry_is_refused() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// 9. A stop moves a running job to Stopping.
+// ---------------------------------------------------------------------------------------
+
+/// The refusal a stop of a job that is no longer running is worded with: the job the stop
+/// addressed, reported as already stopped.
+///
+/// Built from the REQUEST — the identifier it carried — which is why the rows below spell
+/// it this way rather than comparing against one recorded sentence.
+fn already_stopped_message(identifier: &str) -> String {
+    format!("Evaluation job: {identifier} is already in a stopped state.")
+}
+
+/// Whether `body` carries no members: `StopEvaluationJobResponse` is modelled with none
+/// (`smithy_query(query="shape",shape="StopEvaluationJobResponse")`), so the answer is
+/// either an empty document or an empty object.
+fn carries_no_members(body: &Value) -> bool {
+    body.is_null() || body.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+#[tokio::test]
+async fn a_stop_moves_a_running_evaluation_job_to_stopping() {
+    let emu = emulator();
+
+    // Rows differ along what the rule generalises over: the evaluation configuration
+    // (automated and human), the inference configuration (models and a precomputed
+    // inference source), the region the job lives in, and the name lengths the model admits
+    // (`EvaluationJobName` is `@length(1..63)`).
+    let long_name = format!("s{}", "z".repeat(62));
+    let rows: Vec<(&str, &str, String, Value, Value)> = vec![
+        (
+            "automated over one model",
+            REGION,
+            "stop-automated".to_string(),
+            automated_config(TASK_TYPES[0], "Builtin.Gigaword", &["Builtin.Accuracy"]),
+            models_inference(vec![bedrock_model(MODEL_IDS[0])]),
+        ),
+        (
+            "human over two models",
+            REGION,
+            "stop-human".to_string(),
+            human_config(TASK_TYPES[1], "custom-prompts", "readability", "ComparisonChoice"),
+            models_inference(vec![
+                bedrock_model(MODEL_IDS[0]),
+                bedrock_model(MODEL_IDS[2]),
+            ]),
+        ),
+        (
+            "automated over a precomputed inference source, named at the minimum length",
+            REGION,
+            "s".to_string(),
+            automated_config(TASK_TYPES[2], "custom-prompts", &["Builtin.Toxicity"]),
+            models_inference(vec![json!({
+                "precomputedInferenceSource": {
+                    "inferenceSourceIdentifier": "recorded-responses.v3",
+                },
+            })]),
+        ),
+        (
+            "a job of another region, named at the maximum length",
+            "eu-central-1",
+            long_name.clone(),
+            automated_config(
+                TASK_TYPES[1],
+                "Builtin.NaturalQuestions",
+                &["Builtin.Robustness"],
+            ),
+            models_inference(vec![bedrock_model(MODEL_IDS[1])]),
+        ),
+    ];
+
+    for (case, region, name, config, inference) in rows {
+        let created = create_in_region(
+            &emu,
+            region,
+            create_body(&name, ROLE_ARNS[0], OUTPUT_URIS[0], config, inference),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: the create that seeds the stop must be accepted, got {} {:?}",
+            created.status, created.body
+        );
+        let job_arn = created.text("jobArn");
+
+        // The precondition: the job the stop is asked for is running.
+        let running = get_in_region(&emu, region, &job_arn).await;
+        assert_eq!(
+            running.get("status"),
+            json!(IN_PROGRESS),
+            "case {case:?}: an accepted job is running before the stop, got {:?}",
+            running.get("status")
+        );
+        let created_at = running.instant("creationTime");
+
+        let stopped = stop_in_region(&emu, region, &job_arn).await;
+        assert_eq!(
+            stopped.status, 200,
+            "case {case:?}: StopEvaluationJob is bound to @http(code: 200), got {} {:?}",
+            stopped.status, stopped.body
+        );
+        assert_eq!(
+            stopped.error, None,
+            "case {case:?}: a stop of a running job is not a failure, got {:?} {:?}",
+            stopped.error, stopped.body
+        );
+        assert!(
+            carries_no_members(&stopped.body),
+            "case {case:?}: StopEvaluationJobResponse is modelled with no members, got {:?}",
+            stopped.body
+        );
+
+        // The stop is what moves the job, and the move is PERSISTED: the read reports the
+        // transient status the real service reports while the stop winds the job down.
+        let stopping = get_in_region(&emu, region, &job_arn).await;
+        assert_eq!(
+            stopping.status, 200,
+            "case {case:?}: the stopped job must still read back, got {} {:?}",
+            stopping.status, stopping.body
+        );
+        assert_eq!(
+            stopping.get("status"),
+            json!(STOPPING),
+            "case {case:?}: a stop moves a running job to {STOPPING}, got {:?}",
+            stopping.get("status")
+        );
+        assert_eq!(
+            stopping.instant("creationTime"),
+            created_at,
+            "case {case:?}: a stop leaves the creation instant alone, got {:?}",
+            stopping.get("creationTime")
+        );
+        assert!(
+            stopping.instant("lastModifiedTime") >= created_at,
+            "case {case:?}: the stop is the job's last change, so it is stamped no earlier \
+             than the creation at {created_at}, got {}",
+            stopping.instant("lastModifiedTime")
+        );
+        // Everything the job was created with is still what a read reports, so the stop
+        // moved the status and nothing else.
+        assert_eq!(
+            stopping.get("jobName"),
+            json!(name),
+            "case {case:?}: a stop leaves the job's name alone, got {:?}",
+            stopping.get("jobName")
+        );
+
+        // 11. A job that is no longer running cannot be stopped again.
+        let again = stop_in_region(&emu, region, &job_arn).await;
+        assert_eq!(
+            again.status, 400,
+            "case {case:?}: ValidationException is modelled @httpError(400), got {} {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            again.error.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: stopping a job that is not running is refused, got {:?} {:?}",
+            again.error,
+            again.body
+        );
+        assert_eq!(
+            again.get("message"),
+            json!(already_stopped_message(&job_arn)),
+            "case {case:?}: the refusal names the job the stop addressed, got {:?}",
+            again.get("message")
+        );
+        // The refusal stored nothing: the job is the one the first stop moved, which the
+        // clock may since have carried to its terminal status.
+        let after = get_in_region(&emu, region, &job_arn).await;
+        let status = after.text("status");
+        assert!(
+            status == STOPPING || status == STOPPED,
+            "case {case:?}: a refused stop leaves the stopping job as it was, got {status:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 10. The Stopping status settles to Stopped on the clock.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_stopping_status_settles_to_stopped_on_the_clock() {
+    let emu = emulator();
+
+    // Two jobs created the same way: one is stopped, the other is not, so the move below is
+    // attributable to the STOP and not to the span passing.
+    let mut arns: Vec<String> = Vec::new();
+    for name in ["settling-stop", "never-stopped"] {
+        let created = create(
+            &emu,
+            create_body(
+                name,
+                ROLE_ARNS[1],
+                OUTPUT_URIS[1],
+                automated_config(TASK_TYPES[0], "Builtin.BoolQ", &["Builtin.Accuracy"]),
+                models_inference(vec![bedrock_model(MODEL_IDS[0])]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {name:?}: the create must be accepted, got {} {:?}",
+            created.status, created.body
+        );
+        arns.push(created.text("jobArn"));
+    }
+    let (stopped_arn, running_arn) = (arns[0].clone(), arns[1].clone());
+
+    let accepted = stop(&emu, &stopped_arn).await;
+    assert_eq!(
+        accepted.status, 200,
+        "the stop must be accepted, got {} {:?}",
+        accepted.status, accepted.body
+    );
+    let stopped_at = get(&emu, &stopped_arn).await.instant("lastModifiedTime");
+
+    // Straight after the stop the caller observes the transient status: the span is not
+    // zero.
+    assert_eq!(
+        get(&emu, &stopped_arn).await.get("status"),
+        json!(STOPPING),
+        "case straight after the stop: the job is {STOPPING}, got {:?}",
+        get(&emu, &stopped_arn).await.body
+    );
+
+    // The move is owed by the CLOCK: once the span has passed the next call that touches
+    // the record reports it stopped, stamped at the instant the move was owed.
+    tokio::time::sleep(STOP_SPAN + std::time::Duration::from_millis(150)).await;
+    let settled = get(&emu, &stopped_arn).await;
+    assert_eq!(
+        settled.get("status"),
+        json!(STOPPED),
+        "case after the stop span: the job is {STOPPED} once the span has passed, got {:?}",
+        settled.get("status")
+    );
+    let modified = settled.instant("lastModifiedTime");
+    assert!(
+        modified >= stopped_at + STOP_SPAN.as_secs_f64() - 0.001,
+        "case after the stop span: the move must be stamped at the instant it was owed \
+         ({} after the stop at {stopped_at}), got {modified}",
+        STOP_SPAN.as_secs_f64()
+    );
+
+    // The job nobody stopped is still running after that same span, so the clock owes a
+    // transition only to a job a caller stopped.
+    let untouched = get(&emu, &running_arn).await;
+    assert_eq!(
+        untouched.get("status"),
+        json!(IN_PROGRESS),
+        "case the job nobody stopped: it is still {IN_PROGRESS} after the span, got {:?}",
+        untouched.get("status")
+    );
+
+    // 11. A stopped job cannot be stopped again.
+    let refused = stop(&emu, &stopped_arn).await;
+    assert_eq!(
+        refused.status, 400,
+        "case a stop of a stopped job: ValidationException is modelled @httpError(400), got {} \
+         {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("ValidationException"),
+        "case a stop of a stopped job: it is no longer running, so stopping it is refused, \
+         got {:?} {:?}",
+        refused.error,
+        refused.body
+    );
+    // The refusal is built from the request: it names the job the stop addressed.
+    assert_eq!(
+        refused.get("message"),
+        json!(already_stopped_message(&stopped_arn)),
+        "case a stop of a stopped job: the refusal must name the job, got {:?}",
+        refused.get("message")
+    );
+    assert_eq!(
+        get(&emu, &stopped_arn).await.get("status"),
+        json!(STOPPED),
+        "case a stop of a stopped job: the refusal leaves the job {STOPPED}"
+    );
+
+    // And the job nobody stopped is still stoppable, so the refusal is about the STATUS.
+    let late = stop(&emu, &running_arn).await;
+    assert_eq!(
+        late.status, 200,
+        "case a late stop of the running job: a running job is stoppable whenever it is \
+         asked for, got {} {:?}",
+        late.status, late.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 11. A stop of an identifier no stored job answers to is refused.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_stop_of_an_identifier_no_stored_job_answers_to_is_refused() {
+    let emu = emulator();
+
+    let created = create(
+        &emu,
+        create_body(
+            "stoppable-job",
+            ROLE_ARNS[0],
+            OUTPUT_URIS[0],
+            automated_config(TASK_TYPES[0], "Builtin.BoolQ", &["Builtin.Accuracy"]),
+            models_inference(vec![bedrock_model(MODEL_IDS[0])]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "the create that seeds this suite must be accepted, got {} {:?}",
+        created.status, created.body
+    );
+    let job_arn = created.text("jobArn");
+    let job_id = job_arn
+        .rsplit_once('/')
+        .expect("an evaluation-job ARN carries its id after the slash")
+        .1
+        .to_string();
+
+    // The same rows the read is refused on: a well-formed `EvaluationJobIdentifier` can name
+    // no stored job through an id that was never minted, the live id under another account,
+    // or the live id under another partition.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "an id that was never minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:evaluation-job/bbbbbbbbbbbb"),
+        ),
+        (
+            "the live id under another account",
+            format!("arn:aws:bedrock:{REGION}:999999999999:evaluation-job/{job_id}"),
+        ),
+        (
+            "the live id under another partition",
+            format!("arn:aws-us-gov:bedrock:{REGION}:{ACCOUNT}:evaluation-job/{job_id}"),
+        ),
+    ];
+
+    for (case, identifier) in rows {
+        let refused = stop(&emu, &identifier).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: ResourceNotFoundException is modelled @httpError(404), got {} \
+             {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: an identifier naming no stored job is not found, got {:?} {:?}",
+            refused.error,
+            refused.body
+        );
+    }
+
+    // The live job was left running by those refusals, so it is still stoppable.
+    let accepted = stop(&emu, &job_arn).await;
+    assert_eq!(
+        accepted.status, 200,
+        "the stored job must still be stoppable after the refusals, got {} {:?}",
+        accepted.status, accepted.body
+    );
+    assert_eq!(
+        get(&emu, &job_arn).await.get("status"),
+        json!(STOPPING),
+        "the stored job must be {STOPPING} once that stop was accepted"
+    );
 }

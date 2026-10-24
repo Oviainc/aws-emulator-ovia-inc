@@ -161,15 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        let Some(position) = store.qev2_idc_application_position(&input.qev2_idc_application_arn)
+        // A modify changes the managed application the onboarding minted, so it
+        // takes the narrower predicate: an application that exists and has
+        // finished onboarding. One refusal covers that whole precondition.
+        let Some(position) =
+            store.modifiable_qev2_idc_application_position(&input.qev2_idc_application_arn)
         else {
             return Err(
                 ModifyQev2IdcApplicationErrorModeled::Qev2IdcApplicationNotExistsFault(
                     Qev2IdcApplicationNotExistsFault {
-                        message: Some(format!(
-                            "Amazon Redshift Query Editor (QEV2) IAM Identity Center application not found: {}",
-                            input.qev2_idc_application_arn
-                        )),
+                        message: Some(st::QEV2_IDC_APPLICATION_NOT_MODIFIABLE.to_string()),
                     },
                 )
                 .into(),

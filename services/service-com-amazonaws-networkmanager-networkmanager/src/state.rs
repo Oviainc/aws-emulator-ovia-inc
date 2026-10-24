@@ -14,7 +14,11 @@
 //! A core network in turn owns its ATTACHMENTS: each joins one resource to the edge
 //! locations that policy configures — one of them for every kind but a Direct Connect
 //! gateway attachment, which spans several — and a Connect attachment is carried over
-//! another attachment (its transport) rather than over a resource of its own. A Connect
+//! another attachment (its transport) rather than over a resource of its own, and a
+//! transit gateway route table attachment over a PEERING — the core network's own
+//! connection to a transit gateway, which is a resource of its own with an id, an ARN and
+//! tags, and which fixes the core network and the edge location the attachment over it
+//! takes. A Connect
 //! attachment in turn carries CONNECT PEERS, each a BGP peering between one edge of the
 //! core network and one appliance outside AWS, and each a resource of its own with an id,
 //! an ARN and tags. The policy's
@@ -43,10 +47,11 @@ use crate::ops::types::{
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
     Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
-    NetworkResource, NetworkTelemetry, OrganizationStatus,
+    NetworkResource, NetworkTelemetry, OrganizationStatus, Peering,
     ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
     RouteAnalysisEndpointOptions, RouteAnalysisEndpointOptionsSpecification, RouteAnalysisPath,
-    Site, SiteToSiteVpnAttachment, Tag, ValidationException,
+    Site, SiteToSiteVpnAttachment, Tag, TransitGatewayPeering,
+    TransitGatewayRouteTableAttachment, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
 
@@ -140,6 +145,26 @@ pub const PREFIX_LIST_ASSOCIATION_KIND: &str = "prefix-list-association";
 /// `RouteAnalysisId` (`smithy_query shape=RouteAnalysis`) — so this name serves the id
 /// prefix (`route-analysis-<hex>`) and the `ResourceType` a not-found refusal reports.
 pub const ROUTE_ANALYSIS_KIND: &str = "route-analysis";
+/// See [`GLOBAL_NETWORK_KIND`]. A PEERING joins a core network to a resource of another
+/// service — a transit gateway, the one `PeeringType` the model carries (`smithy_query
+/// shape=PeeringType`) — so one name serves the id prefix (`peering-<hex>`, which the
+/// model's own `^peering-([0-9a-f]{8,17})$` on `PeeringId` constrains), the ARN resource
+/// type (`peering/<id>`) and the `peering` entry of [`NETWORK_RESOURCE_TYPES`].
+pub const PEERING_KIND: &str = "peering";
+
+/// The one value `PeeringType` enumerates (`smithy_query shape=PeeringType`, mirrored in
+/// `ops::types::PEERING_TYPE_VALUES`): "The type of peering. This will be
+/// `TRANSIT_GATEWAY`" (`smithy_query query="doc" shape="Peering" member="PeeringType"`).
+pub const PEERING_TYPE_TRANSIT_GATEWAY: &str = "TRANSIT_GATEWAY";
+
+/// The id prefix of the peering attachment a transit gateway peering leaves on the
+/// transit gateway side: `TransitGatewayPeeringAttachmentId` carries `pattern
+/// ^tgw-attach-([0-9a-f]{8,17})$` (`smithy_query shape=TransitGatewayPeering`), which the
+/// 17 hex digits of [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
+///
+/// Unlike the kinds above this one is not an ARN resource type of this service: the
+/// attachment it names belongs to the peered transit gateway, an Amazon VPC resource.
+pub const TRANSIT_GATEWAY_PEERING_ATTACHMENT_KIND: &str = "tgw-attach";
 
 /// See [`GLOBAL_NETWORK_KIND`]. A Connect peer hangs off a core network CONNECT attachment
 /// — "Creates a core network Connect peer for a specified core network connect attachment
@@ -161,10 +186,9 @@ pub const CONNECT_PEER_KIND: &str = CONNECT_PEER_TYPE;
 /// it. See [`AttachmentRecord::state_at`].
 pub const ATTACHMENT_STATE_UPDATING: &str = "UPDATING";
 
-/// The four `AttachmentType`s this service mints, of the five the model enumerates
+/// The `AttachmentType`s this service mints, the five the model enumerates
 /// (CONNECT, DIRECT_CONNECT_GATEWAY, SITE_TO_SITE_VPN, TRANSIT_GATEWAY_ROUTE_TABLE, VPC:
 /// `smithy_query shape=AttachmentType`, mirrored in `ops::types::ATTACHMENT_TYPE_VALUES`).
-/// The remaining one belongs to a create that is still a scaffold stub.
 pub const ATTACHMENT_TYPE_VPC: &str = "VPC";
 /// See [`ATTACHMENT_TYPE_VPC`].
 pub const ATTACHMENT_TYPE_CONNECT: &str = "CONNECT";
@@ -174,6 +198,10 @@ pub const ATTACHMENT_TYPE_SITE_TO_SITE_VPN: &str = "SITE_TO_SITE_VPN";
 /// core network rather than sitting at one (see
 /// [`AttachmentDetail::DirectConnectGateway`]).
 pub const ATTACHMENT_TYPE_DIRECT_CONNECT_GATEWAY: &str = "DIRECT_CONNECT_GATEWAY";
+/// See [`ATTACHMENT_TYPE_VPC`]. The one kind created over a PEERING of its core network
+/// rather than over a resource reached directly (see
+/// [`AttachmentDetail::TransitGatewayRouteTable`]).
+pub const ATTACHMENT_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE: &str = "TRANSIT_GATEWAY_ROUTE_TABLE";
 
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
@@ -275,6 +303,14 @@ pub const FIELD_CONNECTED_DEVICE_ID: &str = "connectedDeviceId";
 pub const FIELD_LINK_ID: &str = "linkId";
 /// See [`FIELD_DEVICE_ID`].
 pub const FIELD_CONNECTED_LINK_ID: &str = "connectedLinkId";
+/// See [`FIELD_CORE_NETWORK_ID`]: the same lowerCamelCase spelling of the request member,
+/// for the references and values a peering and a transit gateway route table attachment
+/// carry.
+pub const FIELD_PEERING_ID: &str = "peeringId";
+/// See [`FIELD_PEERING_ID`].
+pub const FIELD_TRANSIT_GATEWAY_ARN: &str = "transitGatewayArn";
+/// See [`FIELD_PEERING_ID`].
+pub const FIELD_TRANSIT_GATEWAY_ROUTE_TABLE_ARN: &str = "transitGatewayRouteTableArn";
 /// See [`FIELD_CORE_NETWORK_ID`]: the references and values a Connect peer create carries
 /// — the Connect attachment the peer is carried over, the inside IP addresses it peers
 /// over, and the subnet it reaches its appliance through.
@@ -416,14 +452,22 @@ pub const NETWORK_RESOURCE_TYPES: [&str; 17] = [
     "dx-vif",
     "dxcon",
     "link",
-    "peering",
+    PEERING_KIND,
     "site",
-    "transit-gateway",
+    TRANSIT_GATEWAY_TYPE,
     TRANSIT_GATEWAY_ATTACHMENT_TYPE,
     "transit-gateway-connect-peer",
-    "transit-gateway-route-table",
+    TRANSIT_GATEWAY_ROUTE_TABLE_TYPE,
     "vpn-connection",
 ];
+
+/// The network-resource type of a TRANSIT GATEWAY, and of one of its route tables: Amazon
+/// VPC resources, which is also the resource type their ARNs carry
+/// (`arn:<partition>:ec2:<region>:<account>:transit-gateway/tgw-<hex>`) and what
+/// [`ec2_resource_region`] is asked for when a request names one.
+pub const TRANSIT_GATEWAY_TYPE: &str = "transit-gateway";
+/// See [`TRANSIT_GATEWAY_TYPE`].
+pub const TRANSIT_GATEWAY_ROUTE_TABLE_TYPE: &str = "transit-gateway-route-table";
 
 /// The network-resource type of an attachment on a TRANSIT GATEWAY registered with a
 /// global network — an Amazon VPC resource, unlike the Cloud WAN attachments this service
@@ -564,6 +608,15 @@ pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
 /// [`VALIDATION_REASON_OTHER`] — the request is invalid against stored state, no single
 /// member is at fault — and stores nothing.
 pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
+
+/// How many peerings one core network may hold here.
+///
+/// CHOSEN, like [`MAX_ATTACHMENTS_PER_CORE_NETWORK`], and refused the same way:
+/// `CreateTransitGatewayPeering` models no `ServiceQuotaExceededException` (`smithy_query
+/// query="operation" operation="CreateTransitGatewayPeering"`), so a create past this cap
+/// answers the modelled `ValidationException` (HTTP 400) carrying
+/// [`VALIDATION_REASON_OTHER`] and stores nothing.
+pub const MAX_PEERINGS_PER_CORE_NETWORK: usize = 100;
 
 /// How many managed prefix lists one core network may be associated with here.
 ///
@@ -1592,6 +1645,100 @@ impl TelemetryResourceRecord {
     }
 }
 
+/// A stored peering: what joins a core network, at ONE of its edge locations, to a
+/// resource of another service — a transit gateway, the one kind of peering the model
+/// carries ([`PEERING_TYPE_TRANSIT_GATEWAY`]).
+///
+/// A peering is a resource of its own, with an id, an ARN and tags, and it is what a
+/// transit gateway route table attachment is created OVER
+/// ([`AttachmentDetail::TransitGatewayRouteTable`]): the attachment takes its core network
+/// and its edge location from the peering rather than from its own request, so the two can
+/// never disagree about which core network the route table is reaching.
+///
+/// Like every record here, `state` is not a field but a function of what is stored and the
+/// clock ([`Self::state_at`]), so reporting a peering never writes.
+#[derive(Debug, Clone)]
+pub struct PeeringRecord {
+    pub id: String,
+    pub arn: String,
+    pub core_network_id: String,
+    /// The ARN of [`Self::core_network_id`], kept so a read never has to resolve the
+    /// parent to report `Peering$CoreNetworkArn`.
+    pub core_network_arn: String,
+    /// One of `ops::types::PEERING_TYPE_VALUES`, which carries the single value
+    /// [`PEERING_TYPE_TRANSIT_GATEWAY`].
+    pub peering_type: &'static str,
+    /// The edge location the peering sits at: one of the locations the core network's
+    /// policy configures ([`PolicyTopology::has_edge_location`]), which is the Region the
+    /// peered resource is in.
+    pub edge_location: String,
+    /// The ARN of the resource peered with — the transit gateway for a transit gateway
+    /// peering, which is also the `TransitGatewayArn` that shape reports.
+    pub resource_arn: String,
+    /// The id of the peering attachment this peering leaves on the peered transit gateway
+    /// ([`TRANSIT_GATEWAY_PEERING_ATTACHMENT_KIND`]): a resource of the peered gateway, so
+    /// it is minted here rather than taken from any request member.
+    pub transit_gateway_peering_attachment_id: String,
+    pub created_at: SystemTime,
+    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    /// The `ClientToken` of the request that minted this record, kept so a retry of that
+    /// request answers this record instead of minting a second peering.
+    pub client_token: Option<String>,
+    pub tags: Vec<Tag>,
+}
+
+impl PeeringRecord {
+    /// This peering's lifecycle state as of `now`.
+    ///
+    /// `PeeringState` carries CREATING, FAILED, AVAILABLE and DELETING (`smithy_query
+    /// shape=PeeringState`, mirrored in `ops::types::PEERING_STATE_VALUES`), two of which
+    /// are the ones the clock decides: a peering under way waits in [`STATE_CREATING`]
+    /// until the transition the clock owes falls due and is [`STATE_AVAILABLE`] after it.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_CREATING
+        }
+    }
+
+    /// The modelled `Peering` envelope of this record, as of `now`.
+    pub fn to_peering(&self, now: SystemTime) -> Peering {
+        Peering {
+            core_network_id: Some(self.core_network_id.clone()),
+            core_network_arn: Some(self.core_network_arn.clone()),
+            peering_id: Some(self.id.clone()),
+            owner_account_id: Some(::engine::emulator_account_id().to_string()),
+            peering_type: Some(self.peering_type.to_string()),
+            state: Some(self.state_at(now).to_string()),
+            edge_location: Some(self.edge_location.clone()),
+            resource_arn: Some(self.resource_arn.clone()),
+            tags: Some(self.tags.clone()),
+            created_at: Some(epoch_seconds(self.created_at)),
+            // No modification of this peering has failed: the list is empty rather than
+            // carrying an error nothing produced.
+            last_modification_errors: Some(Vec::new()),
+        }
+    }
+
+    /// The modelled `TransitGatewayPeering` for this record as of `now`: the envelope
+    /// above plus the two members only a transit gateway peering carries (`smithy_query
+    /// shape=TransitGatewayPeering`).
+    ///
+    /// `TransitGatewayArn` is [`Self::resource_arn`]: the resource a transit gateway
+    /// peering peers with IS the transit gateway, so it is not stored twice.
+    pub fn to_transit_gateway_peering(&self, now: SystemTime) -> TransitGatewayPeering {
+        TransitGatewayPeering {
+            peering: Some(self.to_peering(now)),
+            transit_gateway_arn: Some(self.resource_arn.clone()),
+            transit_gateway_peering_attachment_id: Some(
+                self.transit_gateway_peering_attachment_id.clone(),
+            ),
+        }
+    }
+}
+
 /// A stored attachment: what joins one resource to ONE edge location of a core network.
 ///
 /// Every attachment kind shares the modelled `Attachment` envelope (`smithy_query
@@ -1708,6 +1855,15 @@ pub enum AttachmentDetail {
     /// condition is evaluated against ([`primary_edge_location`]) — and is never reported
     /// for this kind.
     DirectConnectGateway { edge_locations: Vec<String> },
+    /// A transit gateway route table attachment: the transit gateway PEERING it was
+    /// created over ([`PeeringRecord`]).
+    ///
+    /// `TransitGatewayRouteTableArn` is [`AttachmentRecord::resource_arn`], as
+    /// `VpnConnectionArn` is for the site-to-site VPN kind, so it is not stored twice.
+    /// What IS stored here is the peering, because this is the one kind whose edge
+    /// location and core network come from a peering rather than from the attached
+    /// resource: the route table is reached THROUGH that peering.
+    TransitGatewayRouteTable { peering_id: String },
 }
 
 /// The PRIMARY edge of an attachment spanning `edge_locations`: the first of them, or
@@ -1806,7 +1962,8 @@ impl AttachmentRecord {
             }
             AttachmentDetail::Vpc { .. }
             | AttachmentDetail::Connect { .. }
-            | AttachmentDetail::SiteToSiteVpn => false,
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => false,
         }
     }
 
@@ -1848,7 +2005,10 @@ impl AttachmentRecord {
                 AttachmentDetail::DirectConnectGateway { .. } => None,
                 AttachmentDetail::Vpc { .. }
                 | AttachmentDetail::Connect { .. }
-                | AttachmentDetail::SiteToSiteVpn => Some(self.edge_location.clone()),
+                | AttachmentDetail::SiteToSiteVpn
+                | AttachmentDetail::TransitGatewayRouteTable { .. } => {
+                    Some(self.edge_location.clone())
+                }
             },
             edge_locations: match &self.detail {
                 AttachmentDetail::DirectConnectGateway { edge_locations } => {
@@ -1856,7 +2016,8 @@ impl AttachmentRecord {
                 }
                 AttachmentDetail::Vpc { .. }
                 | AttachmentDetail::Connect { .. }
-                | AttachmentDetail::SiteToSiteVpn => None,
+                | AttachmentDetail::SiteToSiteVpn
+                | AttachmentDetail::TransitGatewayRouteTable { .. } => None,
             },
             resource_arn: Some(self.resource_arn.clone()),
             // Which `attachment-policies` rule of the core network policy claimed this
@@ -1894,7 +2055,8 @@ impl AttachmentRecord {
             }),
             AttachmentDetail::Vpc { .. }
             | AttachmentDetail::SiteToSiteVpn
-            | AttachmentDetail::DirectConnectGateway { .. } => None,
+            | AttachmentDetail::DirectConnectGateway { .. }
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => None,
         }
     }
 
@@ -1912,7 +2074,8 @@ impl AttachmentRecord {
             }),
             AttachmentDetail::Connect { .. }
             | AttachmentDetail::SiteToSiteVpn
-            | AttachmentDetail::DirectConnectGateway { .. } => None,
+            | AttachmentDetail::DirectConnectGateway { .. }
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => None,
         }
     }
 
@@ -1933,7 +2096,8 @@ impl AttachmentRecord {
             }),
             AttachmentDetail::Vpc { .. }
             | AttachmentDetail::Connect { .. }
-            | AttachmentDetail::DirectConnectGateway { .. } => None,
+            | AttachmentDetail::DirectConnectGateway { .. }
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => None,
         }
     }
 
@@ -1954,7 +2118,33 @@ impl AttachmentRecord {
             }),
             AttachmentDetail::Vpc { .. }
             | AttachmentDetail::Connect { .. }
-            | AttachmentDetail::SiteToSiteVpn => None,
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => None,
+        }
+    }
+
+    /// The modelled `TransitGatewayRouteTableAttachment` for this record as of `now`, or
+    /// `None` when the record is not a transit gateway route table attachment. See
+    /// [`Self::to_connect_attachment`].
+    ///
+    /// `TransitGatewayRouteTableArn` is [`Self::resource_arn`]: the resource this
+    /// attachment attaches IS the transit gateway route table.
+    pub fn to_transit_gateway_route_table_attachment(
+        &self,
+        now: SystemTime,
+    ) -> Option<TransitGatewayRouteTableAttachment> {
+        match &self.detail {
+            AttachmentDetail::TransitGatewayRouteTable { peering_id } => {
+                Some(TransitGatewayRouteTableAttachment {
+                    attachment: Some(self.to_attachment(now)),
+                    peering_id: Some(peering_id.clone()),
+                    transit_gateway_route_table_arn: Some(self.resource_arn.clone()),
+                })
+            }
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::DirectConnectGateway { .. } => None,
         }
     }
 
@@ -2579,6 +2769,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network-resource inventory and the core-network delete refusal all count
     /// attachments without caring which kind each is.
     pub attachments: BTreeMap<String, AttachmentRecord>,
+    /// Peerings by `PeeringId`, each carrying the `CoreNetworkId` it joins to a resource
+    /// of another service ([`PeeringRecord`]). A `BTreeMap`, so the store has one stable
+    /// order like every other map here.
+    ///
+    /// Bounded by [`MAX_PEERINGS_PER_CORE_NETWORK`] per core network, so repeated creates
+    /// cannot grow it without end.
+    pub peerings: BTreeMap<String, PeeringRecord>,
     /// Prefix list associations by [`prefix_list_association_key`], each tying one stored
     /// core network to one managed prefix list of Amazon VPC. A `BTreeMap`, so listing
     /// order is stable and a pagination token can name a key offset into it.
@@ -2778,6 +2975,14 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many peerings `core_network_id` holds, for the per-core-network quota.
+    pub fn peering_count_of_core_network(&self, core_network_id: &str) -> usize {
+        self.peerings
+            .values()
+            .filter(|peering| peering.core_network_id == core_network_id)
+            .count()
+    }
+
     /// How many managed prefix lists `core_network_id` is associated with, for the
     /// per-core-network quota.
     pub fn prefix_list_association_count_of(&self, core_network_id: &str) -> usize {
@@ -2803,7 +3008,8 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 } => transport_attachment_id == attachment_id,
                 AttachmentDetail::Vpc { .. }
                 | AttachmentDetail::SiteToSiteVpn
-                | AttachmentDetail::DirectConnectGateway { .. } => false,
+                | AttachmentDetail::DirectConnectGateway { .. }
+                | AttachmentDetail::TransitGatewayRouteTable { .. } => false,
             })
             .count()
     }
@@ -2850,6 +3056,28 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many peerings the global network `global_network_id` holds, for the
+    /// network-resource inventory: a peering hangs off a core network, which hangs off a
+    /// global network, so the count is resolved through that chain rather than stored
+    /// twice.
+    pub fn peering_count_of_global_network(&self, global_network_id: &str) -> usize {
+        self.peerings_of_global_network(global_network_id).count()
+    }
+
+    /// The peerings the global network `global_network_id` holds, in `PeeringId` order.
+    /// See [`Self::peering_count_of_global_network`] for the chain they are resolved
+    /// through.
+    fn peerings_of_global_network<'a>(
+        &'a self,
+        global_network_id: &'a str,
+    ) -> impl Iterator<Item = &'a PeeringRecord> {
+        self.peerings.values().filter(move |peering| {
+            self.core_networks
+                .get(&peering.core_network_id)
+                .is_some_and(|core_network| core_network.global_network_id == global_network_id)
+        })
+    }
+
     /// How many resources of `resource_type` the global network `global_network_id`
     /// holds, for the network-resource inventory.
     ///
@@ -2865,6 +3093,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             CONNECTION_KIND => self.connection_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
             ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
+            PEERING_KIND => self.peering_count_of_global_network(global_network_id),
             CONNECT_PEER_KIND => self.connect_peer_count_of_global_network(global_network_id),
             _ => 0,
         };
@@ -2906,6 +3135,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 resource_definition(&SiteToSiteVpnAttachment::SCHEMA, &vpn)
             } else if let Some(gateway) = record.to_direct_connect_gateway_attachment(now) {
                 resource_definition(&DirectConnectGatewayAttachment::SCHEMA, &gateway)
+            } else if let Some(route_table) = record.to_transit_gateway_route_table_attachment(now)
+            {
+                resource_definition(&TransitGatewayRouteTableAttachment::SCHEMA, &route_table)
             } else {
                 None
             };
@@ -2916,6 +3148,17 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                     core_network_id: Some(record.core_network_id.clone()),
                     definition,
                     ..network_resource(ATTACHMENT_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self.peerings_of_global_network(global_network_id) {
+            resources.insert(
+                network_resource_key(PEERING_KIND, &record.id),
+                NetworkResource {
+                    // A peering belongs to the core network it joins to another resource.
+                    core_network_id: Some(record.core_network_id.clone()),
+                    definition: resource_definition(&Peering::SCHEMA, &record.to_peering(now)),
+                    ..network_resource(PEERING_KIND, &record.id, &record.arn, &record.tags, now)
                 },
             );
         }
@@ -3184,6 +3427,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .get(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &record.tags),
+            PEERING_KIND => self
+                .peerings
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
             CONNECT_PEER_KIND => self
                 .connect_peers
                 .get(parts.id)
@@ -3229,6 +3477,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &mut record.tags),
             ATTACHMENT_KIND => self
                 .attachments
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            PEERING_KIND => self
+                .peerings
                 .get_mut(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),
@@ -5156,6 +5409,31 @@ pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -
 /// with an edge location no edge has.
 pub fn ec2_arn_region(arn: &str) -> Option<&str> {
     let region = arn.split(':').nth(3)?;
+    (!region.is_empty()).then_some(region)
+}
+
+/// The Region of an EC2 resource ARN that must name a resource of type `resource_type`
+/// (`arn:<partition>:ec2:<region>:<account>:<resource_type>/<id>`), or `None` when the
+/// string is not such an ARN or names no Region.
+///
+/// [`ec2_arn_region`] is enough where the MODEL constrains the ARN's form, but
+/// `TransitGatewayArn` and `TransitGatewayRouteTableArn` carry only a length and the
+/// permissive `^[\s\S]*$` (`smithy_query shape=TransitGatewayArn`), so for those the
+/// handler is what has to establish the resource an ARN names before anything is stored
+/// against it.
+pub fn ec2_resource_region<'a>(arn: &'a str, resource_type: &str) -> Option<&'a str> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != EC2_NAMESPACE {
+        return None;
+    }
+    let region = fields.next()?;
+    // The account segment is not judged: a peered transit gateway may belong to another
+    // account of the organization.
+    let _account = fields.next()?;
+    let (kind, id) = fields.next()?.split_once('/')?;
+    if kind != resource_type || id.is_empty() {
+        return None;
+    }
     (!region.is_empty()).then_some(region)
 }
 

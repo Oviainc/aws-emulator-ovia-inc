@@ -324,7 +324,7 @@ async fn backup_enabled_at_tracks_when_backup_became_enabled() {
     // A later change that leaves backup enabled does not re-enable anything.
     // The record has to have settled out of `UPDATING` first: a second update
     // while the first is still being applied is refused (see
-    // `datastore_state_conflict`).
+    // `datastore_update_not_active`).
     tokio::time::sleep(PAST_TRANSITION).await;
     let changed = service
         .ok(
