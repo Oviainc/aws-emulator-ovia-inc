@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstanceSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstanceSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes a point-in-time copy of ONE stored instance and persists it under the
+//! snapshot name the request names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstanceSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Everything the snapshot says about its source is copied out of the stored
+//! instance record at this instant — blueprint id, bundle id, the system volume's
+//! size, the block storage disks attached to it, and its location — so the
+//! snapshot keeps reporting them even after the instance is changed or deleted;
+//! the caller's `tags` are kept verbatim and every server-assigned member (ARN,
+//! support code, creation time, resource type, state) is computed from them plus
+//! the store's own allocators. The snapshot is created `pending` and the CLOCK,
+//! not a reader, settles it into `available`.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +172,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstanceSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstanceSnapshot"))
+        // Nothing about this request is regional: a snapshot is located where the
+        // instance it was taken of is located
+        // (`InstanceSnapshot$location` is "The region name and Availability Zone
+        // where you created the snapshot"), which the stored source record
+        // already names.
+        let _ = ctx;
+
+        // `instanceName` and `instanceSnapshotName` are modelled `@required`
+        // members carrying the modelled `ResourceName` pattern, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: the source must be an
+        // instance this account holds, the snapshot name must not already be
+        // taken, and the caller-sized tag list must be within the store's
+        // bounds. Each is checked BEFORE the first write, so a refused request
+        // creates nothing.
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let name = input.instance_snapshot_name;
+        let source_name = input.instance_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A snapshot name addresses one snapshot, so creating one this
+            // account already holds is refused rather than silently replacing a
+            // record a restore may already be using.
+            if store.instance_snapshot(&name).is_some() {
+                return Err(invalid(format!(
+                    "an instance snapshot named '{name}' already exists"
+                )));
+            }
+            if store.instance_snapshots.len() >= crate::state::MAX_INSTANCE_SNAPSHOTS {
+                return Err(invalid(format!(
+                    "creating an instance snapshot would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_INSTANCE_SNAPSHOTS
+                )));
+            }
+
+            // Every block storage disk attached to the source right now is part
+            // of what this snapshot captures, so it is copied here rather than
+            // resolved on every later read: an attachment lives on the DISK
+            // record, and a disk detached afterwards was still attached when the
+            // snapshot was taken.
+            let from_attached_disks: Vec<crate::state::StoredDisk> = store
+                .disks_attached_to(&source_name)
+                .into_iter()
+                .cloned()
+                .collect();
+
+            // Everything about the source is read out of the SOURCE record as it
+            // stands now, so the snapshot keeps it even if the instance later
+            // changes or is deleted.
+            let instance = store.instance(&source_name).ok_or_else(|| {
+                // The source the request named is not a resource this account
+                // holds: Lightsail's `DoesNotExist` rejection — HTTP 400, wire
+                // error `NotFoundException`, body `code` `DoesNotExist` and a
+                // message naming the resource type and the requested name.
+                crate::scaffolded::Scaffolded::resource_does_not_exist(
+                    crate::state::RESOURCE_TYPE_INSTANCE,
+                    &source_name,
+                )
+            })?;
+            let location = instance.location.clone();
+            let from_instance_name = instance.name.clone();
+            let from_instance_arn = instance.arn.clone();
+            let from_blueprint_id = instance.blueprint_id.clone();
+            let from_bundle_id = instance.bundle_id.clone();
+            // The snapshotted volume is the instance bundle's own SSD — the
+            // system disk `GetInstance` reports first in its hardware.
+            let size_in_gb = instance.bundle.disk_size_in_gb;
+
+            let id = store.mint_uuid();
+            // A snapshot is not restorable yet: the clock owes it `available`,
+            // which is why a read straight after this call still reports
+            // `pending`.
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE,
+            );
+            store.insert_instance_snapshot(crate::state::StoredInstanceSnapshot {
+                name: name.clone(),
+                arn: crate::state::instance_snapshot_arn(&location.region_name, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                size_in_gb,
+                state: crate::state::INSTANCE_SNAPSHOT_STATE_PENDING,
+                due: Some(due),
+                from_instance_name,
+                from_instance_arn,
+                from_blueprint_id,
+                from_bundle_id,
+                from_attached_disks,
+            });
+            // `operations` is a list because other Lightsail creates act on
+            // several resources at once; `CreateInstanceSnapshot` creates exactly
+            // one snapshot, so it answers exactly one entry, left non-terminal
+            // until the copy the clock owes the snapshot is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_INSTANCE_SNAPSHOT,
+                crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateInstanceSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateInstanceSnapshotError {
+    CreateInstanceSnapshotErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateInstanceSnapshotError {
+    CreateInstanceSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance snapshot store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
