@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSyncBlocker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSyncBlocker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSyncBlocker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the sync blocker its (`Id`, `ResourceName`, `SyncType`) triple
+//! addresses in [`crate::state`] and reports the stored blocker. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +122,19 @@ impl From<UpdateSyncBlockerErrorModeled> for UpdateSyncBlockerError {
     }
 }
 
+/// The status the LIVE service answers a sync blocker id that addresses no blocker with.
+///
+/// The model puts `@httpError 404` on `SyncBlockerDoesNotExistException`, but the
+/// recorded wire response for this exact call (corpus `simparity-wire-aws-v1`, fixture
+/// `codestar-connections-sync-status-and-blocker-error-paths#task#6`: "status: expected
+/// 400", `__type` `com.amazonaws.codestar.connections#SyncBlockerDoesNotExistException`,
+/// `Message` "Sync blocker with id … does not exist ") is HTTP 400 — so the shape, its
+/// wire code and its message stay the model's while the STATUS is the one a client of
+/// the real service branches on. It is the same treatment `GetHost` and `DeleteHost`
+/// give an absent host, from the sibling fixtures of the same corpus. See
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`].
+const SYNC_BLOCKER_DOES_NOT_EXIST_STATUS: u16 = 400;
+
 /// The `UpdateSyncBlocker` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +171,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSyncBlocker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSyncBlockerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSyncBlocker"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSyncBlockerErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "CodeStar connections state is unavailable on this engine".to_string(),
+                ),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // A sync blocker is addressed by its `Id` TOGETHER with the resource and the sync
+        // type it was raised for, so a triple that resolves to no stored blocker — an id
+        // never raised, or one raised under another resource or sync type — is the
+        // modeled `SyncBlockerDoesNotExistException`, with a message naming the id that
+        // was asked for — the blocker-specific absence, which is what the recorded wire
+        // answers such a call with. The operation's other absence,
+        // `ResourceNotFoundException`, is about the RESOURCE rather than the blocker, so
+        // it stays reserved for the resource-resolution the sync-configuration surface
+        // owns (its operations are still scaffolds, each with its own open issue).
+        let Some(blocker) =
+            store.sync_blocker_mut(&input.id, &input.resource_name, &input.sync_type)
+        else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                UpdateSyncBlockerErrorModeled::SyncBlockerDoesNotExistException(
+                    SyncBlockerDoesNotExistException {
+                        message: Some(crate::state::sync_blocker_not_found_message(&input.id)),
+                    },
+                ),
+                SYNC_BLOCKER_DOES_NOT_EXIST_STATUS,
+            ));
+        };
+
+        // Resolving is defined on a blocker that is still blocking: a blocker already
+        // RESOLVED has no status left to move, and answering success would report a
+        // resolution this call did not perform. The refusal is the operation's modeled
+        // `InvalidInputException` (400), and nothing is written.
+        if !blocker.is_active() {
+            return Err(UpdateSyncBlockerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::sync_blocker_already_resolved_message(&input.id)),
+                },
+            )
+            .into());
+        }
+
+        // The whole effect of the call: the stored blocker moves to RESOLVED and records
+        // the reason the caller gave and the instant it was resolved at. Everything the
+        // blocker was raised with — its type, its reason, its creation time and its
+        // contexts — is left exactly as stored.
+        blocker.resolve(&input.resolved_reason, ::std::time::SystemTime::now());
+
+        // The response reports the STORED row, so what the caller reads back is what a
+        // later reader of the same blocker sees; `ResourceName` and `ParentResourceName`
+        // come from the blocker's own record rather than being echoed from the request.
+        let output = UpdateSyncBlockerOutput {
+            resource_name: blocker.resource_name.clone(),
+            parent_resource_name: blocker.parent_resource_name.clone(),
+            sync_blocker: blocker.to_sync_blocker(),
+        };
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key id,
+        // what changed, and the outcome — the shape `CreateConnection` and `CreateHost`
+        // record a state change with.
+        ::tracing::info!(
+            operation = "UpdateSyncBlocker",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            sync_blocker_id = %input.id,
+            resource_name = %input.resource_name,
+            outcome = "resolved",
+            "codestar connections state change"
+        );
+
+        Ok(output)
     }
 }
