@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetUserAccessTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetUserAccessTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetUserAccessTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation is IMPLEMENTED: it polls the user access tasks
+//! `StartUserAccessTasks` persisted under an app bundle and reports each one's
+//! `ResultStatus` as of now.
 //!
 //! ## Shape of an operation
 //!
@@ -145,23 +140,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::BATCH_GET_USER_ACCESS_TASKS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Poll the user access tasks `StartUserAccessTasks` started under the named
+    /// app bundle.
+    ///
+    /// A REPORTING operation (`@readonly`): it writes nothing and only
+    /// materialises the status the CLOCK has already made due, so polling a task
+    /// never moves it. One result item per DISTINCT requested task id, in the
+    /// order the request first names it — a result is per task, so naming one
+    /// task twice does not report it twice. A task id the bundle does not hold,
+    /// and a bundle the store does not hold, are the modelled
+    /// `ResourceNotFoundException`.
+    ///
+    /// An id the bundle holds no task for is a MISSING RESOURCE, not a task
+    /// outcome: the model documents `UserAccessResultItem$taskError` as
+    /// "information about an error returned from a user access task", so it
+    /// belongs to a task that exists and ran, and `app`/`tenantId`/`email` of a
+    /// task nothing started are not knowable. Reporting such an id as an item
+    /// would therefore have to invent a task, so it is refused with the modelled
+    /// `ResourceNotFoundException` (HTTP 404) naming that id instead.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetUserAccessTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetUserAccessTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetUserAccessTasks"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchGetUserAccessTasksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(bundle) = store.resolve_bundle(&input.app_bundle_identifier) else {
+            return Err(BatchGetUserAccessTasksErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_not_found(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+
+        // One instant for the whole batch, so two tasks that settle at the same
+        // instant cannot be reported in two different statuses by one poll.
+        let now = ::std::time::SystemTime::now();
+        let mut polled = ::std::collections::HashSet::with_capacity(input.task_id_list.len());
+        let mut items = Vec::with_capacity(input.task_id_list.len());
+        for task_id in &input.task_id_list {
+            if !polled.insert(task_id.as_str()) {
+                continue;
+            }
+            let Some(task) = bundle.user_access_tasks.get(task_id) else {
+                return Err(BatchGetUserAccessTasksErrorModeled::ResourceNotFoundException(
+                    crate::state::user_access_task_not_found(task_id),
+                )
+                .into());
+            };
+            items.push(task.to_result_item(now));
+        }
+
+        Ok(BatchGetUserAccessTasksOutput {
+            user_access_results_list: Some(items),
+        })
     }
 }

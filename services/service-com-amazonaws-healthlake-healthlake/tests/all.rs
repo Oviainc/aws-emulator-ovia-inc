@@ -21,6 +21,8 @@ mod datastore_state_conflict;
 mod error_envelopes;
 #[path = "all/fhir_datastore_lifecycle.rs"]
 mod fhir_datastore_lifecycle;
+#[path = "all/fhir_export_job_listing.rs"]
+mod fhir_export_job_listing;
 #[path = "all/fhir_rest_and_validate_source.rs"]
 mod fhir_rest_and_validate_source;
 #[path = "all/fhir_update_interaction.rs"]

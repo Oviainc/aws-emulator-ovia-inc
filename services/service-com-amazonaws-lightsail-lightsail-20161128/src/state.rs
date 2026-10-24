@@ -390,12 +390,20 @@ pub const OPERATION_TYPE_ATTACH_DISK: &str = "AttachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DETACH_DISK: &str = "DetachDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DETACH_STATIC_IP: &str = "DetachStaticIp";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DETACH_INSTANCES_FROM_LOAD_BALANCER: &str =
+    "DetachInstancesFromLoadBalancer";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_RELATIONAL_DATABASE_PARAMETERS: &str =
     "UpdateRelationalDatabaseParameters";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
+    "AttachInstancesToLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -448,10 +456,12 @@ pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_INSTANCES: usize = 500;
 
-/// The most names one `CreateInstances` call may carry.
+/// The most instance names ONE request may carry — `CreateInstances`'
+/// `instanceNames`, or `AttachInstancesToLoadBalancer`'s.
 ///
-/// Emulator resource guard: the modelled `StringList` declares no length, so this
-/// is where the bound on a caller-sized list lives.
+/// Emulator resource guard: neither the modelled `StringList` nor the modelled
+/// `ResourceNameList` declares a length, so this is where the bound on a
+/// caller-sized list of instance names lives.
 pub const MAX_INSTANCE_NAMES_PER_REQUEST: usize = 50;
 
 /// The most domain recordsets this emulator will hold.
@@ -6825,6 +6835,45 @@ pub const INSTANCE_HEALTH_INITIAL: &str = "initial";
 pub const INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS: &str = "Lb.RegistrationInProgress";
 
 // ---------------------------------------------------------------------------
+// Released attachments
+// ---------------------------------------------------------------------------
+
+/// One attachment a resource's removal released: everything the operation log
+/// needs to record the detachment that removal performed.
+///
+/// A release is a MUTATION of the record that held the attachment, so it is
+/// logged like any other, under the modelled `OperationType` member for
+/// detaching that kind of resource and located where that resource lives.
+#[derive(Debug, Clone)]
+pub struct ReleasedAttachment {
+    /// The `Operation$operationType` this release is logged under, from the
+    /// modelled `OperationType` enum.
+    pub operation_type: &'static str,
+    /// The `Operation$resourceType` of the record the attachment was released
+    /// on, from the modelled `ResourceType` enum.
+    pub resource_type: &'static str,
+    /// That record's own name — the resource the log entry is about.
+    pub resource_name: String,
+    /// Where that record lives, so the entry is located where the resource is
+    /// rather than where the removed resource was.
+    pub location: StoredLocation,
+}
+
+/// The outcome of removing one instance: the record itself, and every
+/// attachment the removal released
+/// (see [`ComAmazonawsLightsailLightsail20161128State::remove_instance`]).
+#[derive(Debug)]
+pub struct RemovedInstance {
+    /// The instance record that was removed.
+    pub instance: StoredInstance,
+    /// One entry per attachment the removal released, in the store's own
+    /// stable order: disks by name, then static IPs by name, then load
+    /// balancers by region and name — every one of those maps is a
+    /// `BTreeMap`, so the order is the same on every call.
+    pub released_attachments: Vec<ReleasedAttachment>,
+}
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -7018,10 +7067,95 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .insert(record.name.clone(), record);
     }
 
-    /// Remove the instance `name` names, answering it. `None` when nothing
-    /// matched.
-    pub fn remove_instance(&mut self, name: &str) -> Option<StoredInstance> {
-        self.instances.remove(name)
+    /// Remove the instance `name` names, answering the record and every
+    /// attachment its removal released. `None` when nothing matched.
+    ///
+    /// Removing a resource also releases every attachment another stored
+    /// resource holds to it: an attachment names "the resources to which" one
+    /// resource "is attached" (the modelled `Disk$attachedTo` and
+    /// `StaticIp$attachedTo`), and a resource this account no longer holds is
+    /// not one of them — so the removal and the release are one step, and no
+    /// read can observe an attachment to a record that is gone.
+    pub fn remove_instance(&mut self, name: &str) -> Option<RemovedInstance> {
+        let instance = self.instances.remove(name)?;
+        let released_attachments = self.release_attachments_to_instance(name);
+        Some(RemovedInstance {
+            instance,
+            released_attachments,
+        })
+    }
+
+    /// Release every attachment the store holds to the instance `name`,
+    /// answering one entry per release so the caller can log it.
+    ///
+    /// Three kinds of record can hold one: a block storage disk (`attachedTo`
+    /// plus the device `path` it is mounted at), a static IP (`attachedTo`), and
+    /// a load balancer (the instance registered with it). Each returns to the
+    /// state it has while it is attached to nothing — for a disk that is
+    /// `available`, the modelled `DiskState` value for a disk that "exists and
+    /// is attached to nothing" next to `in-use`.
+    ///
+    /// Every walk is bounded: the disks by [`MAX_DISKS`], the static IPs by
+    /// [`MAX_STATIC_IPS`], and the load balancers by
+    /// [`MAX_LOAD_BALANCERS_PER_REGION`] per region.
+    fn release_attachments_to_instance(&mut self, name: &str) -> Vec<ReleasedAttachment> {
+        let mut released = Vec::new();
+        for disk in self.disks.values_mut() {
+            if disk.attached_to.as_deref() != Some(name) {
+                continue;
+            }
+            disk.attached_to = None;
+            disk.path = None;
+            disk.state = DISK_STATE_AVAILABLE;
+            // A detachment the clock still owed this disk has nothing left to
+            // do: the attachment it was going to release is already released,
+            // and leaving the `due` in place would only re-apply the same
+            // settle. A `due` of any OTHER state is left alone — it is not this
+            // attachment's.
+            if disk.due.is_some_and(|due| due.state == DISK_STATE_AVAILABLE) {
+                disk.due = None;
+            }
+            released.push(ReleasedAttachment {
+                operation_type: OPERATION_TYPE_DETACH_DISK,
+                resource_type: RESOURCE_TYPE_DISK,
+                resource_name: disk.name.clone(),
+                location: disk.location.clone(),
+            });
+        }
+        for static_ip in self.static_ips.values_mut() {
+            if static_ip.attached_to.as_deref() != Some(name) {
+                continue;
+            }
+            // The address stays ALLOCATED to the account — nothing released the
+            // reservation, only the attachment — so the record keeps every
+            // other member it has.
+            static_ip.attached_to = None;
+            released.push(ReleasedAttachment {
+                operation_type: OPERATION_TYPE_DETACH_STATIC_IP,
+                resource_type: RESOURCE_TYPE_STATIC_IP,
+                resource_name: static_ip.name.clone(),
+                location: static_ip.location.clone(),
+            });
+        }
+        for balancer in self.load_balancers.values_mut() {
+            if !balancer
+                .attached_instances
+                .iter()
+                .any(|attached| attached == name)
+            {
+                continue;
+            }
+            balancer
+                .attached_instances
+                .retain(|attached| attached != name);
+            released.push(ReleasedAttachment {
+                operation_type: OPERATION_TYPE_DETACH_INSTANCES_FROM_LOAD_BALANCER,
+                resource_type: RESOURCE_TYPE_LOAD_BALANCER,
+                resource_name: balancer.name.clone(),
+                location: balancer.location.clone(),
+            });
+        }
+        released
     }
 
     /// The container service `name` names in `region`, for a reporting
@@ -7192,6 +7326,21 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .filter(|((balancer_region, _), _)| balancer_region == region)
             .map(|(_, balancer)| balancer)
             .collect()
+    }
+
+    /// The load balancer `name` names in `region`, for an operation the spec says
+    /// mutates it — registering an instance with it, or releasing one.
+    ///
+    /// The `(region, name)` pair is this record's store key, so neither may be
+    /// reassigned through this handle; no operation in this slice renames a load
+    /// balancer or moves one between Regions.
+    pub fn load_balancer_mut(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Option<&mut StoredLoadBalancer> {
+        self.load_balancers
+            .get_mut(&(region.to_string(), name.to_string()))
     }
 
     /// Store a newly created load balancer.

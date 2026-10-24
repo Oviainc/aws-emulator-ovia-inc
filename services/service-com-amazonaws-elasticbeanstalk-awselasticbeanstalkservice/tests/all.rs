@@ -75,3 +75,5 @@ mod tag_batch_conflicts;
 mod update_application;
 #[path = "all/update_application_lifecycle_projection.rs"]
 mod update_application_lifecycle_projection;
+#[path = "all/update_environment.rs"]
+mod update_environment;

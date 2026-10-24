@@ -69,6 +69,8 @@ mod insights_data;
 mod insights_metric_data;
 #[path = "all/lake_queries.rs"]
 mod lake_queries;
+#[path = "all/list_tags_reader.rs"]
+mod list_tags_reader;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
 #[path = "all/range_refusal_wording.rs"]

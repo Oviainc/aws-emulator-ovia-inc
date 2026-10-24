@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableAwsNetworkPerformanceMetricSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableAwsNetworkPerformanceMetricSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableAwsNetworkPerformanceMetricSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one Infrastructure Performance metric subscription from [`crate::state`]: the
+//! one the request's `Source`, `Destination`, `Metric` and `Statistic` name, so
+//! `DescribeAwsNetworkPerformanceMetricSubscriptions` stops reporting it. A MUTATION —
+//! "Disables Infrastructure Performance metric subscriptions".
+//!
+//! Every caller of this emulator holds the action's permissions, so a `DryRun` request
+//! always resolves to the permitted branch (`DryRunOperation`, HTTP 412) and never to
+//! `UnauthorizedOperation`: the answer says the request would have succeeded, not that any
+//! principal was evaluated.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +141,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableAwsNetworkPerformanceMetricSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableAwsNetworkPerformanceMetricSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableAwsNetworkPerformanceMetricSubscription"))
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // subscription is named by the Regions and zones the REQUEST names, not by the one
+        // it was signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The four members that name the subscription to remove — the same four the enable
+        // names one with. None is modelled `@required`, so this is what refuses a request
+        // that omits one, naming the member it left out.
+        let source = state::require_subscription_member(input.source.as_deref(), "Source")?;
+        let destination =
+            state::require_subscription_member(input.destination.as_deref(), "Destination")?;
+        let metric = state::require_subscription_member(input.metric.as_deref(), "Metric")?;
+        let statistic =
+            state::require_subscription_member(input.statistic.as_deref(), "Statistic")?;
+
+        // "The metric used for the disabled subscription" is one `MetricType` member and
+        // "the statistic used for the disabled subscription" one `StatisticType` member.
+        // Both are modelled enums, so the request walk has already refused a value outside
+        // either catalog; resolving it again here keeps this path naming a subscription by
+        // the same catalog words the enable stored it under.
+        let metric = state::subscription_metric(metric).ok_or_else(|| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{metric}' for Metric. It must be one of: {catalog}",
+                catalog = METRIC_TYPE_VALUES.join(", "),
+            ))
+        })?;
+        let statistic = state::subscription_statistic(statistic).ok_or_else(|| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{statistic}' for Statistic. It must be one of: {catalog}",
+                catalog = STATISTIC_TYPE_VALUES.join(", "),
+            ))
+        })?;
+
+        // "The source Region or Availability Zone that the metric subscription is disabled
+        // for" — and the same for `Destination`: the two forms the enable accepts, held to
+        // the one catalog in `crate::state`, so a value neither operation could ever have
+        // subscribed is refused here too rather than reported as nothing to remove.
+        state::require_subscription_endpoint("Source", source)?;
+        state::require_subscription_endpoint("Destination", destination)?;
+
+        // Every member of the request has been checked, so this is a request that would have
+        // succeeded: a dry run stops HERE — "If you have the required permissions, the error
+        // response is DryRunOperation" (`DryRun`) — before the store is even reached, so the
+        // path that removes nothing takes no lock either.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let subscriptions = state::require_service_state(&*self.engine)?;
+        let mut store = subscriptions.lock();
+
+        store.disable_network_performance_subscription(source, destination, metric, statistic);
+
+        // "Indicates whether the unsubscribe action was successful"
+        // (`DisableAwsNetworkPerformanceMetricSubscriptionResult$Output`): the account holds
+        // no subscription for those four members once this returns, which is what the
+        // unsubscribe asked for whether or not one was held — so the answer is the removal
+        // having happened, not whether a row happened to be there to remove.
+        debug_assert!(
+            !store
+                .network_performance_subscriptions
+                .contains_key(&state::subscription_key(
+                    source,
+                    destination,
+                    metric,
+                    statistic,
+                )),
+            "the disabled subscription must be gone from the store"
+        );
+
+        Ok(DisableAwsNetworkPerformanceMetricSubscriptionOutput { output: Some(true) })
     }
 }

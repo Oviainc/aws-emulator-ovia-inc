@@ -186,9 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutApprovalResultErrorModeled::StageNotFoundException(
                 StageNotFoundException {
-                    message: Some(format!(
-                        "Pipeline '{}' does not have a stage with name '{}'",
-                        input.pipeline_name, input.stage_name
+                    message: Some(crate::state::stage_not_found_message(
+                        &input.pipeline_name,
+                        &input.stage_name,
                     )),
                 },
             )
@@ -204,9 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutApprovalResultErrorModeled::ActionNotFoundException(
                 ActionNotFoundException {
-                    message: Some(format!(
-                        "Stage '{}' of pipeline '{}' does not have an action with name '{}'",
-                        input.stage_name, input.pipeline_name, input.action_name
+                    message: Some(crate::state::action_not_found_message(
+                        &input.pipeline_name,
+                        &input.stage_name,
+                        &input.action_name,
                     )),
                 },
             )

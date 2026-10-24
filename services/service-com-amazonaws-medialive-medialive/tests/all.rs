@@ -53,6 +53,9 @@ mod event_bridge_rule_templates;
 #[path = "all/input_deletion.rs"]
 mod input_deletion;
 
+#[path = "all/input_device_maintenance_window.rs"]
+mod input_device_maintenance_window;
+
 #[path = "all/input_endpoint_release.rs"]
 mod input_endpoint_release;
 
@@ -94,6 +97,9 @@ mod multiplex_start;
 
 #[path = "all/multiplex_stop.rs"]
 mod multiplex_stop;
+
+#[path = "all/networks.rs"]
+mod networks;
 
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;

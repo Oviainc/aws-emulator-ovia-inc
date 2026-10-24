@@ -51,6 +51,8 @@ mod domain_entry_update;
 mod domain_zone;
 #[path = "all/export_snapshot_records.rs"]
 mod export_snapshot_records;
+#[path = "all/instance_delete_attachments.rs"]
+mod instance_delete_attachments;
 #[path = "all/instance_error_envelope.rs"]
 mod instance_error_envelope;
 #[path = "all/instance_lifecycle.rs"]
@@ -61,6 +63,8 @@ mod instance_metric_data;
 mod instance_public_ports;
 #[path = "all/instance_reboot.rs"]
 mod instance_reboot;
+#[path = "all/load_balancer_instance_attachment.rs"]
+mod load_balancer_instance_attachment;
 #[path = "all/load_balancer_listing.rs"]
 mod load_balancer_listing;
 #[path = "all/load_balancer_provisioning.rs"]

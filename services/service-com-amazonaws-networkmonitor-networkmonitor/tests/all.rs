@@ -25,3 +25,5 @@ mod tagging;
 mod update_monitor;
 #[path = "all/update_probe.rs"]
 mod update_probe;
+#[path = "all/validation_message_wording.rs"]
+mod validation_message_wording;

@@ -7,8 +7,11 @@
 //! responses carries `@timestampFormat("date-time")` —
 //! `smithy_query(query="operation", operation="GetGuardrail")` reports
 //! `"timestampFormat": "date-time"` on `createdAt` and `updatedAt`, and
-//! `smithy_query(query="shape", shape="GuardrailSummary")` the same on its two. On the
-//! restJson1 wire that makes the RFC 3339 / ISO-8601 STRING form part of the contract.
+//! `smithy_query(query="shape", shape="GuardrailSummary")` the same on its two — and so
+//! does every `Timestamp` member of the prompt router responses
+//! (`query="operation", operation="GetPromptRouter"`), because the trait sits on the
+//! `Timestamp` shape they all target. On the restJson1 wire that makes the RFC 3339 /
+//! ISO-8601 STRING form part of the contract.
 //! The JSON codec decides the rendering per member, from the member schema's own format
 //! (`vendor/smithy-schema-server/src/json.rs::write_timestamp` ->
 //! `Schema::timestamp_format()`), and falls back to the protocol default — epoch
@@ -72,6 +75,9 @@ macro_rules! bedrock_shape_type {
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
     };
+    (list_of_struct) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
     (struct_of) => {
         ::aws_smithy_schema::ShapeType::Structure
     };
@@ -81,7 +87,7 @@ macro_rules! bedrock_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `date_time`, `list_of_string` or `struct_of(T)`.
+/// string-encoded), `date_time`, `list_of_string`, `list_of_struct(T)` or `struct_of(T)`.
 macro_rules! bedrock_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -124,6 +130,18 @@ macro_rules! bedrock_write_member {
             Ok(())
         })?;
     };
+    ($s:ident, $m:expr, $v:expr, list_of_struct($inner:ty)) => {
+        // A list of structures writes each element against the ELEMENT shape's own
+        // `SCHEMA`, which is what the vendored codegen does for this kind
+        // (`vendor/smithy-macros/src/codegen.rs::emit_write`, the `ShapeKind::List`
+        // arm's `item_schema_expr`).
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                __sl.write_struct(&<$inner>::SCHEMA, __it)?;
+            }
+            Ok(())
+        })?;
+    };
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
 }
 
@@ -140,6 +158,16 @@ macro_rules! bedrock_read_member {
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
         $d.read_list($m, &mut |__dl| {
             __out.push(__dl.read_string($m)?);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, list_of_struct($inner:ty)) => {{
+        let mut __out: ::std::vec::Vec<$inner> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            __out.push(
+                <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__dl)?,
+            );
             Ok(())
         })?;
         __out

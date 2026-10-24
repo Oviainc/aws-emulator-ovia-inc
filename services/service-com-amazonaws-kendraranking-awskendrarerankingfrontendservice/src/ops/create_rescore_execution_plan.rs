@@ -254,7 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: arn.clone(),
                 name: input.name,
                 description: input.description,
-                capacity_units: input.capacity_units,
+                // A create that carries no `CapacityUnits` is asking for zero
+                // ADDITIONAL units ("If you want to use the default capacity, you
+                // don't set additional capacity units."), which is a capacity
+                // configuration the plan HAS — stored as such, so a reader reports
+                // `RescoreCapacityUnits: 0` rather than nothing.
+                capacity_units: input
+                    .capacity_units
+                    .unwrap_or_else(crate::state::default_capacity_units),
                 created_at_millis: now,
                 updated_at_millis: now,
                 // Creating a plan is asynchronous: it is stored CREATING and the clock

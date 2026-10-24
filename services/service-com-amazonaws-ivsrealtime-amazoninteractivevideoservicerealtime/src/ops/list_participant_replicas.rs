@@ -167,11 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(crate::state::decode_replica_page_token(token).ok_or_else(|| {
                     crate::state::validation_failed(
                         ListParticipantReplicasErrorModeled::ValidationException,
-                        format!(
-                            "{}.nextToken is required to be a pagination token issued by {}",
-                            Self::NAME,
-                            Self::NAME,
-                        ),
+                        // The one rule this service words a foreign page token with,
+                        // shared with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
                     )
                 })?)
             }

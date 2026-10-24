@@ -25,7 +25,9 @@
 
 use serde_json::{json, Value};
 
-use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text, ACCOUNT};
+use crate::collection_lifecycle::{
+    at, call, emulator, is_policy_version, text, ACCOUNT, CLIENT_ERROR,
+};
 
 /// One policy family this rule covers: the `type` value, the operations that create, write
 /// and read one of its policies, the member its detail is reported under, and a document
@@ -313,19 +315,19 @@ async fn a_policy_update_chains_the_version_and_refuses_a_stale_one() {
             (
                 "the creation version, long since superseded",
                 versions[0].clone(),
-                409,
+                CLIENT_ERROR,
                 "ConflictException",
             ),
             (
                 "the version before the last write",
                 versions[versions.len() - 2].clone(),
-                409,
+                CLIENT_ERROR,
                 "ConflictException",
             ),
             (
                 "a well-formed version nothing ever minted",
                 STALE_VERSION.to_string(),
-                409,
+                CLIENT_ERROR,
                 "ConflictException",
             ),
         ];
@@ -388,8 +390,8 @@ async fn a_policy_update_chains_the_version_and_refuses_a_stale_one() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {}({}/absent): expected 404 ResourceNotFoundException, got {status} {code} with {answer}",
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case {}({}/absent): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}",
             family.update,
             family.kind
         );
@@ -524,8 +526,8 @@ async fn a_deleted_access_policy_is_absent_from_every_later_read() {
             .await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, "ResourceNotFoundException"),
-                "case GetAccessPolicy(data/{name}) poll {attempt}: expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+                (CLIENT_ERROR, "ResourceNotFoundException"),
+                "case GetAccessPolicy(data/{name}) poll {attempt}: expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
             );
             assert_eq!(
                 at(&answer, "accessPolicyDetail"),
@@ -543,8 +545,8 @@ async fn a_deleted_access_policy_is_absent_from_every_later_read() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case DeleteAccessPolicy(data/{name}, twice): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case DeleteAccessPolicy(data/{name}, twice): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
 
         // A write to a deleted policy names no record either — the same refusal the read
@@ -562,8 +564,8 @@ async fn a_deleted_access_policy_is_absent_from_every_later_read() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case UpdateAccessPolicy(data/{name}, deleted): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case UpdateAccessPolicy(data/{name}, deleted): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
 
         // And the teardown/recreate cycle: the freed pair takes a new policy, whose own

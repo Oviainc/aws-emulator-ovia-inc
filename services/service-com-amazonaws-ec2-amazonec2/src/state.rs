@@ -167,6 +167,24 @@
 //! volume stores are kept in, so a pagination token can name the id the next page starts
 //! at.
 //!
+//! ## Network interfaces
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_interfaces`] holds the account's elastic
+//! network interfaces as the modelled [`NetworkInterface`] shape itself — the one
+//! `CreateNetworkInterface` answers with and `DescribeNetworkInterfaces` reports — keyed by
+//! `NetworkInterfaceId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
+//! are kept in, so a pagination token can name the id the next page starts at. The shape
+//! carries the one fact a delete turns on itself, its `Attachment`: "you must detach the
+//! network interface before you can delete it" (`DeleteNetworkInterface`), so nothing is
+//! stored beside the record.
+//!
+//! An interface AWS hands back is ready (`available`, or `in-use` once something holds it),
+//! so the clock owes it no transition and there is nothing to derive on read.
+//! [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] is the writer seam, ahead of
+//! the operation that will call it — `CreateNetworkInterface` is still a scaffold stub with
+//! its own open issue — so the create lands on this one record rather than on a second copy
+//! of an interface beside it.
+//!
 //! ## BYOIP address ranges
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
@@ -320,6 +338,26 @@
 //! record carries the [`PendingStateMove`] the clock owes it, which
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies — the BYOIP range
 //! above included, whose record carries one beside the release it may owe.
+//!
+//! ## IPAM scopes and the pools created in them
+//!
+//! [`ComAmazonawsEc2Amazonec2State::ipam_scopes`] holds the account's IPAM scopes as the
+//! modelled [`IpamScope`] shape itself, keyed by `IpamScopeId`, beside the
+//! [`ComAmazonawsEc2Amazonec2State::ipam_pools`] created in them: a scope is "the
+//! highest-level container within IPAM" (`IpamScope`), so `CreateIpamPool` resolves its
+//! `IpamScopeId` there and takes the pool's IPAM, Region and scope type from the scope it
+//! finds rather than from the request. A scope the account does not hold is refused with
+//! [`invalid_ipam_scope_id_not_found`], and a scope's own "number of pools in the scope"
+//! (`IpamScope$PoolCount`) is RECOUNTED from the pool store
+//! ([`ComAmazonawsEc2Amazonec2State::insert_creating_ipam_pool`]) rather than tracked
+//! separately, so the two cannot drift.
+//!
+//! A pool `CreateIpamPool` answers with is `create-in-progress`, a non-terminal
+//! `IpamPoolState`, so the clock owes it `create-complete` one [`TRANSITION_DELAY`] later;
+//! that due instant is a fact the modelled [`IpamPool`] carries no member for, so it lives
+//! beside the pool under the same id in
+//! [`ComAmazonawsEc2Amazonec2State::ipam_pool_create_complete_at`], the way a `pending`
+//! VPC's does.
 //!
 //! ## Network Access Scopes and their analyses
 //!
@@ -623,6 +661,21 @@
 //! reporting one group differently. A placement group is "a logical grouping of instances"
 //! (`CreatePlacementGroup`) with nothing to provision, so it is stored `available` and no
 //! clock-owed move is recorded for it.
+//!
+//! ## Infrastructure Performance metric subscriptions
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_performance_subscriptions`] holds the
+//! subscriptions `EnableAwsNetworkPerformanceMetricSubscription` turns on, as the modelled
+//! [`Subscription`] shape itself, keyed by [`subscription_key`] — the four members that
+//! name one (`Source`, `Destination`, `Metric`, `Statistic`), because a subscription
+//! carries no id of its own. Enabling the same four twice therefore leaves ONE
+//! subscription, a disable removes exactly the one it names, and
+//! `DescribeAwsNetworkPerformanceMetricSubscriptions` reports what those two have left
+//! here — it writes nothing itself, because a subscription is enabled the moment the
+//! enable answers and so has no clock-owed move. Every word stored comes from a catalog
+//! (a Region or Availability Zone id of [`subscription_endpoint_region`], a `MetricType`
+//! and a `StatisticType` member, and the service's own [`SUBSCRIPTION_PERIOD`]), so the
+//! store holds no request text.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -644,7 +697,7 @@ use crate::ops::types::{
     EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, Instance, InstanceApplicationStatus, InstanceStorageInfo, InstanceTypeInfo,
     IpamInternetRegistryAssociation, IpamPool, IpamRoutingPolicyRegistration,
-    IpamRoutingPolicyRegistrationDelta,
+    IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
@@ -658,7 +711,7 @@ use crate::ops::types::{
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
-    Subnet, SubnetAssociation, Tag,
+    Subnet, SubnetAssociation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
@@ -1561,6 +1614,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every elastic network interface the account holds, by `NetworkInterfaceId`, as the
+    /// modelled [`NetworkInterface`] shape itself — so a member a writer sets round-trips
+    /// through `DescribeNetworkInterfaces` without a field-by-field copy. Ordered by id,
+    /// which is the order the describe reports and pages over. See the module docs.
+    ///
+    /// Starts EMPTY: a fresh account holds no interface of its own until something creates
+    /// one through [`Self::insert_network_interface`].
+    pub network_interfaces: BTreeMap<String, NetworkInterface>,
     /// Every route server the account holds, by `RouteServerId` — see the module docs.
     /// Ordered by id, which is the order `DescribeRouteServers` reports and pages over.
     pub route_servers: BTreeMap<String, RouteServerRecord>,
@@ -1706,6 +1767,27 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every IPAM pool the account holds, by `IpamPoolId`, as the modelled [`IpamPool`]
     /// shape itself.
     pub ipam_pools: BTreeMap<String, IpamPool>,
+    /// Every IPAM scope the account holds, by `IpamScopeId`, as the modelled [`IpamScope`]
+    /// shape itself — "the highest-level container within IPAM" (`IpamScope`), which is what
+    /// `CreateIpamPool` resolves its `IpamScopeId` against and takes the pool's IPAM, Region
+    /// and scope type from.
+    ///
+    /// A fresh account holds none: a scope belongs to an IPAM, and `CreateIpam` and
+    /// `CreateIpamScope` are both still scaffolds, so until one of them is written every
+    /// scope id a request names answers [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`] — exactly as the
+    /// real service does for a scope that does not exist.
+    pub ipam_scopes: BTreeMap<String, IpamScope>,
+    /// When a `create-in-progress` IPAM pool's move to `create-complete` falls due, by
+    /// `IpamPoolId` — the fact the modelled [`IpamPool`] shape carries no member for, stored
+    /// beside the pool under the same id the way [`Self::vpc_available_at`] holds a
+    /// `pending` VPC's `available` move, on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`]. [`Self::materialize_due_transitions`] applies it.
+    pub ipam_pool_create_complete_at: BTreeMap<String, Instant>,
+    /// A `CreateIpamPool` `ClientToken` and the `IpamPoolId` that call minted, so a replay
+    /// of the same request answers with that pool instead of creating a second one: "a
+    /// unique, case-sensitive identifier that you provide to ensure the idempotency of the
+    /// request" (`CreateIpamPoolRequest$ClientToken`).
+    pub ipam_pool_client_tokens: HashMap<String, String>,
     /// Every IPAM internet registry association the account holds, by
     /// `IpamInternetRegistryAssociationId`, each with the routing policy registrations
     /// (ROAs) made under it — see [`IpamInternetRegistryAssociationRecord`]. Ordered by id,
@@ -1751,6 +1833,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
     /// placement group" — [`PlacementGroup`]) is a member of it.
     pub placement_groups: BTreeMap<String, PlacementGroup>,
+    /// Every Infrastructure Performance metric subscription the account has enabled, as the
+    /// modelled [`Subscription`] shape itself, keyed by [`subscription_key`] — the four
+    /// members that are a subscription's identity.
+    ///
+    /// Starts EMPTY: a fresh account subscribes to nothing.
+    /// `EnableAwsNetworkPerformanceMetricSubscription` is the one way an entry is written
+    /// ([`Self::enable_network_performance_subscription`]) and
+    /// `DisableAwsNetworkPerformanceMetricSubscription` the one way one is removed
+    /// ([`Self::disable_network_performance_subscription`]), so
+    /// `DescribeAwsNetworkPerformanceMetricSubscriptions` reports exactly what those two
+    /// have left here. Keyed by that identity, so the map's order is the stable order the
+    /// describe reports and pages over.
+    pub network_performance_subscriptions: BTreeMap<String, Subscription>,
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
@@ -1833,6 +1928,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            network_interfaces: BTreeMap::new(),
             route_servers: BTreeMap::new(),
             route_server_client_tokens: HashMap::new(),
             address_transfers: BTreeMap::new(),
@@ -1863,6 +1959,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
             ipam_pools: BTreeMap::new(),
+            ipam_scopes: BTreeMap::new(),
+            ipam_pool_create_complete_at: BTreeMap::new(),
+            ipam_pool_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
             ipam_routing_policy_registration_deltas: BTreeMap::new(),
             ipam_routing_policy_registration_delta_client_tokens: HashMap::new(),
@@ -1874,6 +1973,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             spot_instance_requests: BTreeMap::new(),
             spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
+            // A fresh account has enabled no Infrastructure Performance metric
+            // subscription.
+            network_performance_subscriptions: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
@@ -2926,6 +3028,23 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this subnet any more.
             false
         });
+        // An IPAM pool `CreateIpamPool` answered as `create-in-progress` reaches
+        // `create-complete` once its due instant has passed, whether or not anybody called —
+        // the same contract as the `pending` VPC above, and the reason the pool's due
+        // instant is kept beside the pool rather than on the modelled shape.
+        let ipam_pools = &mut self.ipam_pools;
+        self.ipam_pool_create_complete_at.retain(|pool_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(pool) = ipam_pools.get_mut(pool_id) {
+                if pool.state.as_deref() == Some(IPAM_POOL_STATE_CREATE_IN_PROGRESS) {
+                    pool.state = Some(IPAM_POOL_STATE_CREATE_COMPLETE.to_string());
+                }
+            }
+            // The transition is applied once; nothing is owed on this pool any more.
+            false
+        });
         // A VPC BPA exclusion `CreateVpcBlockPublicAccessExclusion` answered as
         // `create-in-progress` reaches `create-complete` once its due instant has passed,
         // whether or not anybody called — the same contract as a `pending` VPC's move
@@ -3531,6 +3650,18 @@ pub fn tag_bytes(tags: &BTreeMap<String, String>) -> usize {
 
 /// The bytes a modelled `Tag` list holds.
 pub fn tag_list_bytes(tags: &[Tag]) -> usize {
+    tags.iter()
+        .map(|tag| {
+            tag.key.as_ref().map_or(0, String::len) + tag.value.as_ref().map_or(0, String::len)
+        })
+        .sum()
+}
+
+/// The bytes a modelled `IpamResourceTag` list holds — the [`tag_list_bytes`] of the
+/// separate tag shape IPAM's allocation rules carry ("tags that are required for resources
+/// that use CIDRs from this IPAM pool", `IpamPool$AllocationResourceTags`), which a pool
+/// retains for the process's lifetime just as it retains its own tags.
+pub fn ipam_resource_tag_list_bytes(tags: &[IpamResourceTag]) -> usize {
     tags.iter()
         .map(|tag| {
             tag.key.as_ref().map_or(0, String::len) + tag.value.as_ref().map_or(0, String::len)
@@ -11854,6 +11985,250 @@ pub fn invalid_network_interface_id_not_found<E>(network_interface_id: &str) -> 
     )
 }
 
+// ---------------------------------------------------------------------------
+// Network interfaces: the account's own elastic network interfaces, the writer
+// seam a create lands on, and what a delete refuses
+// ---------------------------------------------------------------------------
+
+// Imported here rather than in this module's shared import list, beside the only
+// code that names these shapes, the way the import tasks' shapes are imported
+// with their own section further up.
+use crate::ops::types::{
+    NetworkInterface, NetworkInterfaceAttachment, NetworkInterfacePrivateIpAddress,
+};
+
+/// The id prefix EC2 mints a network interface with, as
+/// [`network_interface_id_is_well_formed`] reads one: `eni-`, carried here without the
+/// separator [`ComAmazonawsEc2Amazonec2State::next_id`] adds.
+pub const NETWORK_INTERFACE_ID_PREFIX: &str = "eni";
+
+/// The id prefix EC2 mints the attachment of a network interface to an instance with, which
+/// is what `NetworkInterfaceAttachment$AttachmentId` names (`eni-attach-…`, as the
+/// `NetworkInterfaceAttachmentId` ids in EC2's own documentation read).
+pub const NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX: &str = "eni-attach";
+
+/// "The type of network interface. The default is interface"
+/// (`CreateNetworkInterfaceRequest$InterfaceType`) — the `NetworkInterfaceType` member an
+/// interface a caller creates without asking for another type carries
+/// (`smithy_query(query="shape",shape="NetworkInterfaceType")`).
+pub const NETWORK_INTERFACE_TYPE_INTERFACE: &str = "interface";
+
+/// The status of a network interface nothing holds: the `NetworkInterfaceStatus` enum's
+/// `available` member (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`), which
+/// is where an interface with no attachment sits — and the one state a delete accepts.
+pub const NETWORK_INTERFACE_STATUS_AVAILABLE: &str = "available";
+
+/// The status of a network interface something holds: the `NetworkInterfaceStatus` enum's
+/// `in-use` member, which is where an interface with an attachment sits.
+pub const NETWORK_INTERFACE_STATUS_IN_USE: &str = "in-use";
+
+/// The `AttachmentStatus` of an attachment that has been taken away
+/// (`smithy_query(query="shape",shape="AttachmentStatus")`): the one attachment status that
+/// leaves the interface holding nothing, so it is the one a delete does not refuse.
+pub const ATTACHMENT_STATUS_DETACHED: &str = "detached";
+
+/// The `AttachmentStatus` of a finished attachment: the state an attachment the clock has
+/// completed sits in.
+pub const ATTACHMENT_STATUS_ATTACHED: &str = "attached";
+
+/// `InvalidNetworkInterface.InUse` (HTTP 400): the request asked for something that cannot
+/// be done to a network interface while it is still attached. "The specified interface is
+/// currently in use and cannot be deleted or attached to another instance. Ensure that you
+/// have detached the network interface first" (EC2 API error codes,
+/// "InvalidNetworkInterface.InUse").
+pub const INVALID_NETWORK_INTERFACE_IN_USE: &str = "InvalidNetworkInterface.InUse";
+
+/// Refuse an action on a network interface something still holds: HTTP 400
+/// `InvalidNetworkInterface.InUse`. "You must detach the network interface before you can
+/// delete it" (`DeleteNetworkInterface`).
+pub fn network_interface_in_use<E>(network_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_IN_USE,
+        400,
+        format!(
+            "The network interface '{network_interface_id}' is currently in use and must be \
+             detached first"
+        ),
+    )
+}
+
+/// One network interface as a writer asks for it: the members a creator chooses.
+///
+/// Everything the service itself owns — the `NetworkInterfaceId`, the owning account, the
+/// primary private address entry and the `Status` that follows from the attachment — is
+/// derived by [`ComAmazonawsEc2Amazonec2State::insert_network_interface`], so two writers
+/// cannot report the same interface differently.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInterfaceSpec {
+    /// "The ID of the subnet" the interface sits in (`NetworkInterface$SubnetId`).
+    pub subnet_id: String,
+    /// "The ID of the VPC" that subnet belongs to (`NetworkInterface$VpcId`).
+    pub vpc_id: String,
+    /// "The Availability Zone" of that subnet (`NetworkInterface$AvailabilityZone`).
+    pub availability_zone: String,
+    /// "The ID of the Availability Zone" (`NetworkInterface$AvailabilityZoneId`).
+    pub availability_zone_id: String,
+    /// "A description" (`NetworkInterface$Description`).
+    pub description: String,
+    /// "Any security groups for the network interface" (`NetworkInterface$Groups`).
+    pub groups: Vec<GroupIdentifier>,
+    /// "The IPv4 address of the network interface within the subnet"
+    /// (`NetworkInterface$PrivateIpAddress`) — the interface's primary private address.
+    pub private_ip_address: Option<String>,
+    /// "The type of network interface" (`NetworkInterface$InterfaceType`), one of the
+    /// `NetworkInterfaceType` values; [`NETWORK_INTERFACE_TYPE_INTERFACE`] is the default.
+    pub interface_type: String,
+    /// "The network interface attachment" (`NetworkInterface$Attachment`), for an interface
+    /// that is already held by something; `None` for one that is attached to nothing.
+    pub attachment: Option<NetworkInterfaceAttachment>,
+    /// "Any tags assigned to the network interface" (`NetworkInterface$TagSet`).
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes a stored network interface retains: its tags, its description
+/// and the addresses it holds. The same quantity
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] charged against the store's
+/// budget, so [`ComAmazonawsEc2Amazonec2State::remove_network_interface`] gives back
+/// exactly what was taken.
+///
+/// The primary address is charged ONCE though the record names it twice: it is both
+/// `PrivateIpAddress` and an entry of `PrivateIpAddresses`, so the SET is what is counted
+/// when the record carries one and the scalar only when it does not.
+pub fn network_interface_payload_bytes(interface: &NetworkInterface) -> usize {
+    let address_bytes: usize = match interface.private_ip_addresses.as_deref() {
+        Some(addresses) => addresses
+            .iter()
+            .map(|address| address.private_ip_address.as_deref().map_or(0, str::len))
+            .sum(),
+        None => interface.private_ip_address.as_deref().map_or(0, str::len),
+    };
+    tag_list_bytes(interface.tag_set.as_deref().unwrap_or_default())
+        .saturating_add(interface.description.as_deref().map_or(0, str::len))
+        .saturating_add(address_bytes)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Insert a network interface, and answer the `NetworkInterfaceId` it was given.
+    ///
+    /// The writer seam for the network interface store, ahead of the operation that will
+    /// call it: `CreateNetworkInterface` is still a scaffold stub with its own open issue,
+    /// so for now this is reached only from this crate's tests, which seed interfaces the
+    /// way that create will. It lives here rather than in a test so the create lands on
+    /// this one record instead of a second copy of an interface beside it, exactly as
+    /// [`Self::insert_coip_pool`] does for a CoIP pool.
+    ///
+    /// The `Status` is derived from the attachment rather than taken from the writer, so a
+    /// stored interface cannot claim to be `available` while something holds it. The
+    /// caller-chosen bytes are charged against the store's byte budget here, so a writer
+    /// cannot store them uncharged. `None` means the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored: the ceiling is enforced
+    /// here so a writer that forgets to ask cannot grow the store without bound.
+    pub fn insert_network_interface(&mut self, spec: NetworkInterfaceSpec) -> Option<String> {
+        if self.network_interfaces.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let network_interface_id = self.next_id(NETWORK_INTERFACE_ID_PREFIX);
+        // "The status of the network interface" (`NetworkInterface$Status`): an interface
+        // something holds is `in-use`, one that is attached to nothing is `available`. A
+        // detached attachment holds nothing, so it leaves the interface `available`.
+        let held = spec
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| !attachment_is_detached(attachment));
+        let status = if held {
+            NETWORK_INTERFACE_STATUS_IN_USE
+        } else {
+            NETWORK_INTERFACE_STATUS_AVAILABLE
+        };
+        let interface = NetworkInterface {
+            attachment: spec.attachment,
+            availability_zone: Some(spec.availability_zone),
+            availability_zone_id: Some(spec.availability_zone_id),
+            description: Some(spec.description),
+            groups: Some(spec.groups),
+            interface_type: Some(spec.interface_type),
+            network_interface_id: Some(network_interface_id.clone()),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            // "The private IPv4 addresses associated with the network interface"
+            // (`NetworkInterface$PrivateIpAddresses`): the primary one is one of them, so
+            // it appears in both members rather than only in the scalar. An interface
+            // stored without a private address reports NO set rather than an empty one:
+            // AWS never reports an interface that holds no address at all.
+            private_ip_addresses: spec.private_ip_address.as_ref().map(|address| {
+                vec![NetworkInterfacePrivateIpAddress {
+                    primary: Some(true),
+                    private_ip_address: Some(address.clone()),
+                    ..NetworkInterfacePrivateIpAddress::default()
+                }]
+            }),
+            private_ip_address: spec.private_ip_address,
+            // An interface a caller creates is the account's own, not one Amazon manages
+            // on its behalf ("Indicates whether the network interface is being managed by
+            // Amazon Web Services" — `NetworkInterface$RequesterManaged`).
+            requester_managed: Some(false),
+            // "Indicates whether source/destination checking is enabled"
+            // (`NetworkInterface$SourceDestCheck`): on, which is where AWS starts an
+            // interface until `ModifyNetworkInterfaceAttribute` turns it off.
+            source_dest_check: Some(true),
+            status: Some(status.to_string()),
+            subnet_id: Some(spec.subnet_id),
+            tag_set: Some(spec.tags),
+            vpc_id: Some(spec.vpc_id),
+            ..NetworkInterface::default()
+        };
+        // [`STORED_RECORD_OVERHEAD_BYTES`] beside the caller-chosen bytes, so an interface
+        // with no description and no tags is not free against the byte budget either.
+        self.add_stored_bytes(
+            network_interface_payload_bytes(&interface)
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        self.network_interfaces
+            .insert(network_interface_id.clone(), interface);
+        Some(network_interface_id)
+    }
+
+    /// Remove the network interface `network_interface_id` and answer it as it was last
+    /// reported, or `None` when the store holds no such interface. The bytes the record
+    /// held go back to the store's budget on exactly the terms
+    /// [`Self::insert_network_interface`] took them on.
+    pub fn remove_network_interface(
+        &mut self,
+        network_interface_id: &str,
+    ) -> Option<NetworkInterface> {
+        let interface = self.network_interfaces.remove(network_interface_id)?;
+        self.release_stored_bytes(
+            network_interface_payload_bytes(&interface)
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        Some(interface)
+    }
+
+    /// The attachment that still holds the network interface `network_interface_id`, or
+    /// `None` when nothing holds it — either because the store has no such interface or
+    /// because its attachment has been taken away.
+    ///
+    /// A READ ONLY: this is what "you must detach the network interface before you can
+    /// delete it" (`DeleteNetworkInterface`) asks, so every operation that must refuse a
+    /// held interface asks it the same way.
+    pub fn network_interface_attachment(
+        &self,
+        network_interface_id: &str,
+    ) -> Option<&NetworkInterfaceAttachment> {
+        self.network_interfaces
+            .get(network_interface_id)?
+            .attachment
+            .as_ref()
+            .filter(|attachment| !attachment_is_detached(attachment))
+    }
+}
+
+/// Whether `attachment` holds nothing any more: its `Status` has reached
+/// [`ATTACHMENT_STATUS_DETACHED`]. Every other status — including an attachment that
+/// carries none at all — still holds the interface.
+fn attachment_is_detached(attachment: &NetworkInterfaceAttachment) -> bool {
+    attachment.status.as_deref() == Some(ATTACHMENT_STATUS_DETACHED)
+}
+
 /// Refuse an association the resource already has with something else, which the request
 /// did not allow to be replaced: HTTP 400 `Resource.AlreadyAssociated`.
 pub fn resource_already_associated<E>(message: impl Into<String>) -> Scaffolded<E> {
@@ -14043,6 +14418,68 @@ pub const ADDRESS_FAMILY_IPV4: &str = "ipv4";
 /// The `AddressFamily` of an IPv6 pool or range.
 pub const ADDRESS_FAMILY_IPV6: &str = "ipv6";
 
+/// The id prefix an IPAM scope is minted with.
+///
+/// The prefix AWS's own refusal spells for a scope that does not exist ("The IPAM scope
+/// (ipam-scope-…) does not exist", recorded in the wire corpus for a `CreateIpamPool` naming
+/// an unknown scope), read through the one [`prefixed_id_is_well_formed`] every resource of
+/// this module asks.
+pub const IPAM_SCOPE_ID_PREFIX: &str = "ipam-scope";
+
+/// The `IpamScopeType` of a scope holding the account's own internal space: the other member
+/// of that catalog beside [`IPAM_SCOPE_TYPE_PUBLIC`]
+/// (`smithy_query(query="shape",shape="IpamScopeType")` is `public | private`).
+pub const IPAM_SCOPE_TYPE_PRIVATE: &str = "private";
+
+/// A pool whose creation has been asked for and has not settled yet: the `IpamPoolState`
+/// enum's `create-in-progress` member
+/// (`smithy_query(query="shape",shape="IpamPoolState")`), which is what `CreateIpamPool`
+/// answers with.
+pub const IPAM_POOL_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// A pool whose creation has settled: the `IpamPoolState` enum's `create-complete` member,
+/// which the clock owes an [`IPAM_POOL_STATE_CREATE_IN_PROGRESS`] pool one
+/// [`TRANSITION_DELAY`] after the call that created it.
+pub const IPAM_POOL_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// The `IpamPoolPublicIpSource` a public-scope pool gets when the request names none:
+/// "Default is byoip" (`CreateIpamPoolRequest$PublicIpSource`).
+pub const IPAM_POOL_PUBLIC_IP_SOURCE_BYOIP: &str = "byoip";
+
+/// The `ResourceType` an IPAM pool is tagged under, from the modelled catalog
+/// (`crate::ops::types::RESOURCE_TYPE_VALUES` carries `ipam-pool`), and the type segment of
+/// its ARN.
+pub const RESOURCE_TYPE_IPAM_POOL: &str = "ipam-pool";
+
+/// The `ResourceType` an IPAM scope is tagged under, from the same catalog, and the type
+/// segment of its ARN.
+pub const RESOURCE_TYPE_IPAM_SCOPE: &str = "ipam-scope";
+
+/// How deep a tree of IPAM pools may go: "The pool depth quota is 10"
+/// (`IpamPool$PoolDepth`). A top-level pool sits at depth 1 and a pool created inside a
+/// source pool one deeper, so a create that would pass this is refused rather than stored.
+pub const MAX_IPAM_POOL_DEPTH: i32 = 10;
+
+/// The depth of a pool created with no source pool: "the depth of pools in your IPAM pool"
+/// (`IpamPool$PoolDepth`) counts the pool itself, so a top-level pool is at 1.
+pub const TOP_LEVEL_IPAM_POOL_DEPTH: i32 = 1;
+
+/// The longest netmask an address of `family` can carry: "Possible netmask lengths for IPv4
+/// addresses are 0 - 32. Possible netmask lengths for IPv6 addresses are 0 - 128"
+/// (`CreateIpamPoolRequest$AllocationMinNetmaskLength`).
+///
+/// The modelled `IpamNetmaskLength` carries `range 0..128`, which the boundary validator has
+/// already applied, so this is the per-family bound INSIDE it that a pool's own allocation
+/// rules are held to. The family has been through the modelled `AddressFamily` enum
+/// (`ipv4 | ipv6`) by the time this is asked, so anything that is not IPv6 is IPv4.
+pub fn max_netmask_length_for_family(family: &str) -> i32 {
+    if family == ADDRESS_FAMILY_IPV6 {
+        128
+    } else {
+        32
+    }
+}
+
 /// The address family a canonical BYOIP range belongs to, as `AddressFamily` spells it on
 /// the wire.
 ///
@@ -14105,6 +14542,30 @@ pub const INVALID_IPAM_POOL_ID_NOT_FOUND: &str = "InvalidIpamPoolId.NotFound";
 
 /// `InvalidIpamPoolId.Malformed` (HTTP 400).
 pub const INVALID_IPAM_POOL_ID_MALFORMED: &str = "InvalidIpamPoolId.Malformed";
+
+/// `InvalidIpamScopeId.NotFound` (HTTP 400): the request named an IPAM scope id this account
+/// holds no scope for — the code AWS answers a `CreateIpamPool` naming an unknown scope
+/// with, as the wire corpus records.
+pub const INVALID_IPAM_SCOPE_ID_NOT_FOUND: &str = "InvalidIpamScopeId.NotFound";
+
+/// `InvalidIpamScopeId.Malformed` (HTTP 400): the request named something that is not an
+/// IPAM scope id at all, so there is nothing to look up.
+pub const INVALID_IPAM_SCOPE_ID_MALFORMED: &str = "InvalidIpamScopeId.Malformed";
+
+/// Refuse a well-formed IPAM scope id this account holds no scope for: HTTP 400
+/// [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`].
+///
+/// The wording is this resource's own — "The IPAM scope (…) does not exist.", the sentence
+/// AWS answered a `CreateIpamPool` naming a scope that does not exist with — built from the
+/// id the REQUEST named, never from the recording. The parenthesised id is why this resource
+/// does not go through [`id_not_found`], whose sentence quotes the id instead.
+pub fn invalid_ipam_scope_id_not_found<E>(scope_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IPAM_SCOPE_ID_NOT_FOUND,
+        400,
+        format!("The IPAM scope ({scope_id}) does not exist."),
+    )
+}
 
 /// Refuse an id of the kind `prefix` names that this service cannot resolve: a malformed
 /// one with `malformed`, an unknown one with `not_found`, in that order — the order the
@@ -14432,7 +14893,7 @@ impl ComAmazonawsEc2Amazonec2State {
         view.ipam_pool_arn = Some(::engine::emulator_arn(
             "ec2",
             view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
-            &format!("ipam-pool/{pool_id}"),
+            &format!("{RESOURCE_TYPE_IPAM_POOL}/{pool_id}"),
         ));
         self.add_stored_bytes(
             STORED_RECORD_OVERHEAD_BYTES
@@ -14441,6 +14902,108 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         self.ipam_pools.insert(pool_id.clone(), view);
         Some(pool_id)
+    }
+
+    /// Whether another IPAM scope fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]) — the same contract as
+    /// [`Self::has_ipam_pool_capacity`].
+    pub fn has_ipam_scope_capacity(&self) -> bool {
+        self.ipam_scopes.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store an IPAM scope and answer the `IpamScopeId` it was given — or `None` when the
+    /// store is at its ceiling and nothing was stored.
+    ///
+    /// The ONE way a scope is stored, so the members the SERVICE owns cannot be built two
+    /// ways: the id, the ARN it reports, the account that owns it and the number of pools in
+    /// it are all derived here — a scope nothing has created a pool in holds none — rather
+    /// than taken from a caller, exactly as [`Self::insert_ipam_pool`] derives a pool's.
+    pub fn insert_ipam_scope(&mut self, mut view: IpamScope) -> Option<String> {
+        if !self.has_ipam_scope_capacity() {
+            return None;
+        }
+        let scope_id = self.next_id(IPAM_SCOPE_ID_PREFIX);
+        view.ipam_scope_id = Some(scope_id.clone());
+        // "The Amazon Resource Name (ARN) of the scope" (`IpamScope$IpamScopeArn`): an EC2
+        // ARN in the IPAM's own Region, under this resource's modelled type.
+        view.ipam_scope_arn = Some(::engine::emulator_arn(
+            "ec2",
+            view.ipam_region.as_deref().unwrap_or(DEFAULT_REGION),
+            &format!("{RESOURCE_TYPE_IPAM_SCOPE}/{scope_id}"),
+        ));
+        // "The Amazon Web Services account ID of the owner of the scope"
+        // (`IpamScope$OwnerId`): this emulator serves one account.
+        view.owner_id = Some(::engine::emulator_account_id().to_string());
+        // "The number of pools in the scope" (`IpamScope$PoolCount`), which
+        // [`Self::recount_ipam_scope_pools`] keeps as pools are created in it.
+        view.pool_count = Some(0);
+        self.add_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+                + view.description.as_deref().unwrap_or_default().len(),
+        );
+        self.ipam_scopes.insert(scope_id.clone(), view);
+        Some(scope_id)
+    }
+
+    /// Store an IPAM pool a create has just made in the scope `scope_id` names, and answer
+    /// the `IpamPoolId` it was given — or `None` when the store is at its ceiling and
+    /// nothing was stored.
+    ///
+    /// The ONE way a CREATED pool is stored, so no path can leave the store disagreeing with
+    /// itself about one: the pool is answered in the non-terminal `create-in-progress` state,
+    /// so the clock owes it [`IPAM_POOL_STATE_CREATE_COMPLETE`] one [`TRANSITION_DELAY`]
+    /// later ([`Self::ipam_pool_create_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); `client_token` names the pool from here on so
+    /// a replay of the same request answers it instead of creating a second one; the scope's
+    /// own count of the pools in it is recounted; and every caller-chosen byte the record
+    /// retains — the allocation resource tags and the token beside what
+    /// [`Self::insert_ipam_pool`] already charges — is charged to the store's budget.
+    pub fn insert_creating_ipam_pool(
+        &mut self,
+        scope_id: &str,
+        client_token: Option<&str>,
+        mut view: IpamPool,
+    ) -> Option<String> {
+        view.state = Some(IPAM_POOL_STATE_CREATE_IN_PROGRESS.to_string());
+        let retained = ipam_resource_tag_list_bytes(
+            view.allocation_resource_tags.as_deref().unwrap_or_default(),
+        ) + client_token.unwrap_or_default().len();
+        let pool_id = self.insert_ipam_pool(view)?;
+        self.add_stored_bytes(retained);
+        self.ipam_pool_create_complete_at
+            .insert(pool_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_pool_client_tokens
+                .insert(token.to_string(), pool_id.clone());
+        }
+        self.recount_ipam_scope_pools(scope_id);
+        Some(pool_id)
+    }
+
+    /// Set the scope's `PoolCount` to the number of pools the store now holds in it.
+    ///
+    /// "The number of pools in the scope" (`IpamScope$PoolCount`) is DERIVED from the pools
+    /// themselves, so it is recounted from them rather than incremented — two writers cannot
+    /// then leave the scope claiming a pool count the store does not hold. A pool names its
+    /// scope by `IpamScopeArn` (the modelled [`IpamPool`] carries no scope id at all), which
+    /// is what the pools of this scope are counted by.
+    fn recount_ipam_scope_pools(&mut self, scope_id: &str) {
+        let Some(scope_arn) = self
+            .ipam_scopes
+            .get(scope_id)
+            .and_then(|scope| scope.ipam_scope_arn.clone())
+        else {
+            return;
+        };
+        let pools = self
+            .ipam_pools
+            .values()
+            .filter(|pool| pool.ipam_scope_arn.as_deref() == Some(scope_arn.as_str()))
+            .count();
+        if let Some(scope) = self.ipam_scopes.get_mut(scope_id) {
+            scope.pool_count = i32::try_from(pools).ok();
+        }
     }
 }
 
@@ -17644,6 +18207,279 @@ impl ComAmazonawsEc2Amazonec2State {
         self.network_insights_access_scope_analysis_client_tokens
             .insert(spec.client_token, analysis_id);
         Some(stored)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Infrastructure Performance metric subscriptions
+// ---------------------------------------------------------------------------
+
+/// The data aggregation period of a subscription this API enables: the `PeriodType` enum's
+/// `five-minutes` member.
+///
+/// The period is the SERVICE's, not the caller's —
+/// `EnableAwsNetworkPerformanceMetricSubscription`'s request carries no `Period` member at
+/// all, while `Subscription$Period` ("The data aggregation time for the subscription") is
+/// reported back — and it is the period AWS's own Infrastructure Performance
+/// documentation shows on the subscription its
+/// `describe-aws-network-performance-metric-subscriptions` example reports. Naming it once
+/// here is what keeps the enable and the describe from disagreeing about it.
+pub const SUBSCRIPTION_PERIOD: &str = "five-minutes";
+
+/// Which forms of a Region-or-zone endpoint an operation admits.
+///
+/// EC2 names a place in three ways — a Region code (`us-east-1`), an Availability Zone name
+/// (`us-east-1a`) and that zone's id (`use1-az1`) — and its operations differ in which of
+/// them a member accepts, so the difference is a parameter of [`region_of_endpoint`] rather
+/// than a second resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointForms {
+    /// A Region code or an Availability Zone ID, and NOT a zone name: the two forms
+    /// "the source Region (like `us-east-1`) or Availability Zone ID (like `use1-az1`)"
+    /// (`EnableAwsNetworkPerformanceMetricSubscriptionRequest$Source`) names.
+    RegionOrZoneId,
+    /// Any of the three, for a member documented as "a Region or Availability Zone" without
+    /// saying which name of a zone — `GetAwsNetworkPerformanceData`'s locations.
+    RegionOrZoneNameOrZoneId,
+}
+
+/// The Region the endpoint `value` belongs to in the `forms` it admits: the Region itself,
+/// or the Region whose Availability Zone it names. `None` for anything else.
+///
+/// The ONE resolver for every member of this service that names a place, so two operations
+/// cannot disagree about whether a value names one. The catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
+/// sorted — the source of truth [`region_name_is_well_formed`] names), so every partition's
+/// Regions count: this emulator answers for whatever Region a request is signed for
+/// ([`request_region`]), so a GovCloud or China Region is as real an endpoint as a
+/// commercial one. ([`commercial_regions`] is that catalog filtered by partition, which is
+/// a different question — the Regions `GetSpotPlacementScores` scores OVER when a request
+/// narrows nothing.) Both zone forms are derived through
+/// [`availability_zones_in_region`], the one place a Region's zone names and zone ids come
+/// from, so neither form re-derives the shape of a zone id.
+///
+/// The answer is a `&'static str` out of the catalog, so a caller's text can be checked
+/// without any of it reaching the store.
+pub fn region_of_endpoint(value: &str, forms: EndpointForms) -> Option<&'static str> {
+    let catalog = ::emulator_telemetry::policy::KNOWN_REGIONS;
+    if let Ok(position) = catalog.binary_search(&value) {
+        return catalog.get(position).copied();
+    }
+    catalog.iter().copied().find(|region| {
+        availability_zones_in_region(region).iter().any(|zone| {
+            zone.zone_id == value
+                || (forms == EndpointForms::RegionOrZoneNameOrZoneId && zone.zone_name == value)
+        })
+    })
+}
+
+/// The Region the subscription endpoint `endpoint` belongs to, or `None` when it names
+/// neither a Region nor an Availability Zone id.
+///
+/// A `Source`/`Destination` is "the source Region (like `us-east-1`) or Availability Zone
+/// ID (like `use1-az1`)"
+/// (`EnableAwsNetworkPerformanceMetricSubscriptionRequest$Source`), so it is
+/// [`region_of_endpoint`] in [`EndpointForms::RegionOrZoneId`]: the zone's ID is a form of
+/// this member, its NAME is not.
+pub fn subscription_endpoint_region(endpoint: &str) -> Option<&'static str> {
+    region_of_endpoint(endpoint, EndpointForms::RegionOrZoneId)
+}
+
+/// The Region the subscription endpoint `value` of member `member` belongs to, or EC2's
+/// `InvalidParameterValue` refusal naming the value that is neither a Region nor an
+/// Availability Zone id.
+///
+/// The refusal lives HERE, beside the catalog [`subscription_endpoint_region`] it comes
+/// from, so the enable and the disable hold their `Source` and `Destination` to one rule
+/// worded one way rather than to two copies of it — the same reason
+/// [`require_subscription_member`] is shared.
+pub fn require_subscription_endpoint<E>(
+    member: &str,
+    value: &str,
+) -> Result<&'static str, Scaffolded<E>> {
+    subscription_endpoint_region(value).ok_or_else(|| {
+        invalid_parameter_value(format!(
+            "Invalid value '{value}' for {member}. It must be a Region code (like us-east-1) \
+             or an Availability Zone ID (like use1-az1)"
+        ))
+    })
+}
+
+/// The `MetricType` member `requested` names, or `None` when it names none.
+///
+/// The catalog is the generated [`crate::ops::types::METRIC_TYPE_VALUES`], so this module
+/// holds no second copy of it, and answering a `&'static str` out of it keeps request text
+/// out of the store — the same shape as [`snapshot_block_public_access_mode`].
+pub fn subscription_metric(requested: &str) -> Option<&'static str> {
+    crate::ops::types::METRIC_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|metric| *metric == requested)
+}
+
+/// The `StatisticType` member `requested` names, or `None` when it names none
+/// ([`crate::ops::types::STATISTIC_TYPE_VALUES`]).
+pub fn subscription_statistic(requested: &str) -> Option<&'static str> {
+    crate::ops::types::STATISTIC_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|statistic| *statistic == requested)
+}
+
+/// The store key — and the pagination cursor — of the subscription between `source` and
+/// `destination` for one metric and statistic.
+///
+/// A subscription carries no id of its own: the modelled [`Subscription`] is exactly these
+/// four members plus the period the service sets, and the enable and the disable name one
+/// by those four members alone. So they are its identity, and enabling the same four twice
+/// names ONE subscription.
+///
+/// The parts are joined with a space, which sorts ahead of every character a Region code,
+/// an Availability Zone id or a `MetricType`/`StatisticType` member can carry (lowercase
+/// letters, digits and `-`), so one part being a prefix of another cannot reorder two keys
+/// — the same cursor construction as [`offering_page_cursor`].
+pub fn subscription_key(source: &str, destination: &str, metric: &str, statistic: &str) -> String {
+    format!("{source} {destination} {metric} {statistic}")
+}
+
+/// The key `subscription` is stored under, read back off the subscription itself so a
+/// reported subscription and its cursor cannot disagree.
+pub fn subscription_key_of(subscription: &Subscription) -> String {
+    subscription_key(
+        subscription.source.as_deref().unwrap_or_default(),
+        subscription.destination.as_deref().unwrap_or_default(),
+        subscription.metric.as_deref().unwrap_or_default(),
+        subscription.statistic.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The value of a member a subscription request must name, or EC2's `MissingParameter`
+/// refusal naming the member.
+///
+/// The model marks none of `Source`, `Destination`, `Metric` and `Statistic` `@required`
+/// (`smithy_query(query="shape",shape="EnableAwsNetworkPerformanceMetricSubscriptionRequest")`),
+/// so the boundary validator admits a request that omits one and the handler is what
+/// refuses it — with `MissingParameter`, the code EC2 answers for a parameter the request
+/// left out, rather than a 501 or a value error. An empty value names nothing either, so it
+/// is the same refusal.
+pub fn require_subscription_member<'a, E>(
+    value: Option<&'a str>,
+    member: &str,
+) -> Result<&'a str, Scaffolded<E>> {
+    value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| missing_parameter(format!("The request must contain the parameter {member}")))
+}
+
+/// The largest number of Infrastructure Performance metric subscriptions this in-memory
+/// store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each subscription
+/// is an entry in this process's memory and nothing reclaims one but a disable, so the
+/// number a caller can enable has to be finite. The identity of a subscription already
+/// closes the key space — every part of a key comes from a catalog (a Region or zone of
+/// [`subscription_endpoint_region`], a `MetricType` and a `StatisticType` member), so
+/// repeated enables cannot mint fresh keys without end — and this ceiling is the second,
+/// explicit bound: it is enforced INSIDE
+/// [`ComAmazonawsEc2Amazonec2State::enable_network_performance_subscription`], so no writer
+/// can grow the store past it even if a future caller forgets to ask first.
+pub const MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS: usize = 1_000;
+
+/// The code an enable past [`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`] answers with.
+///
+/// EC2 names every per-resource quota refusal `<Resource>LimitExceeded`
+/// ([`VPC_LIMIT_EXCEEDED`]), and EC2's model declares no error shapes at all, so this
+/// resource's code follows that convention.
+pub const SUBSCRIPTION_LIMIT_EXCEEDED: &str = "SubscriptionLimitExceeded";
+
+/// Refuse an enable that would take the store past
+/// [`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`]: HTTP 400 [`SUBSCRIPTION_LIMIT_EXCEEDED`].
+pub fn subscription_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        SUBSCRIPTION_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of Infrastructure Performance metric subscriptions has been \
+             reached ({MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS})"
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another subscription fits inside the store's ceiling
+    /// ([`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: an enable asks first and refuses
+    /// with [`subscription_limit_exceeded`] when it answers `false`.
+    pub fn has_network_performance_subscription_capacity(&self) -> bool {
+        self.network_performance_subscriptions.len() < MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS
+    }
+
+    /// Enable the subscription naming `source`, `destination`, `metric` and `statistic`,
+    /// and answer it as stored.
+    ///
+    /// `metric` and `statistic` are `&'static str`s out of
+    /// [`subscription_metric`]/[`subscription_statistic`], and `source` and `destination`
+    /// are endpoints [`subscription_endpoint_region`] resolved, so every word stored here
+    /// comes from a catalog rather than from the request's own bytes.
+    ///
+    /// Enabling a subscription that is already enabled changes nothing — the four members
+    /// are its identity, so there is one subscription either way, and it keeps the period
+    /// it was enabled with. What comes back is the stored subscription itself, so the
+    /// enable and a later describe cannot report one subscription differently.
+    ///
+    /// `None` means the store is at [`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`] and NOTHING
+    /// was stored; the caller refuses with [`subscription_limit_exceeded`] rather than
+    /// reporting a subscription it does not hold. The ceiling is enforced here as well as
+    /// by [`Self::has_network_performance_subscription_capacity`], so a writer that forgets
+    /// the gate cannot grow the store without bound either. An enable naming a subscription
+    /// the store ALREADY holds adds no entry, so it is admitted whatever the count.
+    pub fn enable_network_performance_subscription(
+        &mut self,
+        source: &str,
+        destination: &str,
+        metric: &'static str,
+        statistic: &'static str,
+    ) -> Option<Subscription> {
+        let key = subscription_key(source, destination, metric, statistic);
+        // An enable that names a subscription already held adds no entry, so only a new key
+        // has to fit inside the ceiling.
+        if !self.network_performance_subscriptions.contains_key(&key)
+            && !self.has_network_performance_subscription_capacity()
+        {
+            return None;
+        }
+        Some(
+            self.network_performance_subscriptions
+                .entry(key)
+                .or_insert_with(|| Subscription {
+                    source: Some(source.to_string()),
+                    destination: Some(destination.to_string()),
+                    metric: Some(metric.to_string()),
+                    statistic: Some(statistic.to_string()),
+                    period: Some(SUBSCRIPTION_PERIOD.to_string()),
+                })
+                .clone(),
+        )
+    }
+
+    /// Disable the subscription those four members name, answering whether the account
+    /// held one.
+    ///
+    /// `DisableAwsNetworkPerformanceMetricSubscription` names a subscription the same way
+    /// the enable does, so the key is built the same way; after this call the account has
+    /// no subscription for those members, which is what the disable asked for whether or
+    /// not one was held.
+    pub fn disable_network_performance_subscription(
+        &mut self,
+        source: &str,
+        destination: &str,
+        metric: &str,
+        statistic: &str,
+    ) -> bool {
+        self.network_performance_subscriptions
+            .remove(&subscription_key(source, destination, metric, statistic))
+            .is_some()
     }
 }
 

@@ -19,6 +19,8 @@ mod missing_resource_lookups;
 mod resource_tag_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/task_instance_reads.rs"]
+mod task_instance_reads;
 #[path = "all/validation_errors.rs"]
 mod validation_errors;
 #[path = "all/workflow_lifecycle.rs"]

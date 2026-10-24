@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the named tag keys from the persisted resource a `ResourceArn` names.
 //!
 //! ## Shape of an operation
 //!
@@ -133,23 +125,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Detach the named tag keys from the resource the `ResourceArn` names.
+    ///
+    /// Removal is per KEY and touches nothing else: a key the resource carries is gone
+    /// afterwards, a key it never carried removes nothing, and every tag whose key the
+    /// request did not name keeps its value. So the call's result is "none of these keys is
+    /// attached any more", which makes a repeat of the same call a no-op rather than a
+    /// failure — the operation models no error for an absent key, and the empty `TagKeys`
+    /// list the modelled `length 0..200` admits removes nothing at all.
+    ///
+    /// The tag set belongs to the stored resource, so an ARN that names no resource this
+    /// service holds is the modelled `ResourceNotFoundException` (404) and writes nothing:
+    /// there is no resource to detach a tag from.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::ThrottlingException(ThrottlingException {
+                message: crate::state::STATE_UNAVAILABLE.to_string(),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The tag set is keyed by the STORED resource's own ARN, so it is resolved before
+        // anything is removed — and copied out, since the removal borrows the store mutably.
+        let Some(arn) = store
+            .tagged_resource_arn(&input.resource_arn)
+            .map(ToString::to_string)
+        else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(&input.resource_arn),
+            )
+            .into());
+        };
+
+        store.remove_tags(&arn, &input.tag_keys);
+        Ok(UntagResourceOutput {})
     }
 }

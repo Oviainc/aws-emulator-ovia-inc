@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -170,10 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A read: the response is computed from the stored record and the tag store
         // and nothing is written, so a later caller sees exactly what this one saw.
+        let region = crate::state::request_region(ctx.parts());
         let state = store.lock();
         // The `Id` addresses the resource (it is an `@httpLabel`), so one this service
-        // holds nothing under is the addressed resource missing — 404.
-        let Some(stored) = state.packaging_configurations.get(&input.id) else {
+        // holds nothing under IN THIS REGION is the addressed resource missing — 404.
+        let Some(stored) = state.packaging_configuration(&region, &input.id) else {
             return Err(DescribePackagingConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::scaffolded::not_found_message(

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableAwsNetworkPerformanceMetricSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableAwsNetworkPerformanceMetricSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableAwsNetworkPerformanceMetricSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables one Infrastructure Performance metric subscription in [`crate::state`]: the
+//! subscription the request's `Source`, `Destination`, `Metric` and `Statistic` name, which
+//! `DescribeAwsNetworkPerformanceMetricSubscriptions` then reports. A MUTATION — "Enables
+//! Infrastructure Performance subscriptions" — and an idempotent one, because those four
+//! members are the subscription's identity, so enabling them twice leaves one
+//! subscription.
+//!
+//! Every caller of this emulator holds the action's permissions, so a `DryRun` request
+//! always resolves to the permitted branch (`DryRunOperation`, HTTP 412) and never to
+//! `UnauthorizedOperation`: the answer says the request would have succeeded, not that any
+//! principal was evaluated.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +145,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableAwsNetworkPerformanceMetricSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableAwsNetworkPerformanceMetricSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableAwsNetworkPerformanceMetricSubscription"))
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // subscription is named by the Regions and zones the REQUEST names, not by the one
+        // it was signed for. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The four members that name the subscription. None is modelled `@required`, so
+        // the boundary validator admits a request that omits one and this is what refuses
+        // it; the refusal names the member, so it is built from the request.
+        let source = state::require_subscription_member(input.source.as_deref(), "Source")?;
+        let destination =
+            state::require_subscription_member(input.destination.as_deref(), "Destination")?;
+        let metric = state::require_subscription_member(input.metric.as_deref(), "Metric")?;
+        let statistic =
+            state::require_subscription_member(input.statistic.as_deref(), "Statistic")?;
+
+        // "The metric used for the enabled subscription" is one `MetricType` member and
+        // "the statistic used for the enabled subscription" one `StatisticType` member. The
+        // model declares both as enums, so the request walk has already refused a value
+        // outside either catalog; resolving it again here is what yields the `&'static str`
+        // the store keeps, so the stored word is a modelled member rather than the
+        // request's own text.
+        let metric = state::subscription_metric(metric).ok_or_else(|| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{metric}' for Metric. It must be one of: {catalog}",
+                catalog = METRIC_TYPE_VALUES.join(", "),
+            ))
+        })?;
+        let statistic = state::subscription_statistic(statistic).ok_or_else(|| {
+            state::invalid_parameter_value(format!(
+                "Invalid value '{statistic}' for Statistic. It must be one of: {catalog}",
+                catalog = STATISTIC_TYPE_VALUES.join(", "),
+            ))
+        })?;
+
+        // "The source Region (like us-east-1) or Availability Zone ID (like use1-az1) that
+        // the metric subscription is enabled for" — and the same two forms for
+        // `Destination`. Anything that is neither names no place to measure between, so it
+        // is refused with the value it carried.
+        let source_region = state::require_subscription_endpoint("Source", source)?;
+        let destination_region = state::require_subscription_endpoint("Destination", destination)?;
+
+        // "If you use Availability Zone IDs, the Source and Destination Availability Zones
+        // must be in the same Region" (`Source`/`Destination`). An endpoint is a zone id
+        // exactly when it is not the Region it resolved to, so the rule applies only when
+        // BOTH are zones — each member is a value the service accepts on its own, which is
+        // what `InvalidParameterCombination` says.
+        if source != source_region
+            && destination != destination_region
+            && source_region != destination_region
+        {
+            return Err(state::invalid_parameter_combination(format!(
+                "The Source Availability Zone '{source}' is in {source_region} and the \
+                 Destination Availability Zone '{destination}' is in {destination_region}; \
+                 Availability Zones must be in the same Region"
+            )));
+        }
+
+        // Every member of the request has been checked, so this is a request that would have
+        // succeeded: a dry run stops HERE — "If you have the required permissions, the error
+        // response is DryRunOperation" (`DryRun`) — before the store is even reached, so the
+        // path that writes nothing takes no lock either.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let subscriptions = state::require_service_state(&*self.engine)?;
+        let mut store = subscriptions.lock();
+
+        // "Indicates whether the subscribe action was successful"
+        // (`EnableAwsNetworkPerformanceMetricSubscriptionResult$Output`): the writer answers
+        // the subscription the store now holds for those four members — whether this call
+        // created it or it was already enabled — and `None` only when the store is at its
+        // ceiling and nothing was stored, which is refused with EC2's own quota code rather
+        // than reported as a subscription the account does not have. So reaching the `Ok`
+        // below IS the subscribe having succeeded.
+        let stored = store
+            .enable_network_performance_subscription(source, destination, metric, statistic)
+            .ok_or_else(state::subscription_limit_exceeded)?;
+        // The stored subscription carries the four members it is keyed by; naming it here
+        // keeps the write and the answer about one subscription.
+        debug_assert_eq!(
+            state::subscription_key_of(&stored),
+            state::subscription_key(source, destination, metric, statistic),
+            "the stored subscription must be the one the request named"
+        );
+
+        Ok(EnableAwsNetworkPerformanceMetricSubscriptionOutput { output: Some(true) })
     }
 }

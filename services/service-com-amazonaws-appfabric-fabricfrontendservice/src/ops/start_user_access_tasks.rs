@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartUserAccessTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartUserAccessTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartUserAccessTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation is IMPLEMENTED: it fans out over the named app bundle's app
+//! authorizations, starts one user access task per `Connected` one and persists it under
+//! the bundle, where `BatchGetUserAccessTasks` polls it back.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +111,44 @@ impl From<StartUserAccessTasksErrorModeled> for StartUserAccessTasksError {
     }
 }
 
+/// One of the app bundle's app authorizations, snapshotted out of the store
+/// before any task is minted.
+///
+/// A user access task is started per authorization, and what decides each
+/// reported item is the authorization's (`app`, tenant) pair and whether it has
+/// completed the connect handshake — so those four fields are all this call
+/// needs, and holding them by name keeps the snapshot readable where a tuple
+/// would not be.
+struct Authorization {
+    app: String,
+    tenant_identifier: String,
+    tenant_display_name: String,
+    status: String,
+}
+
+impl Authorization {
+    /// One bundle's app authorizations in creation order, so the list this
+    /// operation reports is stable across calls.
+    fn snapshot_of(bundle: &crate::state::AppBundleRecord) -> Vec<Self> {
+        bundle
+            .app_authorizations_in_order()
+            .into_iter()
+            .map(|authorization| Self {
+                app: authorization.app.clone(),
+                tenant_identifier: authorization.tenant_identifier.clone(),
+                tenant_display_name: authorization.tenant_display_name.clone(),
+                status: authorization.status.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether this authorization has completed the connect handshake, which is
+    /// what AppFabric needs to reach the application at all.
+    fn is_connected(&self) -> bool {
+        self.status == crate::state::APP_AUTHORIZATION_STATUS_CONNECTED
+    }
+}
+
 /// The `StartUserAccessTasks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,23 +180,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_USER_ACCESS_TASKS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 201u16;
 
+    /// Start one user access task per app authorization the named bundle holds.
+    ///
+    /// A task searches ONE application tenant for the email address, and
+    /// AppFabric reaches an application only through an app authorization of
+    /// that tenant which has completed the connect handshake — so the bundle's
+    /// authorizations are what this call fans out over: a `Connected` one gets a
+    /// task minted under the bundle (reported with its `taskId`), and one that
+    /// is not yet connected is reported with the modelled `error` and no task.
+    /// A bundle holding no authorizations therefore starts no tasks and reports
+    /// an empty list, and a bundle the store does not hold is the modelled
+    /// `ResourceNotFoundException`.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartUserAccessTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartUserAccessTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartUserAccessTasks"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartUserAccessTasksErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AppFabric emulator could not reach its state store".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // ONE lookup and ONE refusal: the bundle must exist before anything is
+        // minted, and its authorizations are snapshotted in creation order so
+        // the reported list is stable across calls.
+        let Some(authorizations) = store
+            .resolve_bundle(&input.app_bundle_identifier)
+            .map(Authorization::snapshot_of)
+        else {
+            return Err(StartUserAccessTasksErrorModeled::ResourceNotFoundException(
+                crate::state::app_bundle_id_not_valid(&input.app_bundle_identifier),
+            )
+            .into());
+        };
+
+        let started_at = ::std::time::SystemTime::now();
+        // A task's status is non-terminal for a span the clock owes, so the
+        // settle instant is STORED here rather than waited for.
+        let settles_at = started_at + crate::state::USER_ACCESS_TASK_SETTLES_AFTER;
+        // The records are minted BEFORE the bundle is borrowed for writing,
+        // because `next_sequence` is the store's own counter.
+        let minted: Vec<Option<crate::state::UserAccessTaskRecord>> = authorizations
+            .iter()
+            .map(|authorization| {
+                authorization
+                    .is_connected()
+                    .then(|| crate::state::UserAccessTaskRecord {
+                        id: crate::state::new_uuid(),
+                        app: authorization.app.clone(),
+                        tenant_identifier: authorization.tenant_identifier.clone(),
+                        tenant_display_name: authorization.tenant_display_name.clone(),
+                        email: input.email.clone(),
+                        started_at,
+                        settles_at,
+                        sequence: store.next_sequence(),
+                    })
+            })
+            .collect();
+
+        if let Some(bundle) = store.resolve_bundle_mut(&input.app_bundle_identifier) {
+            for record in minted.iter().flatten() {
+                bundle
+                    .user_access_tasks
+                    .insert(record.id.clone(), record.clone());
+            }
+            // A RESOURCE GUARD on the store: a task is a transient poll record
+            // and this operation models no quota error, so the OLDEST tasks are
+            // dropped instead of the call being refused.
+            bundle.evict_oldest_user_access_tasks();
+        }
+
+        // Every reported item is read back OUT of the store, so what the caller
+        // sees is exactly what a later poll will see.
+        let stored = store.resolve_bundle(&input.app_bundle_identifier);
+        let mut items = Vec::with_capacity(authorizations.len());
+        for (authorization, task) in authorizations.iter().zip(minted.iter()) {
+            match task {
+                Some(record) => {
+                    let Some(item) = stored
+                        .and_then(|bundle| bundle.user_access_tasks.get(&record.id))
+                        .map(crate::state::UserAccessTaskRecord::to_task_item)
+                    else {
+                        return Err(StartUserAccessTasksErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the started user access task could not be read back"
+                                    .to_string(),
+                                retry_after_seconds: None,
+                            },
+                        )
+                        .into());
+                    };
+                    crate::state::audit_resource_change(
+                        ctx.parts(),
+                        Self::NAME,
+                        "UserAccessTask",
+                        &record.id,
+                        "started",
+                    );
+                    items.push(item);
+                }
+                None => items.push(UserAccessTaskItem {
+                    app: authorization.app.clone(),
+                    tenant_id: authorization.tenant_identifier.clone(),
+                    task_id: None,
+                    error: Some(crate::state::user_access_task_not_started(
+                        &authorization.app,
+                        &authorization.status,
+                    )),
+                }),
+            }
+        }
+
+        Ok(StartUserAccessTasksOutput {
+            user_access_tasks_list: Some(items),
+        })
     }
 }
+

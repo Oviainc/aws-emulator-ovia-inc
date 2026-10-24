@@ -12,14 +12,14 @@
 //! is therefore always read back out of what a create call wrote.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AppAuthorization, AppAuthorizationSummary, AppBundle, AppBundleSummary, ConflictException,
     Credential, Destination, DestinationConfiguration, Ingestion, IngestionDestination,
     IngestionDestinationSummary, IngestionSummary, ProcessingConfiguration,
-    ResourceNotFoundException, ServiceQuotaExceededException, Tag, Tenant, ValidationException,
-    ValidationExceptionField,
+    ResourceNotFoundException, ServiceQuotaExceededException, Tag, TaskError, Tenant,
+    UserAccessResultItem, UserAccessTaskItem, ValidationException, ValidationExceptionField,
 };
 
 /// The ARN namespace (and sigv4 signing name) this service's ARNs carry, from
@@ -118,6 +118,40 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// evicts the oldest entry, which is the one least likely to still be retried.
 pub const MAX_CLIENT_TOKENS: usize = 10_000;
 
+/// The non-terminal `ResultStatus` a user access task is started in, from the
+/// model's `ResultStatus` enum (`RESULT_STATUS_VALUES`), whose own documentation
+/// states it: "`IN_PROGRESS`: The user access task is in progress."
+pub const RESULT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The terminal `ResultStatus` of a task whose search could not be carried out,
+/// from the same enum: "`FAILED`: The user access task failed."
+pub const RESULT_STATUS_FAILED: &str = "FAILED";
+
+/// How long after `StartUserAccessTasks` a task's non-terminal status settles.
+///
+/// A CHOSEN span, not an AWS-published duration: AppFabric documents only that a
+/// task runs until the user access data is found or the application's API calls
+/// time out, and this emulator makes no outbound connection, so the span is the
+/// emulator's own. It is non-zero on purpose — a caller polling straight after
+/// the start call still observes the `IN_PROGRESS` status, the way it would
+/// against AppFabric.
+pub const USER_ACCESS_TASK_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// The emulator's ceiling on the user access tasks ONE app bundle keeps.
+///
+/// A RESOURCE GUARD, not an AWS-published quota, and NOT answered with an error:
+/// `StartUserAccessTasks` models no quota error, and a user access task is a
+/// transient poll record rather than a resource a caller creates, so past the
+/// ceiling the OLDEST tasks are dropped (see
+/// [`AppBundleRecord::evict_oldest_user_access_tasks`]) — an evicted task simply
+/// stops being pollable, which is how the same bound on spent idempotency tokens
+/// behaves ([`MAX_CLIENT_TOKENS`]). It is ten times the number of tasks ONE
+/// start call can mint (one per app authorization, bounded by
+/// [`MAX_APP_AUTHORIZATIONS_PER_APP_BUNDLE`]), so repeated start calls over a
+/// bundle at the authorization ceiling keep several calls' worth of tasks
+/// pollable rather than only the newest call's.
+pub const MAX_USER_ACCESS_TASKS_PER_APP_BUNDLE: usize = 10 * MAX_APP_AUTHORIZATIONS_PER_APP_BUNDLE;
+
 /// An app bundle, as `CreateAppBundle` stored it.
 #[derive(Debug, Clone)]
 pub struct AppBundleRecord {
@@ -138,6 +172,11 @@ pub struct AppBundleRecord {
     /// [`AppBundleRecord::connected_authorization`]), so they are stored under
     /// the same bundle record the ingestions are.
     pub app_authorizations: HashMap<String, AppAuthorizationRecord>,
+    /// The user access tasks `StartUserAccessTasks` started under this bundle,
+    /// keyed by task id: `BatchGetUserAccessTasks` polls them back by that id,
+    /// and both operations scope them to the bundle the way the two modelled
+    /// `appBundleIdentifier` members do.
+    pub user_access_tasks: HashMap<String, UserAccessTaskRecord>,
 }
 
 impl AppBundleRecord {
@@ -230,6 +269,35 @@ impl AppBundleRecord {
         self.authorization_for(app, tenant)
             .filter(|authorization| authorization.status == APP_AUTHORIZATION_STATUS_CONNECTED)
     }
+
+    /// This bundle's user access tasks in start order.
+    pub fn user_access_tasks_in_order(&self) -> Vec<&UserAccessTaskRecord> {
+        let mut tasks: Vec<&UserAccessTaskRecord> = self.user_access_tasks.values().collect();
+        tasks.sort_by_key(|task| task.sequence);
+        tasks
+    }
+
+    /// Drop this bundle's OLDEST user access tasks until it is back within
+    /// [`MAX_USER_ACCESS_TASKS_PER_APP_BUNDLE`] — see that ceiling for why a task
+    /// is evicted rather than refused.
+    pub fn evict_oldest_user_access_tasks(&mut self) {
+        let surplus = self
+            .user_access_tasks
+            .len()
+            .saturating_sub(MAX_USER_ACCESS_TASKS_PER_APP_BUNDLE);
+        if surplus == 0 {
+            return;
+        }
+        let evicted: Vec<String> = self
+            .user_access_tasks_in_order()
+            .into_iter()
+            .take(surplus)
+            .map(|task| task.id.clone())
+            .collect();
+        for id in evicted {
+            self.user_access_tasks.remove(&id);
+        }
+    }
 }
 
 /// An app authorization, as `CreateAppAuthorization` stored it and
@@ -298,6 +366,128 @@ impl AppAuthorizationRecord {
             status: self.status.clone(),
             updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
         }
+    }
+}
+
+/// One user access task, as `StartUserAccessTasks` started it.
+///
+/// A task searches ONE application tenant for ONE email address, which is why it
+/// is minted per app authorization: the tenant it searches, and the display name
+/// `BatchGetUserAccessTasks` reports for that tenant, are the authorization's.
+#[derive(Debug, Clone)]
+pub struct UserAccessTaskRecord {
+    /// The task's `UUID` — the key it is stored under and the id a caller polls
+    /// it by.
+    pub id: String,
+    pub app: String,
+    pub tenant_identifier: String,
+    pub tenant_display_name: String,
+    /// The target user's email address, as the start call named it. Reported
+    /// back by the modelled `UserAccessResultItem$email`.
+    pub email: String,
+    pub started_at: SystemTime,
+    /// The instant the clock makes this task's `IN_PROGRESS` status settle into
+    /// its terminal one ([`USER_ACCESS_TASK_SETTLES_AFTER`] past
+    /// [`UserAccessTaskRecord::started_at`]). Stored rather than slept for, so a
+    /// poll reports the status the clock already owes.
+    pub settles_at: SystemTime,
+    /// Start order, so a bundle's tasks are reported in a stable order and the
+    /// oldest is the one evicted first.
+    pub sequence: u64,
+}
+
+impl UserAccessTaskRecord {
+    /// The modelled `UserAccessTaskItem` the start call reports for this task.
+    pub fn to_task_item(&self) -> UserAccessTaskItem {
+        UserAccessTaskItem {
+            app: self.app.clone(),
+            tenant_id: self.tenant_identifier.clone(),
+            task_id: Some(self.id.clone()),
+            // The task WAS started, so there is no start-time error to report;
+            // whether its search succeeded is what a poll reports.
+            error: None,
+        }
+    }
+
+    /// This task's `ResultStatus` at `now`: `IN_PROGRESS` until the clock makes
+    /// it due to settle, and terminal from then on.
+    pub fn result_status(&self, now: SystemTime) -> &'static str {
+        if now < self.settles_at {
+            RESULT_STATUS_IN_PROGRESS
+        } else {
+            RESULT_STATUS_FAILED
+        }
+    }
+
+    /// The modelled `UserAccessResultItem` a poll reports for this task at `now`.
+    ///
+    /// The user members (`userId`, `userFullName`, `userFirstName`,
+    /// `userLastName`, `userStatus`) are reported by AppFabric out of what the
+    /// application answered. This emulator serves no application and makes no
+    /// outbound connection, so nothing searched for them and they stay ABSENT
+    /// rather than carrying a value nothing computed; once the task has
+    /// terminated, the modelled `taskError` says exactly that.
+    pub fn to_result_item(&self, now: SystemTime) -> UserAccessResultItem {
+        let status = self.result_status(now);
+        UserAccessResultItem {
+            app: Some(self.app.clone()),
+            tenant_id: Some(self.tenant_identifier.clone()),
+            tenant_display_name: Some(self.tenant_display_name.clone()),
+            task_id: Some(self.id.clone()),
+            result_status: Some(status.to_string()),
+            email: Some(self.email.clone()),
+            user_id: None,
+            user_full_name: None,
+            user_first_name: None,
+            user_last_name: None,
+            user_status: None,
+            task_error: (status == RESULT_STATUS_FAILED)
+                .then(|| user_access_search_not_performed(&self.app)),
+        }
+    }
+}
+
+/// The `TaskError` a user access task carries once it has terminated.
+///
+/// A user access search is an outbound call into the application itself, which
+/// this emulator does not make: no search ran, so the task ends in the modelled
+/// `FAILED` status with a reason that says so, rather than reporting a user
+/// record nothing looked up.
+pub fn user_access_search_not_performed(app: &str) -> TaskError {
+    TaskError {
+        error_code: Some("ApplicationNotReachable".to_string()),
+        error_message: Some(format!(
+            "The emulator makes no outbound connection to {app}, so the user access status \
+             could not be searched for."
+        )),
+    }
+}
+
+/// The `TaskError` `StartUserAccessTasks` reports for an app authorization it
+/// could not start a task against.
+///
+/// AppFabric reaches an application only through an app authorization that has
+/// completed the connect handshake (authorize → connect → query), so a bundle's
+/// authorization that is not `Connected` yields an item carrying this error and
+/// NO `taskId` — the modelled shape of "this application was not searched".
+pub fn user_access_task_not_started(app: &str, status: &str) -> TaskError {
+    TaskError {
+        error_code: Some("AppAuthorizationNotConnected".to_string()),
+        error_message: Some(format!(
+            "The app authorization for {app} is {status}, not \
+             {APP_AUTHORIZATION_STATUS_CONNECTED}, so no user access task was started for it."
+        )),
+    }
+}
+
+/// A modelled `ResourceNotFoundException` for a user access task the bundle does
+/// not hold — a constant sentence, for the reason [`app_bundle_not_found`]
+/// states, with the polled task id in the modelled `resourceId`.
+pub fn user_access_task_not_found(task_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: "The specified user access task does not exist".to_string(),
+        resource_id: task_id.to_string(),
+        resource_type: "UserAccessTask".to_string(),
     }
 }
 

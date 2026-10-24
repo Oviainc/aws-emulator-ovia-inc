@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteAssetErrorModeled::InternalServerErrorException(
@@ -160,8 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Regional: this delete reaches only the assets of the Region it was served
+        // in, so an `Id` another Region holds is missing here rather than destroyed.
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
-        let Some(removed) = state.assets.remove(&input.id) else {
+        let Some(removed) = state.remove_asset(&region, &input.id) else {
             return Err(DeleteAssetErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::scaffolded::not_found_message("Asset", &input.id)),
             })

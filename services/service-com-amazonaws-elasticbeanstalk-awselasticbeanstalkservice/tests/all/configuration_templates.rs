@@ -40,10 +40,15 @@ const APPLICATION: &str = "template-app";
 /// ResourceName)`. `ResourceName` is empty where the request omits it — "a
 /// unique resource name for the option setting", which only a time-based scaling
 /// option carries.
-type Option4 = (&'static str, &'static str, &'static str, &'static str);
+///
+/// `pub(crate)` along with [`option_params`], [`expected_options`] and
+/// [`reported_options`] below: the `update_environment` suite in this same test
+/// target sends and reads option settings over the same wire, so it drives them
+/// through these rather than keeping a second encoder and reader of its own.
+pub(crate) type Option4 = (&'static str, &'static str, &'static str, &'static str);
 
 /// Borrow an owned parameter list for [`Emulator::call`].
-fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
     params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -53,7 +58,7 @@ fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
 /// The awsQuery form parameters that send `settings` as the request's
 /// `OptionSettings` list (`OptionSettings.member.<n>.<Member>`: the list's
 /// member is unnamed in the model, so it serializes as `member`).
-fn option_params(settings: &[Option4]) -> Vec<(String, String)> {
+pub(crate) fn option_params(settings: &[Option4]) -> Vec<(String, String)> {
     let mut params = Vec::new();
     for (index, (namespace, option_name, value, resource_name)) in settings.iter().enumerate() {
         let position = index + 1;
@@ -83,7 +88,7 @@ fn option_params(settings: &[Option4]) -> Vec<(String, String)> {
 /// ResourceName)` in the order the document lists them. Read member by member,
 /// so an answer that mixes up which value belongs to which option fails rather
 /// than matching four independent flat lists.
-fn reported_options(answer: &Answer) -> Vec<(String, String, String, String)> {
+pub(crate) fn reported_options(answer: &Answer) -> Vec<(String, String, String, String)> {
     answer
         .elements_at("OptionSettings/member")
         .iter()
@@ -99,7 +104,7 @@ fn reported_options(answer: &Answer) -> Vec<(String, String, String, String)> {
 }
 
 /// `settings` in the same shape [`reported_options`] returns.
-fn expected_options(settings: &[Option4]) -> Vec<(String, String, String, String)> {
+pub(crate) fn expected_options(settings: &[Option4]) -> Vec<(String, String, String, String)> {
     settings
         .iter()
         .map(|(namespace, option_name, value, resource_name)| {
@@ -116,7 +121,7 @@ fn expected_options(settings: &[Option4]) -> Vec<(String, String, String, String
 /// The service's own published solution stack at `index` — the catalogue
 /// `ListAvailableSolutionStacks` reports (`eb::state::SOLUTION_STACKS`), so a row
 /// cannot name a platform version the service does not publish.
-fn published_stack(index: usize) -> &'static eb::state::SolutionStack {
+pub(crate) fn published_stack(index: usize) -> &'static eb::state::SolutionStack {
     eb::state::SOLUTION_STACKS
         .get(index)
         .expect("the service publishes this many solution stacks")

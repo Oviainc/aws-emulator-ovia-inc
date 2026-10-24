@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCloudWatchAlarmTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCloudWatchAlarmTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCloudWatchAlarmTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +158,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCloudWatchAlarmTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCloudWatchAlarmTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCloudWatchAlarmTemplate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // A template is only visible to the region it was created in, which is
+        // the region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "Deletes a cloudwatch alarm template": the record LEAVES the store, so
+        // `GetCloudWatchAlarmTemplate` misses from here on, the name the template
+        // held is free again and the group that held it no longer counts it. The
+        // operation documents no precondition, so the miss is the only refusal.
+        state
+            .delete_alarm_template(&region, &input.identifier)
+            .ok_or_else(|| not_found(&input.identifier))?;
+
+        Ok(DeleteCloudWatchAlarmTemplateOutput)
     }
+}
+
+/// No cloudwatch alarm template in this region has that id or name, by either
+/// form `Identifier` documents ("Can be either be its id or current name"). The
+/// operation's own modelled 404, with a message built from the request.
+fn not_found(identifier: &str) -> DeleteCloudWatchAlarmTemplateError {
+    DeleteCloudWatchAlarmTemplateErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::not_found_message(
+            "cloudwatch alarm template",
+            identifier,
+        )),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the template from. A modelled server error,
+/// never a fresh engine (which would drop the deletion when this request
+/// returns).
+fn unavailable() -> DeleteCloudWatchAlarmTemplateError {
+    DeleteCloudWatchAlarmTemplateErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

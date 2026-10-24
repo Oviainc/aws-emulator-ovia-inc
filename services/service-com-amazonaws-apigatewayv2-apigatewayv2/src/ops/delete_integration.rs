@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the [`crate::state::Integration`] record its api holds under the
+//! requested `IntegrationId`, unless a route of that api is still wired to it. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -62,6 +56,11 @@
 //!   See the message field for more information.
 //! * `TooManyRequestsException` (HTTP 429) — A limit has been exceeded. See the accompanying
 //!   error message for details.
+//! * `ConflictException` (HTTP 409) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE models for "the requested operation would cause a conflict with
+//!   the current state of a service resource associated with the request", which is what a
+//!   route still targeting the integration is. This operation's own modelled `errors` list
+//!   omits it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -101,9 +100,17 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteIntegrationOutput 
 // here — hence the `DeleteIntegrationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.apigatewayv2#DeleteIntegration")]
+// `ConflictException` — a shape this SERVICE models, and one `CreateIntegration` on the
+// very same resource lists — is widened in through `extra_errors`: an integration a route
+// is still wired to cannot be removed, and that refusal is a conflict with the current
+// state of the api's resources, not a missing resource (404) or a rate limit (429).
+#[smithy_macros::operation_error(
+    "com.amazonaws.apigatewayv2#DeleteIntegration",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteIntegrationErrorModeled {
+    ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
 }
@@ -159,18 +166,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIntegration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteIntegration",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(format!(
+                "Invalid API identifier specified {}:{}",
+                ::engine::emulator_account_id(),
+                input.api_id
+            )));
+        };
+
+        // An integration is addressed by the api that owns it AND its own id, so an id
+        // that names an integration of ANOTHER api is not found here either — the same
+        // addressing `GetIntegration` reports on.
+        if !api.integrations.contains_key(&input.integration_id) {
+            return Err(not_found(format!(
+                "Invalid Integration identifier specified {}:{}",
+                ::engine::emulator_account_id(),
+                input.integration_id
+            )));
+        }
+
+        // A route of this api holds the reference, through its
+        // `integrations/{IntegrationId}` target. Removing the integration would leave
+        // those routes wired to nothing, so the delete is refused while any of them
+        // exists and the store is left exactly as it was: the caller unwires or deletes
+        // the routes first. The ids are listed so the caller knows which ones.
+        let dependents = api.routes_targeting_integration(&input.integration_id);
+        if !dependents.is_empty() {
+            return Err(DeleteIntegrationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Integration {} cannot be deleted while route(s) {} target it.",
+                        input.integration_id,
+                        dependents.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The api OWNS its integrations, so removing the entry is the whole delete: a
+        // later GetIntegration finds nothing, and a second DeleteIntegration of the
+        // same id answers 404 rather than removing anything again.
+        api.integrations.remove(&input.integration_id);
+
+        Ok(DeleteIntegrationOutput)
     }
+}
+
+/// This operation's "the resource specified in the request was not found" refusal, as
+/// every other reader and writer of an api's child resources spells it: the modelled
+/// `NotFoundException`, whose message names the identifier that resolved to nothing.
+fn not_found(message: String) -> DeleteIntegrationError {
+    DeleteIntegrationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

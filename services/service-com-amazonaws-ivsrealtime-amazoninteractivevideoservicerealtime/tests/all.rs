@@ -19,6 +19,8 @@ mod error_envelope;
 mod ingest_configurations;
 #[path = "all/participant_replication.rs"]
 mod participant_replication;
+#[path = "all/participants.rs"]
+mod participants;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/stages.rs"]

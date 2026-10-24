@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     EncryptionConfiguration, EncryptionConfigurationForRepositoryCreationTemplate, ImageDetail,
-    ImageIdentifier, ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
+    ImageIdentifier, ImageScanFinding, ImageScanFindings, ImageScanStatus,
+    ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
     LifecyclePolicyPreviewResult, LifecyclePolicyPreviewSummary, LifecyclePolicyRuleAction,
     PullThroughCacheRule, ReplicationConfiguration, ReplicationRule, Repository,
     RepositoryCreationTemplate, RepositoryScanningConfiguration, SigningConfiguration, Tag,
@@ -173,6 +174,34 @@ pub const PREVIEW_STATUS_COMPLETE: &str = "COMPLETE";
 /// The `LifecyclePolicyStorageClass` of an image in standard storage — the storage class
 /// that goes with [`ACTIVE_IMAGE_STATUS`], as a lifecycle policy preview spells it.
 pub const STANDARD_STORAGE_CLASS: &str = "STANDARD";
+
+/// How long after the `StartImageScan` call that starts it the clock owes a basic image
+/// scan its `IN_PROGRESS` -> `COMPLETE` transition.
+///
+/// AWS publishes no duration for a basic scan run, so this is a CHOSEN value inside the
+/// 250–750 ms band this project fixes for a clock-owed transition. It is never zero, so a
+/// caller that reads the scan straight after starting it still meets the `IN_PROGRESS`
+/// state. Like [`LIFECYCLE_PREVIEW_DELAY`] it is stored as a due instant and never slept
+/// for: the completion is owed whether or not anybody calls again.
+pub const IMAGE_SCAN_DELAY: Duration = Duration::from_millis(400);
+
+/// The `ScanStatus` a basic scan carries while it is still running.
+pub const SCAN_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `ScanStatus` a basic scan carries once the clock has made its completion due:
+/// the state in which its findings are readable.
+pub const SCAN_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// How often one image may be scanned: "A basic image scan can only be started once per
+/// 24 hours on an individual image. This limit includes if an image was scanned on
+/// initial push." (`StartImageScan`), so a start inside this span of the last scan of
+/// that image is refused with the `LimitExceededException` the operation models.
+pub const BASIC_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many basic scans one registry may start per [`BASIC_SCAN_INTERVAL`]: "You can
+/// start up to 100,000 basic scans per 24 hours." (`StartImageScan`). Unlike the caps
+/// this store sets for itself, this one is AWS's own published number.
+pub const MAX_BASIC_SCANS_PER_INTERVAL: usize = 100_000;
 
 /// The `LifecyclePolicyStorageClass` of an image whose `ImageStatus` is `status`.
 ///
@@ -357,6 +386,169 @@ pub struct LayerBlob {
     pub media_type: Option<String>,
 }
 
+/// The one basic image scan an image carries: the run `StartImageScan` started on it.
+///
+/// A scan is the record of a RUN, not a projection of the image: it exists because a
+/// start call created it, and reading it back computes nothing new. Its status follows
+/// from the instant the clock owes it its completion, so every reader derives the same
+/// answer from the same record and no read has to write.
+#[derive(Debug, Clone)]
+pub struct ImageScan {
+    /// When the call that started this scan was made. It is what the once-per-image
+    /// [`BASIC_SCAN_INTERVAL`] is measured from, and what counts this scan towards the
+    /// registry's [`MAX_BASIC_SCANS_PER_INTERVAL`].
+    pub started_at: SystemTime,
+    /// When the clock owes this scan its `IN_PROGRESS` -> `COMPLETE` transition:
+    /// `started_at` + [`IMAGE_SCAN_DELAY`]. The transition is owed whether or not
+    /// anybody calls again, so the instant is stored and never slept for, and a
+    /// completed scan reports it as `imageScanCompletedAt` — the same instant on every
+    /// read.
+    pub complete_due_at: SystemTime,
+    /// What the scan found, computed once when it was started (see
+    /// [`basic_scan_findings`]) and stored, so paging through the findings reports the
+    /// run rather than a fresh evaluation. The order is the run's own and never changes
+    /// once stored, so a finding's INDEX in this list is the stable, unique and ascending
+    /// key a page of findings is addressed by — see [`Self::finding_page_keys`]; a
+    /// finding's `name` is neither unique nor ordered, so it is not that key.
+    pub findings: Vec<ImageScanFinding>,
+}
+
+impl ImageScan {
+    /// Whether the clock has already made this scan's completion due at `now`.
+    pub fn is_complete(&self, now: SystemTime) -> bool {
+        self.complete_due_at <= now
+    }
+
+    /// When this scan completed, or `None` while it is still running. The instant is the
+    /// one the clock owed, so it does not move between reads.
+    pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.is_complete(now).then_some(self.complete_due_at)
+    }
+
+    /// Whether a new scan of the same image may be started at `now`:
+    /// [`BASIC_SCAN_INTERVAL`] must have passed since this one was started. A clock that
+    /// went backwards leaves the scan inside its interval rather than reopening it.
+    pub fn may_restart_at(&self, now: SystemTime) -> bool {
+        matches!(now.duration_since(self.started_at), Ok(age) if age >= BASIC_SCAN_INTERVAL)
+    }
+
+    /// Whether this scan was started within `interval` of `now` — how a scan is counted
+    /// towards the registry's scan budget.
+    pub fn started_within(&self, interval: Duration, now: SystemTime) -> bool {
+        match now.duration_since(self.started_at) {
+            Ok(age) => age < interval,
+            // Started "after" now: a clock that went backwards, so the scan is inside
+            // any window ending at `now`.
+            Err(_) => true,
+        }
+    }
+
+    /// This scan's findings, each paired with the key a page is addressed by: its
+    /// zero-padded INDEX in the run, which is unique and ascending as a string, so
+    /// [`paginate`] resumes exactly where the previous page ended whatever the findings
+    /// are named (two findings may share a `name`, or carry none at all).
+    ///
+    /// The width is fixed, so the keys sort the way the indices do; one run's findings
+    /// are bounded by the image's own content, far inside it.
+    pub fn finding_page_keys(&self) -> Vec<(String, ImageScanFinding)> {
+        self.findings
+            .iter()
+            .enumerate()
+            .map(|(index, finding)| (format!("{index:012}"), finding.clone()))
+            .collect()
+    }
+
+    /// The `ImageScanStatus` every operation that reports this scan answers with.
+    ///
+    /// The description states the status in words: AWS's own wording for it is not
+    /// documented and no caller rule reads it, so it is this emulator's, derived from the
+    /// status rather than stored beside it.
+    pub fn to_status(&self, now: SystemTime) -> ImageScanStatus {
+        if self.is_complete(now) {
+            ImageScanStatus {
+                status: Some(SCAN_STATUS_COMPLETE.to_string()),
+                description: Some("The scan was completed successfully.".to_string()),
+            }
+        } else {
+            ImageScanStatus {
+                status: Some(SCAN_STATUS_IN_PROGRESS.to_string()),
+                description: Some("The scan is in progress.".to_string()),
+            }
+        }
+    }
+
+    /// How many findings this scan reports per `FindingSeverity`, counted from the
+    /// findings themselves. A scan with no findings counts none, which is the empty map
+    /// ECR reports for an image nothing was found on.
+    pub fn finding_severity_counts(&self) -> ::std::collections::HashMap<String, i32> {
+        let mut counts: ::std::collections::HashMap<String, i32> =
+            ::std::collections::HashMap::new();
+        for finding in &self.findings {
+            if let Some(severity) = finding.severity.as_deref() {
+                *counts.entry(severity.to_string()).or_default() += 1;
+            }
+        }
+        counts
+    }
+
+    /// The `imageScanFindings` a scan read reports, carrying `page` — the page of this
+    /// scan's findings the request asked for — or `None` while the scan is still
+    /// running: findings are readable once it has completed.
+    ///
+    /// The severity counts summarise the WHOLE scan rather than the page, so they do not
+    /// change as a caller pages through the findings. `vulnerabilitySourceUpdatedAt` is
+    /// omitted because no vulnerability source was consulted — see
+    /// [`basic_scan_findings`].
+    pub fn to_findings(
+        &self,
+        now: SystemTime,
+        page: Vec<ImageScanFinding>,
+    ) -> Option<ImageScanFindings> {
+        self.completed_at(now).map(|completed_at| ImageScanFindings {
+            image_scan_completed_at: Some(::aws_smithy_types::DateTime::from(completed_at)),
+            vulnerability_source_updated_at: None,
+            finding_severity_counts: Some(self.finding_severity_counts()),
+            findings: Some(page),
+            // `enhancedFindings` are Amazon Inspector's, which the ENHANCED scan type
+            // produces; a basic scan reports its own findings in `findings`.
+            enhanced_findings: None,
+        })
+    }
+}
+
+/// What a BASIC scan of `image` finds.
+///
+/// A basic image scan is a vulnerability scan of the operating-system packages INSIDE the
+/// image's filesystem layers. This registry records a layer's digest, its size and its
+/// media type — `CompleteLayerUpload` registers that record — and deliberately never the
+/// layer's bytes ([`Repo::layer_blobs`]), so no package of the image is observable here
+/// and no vulnerability database is reachable from the emulator: the scan has nothing to
+/// examine and therefore reports nothing. A finding is never invented for content nothing
+/// has read, so the list is empty, and `findingSeverityCounts` counts it rather than
+/// stating a figure of its own.
+///
+/// It takes the stored image so that the one place a registry holding layer content would
+/// read packages from is this function, and so that every caller gets the findings of the
+/// image it scanned rather than a shared constant.
+pub fn basic_scan_findings(image: &ImageRecord) -> Vec<ImageScanFinding> {
+    let _ = image;
+    Vec::new()
+}
+
+/// Whether `manifest` describes something a basic scan can examine: a container image
+/// with at least one filesystem layer.
+///
+/// A basic scan reads the operating-system packages in an image's filesystem, so the
+/// manifest has to declare one. The Docker image manifest V2 schema 2 and the OCI image
+/// manifest declare it as `layers`, the older V2 schema 1 as `fsLayers`; a manifest LIST
+/// or OCI image index declares neither — it references other manifests, not layers — and
+/// neither does a document that is not an image manifest at all. Those are what
+/// `StartImageScan`'s `UnsupportedImageTypeException` ("the image is of a type that
+/// cannot be scanned") reports.
+pub fn is_scannable_image_manifest(manifest: &str) -> bool {
+    !manifest_layer_descriptors(manifest).is_empty()
+}
+
 /// How many levels of manifest list [`Repo::refresh_image_sizes`] resolves when it
 /// recomputes the size of every stored image.
 ///
@@ -504,6 +696,11 @@ pub struct ImageRecord {
     /// a size for this image.
     pub size_in_bytes: Option<i64>,
     pub pushed_at: SystemTime,
+    /// The one basic scan this image carries, or `None` while none has been started on
+    /// it — which is what `DescribeImageScanFindings` reports `ScanNotFoundException`
+    /// for. One image carries at most one scan ([`BASIC_SCAN_INTERVAL`]), and it lives on
+    /// the image record, so deleting the image drops its scan with it.
+    pub scan: Option<ImageScan>,
     /// This image's `ImageStatus`: [`ACTIVE_IMAGE_STATUS`] while it is in Amazon ECR
     /// standard storage and [`ARCHIVED_IMAGE_STATUS`] once `UpdateImageStorageClass` has
     /// moved it to Amazon ECR archive. Per image, so archiving one image in a repository
@@ -543,10 +740,23 @@ impl ImageRecord {
             last_archived_at: None,
             last_activated_at: None,
             activate_due_at: None,
+            // A scan is started by `StartImageScan`, never by a push: a freshly stored
+            // image carries none, which is what `DescribeImageScanFindings` reports
+            // `ScanNotFoundException` for.
+            scan: None,
         }
     }
 
     /// The `ImageDetail` `DescribeImages` reports for this image.
+    ///
+    /// `imageScanStatus` and `imageScanFindingsSummary` are deliberately NOT reported:
+    /// "The new version of Amazon ECR Basic Scanning doesn't use the
+    /// ImageDetail$imageScanFindingsSummary and ImageDetail$imageScanStatus attributes
+    /// from the API response to return scan results. Use the DescribeImageScanFindings
+    /// API instead." (`DescribeImages`), and this registry is on that new version —
+    /// `BASIC_SCAN_TYPE_VERSION`'s only settable value and its default are `AWS_NATIVE`
+    /// (see [`ACCOUNT_SETTINGS`]). A scan is therefore read through
+    /// `DescribeImageScanFindings`, which reports the record [`ImageScan`] holds.
     pub fn to_detail(&self, registry_id: &str, repository_name: &str) -> ImageDetail {
         ImageDetail {
             registry_id: Some(registry_id.to_string()),
@@ -1694,6 +1904,31 @@ impl Repo {
         }
     }
 
+    /// The stored image an [`ImageIdentifier`] names, FOR MUTATION, or the [`Fault`] it
+    /// resolves to.
+    ///
+    /// The resolution is [`Self::resolve_image`]'s, so an operation that WRITES to an
+    /// image names it exactly as a read does; what this adds is the record to write to,
+    /// so no caller has to look the digest up a second time (and no caller has to invent
+    /// a failure for a second lookup that cannot miss).
+    pub fn resolve_image_mut(
+        &mut self,
+        id: &ImageIdentifier,
+    ) -> Result<&mut ImageRecord, Fault> {
+        // Resolved first, then taken mutably: the digest is the stored record's own, so
+        // the second lookup is the same image and cannot miss. It is still written as a
+        // lookup rather than an unwrap, so a store that changes under this call answers
+        // the caller's own not-found rather than panicking; nothing of the repository is
+        // cloned to word it, because that wording is never reached.
+        let digest = self.resolve_image(id)?.digest.clone();
+        self.images.get_mut(&digest).ok_or_else(|| {
+            Fault::ImageNotFound(format!(
+                "The image with {} does not exist within the repository",
+                identifier_description(id)
+            ))
+        })
+    }
+
     /// Every blob this repository holds, by digest.
     ///
     /// A blob is in a repository because a layer upload against that repository was
@@ -2164,6 +2399,24 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// byte of its payload is stored.
     pub fn has_byte_budget_for(&self, additional: usize) -> bool {
         self.caller_bytes_held().saturating_add(additional) <= MAX_REGISTRY_CALLER_BYTES
+    }
+
+    /// How many basic image scans this registry has started within `interval` of `now`:
+    /// the figure [`MAX_BASIC_SCANS_PER_INTERVAL`] bounds.
+    ///
+    /// Counted from the scans the registry holds rather than from a counter beside them,
+    /// so the budget can never disagree with the scans actually recorded: an image
+    /// deleted with its scan stops counting, exactly as its scan stops being readable.
+    pub fn basic_scans_started_within(&self, interval: Duration, now: SystemTime) -> usize {
+        self.repositories.values().fold(0usize, |started, repo| {
+            repo.images.values().fold(started, |started, image| {
+                let counted = image
+                    .scan
+                    .as_ref()
+                    .is_some_and(|scan| scan.started_within(interval, now));
+                started.saturating_add(usize::from(counted))
+            })
+        })
     }
 
     /// Drop every in-flight upload nothing has touched for [`ABANDONED_UPLOAD_AGE`] as of
@@ -2656,6 +2909,19 @@ pub fn lifecycle_policy_not_found_message(name: &str) -> String {
     format!(
         "Lifecycle policy does not exist for the repository with name '{name}' in the \
          registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when the image an identifier names carries no scan: the state
+/// `ScanNotFoundException` reports ("the specified image scan could not be found"). It
+/// names the identifier the request sent, the repository and the registry, the way every
+/// other not-found in this service does.
+pub fn scan_not_found_message(id: &ImageIdentifier, repository_name: &str) -> String {
+    format!(
+        "Image scan does not exist for the image with '{}' in the repository with name \
+         '{repository_name}' in the registry with id '{}'",
+        identifier_description(id),
         registry_id()
     )
 }
@@ -3196,18 +3462,38 @@ pub fn manifest_media_type(manifest: &str) -> Option<String> {
 /// the image's layers first — and it is the only place the order is observable: every
 /// other reader keys the blobs by digest.
 pub fn manifest_blobs(manifest: &str) -> Vec<LayerBlob> {
+    let mut blobs = manifest_layer_descriptors(manifest);
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(manifest) else {
+        return blobs;
+    };
+    if let Some(blob) = document.get("config").and_then(blob_descriptor) {
+        blobs.push(blob);
+    }
+    blobs
+}
+
+/// The FILESYSTEM LAYER descriptors an image manifest declares, in the order it lists
+/// them — the `layers` entries of a Docker image manifest V2 schema 2 or an OCI image
+/// manifest, or the `fsLayers[].blobSum` digests of the older V2 schema 1.
+///
+/// The one reader of those two members: [`manifest_blobs`] adds the image configuration
+/// blob to them, and [`is_scannable_image_manifest`] asks whether there are any, so
+/// neither has its own copy of the extraction. A manifest list or OCI image index
+/// declares none — its `manifests` entries are other images, not this one's layers — and
+/// neither does a document that is not an image manifest at all.
+pub fn manifest_layer_descriptors(manifest: &str) -> Vec<LayerBlob> {
     let Ok(document) = serde_json::from_str::<serde_json::Value>(manifest) else {
         return Vec::new();
     };
-    let mut blobs = Vec::new();
-    if let Some(layers) = document.get("layers").and_then(serde_json::Value::as_array) {
-        blobs.extend(layers.iter().filter_map(blob_descriptor));
+    let mut layers = Vec::new();
+    if let Some(declared) = document.get("layers").and_then(serde_json::Value::as_array) {
+        layers.extend(declared.iter().filter_map(blob_descriptor));
     }
     if let Some(fs_layers) = document
         .get("fsLayers")
         .and_then(serde_json::Value::as_array)
     {
-        blobs.extend(fs_layers.iter().filter_map(|entry| {
+        layers.extend(fs_layers.iter().filter_map(|entry| {
             Some(LayerBlob {
                 digest: entry.get("blobSum")?.as_str()?.to_string(),
                 size: None,
@@ -3215,10 +3501,7 @@ pub fn manifest_blobs(manifest: &str) -> Vec<LayerBlob> {
             })
         }));
     }
-    if let Some(blob) = document.get("config").and_then(blob_descriptor) {
-        blobs.push(blob);
-    }
-    blobs
+    layers
 }
 
 /// One OCI/Docker content descriptor, or `None` when it names no blob.

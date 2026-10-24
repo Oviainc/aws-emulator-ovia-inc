@@ -201,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !pipeline.declares_stage(&input.stage_name) {
             return Err(DisableStageTransitionErrorModeled::StageNotFoundException(
                 StageNotFoundException {
-                    message: Some(format!(
-                        "pipeline {} has no stage named {}",
-                        input.pipeline_name, input.stage_name
+                    message: Some(crate::state::stage_not_found_message(
+                        &input.pipeline_name,
+                        &input.stage_name,
                     )),
                 },
             )

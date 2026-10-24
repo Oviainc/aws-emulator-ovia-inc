@@ -17,7 +17,14 @@ pub struct GetPromptRouterInput {
     pub prompt_router_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetPromptRouterResponse")]
+/// `GetPromptRouterResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="GetPromptRouter")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone, Default)]
 pub struct GetPromptRouterOutput {
     pub prompt_router_name: String,
@@ -31,4 +38,57 @@ pub struct GetPromptRouterOutput {
     pub status: String,
     pub r#type: String,
 }
+
+bedrock_schema_and_codec!(
+    GetPromptRouterOutput,
+    GET_PROMPT_ROUTER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetPromptRouterResponse",
+    "com.amazonaws.bedrock",
+    "GetPromptRouterResponse",
+    (
+        M_PROMPT_ROUTER_NAME,
+        prompt_router_name,
+        "promptRouterName",
+        0,
+        req,
+        string
+    ),
+    (
+        M_ROUTING_CRITERIA,
+        routing_criteria,
+        "routingCriteria",
+        1,
+        req,
+        struct_of(RoutingCriteria)
+    ),
+    (M_DESCRIPTION, description, "description", 2, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, opt, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 4, opt, date_time),
+    (
+        M_PROMPT_ROUTER_ARN,
+        prompt_router_arn,
+        "promptRouterArn",
+        5,
+        req,
+        string
+    ),
+    (
+        M_MODELS,
+        models,
+        "models",
+        6,
+        req,
+        list_of_struct(PromptRouterTargetModel)
+    ),
+    (
+        M_FALLBACK_MODEL,
+        fallback_model,
+        "fallbackModel",
+        7,
+        req,
+        struct_of(PromptRouterTargetModel)
+    ),
+    (M_STATUS, status, "status", 8, req, string),
+    (M_TYPE, r#type, "type", 9, req, string),
+);
 

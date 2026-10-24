@@ -165,6 +165,11 @@ pub const MAX_VOCABULARIES: usize = 100;
 /// and `ListVocabularyFiltersRequest$MaxResults`).
 pub const DEFAULT_VOCABULARY_LIST_MAX_RESULTS: i32 = 5;
 
+/// The number of Call Analytics categories `ListCallAnalyticsCategories` returns when
+/// the request names no `MaxResults`: "If you do not specify a value, a default of 5
+/// is used" (model doc for `ListCallAnalyticsCategoriesRequest$MaxResults`).
+pub const DEFAULT_CATEGORY_LIST_MAX_RESULTS: i32 = 5;
+
 /// `InputType` values, from the model's enum
 /// (`smithy_query(query="shape", shape="InputType")`, also
 /// [`crate::ops::types::INPUT_TYPE_VALUES`]): a Call Analytics category applies
@@ -818,6 +823,37 @@ pub fn parse_page_cursor(token: &str) -> Option<u64> {
         .next()
         .and_then(|sequence| sequence.parse::<u64>().ok())
         .filter(|sequence| *sequence > 0)
+}
+
+/// The prefix a name-keyed page cursor carries, which is what tells a token this
+/// service handed out from one it never wrote. See [`name_page_cursor`].
+const NAME_CURSOR_PREFIX: &str = "name|";
+
+/// The `NextToken` a listing of records keyed by NAME ALONE hands out to resume
+/// strictly after `name`.
+///
+/// The Call Analytics categories are stored without a creation sequence — their
+/// record holds no such member (see [`CallAnalyticsCategoryRecord`]) and their listing
+/// is documented with no order — so `ListCallAnalyticsCategories` pages over the
+/// store's own key order (the name, ascending) and its cursor is a name rather than a
+/// sequence ([`page_cursor`]). Resuming strictly past a NAME is what makes paging
+/// stable under concurrent writes: a category created or deleted between two pages
+/// cannot shift the position the next page resumes from. Single-homed here beside the
+/// sequence cursor so both token formats of this service live in one place.
+pub fn name_page_cursor(name: &str) -> String {
+    format!("{NAME_CURSOR_PREFIX}{name}")
+}
+
+/// The record name a `NextToken` resumes after, or `None` for a token this service
+/// never handed out — which a listing refuses rather than silently restarting from the
+/// top.
+///
+/// Every name this service keys a record by is non-empty (`CategoryName` is modelled
+/// `@length(min: 1, max: 200)`), so a bare prefix is a token this service never wrote.
+pub fn parse_name_page_cursor(token: &str) -> Option<&str> {
+    token
+        .strip_prefix(NAME_CURSOR_PREFIX)
+        .filter(|name| !name.is_empty())
 }
 
 /// What a request's two content members say about where a vocabulary's terms come

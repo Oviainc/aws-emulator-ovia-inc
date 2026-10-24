@@ -33,6 +33,16 @@ const TARGET_PREFIX: &str = "OpenSearchServerless";
 /// (`smithy_query(query="service_info")` -> `sigv4Name`).
 const SIGNING_NAME: &str = "aoss";
 
+/// The HTTP status this service answers EVERY modelled client error with.
+///
+/// aoss speaks `awsJson1_0` (`smithy_query(query="service_info")` -> `protocols`), where
+/// the status is not how a client discriminates an error — the body's `__type` is — so the
+/// endpoint answers one status, 400, for every client error whatever `@httpError` its
+/// shape carries (`ConflictException` 409, `ResourceNotFoundException` 404,
+/// `ServiceQuotaExceededException` 402, `ValidationException` 400). The suites below
+/// assert the code from the body and this status.
+pub(crate) const CLIENT_ERROR: u16 = 400;
+
 /// Long enough for the `CREATING -> ACTIVE` transition `CreateCollection` starts to fall
 /// due; the emulator's span is 500 ms and nothing sleeps for it inside a handler.
 const SETTLE_WAIT: Duration = Duration::from_millis(700);
@@ -644,8 +654,8 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case DeleteCollection(still CREATING): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case DeleteCollection(still CREATING): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
     await_active(&router, "us-east-1", &transient_id).await;
 
@@ -667,8 +677,8 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case DeleteCollection(deletionProtection ENABLED): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case DeleteCollection(deletionProtection ENABLED): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     for (case, name, request_protection) in [
@@ -707,7 +717,7 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
         );
 
         // The record is gone: a read reports it as missing, the listing no longer carries
-        // it, and a second delete is a 404.
+        // it, and a second delete is the `ResourceNotFoundException`.
         let (_, _, read) = call(&router, "BatchGetCollection", json!({ "ids": [id.clone()] })).await;
         assert_eq!(
             at(&read, "collectionDetails"),
@@ -735,8 +745,8 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
         let (status, code, answer) = call(&router, "DeleteCollection", json!({ "id": id })).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case DeleteCollection({case}, second time): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case DeleteCollection({case}, second time): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
 
         // And the name is free again, which is what proves the name index was dropped
@@ -744,7 +754,8 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
         create_collection(&router, "us-east-1", json!({ "name": name })).await;
     }
 
-    // An id of the right shape that names no collection is a 404, not an empty success.
+    // An id of the right shape that names no collection is the `ResourceNotFoundException`,
+    // not an empty success.
     let (status, code, answer) = call(
         &router,
         "DeleteCollection",
@@ -753,8 +764,8 @@ async fn deleting_a_collection_removes_it_and_refuses_what_it_must() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "case DeleteCollection(unknown id): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ResourceNotFoundException"),
+        "case DeleteCollection(unknown id): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
     );
 }
 
@@ -778,8 +789,8 @@ async fn create_collection_refuses_a_duplicate_name_and_an_invalid_input() {
         let (status, code, answer) = call(&router, "CreateCollection", request).await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case CreateCollection(duplicate name, {case}): expected 409 ConflictException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ConflictException"),
+            "case CreateCollection(duplicate name, {case}): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
         );
     }
 
@@ -815,8 +826,8 @@ async fn create_collection_refuses_a_duplicate_name_and_an_invalid_input() {
         let (status, code, answer) = call(&router, "CreateCollection", request).await;
         assert_eq!(
             (status, code.as_str()),
-            (400, "ValidationException"),
-            "case CreateCollection({case}): expected 400 ValidationException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ValidationException"),
+            "case CreateCollection({case}): expected {CLIENT_ERROR} ValidationException, got {status} {code} with {answer}"
         );
     }
 
@@ -853,8 +864,8 @@ async fn a_replayed_client_token_answers_the_record_it_first_created() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateCollection(new token, taken name): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateCollection(new token, taken name): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // The same contract on the policy create.
@@ -1089,8 +1100,8 @@ async fn the_security_policy_lifecycle_is_served_from_state() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateSecurityPolicy(duplicate pair): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateSecurityPolicy(duplicate pair): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // The refusals a policy create owes: a `type` outside the value list, a `policy` that
@@ -1152,13 +1163,14 @@ async fn the_security_policy_lifecycle_is_served_from_state() {
                 call(&router, operation, json!({ "type": kind, "name": name })).await;
             assert_eq!(
                 (status, code.as_str()),
-                (404, expected),
-                "case {operation}({kind}/{name}, after delete): expected 404 {expected}, got {status} {code} with {answer}"
+                (CLIENT_ERROR, expected),
+                "case {operation}({kind}/{name}, after delete): expected {CLIENT_ERROR} {expected}, got {status} {code} with {answer}"
             );
         }
     }
 
-    // And a pair that was never created is a 404 too, for both types.
+    // And a pair that was never created is the `ResourceNotFoundException` too, for both
+    // types.
     for kind in ["encryption", "network"] {
         let (status, code, answer) = call(
             &router,
@@ -1168,8 +1180,8 @@ async fn the_security_policy_lifecycle_is_served_from_state() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case GetSecurityPolicy({kind}/never-created): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case GetSecurityPolicy({kind}/never-created): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
     }
 }

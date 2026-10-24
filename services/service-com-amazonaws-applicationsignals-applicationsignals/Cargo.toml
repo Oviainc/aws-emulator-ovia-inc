@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries the ONE resource-ARN parse, which the tagging operations read a
+# caller-supplied `ResourceArn` with.
+service-common = { path = "../common" }
 # Opaque pagination tokens: `ListServiceLevelObjectives`'s `NextToken` is the hex
 # encoding of the cursor, so a caller cannot read or forge a store key out of it.
 hex = { workspace = true }

@@ -3,10 +3,11 @@
 //! Engine state for the com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime service.
 //!
 //! The stage lifecycle (`CreateStage`, `GetStage`, `ListStages`, `UpdateStage`,
-//! `DeleteStage`) and the token issuance that makes a stage usable
-//! (`CreateParticipantToken`) all read and write the records below, so the records,
-//! the id minting they share and the modelled defaults they apply live here rather
-//! than in any one operation's file.
+//! `DeleteStage`), the token issuance that makes a stage usable
+//! (`CreateParticipantToken`) and the stage sessions a stage's participants are
+//! grouped into (`ListParticipants`) all read and write the records below, so the
+//! records, the id minting they share and the modelled defaults they apply live here
+//! rather than in any one operation's file.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -20,9 +21,9 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     AutoParticipantRecordingConfiguration, ConflictException, IngestConfiguration,
     InternalServerException, ParticipantRecordingHlsConfiguration, ParticipantReplica,
-    ParticipantThumbnailConfiguration, ParticipantToken, RedundantIngestCredential,
-    ResourceNotFoundException, ServiceQuotaExceededException, Stage, StageEndpoints, StageSummary,
-    ValidationException,
+    ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken,
+    RedundantIngestCredential, ResourceNotFoundException, ServiceQuotaExceededException, Stage,
+    StageEndpoints, StageSummary, ValidationException,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -312,6 +313,17 @@ pub const MAX_PARTICIPANT_TOKENS_PER_STAGE: usize = 1_000;
 /// `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_INGEST_CONFIGURATIONS: usize = 1_000;
 
+/// Stage sessions this emulator keeps per stage. Not an AWS quota — this emulator's
+/// own resource guard on the store [`join_stage_session`] grows, set the same way
+/// [`MAX_STAGES`] is. A session is not created by an API call (see
+/// [`StageSessionRecord`]), so reaching it is not a request to refuse: the join is
+/// simply not recorded.
+pub const MAX_STAGE_SESSIONS_PER_STAGE: usize = 1_000;
+
+/// Participants this emulator keeps per stage session, bounded the same way and for
+/// the same reason as [`MAX_STAGE_SESSIONS_PER_STAGE`].
+pub const MAX_PARTICIPANTS_PER_SESSION: usize = 1_000;
+
 // ---------------------------------------------------------------------------
 // What an ingest configuration reports beyond what the creating request said
 //
@@ -399,6 +411,12 @@ pub const MAX_PARTICIPANT_REPLICAS_PER_STAGE: usize = 1_000;
 /// Marks a `ListStages` page token as this service's, so a token from elsewhere is
 /// refused rather than silently read as a position.
 const PAGE_TOKEN_PREFIX: &str = "ivs-realtime-stage-after:";
+
+/// Marks a `ListParticipants` page token, the same way [`PAGE_TOKEN_PREFIX`] marks a
+/// `ListStages` one. The prefixes differ so a token issued by one listing names no
+/// position in the other: the two page over different records, and a position in one
+/// is meaningless in the other.
+const PARTICIPANT_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-participant-after:";
 
 /// The same marker for a `ListParticipantReplicas` page, kept distinct from
 /// [`PAGE_TOKEN_PREFIX`] so a token issued by one listing names no position in the
@@ -583,6 +601,121 @@ impl IngestConfigurationRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage sessions and the participants in them
+//
+// A participant reaches a stage through the stage's DATA plane — it joins over WebRTC
+// with the participant token it was issued, or publishes to the WHIP/RTMP endpoints
+// `CreateStage` advertises. No operation of this control plane makes a participant
+// join: the sibling `ivs` emulator records the same thing about a channel going live
+// (`is_broadcasting`), and this service already records it about a publisher
+// ([`NO_PUBLISHER_INGEST_CONFIGURATION_STATE`]). So the records below are written by
+// [`join_stage_session`] / [`leave_stage_session`] — the one entry point a stage data
+// plane uses, and the one place the modelled defaults of a joining participant are
+// applied — over the session [`ensure_active_session`] opens, and the reporting
+// operations (`ListParticipants` today; `GetParticipant`, `GetStageSession` and
+// `ListStageSessions`, each its own gap issue) answer from exactly what those
+// recorded, never from a value invented for a join that never happened.
+// ---------------------------------------------------------------------------
+
+/// `ParticipantState` of a participant that is in the stage right now.
+///
+/// One of the two values the modelled `ParticipantState` enum carries
+/// (`smithy_query(query="shape",shape="ParticipantState")`), and the state a
+/// participant is in from the moment it joins.
+pub const PARTICIPANT_STATE_CONNECTED: &str = "CONNECTED";
+
+/// `ParticipantState` of a participant that has left the stage, the other value that
+/// enum carries. A participant that leaves is not forgotten: the model documents
+/// `ParticipantSummary$firstJoinTime` as "when the participant FIRST joined the stage
+/// session" and `published` as "whether the participant EVER published", so the
+/// session keeps the record and moves its state.
+pub const PARTICIPANT_STATE_DISCONNECTED: &str = "DISCONNECTED";
+
+/// `ParticipantRecordingState` of a participant nothing is recording.
+///
+/// `DISABLED` is the value the modelled `ParticipantRecordingState` carries for
+/// exactly this (and the only one of its values that is NOT a
+/// `ParticipantRecordingFilterByRecordingState`, which lists the five states a
+/// recording passes through). It is what a joining participant gets unless the
+/// recorder reports otherwise: this emulator writes no participant media — it serves
+/// no S3 data plane — so a state out of that five would name work nothing ran.
+pub const NOT_RECORDED_PARTICIPANT_RECORDING_STATE: &str = "DISABLED";
+
+/// `ReplicationType` of a participant that is neither replicated to another stage nor
+/// a replica from one.
+///
+/// The model documents it on `ParticipantSummary$replicationType`: "Indicates if the
+/// participant has been replicated to another stage or is a replica from another
+/// stage. Default: `NONE`." `StartParticipantReplication` (its own gap issue) is what
+/// moves a participant off it.
+pub const REPLICATION_TYPE_NONE: &str = "NONE";
+
+/// One participant of one stage session, as the stage's data plane recorded it
+/// joining ([`join_stage_session`]) and `ListParticipants` reports it.
+#[derive(Debug, Clone)]
+pub struct ParticipantRecord {
+    /// The participant id it joined under: the one its participant token carries, or
+    /// the one its ingest credential publishes as.
+    pub participant_id: String,
+    /// The customer-assigned name the token carried, when it carried one.
+    pub user_id: Option<String>,
+    /// The attributes the token carried. No member of `ParticipantSummary` reports
+    /// them — `Participant$attributes` does, which `GetParticipant` reports (its own
+    /// gap issue) — so they are recorded here where the join supplies them.
+    pub attributes: HashMap<String, String>,
+    /// [`PARTICIPANT_STATE_CONNECTED`] or [`PARTICIPANT_STATE_DISCONNECTED`].
+    pub state: String,
+    /// When this participant FIRST joined this session; unchanged by a later rejoin,
+    /// as the member's own doc requires.
+    pub first_join_time: SystemTime,
+    /// Whether it EVER published to the session, so it stays set once set.
+    pub published: bool,
+    /// What the recorder reports for it; [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`]
+    /// when nothing records it.
+    pub recording_state: String,
+    /// [`REPLICATION_TYPE_NONE`] unless replication made it a `SOURCE` or a `REPLICA`.
+    pub replication_type: String,
+    /// The replication's own state (`ACTIVE` / `STOPPED`), absent while
+    /// [`Self::replication_type`] is [`REPLICATION_TYPE_NONE`].
+    pub replication_state: Option<String>,
+    /// Where a replica was replicated from: both members are reported only "if
+    /// `replicationType` is `REPLICA`", as their docs state.
+    pub source_stage_arn: Option<String>,
+    pub source_session_id: Option<String>,
+    /// Whether the publisher reached the stage over redundant ingest.
+    pub redundant_ingest: bool,
+    /// The ingest configuration the publisher broadcast with, when it used one.
+    pub ingest_configuration_arn: Option<String>,
+    /// Join order within the session, and the stable key `ListParticipants` pages
+    /// over — the same role [`StageRecord::sequence`] plays for `ListStages`.
+    pub sequence: u64,
+}
+
+impl ParticipantRecord {
+    /// The modelled `ParticipantSummary` this record reports in a `ListParticipants`
+    /// page.
+    pub fn to_summary(&self) -> ParticipantSummary {
+        ParticipantSummary {
+            participant_id: Some(self.participant_id.clone()),
+            // Reported only when the token named one: the member is optional, and an
+            // absent member is how the model says "no user id", exactly as on a
+            // participant token.
+            user_id: self.user_id.clone(),
+            state: Some(self.state.clone()),
+            first_join_time: Some(::aws_smithy_types::DateTime::from(self.first_join_time)),
+            published: self.published,
+            recording_state: Some(self.recording_state.clone()),
+            replication_type: Some(self.replication_type.clone()),
+            replication_state: self.replication_state.clone(),
+            source_stage_arn: self.source_stage_arn.clone(),
+            source_session_id: self.source_session_id.clone(),
+            redundant_ingest: self.redundant_ingest,
+            ingest_configuration_arn: self.ingest_configuration_arn.clone(),
+        }
+    }
+}
+
 /// One started replication of one publishing participant into one destination stage, as
 /// `StartParticipantReplication` persisted it and `ListParticipantReplicas` reports it.
 #[derive(Debug, Clone)]
@@ -636,6 +769,224 @@ impl ParticipantReplicaRecord {
     }
 }
 
+/// One stage session: the stretch of a stage's life its participants are grouped
+/// into.
+///
+/// The model's `StageSession` doc fixes what one is: "A stage session begins when the
+/// first participant joins a stage and ends after the last participant leaves the
+/// stage." So a session is not created or deleted by an API call — [`join_stage_session`]
+/// opens one when a stage has none, and [`leave_stage_session`] closes it when the last
+/// participant has gone.
+#[derive(Debug, Clone)]
+pub struct StageSessionRecord {
+    /// The modelled `StageSessionId` ([`stage_session_id`]), and the key
+    /// `ListParticipants` resolves the session by.
+    pub session_id: String,
+    /// When the first participant joined.
+    pub start_time: SystemTime,
+    /// When the last participant left, or `None` while the session is active — "This
+    /// is null if the stage is active", as `StageSession$endTime` states.
+    pub end_time: Option<SystemTime>,
+    /// Every participant that joined this session, in join order, the ones that have
+    /// left included.
+    pub participants: Vec<ParticipantRecord>,
+    /// Start order, the key a page over the sessions of one stage resumes from.
+    pub sequence: u64,
+}
+
+impl StageSessionRecord {
+    /// This session's participants in join order — the order `ListParticipants` pages
+    /// over, so a record added or left mid-pagination cannot shift a later page onto
+    /// an already-returned one.
+    pub fn participants_in_join_order(&self) -> Vec<&ParticipantRecord> {
+        let mut participants: Vec<&ParticipantRecord> = self.participants.iter().collect();
+        participants.sort_by_key(|record| record.sequence);
+        participants
+    }
+}
+
+/// What a stage's data plane observes about one participant joining a stage: the
+/// identity its token or ingest credential carries, and what it does in the stage.
+///
+/// Everything else a [`ParticipantRecord`] holds is the join's own doing and is
+/// applied by [`join_stage_session`], so no two callers can record a join
+/// differently.
+#[derive(Debug, Default, Clone)]
+pub struct JoinedParticipant {
+    /// The id the joining client's participant token carries, or the one its ingest
+    /// credential publishes as. Both are minted by this service
+    /// ([`issue_token_record`], [`mint_ingest_credential`]).
+    pub participant_id: String,
+    pub user_id: Option<String>,
+    pub attributes: HashMap<String, String>,
+    /// Whether this participant is publishing media, rather than only subscribing.
+    pub published: bool,
+    /// What the recorder reports for this participant, when something records it.
+    /// `None` is [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`].
+    pub recording_state: Option<String>,
+    /// Whether the publisher reached the stage over redundant ingest.
+    pub redundant_ingest: bool,
+    /// The ingest configuration it broadcast with, when it used one.
+    pub ingest_configuration_arn: Option<String>,
+}
+
+/// Record the participant `joined` describes joining `stage_arn`, opening a session
+/// for the stage when no session is active, and return the record the session now
+/// holds for it.
+///
+/// The ONE place a participant record is created, so every operation that reports one
+/// answers the same representation: a joining participant is
+/// [`PARTICIPANT_STATE_CONNECTED`], its `firstJoinTime` is the instant it joined, it
+/// is recorded with the recording state the recorder reports (or
+/// [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`]), and it is neither a replication
+/// source nor a replica ([`REPLICATION_TYPE_NONE`]).
+///
+/// A participant the session already holds REJOINS it: the model documents
+/// `firstJoinTime` as the first join and `published` as whether the participant ever
+/// published, so the record keeps its id, its first join instant and its page
+/// position, comes back to `CONNECTED`, and keeps `published` once set.
+///
+/// The session itself is opened by [`ensure_active_session`], the one place a session
+/// of this service begins, so a participant that joins and a replica that is
+/// replicated in are in the SAME session of the stage.
+///
+/// `None` — nothing recorded — when this store holds no such stage, when the stage is
+/// at [`MAX_STAGE_SESSIONS_PER_STAGE`] sessions, or when the session is at
+/// [`MAX_PARTICIPANTS_PER_SESSION`] participants.
+pub fn join_stage_session(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    joined: JoinedParticipant,
+) -> Option<ParticipantRecord> {
+    // The session the stage is in, or a fresh one: "a stage session begins when the
+    // first participant joins a stage".
+    let session_id = ensure_active_session(state, stage_arn)?;
+
+    // A participant the session already holds is REJOINING it, so it keeps its id, its
+    // first join instant and its page position.
+    {
+        let session = session_mut(state, stage_arn, &session_id)?;
+        if let Some(rejoined) = session
+            .participants
+            .iter_mut()
+            .find(|participant| participant.participant_id == joined.participant_id)
+        {
+            rejoined.state = PARTICIPANT_STATE_CONNECTED.to_string();
+            rejoined.published = rejoined.published || joined.published;
+            if let Some(recording_state) = joined.recording_state {
+                rejoined.recording_state = recording_state;
+            }
+            rejoined.redundant_ingest = joined.redundant_ingest;
+            if joined.ingest_configuration_arn.is_some() {
+                rejoined.ingest_configuration_arn = joined.ingest_configuration_arn;
+            }
+            return Some(rejoined.clone());
+        }
+
+        // Bound the store this join grows: the records are reclaimed only with the
+        // stage.
+        if session.participants.len() >= MAX_PARTICIPANTS_PER_SESSION {
+            return None;
+        }
+    }
+
+    // Only a participant that is NEW to the session takes a page position, so the join
+    // order of a session's participants stays contiguous.
+    let sequence = state.next_sequence();
+    let record = ParticipantRecord {
+        participant_id: joined.participant_id,
+        user_id: joined.user_id,
+        attributes: joined.attributes,
+        state: PARTICIPANT_STATE_CONNECTED.to_string(),
+        first_join_time: SystemTime::now(),
+        published: joined.published,
+        recording_state: joined
+            .recording_state
+            .unwrap_or_else(|| NOT_RECORDED_PARTICIPANT_RECORDING_STATE.to_string()),
+        replication_type: REPLICATION_TYPE_NONE.to_string(),
+        replication_state: None,
+        source_stage_arn: None,
+        source_session_id: None,
+        redundant_ingest: joined.redundant_ingest,
+        ingest_configuration_arn: joined.ingest_configuration_arn,
+        sequence,
+    };
+    session_mut(state, stage_arn, &session_id)?
+        .participants
+        .push(record.clone());
+    Some(record)
+}
+
+/// The session `session_id` of the stage `stage_arn`, mutably: the one lookup
+/// [`join_stage_session`] and [`leave_stage_session`] resolve a session to write
+/// through, keyed exactly as the reading
+/// [`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::stage_session`]
+/// is.
+fn session_mut<'a>(
+    state: &'a mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+) -> Option<&'a mut StageSessionRecord> {
+    state
+        .stage_sessions
+        .get_mut(stage_arn)?
+        .iter_mut()
+        .find(|session| session.session_id == session_id)
+}
+
+/// Record the participant `participant_id` leaving the session `session_id` of
+/// `stage_arn`, and close that session when it was the last one in it.
+///
+/// The counterpart of [`join_stage_session`], and the one place a participant leaves:
+/// the record stays in the session and moves to
+/// [`PARTICIPANT_STATE_DISCONNECTED`] — `ListParticipants` reports the participants
+/// of a session, which the ones that have left are — and when every participant has
+/// left, the session "ends after the last participant leaves the stage": its
+/// `endTime` is set and the stage reports no active session again, so the next join
+/// begins a new session.
+///
+/// `false` — nothing recorded — when this store holds no such stage, session or
+/// participant, or when that participant has already left.
+pub fn leave_stage_session(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    participant_id: &str,
+) -> bool {
+    let session_ended = {
+        let Some(session) = session_mut(state, stage_arn, session_id) else {
+            return false;
+        };
+        let Some(leaving) = session
+            .participants
+            .iter_mut()
+            .find(|participant| participant.participant_id == participant_id)
+        else {
+            return false;
+        };
+        if leaving.state == PARTICIPANT_STATE_DISCONNECTED {
+            return false;
+        }
+        leaving.state = PARTICIPANT_STATE_DISCONNECTED.to_string();
+        let emptied = session
+            .participants
+            .iter()
+            .all(|participant| participant.state == PARTICIPANT_STATE_DISCONNECTED);
+        if emptied {
+            session.end_time = Some(SystemTime::now());
+        }
+        emptied
+    };
+    if session_ended {
+        if let Some(stage) = state.stages.get_mut(stage_arn) {
+            if stage.active_session_id.as_deref() == Some(session_id) {
+                stage.active_session_id = None;
+            }
+        }
+    }
+    true
+}
+
 /// Per-service state for com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime. A handler reaches it through [`service_state`].
 ///
 /// ONE store per engine, not one per region: the minted ARN names the region the
@@ -651,6 +1002,11 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     /// The tokens issued against a stage, keyed by that stage's ARN. Removed with
     /// the stage.
     pub participant_tokens: HashMap<String, Vec<ParticipantTokenRecord>>,
+    /// The sessions a stage has had, keyed by that stage's ARN and held in start
+    /// order. A session is opened by [`ensure_active_session`] and its participants
+    /// written by [`join_stage_session`] / [`leave_stage_session`] — the stage's data
+    /// plane, not this control plane — and the sessions go with the stage.
+    pub stage_sessions: HashMap<String, Vec<StageSessionRecord>>,
     /// Every live ingest configuration, keyed by its ARN.
     pub ingest_configurations: HashMap<String, IngestConfigurationRecord>,
     /// The started replications of a stage's participants, keyed by that SOURCE stage's
@@ -674,6 +1030,19 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         let mut stages: Vec<&StageRecord> = self.stages.values().collect();
         stages.sort_by_key(|record| record.sequence);
         stages
+    }
+
+    /// The session `session_id` of the stage `stage_arn`, or `None` when this store
+    /// holds no such session for that stage.
+    ///
+    /// The lookup is by BOTH keys: a session id names a session of one stage, so a
+    /// session of another stage is not found here even though every id this store
+    /// mints is unique.
+    pub fn stage_session(&self, stage_arn: &str, session_id: &str) -> Option<&StageSessionRecord> {
+        self.stage_sessions
+            .get(stage_arn)?
+            .iter()
+            .find(|session| session.session_id == session_id)
     }
 }
 
@@ -810,17 +1179,22 @@ pub fn stage_session_id(sequence: u64) -> String {
 }
 
 /// The id of the session active in the stage `stage_arn`, opening one if the stage has
-/// none, or `None` when this store holds no such stage.
+/// none, or `None` when this store holds no such stage (or when it is at
+/// [`MAX_STAGE_SESSIONS_PER_STAGE`] sessions, which no emulated use reaches).
 ///
 /// A stage session is the span a stage has participants in: the model's `StageSession`
 /// doc describes it as beginning "when the first participant joins" and the stage
 /// reporting it as `activeSessionId` until it ends. Nothing joins an emulated stage over
-/// the API, so the one call that does put a participant into a stage —
-/// `StartParticipantReplication`, which puts a publisher's replica into the destination
-/// stage and names the session its publisher is in on the source side — is what opens the
-/// session each of those two stages needs. A stage that already has one keeps it, so
-/// every replica of one stage names the same session and a caller that read
-/// `activeSessionId` off the stage reads the same value again.
+/// the API, so the two things that put a participant into a stage open the session it
+/// needs through here — `StartParticipantReplication`, which puts a publisher's replica
+/// into the destination stage and names the session its publisher is in on the source
+/// side, and [`join_stage_session`], the stage data plane's own entry point. A stage that
+/// already has one keeps it, so every replica and every participant of one stage names
+/// the same session and a caller that read `activeSessionId` off the stage reads the same
+/// value again.
+///
+/// The ONE place a session begins, so the id a stage reports and the
+/// [`StageSessionRecord`] the reporting operations read are one session and not two.
 pub fn ensure_active_session(
     state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
@@ -829,11 +1203,33 @@ pub fn ensure_active_session(
         .stages
         .get(stage_arn)?
         .active_session_id
-        .clone();
+        .clone()
+        // The empty value is the "no session" reading of the member
+        // ([`NO_ACTIVE_SESSION_ID`]), not a session id.
+        .filter(|session_id| !session_id.is_empty());
     if let Some(session_id) = active {
         return Some(session_id);
     }
-    let session_id = stage_session_id(state.next_sequence());
+    // Bound the one store a session opening grows; the records are reclaimed with the
+    // stage.
+    if state.stage_sessions.get(stage_arn).map_or(0, Vec::len) >= MAX_STAGE_SESSIONS_PER_STAGE {
+        return None;
+    }
+    let sequence = state.next_sequence();
+    let session_id = stage_session_id(sequence);
+    state
+        .stage_sessions
+        .entry(stage_arn.to_string())
+        .or_default()
+        .push(StageSessionRecord {
+            session_id: session_id.clone(),
+            start_time: SystemTime::now(),
+            end_time: None,
+            participants: Vec::new(),
+            sequence,
+        });
+    // The stage now reports the session a caller passes to `ListParticipants`, which is
+    // what `Stage$activeSessionId` is for.
     state.stages.get_mut(stage_arn)?.active_session_id = Some(session_id.clone());
     Some(session_id)
 }
@@ -1104,6 +1500,23 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
     decode_after(PAGE_TOKEN_PREFIX, token)
 }
 
+/// The opaque `nextToken` a `ListParticipants` page ends with: the join sequence of
+/// the last participant it reported, which the next page resumes after.
+///
+/// Encoded exactly as [`encode_page_token`] is, under its own prefix, so a token one
+/// listing issued names no position in another
+/// ([`PARTICIPANT_PAGE_TOKEN_PREFIX`]).
+pub fn encode_participant_page_token(after_sequence: u64) -> String {
+    encode_after(PARTICIPANT_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The join sequence a `ListParticipants` `nextToken` resumes after, or `None` when
+/// the token was not issued by [`encode_participant_page_token`] — a token from
+/// another listing included.
+pub fn decode_participant_page_token(token: &str) -> Option<u64> {
+    decode_after(PARTICIPANT_PAGE_TOKEN_PREFIX, token)
+}
+
 /// [`encode_page_token`] for a `ListParticipantReplicas` page: the start sequence the
 /// next page of replicas resumes after, under that listing's own marker.
 pub fn encode_replica_page_token(after_sequence: u64) -> String {
@@ -1111,13 +1524,13 @@ pub fn encode_replica_page_token(after_sequence: u64) -> String {
 }
 
 /// The start sequence a replica `nextToken` resumes after, or `None` when the token was
-/// not issued by [`encode_replica_page_token`] — a token from the other listing
+/// not issued by [`encode_replica_page_token`] — a token from another listing
 /// included.
 pub fn decode_replica_page_token(token: &str) -> Option<u64> {
     decode_after(REPLICA_PAGE_TOKEN_PREFIX, token)
 }
 
-/// The one page-token codec, so the two listings cannot encode a position two ways.
+/// The one page-token codec, so the listings cannot encode a position two ways.
 fn encode_after(prefix: &str, after_sequence: u64) -> String {
     ::aws_smithy_types::base64::encode(format!("{prefix}{after_sequence}"))
 }
@@ -1154,6 +1567,40 @@ pub fn resource_not_found_message(identifier: &str) -> String {
 /// it names the resource the quota is on and the limit that was reached.
 pub fn quota_exceeded_message(resource: &str, limit: usize) -> String {
     format!("Resource: {resource} quota exceeded limit: {limit}")
+}
+
+/// How this service states a `nextToken` it did not issue: the operation, the member
+/// and the requirement, in the construction every other member refusal of this
+/// service uses (`crate::state::violation_clause`).
+///
+/// One rule for every listing of this service — each pages over its own records under
+/// its own token prefix — so a token from elsewhere is refused in the same words
+/// whichever page it was offered to.
+pub fn foreign_page_token_message(operation: &str) -> String {
+    format!("{operation}.nextToken is required to be a pagination token issued by {operation}")
+}
+
+/// How this service states a request that supplied more than one of a set of members
+/// only one of which may be given: it names the members the request actually carried,
+/// then the whole set, in the construction every other member refusal of this service
+/// uses (`<Operation>.<member> …`).
+///
+/// One rule for every operation whose model documents such a set — the four
+/// `ListParticipants` filters say it in those words ("Only one of filterByUserId,
+/// filterByPublished, filterByState, or filterByRecordingState can be provided per
+/// request") — so two operations cannot word the same refusal two ways. `supplied`
+/// holds the members the request carried, in the order `exclusive` lists them, and
+/// `exclusive` the whole set.
+pub fn mutually_exclusive_members_message(
+    operation: &str,
+    supplied: &[&str],
+    exclusive: &[&str],
+) -> String {
+    format!(
+        "{operation} is required to have at most one of {}, found {}",
+        exclusive.join(", "),
+        supplied.join(", "),
+    )
 }
 
 /// The `ResourceNotFoundException` (HTTP 404) a handler answers when a request names a

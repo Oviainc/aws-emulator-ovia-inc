@@ -11,7 +11,10 @@
 //! visible to the next request on the same engine. The custom lenses `ImportLens`
 //! imports, the versions `CreateLensVersion` publishes from them and the content
 //! `ExportLens` reads back are backed the same way, and `ListLenses` pages over those
-//! lenses beside the AWS-official lens this emulator ships. The record types and their
+//! lenses beside the AWS-official lens this emulator ships. The agent profiles
+//! (`CreateAgentProfile`, `GetAgentProfile`) and the optimization goals recorded against
+//! one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are backed the same way,
+//! each goal keyed under the profile it belongs to. The record types and their
 //! projections live here rather than in a handler because several operations reach them.
 //!
 //! The one lens definition this emulator ships itself — the AWS-official Well-Architected
@@ -30,9 +33,11 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Choice, ConflictException, LensSummary, Milestone, MilestoneSummary,
+    AggregationConfiguration, Choice, ConflictException, GoalSummary, LensSummary, Milestone,
+    MilestoneSummary,
     ResourceNotFoundException,
-    ReviewTemplate, ShareInvitation, ShareInvitationSummary, Workload, WorkloadDiscoveryConfig,
+    ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
+    ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
 };
@@ -1410,6 +1415,17 @@ fn empty_risk_counts() -> BTreeMap<String, i32> {
         .collect()
 }
 
+/// A question roll-up with one entry for every `Question` the enum publishes, all zero:
+/// what every `QuestionCounts` roll-up here starts from, so a caller that reads a bucket
+/// to report review progress always finds it — including for a lens this emulator holds
+/// no question set for, whose every bucket stays 0.
+fn empty_question_counts() -> BTreeMap<String, i32> {
+    QUESTION_VALUES
+        .iter()
+        .map(|bucket| ((*bucket).to_string(), 0))
+        .collect()
+}
+
 /// A risk roll-up as the modelled `RiskCounts` map a response carries.
 pub fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
     counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
@@ -1452,6 +1468,30 @@ impl MilestoneRecord {
     }
 }
 
+/// The notes one lens review of a review template carries: "the notes that will be
+/// associated with the workload when the template is applied"
+/// (`UpdateReviewTemplateLensReviewInput$LensNotes` / `$PillarNotes` docs).
+///
+/// A lens review of a template is not a resource of its own — it exists exactly while
+/// the lens is applied to the template ([`ReviewTemplateRecord::applies_lens`]) — so
+/// what this record holds is only what a caller has WRITTEN to it: the review's own
+/// notes, the notes of each pillar of that lens, and when either was last written
+/// (`ReviewTemplateLensReview$UpdatedAt`, "the date and time when the review template
+/// lens review was last updated"). Everything else a lens review reports — the lens's
+/// name, version and status, its pillars and its question roll-up — is DERIVED from the
+/// lens content and the template's stored answers by
+/// [`ReviewTemplateRecord::to_lens_review`].
+#[derive(Debug, Clone)]
+pub struct ReviewTemplateLensNotes {
+    /// `ReviewTemplateLensReview$Notes`, absent until a caller writes it.
+    pub notes: Option<String>,
+    /// `ReviewTemplatePillarReviewSummary$Notes` per `PillarId`, holding only the
+    /// pillars a caller has written notes for.
+    pub pillar_notes: BTreeMap<String, String>,
+    /// `ReviewTemplateLensReview$UpdatedAt`.
+    pub updated_at: SystemTime,
+}
+
 /// One stored review template: "A review template" (`ReviewTemplate` shape doc).
 ///
 /// Every member of the modelled `ReviewTemplate` a request can set is persisted here;
@@ -1474,6 +1514,10 @@ pub struct ReviewTemplateRecord {
     /// ([`WorkloadRecord::answers`]) — a review template is reviewed against the same
     /// lens question set, so the two cannot disagree about what an answer records.
     pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
+    /// The notes recorded against this template's lens reviews, by lens ALIAS (as
+    /// [`lens_alias`] resolves it, so one entry however the request named the lens).
+    /// A lens whose review nothing has been written to carries no entry.
+    pub lens_reviews: BTreeMap<String, ReviewTemplateLensNotes>,
 }
 
 impl ReviewTemplateRecord {
@@ -1503,26 +1547,179 @@ impl ReviewTemplateRecord {
     /// answers on every read and never stored, so it moves when either does — exactly
     /// as a workload's risk roll-up does ([`WorkloadRecord::risk_counts`]).
     pub fn question_counts(&self) -> BTreeMap<String, i32> {
-        let mut counts: BTreeMap<String, i32> = QUESTION_VALUES
-            .iter()
-            .map(|bucket| ((*bucket).to_string(), 0))
-            .collect();
+        let mut counts = empty_question_counts();
         let applied: std::collections::BTreeSet<&str> =
             self.lenses.iter().map(|lens| lens_alias(lens)).collect();
         for lens in applied {
-            for question in lens_questions(lens) {
-                let bucket = if self.answer(lens, question.question_id).is_some() {
-                    QUESTION_ANSWERED
-                } else {
-                    QUESTION_UNANSWERED
-                };
+            for (bucket, count) in self.lens_question_counts(lens) {
                 counts
-                    .entry(bucket.to_string())
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
+                    .entry(bucket)
+                    .and_modify(|total| *total = total.saturating_add(count))
+                    .or_insert(count);
             }
         }
         counts
+    }
+
+    /// The question roll-up of ONE lens review of this template: the same buckets as
+    /// [`Self::question_counts`], counted over the questions that ONE lens asks rather
+    /// than over every applied lens's — which is what a lens review reports.
+    ///
+    /// `lens` is a lens as a request names it (an alias or an ARN). A lens this emulator
+    /// holds no question set for asks nothing ([`lens_questions`]), so every bucket is 0.
+    pub fn lens_question_counts(&self, lens: &str) -> BTreeMap<String, i32> {
+        self.question_counts_over(lens, lens_questions(lens).iter())
+    }
+
+    /// [`Self::lens_question_counts`] narrowed to the questions ONE pillar of that lens
+    /// asks, which is what a pillar review summary of a lens review reports.
+    pub fn pillar_question_counts(&self, lens: &str, pillar_id: &str) -> BTreeMap<String, i32> {
+        self.question_counts_over(
+            lens,
+            lens_questions(lens)
+                .iter()
+                .filter(|question| question.pillar_id == pillar_id),
+        )
+    }
+
+    /// The question roll-up over an arbitrary set of ONE lens's questions — the one
+    /// place a template question is bucketed, so the template's roll-up, a lens
+    /// review's and a pillar's cannot disagree about what a question counts as.
+    fn question_counts_over<'question>(
+        &self,
+        lens: &str,
+        questions: impl Iterator<Item = &'question FrameworkQuestion>,
+    ) -> BTreeMap<String, i32> {
+        let mut counts = empty_question_counts();
+        for question in questions {
+            let bucket = if self.answer(lens, question.question_id).is_some() {
+                QUESTION_ANSWERED
+            } else {
+                QUESTION_UNANSWERED
+            };
+            counts
+                .entry(bucket.to_string())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
+        counts
+    }
+
+    /// The notes written to ONE of this template's lens reviews, if any have been.
+    ///
+    /// `lens` is a lens as a request names it, so the same notes are found by either
+    /// spelling ([`lens_alias`]).
+    pub fn lens_review_notes(&self, lens: &str) -> Option<&ReviewTemplateLensNotes> {
+        self.lens_reviews.get(lens_alias(lens))
+    }
+
+    /// [`Self::lens_review_notes`] for a caller about to WRITE them, created empty at
+    /// `now` on the first write: the lens review itself exists as soon as the lens is
+    /// applied, and this record is only how the store remembers what was written to it.
+    pub fn lens_review_notes_mut(
+        &mut self,
+        lens: &str,
+        now: SystemTime,
+    ) -> &mut ReviewTemplateLensNotes {
+        self.lens_reviews
+            .entry(lens_alias(lens).to_string())
+            .or_insert_with(|| ReviewTemplateLensNotes {
+                notes: None,
+                pillar_notes: BTreeMap::new(),
+                updated_at: now,
+            })
+    }
+
+    /// The pillars ONE lens review of this template reports a summary for, each with the
+    /// `PillarName` the lens content gives it where this emulator holds that content.
+    ///
+    /// The pillars the lens is organized into come first, in the lens's own order
+    /// ([`lens_pillars`]); then any pillar this template records notes for that the lens
+    /// content does not name, in `PillarId` order and with no `PillarName`, so notes a
+    /// caller wrote are always readable back. For a lens this emulator holds content for
+    /// the second group is empty — `UpdateReviewTemplateLensReview` refuses a
+    /// `PillarNotes` key that lens does not define — and for a lens it holds none for the
+    /// first group is, because such a lens is organized into no pillars HERE while the
+    /// real lens is.
+    pub fn lens_review_pillars(&self, lens: &str) -> Vec<(String, Option<&'static str>)> {
+        let defined = lens_pillars(lens);
+        let mut pillars: Vec<(String, Option<&'static str>)> = defined
+            .iter()
+            .map(|(pillar_id, pillar_name, _)| ((*pillar_id).to_string(), Some(*pillar_name)))
+            .collect();
+        if let Some(written) = self.lens_review_notes(lens) {
+            // `pillar_notes` is a `BTreeMap`, so the extra pillars come out in
+            // `PillarId` order.
+            pillars.extend(
+                written
+                    .pillar_notes
+                    .keys()
+                    .filter(|pillar_id| {
+                        !defined
+                            .iter()
+                            .any(|(defined_id, _, _)| defined_id == pillar_id)
+                    })
+                    .map(|pillar_id| (pillar_id.clone(), None)),
+            );
+        }
+        pillars
+    }
+
+    /// The `ReviewTemplateLensReview` shape `GetReviewTemplateLensReview` and
+    /// `UpdateReviewTemplateLensReview` return for ONE lens applied to this template.
+    ///
+    /// `lens` is the lens AS THE REQUEST NAMED IT — `LensAlias` is "either the lens
+    /// alias … or the lens ARN" (`LensAlias` doc) and this shape models no member to
+    /// resolve one spelling into the other — and `lens_arn` is the ARN that lens is
+    /// reported by ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]).
+    ///
+    /// Everything but the notes is DERIVED on every read: the lens's own name, version
+    /// and status from the lens content this emulator holds ([`lens_metadata`], absent
+    /// for a lens it holds none for), one pillar summary per pillar of the lens
+    /// ([`Self::lens_review_pillars`]) and the answered/unanswered roll-ups from the
+    /// template's stored answers.
+    pub fn to_lens_review(&self, lens: &str, lens_arn: String) -> ReviewTemplateLensReview {
+        let metadata = lens_metadata(lens);
+        let written = self.lens_review_notes(lens);
+        ReviewTemplateLensReview {
+            lens_alias: Some(lens.to_string()),
+            lens_arn: Some(lens_arn),
+            lens_version: metadata.map(|metadata| metadata.version.to_string()),
+            lens_name: metadata.map(|metadata| metadata.name.to_string()),
+            lens_status: metadata.map(|metadata| metadata.status.to_string()),
+            pillar_review_summaries: Some(
+                self.lens_review_pillars(lens)
+                    .into_iter()
+                    .map(|(pillar_id, pillar_name)| ReviewTemplatePillarReviewSummary {
+                        notes: written
+                            .and_then(|written| written.pillar_notes.get(&pillar_id).cloned()),
+                        question_counts: Some(
+                            self.pillar_question_counts(lens, &pillar_id)
+                                .into_iter()
+                                .collect::<HashMap<String, i32>>(),
+                        ),
+                        pillar_id: Some(pillar_id),
+                        pillar_name: pillar_name.map(str::to_string),
+                    })
+                    .collect(),
+            ),
+            // "The date and time when the review template lens review was last updated":
+            // the notes record carries that instant, and a lens review nothing has been
+            // written to was last changed when the template carrying it was.
+            updated_at: Some(::aws_smithy_types::DateTime::from(
+                written.map_or(self.updated_at, |written| written.updated_at),
+            )),
+            notes: written.and_then(|written| written.notes.clone()),
+            question_counts: Some(
+                self.lens_question_counts(lens)
+                    .into_iter()
+                    .collect::<HashMap<String, i32>>(),
+            ),
+            // `ReviewTemplateLensReview$NextToken` continues a paged read, and neither
+            // operation that returns this shape models a paging member to continue, so
+            // there is nothing to hand back.
+            next_token: None,
+        }
     }
 
     /// The `ReviewTemplate` shape `GetReviewTemplate` returns.
@@ -2431,6 +2628,187 @@ pub struct CreateReviewTemplateToken {
     pub fingerprint: String,
 }
 
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for an
+/// AGENT profile — the resource `CreateAgentProfile` mints and every
+/// `/api/v1/agent-profiles/{profileArn}` route resolves.
+///
+/// Deliberately NOT [`PROFILE_RESOURCE_TYPE`]: the Well-Architected Tool profile of
+/// `CreateProfile` is a different resource, named by a different ARN (`ProfileArn`'s
+/// `profile/…` against `AgentProfileArn`'s `agent-profile/…` —
+/// `smithy_query(query="shape", shape="AgentProfileArn")`), so a failure about one must
+/// not claim to be about the other.
+pub const AGENT_PROFILE_RESOURCE_TYPE: &str = "AGENT_PROFILE";
+
+/// `ResourceNotFoundException$ResourceType` for an optimization goal of an agent
+/// profile. `ExceptionResourceType` is a free-form string
+/// (`smithy_query(query="shape", shape="ExceptionResourceType")`), so it names the kind
+/// of resource that was missing: a goal.
+pub const AGENT_GOAL_RESOURCE_TYPE: &str = "GOAL";
+
+/// The most agent profiles this emulator holds.
+///
+/// `CreateAgentProfile` models `ServiceQuotaExceededException` (HTTP 402, "The user has
+/// reached their resource quota") and the real quota is adjustable through Service
+/// Quotas, so the number here is this emulator's own ceiling rather than a value read
+/// off a doc page — it is what bounds [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::agent_profiles`]
+/// (and, with it, the create ledger that is 1:1 with a live profile), and it sits far
+/// above any realistic client workflow.
+pub const MAX_AGENT_PROFILES: usize = 1_000;
+
+/// The most optimization goals one agent profile holds here. `CreateAgentGoal` models
+/// `ServiceQuotaExceededException` for the case; the ceiling is this emulator's own, for
+/// the reasons [`MAX_AGENT_PROFILES`] gives, and it bounds the goal map per profile.
+pub const MAX_GOALS_PER_AGENT_PROFILE: usize = 100;
+
+/// The modelled input member a pillar-set finding names
+/// (`CreateAgentProfileRequest$pillars`, `CreateAgentGoalRequest$pillars`), as
+/// `ValidationExceptionField$Name` reports it.
+pub const PILLARS_MEMBER: &str = "pillars";
+
+/// The modelled input member an agent profile's generation-eligibility finding names
+/// (`CreateAgentProfileRequest$aggregationConfiguration`), as
+/// `CreateAgentProfileResponse$fieldErrors` keys it — "a map of field paths to error
+/// messages for invalid or missing input fields".
+pub const AGGREGATION_CONFIGURATION_MEMBER: &str = "aggregationConfiguration";
+
+/// What `fieldErrors` says about a profile that names no scope to analyse, and so is
+/// not eligible for recommendation generation (see
+/// [`AgentProfileRecord::eligible_for_generation`]).
+pub const NO_AGGREGATION_CONFIGURATION_MESSAGE: &str =
+    "At least one aggregation configuration is required to generate recommendations.";
+
+/// One stored agent profile: the resource `CreateAgentProfile` mints, `GetAgentProfile`
+/// reports and the goals below belong to.
+///
+/// The record holds what the request carried plus what the SERVICE owns — the ARN it
+/// minted, the identity it attributed the create to and when it happened — and the
+/// reporting members (`eligibleFor…`, `fieldErrors`) are DERIVED from it rather than
+/// stored, so they cannot drift from the profile they describe.
+#[derive(Debug, Clone)]
+pub struct AgentProfileRecord {
+    pub arn: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub business_overview: Option<String>,
+    pub pillars: Vec<String>,
+    pub deletion_protection: bool,
+    pub execution_role_arn: String,
+    pub aggregation_configuration: Vec<AggregationConfiguration>,
+    /// The profile's tags, by key — a `BTreeMap` so they are reported in one stable
+    /// order, as a workload's and a review template's tags are held.
+    pub tags: BTreeMap<String, String>,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    pub last_modified_by: Option<String>,
+    pub last_modified_at: Option<SystemTime>,
+}
+
+impl AgentProfileRecord {
+    /// Whether this profile is "valid for scheduled recommendation generation" /
+    /// "valid for manual architecture generation"
+    /// (`CreateAgentProfileResponse$eligibleForScheduledGeneration` /
+    /// `$eligibleForArchitectureGeneration`).
+    ///
+    /// Generation analyses the Amazon Web Services resources the profile's
+    /// `aggregationConfiguration` scopes it to ("configuration settings that define the
+    /// scope of Amazon Web Services resources to analyze for optimization
+    /// recommendations" — `smithy_query(query="shape",
+    /// shape="AggregationConfiguration")`), and the list is modelled `@length(min: 0)`,
+    /// so a profile that names no account and Region has nothing to analyse and is
+    /// eligible for neither. Both eligibility members answer the same question of the
+    /// same stored scope, so they are derived from it together.
+    pub fn eligible_for_generation(&self) -> bool {
+        !self.aggregation_configuration.is_empty()
+    }
+
+    /// `fieldErrors`: one entry per input member that leaves this profile unable to
+    /// generate recommendations, or `None` when none does. Derived from the stored
+    /// profile, so it reports what is actually wrong with it rather than what one
+    /// request looked like.
+    pub fn field_errors(&self) -> Option<HashMap<String, String>> {
+        (!self.eligible_for_generation()).then(|| {
+            HashMap::from([(
+                AGGREGATION_CONFIGURATION_MEMBER.to_string(),
+                NO_AGGREGATION_CONFIGURATION_MESSAGE.to_string(),
+            )])
+        })
+    }
+
+    /// The profile's tags as the wire carries them, or `None` when it has none: the
+    /// modelled `Tags` member is a list of `Tag` key/value pairs
+    /// (`smithy_query(query="shape", shape="Tag")`).
+    pub fn tag_list(&self) -> Option<Vec<Tag>> {
+        (!self.tags.is_empty()).then(|| {
+            self.tags
+                .iter()
+                .map(|(key, value)| Tag {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect()
+        })
+    }
+}
+
+/// One stored optimization goal of an agent profile: "specific targets and objectives
+/// for the optimization process" (`CreateAgentGoal` doc).
+///
+/// A goal belongs to the profile its `profileArn` names — it is reached only through
+/// that profile's `/goals` routes — and carries, beside what the request sent, the id
+/// the service minted for it and the identity and instant the create is attributed to.
+#[derive(Debug, Clone)]
+pub struct AgentGoalRecord {
+    pub id: String,
+    pub profile_arn: String,
+    pub pillars: Vec<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    pub last_modified_by: Option<String>,
+    pub last_modified_at: Option<SystemTime>,
+}
+
+impl AgentGoalRecord {
+    /// The `GoalSummary` projection every goal operation answers with
+    /// (`CreateAgentGoal`, `GetAgentGoal`, and — once they are implemented —
+    /// `UpdateAgentGoal` and `ListAgentGoals`), so one place decides how a stored goal
+    /// is reported.
+    pub fn to_summary(&self) -> GoalSummary {
+        GoalSummary {
+            id: self.id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            pillars: self.pillars.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            created_by: self.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_by: self.last_modified_by.clone(),
+            last_modified_at: self
+                .last_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
+/// What a `CreateAgentProfile` idempotency token resolves to: the profile the original
+/// request created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateAgentProfileToken {
+    pub profile_arn: String,
+    pub fingerprint: String,
+}
+
+/// What a `CreateAgentGoal` idempotency token resolves to: the goal the original request
+/// created, the profile it belongs to, and that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateAgentGoalToken {
+    pub profile_arn: String,
+    pub goal_id: String,
+    pub fingerprint: String,
+}
+
 /// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
@@ -2479,6 +2857,21 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// bound what a publish can RECORD, not the stream of tokens a caller can spend
     /// against it.
     pub create_lens_version_tokens: TokenLedger<CreateLensVersionToken>,
+    /// Every stored agent profile, keyed by its `AgentProfileArn` — the only identifier
+    /// the modelled agent-profile operations take for one (`GetAgentProfile`,
+    /// `UpdateAgentProfile`, `DeleteAgentProfile` and every `/goals` route bind
+    /// `profileArn` as the URI label).
+    pub agent_profiles: HashMap<String, AgentProfileRecord>,
+    /// `CreateAgentProfile`'s `clientToken` -> what the original request created. Caller
+    /// input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_agent_profile_tokens: TokenLedger<CreateAgentProfileToken>,
+    /// Every optimization goal recorded against an agent profile, keyed by that
+    /// profile's ARN then by the goal's `UUID`. A `BTreeMap` because goal-id order is the
+    /// stable order `ListAgentGoals` pages over.
+    pub agent_goals: HashMap<String, BTreeMap<String, AgentGoalRecord>>,
+    /// `CreateAgentGoal`'s `clientToken` -> what the original request created. Caller
+    /// input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_agent_goal_tokens: TokenLedger<CreateAgentGoalToken>,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
@@ -2561,6 +2954,79 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 return id;
             }
         }
+    }
+
+    /// A fresh `AgentProfileArn`: `agent-profile/<32 lowercase hex>` in `region`, which
+    /// satisfies the modelled pattern's `agent-profile/([a-zA-Z0-9_-]+)` resource part,
+    /// and unused by any stored agent profile.
+    ///
+    /// The resource part is a minted id rather than the profile's `name`: the name is a
+    /// mutable member (`UpdateAgentProfile`), and an ARN identifies the resource for its
+    /// whole life.
+    pub fn mint_agent_profile_arn(&mut self, region: &str) -> String {
+        loop {
+            let id = self.next_hex_id();
+            let arn = ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("agent-profile/{id}"));
+            if !self.agent_profiles.contains_key(&arn) {
+                return arn;
+            }
+        }
+    }
+
+    /// A fresh goal id: 32 lowercase hex characters in the five dashed groups the
+    /// modelled `UUID` pattern requires
+    /// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`), and unused by
+    /// any goal this store holds.
+    ///
+    /// Uniqueness is checked across EVERY profile's goals, not only one profile's: a goal
+    /// id identifies a goal, so two profiles handing out the same one would make the id
+    /// ambiguous in anything that reports goals side by side.
+    pub fn mint_agent_goal_id(&mut self) -> String {
+        loop {
+            let hex = self.next_hex_id();
+            let id = format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            );
+            if !self
+                .agent_goals
+                .values()
+                .any(|goals| goals.contains_key(&id))
+            {
+                return id;
+            }
+        }
+    }
+
+    /// The goal `id` of the agent profile `profile_arn` names, if that profile holds one.
+    pub fn agent_goal(&self, profile_arn: &str, id: &str) -> Option<&AgentGoalRecord> {
+        self.agent_goals.get(profile_arn)?.get(id)
+    }
+
+    /// Drop one goal of an agent profile and everything keyed to it: any create token
+    /// that resolved to it, and the profile's goal map once its last goal is gone, so an
+    /// emptied profile leaves nothing behind.
+    pub fn remove_agent_goal(&mut self, profile_arn: &str, id: &str) -> Option<AgentGoalRecord> {
+        let goals = self.agent_goals.get_mut(profile_arn)?;
+        let record = goals.remove(id)?;
+        if goals.is_empty() {
+            self.agent_goals.remove(profile_arn);
+        }
+        self.create_agent_goal_tokens
+            .retain(|token| !(token.profile_arn == profile_arn && token.goal_id == id));
+        Some(record)
+    }
+
+    /// How many goals the agent profile `profile_arn` names currently holds — what
+    /// [`MAX_GOALS_PER_AGENT_PROFILE`] bounds.
+    pub fn agent_goal_count(&self, profile_arn: &str) -> usize {
+        self.agent_goals
+            .get(profile_arn)
+            .map_or(0, BTreeMap::len)
     }
 
     /// The next 32-lowercase-hex candidate id: a per-store counter and the wall clock,
@@ -3182,6 +3648,36 @@ pub fn review_template_not_found(template_arn: &str) -> ResourceNotFoundExceptio
         template_arn.to_string(),
         &format!("review template with ARN {template_arn}"),
     )
+}
+
+/// [`resource_not_found`] for an `AgentProfileArn` that names no stored agent profile.
+/// Shared by every operation that resolves one, so they cannot word it differently.
+pub fn agent_profile_not_found(profile_arn: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        AGENT_PROFILE_RESOURCE_TYPE,
+        profile_arn.to_string(),
+        &format!("agent profile with ARN {profile_arn}"),
+    )
+}
+
+/// [`resource_not_found`] for a goal id that names no goal of the agent profile
+/// `profile_arn`.
+///
+/// A goal is reached through its profile, so — as for a milestone — the `ResourceId` is
+/// the composite of the two and the message names both: a goal id that belongs to
+/// ANOTHER profile is as absent here as one that belongs to none.
+pub fn agent_goal_not_found(profile_arn: &str, id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        AGENT_GOAL_RESOURCE_TYPE,
+        agent_goal_resource_id(profile_arn, id),
+        &format!("goal with ID {id} in an agent profile with ARN {profile_arn}"),
+    )
+}
+
+/// How a goal of an agent profile is named in an exception's `ResourceId`: the profile
+/// it belongs to and its own id, which together identify it.
+pub fn agent_goal_resource_id(profile_arn: &str, id: &str) -> String {
+    format!("{profile_arn}.{id}")
 }
 
 /// [`resource_not_found`] for a milestone number that names no recorded milestone of

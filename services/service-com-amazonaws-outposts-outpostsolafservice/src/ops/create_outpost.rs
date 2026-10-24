@@ -273,6 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::OutpostRecord {
                 sequence,
                 outpost: outpost.clone(),
+                // Private connectivity is configured by its own call
+                // (`CreatePrivateConnectivityConfig`), so a just-created Outpost
+                // has none and `GetPrivateConnectivityConfig` reports none.
+                private_connectivity: None,
                 active_at: Some(std::time::Instant::now() + crate::state::OUTPOST_PROVISIONING),
             },
         );

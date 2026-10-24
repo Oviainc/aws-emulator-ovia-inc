@@ -24,9 +24,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AccountInsightHealth, CloudFormationCollection, CloudFormationHealth, InsightHealth,
-    InsightTimeRange, PredictionTimeRange, ProactiveInsight, ProactiveInsightSummary,
-    ReactiveInsight, ReactiveInsightSummary, ResourceCollection, ServiceCollection, ServiceHealth,
-    ServiceInsightHealth, TagCollection, TagHealth,
+    InsightTimeRange, MonitoredResourceIdentifier, PredictionTimeRange, ProactiveInsight,
+    ProactiveInsightSummary, ReactiveInsight, ReactiveInsightSummary, ResourceCollection,
+    ServiceCollection, ServiceHealth, ServiceInsightHealth, TagCollection, TagHealth,
 };
 
 /// Per-service state for com-amazonaws-devopsguru-capstonecontrolplaneservice. A handler reaches it through [`service_state`].
@@ -573,7 +573,8 @@ impl ResourceCoverage {
     /// `ADD` does not raise the count and a `REMOVE` lowers it.
     ///
     /// `DescribeAccountHealth` reports this as `AnalyzedResourceCount`, and bills one
-    /// resource-analysis hour per entry as `ResourceHours`.
+    /// resource-analysis hour per entry as `ResourceHours`. The entries themselves are
+    /// [`Self::monitored_resources`], so this count is exactly that list's length.
     pub fn monitored_resource_count(&self) -> usize {
         self.cloudformation_stack_names.len()
             + self
@@ -582,6 +583,116 @@ impl ResourceCoverage {
                 .map(BTreeSet::len)
                 .sum::<usize>()
     }
+
+    /// The resources this coverage puts under DevOps Guru analysis, one
+    /// `MonitoredResourceIdentifier` each, as `ListMonitoredResources` reports them.
+    ///
+    /// The same population [`Self::monitored_resource_count`] counts and
+    /// `DescribeAccountHealth` reports as `AnalyzedResourceCount` — one entry per
+    /// covered stack name, then one per `(app-boundary key, tag value)` pair — so the
+    /// list a client walks and the count it is told cannot disagree. Both halves are
+    /// sets, so the order is the store's stable one, which is what a page cursor needs.
+    ///
+    /// Each entry carries:
+    ///
+    /// * `ResourceCollection` — the one coverage entry this resource IS, so the
+    ///   identity of every reported resource is exact even when its name is not a
+    ///   well-formed [`monitored_resource_name`].
+    /// * `Type` — [`MONITORED_STACK_RESOURCE_TYPE`] or [`MONITORED_TAG_RESOURCE_TYPE`],
+    ///   the same value a cost estimation over the same entry reports.
+    /// * `ResourcePermission` — [`RESOURCE_PERMISSION_FULL`]: nothing in this store
+    ///   records DevOps Guru being denied access to a covered entry.
+    /// * no `LastUpdated`. `UpdateResourceCollection` stores coverage as SET
+    ///   MEMBERSHIP, and this same shape also records what an insight is ABOUT, where
+    ///   a per-entry instant means nothing — so the store holds no instant at which an
+    ///   entry was last updated and a read omits the optional member rather than
+    ///   inventing one, exactly as `ServiceHealth.AnalyzedResourceCount` is
+    ///   omitted in [`service_healths`].
+    ///
+    /// [`service_healths`]: ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::service_healths
+    pub fn monitored_resources(&self) -> Vec<MonitoredResourceIdentifier> {
+        let stacks = self
+            .cloudformation_stack_names
+            .iter()
+            .map(|stack_name| MonitoredResourceIdentifier {
+                monitored_resource_name: monitored_resource_name(stack_name),
+                r#type: Some(MONITORED_STACK_RESOURCE_TYPE.to_string()),
+                resource_permission: Some(RESOURCE_PERMISSION_FULL.to_string()),
+                last_updated: None,
+                resource_collection: Some(ResourceCollection {
+                    cloud_formation: Some(CloudFormationCollection {
+                        stack_names: Some(vec![stack_name.clone()]),
+                    }),
+                    tags: None,
+                }),
+            });
+        let tagged = self
+            .tag_collections
+            .iter()
+            .flat_map(|(app_boundary_key, tag_values)| {
+                tag_values
+                    .iter()
+                    .map(move |tag_value| MonitoredResourceIdentifier {
+                        monitored_resource_name: monitored_resource_name(tag_value),
+                        r#type: Some(MONITORED_TAG_RESOURCE_TYPE.to_string()),
+                        resource_permission: Some(RESOURCE_PERMISSION_FULL.to_string()),
+                        last_updated: None,
+                        resource_collection: Some(ResourceCollection {
+                            cloud_formation: None,
+                            tags: Some(vec![TagCollection {
+                                app_boundary_key: app_boundary_key.clone(),
+                                tag_values: vec![tag_value.clone()],
+                            }]),
+                        }),
+                    })
+            });
+        stacks.chain(tagged).collect()
+    }
+}
+
+/// The `MonitoredResourceIdentifier.Type` of the monitored resource one covered
+/// CloudFormation stack is.
+///
+/// The SAME value a cost estimation reports for that coverage entry
+/// ([`COST_ESTIMATION_STACK_TYPE`]), so two reads of one store cannot disagree about
+/// what a covered stack is.
+pub const MONITORED_STACK_RESOURCE_TYPE: &str = COST_ESTIMATION_STACK_TYPE;
+
+/// The `MonitoredResourceIdentifier.Type` of the monitored resource one covered
+/// `(AppBoundaryKey, TagValue)` pair is — [`COST_ESTIMATION_TAG_TYPE`], for the reason
+/// [`MONITORED_STACK_RESOURCE_TYPE`] gives.
+pub const MONITORED_TAG_RESOURCE_TYPE: &str = COST_ESTIMATION_TAG_TYPE;
+
+/// `ResourcePermission` as the model spells "DevOps Guru may access this resource" —
+/// see `RESOURCE_PERMISSION_VALUES` in `ops/types/shared_types.rs`, whose other value,
+/// `MISSING_PERMISSION`, says the opposite.
+///
+/// A coverage entry is a boundary the client itself declared and that
+/// `UpdateResourceCollection` accepted, and no operation of this service records a
+/// permission DevOps Guru lacks, so every monitored resource in this store is
+/// accessible to it.
+pub const RESOURCE_PERMISSION_FULL: &str = "FULL_PERMISSION";
+
+/// The length a `MonitoredResourceName` may not exceed, from
+/// `smithy_query(query="shape",shape="MonitoredResourceName")`: length 1..512.
+const MAX_MONITORED_RESOURCE_NAME: usize = 512;
+
+/// `candidate` as a `MonitoredResourceName`, or `None` when it is not one.
+///
+/// `MonitoredResourceName` is length 1..512 matching `^[\.\-_\/#A-Za-z0-9]+$`
+/// (`smithy_query(query="shape",shape="MonitoredResourceName")`), while the value a
+/// coverage entry is named by is a `StackName` or a `TagValue`, whose own patterns
+/// admit characters that one does not — a `*` wildcard in a stack name; a space, `=`,
+/// `:`, `+` or `@` in a tag value, or the empty tag value. Such an entry is reported
+/// with its identity in `ResourceCollection` and NO `MonitoredResourceName`, rather
+/// than with a name the model refuses.
+pub fn monitored_resource_name(candidate: &str) -> Option<String> {
+    let length = candidate.chars().count();
+    let well_formed = (1..=MAX_MONITORED_RESOURCE_NAME).contains(&length)
+        && candidate.chars().all(|c| {
+            matches!(c, '.' | '-' | '_' | '/' | '#') || c.is_ascii_alphanumeric()
+        });
+    well_formed.then(|| candidate.to_string())
 }
 
 /// One notification channel, as `AddNotificationChannel` stored it.

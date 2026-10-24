@@ -1367,6 +1367,21 @@ pub const SUBNET_CHANGE_PROTECTED_MESSAGE: &str =
 /// request asks for no association at all, which no mapping can satisfy.
 pub const NO_SUBNETS_MESSAGE: &str = "Specify at least one subnet.";
 
+/// What a change to a protected firewall's POLICY association is refused with.
+///
+/// The rule is documented on `Firewall$FirewallPolicyChangeProtection`: "A
+/// setting indicating whether the firewall is protected against a change to the
+/// firewall policy association. Use this setting to protect against
+/// accidentally modifying the firewall policy for a firewall that is in use",
+/// so while the flag is set the change is not a valid operation on this firewall
+/// (`InvalidOperationException`, client, HTTP 400). Same shape as
+/// [`SUBNET_CHANGE_PROTECTED_MESSAGE`]: the model does not fix the text, and the
+/// refusal is a property of the setting rather than of the request, so the
+/// message is one constant carrying nothing from the request.
+pub const FIREWALL_POLICY_CHANGE_PROTECTED_MESSAGE: &str =
+    "Unable to change the firewall policy because the firewall is protected against firewall \
+     policy changes";
+
 /// What a subnet-association change past [`MAX_AVAILABILITY_ZONES`] is refused
 /// with: `AssociateSubnets` is documented "You can specify one subnet for each
 /// of the Availability Zones that the VPC spans", and

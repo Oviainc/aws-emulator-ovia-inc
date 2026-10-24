@@ -35,7 +35,10 @@ const IDEMPOTENT_MISMATCH_MESSAGE: &str = "The request tied to this token is dif
 
 /// The `message` member of an error body, under either casing the awsJson family
 /// renders it with.
-fn error_message(body: &Value) -> String {
+///
+/// `pub(crate)` so the sibling suites in this binary read a refusal's body the
+/// same way rather than each growing a copy of this.
+pub(crate) fn error_message(body: &Value) -> String {
     ["message", "Message"]
         .iter()
         .find_map(|key| body.get(*key).and_then(Value::as_str))

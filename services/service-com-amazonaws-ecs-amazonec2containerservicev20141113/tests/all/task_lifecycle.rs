@@ -1374,18 +1374,18 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
     ];
     let mut arns = std::collections::HashMap::new();
     for (case, family, started_by, launch_type) in rows {
-        let run = ok(
-            &router,
-            "RunTask",
-            json!({
-                "cluster": "demo",
-                "taskDefinition": family,
-                "startedBy": started_by,
-                "launchType": launch_type,
-            }),
-            case,
-        )
-        .await;
+        let mut request = json!({
+            "cluster": "demo",
+            "taskDefinition": family,
+            "startedBy": started_by,
+            "launchType": launch_type,
+        });
+        if family == "web" {
+            // `web` is an `awsvpc` revision, so its launch carries the network
+            // configuration its elastic network interface takes.
+            request["networkConfiguration"] = crate::ecs_wire::awsvpc_network_configuration();
+        }
+        let run = ok(&router, "RunTask", request, case).await;
         arns.insert(
             case,
             string(&list(&run, "tasks", case)[0], "taskArn", case),
@@ -1394,7 +1394,11 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
     ok(
         &router,
         "RunTask",
-        json!({ "cluster": "other", "taskDefinition": "web" }),
+        json!({
+            "cluster": "other",
+            "taskDefinition": "web",
+            "networkConfiguration": crate::ecs_wire::awsvpc_network_configuration(),
+        }),
         "other cluster",
     )
     .await;

@@ -3,8 +3,8 @@
 //! @op ImportDocumentationParts
 //! IMPLEMENTED: reads the documentation parts an OpenAPI body declares under its
 //! `x-amazon-apigateway-documentation` extension and writes one `DocumentationPart` per
-//! entry, `merge` landing an entry on the part that already documents that entity and
-//! `overwrite` replacing the API's documentation set.
+//! documented ENTITY, `merge` landing an entry on the part that already documents that
+//! entity and `overwrite` replacing the API's documentation set.
 //!
 //! ## Shape of an operation
 //!
@@ -82,15 +82,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ::serde_json::Value;
 
 use crate::state::DocumentationPartEntry;
 
-use super::create_documentation_part::{
-    location_key, part_at_location, validated_location, validated_properties,
-};
+use super::create_documentation_part::{location_key, validated_location, validated_properties};
 use super::put_rest_api::{put_mode, PutModeKind};
 
 /// The OpenAPI extension API Gateway carries a documentation set in, and the member of
@@ -110,11 +108,22 @@ const DOCUMENTATION_PARTS_MEMBER: &str = "documentationParts";
 /// reads.
 ///
 /// The same bound the sibling API-definition import uses
-/// (`super::put_rest_api`'s `MAX_DEFINITION_BYTES`), for the same reason: an API holds at
-/// most [`crate::state::MAX_DOCUMENTATION_PARTS_PER_API`] documentation parts, so a body
-/// past this cannot be imported in full anyway, and bounding the body is what bounds the
-/// work the reader does.
+/// (`super::put_rest_api`'s `MAX_DEFINITION_BYTES`), for the same reason: bounding the
+/// body is what bounds the work the reader does, and an API holds at most
+/// [`crate::state::MAX_DOCUMENTATION_PARTS_PER_API`] documentation parts, far fewer
+/// entities than a body this size can name.
 const MAX_IMPORT_BYTES: usize = 1024 * 1024;
+
+/// Emulator resource guard, NOT an AWS quota: the most entries this emulator reads out of
+/// one import body.
+///
+/// The published quota is on the documentation parts an API HOLDS
+/// ([`crate::state::MAX_DOCUMENTATION_PARTS_PER_API`]), and a body may document one entity
+/// in several entries, so this bound is a small multiple of that quota: generous enough
+/// that no body whose entities could be stored is refused for its entry count, while
+/// keeping the work one request causes bounded by a constant rather than by how many
+/// entries fit in [`MAX_IMPORT_BYTES`].
+const MAX_IMPORT_ENTRIES: usize = 4 * crate::state::MAX_DOCUMENTATION_PARTS_PER_API;
 
 /// One entry of an import: the entity it documents, and the content map to store for it.
 #[derive(Debug, Clone)]
@@ -185,8 +194,9 @@ fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
 /// Read the documentation set out of a `body` payload.
 ///
 /// The body is "a JSON object" per the member's documentation, read by `serde_json` under
-/// its own recursion limit and bounded by [`MAX_IMPORT_BYTES`] and the per-API part
-/// quota, so it cannot amplify what the body carries.
+/// its own recursion limit and bounded by [`MAX_IMPORT_BYTES`] and [`MAX_IMPORT_ENTRIES`],
+/// so it cannot amplify what the body carries. The per-API part quota is NOT a bound here:
+/// it counts the parts the API would hold, which `handle` is where it knows.
 ///
 /// `Err` carries the message for a body that is not such a document: the caller has to fix
 /// it from this text alone.
@@ -217,12 +227,18 @@ fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
     let declared = declared.as_array().ok_or_else(|| {
         format!("{DOCUMENTATION_PARTS_MEMBER} must be a list of documentation parts")
     })?;
+    // The reader's own entry bound, so the work one request causes is bounded by a
+    // constant and not by how many entries fit in the body's bytes. It is NOT the AWS
+    // quota: that one counts the documentation parts an API HOLDS — one per documented
+    // entity — so it is enforced on the entities the import would leave behind, in
+    // `handle`, as the modelled `LimitExceededException`.
     crate::state::bound_entries(
         DOCUMENTATION_PARTS_MEMBER,
         declared.len(),
-        crate::state::MAX_DOCUMENTATION_PARTS_PER_API,
+        MAX_IMPORT_ENTRIES,
     )?;
     let mut read = ImportedParts::default();
+    let mut unstorable = 0usize;
     for (index, entry) in declared.iter().enumerate() {
         match imported_part(entry) {
             Ok(part) => read.parts.push(part),
@@ -230,12 +246,24 @@ fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
             // entries this service reports for a caller-sized list: what the response
             // carries stays bounded however many entries the body declares.
             Err(message) => {
+                unstorable += 1;
                 if read.warnings.len() < crate::state::MAX_COLLECTION_ENTRIES {
                     read.warnings
                         .push(format!("{DOCUMENTATION_PARTS_MEMBER}[{index}]: {message}"));
                 }
             }
         }
+    }
+    // A body with more unstorable entries than that says how many more there were, so the
+    // bounded list never reports fewer failures than happened. The summary takes the LAST
+    // slot rather than an extra one, so the list is at most
+    // `MAX_COLLECTION_ENTRIES` entries whatever the body declared.
+    if unstorable > read.warnings.len() {
+        read.warnings.pop();
+        let further = unstorable - read.warnings.len();
+        read.warnings.push(format!(
+            "{DOCUMENTATION_PARTS_MEMBER}: {further} further entries were not imported"
+        ));
     }
     Ok(read)
 }
@@ -344,17 +372,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        {
+        // How many identifiers this import has to mint: one per entity the body
+        // documents that the surviving documentation set does not already document.
+        // Entities are counted, not entries, so two entries for one entity count once,
+        // exactly as they will be stored — and that count is what the per-API quota
+        // applies to, because it is what the API will HOLD.
+        let minted_count = {
             let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
                 ImportDocumentationPartsErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
                 })
             })?;
-            // The documentation set the import would leave behind: what survives it —
-            // nothing in `overwrite` mode — plus one part per entity the body documents.
-            // Entities are counted, not entries, so two entries for one entity count once,
-            // exactly as they will be stored.
-            let mut documented: BTreeSet<[String; 5]> = match mode {
+            // What survives the import: nothing in `overwrite` mode, which replaces "any
+            // existing DocumentationParts definition".
+            let surviving: BTreeSet<[String; 5]> = match mode {
                 PutModeKind::Overwrite => BTreeSet::new(),
                 PutModeKind::Merge => api
                     .documentation_parts
@@ -362,8 +393,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|part| location_key(&part.location))
                     .collect(),
             };
-            documented.extend(parts.iter().map(|part| location_key(&part.location)));
-            if documented.len() > crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
+            let minted: BTreeSet<[String; 5]> = parts
+                .iter()
+                .map(|part| location_key(&part.location))
+                .filter(|key| !surviving.contains(key))
+                .collect();
+            if surviving.len() + minted.len() > crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
                 return Err(ImportDocumentationPartsErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
@@ -375,13 +410,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-        }
+            minted.len()
+        };
 
-        // One id and one creation rank per entry, which is the most this import can
-        // create: an entry that lands on the part already documenting its entity keeps
-        // that part's id and rank instead, leaving its reserved id unused.
-        let ids = store.reserve_ids(parts.len());
-        let sequences: Vec<u64> = (0..parts.len()).map(|_| store.next_sequence()).collect();
+        // One id and one creation rank per entity this import CREATES: an entry that
+        // lands on the part already documenting its entity keeps that part's id and
+        // rank instead.
+        let ids = store.reserve_ids(minted_count);
+        let sequences: Vec<u64> = (0..minted_count).map(|_| store.next_sequence()).collect();
 
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             ImportDocumentationPartsErrorModeled::NotFoundException(NotFoundException {
@@ -395,16 +431,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             api.documentation_parts.clear();
         }
 
+        // The entity-to-part index this import writes through, built ONCE from the
+        // documentation set that survives it: an entry lands on the part documenting its
+        // entity with a lookup, so the work under the lock is one lookup per entry rather
+        // than a scan of the API's whole documentation set.
+        let mut documented: BTreeMap<[String; 5], (String, u64)> = api
+            .documentation_parts
+            .values()
+            .map(|part| {
+                (
+                    location_key(&part.location),
+                    (part.id.clone(), part.sequence),
+                )
+            })
+            .collect();
+
         let mut minted = 0usize;
-        let mut imported: Vec<String> = Vec::with_capacity(parts.len());
+        // No capacity hint: this collects one id per entity the body documents, which is
+        // the minted ones plus however many landed on a surviving part.
+        let mut imported: Vec<String> = Vec::new();
+        let mut reported: BTreeSet<String> = BTreeSet::new();
         for part in parts {
             // `merge` merges "the new definition into the existing one": an entry for an
             // entity the API already documents replaces that part's content map under its
             // own identifier, so a re-import does not double the documentation set.
-            let landed = part_at_location(api, &part.location)
-                .map(|existing| (existing.id.clone(), existing.sequence));
-            let (id, sequence) = match landed {
-                Some(existing) => existing,
+            let key = location_key(&part.location);
+            let (id, sequence) = match documented.get(&key) {
+                Some(existing) => existing.clone(),
                 None => {
                     let id = ids
                         .get(minted)
@@ -415,6 +468,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .copied()
                         .ok_or_else(crate::state::state_unavailable)?;
                     minted += 1;
+                    documented.insert(key, (id.clone(), sequence));
                     (id, sequence)
                 }
             };
@@ -427,7 +481,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     sequence,
                 },
             );
-            imported.push(id);
+            // "A list of the returned documentation part identifiers": one per part the
+            // import left behind, in the order the body first documented its entity, so
+            // an entity several entries document is named once.
+            if reported.insert(id.clone()) {
+                imported.push(id);
+            }
         }
 
         // Everything below is owned, so the store lock is released before the response is

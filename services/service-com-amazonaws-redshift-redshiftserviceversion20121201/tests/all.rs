@@ -31,6 +31,8 @@ mod modify_cluster_parameter_group;
 mod orderable_cluster_options;
 #[path = "all/reset_cluster_parameter_group.rs"]
 mod reset_cluster_parameter_group;
+#[path = "all/snapshot_access.rs"]
+mod snapshot_access;
 #[path = "all/snapshot_restore.rs"]
 mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]

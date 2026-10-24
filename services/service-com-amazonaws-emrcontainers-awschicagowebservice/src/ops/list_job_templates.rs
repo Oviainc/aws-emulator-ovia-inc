@@ -72,27 +72,24 @@
 use super::types::*;
 
 /// The opaque `nextToken` for the template the next page starts at: that template's
-/// place in the newest-first order (the pair the order is built from). A client must not
-/// read it; the service only has to be able to resume from it.
+/// place in the newest-first order, under this operation's cursor scope.
 ///
-/// The components are joined by `:`, which neither a decimal millisecond (it may carry a
-/// leading `-`) nor a sequence can contain, so the split below is unambiguous whatever
-/// the stored instant is.
+/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
+/// one encoder every paginated list in this service shares.
 fn encode_cursor(record: &crate::state::JobTemplateRecord) -> String {
-    format!("{}:{}", record.created_at_millis, record.sequence)
+    crate::state::encode_list_cursor(
+        crate::state::LIST_JOB_TEMPLATES_SCOPE,
+        record.created_at_millis,
+        record.sequence,
+    )
 }
 
 /// The place in the newest-first order a `nextToken` names.
 ///
-/// `None` — refused as an invalid request — when the token is not one of this
-/// operation's cursors.
+/// `None` — refused as an invalid request — when the token is not one of THIS operation's
+/// cursors: a cursor another listing minted does not carry this scope.
 fn decode_cursor(token: &str) -> Option<(i64, u64)> {
-    let mut parts = token.split(':');
-    let (Some(created_at_millis), Some(sequence), None) = (parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
+    crate::state::decode_list_cursor(crate::state::LIST_JOB_TEMPLATES_SCOPE, token)
 }
 
 /// Whether one stored template satisfies every filter the request carried. A filter the

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachInstancesToLoadBalancer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachInstancesToLoadBalancer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers the instances the request names with one stored load balancer, so
+//! every later read of that load balancer reports them in its instance health
+//! summary, and answers the operation-log entries the registration appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachInstancesToLoadBalancer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachInstancesToLoadBalancer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachInstancesToLoadBalancerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachInstancesToLoadBalancer"))
+        // A load balancer is a REGIONAL resource — its own documentation caps
+        // them "per AWS Region in your account" — so the load balancer a name
+        // addresses is the one in the Region THIS request is signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName` and `instanceNames` are modelled `@required`
+        // members and every name carries the modelled `ResourceName` pattern, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the list has to
+        // name at least one instance, no instance twice, and no more names than
+        // the store's bound on a caller-sized list; the load balancer and every
+        // instance have to be ones this account holds; and every instance has to
+        // be running and in the load balancer's own Region. Every one of those is
+        // checked BEFORE the first write, so a refused request registers nothing.
+        let load_balancer_name = input.load_balancer_name;
+        let instance_names = input.instance_names;
+        if instance_names.is_empty() {
+            return Err(invalid(
+                "instanceNames must name at least one instance to attach to the load \
+                 balancer"
+                    .to_string(),
+            ));
+        }
+        if instance_names.len() > crate::state::MAX_INSTANCE_NAMES_PER_REQUEST {
+            return Err(invalid(format!(
+                "instanceNames carries {} names, more than the {} this service accepts in \
+                 one request",
+                instance_names.len(),
+                crate::state::MAX_INSTANCE_NAMES_PER_REQUEST
+            )));
+        }
+        // An instance is registered with a load balancer at most once — the
+        // modelled `instanceHealthSummary` carries one entry per registered
+        // instance — so one request naming the same instance twice describes no
+        // registration this service can make.
+        for (position, name) in instance_names.iter().enumerate() {
+            if instance_names[..position].contains(name) {
+                return Err(invalid(format!(
+                    "instanceNames names '{name}' more than once"
+                )));
+            }
+        }
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The load balancer first: it is the resource this operation acts on,
+            // and the one tag-based access control is evaluated against ("supports
+            // tag-based access control via resource tags applied to the resource
+            // identified by load balancer name").
+            let balancer = store
+                .load_balancer(&region, &load_balancer_name)
+                .ok_or_else(|| {
+                    not_found(
+                        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                        &load_balancer_name,
+                    )
+                })?;
+            let balancer_location = balancer.location.clone();
+
+            // Every instance is resolved and checked before ANY of them is
+            // registered, so a request naming one instance that cannot be
+            // attached registers none of the others either.
+            let mut targets: Vec<(String, crate::state::StoredLocation)> =
+                Vec::with_capacity(instance_names.len());
+            for name in &instance_names {
+                let instance = store
+                    .instance(name)
+                    .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_INSTANCE, name))?;
+                // From this operation's own `instanceNames` documentation: "An
+                // instance must be running before you can attach it to your load
+                // balancer." An instance still coming up or already down is not
+                // running, so there is nothing for the load balancer to send
+                // traffic to.
+                if instance.state != crate::state::RUNNING {
+                    return Err(operation_failure(format!(
+                        "The instance {name} is {}: an instance must be running before it \
+                         can be attached to a load balancer.",
+                        instance.state.name
+                    )));
+                }
+                // A load balancer is regional and an instance runs in one zone of
+                // one Region, and the modelled `LoadBalancer$location`
+                // documentation says "Lightsail automatically creates your load
+                // balancer across Availability Zones" — of its OWN Region — so an
+                // instance of another Region is not one it can spread traffic
+                // across.
+                if instance.location.region_name != balancer_location.region_name {
+                    return Err(operation_failure(format!(
+                        "The instance {name} is in {} and the load balancer \
+                         {load_balancer_name} is in {}: an instance can be attached only to \
+                         a load balancer in the same Amazon Web Services Region.",
+                        instance.location.region_name, balancer_location.region_name
+                    )));
+                }
+                targets.push((name.clone(), instance.location.clone()));
+            }
+
+            // The registration itself: the load balancer names the instances
+            // registered with it, in registration order, and reports one
+            // `instanceHealthSummary` entry per name from here on. Registering an
+            // instance that is already registered leaves the record as it is —
+            // it is in the state the request asks for — rather than reporting it
+            // twice.
+            let Some(balancer) = store.load_balancer_mut(&region, &load_balancer_name) else {
+                // Unreachable: the load balancer was read above under this same
+                // lock.
+                return Err(not_found(
+                    crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                    &load_balancer_name,
+                ));
+            };
+            for (name, _) in &targets {
+                if !balancer.attached_instances.contains(name) {
+                    balancer.attached_instances.push(name.clone());
+                }
+            }
+
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once, and this one does: it answers one entry for the
+            // load balancer the instances were registered with and one per
+            // instance it registered, each located where its own resource is and
+            // each left non-terminal until the registration the clock owes is
+            // due.
+            let settles_at_ms = Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS));
+            let mut operations = Vec::with_capacity(targets.len() + 1);
+            operations.push(
+                store
+                    .start_operation(
+                        now,
+                        crate::state::OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER,
+                        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                        &load_balancer_name,
+                        &balancer_location,
+                        settles_at_ms,
+                    )
+                    .view(),
+            );
+            for (name, location) in &targets {
+                operations.push(
+                    store
+                        .start_operation(
+                            now,
+                            crate::state::OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER,
+                            crate::state::RESOURCE_TYPE_INSTANCE,
+                            name,
+                            location,
+                            settles_at_ms,
+                        )
+                        .view(),
+                );
+            }
+            Ok(AttachInstancesToLoadBalancerOutput {
+                operations: Some(operations),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> AttachInstancesToLoadBalancerError {
+    AttachInstancesToLoadBalancerErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> AttachInstancesToLoadBalancerError {
+    AttachInstancesToLoadBalancerErrorModeled::OperationFailureException(
+        OperationFailureException {
+            message: Some(message),
+            ..Default::default()
+        },
+    )
+    .into()
+}
+
+/// The request names a resource this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(resource_type: &str, name: &str) -> AttachInstancesToLoadBalancerError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> AttachInstancesToLoadBalancerError {
+    AttachInstancesToLoadBalancerErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

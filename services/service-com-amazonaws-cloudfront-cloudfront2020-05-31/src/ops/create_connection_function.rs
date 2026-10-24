@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnectionFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnectionFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnectionFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a create MINTS the connection function's identity (its `Id`, its ARN and
+//! the version token of its `DEVELOPMENT` stage) and PERSISTS the code, the configuration
+//! and the tags it was given in `crate::state`, so `DescribeConnectionFunction` answers
+//! from that one record rather than from the request being served. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +152,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnectionFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnectionFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Every refusal below is decided BEFORE anything is minted or inserted, so a
+        // refused create leaves the store exactly as it was: no id, no ARN, no version
+        // token and no name is spent on it.
+
+        // A tag set no resource can carry (one key named twice, or more tags than a
+        // resource may hold) is "The tagging specified is not valid" — the refusal this
+        // operation models for it. The rule is the service's one tagging rule, shared with
+        // every tagged resource kind.
+        let tags = input
+            .tags
+            .as_ref()
+            .map(crate::state::tag_set)
+            .transpose()
+            .map_err(|reason| {
+                CreateConnectionFunctionErrorModeled::InvalidTagging(
+                    crate::state::invalid_tagging(reason),
+                )
+            })?
+            .unwrap_or_default();
+
+        // "The entity size limit was exceeded": a `FunctionBlob` admits more on the wire
+        // than CloudFront's published function-code quota allows, so code within the model
+        // but past that quota is refused with the modelled 413.
+        if input.connection_function_code.len() > crate::state::MAX_CONNECTION_FUNCTION_CODE_BYTES {
+            return Err(CreateConnectionFunctionErrorModeled::EntitySizeLimitExceeded(
+                EntitySizeLimitExceeded {
+                    message: Some(format!(
+                        "The entity size limit was exceeded: the code is {} bytes and at most \
+                         {} bytes are allowed per connection function",
+                        input.connection_function_code.len(),
+                        crate::state::MAX_CONNECTION_FUNCTION_CODE_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every CloudFront list travels in a wrapper stating its own length, and a
+        // configuration whose `Quantity` disagrees with its `Items` describes no function
+        // at all. The ONE rule for a `FunctionConfig`, shared with `CreateFunction`.
+        if let Some(message) =
+            crate::state::function_config_quantity_mismatch(&input.connection_function_config)
+        {
+            return Err(invalid_argument(message).into());
+        }
+
+        // An association names a key value store by the ARN that store's own create minted,
+        // so a connection function can only be associated with a store this service HOLDS:
+        // the check is against the stored ARN, never against the request alone. The list is
+        // bounded FIRST — CloudFront's published quota for "Key value stores per function"
+        // is one ([`crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS`]), the model puts no
+        // length on the list, and the lookup below walks the stored stores — so a request
+        // naming more describes no function this service runs and is refused before any
+        // scanning is done.
+        let associations = input
+            .connection_function_config
+            .key_value_store_associations
+            .as_ref()
+            .map_or(&[][..], |associations| {
+                associations.items.as_deref().unwrap_or_default()
+            });
+        if associations.len() > crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS {
+            return Err(invalid_argument(format!(
+                "the configuration associates {} key value stores with the connection \
+                 function but at most {} may be associated",
+                associations.len(),
+                crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS
+            ))
+            .into());
+        }
+        for association in associations {
+            if store
+                .key_value_store_by_arn(&association.key_value_store_arn)
+                .is_none()
+            {
+                return Err(invalid_argument(format!(
+                    "the key value store {} does not exist",
+                    association.key_value_store_arn
+                ))
+                .into());
+            }
+        }
+
+        // "The entity already exists. You must provide a unique entity": a name identifies
+        // ONE connection function for its whole life, so a name the store already holds
+        // cannot name a second one.
+        if store.connection_function_named(&input.name).is_some() {
+            return Err(CreateConnectionFunctionErrorModeled::EntityAlreadyExists(
+                crate::state::connection_function_already_exists(&input.name),
+            )
+            .into());
+        }
+
+        // "The entity limit has been exceeded." A connection function record is what a
+        // later read answers from, so it cannot be evicted: the account quota is an entry
+        // count refused before the insert.
+        if store.connection_functions.len() >= crate::state::MAX_CONNECTION_FUNCTIONS {
+            return Err(CreateConnectionFunctionErrorModeled::EntityLimitExceeded(
+                EntityLimitExceeded {
+                    message: Some(format!(
+                        "The entity limit has been exceeded: at most {} connection functions \
+                         are allowed in this Amazon Web Services account",
+                        crate::state::MAX_CONNECTION_FUNCTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.allocate_connection_function_id();
+        let etag = store.next_etag();
+        let stored = crate::state::StoredConnectionFunction {
+            arn: crate::state::connection_function_arn(&id),
+            id: id.clone(),
+            name: input.name,
+            // A created connection function exists in the DEVELOPMENT stage and has not
+            // been copied to LIVE, which is what its status reports; it reaches LIVE
+            // through a `PublishConnectionFunction` call, never by waiting.
+            development: crate::state::StoredConnectionFunctionStage {
+                stage: crate::state::FUNCTION_STAGE_DEVELOPMENT.to_string(),
+                config: input.connection_function_config,
+                code: input.connection_function_code,
+                status: crate::state::FUNCTION_STATUS_UNPUBLISHED.to_string(),
+                etag: etag.clone(),
+                created_time: now,
+                last_modified_time: now,
+            },
+            live: None,
+            // Held as the one tag representation every tagged resource uses: a later read
+            // answers from this record, never from the request that is being served.
+            tags,
+        };
+        let summary = stored
+            .development
+            .to_summary(&stored.name, &stored.id, &stored.arn);
+        let location = crate::state::location_uri(&crate::state::connection_function_path(&id));
+        store.connection_functions.insert(id, stored);
+
+        Ok(CreateConnectionFunctionOutput {
+            // "The summary for the connection function" — the projection of the record
+            // that was just stored.
+            connection_function_summary: Some(summary),
+            // "The location of the connection function": the URI the resource is managed
+            // at under this service's one global endpoint.
+            location: Some(location),
+            // "The version identifier for the current version of the connection function"
+            // — the token an `If-Match` against its DEVELOPMENT stage is checked against.
+            e_tag: Some(etag),
+        })
     }
+}
+
+/// The modelled `InvalidArgument` ("An argument is invalid") for a request this operation
+/// refuses, carrying `reason`.
+///
+/// One constructor rather than the shape at each use site: every refusal above that is not
+/// a name conflict, a size or a count is the same error with a different reason, and the
+/// sentence a client reads names the error it was given.
+fn invalid_argument(reason: impl ::std::fmt::Display) -> CreateConnectionFunctionErrorModeled {
+    CreateConnectionFunctionErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    })
 }

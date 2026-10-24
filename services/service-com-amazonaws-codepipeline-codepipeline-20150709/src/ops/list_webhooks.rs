@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ListWebhooksErrorModeled::InvalidNextTokenException(
                                 InvalidNextTokenException {
                                     message: Some(
-                                        "NextToken was not issued by ListWebhooks".to_string(),
+                                        crate::state::invalid_next_token_message(token),
                                     ),
                                 },
                             ),

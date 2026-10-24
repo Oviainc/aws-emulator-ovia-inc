@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageScanFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageScanFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageScanFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the basic image scan one image carries: the record `StartImageScan` wrote on
+//! it. An image nothing has scanned answers `ScanNotFoundException`, an identifier that
+//! names no stored image `ImageNotFoundException`, and a scan the clock has not yet made
+//! due is reported `IN_PROGRESS` with no findings — the findings are readable once it has
+//! completed, paged like every other list this service serves.
+//!
+//! This is the one API that reports a basic scan's results: "The new version of Amazon
+//! ECR Basic Scanning doesn't use the ImageDetail$imageScanFindingsSummary and
+//! ImageDetail$imageScanStatus attributes from the API response to return scan results.
+//! Use the DescribeImageScanFindings API instead." (`DescribeImages`).
+//!
+//! Nothing here writes: the status and the completion instant follow from the stored
+//! record and the instant the call is made.
 //!
 //! ## Shape of an operation
 //!
@@ -146,6 +151,37 @@ impl From<DescribeImageScanFindingsErrorModeled> for DescribeImageScanFindingsEr
     }
 }
 
+/// The shared state helpers report their failures as [`crate::state::Fault`]; this maps
+/// each onto the modelled error this operation declares for it.
+fn fault_error(fault: crate::state::Fault) -> DescribeImageScanFindingsErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            DescribeImageScanFindingsErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        crate::state::Fault::ImageNotFound(_) => {
+            DescribeImageScanFindingsErrorModeled::ImageNotFoundException(ImageNotFoundException {
+                message,
+            })
+        }
+        // A registry that is not this one, an identifier that names neither a digest nor
+        // a tag, and a pagination token that was never issued are each a parameter this
+        // operation cannot honour. The remaining kinds are unreachable here — this
+        // operation names no policy and carries no tags — and an invalid parameter is
+        // what each of them is from here.
+        crate::state::Fault::InvalidParameter(_)
+        | crate::state::Fault::LifecyclePolicyNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
+            DescribeImageScanFindingsErrorModeled::InvalidParameterException(
+                InvalidParameterException { message },
+            )
+        }
+    }
+}
+
 /// The `DescribeImageScanFindings` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,20 +216,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageScanFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageScanFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageScanFindings"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeImageScanFindingsErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let now = ::std::time::SystemTime::now();
+        // A read: the store is locked immutably, so reporting a scan cannot change what a
+        // later caller sees.
+        let store = state.lock();
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(fault_error)?;
+        let stored = repo.resolve_image(&input.image_id).map_err(fault_error)?;
+
+        // An image that exists but was never scanned is the `ScanNotFoundException`
+        // state, which is a different answer from the `ImageNotFoundException` the
+        // resolution above reports for a digest or tag that names no stored image.
+        let Some(scan) = stored.scan.as_ref() else {
+            return Err(DescribeImageScanFindingsErrorModeled::ScanNotFoundException(
+                ScanNotFoundException {
+                    message: Some(crate::state::scan_not_found_message(
+                        &input.image_id,
+                        &repo.name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `nextToken` and `maxResults` are honoured whatever the scan's status, so a
+        // token this service never issued addresses no page of a running scan either.
+        // Each finding is keyed by its index in the run, which is unique and ascending,
+        // so a page — and therefore a pagination token — resumes exactly where the
+        // previous one ended.
+        let (page, page_token) = crate::state::paginate(
+            scan.finding_page_keys(),
+            input.next_token.as_ref(),
+            input.max_results,
+        )
+        .map_err(fault_error)?;
+        // The findings are readable once the clock has made the scan's completion due;
+        // while it is still running the status is all there is to report, so neither the
+        // page nor the token that follows it is reported.
+        let (image_scan_findings, next_token) = match scan.to_findings(now, page) {
+            Some(findings) => (Some(findings), page_token),
+            None => (None, None),
+        };
+
+        Ok(DescribeImageScanFindingsOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            image_id: Some(stored.identifier(input.image_id.image_tag.as_deref())),
+            image_scan_status: Some(scan.to_status(now)),
+            image_scan_findings,
+            next_token,
+        })
     }
 }

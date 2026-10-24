@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ListAssetsErrorModeled::InternalServerErrorException(
@@ -163,13 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::resume_after(crate::state::LISTING_ASSETS, input.next_token.as_deref())?;
         let page_size = crate::state::page_size(input.max_results)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let state = store.lock();
         let group_filter = input.packaging_group_id.as_deref();
-        // `assets` is a `BTreeMap`, so this is one stable id order across pages: a
-        // cursor can resume strictly after the id the previous page ended on.
+        // One Region's assets are a contiguous `Id`-ordered range of the store, so
+        // this is one stable id order across pages: a cursor can resume strictly after
+        // the id the previous page ended on. An asset of another Region is not
+        // reported here at all.
         let matching: Vec<&crate::state::AssetRecord> = state
-            .assets
-            .values()
+            .assets_in(&region)
             .filter(|asset| {
                 group_filter.is_none_or(|group| asset.packaging_group_id == group)
             })

@@ -324,12 +324,15 @@ async fn the_quota_refusal_is_audited() {
     use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::MAX_DASHBOARDS;
 
     let router = router();
-    let request = json!({"name": "Quota Filler", "widgets": []});
-    for _ in 0..MAX_DASHBOARDS {
+    // A distinct name per create: a dashboard's name is unique within the account, so the
+    // quota is what must refuse the create past the ceiling.
+    for index in 0..MAX_DASHBOARDS {
+        let request = json!({"name": format!("Quota Filler {index:04}"), "widgets": []});
         ok_call(&router, "CreateDashboard", &request).await;
     }
 
     let (capture, _guard) = capture_events();
+    let request = json!({"name": "Quota Filler Overflow", "widgets": []});
     let (status, body) = call(&router, "CreateDashboard", &request).await;
     assert_eq!(
         status, 402,

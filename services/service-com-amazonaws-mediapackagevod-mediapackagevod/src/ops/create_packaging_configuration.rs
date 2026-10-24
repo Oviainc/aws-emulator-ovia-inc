@@ -206,17 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The group id arrives in the request BODY, so one that resolves to nothing
         // is a violation of that PARAMETER rather than a missing addressed resource.
-        if !state
-            .packaging_groups
-            .contains_key(&input.packaging_group_id)
-        {
+        // It resolves in this request's Region only: a group of the same `Id` in
+        // another Region is not this Region's group.
+        if !state.has_packaging_group(&region, &input.packaging_group_id) {
             return Err(crate::scaffolded::UnprocessableEntity::member(
                 "packagingGroupId",
                 "does not exist",
             )
             .into());
         }
-        if state.packaging_configurations.contains_key(&input.id) {
+        if state.has_packaging_configuration(&region, &input.id) {
             return Err(
                 CreatePackagingConfigurationErrorModeled::UnprocessableEntityException(
                     UnprocessableEntityException {
@@ -247,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if state.configuration_count(&input.packaging_group_id)
+        if state.configuration_count(&region, &input.packaging_group_id)
             >= crate::state::MAX_PACKAGING_CONFIGURATIONS_PER_GROUP
         {
             return Err(
@@ -268,6 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::resource_arn("packaging-configurations", &region, &input.id);
         let record = crate::state::PackagingConfigurationRecord {
             id: input.id.clone(),
+            region: region.clone(),
             arn: arn.clone(),
             created_at: crate::state::now_iso8601(),
             packaging_group_id: input.packaging_group_id,
@@ -286,9 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_instant: std::time::Instant::now(),
         };
         state.set_tags(&arn, input.tags.as_ref());
-        state.packaging_configurations.insert(input.id.clone(), record);
+        state.insert_packaging_configuration(record);
 
-        let Some(stored) = state.packaging_configurations.get(&input.id) else {
+        let Some(stored) = state.packaging_configuration(&region, &input.id) else {
             return Err(
                 CreatePackagingConfigurationErrorModeled::InternalServerErrorException(
                     InternalServerErrorException {

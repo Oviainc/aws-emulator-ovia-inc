@@ -69,6 +69,13 @@ pub const DEFAULT_AUTHORIZATION_TYPE: &str = "NONE";
 /// emulator defaults to (see `emulator_server::emulator_arn`).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The prefix a `Route$Target` carries when the route is wired to an integration of
+/// its own api: API Gateway addresses an integration target as
+/// `integrations/{IntegrationId}` — the form `CreateRoute$Target` takes and the one
+/// every route reader reports back. [`Route::target_integration_id`] is what reads an
+/// `IntegrationId` out of a target, so no handler has to know the spelling.
+pub const INTEGRATION_TARGET_PREFIX: &str = "integrations/";
+
 /// The most apis one account may hold, after which CreateApi is refused.
 ///
 /// AWS's published API Gateway quota is 600 HTTP/WebSocket APIs per account per
@@ -465,6 +472,20 @@ impl Api {
 }
 
 impl Api {
+    /// The ids of this api's routes that are wired to `integration_id`, in the store's
+    /// stable `RouteId` order.
+    ///
+    /// A route holds the reference (through its `Target`), so the integration is the
+    /// one that cannot be removed while any of them exists: a deleted integration
+    /// would leave those routes pointing at nothing.
+    pub fn routes_targeting_integration(&self, integration_id: &str) -> Vec<String> {
+        self.routes
+            .values()
+            .filter(|route| route.target_integration_id() == Some(integration_id))
+            .map(|route| route.route_id.clone())
+            .collect()
+    }
+
     /// Project the record onto the modelled `Api` shape.
     pub fn to_wire(&self) -> wire::Api {
         wire::Api {
@@ -523,6 +544,16 @@ pub struct Route {
 }
 
 impl Route {
+    /// The `IntegrationId` this route is wired to, when its target names an
+    /// integration of the same api (`integrations/{IntegrationId}`). `None` for a
+    /// route with no target at all, and for a target of any other form — a target
+    /// this service does not resolve to an integration references none of them.
+    pub fn target_integration_id(&self) -> Option<&str> {
+        self.target
+            .as_deref()?
+            .strip_prefix(INTEGRATION_TARGET_PREFIX)
+    }
+
     /// Mint a fresh `RouteResponseId` for this route: ten lowercase alphanumerics,
     /// never one this route already minted.
     pub fn mint_route_response_id(&mut self) -> String {

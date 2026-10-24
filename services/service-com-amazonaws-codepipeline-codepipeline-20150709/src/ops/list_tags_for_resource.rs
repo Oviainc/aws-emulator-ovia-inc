@@ -209,8 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ListTagsForResourceErrorModeled::InvalidNextTokenException(
                                 InvalidNextTokenException {
                                     message: Some(
-                                        "nextToken was not issued by ListTagsForResource"
-                                            .to_string(),
+                                        crate::state::invalid_next_token_message(token),
                                     ),
                                 },
                             ),

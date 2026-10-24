@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -170,14 +170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         let page_size = crate::state::page_size(input.max_results)?;
 
+        let region = crate::state::request_region(ctx.parts());
         let state = store.lock();
         let group_filter = input.packaging_group_id.as_deref();
-        // `packaging_configurations` is a `BTreeMap`, so this is one stable id order
-        // across pages: a cursor resumes strictly after the id the previous page
-        // ended on, so no configuration is reported twice and none is skipped.
+        // One Region's configurations are a contiguous `Id`-ordered range of the
+        // store, so this is one stable id order across pages: a cursor resumes
+        // strictly after the id the previous page ended on, so no configuration is
+        // reported twice and none is skipped. A configuration of another Region is not
+        // reported here at all.
         let matching: Vec<&crate::state::PackagingConfigurationRecord> = state
-            .packaging_configurations
-            .values()
+            .packaging_configurations_in(&region)
             .filter(|cfg| group_filter.is_none_or(|group| cfg.packaging_group_id == group))
             .filter(|cfg| {
                 resume_after

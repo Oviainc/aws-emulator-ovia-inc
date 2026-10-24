@@ -242,12 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A collection name identifies one collection in the account, so a name already
         // taken is the conflict `ConflictException` describes: "thrown when a resource
         // with the same name already exists or is being created".
-        if let Some(existing) = store.collection_by_name(&input.name) {
+        //
+        // The refusal names the member the request carried and nothing else: the id of
+        // the collection that holds the name is this account's to read through
+        // `ListCollections`, not something a refused create reports back.
+        if store.collection_by_name(&input.name).is_some() {
             return Err(CreateCollectionErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
-                        "Collection with name {} already exists with id {}",
-                        existing.name, existing.id
+                        "A collection with name '{}' already exists.",
+                        input.name
                     )),
                 },
             )

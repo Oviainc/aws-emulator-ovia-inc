@@ -41,6 +41,8 @@ mod function_lifecycle;
 mod function_recursion_config;
 #[path = "all/function_url_config.rs"]
 mod function_url_config;
+#[path = "all/function_url_deletion.rs"]
+mod function_url_deletion;
 #[path = "all/function_version_listing.rs"]
 mod function_version_listing;
 #[path = "all/layer_listing.rs"]

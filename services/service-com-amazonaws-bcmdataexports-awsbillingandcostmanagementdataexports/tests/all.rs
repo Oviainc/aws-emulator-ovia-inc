@@ -51,6 +51,8 @@ mod table_listing;
 mod tagging;
 #[path = "all/tagging_arn_validation.rs"]
 mod tagging_arn_validation;
+#[path = "all/untagging_authorization.rs"]
+mod untagging_authorization;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
 #[path = "all/validation_messages.rs"]

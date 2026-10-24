@@ -391,8 +391,9 @@ async fn every_kinesis_video_route_is_claimed_by_exactly_one_of_the_five_service
         ),
         (
             // Signaling binds both its operations under `/v1/…`, a first segment no other
-            // Kinesis Video model uses. Both are still scaffolds (its bootstrap issue), so
-            // only the selection is asserted.
+            // Kinesis Video model uses. Both are served from that crate's own channel
+            // registry now; this suite asserts only the selection, and the signaling
+            // crate's own suite asserts what each answers.
             "signaling GetIceServerConfig",
             Call::post(
                 "/v1/get-ice-server-config",

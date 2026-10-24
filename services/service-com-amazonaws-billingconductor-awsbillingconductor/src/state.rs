@@ -1182,6 +1182,33 @@ pub fn validation_exception(
     }
 }
 
+/// The modelled refusal a request earns when one of the account ids it names is
+/// already associated with a DIFFERENT billing group.
+///
+/// An account belongs to at most one billing group, so an account list naming one
+/// another group already owns is a fault in the INPUT, not an inconsistent state of
+/// the group addressed: `ValidationExceptionReason` enumerates
+/// `ACCOUNTS_ALREADY_ASSOCIATED` for exactly this case, while no
+/// `ConflictExceptionReason` value describes it
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason,ConflictExceptionReason")`).
+/// So the answer is the 400 `ValidationException` with that reason, built here so
+/// every operation that takes account ids answers it the same way; `field` names the
+/// input member that carried the id (`AccountIds`, `AccountGrouping.LinkedAccountIds`,
+/// …), which is what goes in `Fields`.
+pub fn accounts_already_associated(
+    field: &str,
+    account_id: &str,
+    owner_group_arn: &str,
+) -> crate::ops::types::ValidationException {
+    validation_exception(
+        "ACCOUNTS_ALREADY_ASSOCIATED",
+        field,
+        format!(
+            "account {account_id} is already associated with billing group {owner_group_arn}"
+        ),
+    )
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

@@ -3,7 +3,9 @@
 //! @op CreateCallAnalyticsCategory
 //! Records a new Call Analytics category — its rules, its input type and its tags —
 //! refusing a name this account already holds a category under (see
-//! [`CreateCallAnalyticsCategory::handle`]).
+//! [`CreateCallAnalyticsCategory::handle`]). The stored record is what
+//! `GetCallAnalyticsCategory` reads back and what `UpdateCallAnalyticsCategory`
+//! replaces the rules of.
 //!
 //! ## Shape of an operation
 //!

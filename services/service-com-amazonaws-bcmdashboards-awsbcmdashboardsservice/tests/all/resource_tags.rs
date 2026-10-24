@@ -225,9 +225,11 @@ async fn tags_are_reported_per_resource() {
     let router = router();
 
     let mut stored: Vec<StoredResource> = Vec::new();
-    for case in tag_cases() {
-        let arn = create_tagged(&router, "Shared Router Dashboard", &case.tags, case.supply_member)
-            .await;
+    for (index, case) in tag_cases().into_iter().enumerate() {
+        // A distinct name per row: a dashboard's name is unique within the account, and
+        // these rows share one router.
+        let name = format!("Shared Router Dashboard {index}");
+        let arn = create_tagged(&router, &name, &case.tags, case.supply_member).await;
         stored.push(StoredResource {
             label: case.label,
             arn,

@@ -729,13 +729,13 @@ async fn associate_accounts_refuses_an_unknown_group_and_a_taken_account() {
             )
             .await;
         assert_eq!(
-            status, 409,
-            "case {case:?}: expected HTTP 409, got {status} with {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
         );
         assert_eq!(
             error_code(&body),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {body:?}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
         );
         // The refusal changed nothing: the account still belongs to the first group.
         let members = list_associations(&em, &json!({"Filters": {"AccountId": account}})).await;
@@ -764,13 +764,13 @@ async fn associate_accounts_refuses_an_unknown_group_and_a_taken_account() {
         )
         .await;
     assert_eq!(
-        status, 409,
-        "case \"CreateBillingGroup over a taken account\": expected HTTP 409, got {status} with {body:?}"
+        status, 400,
+        "case \"CreateBillingGroup over a taken account\": expected HTTP 400, got {status} with {body:?}"
     );
     assert_eq!(
         error_code(&body),
-        "ConflictException",
-        "case \"CreateBillingGroup over a taken account\": expected ConflictException, got {body:?}"
+        "ValidationException",
+        "case \"CreateBillingGroup over a taken account\": expected ValidationException, got {body:?}"
     );
 }
 

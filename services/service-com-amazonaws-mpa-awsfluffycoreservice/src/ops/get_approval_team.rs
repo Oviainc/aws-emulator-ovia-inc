@@ -190,7 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
-        let Some(team) = state.team(&input.arn) else {
+        // The team record is taken as a snapshot so the resolver below — which reads the
+        // whole store for the sessions outstanding against this team — can run beside it.
+        let Some(team) = state.team(&input.arn).cloned() else {
             // The one message this service answers every resource lookup that
             // resolves to nothing with: a service constant that names neither the
             // operation nor the ARN asked for (`crate::state::resource_not_found`).
@@ -199,6 +201,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let team = &team;
+
+        // The outstanding baseline session of each approver, resolved out of the SAME
+        // session records `GetSession` reports, so the two reads cannot disagree about
+        // which session is pending for whom.
+        let pending_baselines: ::std::collections::BTreeMap<&str, String> = team
+            .approvers
+            .iter()
+            .filter_map(|approver| {
+                state
+                    .pending_baseline_session_arn(&input.arn, &approver.approver_id)
+                    .map(|session_arn| (approver.approver_id.as_str(), session_arn))
+            })
+            .collect();
 
         let crate::state::StoredApprovalStrategy::MofN {
             min_approvals_required,
@@ -234,9 +250,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         last_activity_time: approver
                             .last_activity_time
                             .map(::aws_smithy_types::DateTime::from),
-                        // No baseline session is minted until `StartApprovalTeamBaseline`
-                        // is implemented, and this service stores no MFA devices.
-                        pending_baseline_session_arn: None,
+                        // The baseline session this approver still has to answer, read
+                        // off the stored sessions; this service stores no MFA devices.
+                        pending_baseline_session_arn: pending_baselines
+                            .get(approver.approver_id.as_str())
+                            .cloned(),
                         mfa_methods: None,
                     })
                     .collect(),

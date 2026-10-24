@@ -1240,15 +1240,22 @@ pub(crate) fn name_path_segment(name: &str) -> String {
     name.replace(' ', "%20")
 }
 
-/// The ARN of the SLO called `name`, written as one URI path segment.
-///
-/// The ARN's own punctuation is spelled in its escaped form here rather than computed: a
-/// path segment cannot carry `/` (it would split the segment), and `:` is written `%3A`
-/// beside it for symmetry. The unescaped form is what the test asserts the service RETURNS;
-/// this is only how it is spelled in a request line.
+/// The ARN of the SLO called `name`, written as one URI segment.
 pub(crate) fn arn_path_segment(name: &str) -> String {
-    format!(
-        "arn%3Aaws%3Aapplication-signals%3A{REGION}%3A{ACCOUNT}%3Aslo%2F{}",
+    arn_uri_segment(&format!(
+        "arn:aws:application-signals:{REGION}:{ACCOUNT}:slo/{}",
         name_path_segment(name)
-    )
+    ))
+}
+
+/// An ARN written as one URI segment (a path segment, or a query value).
+///
+/// The ARN's own punctuation is what needs escaping and nothing else: a segment cannot carry
+/// `/` (it would split the segment), and `:` is escaped beside it. Every other character an
+/// ARN of this service carries is in RFC 3986's unreserved set, so this is a COMPLETE
+/// escaping of any ARN the API accepts rather than a general percent-encoder. The ONE place
+/// this test target spells a request's ARN, so two suites cannot encode one differently; the
+/// unescaped form is what the tests assert the service RETURNS.
+pub(crate) fn arn_uri_segment(arn: &str) -> String {
+    arn.replace(':', "%3A").replace('/', "%2F")
 }

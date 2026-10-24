@@ -250,16 +250,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     environment_name: Some(environment.environment_name.clone()),
                     // "Describes this configuration set." The store holds no
                     // description of its own for an environment's configuration
-                    // — only `UpdateEnvironment`/`DeleteEnvironmentConfiguration`
-                    // would create one, both still their own stubs — so the
-                    // environment's own description is what describes it, rather
-                    // than a sentence invented here.
+                    // — `UpdateEnvironment` deploys settings onto the
+                    // environment rather than describing the set they form — so
+                    // the environment's own description is what describes it,
+                    // rather than a sentence invented here.
                     description: environment.description.clone(),
                     // "deployed: This is the configuration that is currently
                     // deployed to the associated running environment." The
                     // second description the operation can report is a DRAFT
                     // configuration (`pending`/`failed`) of an update in
-                    // flight, which this store holds none of.
+                    // flight, which this store holds none of: an update applies
+                    // its settings to the environment when it starts, so the
+                    // configuration the environment carries is always the
+                    // deployed one.
                     deployment_status: Some(DEPLOYMENT_STATUS_DEPLOYED.to_string()),
                     date_created: Some(environment.date_created),
                     date_updated: Some(environment.date_updated),

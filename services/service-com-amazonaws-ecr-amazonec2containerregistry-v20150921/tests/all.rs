@@ -23,6 +23,8 @@ mod create_repository_contract;
 mod error_message_construction;
 #[path = "all/image_metadata.rs"]
 mod image_metadata;
+#[path = "all/image_scan.rs"]
+mod image_scan;
 #[path = "all/image_tag_mutability.rs"]
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]

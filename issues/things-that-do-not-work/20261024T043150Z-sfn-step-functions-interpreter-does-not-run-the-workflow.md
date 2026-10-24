@@ -1,0 +1,118 @@
+Issue-Severity: CRITICAL
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: sfn.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime sfn.deep-sfn-1-sfn-sync-lambda-invoke-envelope-vs-raw-arn-bare-payload sfn.deep-sfn-1-sfn-sync-lambda-result-over-256kib-rejected sfn.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected sfn.deep-sfn-1-sfn-sync-v1-output-string-vs-v2-output-object sfn.deep-sfn-2-sfn-jsonata-context-retry-count-increments-per-attempt sfn.input-output-processing-stages-apply-in-the-documented-order sfn.nested-fire-and-forget-start-execution-does-not-block-on-child sfn.sfn-aws-sdk-task-writes-dynamodb-and-a-later-state-reads-it-back sfn.sfn-nested-sync-child-execution-output-is-returned-to-the-parent sfn.sfn-result-selector-and-result-path-compose-over-a-real-sdk-task sfn.sfn-task-state-invokes-lambda lambda__sfn__sqs.sfn-invoke-lambda-task-positive lambda__sfn__sqs.sfn-sqs-changemessagevisibility-task-extends-timeout lambda__sfn__sqs.sfn-sqs-delete-message-task-removes-from-queue glue__s3__sfn.xsvc-sfn-1-glue-sync-succeeds-only-after-the-job-run-completes events__lambda__stepfunctions.refarch-sfn-nonexistent-role-accepted-at-create-rejected-on-data-plane events__lambda__stepfunctions.refarch-sfn-stop-execution-on-terminal-execution-is-idempotent dynamodb__lambda__s3__sfn.tenant-provisioning-workflow-writes-objects-url-and-provisioned-status cloudfront__dynamodb__lambda__s3__sfn.e2e-cloudfront-distribution-origin-error-diagnosis-lifecycle sfn__xray.tracing-enabled-state-machine-publishes-a-trace-and-a-disabled-twin-does-not dynamodb__lambda__sfn.sfn-saga-compensate-on-failure lambda__stepfunctions.execution-history-attributes-failure-to-the-task-state sfn.choice-jsonata-non-boolean-condition-rejected sfn.deep-sfn-2-sfn-jsonata-states-context-execution-name-and-entered-time sfn.deep-sfn-2-sfn-jsonata-task-arguments-aws-sdk-result-output sfn.jsonata-assign-variables-scope-across-states sfn.conc-distributed-map-200-s3-objects-processed-once-under-concurrency-cap sfn.conc-distributed-map-csv-item-reader-delivers-header-keyed-string-columns sfn.conc-distributed-map-item-batcher-groups-items-into-configured-batches sfn.conc-distributed-map-item-reader-missing-object-fails-before-any-child sfn.conc-distributed-map-tolerated-failure-percentage-succeeds-and-names-failed-items sfn.conc-distributed-map-zero-tolerance-run-fails-and-keeps-completed-items s3__sfn.sfn-distributed-map-over-real-s3-objects-writes-a-result-manifest s3__sfn.sfn-distributed-map-without-start-execution-permission-fails-with-zero-children sfn.conc-distributed-map-accepts-items-whose-inline-map-history-limit-fails sfn.conc-distributed-map-child-executions-listed-and-describable-per-item lambda__sfn__sqs.sfn-wait-for-task-token-lambda-resumes lambda__sfn__sqs.sfn-sqs-waitfortasktoken-heartbeat-timeout-negative lambda__sfn__sqs.sfn-task-token-invalid-token-sendtasksuccess-negative sfn__sqs.sfn-task-token-timeout-on-no-callback events__lambda__s3__sfn.sfn-task-token-lambda-missing-sendtask-permission-blocks-resume sfn.deep-sfn-language-retry-first-matching-retrier-and-catch-order sfn.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected
+Issue-Key: sfn.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime|run#8|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-1-sfn-sync-lambda-invoke-envelope-vs-raw-arn-bare-payload|run#7|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-1-sfn-sync-lambda-result-over-256kib-rejected|run#5|AssertionError|assert ok["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected|run#12|AssertionError|assert ok["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-1-sfn-sync-v1-output-string-vs-v2-output-object|run#8|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-2-sfn-jsonata-context-retry-count-increments-per-attempt|run#7|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.input-output-processing-stages-apply-in-the-documented-order|run#7|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: sfn.nested-fire-and-forget-start-execution-does-not-block-on-child|run#6|AssertionError|assert parent["status"] == "SUCCEEDED", (
+Issue-Key: sfn.sfn-aws-sdk-task-writes-dynamodb-and-a-later-state-reads-it-back|run#15|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.sfn-nested-sync-child-execution-output-is-returned-to-the-parent|run#12|AssertionError|assert parent["status"] == "SUCCEEDED", (
+Issue-Key: sfn.sfn-result-selector-and-result-path-compose-over-a-real-sdk-task|run#8|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.sfn-task-state-invokes-lambda|run#10|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: lambda__sfn__sqs.sfn-invoke-lambda-task-positive|run#20|AssertionError|assert desc["status"] == "SUCCEEDED", f"Expected SUCCEEDED, got: {desc['status']}"
+Issue-Key: lambda__sfn__sqs.sfn-sqs-changemessagevisibility-task-extends-timeout|run#13|AssertionError|assert execution["status"] == "SUCCEEDED", execution.get("cause", execution)
+Issue-Key: lambda__sfn__sqs.sfn-sqs-delete-message-task-removes-from-queue|run#12|AssertionError|assert execution["status"] == "SUCCEEDED", execution.get("cause", execution)
+Issue-Key: glue__s3__sfn.xsvc-sfn-1-glue-sync-succeeds-only-after-the-job-run-completes|run#12|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-nonexistent-role-accepted-at-create-rejected-on-data-plane|run#20|AssertionError|assert denied.get("error") == "States.TaskFailed", (
+Issue-Key: events__lambda__stepfunctions.refarch-sfn-stop-execution-on-terminal-execution-is-idempotent|run#8|AssertionError|assert before["status"] == "SUCCEEDED", (
+Issue-Key: dynamodb__lambda__s3__sfn.tenant-provisioning-workflow-writes-objects-url-and-provisioned-status|_await_workflow_role#1|AssertionError|assert not assumed and time.monotonic() < deadline, (
+Issue-Key: cloudfront__dynamodb__lambda__s3__sfn.e2e-cloudfront-distribution-origin-error-diagnosis-lifecycle|phase#9|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
+Issue-Key: sfn__xray.tracing-enabled-state-machine-publishes-a-trace-and-a-disabled-twin-does-not|_sync#7|AssertionError|assert resp["status"] == "SUCCEEDED", (
+Issue-Key: dynamodb__lambda__sfn.sfn-saga-compensate-on-failure|run#9|Timeout|time.sleep(15)
+Issue-Key: lambda__stepfunctions.execution-history-attributes-failure-to-the-task-state|_await_role_assumable#10|Timeout|time.sleep(5.0)
+Issue-Key: sfn.choice-jsonata-non-boolean-condition-rejected|assert_routes#4|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-2-sfn-jsonata-states-context-execution-name-and-entered-time|run#8|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.deep-sfn-2-sfn-jsonata-task-arguments-aws-sdk-result-output|run#9|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.jsonata-assign-variables-scope-across-states|run#3|AssertionError|assert desc["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-200-s3-objects-processed-once-under-concurrency-cap|run#15|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-csv-item-reader-delivers-header-keyed-string-columns|run#12|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-item-batcher-groups-items-into-configured-batches|run#11|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-item-reader-missing-object-fails-before-any-child|run#12|AssertionError|assert ok["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-tolerated-failure-percentage-succeeds-and-names-failed-items|run#10|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-zero-tolerance-run-fails-and-keeps-completed-items|run#10|AssertionError|assert ok_exe["status"] == "SUCCEEDED", (
+Issue-Key: s3__sfn.sfn-distributed-map-over-real-s3-objects-writes-a-result-manifest|run#11|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: s3__sfn.sfn-distributed-map-without-start-execution-permission-fails-with-zero-children|run#14|AssertionError|assert "not authorized to perform: states:StartExecution" in (first.get("cause") or ""), (
+Issue-Key: sfn.conc-distributed-map-accepts-items-whose-inline-map-history-limit-fails|run#8|AssertionError|assert dist["status"] == "SUCCEEDED", (
+Issue-Key: sfn.conc-distributed-map-child-executions-listed-and-describable-per-item|run#9|AssertionError|assert exe["status"] == "SUCCEEDED", (
+Issue-Key: lambda__sfn__sqs.sfn-wait-for-task-token-lambda-resumes|_wait_for_messages#7|Timeout|resp = sqs.receive_message(
+Issue-Key: lambda__sfn__sqs.sfn-sqs-waitfortasktoken-heartbeat-timeout-negative|_receive_token#7|Timeout|resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=5)
+Issue-Key: lambda__sfn__sqs.sfn-task-token-invalid-token-sendtasksuccess-negative|_receive_token#6|Timeout|resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=5)
+Issue-Key: sfn__sqs.sfn-task-token-timeout-on-no-callback|run#6|Timeout|time.sleep(15)
+Issue-Key: events__lambda__s3__sfn.sfn-task-token-lambda-missing-sendtask-permission-blocks-resume|_poll_for_object#10|Timeout|time.sleep(interval_s)
+Issue-Key: sfn.deep-sfn-language-retry-first-matching-retrier-and-catch-order|_wait_role_can_write#3|Timeout|time.sleep(3)
+Issue-Key: sfn.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected|_wait_role_can_write#3|Timeout|time.sleep(3)
+Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
+
+# Step Functions interpreter does not run the workflow language: Task states, JSONata, Distributed Map, callbacks and Retry/Catch all never execute (6 causes)
+
+> _Note: this issue was identified against the code base at commit `3ecafc116f2b44ac9fb7ddf17b83f092c778a529`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+StartExecution
+
+## Description
+This issue bundles SIX distinct root causes in the Step Functions execution engine. All six must be closed before submitting. A fixer should re-replay every check id listed in trace_ids.
+
+Cause 1 of 6: Task states are never executed at all.
+AWS: a Task state invokes its Resource (a Lambda ARN, an `arn:aws:states:::aws-sdk:<svc>:<op>` SDK integration, `arn:aws:states:::states:startExecution.sync`, `arn:aws:states:::sqs:deleteMessage`, etc.), binds the call result as the state result, and the execution continues; Smithy: StartExecution output is only `executionArn`/`startDate`, and the execution's terminal state is observed through DescribeExecution, whose `status` must become SUCCEEDED for a well-formed workflow. Nothing in the model permits a Task to be skipped.
+Emulator: every execution containing a Task terminates immediately with `status=FAILED`, `error='States.Runtime'`, `cause="state '<Name>' is of type 'Task', which this emulator does not execute, so nothing was run for it"`. This is the same root cause as open issue 20261023T114649Z-sfn-step-functions-never-executes-task-states-every-execution.md, which carries the replay key for only one check (events__lambda__s3__sfn.sfn-task-token-heartbeat-timeout-fails-execution); the check ids below are the additional ones this defect fails and are not covered by that issue's replay set.
+Why: no realistic workflow can be emulated. Lambda orchestration, AWS SDK integrations, `.sync` service integrations, nested/child executions, InputPath/Parameters/ResultSelector/ResultPath composition, saga compensation and X-Ray tracing are all unobservable, and a client sees a bogus `States.Runtime` failure for a definition AWS runs successfully.
+Fix: the Task-state branch of the execution interpreter in the sfn crate (state execution/dispatch to the Resource integrations), not the control plane.
+Traces: sfn.deep-sfn-1-sfn-sync-express-machine-sync-task-rejected-at-runtime, sfn.deep-sfn-1-sfn-sync-lambda-invoke-envelope-vs-raw-arn-bare-payload, sfn.deep-sfn-1-sfn-sync-lambda-result-over-256kib-rejected, sfn.deep-sfn-1-sfn-sync-start-unpermitted-child-rejected, sfn.deep-sfn-1-sfn-sync-v1-output-string-vs-v2-output-object, sfn.deep-sfn-2-sfn-jsonata-context-retry-count-increments-per-attempt, sfn.input-output-processing-stages-apply-in-the-documented-order, sfn.nested-fire-and-forget-start-execution-does-not-block-on-child, sfn.sfn-aws-sdk-task-writes-dynamodb-and-a-later-state-reads-it-back, sfn.sfn-nested-sync-child-execution-output-is-returned-to-the-parent, sfn.sfn-result-selector-and-result-path-compose-over-a-real-sdk-task, sfn.sfn-task-state-invokes-lambda, lambda__sfn__sqs.sfn-invoke-lambda-task-positive, lambda__sfn__sqs.sfn-sqs-changemessagevisibility-task-extends-timeout, lambda__sfn__sqs.sfn-sqs-delete-message-task-removes-from-queue, glue__s3__sfn.xsvc-sfn-1-glue-sync-succeeds-only-after-the-job-run-completes, events__lambda__stepfunctions.refarch-sfn-nonexistent-role-accepted-at-create-rejected-on-data-plane, events__lambda__stepfunctions.refarch-sfn-stop-execution-on-terminal-execution-is-idempotent, dynamodb__lambda__s3__sfn.tenant-provisioning-workflow-writes-objects-url-and-provisioned-status, cloudfront__dynamodb__lambda__s3__sfn.e2e-cloudfront-distribution-origin-error-diagnosis-lifecycle, sfn__xray.tracing-enabled-state-machine-publishes-a-trace-and-a-disabled-twin-does-not, dynamodb__lambda__sfn.sfn-saga-compensate-on-failure, lambda__stepfunctions.execution-history-attributes-failure-to-the-task-state.
+
+Cause 2 of 6: the JSONata query language is not implemented.
+AWS: a state machine whose top-level `QueryLanguage` is `JSONata` (or a state with a per-state `QueryLanguage`) evaluates `{% ... %}` expressions for Choice `Condition`, Task `Arguments`/`Output`, and `Assign` variable scoping, and runs to SUCCEEDED. Recorded behavior: the checks' control arms succeed on real AWS.
+Emulator: every JSONata definition fails at the first state with `error='States.Runtime'`, `cause="the definition is written in 'JSONata', and this emulator evaluates only 'JSONPath' definitions, so nothing was run for it"`.
+Why: half of the current Step Functions authoring surface (JSONata mode, `Arguments`/`Output`/`Assign`, `$states.*` context) is unusable; a client gets a runtime failure for a definition CreateStateMachine accepted.
+Fix: a JSONata evaluator in the sfn execution interpreter's expression-evaluation component, plus honoring `QueryLanguage` at the definition and state level.
+Traces: sfn.choice-jsonata-non-boolean-condition-rejected, sfn.deep-sfn-2-sfn-jsonata-states-context-execution-name-and-entered-time, sfn.deep-sfn-2-sfn-jsonata-task-arguments-aws-sdk-result-output, sfn.jsonata-assign-variables-scope-across-states.
+
+Cause 3 of 6: Map `ItemReader` is not interpreted.
+AWS: a Distributed Map's `ItemReader` (S3 `ListObjectsV2`, `GetObject` with `InputType: CSV`/`JSON`/`JSONL`, `ManifestFile`) reads the items from S3 and feeds them to the child executions; a missing object fails the run before any child is started. Recorded behavior: the checks' control arms run to SUCCEEDED on real AWS.
+Emulator: the execution fails with `error='States.Runtime'`, `cause="state '<Name>' carries the member 'ItemReader', which this emulator does not interpret, so nothing was run for it"`.
+Why: every S3-backed fan-out workflow, CSV header-keyed column delivery, `ItemBatcher` grouping, `ToleratedFailurePercentage`/`ToleratedFailureCount` semantics and the result manifest are unobservable.
+Fix: the Map-state ItemReader component of the sfn execution interpreter (S3 item source + InputType parsing), feeding the existing child-execution machinery.
+Traces: sfn.conc-distributed-map-200-s3-objects-processed-once-under-concurrency-cap, sfn.conc-distributed-map-csv-item-reader-delivers-header-keyed-string-columns, sfn.conc-distributed-map-item-batcher-groups-items-into-configured-batches, sfn.conc-distributed-map-item-reader-missing-object-fails-before-any-child, sfn.conc-distributed-map-tolerated-failure-percentage-succeeds-and-names-failed-items, sfn.conc-distributed-map-zero-tolerance-run-fails-and-keeps-completed-items, s3__sfn.sfn-distributed-map-over-real-s3-objects-writes-a-result-manifest, s3__sfn.sfn-distributed-map-without-start-execution-permission-fails-with-zero-children.
+
+Cause 4 of 6: a DISTRIBUTED Map is run as an inline Map, so inline limits are applied and no child executions exist.
+AWS: with `ProcessorConfig.Mode: DISTRIBUTED` each item (or batch) runs as its OWN child execution, so the parent is not subject to the 25,000-history-event / state-transition budget of an inline Map; a 3,200-item Distributed Map succeeds, and each child execution is listable via ListExecutions(mapRunArn=...) and describable.
+Emulator: a 3,200-item DISTRIBUTED Map fails with `error='States.Runtime'`, `cause='the execution made more than the 1000 state transitions this emulator runs, so it was stopped'`; and an 8-item Distributed Map fails with `error='States.ExceedToleratedFailureThreshold'`, `cause="8 of 8 items failed, more than this 'Map' state tolerates"` instead of producing 8 describable child executions.
+Why: Distributed Map is indistinguishable from inline Map; large fan-outs that AWS completes are failed, and per-item child executions and MapRun bookkeeping a client lists are absent.
+Fix: the Map-state mode handling and child-execution creation in the sfn execution interpreter and the MapRun state, including the transition/history accounting that must not be charged to the parent.
+Traces: sfn.conc-distributed-map-accepts-items-whose-inline-map-history-limit-fails, sfn.conc-distributed-map-child-executions-listed-and-describable-per-item.
+
+Cause 5 of 6: the callback (`.waitForTaskToken`) pattern never produces or consumes a task token, and the checks hang.
+AWS: a Task whose Resource ends in `.waitForTaskToken` emits `$$.Task.Token`, pauses the execution, and resumes on SendTaskSuccess/SendTaskFailure; SendTaskHeartbeat resets the heartbeat clock and a missed heartbeat fails the execution with `States.HeartbeatTimeout`; SendTaskSuccess with an unknown token is refused with `TaskDoesNotExist` (Smithy: SendTaskSuccess errors include TaskDoesNotExist, TaskTimedOut, InvalidToken).
+Emulator: no token is ever delivered and no execution ever resumes; the checks make no progress and are killed by the harness with `Check timed out after 60.0s`.
+Why: every human-approval / long-running-worker workflow deadlocks instead of resuming, and the negative cases (invalid token, heartbeat timeout, missing `states:SendTaskSuccess` grant) cannot be observed.
+Fix: the callback/task-token component of the sfn execution interpreter and the task-token registry its SendTask* handlers read.
+Traces: lambda__sfn__sqs.sfn-wait-for-task-token-lambda-resumes, lambda__sfn__sqs.sfn-sqs-waitfortasktoken-heartbeat-timeout-negative, lambda__sfn__sqs.sfn-task-token-invalid-token-sendtasksuccess-negative, sfn__sqs.sfn-task-token-timeout-on-no-callback, events__lambda__s3__sfn.sfn-task-token-lambda-missing-sendtask-permission-blocks-resume.
+
+Cause 6 of 6: executions that must retry or be caught never reach a terminal state.
+AWS: `Retry` selects the FIRST retrier whose `ErrorEquals` matches and applies its `IntervalSeconds`/`MaxAttempts`/`BackoffRate`; `Catch` then selects the first matching catcher; a `States.Runtime` error is explicitly NOT retriable or catchable and must terminate the execution.
+Emulator: these executions never become terminal — the checks are killed with `Check timed out after 60.0s` rather than reaching SUCCEEDED/FAILED.
+Why: a client polling DescribeExecution for a retried or caught workflow waits forever; retrier-ordering and the `States.Runtime` escape rule cannot be relied on.
+Fix: the Retry/Catch scheduling component of the sfn execution interpreter (error-name matching, attempt accounting, and the non-retriable/non-catchable classification of `States.Runtime`).
+Traces: sfn.deep-sfn-language-retry-first-matching-retrier-and-catch-order, sfn.deep-sfn-language-states-runtime-escapes-retry-and-catch-rejected.
+
+## Evidence
+Cause 1: DescribeExecution returns e.g. {'status': 'FAILED', 'error': 'States.Runtime', 'cause': "state 'WaitForHeartbeat' is of type 'Task', which this emulator does not execute, so nothing was run for it", 'redriveStatus': 'REDRIVABLE'} where AWS returns status SUCCEEDED with the Task's result as output. Expected: SUCCEEDED (e.g. lambda__sfn__sqs.sfn-invoke-lambda-task-positive asserts 'Expected SUCCEEDED, got: FAILED').
+Cause 2: expected SUCCEEDED, got FAILED error='States.Runtime' cause="the definition is written in 'JSONata', and this emulator evaluates only 'JSONPath' definitions, so nothing was run for it".
+Cause 3: expected SUCCEEDED, got FAILED error='States.Runtime' cause="state 'Fan' carries the member 'ItemReader', which this emulator does not interpret, so nothing was run for it".
+Cause 4: expected SUCCEEDED for a 3200-item DISTRIBUTED Map, got FAILED error='States.Runtime' cause='the execution made more than the 1000 state transitions this emulator runs, so it was stopped'; and expected 8 describable child executions, got FAILED error='States.ExceedToleratedFailureThreshold' cause="8 of 8 items failed, more than this 'Map' state tolerates".
+Cause 5: expected a resumed execution / TaskDoesNotExist / States.HeartbeatTimeout; got no progress at all — harness reports 'Check timed out after 60.0s'.
+Cause 6: expected a terminal execution showing retrier/catcher selection; got 'Check timed out after 60.0s'.
+
+## Steps to Reproduce
+1. Boot the emulator and replay the behavioral suite.
+2. Cause 1: CreateStateMachine with a definition whose single state is a Task (Resource 'arn:aws:states:::aws-sdk:sts:getCallerIdentity' or a Lambda ARN), StartExecution, then DescribeExecution — it is FAILED with States.Runtime instead of SUCCEEDED.
+3. Cause 2: CreateStateMachine with '"QueryLanguage": "JSONata"' and a Pass/Choice state using a '{% ... %}' expression, StartExecution, DescribeExecution.
+4. Cause 3: CreateStateMachine with a Map state in DISTRIBUTED mode carrying an ItemReader over an existing S3 prefix, StartExecution, DescribeExecution.
+5. Cause 4: run a DISTRIBUTED Map over 3,200 trivial items; then run one over 8 items and call ListExecutions with the MapRun ARN.
+6. Cause 5: run a workflow whose Task Resource ends in '.waitForTaskToken'; observe that no token is ever produced and the execution never leaves RUNNING.
+7. Cause 6: run a workflow whose Task fails and declares two Retry entries plus a Catch; observe the execution never reaches a terminal status.

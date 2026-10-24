@@ -216,8 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that sets tags on a resource of this service applies
         // (`state::validate_tags`), each defect reported as the error shape the model
         // declares for it.
-        if let Err(problem) = crate::state::validate_tags(input.tags.as_deref().unwrap_or_default())
-        {
+        if let Err(problem) = crate::state::validate_tags(
+            input.tags.as_deref().unwrap_or_default(),
+            &crate::state::pipeline_resource(&name),
+        ) {
             let message = Some(problem.message().to_string());
             return Err(match problem {
                 crate::state::TagProblem::TooMany(_) => {
