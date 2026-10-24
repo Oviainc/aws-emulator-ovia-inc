@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/campaign_communication_limits.rs"]
 mod campaign_communication_limits;
+#[path = "all/campaign_communication_time_deletion.rs"]
+mod campaign_communication_time_deletion;
 #[path = "all/campaign_flow_association.rs"]
 mod campaign_flow_association;
 #[path = "all/campaign_lifecycle.rs"]
