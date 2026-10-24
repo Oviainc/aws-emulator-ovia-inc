@@ -1,0 +1,38 @@
+Issue-Severity: MEDIUM
+Issue-Gap-Class: wrong-behavior
+Issue-Commit: e0e9a90161aff7ec754055c046e25b8f716c6f2d
+
+# A CMAF child manifest with no ManifestName defaults to the literal "index" instead of inheriting the OriginEndpoint's ManifestName
+
+_Filed: 2026-10-24T21:16:43Z_
+_Operation: UpdateOriginEndpoint | Class: wrong-behavior_
+
+> _Note: this issue was identified against the code base at commit `e0e9a90161aff7ec754055c046e25b8f716c6f2d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Description
+
+Expected: the Smithy model documents the fallback for a CMAF child manifest's name explicitly. `HlsManifestCreateOrUpdateParameters$ManifestName` is "An optional short string appended to the end of the OriginEndpoint URL. If not specified, defaults to the manifestName for the OriginEndpoint." So for an endpoint whose own `ManifestName` is `stream`, a child `cmafPackage.hlsManifests[]` entry that sends no `manifestName` must be stored (and projected on every later read) with `manifestName` = `stream`, and the child's derived playback `Url` must name `stream` too. Only when the ENDPOINT also has no `ManifestName` does the service-wide default (`index`) apply, and then it applies because the endpoint inherited it, not because the child has its own literal default.
+
+Actual: the shared helper `crate::state::stored_cmaf_package` resolves a child manifest's name as `manifest.manifest_name.clone().unwrap_or_else(|| DEFAULT_MANIFEST_NAME.to_string())` — it never looks at the endpoint's `ManifestName` at all; the endpoint-level value is not even passed to the function. A request `UpdateOriginEndpoint(Id=oe, ManifestName="stream", CmafPackage={"hlsManifests":[{"id":"a"}]})` therefore stores and returns `cmafPackage.hlsManifests[0].manifestName = "index"` while the endpoint itself reports `manifestName = "stream"`, and the child `url` is derived from `index` rather than from `stream`.
+
+The update path is structurally unable to honour the documented rule even in principle: `update_origin_endpoint.rs` calls `stored_cmaf_package(...)` at the packaging-replacement step (line ~324) and only computes the effective endpoint-level `manifest_name` afterwards (lines ~360-365), so at the moment the children are materialised the value they are supposed to inherit has not been resolved yet. The same helper is called by `create_origin_endpoint.rs` (lines ~343-345), so the create response, `DescribeOriginEndpoint` and every `ListOriginEndpoints` entry carry the same wrong child name and child URL; the fix belongs in the one shared helper plus the ordering in the update handler.
+
+Secondary symptom of the same write-path filler (same root area, listed so the fixer sees it): `apply_origin_endpoint_defaults` deliberately leaves `StreamSelection` and `MssPackage`'s members unfilled (state.rs comment: "A member whose default neither the model nor a recording publishes is left exactly as the request sent it — SegmentDurationSeconds, StreamSelection, Encryption, the DASH window/timing members and every MssPackage member"). Real MediaPackage server-fills a complete `streamSelection` block (`streamOrder` ORIGINAL, `minVideoBitsPerSecond` 0, `maxVideoBitsPerSecond` 2147483647) on every packaging block it stores, so an endpoint updated with `mssPackage: {}` or `hlsPackage: {}` comes back from AWS with `streamSelection` populated and from the emulator with it absent. This is the same class of fault as the already-open DASH issue (20261024T090916Z-mediapackage-createoriginendpoint-wrong-behavior), which was deliberately scoped to DashPackage only and explicitly excluded MssPackage/StreamSelection.
+
+## Evidence
+
+Spec grounding (hard, from the model itself): `smithy_query(query="shape",shape="HlsManifestCreateOrUpdateParameters")` on services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json returns for member `ManifestName`: doc = "An optional short string appended to the end of the OriginEndpoint URL. If not specified, defaults to the manifestName for the OriginEndpoint." The emulator already honours the sibling documented default in the same helper (`SegmentPrefix` -> ChannelId), so the rule that an absent member of this shape takes its documented default is one the crate accepts; this member's documented default is simply the wrong value.
+
+Implementation: `src/state.rs` `stored_cmaf_package` (~lines 2250-2297) — `let manifest_name = manifest.manifest_name.clone().unwrap_or_else(|| DEFAULT_MANIFEST_NAME.to_string());` and the signature `(params, region, channel_id, endpoint_id)` which carries no endpoint `ManifestName`. Callers: `src/ops/update_origin_endpoint.rs` lines ~324-326 (before the endpoint-level `manifest_name` is resolved at lines ~360-365) and `src/ops/create_origin_endpoint.rs` lines ~343-345 (the endpoint-level `manifest_name` IS already in scope there, lines ~325-328, and is still not passed). `OriginEndpointRecord::to_origin_endpoint` (state.rs ~1578) then projects the stored child into the update, create, describe and list responses unchanged.
+
+Test coverage status: the current (wrong) behaviour is PINNED, so the fixer must update tests as well — `tests/all/mutation_persistence.rs` line 735 asserts `"/cmafPackage/hlsManifests/1/manifestName": "index"` for a child sent without a name, and `tests/all/channel_lifecycle.rs` lines 650-658 computes the expected child name as `sent_child.manifestName` or else the literal `"index"`, never consulting the endpoint's own `manifestName`. No test exercises an endpoint-level `ManifestName` together with an unnamed CMAF child, which is exactly the combination the documented rule governs. For the secondary symptom, `tests/all/origin_endpoint_defaults.rs` `a_package_with_no_published_defaults_gains_no_invented_member` (lines 351-393) pins `mssPackage` and a supplied `streamSelection` as "stored exactly as sent".
+
+## Steps to Reproduce
+
+1. Boot the emulator and point an SDK/boto3 mediapackage client at it.
+2. mp.create_channel(Id="c1").
+3. mp.create_origin_endpoint(Id="oe-cmaf", ChannelId="c1", ManifestName="stream", CmafPackage={"HlsManifests": [{"Id": "a"}]}) -> HTTP 200. Observe $.manifestName == "stream" but $.cmafPackage.hlsManifests[0].manifestName == "index", and that the child's $.url path segment is "index" rather than "stream". AWS returns "stream" for both, per the modeled ManifestName documentation.
+4. mp.update_origin_endpoint(Id="oe-cmaf", ManifestName="replay", CmafPackage={"HlsManifests": [{"Id": "a"}]}) -> HTTP 200. The endpoint reports $.manifestName == "replay" while $.cmafPackage.hlsManifests[0].manifestName is still "index"; on AWS the child inherits "replay".
+5. mp.describe_origin_endpoint(Id="oe-cmaf") and mp.list_origin_endpoints(ChannelId="c1") -> the stored record repeats the same wrong child manifestName and child url, confirming the value is persisted and not a serialization artifact.
+6. Repeat step 3 sending the child name explicitly (CmafPackage={"HlsManifests": [{"Id": "a", "ManifestName": "master"}]}) -> echoed back as "master", confirming the gap is only the missing inheritance of the endpoint's ManifestName.
+7. Secondary symptom: mp.update_origin_endpoint(Id="oe-cmaf", MssPackage={}) and mp.update_origin_endpoint(Id="oe-cmaf", HlsPackage={}) -> neither response carries a streamSelection block; AWS returns streamSelection = {streamOrder: ORIGINAL, minVideoBitsPerSecond: 0, maxVideoBitsPerSecond: 2147483647} on every packaging block it stores.
