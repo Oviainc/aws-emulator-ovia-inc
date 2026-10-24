@@ -15,6 +15,8 @@
 mod account_policies;
 #[path = "all/account_policy_release.rs"]
 mod account_policy_release;
+#[path = "all/account_policy_removal.rs"]
+mod account_policy_removal;
 #[path = "all/account_policy_selection_criteria.rs"]
 mod account_policy_selection_criteria;
 #[path = "all/data_protection_policies.rs"]

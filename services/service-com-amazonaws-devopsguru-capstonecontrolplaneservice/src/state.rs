@@ -534,6 +534,168 @@ pub fn millis_of(at: &::aws_smithy_types::DateTime) -> Option<i64> {
     at.to_millis().ok()
 }
 
+/// One day, in milliseconds.
+///
+/// The granularity of a DevOps Guru time range whose bounds are DAYS rather than
+/// instants: `DescribeAccountOverview`'s and `DescribeOrganizationOverview`'s `FromTime`
+/// and `ToTime` are both documented "The start time granularity is at the day level. The
+/// floor of the start time is used."
+pub const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// `millis_since_epoch` floored to the start of the UTC day that holds it — the "floor"
+/// a day-granular time range applies to each of its bounds.
+///
+/// Euclidean division, so an instant before the epoch floors to the start of ITS day
+/// instead of towards the epoch. The multiplication SATURATES: a bound comes straight
+/// from a request, and the floor of an instant within a day of `i64::MIN` lies below
+/// `i64::MIN`, so the product is clamped to the earliest instant this store can keep
+/// rather than overflowing.
+pub fn day_floor_millis(millis_since_epoch: i64) -> i64 {
+    millis_since_epoch
+        .div_euclid(MILLIS_PER_DAY)
+        .saturating_mul(MILLIS_PER_DAY)
+}
+
+/// A range of whole UTC DAYS, in the milliseconds this store keeps: every instant from
+/// the start of the first day up to, but not including, the start of the day AFTER the
+/// last.
+///
+/// What a DevOps Guru overview's `FromTime` / `ToTime` pair means. Both members are
+/// documented "The start time granularity is at the day level. The floor of the start
+/// time is used", so each names a DAY rather than an instant and the range spans those
+/// days in full. The model's "occurred after this day" / "occurred before this day" is
+/// read as naming the first and the last day OF the range, which is the only reading
+/// under which a one-day request — `FromTime` and `ToTime` on the same day, or the
+/// `ToTime` default of "the current day" — holds any instant at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayRange {
+    /// The start of the first day — inclusive.
+    pub from: i64,
+    /// The start of the day after the last — exclusive, so the last day counts in full.
+    pub until: i64,
+}
+
+impl DayRange {
+    /// The range whose first day holds `from_millis` and whose last day holds
+    /// `to_millis`, or — when the request named no end — the current day.
+    ///
+    /// A `from_millis` after `to_millis` yields a range that holds no instant, so it
+    /// selects nothing, which is what an empty interval means. The model states no
+    /// ordering rule for the two members, so refusing such a request would be this
+    /// emulator's invention.
+    pub fn of_days(from_millis: i64, to_millis: Option<i64>) -> Self {
+        let last_day = day_floor_millis(to_millis.unwrap_or_else(now_millis));
+        Self {
+            from: day_floor_millis(from_millis),
+            until: last_day.saturating_add(MILLIS_PER_DAY),
+        }
+    }
+
+    /// Whether the instant `at` lies in this range.
+    pub fn holds(&self, at: i64) -> bool {
+        at >= self.from && at < self.until
+    }
+}
+
+/// The wall clock in the milliseconds this store keeps.
+///
+/// What "the current day" means for a read whose `ToTime` is absent.
+pub fn now_millis() -> i64 {
+    let now = ::std::time::SystemTime::now();
+    match now.duration_since(::std::time::UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX),
+        Err(before_epoch) => {
+            i64::try_from(before_epoch.duration().as_millis()).map_or(i64::MIN, |millis| -millis)
+        }
+    }
+}
+
+/// Which member accounts of the organization an organization-wide read leaves in scope.
+///
+/// Every `*Organization*` operation of this service carries the same two optional
+/// filters: `AccountIds` is "The ID of the Amazon Web Services account" and
+/// `OrganizationalUnitIds` "The ID of the organizational unit". Both NARROW the
+/// organization-wide answer to the member accounts they name, so an account is in scope
+/// exactly while every filter the request carries selects it. A filter that names
+/// nothing restricts nothing, which is what an absent filter means, so an empty list and
+/// an absent member behave alike (`AccountIdList` and `OrganizationalUnitIdList` are both
+/// modelled len 0..5, so an empty list is a well-formed request).
+#[derive(Debug, Clone, Copy)]
+pub struct OrganizationAccountScope<'a> {
+    /// The `AccountIds` the request names, or `None` when it names none.
+    pub account_ids: Option<&'a Vec<String>>,
+    /// The `OrganizationalUnitIds` the request names, or `None` when it names none.
+    pub organizational_unit_ids: Option<&'a Vec<String>>,
+}
+
+impl<'a> OrganizationAccountScope<'a> {
+    /// The scope a request's two filter members name.
+    pub fn of(
+        account_ids: &'a Option<Vec<String>>,
+        organizational_unit_ids: &'a Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            account_ids: named(account_ids),
+            organizational_unit_ids: named(organizational_unit_ids),
+        }
+    }
+
+    /// Whether this scope holds the member account `account_id`, whose organizational
+    /// unit membership is `organizational_unit_ids`.
+    ///
+    /// An `OrganizationalUnitIds` filter selects the member accounts of the units it
+    /// names, so an account in none of them — which is every account of a store that
+    /// records no organizational unit — is out of scope rather than reported as if the
+    /// filter had not been sent.
+    pub fn holds(&self, account_id: &str, organizational_unit_ids: &[String]) -> bool {
+        self.account_ids
+            .is_none_or(|wanted| wanted.iter().any(|id| id == account_id))
+            && self.organizational_unit_ids.is_none_or(|wanted| {
+                wanted
+                    .iter()
+                    .any(|unit| organizational_unit_ids.iter().any(|held| held == unit))
+            })
+    }
+
+    /// Whether this scope holds the one member account this emulator serves.
+    ///
+    /// The store holds the coverage, the insights and the configuration of a SINGLE
+    /// account and records no organizational-unit membership for it, so the
+    /// organization's membership is that one account in no unit: an
+    /// `OrganizationalUnitIds` filter therefore leaves no account in scope. Stated here
+    /// once, so every organization-wide read of this store scopes its answer the same
+    /// way and a store that one day records unit membership has one place to change.
+    pub fn holds_served_member(&self, account_id: &str) -> bool {
+        self.holds(account_id, &[])
+    }
+
+    /// This scope as a fragment of a page token's scope string, so a cursor issued under
+    /// one filter does not resolve under another.
+    ///
+    /// The join is unambiguous because of the two modelled patterns: `AwsAccountId` is
+    /// `^\d{12}$` and `OrganizationalUnitId` `^ou-[0-9a-z]{4,32}-[a-z0-9]{8,32}$`, so no
+    /// id a well-formed request can carry holds the `,` or `/` this fragment separates
+    /// with, and two different filter sets cannot render the same string.
+    pub fn page_fragment(&self) -> String {
+        format!(
+            "accounts/{}/units/{}",
+            self.account_ids
+                .map_or_else(|| "-".to_string(), |ids| ids.join(",")),
+            self.organizational_unit_ids
+                .map_or_else(|| "-".to_string(), |ids| ids.join(",")),
+        )
+    }
+}
+
+/// The ids a filter member names, or `None` when it names none: an absent list and an
+/// empty one both restrict nothing.
+fn named(list: &Option<Vec<String>>) -> Option<&Vec<String>> {
+    match list {
+        Some(ids) if !ids.is_empty() => Some(ids),
+        _ => None,
+    }
+}
+
 /// The set of resources DevOps Guru analyses for this account and region.
 ///
 /// Both halves are SETS, not lists: `UpdateResourceCollection` is an

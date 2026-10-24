@@ -25,7 +25,7 @@ use crate::harness::{now_ms, Logs};
 /// Source: `smithy_query(query="shape", shape="PolicyType")` — `DATA_PROTECTION_POLICY`,
 /// `SUBSCRIPTION_FILTER_POLICY`, `FIELD_INDEX_POLICY`, `TRANSFORMER_POLICY`,
 /// `METRIC_EXTRACTION_POLICY`.
-const POLICY_TYPES: [&str; 5] = [
+pub(crate) const POLICY_TYPES: [&str; 5] = [
     "DATA_PROTECTION_POLICY",
     "SUBSCRIPTION_FILTER_POLICY",
     "FIELD_INDEX_POLICY",
@@ -175,6 +175,12 @@ fn policy_rows() -> Vec<(&'static str, String, Option<&'static str>)> {
             Some(r#"LogGroupNamePrefix NOT IN ["/aws/containerinsights"]"#),
         ),
     ]
+}
+
+/// A request body for one delete, naming the `(policyType, policyName)` pair that
+/// identifies one account-level policy.
+pub(crate) fn delete_body(name: &str, policy_type: &str) -> Value {
+    json!({"policyName": name, "policyType": policy_type})
 }
 
 /// A request body for one put.
