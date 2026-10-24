@@ -13,13 +13,21 @@
 // points it into `tests/all/`.
 #[path = "all/feature_group_name_validation.rs"]
 mod feature_group_name_validation;
+#[path = "all/feature_group_resolution.rs"]
+mod feature_group_resolution;
 #[path = "all/online_store_record_lifecycle.rs"]
 mod online_store_record_lifecycle;
 #[path = "all/pattern_refusal_rendering.rs"]
 mod pattern_refusal_rendering;
+#[path = "all/rejection_statements.rs"]
+mod rejection_statements;
 #[path = "all/sagemaker_signing_name_routing.rs"]
 mod sagemaker_signing_name_routing;
+#[path = "all/size_bound_statements.rs"]
+mod size_bound_statements;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_record_partial_update.rs"]
 mod update_record_partial_update;
+#[path = "all/update_record_semantics.rs"]
+mod update_record_semantics;

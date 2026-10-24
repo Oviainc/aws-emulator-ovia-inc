@@ -27,22 +27,52 @@ use std::sync::Arc;
 
 use aws_smithy_types::date_time::{DateTime, Format};
 use serde_json::{json, Value};
+use service_common::feature_store_groups::{FeatureGroupDirectory, FeatureGroupRecord};
 use smithy_server_runtime::{http, MultiServiceRouter};
 
 use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::EmulatedService;
 
 /// A booted emulator holding this service only.
 struct Emulator {
+    engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Emulator {
+    /// A booted emulator with the feature groups this suite updates records in already
+    /// created.
+    ///
+    /// Every operation of this data plane resolves its `FeatureGroupName` against the
+    /// feature groups the SageMaker CONTROL plane holds, so a group has to exist before a
+    /// record can be written to it — exactly as a client has to call
+    /// `CreateFeatureGroup` first.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        let emulator = Self { engine, router };
+        for group in ["customers", "ttlgroup"] {
+            emulator.create_feature_group(group);
+        }
+        emulator
+    }
+
+    /// Create a feature group with an OnlineStore, the way the SageMaker control plane's
+    /// `CreateFeatureGroup` does: by registering its definition — including the two
+    /// feature names the records below carry — in the ONE shared feature-group directory
+    /// this data plane resolves names against.
+    fn create_feature_group(&self, name: &str) {
+        self.engine
+            .state::<FeatureGroupDirectory>()
+            .lock()
+            .register(FeatureGroupRecord {
+                name: name.to_owned(),
+                arn: format!("arn:aws:sagemaker:us-east-1:123456789012:feature-group/{name}"),
+                record_identifier_feature_name: "customer_id".to_owned(),
+                event_time_feature_name: "event_time".to_owned(),
+                online_store_enabled: true,
+            });
     }
 
     /// Send one request and return its status and parsed JSON body (`Value::Null` for
@@ -172,8 +202,9 @@ fn tomorrow_iso() -> String {
 
 /// Ingest the record these tests update, into group `group` under identifier `C1`.
 ///
-/// `customer_id` first, so it is the record-identifier feature the group learns, then
-/// the event time, then three ordinary features of differing value shapes.
+/// `customer_id` is the group's own `RecordIdentifierFeatureName` and `event_time` its
+/// `EventTimeFeatureName` (see `Emulator::create_feature_group`), followed by three
+/// ordinary features of differing value shapes.
 async fn seed(emulator: &Emulator, group: &str, event_time: &str) {
     let (status, body) = emulator
         .put_record(

@@ -4,7 +4,11 @@
 //! IMPLEMENTED: this operation enumerates the record identifiers the feature group's
 //! OnlineStore holds in [`crate::state`], one page at a time: soft-deleted records are
 //! excluded unless the caller asks for them, the page is truncated to `MaxResults`, and
-//! `NextToken` names the identifier the next page resumes at.
+//! `NextToken` names the identifier the next page resumes at. The `FeatureGroupName` is
+//! resolved against the feature groups the SageMaker control plane holds
+//! ([`crate::state::resolve_group`]) and a name that resolves to none is refused with the
+//! modelled `ValidationError` (400), the same classification every operation of this data
+//! plane gives an unresolvable name.
 //!
 //! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
@@ -181,32 +185,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
         };
 
-        let mut store = state.lock();
-        let Some(group) = store.group_mut(&input.feature_group_name) else {
-            return Err(ListRecordsErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Feature group '{}' has no OnlineStore",
-                    input.feature_group_name
-                )),
+        // The data plane's one feature-group resolution: a `FeatureGroupName` naming no
+        // feature group is a request defect (400 `ValidationError`), never a missing
+        // resource (404 `ResourceNotFound`). A group that resolves but has no
+        // `OnlineStore` holds nothing this READ could enumerate, so it is refused the
+        // same way.
+        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
+        {
+            Ok(definition) => definition,
+            Err(unresolved) => {
+                return Err(match unresolved {
+                    crate::state::Unresolved::Refused(message) => {
+                        ListRecordsErrorModeled::ValidationError(ValidationError {
+                            message: Some(message),
+                        })
+                        .into()
+                    }
+                    crate::state::Unresolved::NoDirectory => {
+                        ListRecordsErrorModeled::InternalFailure(InternalFailure {
+                            message: Some(
+                                "ListRecords: this service holds no feature-group directory on \
+                                 the mounted engine"
+                                    .into(),
+                            ),
+                        })
+                        .into()
+                    }
+                })
+            }
+        };
+        if !definition.online_store_enabled {
+            return Err(ListRecordsErrorModeled::ValidationError(ValidationError {
+                message: Some(crate::state::no_online_store(&definition.name)),
             })
             .into());
-        };
+        }
 
         let include_soft_deleted = input.include_soft_deleted_records.unwrap_or(false);
-        // `records()` iterates in ascending identifier order (a `BTreeMap`), which is
-        // what makes the cursor below a correct resume point: `filter` keeps every
-        // identifier at or after it regardless of iteration order, and the token the
-        // page emits is the first identifier it did not return.
-        let mut remaining = group
-            .records()
-            .filter(|record| include_soft_deleted || !record.soft_deleted)
-            .map(|record| record.identifier.clone())
-            .filter(|identifier| {
-                resume_at
-                    .as_deref()
-                    .is_none_or(|resume| identifier.as_str() >= resume)
-            });
-
         // `MaxResults` caps the page; with none named the page holds at most
         // `DEFAULT_LIST_PAGE_SIZE` (the model's own published maximum for MaxResults),
         // so a minimal request never returns a response linear in the whole store. A
@@ -217,9 +232,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(crate::state::DEFAULT_LIST_PAGE_SIZE, |max| {
                 max.max(1) as usize
             });
-        let record_identifiers: Vec<String> = remaining.by_ref().take(page_size).collect();
-        let next_token = remaining
-            .next()
+
+        let mut store = state.lock();
+        // `records()` iterates in ascending identifier order (a `BTreeMap`), which is
+        // what makes the cursor below a correct resume point: `filter` keeps every
+        // identifier at or after it regardless of iteration order, and the token the
+        // page emits is the first identifier it did not return. The walk stops at the
+        // page (plus that one identifier), so nothing linear in the whole store is ever
+        // copied. A feature group that resolves but has taken no record yet has no
+        // online store here, and lists nothing.
+        let (record_identifiers, next_identifier) = store
+            .group_mut(&input.feature_group_name)
+            .map(|group| {
+                let mut remaining = group
+                    .records()
+                    .filter(|record| include_soft_deleted || !record.soft_deleted)
+                    .map(|record| record.identifier.clone())
+                    .filter(|identifier| {
+                        resume_at
+                            .as_deref()
+                            .is_none_or(|resume| identifier.as_str() >= resume)
+                    });
+                let page: Vec<String> = remaining.by_ref().take(page_size).collect();
+                (page, remaining.next())
+            })
+            .unwrap_or_default();
+        drop(store);
+        let next_token = next_identifier
             .map(|identifier| encode_next_token(&identifier));
 
         Ok(ListRecordsOutput {

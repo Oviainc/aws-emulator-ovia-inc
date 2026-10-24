@@ -2674,6 +2674,39 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSagemakerSagemakerState>)
 }
 
+/// The SHARED feature-group directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A feature group is DEFINED here (`CreateFeatureGroup`) and USED by the SageMaker
+/// FeatureStore Runtime data plane, whose own API carries none of that definition: a
+/// `PutRecord` names a feature group and nothing else. So the data plane can resolve that
+/// name — and know which feature of a record identifies it and which carries its event
+/// time — only because this service RECORDED it, in ONE directory under one shared type
+/// ([`::service_common::feature_store_groups::FeatureGroupDirectory`]). The engine keys
+/// state by TYPE, so a copy of its own inside [`ComAmazonawsSagemakerSagemakerState`]
+/// would be invisible to that reader.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// `FeatureGroupDirectory::forget` belongs to `DeleteFeatureGroup`, which is still a
+/// scaffold stub answering 501 (its own issue): nothing in this emulator deletes a
+/// feature group yet, so nothing calls it yet.
+///
+/// Answer `None` by leaving the directory unwritten: the record is an aid to another
+/// service, never part of this operation's own answer.
+pub fn feature_group_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::feature_store_groups::FeatureGroupDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::feature_store_groups::FeatureGroupDirectory,
+            >,
+        )
+}
+
 /// The message a handler refuses with when the service is mounted on an engine that
 /// holds no store for it. Unreachable in the assembled emulator (the router mounts
 /// every service on the one shared `InMemoryEngine`); stated once so no handler

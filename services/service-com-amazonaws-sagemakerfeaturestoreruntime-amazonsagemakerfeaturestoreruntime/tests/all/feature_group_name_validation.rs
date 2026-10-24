@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_common::feature_store_groups::{FeatureGroupDirectory, FeatureGroupRecord};
 use smithy_server_runtime::{http, MultiServiceRouter};
 
 use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::EmulatedService;
@@ -33,6 +34,7 @@ const FEATURE_GROUP_NAME_PATTERN: &str =
 
 /// A booted emulator holding this service only.
 struct Emulator {
+    engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
@@ -41,8 +43,26 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { engine, router }
+    }
+
+    /// Create a feature group with an OnlineStore, the way the SageMaker control plane's
+    /// `CreateFeatureGroup` does: by registering its definition in the ONE shared
+    /// feature-group directory this data plane resolves names against. A name that
+    /// satisfies the modelled constraint still has to name a group that EXISTS before an
+    /// operation will serve it.
+    fn create_feature_group(&self, name: &str) {
+        self.engine
+            .state::<FeatureGroupDirectory>()
+            .lock()
+            .register(FeatureGroupRecord {
+                name: name.to_owned(),
+                arn: format!("arn:aws:sagemaker:us-east-1:000000000000:feature-group/{name}"),
+                record_identifier_feature_name: "record_id".to_owned(),
+                event_time_feature_name: "event_time".to_owned(),
+                online_store_enabled: true,
+            });
     }
 
     /// Send one request and return its status and parsed JSON body (`Value::Null` for an
@@ -220,8 +240,9 @@ async fn every_operation_refuses_a_feature_group_name_outside_the_modeled_patter
 /// reached the store.
 #[derive(Debug, Clone, Copy)]
 enum Verdict {
-    /// Accepted: no feature group is seeded, so the operation answers its own
-    /// `ResourceNotFound` rather than a validation refusal.
+    /// Accepted: the name satisfies the modelled constraint, so the request reaches the
+    /// store. The row's feature group is created first, so what the operation answers is
+    /// its own empty result rather than a refusal of the NAME.
     Accepted,
     /// Refused with a clause containing this text.
     Refused(&'static str),
@@ -279,17 +300,20 @@ async fn the_feature_group_name_constraint_is_the_modeled_one() {
     ];
 
     for (case, value, verdict) in rows {
+        if matches!(verdict, Verdict::Accepted) {
+            emulator.create_feature_group(&value);
+        }
         let uri = format!("/FeatureGroup/{value}?RecordIdentifierValueAsString=1");
         let (status, parsed) = emulator.send("GET", &uri, None).await;
         let code = error_code(&parsed);
         let text = message(&parsed);
         match verdict {
             Verdict::Accepted => assert_eq!(
-                (status, code.as_str()),
-                (404, "ResourceNotFound"),
+                (status, code.as_str(), parsed.get("Record").is_none()),
+                (200, "", true),
                 "case {case:?}: {value:?} satisfies the modelled constraint, so GetRecord \
-                 must reach the store and answer its own ResourceNotFound for an unseeded \
-                 feature group, got {status} {code:?} with message {text:?}"
+                 must reach the store and answer the empty result of a feature group \
+                 holding no such record, got {status} {code:?} with body {parsed:?}"
             ),
             Verdict::Refused(clause) => {
                 assert_eq!(
@@ -353,6 +377,9 @@ async fn the_name_forms_a_uri_label_cannot_carry_are_constrained_the_same_way() 
     ];
 
     for (case, value, verdict) in rows {
+        // Every accepted row names the same feature group (`fg-1`, behind an ARN prefix
+        // the pattern makes optional), so creating it once covers them all.
+        emulator.create_feature_group("fg-1");
         let body = json!({
             "Identifiers": [{
                 "FeatureGroupName": value,
@@ -371,20 +398,15 @@ async fn the_name_forms_a_uri_label_cannot_carry_are_constrained_the_same_way() 
                      BatchGetRecord must reach the store, got {status} {code:?} with message \
                      {text:?}"
                 );
-                // Nothing is seeded, so the batch reports the unknown group per
-                // identifier rather than refusing the request.
-                let reported = parsed
-                    .get("Errors")
-                    .and_then(Value::as_array)
-                    .and_then(|errors| errors.first())
-                    .and_then(|first| first.get("ErrorCode"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+                // The ARN and the bare name reach ONE feature group, so a name that
+                // resolves reports no per-identifier error at all — the identifier is
+                // simply absent from the group.
+                let reported = parsed.get("Errors").cloned().unwrap_or(Value::Null);
                 assert_eq!(
-                    reported, "ResourceNotFound",
-                    "case {case:?}: expected the unseeded feature group {value:?} to be \
-                     reported per identifier as ResourceNotFound, got {reported:?} in {parsed:?}"
+                    reported,
+                    json!([]),
+                    "case {case:?}: expected {value:?} to resolve to the created feature \
+                     group and report no error, got {reported:?} in {parsed:?}"
                 );
             }
             Verdict::Refused(clause) => {

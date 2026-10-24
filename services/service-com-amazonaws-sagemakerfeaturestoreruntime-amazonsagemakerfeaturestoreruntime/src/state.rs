@@ -4,12 +4,13 @@
 //!
 //! The service is the OnlineStore data plane of SageMaker Feature Store: every
 //! operation reads or writes the one store modelled here. The runtime API carries no
-//! feature-group definition (that lives in the SageMaker control plane), so the two
-//! names a feature group's definition would supply — its record-identifier feature and
-//! its event-time feature — are learned from the first `PutRecord` written to the group
-//! and remembered for every later call, as documented on
-//! [`FeatureGroupStore::record_identifier_feature_name`] and
-//! [`FeatureGroupStore::event_time_feature_name`].
+//! feature-group DEFINITION — that lives in the SageMaker control plane — so the name a
+//! request carries is resolved, and the two names the definition supplies (the group's
+//! record-identifier feature and its event-time feature) are read, through the SHARED
+//! feature-group directory the control plane writes: [`resolve_group`], over
+//! [`::service_common::feature_store_groups::FeatureGroupDirectory`]. A name the control
+//! plane never created resolves to nothing and the call is refused; nothing here guesses
+//! a definition from the records a caller happens to write.
 //!
 //! The store is held in memory for the life of the process, so its three growth sites
 //! are bounded by a maximum count: [`MAX_FEATURE_GROUPS`] groups, each holding at most
@@ -71,17 +72,6 @@ impl ComAmazonawsSagemakerfeaturestoreruntimeAmazonsagemakerfeaturestoreruntimeS
         Some(group)
     }
 
-    /// The names a feature group has already learned, without creating it.
-    pub fn learned_feature_names(&self, name_or_arn: &str) -> (Option<String>, Option<String>) {
-        match self.groups.get(group_key(name_or_arn)) {
-            Some(group) => (
-                group.record_identifier_feature_name.clone(),
-                group.event_time_feature_name.clone(),
-            ),
-            None => (None, None),
-        }
-    }
-
     /// The OnlineStore of `name_or_arn`, created empty when this is the first record
     /// ingested into that feature group. The runtime API has no "create feature group"
     /// call, so a group's online store comes into existence with its first `PutRecord`.
@@ -101,18 +91,11 @@ impl ComAmazonawsSagemakerfeaturestoreruntimeAmazonsagemakerfeaturestoreruntimeS
 }
 
 /// One feature group's OnlineStore.
+///
+/// The group's DEFINITION is not here: it is the control plane's, read through
+/// [`resolve_group`]. This holds only what the data plane itself wrote.
 #[derive(Debug, Default)]
 pub struct FeatureGroupStore {
-    /// The feature whose value identifies a record. Set from the FIRST `FeatureValue`
-    /// of the first record written to this group and then fixed, because the runtime
-    /// API never carries the group's `RecordIdentifierFeatureName`.
-    pub record_identifier_feature_name: Option<String>,
-    /// The feature carrying the record's event time, learned the first time a written
-    /// record carries a feature named `EventTime` (in any case, with `-`/`_`
-    /// separators). Absent when no record has carried one, in which case the group's
-    /// records have no event time and neither the historic-record rule nor
-    /// `TtlDuration` has anything to compute from.
-    pub event_time_feature_name: Option<String>,
     /// Records by `RecordIdentifierValueAsString`, at most [`MAX_RECORDS_PER_GROUP`] of
     /// them. A `BTreeMap` so `ListRecords` enumerates in one deterministic ASCENDING
     /// identifier order — which is what lets a page token name the identifier to resume
@@ -183,20 +166,30 @@ impl FeatureGroupStore {
     /// RecordIdentifer as the original, but with `is_deleted` value set to True,
     /// `EventTime` set to the delete input EventTime, and other feature values set to
     /// null."
-    pub fn soft_delete_record(&mut self, identifier: &str, event_time: &str) {
-        let identifier_feature = self.record_identifier_feature_name.clone();
-        let event_time_feature = self.event_time_feature_name.clone();
+    ///
+    /// The two features the tombstone KEEPS are the group's own
+    /// `RecordIdentifierFeatureName` and `EventTimeFeatureName`, which the caller reads
+    /// from the group's definition ([`resolve_group`]) and passes in: this store holds no
+    /// definition of its own, and a group that resolves always has both names.
+    pub fn soft_delete_record(
+        &mut self,
+        identifier: &str,
+        event_time: &str,
+        identifier_feature: &str,
+        event_time_feature: &str,
+    ) {
         if let Some(record) = self.records.get_mut(identifier) {
             record.soft_deleted = true;
             record.event_time = Some(event_time.to_owned());
             record.expires_at = None;
             record.expires_at_secs = None;
+            record.ttl_secs = None;
             record.features.retain(|feature| {
-                identifier_feature.as_deref() == Some(feature.feature_name.as_str())
-                    || event_time_feature.as_deref() == Some(feature.feature_name.as_str())
+                identifier_feature == feature.feature_name
+                    || event_time_feature == feature.feature_name
             });
             for feature in &mut record.features {
-                if event_time_feature.as_deref() == Some(feature.feature_name.as_str()) {
+                if event_time_feature == feature.feature_name {
                     feature.value_as_string = Some(event_time.to_owned());
                     feature.value_as_string_list = None;
                 }
@@ -233,6 +226,12 @@ pub struct StoredRecord {
     /// The same instant as [`Self::expires_at`] in epoch seconds, for the expiry
     /// comparison, so no handler re-parses the string.
     pub expires_at_secs: Option<f64>,
+    /// The record-level `TtlDuration` in SECONDS, kept so a later call that moves the
+    /// record's `EventTime` can re-derive `ExpiresAt = EventTime + TtlDuration` from the
+    /// duration the record was written with. `UpdateRecord` documents exactly that: "If
+    /// you omit this parameter, the record's existing TTL setting remains unchanged",
+    /// and the setting is the DURATION, not the instant it happened to fall due at.
+    pub ttl_secs: Option<f64>,
     /// Set by `DeleteRecord` in `SoftDelete` mode: the record keeps its place in the
     /// store but is no longer retrievable by `GetRecord` or `BatchGetRecord`.
     pub soft_deleted: bool,
@@ -243,6 +242,21 @@ impl StoredRecord {
     /// in neither of the two formats a Feature Store event time can take.
     pub fn event_time_secs(&self) -> Option<f64> {
         self.event_time.as_deref().and_then(parse_event_time_secs)
+    }
+
+    /// Re-derive `ExpiresAt = EventTime + TtlDuration` on this record from its own
+    /// [`Self::event_time`] and [`Self::ttl_secs`], so the stored instant and the two
+    /// values it is computed from can never disagree.
+    ///
+    /// Both members go to `None` when the record carries no TTL duration or no parsable
+    /// event time: there is then no expiry the clock owes.
+    pub fn recompute_expiry(&mut self) {
+        let at = self
+            .ttl_secs
+            .zip(self.event_time_secs())
+            .map(|(ttl, event_time)| event_time + ttl);
+        self.expires_at = at.and_then(|at| iso8601(at).ok());
+        self.expires_at_secs = at;
     }
 
     /// This record's features, restricted to `feature_names` when the caller named
@@ -299,27 +313,12 @@ impl From<&crate::ops::types::FeatureValue> for StoredFeatureValue {
 ///
 /// The member's pattern is `^(arn:aws…:feature-group/)?(<name>)$`: the ARN prefix is
 /// OPTIONAL, so the ARN and the bare name denote the same feature group and must reach
-/// the same store. The key is the name, i.e. the part after the last `/`. Two ARNs that
-/// differ only in region or account therefore collapse onto one store, which is correct
-/// for an emulator serving a single account and region.
+/// the same store. The key is the name, which is also the key the SHARED feature-group
+/// directory holds a definition under, so the ONE reading of that spelling is
+/// [`::service_common::feature_store_groups::group_name`] and this delegates to it: a
+/// name the data plane resolves and the store it reaches can never be two names.
 pub fn group_key(name_or_arn: &str) -> &str {
-    match name_or_arn.rsplit_once('/') {
-        Some((_, name)) => name,
-        None => name_or_arn,
-    }
-}
-
-/// Whether `feature_name` is the conventional name of a group's event-time feature.
-///
-/// The runtime API never states which feature is the event time, so the emulator
-/// recognises the name SageMaker's own feature-group examples use, independent of case
-/// and of the `-`/`_` separators the `FeatureName` pattern allows.
-pub fn is_event_time_feature_name(feature_name: &str) -> bool {
-    feature_name
-        .chars()
-        .filter(|c| *c != '_' && *c != '-')
-        .map(|c| c.to_ascii_lowercase())
-        .eq("eventtime".chars())
+    ::service_common::feature_store_groups::group_name(name_or_arn)
 }
 
 /// An event time in epoch seconds.
@@ -338,27 +337,21 @@ pub fn parse_event_time_secs(event_time: &str) -> Option<f64> {
         .filter(|secs| secs.is_finite())
 }
 
-/// `ExpiresAt = EventTime + TtlDuration`, as the ISO-8601 string the `ExpiresAt`
-/// member documents, plus the same instant in epoch seconds.
+/// `secs` as the ISO-8601 string an `ExpiresAt` carries.
 ///
-/// Returns `None` when the event time is in neither accepted format, or when the unit
-/// is not one the model declares.
-pub fn expires_at(
-    event_time: &str,
-    ttl: &crate::ops::types::TtlDuration,
-) -> Option<(String, f64)> {
-    let seconds = ttl_seconds(&ttl.unit, ttl.value)?;
-    let at = parse_event_time_secs(event_time)? + seconds;
-    let formatted = DateTime::from_secs_f64(at).fmt(Format::DateTime).ok()?;
-    Some((formatted, at))
+/// `Err` only for an instant [`DateTime`] cannot format (one outside the range a
+/// timestamp can state), which no event time plus a modelled `TtlDuration` reaches.
+pub fn iso8601(secs: f64) -> Result<String, aws_smithy_types::date_time::DateTimeFormatError> {
+    DateTime::from_secs_f64(secs).fmt(Format::DateTime)
 }
 
-/// `value` of the `TtlDurationUnit` `unit`, in seconds.
+/// `value` of the `TtlDurationUnit` `unit`, in seconds, or `None` when the unit is not
+/// one the model declares.
 ///
 /// The units are exactly the model's `TtlDurationUnit` values (see
 /// `TTL_DURATION_UNIT_VALUES` in `ops::types`): Seconds, Minutes, Hours, Days, Weeks.
-fn ttl_seconds(unit: &str, value: i32) -> Option<f64> {
-    let unit_secs = match unit {
+pub fn ttl_seconds(ttl: &crate::ops::types::TtlDuration) -> Option<f64> {
+    let unit_secs = match ttl.unit.as_str() {
         "Seconds" => 1.0,
         "Minutes" => 60.0,
         "Hours" => 3600.0,
@@ -366,7 +359,7 @@ fn ttl_seconds(unit: &str, value: i32) -> Option<f64> {
         "Weeks" => 604_800.0,
         _ => return None,
     };
-    Some(f64::from(value) * unit_secs)
+    Some(f64::from(ttl.value) * unit_secs)
 }
 
 /// The first value of an enum-typed member the model's value list does not declare.
@@ -429,4 +422,83 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSagemakerfeaturestoreruntimeAmazonsagemakerfeaturestoreruntimeState>)
+}
+
+/// The SHARED feature-group directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// The runtime API carries no feature-group definition, so the directory the SageMaker
+/// control plane writes when it creates a group
+/// ([`::service_common::feature_store_groups::FeatureGroupDirectory`]) is the only place
+/// this service can resolve a `FeatureGroupName` against. The engine keys state by TYPE,
+/// so a copy of its own inside this service's state would be invisible to the writer.
+///
+/// `None` only when this service is mounted on an engine that holds no state at all,
+/// which is the same condition [`service_state`] answers `None` for: a handler answers it
+/// with a modelled server error, never with a fresh engine.
+pub fn feature_group_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::feature_store_groups::FeatureGroupDirectory>>
+{
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::feature_store_groups::FeatureGroupDirectory,
+            >,
+        )
+}
+
+/// Why a data-plane call cannot go on: the feature group its `FeatureGroupName` names
+/// does not resolve.
+#[derive(Debug)]
+pub enum Unresolved {
+    /// No feature group of that name exists, so the REQUEST is at fault — the name
+    /// denotes no feature group at all — and every operation answers it with its modelled
+    /// `ValidationError` (HTTP 400), carrying this message. It is never
+    /// `ResourceNotFound`, which is reserved for a RECORD that is absent from a feature
+    /// group that does resolve.
+    Refused(String),
+    /// This service is mounted on an engine that holds no state, so nothing can be
+    /// resolved at all: a server fault, answered with the modelled `InternalFailure`.
+    NoDirectory,
+}
+
+/// The definition of the feature group `name_or_arn` names, as the SageMaker control
+/// plane recorded it.
+///
+/// This is the ONE resolution every operation of this data plane performs on its
+/// `FeatureGroupName`, so no two of them can disagree about whether a name denotes a
+/// feature group: a feature group exists only because `CreateFeatureGroup` created one,
+/// and the runtime API has no call that creates one.
+///
+/// Whether the group has an `OnlineStore` is NOT decided here, because the two sides of
+/// this API answer it differently and only one of them is recorded. A READ of a group
+/// with no online store has nothing this service could serve, so it is refused
+/// ([`no_online_store`]); a WRITE to one is accepted by AWS and replicated to the
+/// OfflineStore, which this emulator does not model, so a write leaves the online store
+/// alone and answers success — exactly as a write whose `TargetStores` names only the
+/// OfflineStore does.
+pub fn resolve_group<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name_or_arn: &str,
+) -> Result<::service_common::feature_store_groups::FeatureGroupRecord, Unresolved> {
+    let Some(directory) = feature_group_directory(engine) else {
+        return Err(Unresolved::NoDirectory);
+    };
+    let held = directory.lock().get(name_or_arn).cloned();
+    match held {
+        Some(group) => Ok(group),
+        None => Err(Unresolved::Refused(format!(
+            "Validation Error: FeatureGroup with name {} does not exist.",
+            group_key(name_or_arn)
+        ))),
+    }
+}
+
+/// How a READ of a feature group with no `OnlineStore` is refused: there is no online
+/// store for this data plane to read, so the request names nothing it can serve. Stated
+/// once, so `GetRecord`, `ListRecords` and `BatchGetRecord` cannot word it three ways.
+pub fn no_online_store(group: &str) -> String {
+    format!("Validation Error: FeatureGroup {group} has no OnlineStore enabled.")
 }

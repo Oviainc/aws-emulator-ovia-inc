@@ -103,6 +103,11 @@ mod fis_execution_role_permissions;
 mod fis_execution_role_trust;
 #[path = "all/forecast_signing_name_routing.rs"]
 mod forecast_signing_name_routing;
+// Declared HERE, in the sorted list, rather than appended at the end of this file: the
+// tail is where every concurrently landing router suite appends, so a line added there
+// conflicts with all of them, while these neighbouring lines are stable.
+#[path = "all/sagemaker_feature_store_control_plane_handoff.rs"]
+mod sagemaker_feature_store_control_plane_handoff;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
 #[path = "all/iam_role_id_agrees_with_sts.rs"]

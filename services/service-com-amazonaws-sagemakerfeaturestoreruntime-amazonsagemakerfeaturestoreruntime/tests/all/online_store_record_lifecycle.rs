@@ -11,22 +11,63 @@ use std::sync::Arc;
 
 use aws_smithy_types::date_time::{DateTime, Format};
 use serde_json::{json, Value};
+use service_common::feature_store_groups::{FeatureGroupDirectory, FeatureGroupRecord};
 use smithy_server_runtime::{http, MultiServiceRouter};
 
 use service_com_amazonaws_sagemakerfeaturestoreruntime_amazonsagemakerfeaturestoreruntime::EmulatedService;
 
 /// A booted emulator holding this service only.
 struct Emulator {
+    engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Emulator {
+    /// A booted emulator with the feature groups these suites write to already created.
+    ///
+    /// Every operation of this data plane resolves its `FeatureGroupName` against the
+    /// feature groups the SageMaker CONTROL plane holds, so a group has to exist before a
+    /// record can be written to it — exactly as a client has to call
+    /// `CreateFeatureGroup` first.
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        let emulator = Self { engine, router };
+        for (group, identifier) in [
+            ("customers", "customer_id"),
+            ("orders", "order_id"),
+            ("ttlgroup", "customer_id"),
+            ("expiring", "customer_id"),
+        ] {
+            emulator.create_feature_group(group, identifier, "event_time", true);
+        }
+        emulator
+    }
+
+    /// Create a feature group with an OnlineStore, the way the SageMaker control plane's
+    /// `CreateFeatureGroup` does: by registering its definition in the ONE shared
+    /// feature-group directory this data plane resolves names against.
+    fn create_feature_group(
+        &self,
+        name: &str,
+        record_identifier_feature_name: &str,
+        event_time_feature_name: &str,
+        online_store_enabled: bool,
+    ) {
+        self.engine
+            .state::<FeatureGroupDirectory>()
+            .lock()
+            .register(FeatureGroupRecord {
+                name: name.to_owned(),
+                arn: format!(
+                    "arn:aws:sagemaker:us-east-1:123456789012:feature-group/{name}"
+                ),
+                record_identifier_feature_name: record_identifier_feature_name.to_owned(),
+                event_time_feature_name: event_time_feature_name.to_owned(),
+                online_store_enabled,
+            });
     }
 
     /// Send one request and return its status and parsed JSON body (`Value::Null` for
@@ -756,18 +797,44 @@ async fn delete_record_removes_the_record_from_the_online_store() {
 }
 
 #[tokio::test]
-async fn delete_record_with_an_event_time_not_later_than_the_records_does_not_delete() {
+async fn delete_record_with_an_event_time_before_the_records_does_not_delete() {
     // "Note that the EventTime specified in DeleteRecord should be set later than the
     // EventTime of the existing record … If it is not, the deletion does not occur:
     // For SoftDelete, the existing (not deleted) record remains in the OnlineStore …
-    // HardDelete returns EventTime: 400 ValidationException." (DeleteRecord doc.)
+    // HardDelete returns EventTime: 400 ValidationException." (DeleteRecord doc.) The
+    // boundary the service enforces is SAME-or-after, so a delete submitted at exactly
+    // the record's own EventTime — the value a client reads back from GetRecord —
+    // deletes it, and only a strictly older one does not.
     let cases: Vec<(&str, &str, &str, u16, bool)> = vec![
         ("soft, older", "", "2023-12-31T00:00:00Z", 200, true),
-        ("soft, equal", "&DeletionMode=SoftDelete", "2024-01-01T00:00:00Z", 200, true),
+        ("soft, equal", "&DeletionMode=SoftDelete", "2024-01-01T00:00:00Z", 200, false),
         ("hard, older", "&DeletionMode=HardDelete", "2023-12-31T00:00:00Z", 400, true),
-        ("hard, equal", "&DeletionMode=HardDelete", "2024-01-01T00:00:00Z", 400, true),
+        ("hard, equal", "&DeletionMode=HardDelete", "2024-01-01T00:00:00Z", 200, false),
+        (
+            "hard, one second older",
+            "&DeletionMode=HardDelete",
+            "2023-12-31T23:59:59Z",
+            400,
+            true,
+        ),
+        (
+            "hard, one second later",
+            "&DeletionMode=HardDelete",
+            "2024-01-01T00:00:01Z",
+            200,
+            false,
+        ),
         ("hard, later", "&DeletionMode=HardDelete", "2024-01-02T00:00:00Z", 200, false),
         ("soft, later", "&DeletionMode=SoftDelete", "2024-01-02T00:00:00Z", 200, false),
+        // The same instant in the other accepted event-time format: 2024-01-01T00:00:00Z
+        // is 1 704 067 200 epoch seconds, so this row is "equal" spelled as a Fractional.
+        (
+            "hard, equal as epoch seconds",
+            "&DeletionMode=HardDelete",
+            "1704067200",
+            200,
+            false,
+        ),
     ];
 
     for (case, mode, event_time, expected_status, still_there) in cases {
@@ -940,8 +1007,8 @@ async fn batch_get_record_fans_out_over_the_same_store_get_record_reads() {
         "case \"O1 projection\": expected only the named feature, got {o1_features:?}"
     );
 
-    // An identifier in a feature group with no OnlineStore is reported per identifier,
-    // with one of GetRecord's own error codes.
+    // Every identifier of an entry whose feature group does not resolve is reported per
+    // identifier, with the error code this data plane gives an unresolvable name.
     let errors: Vec<(String, String, String)> = body["Errors"]
         .as_array()
         .expect("Errors is required")
@@ -961,12 +1028,12 @@ async fn batch_get_record_fans_out_over_the_same_store_get_record_reads() {
         (
             "nosuchgroup".to_owned(),
             "X1".to_owned(),
-            "ResourceNotFound".to_owned(),
+            "ValidationError".to_owned(),
         ),
         (
             "nosuchgroup".to_owned(),
             "X2".to_owned(),
-            "ResourceNotFound".to_owned(),
+            "ValidationError".to_owned(),
         ),
     ];
     assert_eq!(
@@ -1019,30 +1086,34 @@ async fn a_feature_group_arn_and_its_name_reach_one_online_store() {
 }
 
 #[tokio::test]
-async fn a_feature_group_with_no_online_store_is_reported_as_not_found() {
+async fn a_feature_group_that_does_not_resolve_is_refused_and_an_absent_record_is_not() {
     let emulator = Emulator::new();
 
-    // GetRecord and ListRecords both model ResourceNotFound (HTTP 404).
+    // A `FeatureGroupName` that names no feature group is a request defect: every
+    // operation of this data plane refuses it with the modelled ValidationError (400),
+    // never with ResourceNotFound (404), which would say a record is missing from a
+    // feature group that exists. The table that spans this rule over every operation and
+    // both name spellings is `tests/all/feature_group_resolution.rs`.
     let (status, body) = emulator
         .get_record("nosuchgroup", "RecordIdentifierValueAsString=C1")
         .await;
-    assert_eq!(status, 404, "case \"GetRecord\": expected 404, got {status}");
+    assert_eq!(status, 400, "case \"GetRecord\": expected 400, got {status}");
     let code = error_code(&body);
     assert_eq!(
-        code, "ResourceNotFound",
-        "case \"GetRecord\": expected the ResourceNotFound error code, got {code:?}"
+        code, "ValidationError",
+        "case \"GetRecord\": expected the ValidationError error code, got {code:?}"
     );
 
     let (status, body) = emulator.list_records("nosuchgroup", json!({})).await;
-    assert_eq!(status, 404, "case \"ListRecords\": expected 404, got {status}");
+    assert_eq!(status, 400, "case \"ListRecords\": expected 400, got {status}");
     let code = error_code(&body);
     assert_eq!(
-        code, "ResourceNotFound",
-        "case \"ListRecords\": expected the ResourceNotFound error code, got {code:?}"
+        code, "ValidationError",
+        "case \"ListRecords\": expected the ValidationError error code, got {code:?}"
     );
 
     // An identifier that was never written to a group that DOES exist is an empty
-    // result, not a 404: "If no Record with RecordIdentifierValue is found, then an
+    // result, not an error: "If no Record with RecordIdentifierValue is found, then an
     // empty result is returned."
     emulator
         .put_record(
@@ -1063,15 +1134,35 @@ async fn a_feature_group_with_no_online_store_is_reported_as_not_found() {
         "case \"unknown identifier\": expected no Record, got {actual:?}"
     );
 
-    // DeleteRecord models no ResourceNotFound, so deleting from a group with no
-    // OnlineStore succeeds with nothing to remove.
-    let (status, _) = emulator
+    // Nor is a group that exists but holds no record yet: it lists nothing and serves
+    // nothing, with no error at all.
+    emulator.create_feature_group("emptygroup", "customer_id", "event_time", true);
+    let (status, body) = emulator.list_records("emptygroup", json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case \"a group with no record yet\": expected ListRecords 200, got {status}"
+    );
+    let listed = body["RecordIdentifiers"].clone();
+    assert_eq!(
+        listed,
+        json!([]),
+        "case \"a group with no record yet\": expected no identifiers, got {listed:?}"
+    );
+
+    // DeleteRecord is refused for the same reason the others are: the delete marker it
+    // documents belongs to a feature group that exists.
+    let (status, body) = emulator
         .delete_record(
             "nosuchgroup",
             "RecordIdentifierValueAsString=C1&EventTime=2024-01-01T00:00:00Z",
         )
         .await;
-    assert_eq!(status, 200, "case \"DeleteRecord\": expected 200, got {status}");
+    assert_eq!(status, 400, "case \"DeleteRecord\": expected 400, got {status}");
+    let code = error_code(&body);
+    assert_eq!(
+        code, "ValidationError",
+        "case \"DeleteRecord\": expected the ValidationError error code, got {code:?}"
+    );
 }
 
 #[tokio::test]
@@ -1267,7 +1358,17 @@ async fn the_online_store_refuses_a_write_past_its_capacity_bound() {
         feature("event_time", "2024-01-01T00:00:00Z")
     ] });
 
-    // The store is process memory, so it holds a bounded number of feature groups.
+    // The store is process memory, so it holds a bounded number of feature groups. Each
+    // one has to exist in the control plane before a record can reach it.
+    for index in 0..MAX_FEATURE_GROUPS {
+        emulator.create_feature_group(
+            &format!("group{index}"),
+            "customer_id",
+            "event_time",
+            true,
+        );
+    }
+    emulator.create_feature_group("onegrouptoomany", "customer_id", "event_time", true);
     for index in 0..MAX_FEATURE_GROUPS {
         let (status, _) = emulator
             .put_record(&format!("group{index}"), record.clone())
@@ -1306,7 +1407,8 @@ async fn the_operations_this_slice_does_not_implement_still_answer_501() {
     let emulator = Emulator::new();
 
     // BatchWriteRecord is left to its own issue: a stub answers 501, never an empty 200.
-    // (`UpdateRecord` is implemented — see `tests/all/update_record_partial_update.rs`.)
+    // (`UpdateRecord` is implemented — see `tests/all/update_record_partial_update.rs`
+    // and `tests/all/update_record_semantics.rs`.)
     let (status, body) = emulator
         .send(
             "POST",

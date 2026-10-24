@@ -3,9 +3,13 @@
 //! @op DeleteRecord
 //! IMPLEMENTED: this operation deletes one record from the feature group's OnlineStore
 //! held in [`crate::state`] — `HardDelete` removes it, `SoftDelete` (the default)
-//! leaves a tombstone that `GetRecord` and `BatchGetRecord` no longer serve — and
-//! refuses, as the model documents, a `HardDelete` whose `EventTime` is not later than
-//! the stored record's.
+//! leaves a tombstone that `GetRecord` and `BatchGetRecord` no longer serve. The
+//! `FeatureGroupName` is resolved against the feature groups the SageMaker control plane
+//! holds ([`crate::state::resolve_group`]) and a name that resolves to none is refused
+//! with the modelled `ValidationError` (400). A deletion is ordered against the stored
+//! record's own `EventTime`: the request's must be the SAME as it or after it, and a
+//! strictly older one does not delete — `SoftDelete` leaves the record standing,
+//! `HardDelete` answers 400 ([`DELETE_EVENT_TIME_OUT_OF_ORDER`]).
 //!
 //! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable, and
 //! the OfflineStore is not modelled: the deleted-record marker the model says Feature
@@ -225,10 +229,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The data plane's one feature-group resolution: a `FeatureGroupName` naming no
+        // feature group is a request defect, refused with the modelled `ValidationError`
+        // — the delete marker this operation's doc appends to the OfflineStore belongs to
+        // a feature group that EXISTS, so an unresolvable name writes nothing anywhere.
+        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
+        {
+            Ok(definition) => definition,
+            Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
+            Err(crate::state::Unresolved::NoDirectory) => {
+                return Err(DeleteRecordErrorModeled::InternalFailure(InternalFailure {
+                    message: Some(
+                        "DeleteRecord: this service holds no feature-group directory on the \
+                         mounted engine"
+                            .into(),
+                    ),
+                })
+                .into())
+            }
+        };
+
         // "A list of stores from which you're deleting the record. By default, Feature
         // Store deletes the record from all of the stores that you're using for the
-        // FeatureGroup." Only the OnlineStore is served here.
-        if !crate::state::targets_online_store(input.target_stores.as_ref()) {
+        // FeatureGroup." Only the OnlineStore is served here, so a delete naming only
+        // the OfflineStore — or one aimed at a feature group that HAS no OnlineStore —
+        // leaves the online store alone.
+        if !crate::state::targets_online_store(input.target_stores.as_ref())
+            || !definition.online_store_enabled
+        {
             return Ok(DeleteRecordOutput);
         }
 
@@ -248,9 +276,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // DeleteRecord models no ResourceNotFound: a delete marker is appended to the
-        // OfflineStore whether or not the OnlineStore holds the group, so an unknown
-        // feature group is a success with nothing to remove online.
+        // A feature group that resolves but has taken no record yet has no online store
+        // here, so there is nothing to remove online.
         let Some(group) = store.group_mut(&input.feature_group_name) else {
             return Ok(DeleteRecordOutput);
         };
@@ -263,21 +290,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Note that the EventTime specified in DeleteRecord should be set later than
         // the EventTime of the existing record in the OnlineStore for that
         // RecordIdentifer. If it is not, the deletion does not occur": SoftDelete
-        // leaves the existing record in the OnlineStore, HardDelete answers 400. A
-        // stored record with no event time at all orders against nothing, so the
-        // deletion proceeds.
+        // leaves the existing record in the OnlineStore, HardDelete answers 400. The
+        // boundary the service enforces is SAME-or-after — a deletion submitted at
+        // exactly the record's own EventTime, which is the value a client reads back
+        // from `GetRecord`, deletes it — so only a STRICTLY older EventTime is out of
+        // order. A stored record with no event time at all orders against nothing, so
+        // the deletion proceeds.
         let out_of_order = stored
             .event_time_secs()
-            .is_some_and(|existing| requested_secs <= existing);
+            .is_some_and(|existing| requested_secs < existing);
         if out_of_order {
             if hard_delete {
-                let existing = stored.event_time.clone().unwrap_or_default();
-                return Err(validation(format!(
-                    "EventTime: the EventTime of a HardDelete must be later than the \
-                     EventTime of the record it deletes, but '{}' is not later than \
-                     '{existing}'",
-                    input.event_time
-                )));
+                return Err(validation(DELETE_EVENT_TIME_OUT_OF_ORDER));
             }
             return Ok(DeleteRecordOutput);
         }
@@ -285,12 +309,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if hard_delete {
             group.remove_record(&identifier);
         } else {
-            group.soft_delete_record(&identifier, &input.event_time);
+            group.soft_delete_record(
+                &identifier,
+                &input.event_time,
+                &definition.record_identifier_feature_name,
+                &definition.event_time_feature_name,
+            );
         }
 
         Ok(DeleteRecordOutput)
     }
 }
+
+/// How this operation states a deletion whose `EventTime` is older than the record's.
+///
+/// The rule it words is the one the service enforces: the delete event time must be the
+/// same as, or after, the stored record's. It names no value from the request because the
+/// rule names none — the two instants are the caller's own and the record's, and a client
+/// re-reads the record's with `GetRecord`.
+const DELETE_EVENT_TIME_OUT_OF_ORDER: &str =
+    "Validation Error: Delete event time must be same or after latest record event time.";
 
 /// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
 fn validation(message: impl Into<String>) -> DeleteRecordError {

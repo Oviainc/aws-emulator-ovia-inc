@@ -6,8 +6,11 @@
 //! a name already in use with the modelled `ResourceInUse` and a schema that cannot
 //! hold together with a 400 `ValidationException`. The group is stored `Creating` and
 //! the clock owes it `Created` (see [`crate::state::FEATURE_GROUP_CREATED_AFTER`]), which
-//! `DescribeFeatureGroup` materialises. This is the ONLY file to touch for this
-//! operation.
+//! `DescribeFeatureGroup` materialises. The definition is ALSO recorded in the shared
+//! feature-group directory ([`crate::state::feature_group_directory`]), which is how the
+//! FeatureStore Runtime data plane — whose API carries no feature-group definition —
+//! resolves a `FeatureGroupName` and learns the group's record-identifier and event-time
+//! features. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -244,6 +247,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // The FeatureStore Runtime data plane resolves a `FeatureGroupName` against the
+        // groups this service holds, and reads the two feature names this definition
+        // fixes, so the definition goes into the SHARED directory as well as this
+        // service's own store. Written while the group is still `Creating`: the clock
+        // owes `Created` (`FEATURE_GROUP_CREATED_AFTER`) and the group exists from the
+        // moment this call accepts it.
+        let registration = ::service_common::feature_store_groups::FeatureGroupRecord {
+            name: input.feature_group_name.clone(),
+            arn: arn.clone(),
+            record_identifier_feature_name: input.record_identifier_feature_name.clone(),
+            event_time_feature_name: input.event_time_feature_name.clone(),
+            // "Turn OnlineStore off by specifying False for the EnableOnlineStore flag.
+            // … The default value is False." (`OnlineStoreConfig$EnableOnlineStore`.)
+            online_store_enabled: input
+                .online_store_config
+                .as_ref()
+                .and_then(|config| config.enable_online_store)
+                .unwrap_or(false),
+        };
         store.feature_groups.insert(
             input.feature_group_name.clone(),
             crate::state::FeatureGroup {
@@ -267,6 +289,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         );
         drop(store);
+        // LOCK ORDER (`crate::state::feature_group_directory`): this service's own store
+        // first, the shared directory second. An engine that holds no directory leaves it
+        // unwritten — the record is an aid to the data plane, never part of this
+        // operation's own answer.
+        if let Some(directory) = crate::state::feature_group_directory(&*self.engine) {
+            directory.lock().register(registration);
+        }
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateFeatureGroupOutput {

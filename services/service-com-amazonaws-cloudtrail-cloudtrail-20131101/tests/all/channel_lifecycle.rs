@@ -54,8 +54,6 @@ use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::EventDataStoreS
 
 // The emulator-under-test harness is shared by this crate's suites; see
 // `tests/all/emulator.rs`.
-
-
 use super::emulator::{Emulator, HOME_REGION};
 
 /// Another Region, for the cases about Region scoping.

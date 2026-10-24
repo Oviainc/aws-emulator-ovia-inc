@@ -7,11 +7,16 @@
 //! carries no such feature yet) and every other stored feature value is left standing,
 //! which is what separates this operation from `PutRecord`'s full over-write.
 //!
-//! The record must already exist and not be soft-deleted, the request's `EventTime` —
-//! the value of the group's event-time feature, when this request carries it — orders
-//! the update against the stored record's, and an omitted `EventTime` keeps the stored
-//! one. A `TtlDuration` recomputes `ExpiresAt = EventTime + TtlDuration` from that
-//! request `EventTime`; an omitted one leaves the record's expiry as it stands.
+//! The `FeatureGroupName` is resolved against the feature groups the SageMaker control
+//! plane holds ([`crate::state::resolve_group`]) and a name that resolves to none is
+//! refused with the modelled `ValidationError` (400). The record must already exist and
+//! not be soft-deleted (`ResourceNotFound`, 404); the request's `EventTime` — the value
+//! of the group's own `EventTimeFeatureName`, when this request carries it — orders the
+//! update against the stored record's, and one older than it is refused with
+//! `ConflictException` (409) leaving the record untouched, while an omitted `EventTime`
+//! keeps the stored one. A `TtlDuration` replaces the record's TTL duration, from which
+//! `ExpiresAt = EventTime + TtlDuration` is re-derived; an omitted one leaves the
+//! record's TTL setting as it stands.
 //!
 //! This is the one operation that GROWS a stored record — a posted feature the record
 //! does not carry yet is appended, where `PutRecord` replaces a record's feature values
@@ -19,13 +24,14 @@
 //! bound, [`crate::state::MAX_FEATURES_PER_RECORD`]: a merge past it answers the modelled
 //! `ServiceUnavailable` instead of growing the store without limit.
 //!
-//! Two things the operation documents are OUTSIDE what this service's wire surface
-//! carries, so they are not emulated here: authorization (the modelled
-//! `AccessForbidden` is unreachable) and the feature group's online store TYPE — "this
-//! operation is available only for feature groups that use the Standard_V2 or InMemory
-//! online store type", which the runtime API never states and only the SageMaker
-//! control plane knows, so every group this store holds is updatable. The OfflineStore
-//! is not modelled at all: this file serves the OnlineStore side of the operation only.
+//! Two things the operation documents are not acted on here: authorization (the modelled
+//! `AccessForbidden` is unreachable, since it is not emulated) and the feature group's
+//! online store TYPE — "this operation is available only for feature groups that use the
+//! Standard_V2 or InMemory online store type". The recorded units that exercise this
+//! operation's rejections create their feature group with no `StorageType` at all and
+//! AWS still answered those rejections rather than refusing the update, so the recording
+//! rules that gate out. The OfflineStore is not modelled at all: this file serves the
+//! OnlineStore side of the operation only.
 //!
 //! ## Shape of an operation
 //!
@@ -234,8 +240,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The data plane's one feature-group resolution: a `FeatureGroupName` naming no
+        // feature group is a request defect (400 `ValidationError`), never a missing
+        // record (404 `ResourceNotFound`). It also supplies the two feature names the
+        // group's definition fixes, which the runtime API never carries.
+        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
+        {
+            Ok(definition) => definition,
+            Err(crate::state::Unresolved::Refused(message)) => return Err(validation(message)),
+            Err(crate::state::Unresolved::NoDirectory) => {
+                return Err(UpdateRecordErrorModeled::InternalFailure(InternalFailure {
+                    message: Some(
+                        "UpdateRecord: this service holds no feature-group directory on the \
+                         mounted engine"
+                            .into(),
+                    ),
+                })
+                .into())
+            }
+        };
+
         // "You can update up to 100 features per call." The model bounds `Features` at
-        // `len 1..` only, so the documented maximum is this handler's to refuse.
+        // `len 1..` only, so the documented maximum is this handler's to refuse. Every
+        // check from here to the store lock is on the REQUEST, so it answers the same
+        // whatever stores the caller named: a request this operation cannot act on is a
+        // request defect, not something an OfflineStore-only target excuses.
         if input.features.len() > MAX_FEATURES_PER_UPDATE {
             return Err(validation(format!(
                 "Features: at most {MAX_FEATURES_PER_UPDATE} features can be updated per \
@@ -250,140 +279,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation("Features must carry at least one FeatureValue"));
         }
 
-        // "The target stores for the record update. By default, Amazon SageMaker
-        // Feature Store updates the record in all stores associated with the
-        // FeatureGroup." This service is the OnlineStore data plane, so a request
-        // naming only the OfflineStore leaves the online store — and so this whole
-        // handler — alone.
-        if !crate::state::targets_online_store(input.target_stores.as_ref()) {
-            return Ok(UpdateRecordOutput);
-        }
-
-        let key = crate::state::group_key(&input.feature_group_name).to_owned();
-        let identifier = input.record_identifier_value_as_string.clone();
-
-        // ONE critical section for the whole read-resolve-write: the group's learned
-        // feature names decide which posted feature is the event time, and the stored
-        // record's event time decides whether the update is accepted at all, so reading
-        // both under the same guard that performs the write is what keeps two concurrent
-        // updates from each merging onto the record the other replaced. Nothing below
-        // can panic — every failure is a modelled error return, which releases the guard.
-        let mut store = state.lock();
-        let (learned_identifier, learned_event_time) =
-            store.learned_feature_names(&input.feature_group_name);
-
-        // The runtime API carries no feature-group definition, so the group's event-time
-        // feature is the one already learned for it, or — when it learned none — the one
-        // this request recognises by its conventional name.
-        let event_time_feature_name = learned_event_time.or_else(|| {
-            input
-                .features
-                .iter()
-                .map(|feature| &feature.feature_name)
-                .find(|name| crate::state::is_event_time_feature_name(name))
-                .cloned()
-        });
-        let posted_event_time = match event_time_feature_name
-            .as_ref()
-            .and_then(|name| {
-                input
-                    .features
-                    .iter()
-                    .find(|feature| feature.feature_name == *name)
-            }) {
+        // The `EventTime` of an update is the value the group's own
+        // `EventTimeFeatureName` carries among the posted features — the runtime API has
+        // no separate member for it — and "If you omit EventTime, the service keeps the
+        // record's existing EventTime and applies the update."
+        let event_time_feature_name = definition.event_time_feature_name.clone();
+        let posted_event_time = match input
+            .features
+            .iter()
+            .find(|feature| feature.feature_name == event_time_feature_name)
+        {
             None => None,
             Some(FeatureValue {
                 value_as_string: Some(value),
                 ..
             }) => Some(value.clone()),
-            Some(feature) => {
+            Some(_) => {
                 return Err(validation(format!(
-                    "EventTime: the event time feature '{}' must carry ValueAsString, not \
-                     ValueAsStringList",
-                    feature.feature_name
+                    "EventTime: the event time feature '{event_time_feature_name}' must carry \
+                     ValueAsString, not ValueAsStringList"
                 )))
             }
         };
 
-        // An event time this request supplies must be a timestamp: the ordering against
-        // the stored record and the TTL are both computed from it, so a value in neither
-        // accepted format is refused rather than silently disabling both.
+        // "If you specify a TtlDuration, you must also provide an EventTime in the
+        // request. Otherwise, the operation returns a ValidationError." (`ExpiresAt` is
+        // `EventTime + TtlDuration`, so a TTL with no event time states no instant.)
+        if input.ttl_duration.is_some() && posted_event_time.is_none() {
+            return Err(validation(format!(
+                "Validation Error: TtlDuration requires an EventTime in the same request; \
+                 include the feature group's EventTime feature '{event_time_feature_name}' in \
+                 Features."
+            )));
+        }
+        let ttl_secs = match input.ttl_duration.as_ref() {
+            None => None,
+            Some(ttl) => match crate::state::ttl_seconds(ttl) {
+                Some(secs) => Some(secs),
+                None => {
+                    return Err(validation(format!(
+                        "TtlDuration.Unit: '{}' is not a TtlDurationUnit; expected one of {}",
+                        ttl.unit,
+                        TTL_DURATION_UNIT_VALUES.join(", ")
+                    )))
+                }
+            },
+        };
+
+        // An event time the request carries must be a timestamp: the update is ordered
+        // against the stored record's, so a value in neither accepted format orders
+        // against nothing.
         let posted_secs = match posted_event_time.as_deref() {
+            None => None,
             Some(at) => match crate::state::parse_event_time_secs(at) {
                 Some(secs) => Some(secs),
                 None => {
-                    let name = event_time_feature_name.clone().unwrap_or_default();
                     return Err(validation(format!(
-                        "EventTime: the event time feature '{name}' must carry an ISO-8601 \
-                         timestamp or seconds since the epoch, not '{at}'"
-                    )));
+                        "EventTime: the event time feature '{event_time_feature_name}' must \
+                         carry an ISO-8601 timestamp or seconds since the epoch, not '{at}'"
+                    )))
                 }
             },
-            None => None,
         };
 
-        // "If you specify a TtlDuration, you must also provide an EventTime in the
-        // request. Otherwise, the operation returns a ValidationError."
-        if input.ttl_duration.is_some() && posted_event_time.is_none() {
-            return Err(validation(
-                "TtlDuration: a request that specifies a TtlDuration must also supply the \
-                 record's EventTime feature, because ExpiresAt = EventTime + TtlDuration",
-            ));
-        }
+        let identifier = input.record_identifier_value_as_string.clone();
+        let key = definition.name.clone();
 
         // `RecordIdentifierValueAsString` "must match the value defined by the feature
         // group's record identifier feature", so an update that posts the group's
         // record-identifier feature must post the value of the record it is updating: a
         // record's identity is not what this operation changes.
-        if let Some(identifier_feature) = learned_identifier.as_deref() {
-            if let Some(posted) = input
-                .features
-                .iter()
-                .find(|feature| feature.feature_name == identifier_feature)
-            {
-                if posted.value_as_string.as_deref() != Some(identifier.as_str()) {
-                    return Err(validation(format!(
-                        "Features: the record identifier feature '{identifier_feature}' must \
-                         carry the RecordIdentifierValueAsString of the record being updated \
-                         ('{identifier}')"
-                    )));
-                }
+        let identifier_feature = definition.record_identifier_feature_name.clone();
+        if let Some(posted) = input
+            .features
+            .iter()
+            .find(|feature| feature.feature_name == identifier_feature)
+        {
+            if posted.value_as_string.as_deref() != Some(identifier.as_str()) {
+                return Err(validation(format!(
+                    "Features: the record identifier feature '{identifier_feature}' must carry \
+                     the RecordIdentifierValueAsString of the record being updated \
+                     ('{identifier}')"
+                )));
             }
         }
 
+        // A feature group that HAS no `OnlineStore` holds no online record to update, and
+        // the update AWS would replicate to the OfflineStore is not modelled here, so
+        // there is nothing for this handler to do once the request itself has been found
+        // well-formed — the same answer a request naming only the OfflineStore gets
+        // below, and not a refusal, which no recording shows.
+        if !definition.online_store_enabled {
+            return Ok(UpdateRecordOutput);
+        }
+
+        // ONE critical section for the whole read-merge-write: the stored record's event
+        // time decides whether the update is accepted at all, so reading it under the
+        // same guard that performs the write is what keeps two concurrent updates from
+        // each merging onto the record the other replaced. Nothing below can panic —
+        // every failure is a modelled error return, which releases the guard.
+        let mut store = state.lock();
         // "The record must already exist. If the record does not exist or has been
         // soft-deleted, the operation returns a ResourceNotFound error. To create a
-        // record, use PutRecord." A feature group whose OnlineStore holds nothing at all
-        // cannot hold the record either, so it is the same refusal.
+        // record, use PutRecord." `live_record` is exactly that: present and not
+        // soft-deleted. A feature group that resolves but has taken no record yet holds
+        // no online store here, which is the same "no such record" answer.
         let Some(group) = store.group_mut(&input.feature_group_name) else {
-            return Err(not_found(format!(
-                "Feature group '{key}' has no OnlineStore record \
-                 '{identifier}' to update"
-            )));
+            return Err(no_such_record(&identifier, &key));
         };
         let Some(existing) = group.live_record(&identifier) else {
-            return Err(not_found(format!(
-                "Feature group '{key}' has no OnlineStore record \
-                 '{identifier}' to update"
-            )));
+            return Err(no_such_record(&identifier, &key));
         };
+        // The merge runs on a CLONE of the stored record, so a refusal below leaves the
+        // store untouched.
         let mut updated = existing.clone();
 
-        // "If you provide an EventTime that is older than the record's current
-        // EventTime, the service rejects the update with a ConflictException. If the
-        // EventTime is equal to or newer than the current value, the service applies the
-        // update." A stored record carrying no event time orders against nothing, so the
-        // update applies.
-        if let (Some(posted), Some(stored)) = (posted_secs, updated.event_time_secs()) {
-            if posted < stored {
-                let current = updated.event_time.clone().unwrap_or_default();
-                let supplied = posted_event_time.clone().unwrap_or_default();
-                return Err(conflict(format!(
-                    "EventTime: '{supplied}' is older than the current EventTime \
-                     '{current}' of record '{identifier}'; retrieve the record's latest \
-                     EventTime and resubmit with a value equal to or newer than it"
-                )));
+        // "If you provide an EventTime that is older than the record's current EventTime,
+        // the service rejects the update with a ConflictException. If the EventTime is
+        // equal to or newer than the current value, the service applies the update." A
+        // stored record carrying no event time orders against nothing, so the update
+        // applies.
+        if let (Some(posted), Some(current)) = (posted_secs, updated.event_time_secs()) {
+            if posted < current {
+                return Err(UpdateRecordErrorModeled::ConflictException(ConflictException {
+                    message: Some(CONFLICTING_EVENT_TIME.to_owned()),
+                })
+                .into());
             }
+        }
+
+        // "The target stores for the record update. By default, Amazon SageMaker
+        // Feature Store updates the record in all stores associated with the
+        // FeatureGroup." This service is the OnlineStore data plane, so a request naming
+        // only the OfflineStore leaves the online record standing. It is answered HERE,
+        // and not earlier: the request's own rules, the record's existence and the
+        // ordering against its event time hold whichever store an update is aimed at, so
+        // an offline-only request is validated and resolved exactly as any other and only
+        // the WRITE is skipped.
+        if !crate::state::targets_online_store(input.target_stores.as_ref()) {
+            return Ok(UpdateRecordOutput);
         }
 
         // "Updates one or more feature values for an existing record… Features that you
@@ -391,21 +425,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the stored value of the feature it names, in place, and a feature the record
         // does not carry yet is added — up to the store's per-record capacity bound,
         // which is this operation's to respect because it is the only one that GROWS a
-        // record (`PutRecord` replaces a record's features wholesale). The merge runs on
-        // a CLONE of the stored record, so a refusal here leaves the store untouched.
+        // record (`PutRecord` replaces a record's features wholesale).
         for posted in &input.features {
             let value = crate::state::StoredFeatureValue::from(posted);
             match updated
                 .features
                 .iter_mut()
-                .find(|stored| stored.feature_name == value.feature_name)
+                .find(|held| held.feature_name == value.feature_name)
             {
-                Some(stored) => *stored = value,
+                Some(held) => *held = value,
                 None => {
                     if updated.features.len() >= crate::state::MAX_FEATURES_PER_RECORD {
                         return Err(at_capacity(format!(
-                            "record '{identifier}' of feature group '{key}' already holds \
-                             {} feature values",
+                            "record '{identifier}' of feature group '{key}' already holds {} \
+                             feature values",
                             crate::state::MAX_FEATURES_PER_RECORD
                         )));
                     }
@@ -418,31 +451,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(at) = posted_event_time {
             updated.event_time = Some(at);
         }
-
-        // `ExpiresAt = EventTime + TtlDuration`, from the EventTime this request
-        // supplied (an absent one was refused above). "If you omit this parameter, the
-        // record's existing TTL setting remains unchanged", so the stored expiry stands.
-        if let Some(ttl) = input.ttl_duration.as_ref() {
-            let Some((iso, secs)) = updated
-                .event_time
-                .as_deref()
-                .and_then(|at| crate::state::expires_at(at, ttl))
-            else {
-                return Err(validation(format!(
-                    "TtlDuration: '{}' is not a TtlDurationUnit; expected one of {}",
-                    ttl.unit,
-                    TTL_DURATION_UNIT_VALUES.join(", ")
-                )));
-            };
-            updated.expires_at = Some(iso);
-            updated.expires_at_secs = Some(secs);
+        // "If you omit this parameter, the record's existing TTL setting remains
+        // unchanged" (`TtlDuration`), so a request that names one replaces the record's
+        // duration and one that does not keeps it — and `ExpiresAt` is re-derived from
+        // the duration and the record's event time either way, because an update may
+        // have moved that event time.
+        if let Some(secs) = ttl_secs {
+            updated.ttl_secs = Some(secs);
         }
-
-        // The group's event-time feature, once a record of it carries one, is remembered
-        // for every later call — exactly as `PutRecord` learns it.
-        if group.event_time_feature_name.is_none() {
-            group.event_time_feature_name = event_time_feature_name;
-        }
+        updated.recompute_expiry();
 
         // The record already exists, so this over-writes it rather than growing the
         // group; the capacity answer is kept all the same, so a future change to the
@@ -465,6 +482,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `smithy-model/`. A documented API limit, not an emulator capacity bound.
 const MAX_FEATURES_PER_UPDATE: usize = 100;
 
+/// How this operation states an `EventTime` older than the record's current one.
+///
+/// The modelled `ConflictException`'s own doc, which is the rule: "The service rejected
+/// the update because the provided EventTime is older than the record's current
+/// EventTime. To persist the update, retrieve the record's latest EventTime and resubmit
+/// the request with an EventTime that is equal to or newer than the current value."
+const CONFLICTING_EVENT_TIME: &str =
+    "The service rejected the update because the provided EventTime is older than the record's \
+     current EventTime. To persist the update, retrieve the record's latest EventTime and \
+     resubmit the request with an EventTime that is equal to or newer than the current value.";
+
 /// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.
 fn validation(message: impl Into<String>) -> UpdateRecordError {
     UpdateRecordErrorModeled::ValidationError(ValidationError {
@@ -474,19 +502,14 @@ fn validation(message: impl Into<String>) -> UpdateRecordError {
 }
 
 /// The modelled `ResourceNotFound` (HTTP 404) for a record this operation cannot update
-/// because the OnlineStore does not hold a live one.
-fn not_found(message: impl Into<String>) -> UpdateRecordError {
+/// because the feature group holds no live one under that identifier — never written, or
+/// soft-deleted.
+fn no_such_record(identifier: &str, group: &str) -> UpdateRecordError {
     UpdateRecordErrorModeled::ResourceNotFound(ResourceNotFound {
-        message: Some(message.into()),
-    })
-    .into()
-}
-
-/// The modelled `ConflictException` (HTTP 409) for an update whose `EventTime` is older
-/// than the stored record's.
-fn conflict(message: impl Into<String>) -> UpdateRecordError {
-    UpdateRecordErrorModeled::ConflictException(ConflictException {
-        message: Some(message.into()),
+        message: Some(format!(
+            "Resource Not Found: Record with RecordIdentifierValueAsString {identifier} was not \
+             found in FeatureGroup {group}."
+        )),
     })
     .into()
 }

@@ -47,7 +47,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, three SHARED STORES live here, each held once in the shared engine so
+//! Beside them, four SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
@@ -57,6 +57,12 @@
 //!   DB resource id — written by the database control planes when they mint one, read
 //!   by the services that monitor those resources, which cannot tell an RDS id from a
 //!   DocumentDB id by its form;
+//! * [`feature_store_groups`], the SageMaker Feature Store feature-group directory the
+//!   SageMaker control plane writes (`CreateFeatureGroup` defines a group, its schema
+//!   and its two key feature names) and the FeatureStore Runtime data plane reads — whose
+//!   own API carries no feature-group definition, so a record's identifier feature and
+//!   its event-time feature, and whether the named group exists at all, are knowable
+//!   there only because the control plane recorded them;
 //! * [`management_events`], the account's management-event (audit) log — written by the
 //!   service that SERVED an API call, which is the only one that knows the call
 //!   happened, and read by CloudTrail, which is the service that reports it
@@ -175,6 +181,7 @@ pub mod db_data_sources;
 /// The `vnd.amazon.eventstream` framing and routing seam a service with a
 /// `@streaming` output member needs, which the scaffold does not generate.
 pub mod event_stream;
+pub mod feature_store_groups;
 pub mod front_door;
 pub mod iam_authorization;
 pub mod iam_role;

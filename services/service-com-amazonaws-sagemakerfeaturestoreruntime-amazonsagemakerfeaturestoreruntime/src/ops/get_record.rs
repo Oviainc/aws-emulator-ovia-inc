@@ -4,7 +4,15 @@
 //! IMPLEMENTED: this operation serves one record from the feature group's OnlineStore
 //! held in [`crate::state`], as `PutRecord` wrote it: the stored feature values,
 //! projected to `FeatureNames` when the caller named any, and `ExpiresAt` when the
-//! caller asked for it.
+//! caller asked for it. The `FeatureGroupName` is resolved against the feature groups the
+//! SageMaker control plane holds ([`crate::state::resolve_group`]) and a name that
+//! resolves to none is refused with the modelled `ValidationError` (400).
+//!
+//! An absent RECORD inside a group that does resolve is NOT an error: "If no Record with
+//! RecordIdentifierValue is found, then an empty result is returned" (this operation's
+//! own doc), so the modelled `ResourceNotFound` (404) — which would be this operation's
+//! answer for a record it refused to look for — is unreachable here, and is never the
+//! answer to an unresolvable feature group NAME.
 //!
 //! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
@@ -174,21 +182,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }))
         })?;
 
-        let mut store = state.lock();
-        let Some(group) = store.group_mut(&input.feature_group_name) else {
-            return Err(GetRecordErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Feature group '{}' has no OnlineStore",
-                    input.feature_group_name
-                )),
+        // The data plane's one feature-group resolution: a `FeatureGroupName` naming no
+        // feature group is a request defect (400 `ValidationError`), never a missing
+        // record (404 `ResourceNotFound`), which is what a client swallows as a cache
+        // miss. A group that resolves but has no `OnlineStore` holds nothing this READ
+        // could serve, so it is refused the same way.
+        let definition = match crate::state::resolve_group(&*self.engine, &input.feature_group_name)
+        {
+            Ok(definition) => definition,
+            Err(unresolved) => {
+                return Err(match unresolved {
+                    crate::state::Unresolved::Refused(message) => {
+                        GetRecordErrorModeled::ValidationError(ValidationError {
+                            message: Some(message),
+                        })
+                        .into()
+                    }
+                    crate::state::Unresolved::NoDirectory => {
+                        GetRecordErrorModeled::InternalFailure(InternalFailure {
+                            message: Some(
+                                "GetRecord: this service holds no feature-group directory on \
+                                 the mounted engine"
+                                    .into(),
+                            ),
+                        })
+                        .into()
+                    }
+                })
+            }
+        };
+        if !definition.online_store_enabled {
+            return Err(GetRecordErrorModeled::ValidationError(ValidationError {
+                message: Some(crate::state::no_online_store(&definition.name)),
             })
             .into());
-        };
+        }
+
+        let identifier = input.record_identifier_value_as_string.clone();
+        let mut store = state.lock();
+        let group = store.group_mut(&input.feature_group_name);
 
         // "If no Record with RecordIdentifierValue is found, then an empty result is
         // returned" — the identifier was never written, was hard-deleted, is
-        // soft-deleted, or its TTL has expired.
-        let Some(record) = group.live_record(&input.record_identifier_value_as_string) else {
+        // soft-deleted, or its TTL has expired. A feature group that resolves but holds
+        // no record at all reaches exactly that empty result.
+        let Some(record) = group.and_then(|group| group.live_record(&identifier)) else {
             return Ok(GetRecordOutput::default());
         };
 

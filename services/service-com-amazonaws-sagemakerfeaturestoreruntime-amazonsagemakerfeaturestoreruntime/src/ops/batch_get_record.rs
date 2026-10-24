@@ -3,9 +3,9 @@
 //! @op BatchGetRecord
 //! IMPLEMENTED: this operation fans out over the same OnlineStore `GetRecord` reads
 //! ([`crate::state`]): every identifier present in its feature group comes back in
-//! `Records`, an identifier in a feature group the store does not hold comes back in
-//! `Errors` with the `ResourceNotFound` error code, and an identifier absent from a
-//! known group is simply omitted.
+//! `Records`, every identifier of an entry whose `FeatureGroupName` resolves to no
+//! feature group comes back in `Errors` with the [`VALIDATION_ERROR_CODE`] error code,
+//! and an identifier absent from a group that resolves is simply omitted.
 //!
 //! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
@@ -187,18 +187,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stays an ARN), while the store is keyed by `group_key`, so both modelled
             // spellings reach one store and the reply pairs with the request.
             let group_name = wanted.feature_group_name.clone();
-            let Some(group) = store.group_mut(&wanted.feature_group_name) else {
-                // `ErrorCode` is documented as one of GetRecord's own error codes, so
-                // a feature group with no OnlineStore is reported per identifier as
-                // the `ResourceNotFound` GetRecord would have answered.
+
+            // The data plane's one feature-group resolution, per entry: this operation
+            // reports a failure that concerns ONE identifier in `Errors` rather than
+            // failing the whole batch, so the refusal an unresolvable `FeatureGroupName`
+            // gets elsewhere (`ValidationError`) is the per-entry `ErrorCode` here. It is
+            // never `ResourceNotFound`, which would say the record is missing from a
+            // feature group that exists. A group that resolves but has no `OnlineStore`
+            // holds nothing this read could serve, and is reported the same way.
+            let refusal = match crate::state::resolve_group(
+                &*self.engine,
+                &wanted.feature_group_name,
+            ) {
+                Ok(definition) => (!definition.online_store_enabled)
+                    .then(|| crate::state::no_online_store(&definition.name)),
+                Err(crate::state::Unresolved::Refused(message)) => Some(message),
+                Err(crate::state::Unresolved::NoDirectory) => {
+                    return Err(BatchGetRecordErrorModeled::InternalFailure(InternalFailure {
+                        message: Some(
+                            "BatchGetRecord: this service holds no feature-group directory on \
+                             the mounted engine"
+                                .into(),
+                        ),
+                    })
+                    .into())
+                }
+            };
+            if let Some(message) = refusal {
                 errors.extend(wanted.record_identifiers_value_as_string.iter().map(
                     |identifier| BatchGetRecordError2 {
                         feature_group_name: group_name.clone(),
                         record_identifier_value_as_string: identifier.clone(),
-                        error_code: "ResourceNotFound".to_owned(),
-                        error_message: format!("Feature group '{group_name}' has no OnlineStore"),
+                        error_code: VALIDATION_ERROR_CODE.to_owned(),
+                        error_message: message.clone(),
                     },
                 ));
+                continue;
+            }
+
+            // A feature group that resolves but has taken no record yet holds no online
+            // store here, so every identifier of the entry is simply absent — the same
+            // empty result `GetRecord` answers for one.
+            let Some(group) = store.group_mut(&wanted.feature_group_name) else {
                 continue;
             };
 
@@ -238,3 +268,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The per-entry `ErrorCode` this operation reports an unresolvable `FeatureGroupName`
+/// with: the wire code of the modelled `ValidationError` every other operation of this
+/// data plane answers the same failure with, so one classification serves the whole
+/// service. `ErrorCode` is documented as "the error code of an error that has occurred
+/// when attempting to retrieve a batch of Records", i.e. one of this API's own error
+/// codes.
+const VALIDATION_ERROR_CODE: &str = "ValidationError";
