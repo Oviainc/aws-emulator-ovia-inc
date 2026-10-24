@@ -50,6 +50,11 @@ mod boot_serve;
 // merges cleanly beside them.
 #[path = "all/cfn_provisions_declared_resources.rs"]
 mod cfn_provisions_declared_resources;
+// Declared in this span of the sorted list rather than appended at the end of this file,
+// for the reason the notes here give: the tail is the region every concurrently landing
+// suite appends to.
+#[path = "all/cloudformation_provisions_cognito_user_pool_groups.rs"]
+mod cloudformation_provisions_cognito_user_pool_groups;
 #[path = "all/cloudformation_provisions_sagemaker_model_package_group.rs"]
 mod cloudformation_provisions_sagemaker_model_package_group;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]
