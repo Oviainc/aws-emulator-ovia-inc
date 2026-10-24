@@ -331,6 +331,36 @@ pub const GROUP_BY_API_MAX_LIMIT: usize = 1000;
 /// `Owner` value for a Custom Policy rule (`com.amazonaws.configservice#Owner`).
 pub const OWNER_CUSTOM_POLICY: &str = "CUSTOM_POLICY";
 
+/// `Owner` value for a Config Managed rule, i.e. one Amazon Web Services owns and
+/// manages (`com.amazonaws.configservice#Owner`; `Source$Owner`: "Config Managed Rules
+/// are predefined rules owned by Amazon Web Services").
+pub const OWNER_AWS: &str = "AWS";
+
+/// The `SourceIdentifier` of the Config Managed rule that evaluates a PROCESS rather
+/// than a recorded resource configuration — the Config Process Check rule, whose
+/// evaluations are delivered from outside Config
+/// (`NoSuchConfigRuleException` on the external-evaluation path: "Verify that the rule
+/// is an Config Process Check rule"). The identifier is the managed rule's entry in
+/// *List of Config Managed Rules* (`Source$SourceIdentifier`: "For Config Managed
+/// rules, a predefined identifier from a list"), which the model does not enumerate.
+pub const SOURCE_IDENTIFIER_PROCESS_CHECK: &str = "AWS_CONFIG_PROCESS_CHECK";
+
+/// The only `ComplianceResourceType` an externally delivered evaluation may name
+/// (`ExternalEvaluation$ComplianceResourceType`: "Config accepts `AWS::::Account`
+/// resource type"). A process check evaluates the account, not a recorded resource.
+pub const EXTERNAL_EVALUATION_RESOURCE_TYPE: &str = "AWS::::Account";
+
+/// Every `ComplianceType` an externally delivered evaluation may carry: the published
+/// `ComplianceType` values MINUS `INSUFFICIENT_DATA`, which Config derives for a rule
+/// it could not evaluate rather than accepting from a caller
+/// (`ExternalEvaluation$ComplianceType`: "The valid values are COMPLIANT,
+/// NON_COMPLIANT, and NOT_APPLICABLE").
+pub const EXTERNAL_EVALUATION_COMPLIANCE_TYPES: [&str; 3] = [
+    COMPLIANCE_TYPE_COMPLIANT,
+    COMPLIANCE_TYPE_NON_COMPLIANT,
+    COMPLIANCE_TYPE_NOT_APPLICABLE,
+];
+
 /// The only `ResourceConfigurationSchemaType` the model publishes
 /// (`com.amazonaws.configservice#ResourceConfigurationSchemaType`), and so the schema
 /// type a resource definition is read as when the request names none.
@@ -1442,12 +1472,15 @@ pub struct ConfigRuleEntry {
     /// `GetComplianceDetailsByConfigRule` reports and what the rule's own compliance
     /// rolls up from ([`Self::compliance`]).
     ///
-    /// No operation of this emulator can record one yet: `PutEvaluations` identifies
-    /// the rule only through a `ResultToken` minted by the Lambda invocation that
-    /// produced the evaluation, which this emulator does not run, so it stays
-    /// scaffolded. A rule therefore carries no results — an empty page of evaluation
-    /// details, and a roll-up of `INSUFFICIENT_DATA` — until an evaluation writer
-    /// lands.
+    /// `PutExternalEvaluation` records one for a Config Process Check rule, whose
+    /// evaluations are delivered from outside Config. Its evaluated resource is the
+    /// account this store stands for, so a process check rule holds at most ONE
+    /// result and a delivery revises it in place. `PutEvaluations` records none yet:
+    /// it identifies the rule only through a `ResultToken` minted by the Lambda
+    /// invocation that produced the evaluation, which this emulator does not run, so
+    /// it stays scaffolded. A rule nothing has delivered an evaluation for therefore
+    /// carries no results — an empty page of evaluation details, and a roll-up of
+    /// `INSUFFICIENT_DATA`.
     pub evaluation_results: BTreeMap<EvaluationResultKey, EvaluationResultEntry>,
     /// When Config invoked this rule and when those invocations finished evaluating
     /// the resources in scope, as `DescribeConfigRuleEvaluationStatus` reports it.
@@ -1481,6 +1514,17 @@ impl ConfigRuleEntry {
             evaluation_modes: Some(self.evaluation_modes.clone()),
             rule_evaluation_visibility: self.rule_evaluation_visibility.clone(),
         }
+    }
+
+    /// Whether this rule is a Config Process Check rule, i.e. the Config Managed rule
+    /// whose evaluations are delivered from OUTSIDE Config rather than computed by
+    /// Config from recorded configuration state. A process check is identified by the
+    /// managed rule it is an instance of: its owner is Amazon Web Services
+    /// ([`OWNER_AWS`]) and its source identifier is that managed rule's
+    /// ([`SOURCE_IDENTIFIER_PROCESS_CHECK`]).
+    pub fn is_process_check(&self) -> bool {
+        self.source.owner == OWNER_AWS
+            && self.source.source_identifier.as_deref() == Some(SOURCE_IDENTIFIER_PROCESS_CHECK)
     }
 
     /// Whether `DescribeConfigRuleEvaluationStatus` reports a status for this rule.
@@ -3314,6 +3358,16 @@ const AGGREGATION_AUTHORIZATION_KEY_SEPARATOR: char = '/';
 /// pattern `^\d{12}$`).
 const ACCOUNT_ID_LENGTH: usize = 12;
 
+/// Whether `value` is a well formed Amazon Web Services account id
+/// (`com.amazonaws.configservice#AccountId`, pattern `^\d{12}$`).
+///
+/// The model applies that pattern to the members it targets with `AccountId`, so this
+/// is for the members that carry an account id under a WIDER target and therefore
+/// reach a handler unchecked.
+pub fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_LENGTH && value.chars().all(|digit| digit.is_ascii_digit())
+}
+
 /// The longest `AwsRegion` the model allows (`com.amazonaws.configservice#AwsRegion`,
 /// `length 1..64`).
 const AWS_REGION_MAX_LENGTH: usize = 64;
@@ -3347,8 +3401,7 @@ pub fn decode_aggregation_authorization_token(token: &str) -> Option<String> {
     let key = decode_page_token(token)?;
     let well_formed = match key.split_once(AGGREGATION_AUTHORIZATION_KEY_SEPARATOR) {
         Some((account, region)) => {
-            account.len() == ACCOUNT_ID_LENGTH
-                && account.chars().all(|digit| digit.is_ascii_digit())
+            is_account_id(account)
                 && (1..=AWS_REGION_MAX_LENGTH).contains(&region.chars().count())
         }
         None => false,
@@ -3654,6 +3707,38 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
+/// The wall-clock instant a modelled timestamp a REQUEST carried names, or `None` for
+/// a timestamp this service cannot place in its history: one that is not finite, is
+/// before the epoch, or is further from it than an instant reaches.
+///
+/// The partial inverse of [`timestamp`]: this service stores every instant as a
+/// `SystemTime`, so an instant a caller supplies is converted once, on the way in, and
+/// read back out through [`timestamp`]. The conversion is the FALLIBLE one
+/// `aws_smithy_types` provides — the JSON wire accepts any numeric epoch, so an
+/// unplaceable value has to come back as a refusal for the caller rather than as a
+/// panic in the arithmetic.
+pub fn instant(at: ::aws_smithy_types::DateTime) -> Option<SystemTime> {
+    let seconds = at.as_secs_f64();
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    SystemTime::try_from(at).ok()
+}
+
+/// How Config words `InvalidParameterValueException` for a timestamp member this
+/// service cannot place as an instant ([`instant`]).
+///
+/// The message is BUILT FROM THE REQUEST — it names the member and the epoch seconds
+/// the caller sent — so every operation that takes an instant from a request words the
+/// refusal the same way.
+pub fn unplaceable_timestamp_message(member: &str, at: ::aws_smithy_types::DateTime) -> String {
+    format!(
+        "'{}' is not a valid value for {member}; the value must be an instant \
+         representable as a time.",
+        at.as_secs_f64()
+    )
+}
+
 /// Encode the key the next page of a paged read should resume at as an opaque
 /// `NextToken`, with the base64 codec the framework already carries. Every paged read
 /// of this service pages over its store's own key ordering, so one codec serves them
@@ -3745,9 +3830,7 @@ pub fn encode_pending_aggregation_request_token(key: &(String, String)) -> Strin
 pub fn decode_pending_aggregation_request_token(token: &str) -> Option<(String, String)> {
     let key = decode_page_token(token)?;
     let (account, region) = key.split_once(PENDING_AGGREGATION_REQUEST_KEY_SEPARATOR)?;
-    let well_formed = account.len() == 12
-        && account.chars().all(|digit| digit.is_ascii_digit())
-        && !region.is_empty();
+    let well_formed = is_account_id(account) && !region.is_empty();
     well_formed.then(|| (account.to_string(), region.to_string()))
 }
 
@@ -3786,6 +3869,19 @@ pub fn decode_evaluation_result_token(token: &str) -> Option<EvaluationResultKey
     Some((fields.next()?, fields.next()?, fields.next()?))
 }
 
+/// How Config words `InvalidParameterValueException` for a member whose value is not
+/// one that member accepts.
+///
+/// The message is BUILT FROM THE REQUEST — it quotes the value the caller sent, names
+/// the member and lists the values that member accepts — so every operation that
+/// refuses an out-of-range value words the refusal the same way.
+pub fn unaccepted_value_message(member: &str, value: &str, accepted: &[&str]) -> String {
+    format!(
+        "'{value}' is not a valid value for {member}; the valid values are {}.",
+        accepted.join(", ")
+    )
+}
+
 /// How Config words `InvalidParameterValueException` for a results filter that named a
 /// `ComplianceType` no filter may name.
 ///
@@ -3793,10 +3889,7 @@ pub fn decode_evaluation_result_token(token: &str) -> Option<EvaluationResultKey
 /// the member and lists the values that member accepts
 /// ([`FILTERABLE_COMPLIANCE_TYPES`]).
 pub fn unfilterable_compliance_type_message(member: &str, value: &str) -> String {
-    format!(
-        "'{value}' is not a valid value for {member}; the valid values are {}.",
-        FILTERABLE_COMPLIANCE_TYPES.join(", ")
-    )
+    unaccepted_value_message(member, value, &FILTERABLE_COMPLIANCE_TYPES)
 }
 
 /// How Config words `NoSuchConfigRuleException` for a request that named ONE rule
