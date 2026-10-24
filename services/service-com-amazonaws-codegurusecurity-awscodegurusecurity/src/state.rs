@@ -33,7 +33,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::{Finding, FindingMetricsValuePerSeverity};
+use crate::ops::types::{
+    Finding, FindingMetricsValuePerSeverity, ValidationException, ValidationExceptionField,
+};
 
 /// The region an emulated request is for: the region of its SigV4 credential scope,
 /// or the emulator's documented default when the request carries no scope (see
@@ -130,6 +132,58 @@ pub const SCAN_QUOTA: usize = 1_000;
 /// tags-per-scan limit for CodeGuru Security, so nothing here should be read as its
 /// recorded behaviour.
 pub const TAGS_PER_SCAN_QUOTA: usize = 200;
+
+/// The tag-key prefix AWS keeps for the tags it applies itself. AWS's tagging rules
+/// state that the `aws:` prefix is reserved for AWS use and that a caller can neither
+/// create nor edit nor delete a tag whose key carries it, so the prefix is not part of
+/// the namespace a tagging request may name. `TagKey` carries only a `@length`
+/// (`smithy_query(query="shape",shape="TagKey")`: 1..128, no `@pattern`), so this is a
+/// semantic rule the boundary validator cannot express and each writer of the tag store
+/// enforces through [`is_reserved_tag_key`].
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// Compared WITHOUT regard to case, so a differently cased spelling of the prefix does
+/// not slip a system-looking tag past the rule. `get(..)` rather than slicing, so a key
+/// whose prefix-length byte boundary falls inside a multi-byte character is simply not
+/// reserved instead of panicking.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first key of `keys` that [`is_reserved_tag_key`], in the order given, or `None`
+/// when the request names no reserved key. The one place the tag writers ask the
+/// question, so `CreateScan`, `TagResource` and `UntagResource` all judge a key the
+/// same way.
+pub fn first_reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// The modelled refusal of a request naming the reserved tag key `key` in member
+/// `member`: a `ValidationException` (HTTP 400), whose message names the member, the
+/// offending key and the constraint it breaks.
+pub fn reserved_tag_key_refusal(member: &str, key: &str) -> ValidationException {
+    ValidationException {
+        error_code: "ValidationException".to_string(),
+        message: format!(
+            "{member} names the tag key {key}, which begins with the reserved \
+             {RESERVED_TAG_KEY_PREFIX} prefix: that namespace holds the tags Amazon Web \
+             Services applies itself, and a caller can neither create, edit nor delete one"
+        ),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "a tag key must not begin with {RESERVED_TAG_KEY_PREFIX}; {key} does"
+            ),
+        }]),
+    }
+}
 
 /// The most runs (revisions) one scan keeps; see [`UPLOAD_ARTIFACT_QUOTA`]. Together
 /// with [`SCAN_QUOTA`] this bounds the total number of runs, and with it the size of the
