@@ -35,23 +35,23 @@ use crate::landing_zone_lifecycle::{
 
 /// The `ControlIdentifier` of a control, shaped like the ARNs AWS Control Tower names
 /// its controls with and inside the modelled pattern `^arn:aws[0-9a-zA-Z_\-:\/]+$`.
-fn control(name: &str) -> String {
+pub(crate) fn control(name: &str) -> String {
     format!("arn:aws:controltower:us-west-2::control/{name}")
 }
 
 /// An organizational-unit `TargetIdentifier`.
-fn ou(id: &str) -> String {
+pub(crate) fn ou(id: &str) -> String {
     format!("arn:aws:organizations::000000000000:ou/o-emulatororg/ou-abcd-{id}")
 }
 
 /// An account `TargetIdentifier` — the other target type the member's docs name.
-fn account(id: &str) -> String {
+pub(crate) fn account(id: &str) -> String {
     format!("arn:aws:organizations::000000000000:account/o-emulatororg/{id}")
 }
 
 /// The ARN prefix every enabled control this emulator mints carries: this service's ARN
 /// namespace, the request's region and the emulator's canonical account id.
-fn enabled_control_prefix() -> String {
+pub(crate) fn enabled_control_prefix() -> String {
     format!(
         "arn:aws:controltower:us-west-2:{}:enabledcontrol/",
         engine::emulator_account_id()
@@ -60,7 +60,10 @@ fn enabled_control_prefix() -> String {
 
 /// `EnableControl` with `body`, asserting it succeeded and handing back
 /// `(arn, operationIdentifier)`.
-async fn enable(router: &MultiServiceRouter, body: serde_json::Value) -> (String, String) {
+pub(crate) async fn enable(
+    router: &MultiServiceRouter,
+    body: serde_json::Value,
+) -> (String, String) {
     let enabled = call(router, "/enable-control", body.clone()).await;
     assert_eq!(
         enabled.status, 200,
@@ -72,7 +75,7 @@ async fn enable(router: &MultiServiceRouter, body: serde_json::Value) -> (String
 
 /// A JSON member as a list, treating an absent member as the empty list: restJson1 may
 /// omit an empty list rather than emit `[]`, and both say "no entries".
-fn entries(value: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(crate) fn entries(value: &serde_json::Value) -> Vec<serde_json::Value> {
     value.as_array().cloned().unwrap_or_default()
 }
 
@@ -102,7 +105,7 @@ fn listed_entry(listed: &Answer, arn: &str) -> serde_json::Value {
 }
 
 /// `GetEnabledControl`'s `enabledControlDetails` for `identifier`, asserting it resolved.
-async fn details(router: &MultiServiceRouter, identifier: &str) -> serde_json::Value {
+pub(crate) async fn details(router: &MultiServiceRouter, identifier: &str) -> serde_json::Value {
     let got = call(
         router,
         "/get-enabled-control",
