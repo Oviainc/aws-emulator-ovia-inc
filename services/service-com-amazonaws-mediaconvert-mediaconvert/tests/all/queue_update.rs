@@ -11,6 +11,9 @@
 //! (`SYSTEM`) queue cannot be modified at all (403), and a reservation plan applies only
 //! to a reserved queue (400 otherwise).
 //!
+//! What a queue's `Status` then means for the jobs in it — a `PAUSED` queue's jobs "won't
+//! begin" — is the rule the sibling suite `queue_pause_gating` covers.
+//!
 //! Each case drives the real restJson1 wire path through the router (the harness is the
 //! one `job_lifecycle` builds), so what is asserted is the bytes a client would see.
 
@@ -24,7 +27,7 @@ use super::job_lifecycle::{Emulator, Reply};
 
 /// `PUT /2017-08-29/queues/{Name}` — the binding
 /// `smithy_query(query="operation",operation="UpdateQueue")` reports, success code 200.
-async fn update_queue(emulator: &Emulator, name: &str, body: Value) -> Reply {
+pub(crate) async fn update_queue(emulator: &Emulator, name: &str, body: Value) -> Reply {
     emulator
         .send("PUT", &format!("/2017-08-29/queues/{name}"), Some(body))
         .await

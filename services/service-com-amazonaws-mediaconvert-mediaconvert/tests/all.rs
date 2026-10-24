@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_endpoints.rs"]
 mod account_endpoints;
+#[path = "all/cancel_job_idempotence.rs"]
+mod cancel_job_idempotence;
 #[path = "all/create_job_validation.rs"]
 mod create_job_validation;
 #[path = "all/created_resource_defaults.rs"]
@@ -21,8 +23,12 @@ mod created_resource_defaults;
 mod error_envelope;
 #[path = "all/idempotent_repeats.rs"]
 mod idempotent_repeats;
+#[path = "all/input_probe.rs"]
+mod input_probe;
 #[path = "all/job_engine_versions.rs"]
 mod job_engine_versions;
+#[path = "all/job_from_template.rs"]
+mod job_from_template;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "all/job_search.rs"]
@@ -45,6 +51,8 @@ mod preset_update;
 mod queue_deletion;
 #[path = "all/queue_listing.rs"]
 mod queue_listing;
+#[path = "all/queue_pause_gating.rs"]
+mod queue_pause_gating;
 #[path = "all/queue_update.rs"]
 mod queue_update;
 #[path = "all/resource_projection_defaults.rs"]

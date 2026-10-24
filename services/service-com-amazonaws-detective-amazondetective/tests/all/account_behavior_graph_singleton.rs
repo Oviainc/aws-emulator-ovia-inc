@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{call, call_with, create_graph_ok, emulator, REGION};
+use crate::support::{call, create_graph_ok, emulator, tags_of, REGION};
 
 /// Every graph ARN `ListGraphs` reports, in the order it served them. The store these
 /// cases build never exceeds one page (the default is the modelled `MemberResultsLimit`
@@ -43,26 +43,6 @@ async fn listed_graph_arns(router: &MultiServiceRouter) -> Vec<String> {
                 .to_string()
         })
         .collect()
-}
-
-/// The tag map `ListTagsForResource` reports for `graph_arn`.
-async fn tags_of(router: &MultiServiceRouter, region: &str, graph_arn: &str) -> Map<String, Value> {
-    let (status, body) = call_with(
-        router,
-        "GET",
-        region,
-        &format!("/tags/{graph_arn}"),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "ListTagsForResource({graph_arn}): expected 200, got {status} {body:?}"
-    );
-    body.get("Tags")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default()
 }
 
 /// One row of the repeat-call table: the Region the calls are signed for, the bodies of

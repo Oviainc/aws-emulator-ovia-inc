@@ -222,33 +222,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Optional. When you create a job, you can either specify a job template or
-        // specify the transcoding settings individually." A template the caller DID name
-        // is a reference to a job template resource — by name or by ARN, as every resource
-        // reference in this service is — so what is stored is the NAME it resolves to,
-        // which is this store's key for the template, exactly as the job's queue is stored
-        // as the queue's name. A member the caller SENT is a value they meant, so an empty
-        // one is refused rather than quietly dropped, as `CreateJobTemplate` refuses an
-        // empty `Queue`.
-        let job_template = match input.job_template.as_deref().map(str::trim) {
-            Some("") => {
-                return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
-                    message: Some("JobTemplate must not be empty.".to_string()),
-                })
-                .into())
-            }
-            Some(reference) => {
-                Some(crate::state::job_template_name_from_reference(reference).to_string())
-            }
-            None => None,
-        };
-        // Every hop destination that names a queue references one, so the list is resolved
-        // against the store below with the job's own `Queue`.
-        let hop_destinations = input.hop_destinations.unwrap_or_default();
+        // specify the transcoding settings individually." A member the caller SENT is a
+        // value they meant, so an empty one is refused rather than quietly dropped, as
+        // `CreateJobTemplate` refuses an empty `Queue`. The reference itself is resolved
+        // against the store below, where the template's settings are read with it.
+        if input.job_template.as_deref().map(str::trim) == Some("") {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some("JobTemplate must not be empty.".to_string()),
+            })
+            .into());
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.settle(now);
 
         // "If you reuse a client request token within one minute of a successful request,
         // the API returns the job details for the original request." Inside that window
@@ -259,6 +245,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(str::trim)
             .filter(|token| !token.is_empty())
             .map(str::to_string);
+
+        // The job template this request inherits from, and the queue the job is sent to,
+        // both read under the store's guard — which is then RELEASED, because the input
+        // probe below calls another emulated service in-process and this service's state
+        // is never locked across that call. Every purely-local refusal is answered here,
+        // before any outbound work: a request naming a template or a queue this account
+        // does not hold costs no probe.
+        let (template, queue) = {
+            let mut store = state.lock();
+            store.settle(now);
+            if let Some(token) = token.as_deref() {
+                if let Some(job) = store.job_for_token(token, now) {
+                    return Ok(CreateJobOutput {
+                        job: Some(job.view(&region)),
+                    });
+                }
+            }
+            let template = match input.job_template.as_deref() {
+                // `JobTemplate` is a REFERENCE to a job-template resource, by name or by
+                // ARN, exactly as `Queue` is — and like `Queue`, a reference this account
+                // holds no resource for is the modelled 404 naming the member it came
+                // from, not a job created against settings that do not exist.
+                Some(reference) => {
+                    let name =
+                        crate::state::job_template_name_from_reference(reference).to_string();
+                    let Some(record) = store.job_templates.get(&name).cloned() else {
+                        return Err(CreateJobErrorModeled::NotFoundException(
+                            NotFoundException {
+                                message: Some(crate::state::not_found_message("jobTemplate")),
+                            },
+                        )
+                        .into());
+                    };
+                    Some((name, record))
+                }
+                None => None,
+            };
+            // "If you don't specify, the job will go to the default queue" — unless the
+            // template the job is created from names one, which the job inherits as it
+            // does every other member it did not state.
+            let queue_reference = input.queue.clone().or_else(|| {
+                template
+                    .as_ref()
+                    .and_then(|(_, record)| record.queue.clone())
+            });
+            let queue = queue_reference
+                .as_deref()
+                .map(crate::state::queue_name_from_reference)
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::state::DEFAULT_QUEUE_NAME.to_string());
+            if !store.queues.contains_key(&queue) {
+                return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
+                    // The refusal names the request member the reference came from,
+                    // `Queue`.
+                    message: Some(crate::state::not_found_message("queue")),
+                })
+                .into());
+            }
+            (template, queue)
+        };
+
+        // "When you create a job, you can either specify a job template or specify the
+        // transcoding settings individually": a job created FROM a template states only
+        // what it wants to differ and inherits every member it leaves out — its settings
+        // member by member, and the job-shaping members the template also carries.
+        let job_template = template.as_ref().map(|(name, _)| name.clone());
+        let inherited = template.as_ref().map(|(_, record)| record);
+        let settings = match inherited {
+            Some(record) => {
+                crate::state::merge_template_settings(&record.settings, input.settings)
+            }
+            None => input.settings,
+        };
+        // Every member below is one the service fills in when NEITHER the request nor the
+        // template states it: "If you don't specify a priority, the service uses the
+        // default value 0", the default status-update cadence, and acceleration left off.
+        // A template always carries a value for each, so a job created from one inherits
+        // the template's rather than the service default.
+        let priority = input
+            .priority
+            .or_else(|| inherited.map(|record| record.priority))
+            .unwrap_or(crate::state::DEFAULT_PRIORITY);
+        let status_update_interval = input
+            .status_update_interval
+            .or_else(|| inherited.map(|record| record.status_update_interval.clone()))
+            .unwrap_or_else(|| crate::state::DEFAULT_STATUS_UPDATE_INTERVAL.to_string());
+        let acceleration_settings = input
+            .acceleration_settings
+            .or_else(|| inherited.map(|record| record.acceleration_settings.clone()))
+            .unwrap_or_else(crate::state::default_acceleration_settings);
+        let hop_destinations = input.hop_destinations.unwrap_or_else(|| {
+            inherited
+                .map(|record| record.hop_destinations.clone())
+                .unwrap_or_default()
+        });
+        // MediaConvert opens (probes) a job's inputs before it can transcode them. The
+        // probe is a REAL read of the job's own `Settings.Inputs[].FileInput` against S3
+        // over the in-process callback, run with no lock held; what it found is stored on
+        // the job, so the status change the clock later makes due reports the failure that
+        // was actually observed rather than one assumed.
+        let unreadable_input = crate::state::unreadable_job_input(
+            ctx,
+            &region,
+            &crate::state::job_input_uris(&settings),
+        )
+        .await;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+        // The token is re-read under the guard the job is stored through: the probe above
+        // ran without it, so a concurrent request carrying the same token may have
+        // created the job in the meantime.
         if let Some(token) = token.as_deref() {
             if let Some(job) = state.job_for_token(token, now) {
                 return Ok(CreateJobOutput {
@@ -267,17 +366,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "If you don't specify, the job will go to the default queue."
-        let queue = input
-            .queue
-            .as_deref()
-            .map(crate::state::queue_name_from_reference)
-            .map(str::to_string)
-            .unwrap_or_else(|| crate::state::DEFAULT_QUEUE_NAME.to_string());
+        // Both reference members are re-read under the guard the job is stored through,
+        // for the same reason the token is: the probe ran without it, so either resource
+        // may have been deleted in the meantime, and a job is never created against a
+        // queue or a template this account no longer holds.
         if !state.queues.contains_key(&queue) {
             return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
                 // The refusal names the request member the reference came from, `Queue`.
                 message: Some(crate::state::not_found_message("queue")),
+            })
+            .into());
+        }
+        if job_template
+            .as_deref()
+            .is_some_and(|name| !state.job_templates.contains_key(name))
+        {
+            return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("jobTemplate")),
             })
             .into());
         }
@@ -296,10 +401,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The settings graph is validated at SUBMIT time, against what the job will
-        // actually be run from: the request's own `Settings` plus whatever the referenced
-        // template supplies. A job that describes no source, or no outputs and has no
-        // template to supply them, describes no transcode at all, which is the modelled
-        // 400 — and nothing is stored, because this returns before `accept_job`.
+        // actually be run from: the request's own `Settings` merged with whatever the
+        // referenced template supplies. A job that describes no source, or no outputs and
+        // has no template to supply them, describes no transcode at all, which is the
+        // modelled 400 — and nothing is stored, because this returns before `accept_job`.
         let settings_problem = {
             let template = match job_template.as_deref() {
                 Some(reference) => match state.job_template_settings(reference) {
@@ -313,7 +418,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 None => None,
             };
-            crate::state::job_settings_problem(&input.settings, template)
+            crate::state::job_settings_problem(&settings, template)
         };
         if let Some(problem) = settings_problem {
             return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
@@ -329,28 +434,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `accept_job` mints and assigns the id.
             id: String::new(),
             role: input.role,
-            settings: input.settings,
+            settings,
             queue,
             // The resolved template name, so a later reader sees the template this job
             // was created from under the name the store holds it by.
             job_template,
-            // Every member below is one the service fills in when the request omits it:
-            // "If you don't specify a priority, the service uses the default value 0",
-            // "Leave blank to use the default value, Job" for the billing tags source,
-            // the default status-update cadence, and acceleration left off. They are
+            // `priority`, `status_update_interval` and `acceleration_settings` above are
+            // the request's value, else the named template's, else the service default
+            // ("If you don't specify a priority, the service uses the default value 0",
+            // the default status-update cadence, acceleration left off). They are
             // persisted, so every reader of the job reports the same value.
-            priority: input.priority.unwrap_or(crate::state::DEFAULT_PRIORITY),
+            priority,
             status: crate::state::JOB_STATUS_SUBMITTED.to_string(),
             created_at: now,
-            status_update_interval: input
-                .status_update_interval
-                .unwrap_or_else(|| crate::state::DEFAULT_STATUS_UPDATE_INTERVAL.to_string()),
+            status_update_interval,
+            // "Leave blank to use the default value, Job" — a member the service fills in
+            // when the request omits it, and one no job template carries.
             billing_tags_source: input
                 .billing_tags_source
                 .unwrap_or_else(|| crate::state::BILLING_TAGS_SOURCE_JOB.to_string()),
-            acceleration_settings: input
-                .acceleration_settings
-                .unwrap_or_else(crate::state::default_acceleration_settings),
+            acceleration_settings,
             // Nothing has shared this job: a resource share is what moves the status.
             share_status: crate::state::SHARE_STATUS_NOT_SHARED.to_string(),
             hop_destinations,
@@ -366,6 +469,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             settles_at: None,
             error_message: None,
+            error_code: None,
+            unreadable_input,
         };
 
         let id = match state.accept_job(record, now) {
