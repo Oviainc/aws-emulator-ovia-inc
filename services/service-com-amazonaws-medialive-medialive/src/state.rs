@@ -26,7 +26,9 @@
 //! [`InputDeviceRecord`] per claimed device, keyed by the device id the claim
 //! named rather than by an id this service mints, because a Link unit's id is
 //! its own. A device's `DeviceUpdateStatus` comes out of the maintenance window
-//! `StartInputDeviceMaintenanceWindow` opens on it, and its `OutputType` and
+//! `StartInputDeviceMaintenanceWindow` opens on it, its `InputDeviceState` out
+//! of the `StartInputDevice` / `StopInputDevice` commands it has accepted, and
+//! its `OutputType` and
 //! `MedialiveInputArns` out of the inputs this store holds — see
 //! [`input_devices`]. A device also carries the TRANSFER pending on it, which
 //! `TransferInputDevice` records and `ListInputDeviceTransfers` reports in the
