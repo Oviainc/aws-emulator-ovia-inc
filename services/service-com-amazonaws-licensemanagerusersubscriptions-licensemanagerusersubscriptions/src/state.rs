@@ -2134,10 +2134,12 @@ pub fn filter_signature(filters: &[Filter]) -> String {
 /// for `ListLicenseServerEndpoints`): the caller passes those
 /// as `(name, value)` pairs, matched EXACTLY as the documentation spells them, so a typo
 /// is refused rather than silently honoured. `Filter.Operation` is the kind of search —
-/// the model documents it only as "the type of search (For example, eq, geq, leq)", so
-/// the comparisons that are meaningful for these string attributes are accepted under
-/// either the documented lowercase spelling or its PascalCase name, and anything else is
-/// refused; an absent operation is equality.
+/// the model documents it as "the type of search (For example, eq, geq, leq)", so the
+/// whole relational family those examples belong to (`eq`, `ne`, `gt`, `geq`, `lt`, `leq`)
+/// is honoured, alongside the substring searches that are meaningful for these string
+/// attributes, under either the short documented spelling or its PascalCase name; anything
+/// else is refused, and an absent operation is equality. Every filterable attribute here
+/// is a string, so the ordering comparisons order values lexicographically.
 ///
 /// Whether a filter is WELL FORMED does not depend on what the store holds, so
 /// [`validate_filters`] is what a list operation calls first, before it looks at a single
@@ -2154,6 +2156,10 @@ pub fn filters_match(
         let matched = match operation {
             FilterOperation::Equals => actual == wanted,
             FilterOperation::NotEquals => actual != wanted,
+            FilterOperation::GreaterThan => actual > wanted,
+            FilterOperation::GreaterThanOrEquals => actual >= wanted,
+            FilterOperation::LessThan => actual < wanted,
+            FilterOperation::LessThanOrEquals => actual <= wanted,
             FilterOperation::Contains => actual.contains(wanted),
             FilterOperation::BeginsWith => actual.starts_with(wanted),
         };
@@ -2174,13 +2180,41 @@ pub fn validate_filters(filters: &[Filter], attribute_names: &[&str]) -> Result<
 }
 
 /// The comparison a `Filter.Operation` names.
+///
+/// The ordering members are the family the model's own examples (`eq`, `geq`, `leq`) are
+/// drawn from; on the string attributes these lists expose they compare lexicographically.
 #[derive(Debug, Clone, Copy)]
 enum FilterOperation {
     Equals,
     NotEquals,
+    GreaterThan,
+    GreaterThanOrEquals,
+    LessThan,
+    LessThanOrEquals,
     Contains,
     BeginsWith,
 }
+
+/// Every `Filter.Operation` spelling this service honours, paired with the comparison it
+/// names: the relational family the model documents by example (`eq`, `geq`, `leq`) under
+/// its short spelling and its PascalCase name, plus the substring searches. Matched
+/// case-insensitively, so `geq`, `GEQ` and `GreaterThanOrEquals` all name one comparison.
+const FILTER_OPERATIONS: &[(&str, FilterOperation)] = &[
+    ("eq", FilterOperation::Equals),
+    ("equals", FilterOperation::Equals),
+    ("ne", FilterOperation::NotEquals),
+    ("notequals", FilterOperation::NotEquals),
+    ("gt", FilterOperation::GreaterThan),
+    ("greaterthan", FilterOperation::GreaterThan),
+    ("geq", FilterOperation::GreaterThanOrEquals),
+    ("greaterthanorequals", FilterOperation::GreaterThanOrEquals),
+    ("lt", FilterOperation::LessThan),
+    ("lessthan", FilterOperation::LessThan),
+    ("leq", FilterOperation::LessThanOrEquals),
+    ("lessthanorequals", FilterOperation::LessThanOrEquals),
+    ("contains", FilterOperation::Contains),
+    ("beginswith", FilterOperation::BeginsWith),
+];
 
 /// The names of the attributes a list operation exposes, in the order it passed them.
 fn attribute_names<'a>(attributes: &[(&'a str, Option<&str>)]) -> Vec<&'a str> {
@@ -2207,19 +2241,23 @@ fn parse_filter(
                 attribute_names.join(", ")
             ))
         })?;
-    let operation = filter.operation.as_deref().unwrap_or("Equals");
-    let operation = match operation.to_ascii_lowercase().as_str() {
-        "equals" | "eq" => FilterOperation::Equals,
-        "notequals" | "ne" => FilterOperation::NotEquals,
-        "contains" => FilterOperation::Contains,
-        "beginswith" => FilterOperation::BeginsWith,
-        _ => {
-            return Err(StateError::Validation(format!(
-                "Filter.Operation {operation} is not supported; supported operations: \
-                 Equals, NotEquals, Contains, BeginsWith"
-            )))
-        }
-    };
+    // An absent operation is equality: the filter is then just an attribute/value pair.
+    let spelling = filter.operation.as_deref().unwrap_or("eq");
+    let folded = spelling.to_ascii_lowercase();
+    let operation = FILTER_OPERATIONS
+        .iter()
+        .find(|(name, _)| *name == folded)
+        .map(|(_, operation)| *operation)
+        .ok_or_else(|| {
+            StateError::Validation(format!(
+                "Filter.Operation {spelling} is not supported; supported operations: {}",
+                FILTER_OPERATIONS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
     Ok((index, operation))
 }
 

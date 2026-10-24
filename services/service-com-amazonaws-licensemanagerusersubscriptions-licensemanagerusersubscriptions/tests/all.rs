@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/associations_follow_their_registration.rs"]
 mod associations_follow_their_registration;
+#[path = "all/filter_operations.rs"]
+mod filter_operations;
 #[path = "all/identity_provider_deregistration.rs"]
 mod identity_provider_deregistration;
 #[path = "all/identity_provider_subscriptions.rs"]
