@@ -3,7 +3,11 @@
 //! @op StartCapacityTask
 //! IMPLEMENTED: mints a capacity task on the Outpost the `OutpostIdentifier` names,
 //! persists everything the caller requested, and answers it from what was persisted;
-//! `GetCapacityTask` reads the same record back. The task starts in the non-terminal
+//! `GetCapacityTask` reads the same record back. The optional `OrderId` and `AssetId`
+//! name OTHER resources of this service, so both are resolved against the store
+//! before anything is created and a reference that resolves to nothing is refused
+//! with the modelled `NotFoundException` rather than stored on the task. The task
+//! starts in the non-terminal
 //! `REQUESTED` status and runs to `COMPLETED` on the clock
 //! ([`crate::state::capacity_task_progression`]), and a second task is refused with the
 //! modelled `ConflictException` while one is still active on the same Outpost or order,
@@ -248,10 +252,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The two OPTIONAL references a capacity task carries name other resources
+        // of this service, so each is resolved against what the store holds before
+        // anything is created: a reference that resolves to nothing is the not-found
+        // error this operation models, worded as the identifier echo of the member it
+        // arrived in, and no task is stored carrying it. Each is resolved in the scope
+        // the model gives it, coarsest member first:
+        //
+        // * an `OrderId` names an Amazon Web Services Outposts ORDER, which is a
+        //   top-level resource of the account (`/orders/{OrderId}`) and is the order
+        //   "of the host associated with the capacity task" — so what has to hold is
+        //   that the account placed it, which is also what makes the one-active-task
+        //   rule below a rule about the order rather than about the Outpost;
+        // * an `AssetId` names one physical unit of hardware INSTALLED on an Outpost,
+        //   a resource nested under the Outpost the task runs on
+        //   (`/outposts/{OutpostIdentifier}/assets`), so it is resolved among THAT
+        //   Outpost's assets.
+        let order_id = crate::state::non_empty(input.order_id);
+        if let Some(order_id) = order_id.as_deref() {
+            if !store.holds_order(order_id) {
+                return Err(StartCapacityTaskErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::ORDER_ID_MEMBER,
+                            order_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let asset_id = crate::state::non_empty(input.asset_id);
+        if let Some(asset_id) = asset_id.as_deref() {
+            if store.asset_of_outpost(&outpost_id, asset_id).is_none() {
+                return Err(StartCapacityTaskErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::ASSET_ID_MEMBER,
+                            asset_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
         // "You can have one active capacity task for each order and each Outpost":
         // a second one is the conflict this operation models, naming the resource
         // the conflict is about in `ResourceId` / `ResourceType`.
-        let order_id = crate::state::non_empty(input.order_id);
         let conflict = store
             .active_capacity_task_on_outpost(&outpost_id)
             .map(|active| {
@@ -311,9 +358,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outpost_id,
             order_id,
             // `AssetIdInput` (`^\d{10}$`) is one of the forms the output's
-            // `AssetId` (`^(\w+)$`) accepts, so the asset the caller named is
-            // reported back as the task's own.
-            asset_id: crate::state::non_empty(input.asset_id),
+            // `AssetId` (`^(\w+)$`) accepts, so the asset the caller named — one
+            // this Outpost holds, resolved above — is reported back as the task's
+            // own.
+            asset_id,
             requested_instance_pools: input.instance_pools,
             instances_to_exclude: input.instances_to_exclude,
             // False here: a dry run never reaches this far.
