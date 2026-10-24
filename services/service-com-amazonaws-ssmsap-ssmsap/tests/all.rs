@@ -15,6 +15,8 @@
 mod application_lifecycle;
 #[path = "all/application_reference_refusals.rs"]
 mod application_reference_refusals;
+#[path = "all/configuration_check_reads.rs"]
+mod configuration_check_reads;
 #[path = "all/configuration_checks.rs"]
 mod configuration_checks;
 #[path = "all/pattern_violation_messages.rs"]
