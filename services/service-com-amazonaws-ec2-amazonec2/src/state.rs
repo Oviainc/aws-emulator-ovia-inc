@@ -1274,6 +1274,23 @@ pub const MIN_LNI_DEVICE_INDEX: i32 = 1;
 /// The prefix of a customer-owned IPv4 address pool id (`CoipPoolId`).
 pub const COIP_POOL_ID_PREFIX: &str = "ipv4pool-coip-";
 
+/// The hexadecimal suffix `id` carries after [`COIP_POOL_ID_PREFIX`], if it carries one at
+/// all: `Some` only for a value that READS as a customer-owned IPv4 address pool id, which
+/// is the prefix followed by at least one lowercase hexadecimal digit and nothing else.
+///
+/// The ONE definition of what a pool id is made of, so the two readers of the form —
+/// [`coip_pool_id_is_well_formed`], which also holds the suffix to one of the two lengths
+/// EC2 mints, and [`coip_pool_id_reads_as_one`], which does not — cannot drift on what a
+/// digit is.
+fn coip_pool_id_suffix(id: &str) -> Option<&str> {
+    let suffix = id.strip_prefix(COIP_POOL_ID_PREFIX)?;
+    let hexadecimal = !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    hexadecimal.then_some(suffix)
+}
+
 /// Whether `id` is a well-formed customer-owned IPv4 address pool id.
 ///
 /// A COIP pool id is [`COIP_POOL_ID_PREFIX`] followed by 8 or 17 lowercase hexadecimal
@@ -1282,13 +1299,18 @@ pub const COIP_POOL_ID_PREFIX: &str = "ipv4pool-coip-";
 /// the model, so this is also what BOUNDS the bytes a caller can park on a subnet through
 /// `ModifySubnetAttribute`: the pool id a subnet retains is at most this long.
 pub fn coip_pool_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix(COIP_POOL_ID_PREFIX) else {
-        return false;
-    };
-    matches!(suffix.len(), 8 | 17)
-        && suffix
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    coip_pool_id_suffix(id).is_some_and(|suffix| matches!(suffix.len(), 8 | 17))
+}
+
+/// Whether `id` READS as a customer-owned address pool id: [`COIP_POOL_ID_PREFIX`] followed
+/// by lowercase hexadecimal digits, however many.
+///
+/// Weaker than [`coip_pool_id_is_well_formed`], which also holds the suffix to one of the
+/// two lengths EC2 mints (8 or 17). The gap between the two is a value EC2 can READ as an
+/// address-pool id but never minted one of, and it is what [`coip_pool_id_does_not_exist`]
+/// refuses differently from a value that is no pool id at all.
+pub fn coip_pool_id_reads_as_one(id: &str) -> bool {
+    coip_pool_id_suffix(id).is_some()
 }
 
 /// The name of the default security group every VPC comes with: "the default security
@@ -2094,16 +2116,26 @@ impl ComAmazonawsEc2Amazonec2State {
                 &format!("coip-pool/{pool_id}"),
             )),
         };
-        let cidr_bytes: usize = pool.pool_cidrs.iter().flatten().map(String::len).sum();
         // [`STORED_RECORD_OVERHEAD_BYTES`] beside the caller-chosen bytes, so a pool with no CIDRs
-        // and no tags is not free against the byte budget either.
-        self.add_stored_bytes(
-            cidr_bytes
-                .saturating_add(tag_list_bytes(pool.tags.as_deref().unwrap_or_default()))
-                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
-        );
+        // and no tags is not free against the byte budget either. The ONE definition of that
+        // charge is [`coip_pool_payload_bytes`], which [`Self::remove_coip_pool`] gives back,
+        // so what a delete releases cannot drift from what this insert took.
+        self.add_stored_bytes(coip_pool_payload_bytes(&pool));
         self.coip_pools.insert(pool_id.clone(), pool);
         Some(pool_id)
+    }
+
+    /// Remove the customer-owned IP address pool `pool_id` names and answer it as it was
+    /// last reported, or `None` when the store holds no such pool.
+    ///
+    /// The answer is the record the removal took OUT of the store, so what a delete reports
+    /// is what the readers reported — never a second copy built beside it. The bytes the
+    /// record held go back to the store's budget on exactly the terms
+    /// [`Self::insert_coip_pool`] took them on ([`coip_pool_payload_bytes`]).
+    pub fn remove_coip_pool(&mut self, pool_id: &str) -> Option<crate::ops::types::CoipPool> {
+        let pool = self.coip_pools.remove(pool_id)?;
+        self.release_stored_bytes(coip_pool_payload_bytes(&pool));
+        Some(pool)
     }
 
     /// Give `vpc_id` the default subnet AWS creates in each Availability Zone of
@@ -2636,6 +2668,23 @@ pub struct SubnetSpec {
     pub map_public_ip_on_launch: bool,
     /// The tags the subnet carries.
     pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored customer-owned IP address pool holds, plus the fixed
+/// overhead the record itself costs.
+///
+/// Only the members whose length the REQUEST chose are counted on top of
+/// [`STORED_RECORD_OVERHEAD_BYTES`]: the pool id and the `PoolArn` are minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_coip_pool`]. The ONE definition of that charge,
+/// the way [`placement_group_spec_bytes`] is for a placement group: the insert charges
+/// exactly it and [`ComAmazonawsEc2Amazonec2State::remove_coip_pool`] gives back exactly
+/// it, so a pool that is created and deleted leaves the byte budget where it started, and a
+/// pool with no CIDRs and no tags is not free against [`MAX_STORED_BYTES`].
+pub fn coip_pool_payload_bytes(pool: &crate::ops::types::CoipPool) -> usize {
+    let cidr_bytes: usize = pool.pool_cidrs.iter().flatten().map(String::len).sum();
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(cidr_bytes)
+        .saturating_add(tag_list_bytes(pool.tags.as_deref().unwrap_or_default()))
 }
 
 /// One customer-owned IP address pool as a writer asks for it: the members a creator
@@ -5766,14 +5815,74 @@ pub fn invalid_group_not_found<E>(group: &str) -> crate::scaffolded::Scaffolded<
     )
 }
 
+/// The most characters of a refused `CoipPoolId` its message repeats back.
+///
+/// The message names the pool the request could not resolve, and it is the request's own
+/// bytes — `Ipv4PoolCoipId` is a bare string the model puts no `@length` on — so the echo is
+/// bounded here the way [`MAX_ECHOED_PAGE_TOKEN_CHARS`] bounds a refused token's. Far above
+/// the longest pool id this service mints ([`COIP_POOL_ID_PREFIX`] plus 17 digits), so a
+/// real id is always named in full.
+pub const MAX_ECHOED_COIP_POOL_ID_CHARS: usize = 128;
+
+/// The sentence EC2's customer-owned-IP surface answers for a `CoipPoolId` it could not
+/// resolve to a pool of the account.
+///
+/// ONE wording for the whole surface, whichever code carries it: the recorded refusals of
+/// `CreateCoipCidr`, `GetCoipPoolUsage` and `DeleteCoipPool` all read
+/// `The pool ID '<id>' does not exist.`, naming the id the request sent — so the message is
+/// built from the request, and only the first [`MAX_ECHOED_COIP_POOL_ID_CHARS`] characters
+/// of it are named.
+pub fn coip_pool_does_not_exist_message(pool_id: &str) -> String {
+    let echoed: String = pool_id
+        .chars()
+        .take(MAX_ECHOED_COIP_POOL_ID_CHARS)
+        .collect();
+    format!("The pool ID '{echoed}' does not exist.")
+}
+
 /// Refuse a request that named an address-pool id no pool of the account has, the way
-/// EC2's customer-owned-IP surface does: HTTP 400 `InvalidPoolID.NotFound`.
+/// EC2's customer-owned-IP surface does: HTTP 400 `InvalidPoolID.NotFound`, with
+/// [`coip_pool_does_not_exist_message`].
 pub fn invalid_pool_id_not_found<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_POOL_ID_NOT_FOUND,
         400,
-        format!("The pool ID '{pool_id}' does not exist"),
+        coip_pool_does_not_exist_message(pool_id),
     )
+}
+
+/// Refuse a `CoipPoolId` that resolves to no customer-owned address pool of the account,
+/// the way the operations that act on the ONE pool their `CoipPoolId` names do: HTTP 400,
+/// with a CODE that says HOW the value failed — which is what a client branches on.
+///
+/// Three outcomes, in the order EC2 decides them, each taken from a recorded refusal of
+/// this surface:
+///
+/// * the value IS a pool id ([`coip_pool_id_is_well_formed`]) and names no pool of the
+///   account: `InvalidPoolID.NotFound` with [`coip_pool_does_not_exist_message`] — the code
+///   recorded for `CreateCoipCidr` and `GetCoipPoolUsage` given a well-formed 17-digit id
+///   nothing was created for;
+/// * the value READS as a pool id ([`coip_pool_id_reads_as_one`]) but carries a digit count
+///   EC2 never mints, so the pool it names can never exist: the surface refuses the request
+///   PARAMETER with `InvalidParameterValue`, carrying that same sentence — the code recorded
+///   for `DeleteCoipPool` given an id whose hexadecimal suffix is neither of EC2's published
+///   lengths;
+/// * the value is no address-pool id at all — another prefix, none, or a suffix that is not
+///   hexadecimal: there is nothing to look up, which is [`invalid_pool_id_malformed`]'s
+///   `InvalidPoolID.Malformed`, the code recorded for the same surface's `DescribeCoipPools`
+///   given a value carrying another prefix.
+///
+/// `DescribeCoipPools` resolves `PoolIds` as a SELECTOR list and answers that member's own
+/// [`invalid_pool_id_malformed`] for every value that is not a well-formed pool id, the
+/// per-operation distinction [`invalid_id_parameter_value`] records.
+pub fn coip_pool_id_does_not_exist<E>(pool_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    if coip_pool_id_is_well_formed(pool_id) {
+        invalid_pool_id_not_found(pool_id)
+    } else if coip_pool_id_reads_as_one(pool_id) {
+        invalid_parameter_value(coip_pool_does_not_exist_message(pool_id))
+    } else {
+        invalid_pool_id_malformed(pool_id)
+    }
 }
 
 /// Refuse a request that named something that is not a customer-owned address pool id at

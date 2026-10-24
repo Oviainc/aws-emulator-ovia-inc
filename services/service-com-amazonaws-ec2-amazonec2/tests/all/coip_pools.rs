@@ -24,7 +24,11 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::ec2_query::{element, elements, error_code, filters, indexed, unescaped};
 
 /// The Region every call here is signed for, and the Region the seeded pools' ARNs name.
-const REGION: &str = "us-east-1";
+///
+/// `pub` because the `DeleteCoipPool` suite drives the same pools through the same Region:
+/// one definition of the CoIP surface's fixtures, so a delete is asserted against exactly
+/// the pools this describe reports.
+pub const REGION: &str = "us-east-1";
 
 /// The local gateway route tables the fixtures below hang off: `lgw-rtb-` plus 17 hex
 /// digits, the id shape `CoipPool$LocalGatewayRouteTableId` carries.
@@ -40,7 +44,10 @@ async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (
 }
 
 /// The pool ids a successful response reports, in the order it reported them.
-async fn described_ids(
+///
+/// `pub`, like [`seed`] and [`REGION`], so the `DeleteCoipPool` suite reads the store back
+/// through the ONE describe wrapper of this test tree rather than a second copy of it.
+pub async fn described_ids(
     router: &MultiServiceRouter,
     case: &str,
     params: &[(String, String)],
@@ -53,8 +60,8 @@ async fn described_ids(
     elements(&body, "poolId")
 }
 
-/// The XML of the one pool `pool_id` names.
-async fn describe_one(router: &MultiServiceRouter, case: &str, pool_id: &str) -> String {
+/// The XML of the one pool `pool_id` names. `pub` for the same reason as [`described_ids`].
+pub async fn describe_one(router: &MultiServiceRouter, case: &str, pool_id: &str) -> String {
     let (status, body) = describe(router, &indexed("PoolId", &[pool_id])).await;
     assert_eq!(
         status, 200,
@@ -137,7 +144,7 @@ fn seeded_fixtures() -> Vec<PoolFixture> {
 
 /// Write the seeded pools into the engine's store, the way a creating operation would, and
 /// report the ids they were given, in store order.
-fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
+pub fn seed(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     seeded_fixtures()
