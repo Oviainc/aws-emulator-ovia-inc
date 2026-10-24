@@ -31,6 +31,8 @@ mod instance_regions;
 mod instance_update;
 #[path = "all/list_instances_pagination.rs"]
 mod list_instances_pagination;
+#[path = "all/permissions_boundary.rs"]
+mod permissions_boundary;
 #[path = "all/ssoadmin_permission_sets.rs"]
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]

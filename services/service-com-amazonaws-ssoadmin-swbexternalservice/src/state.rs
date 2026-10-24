@@ -21,9 +21,10 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
-    ApplicationProvider, DisplayData, EncryptionConfigurationDetails,
-    InstanceAccessControlAttributeConfiguration, InstanceMetadata, PermissionSet, RegionMetadata,
-    ResourceServerConfig, ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
+    ApplicationProvider, CustomerManagedPolicyReference, DisplayData,
+    EncryptionConfigurationDetails, InstanceAccessControlAttributeConfiguration, InstanceMetadata,
+    PermissionSet, PermissionsBoundary, RegionMetadata, ResourceServerConfig,
+    ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -642,11 +643,90 @@ impl Instance {
     }
 }
 
+/// The `Path` a customer-managed policy reference carries when the request names none.
+///
+/// `CustomerManagedPolicyReference$Path`'s own documentation: "The path to the IAM policy
+/// that you have configured in each account where you want to deploy your permission set.
+/// The default is `/`." So the stored reference is normalised to it at write time and
+/// every later read reports the same path, whether or not the writer sent one.
+pub const DEFAULT_MANAGED_POLICY_PATH: &str = "/";
+
+/// The permissions boundary attached to a permission set: EXACTLY ONE of an AWS managed
+/// policy ARN or a customer managed policy reference.
+///
+/// Modeled as a structure with two optional members, but `PermissionsBoundary`'s own
+/// documentation makes it a choice — "Specify either `CustomerManagedPolicyReference` to
+/// use the name and path of a customer managed policy, or `ManagedPolicyArn` to use the
+/// ARN of an Amazon Web Services managed policy" — so the state holds the CHOICE rather
+/// than the pair, and a request that names both or neither never reaches the store
+/// ([`PermissionsBoundaryRecord::from_shape`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionsBoundaryRecord {
+    /// `PermissionsBoundary$ManagedPolicyArn`.
+    ManagedPolicy { managed_policy_arn: String },
+    /// `PermissionsBoundary$CustomerManagedPolicyReference`, with `Path` normalised to
+    /// [`DEFAULT_MANAGED_POLICY_PATH`] when the request named none.
+    CustomerManagedPolicy { name: String, path: String },
+}
+
+impl PermissionsBoundaryRecord {
+    /// The record a modeled `PermissionsBoundary` describes, or `None` when it names
+    /// BOTH policy kinds or NEITHER — the one thing the model's two optional members
+    /// cannot express, and which the shape's documented "specify either … or …" forbids.
+    pub fn from_shape(boundary: &PermissionsBoundary) -> Option<Self> {
+        match (
+            &boundary.customer_managed_policy_reference,
+            &boundary.managed_policy_arn,
+        ) {
+            (Some(reference), None) => Some(Self::CustomerManagedPolicy {
+                name: reference.name.clone(),
+                path: reference
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_MANAGED_POLICY_PATH.to_string()),
+            }),
+            (None, Some(managed_policy_arn)) => Some(Self::ManagedPolicy {
+                managed_policy_arn: managed_policy_arn.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// This record as the modeled `PermissionsBoundary` shape — what
+    /// `GetPermissionsBoundaryForPermissionSet` answers with, so a read reports the
+    /// choice the write stored and nothing else.
+    pub fn to_shape(&self) -> PermissionsBoundary {
+        match self {
+            Self::ManagedPolicy { managed_policy_arn } => PermissionsBoundary {
+                customer_managed_policy_reference: None,
+                managed_policy_arn: Some(managed_policy_arn.clone()),
+            },
+            Self::CustomerManagedPolicy { name, path } => PermissionsBoundary {
+                customer_managed_policy_reference: Some(CustomerManagedPolicyReference {
+                    name: name.clone(),
+                    path: Some(path.clone()),
+                }),
+                managed_policy_arn: None,
+            },
+        }
+    }
+}
+
+/// The refusal a `PermissionsBoundary` that names both policy kinds, or neither, earns —
+/// as the message of the modelled `ValidationException` (HTTP 400).
+///
+/// BUILT from the members the request got wrong, which is what the shape's documented
+/// choice ("Specify either `CustomerManagedPolicyReference` … or `ManagedPolicyArn`") is
+/// about; the caller has to fix the request from this text alone.
+pub const PERMISSIONS_BOUNDARY_CHOICE_MESSAGE: &str =
+    "Specify either CustomerManagedPolicyReference or ManagedPolicyArn in \
+     PermissionsBoundary, but not both.";
+
 /// A permission set, keyed in [`ComAmazonawsSsoadminSwbexternalserviceState::permission_sets`]
 /// by the ARN minted for it at creation.
 ///
-/// `managed_policies` and `inline_policy` are held here so the policy-attachment
-/// operations (still scaffolded) have one record to extend rather than a second map.
+/// `managed_policies`, `inline_policy` and `permissions_boundary` are held here so the
+/// policy-attachment operations have one record to extend rather than a second map.
 #[derive(Debug, Clone)]
 pub struct PermissionSetRecord {
     pub permission_set_arn: String,
@@ -659,6 +739,9 @@ pub struct PermissionSetRecord {
     pub tags: Vec<Tag>,
     pub managed_policies: Vec<String>,
     pub inline_policy: Option<String>,
+    /// The permissions boundary `PutPermissionsBoundaryToPermissionSet` attached, if one
+    /// is attached: a permission set carries AT MOST ONE, so a later put REPLACES it.
+    pub permissions_boundary: Option<PermissionsBoundaryRecord>,
 }
 
 impl PermissionSetRecord {
@@ -984,6 +1067,22 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     ) -> Option<&PermissionSetRecord> {
         self.permission_sets
             .get(permission_set_arn)
+            .filter(|record| record.instance_arn == instance_arn)
+    }
+
+    /// The same permission set, for an operation that CHANGES it (attaching a policy or
+    /// a permissions boundary, say).
+    ///
+    /// Resolves exactly as [`Self::permission_set`] — a record held under another
+    /// instance is as absent here as one that was never created — so a write and a read
+    /// of the same ARN never disagree about which permission set it names.
+    pub fn permission_set_mut(
+        &mut self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+    ) -> Option<&mut PermissionSetRecord> {
+        self.permission_sets
+            .get_mut(permission_set_arn)
             .filter(|record| record.instance_arn == instance_arn)
     }
 

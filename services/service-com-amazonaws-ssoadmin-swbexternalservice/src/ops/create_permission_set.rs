@@ -271,6 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No policy is attached at creation; the attach/put operations own these.
             managed_policies: Vec::new(),
             inline_policy: None,
+            permissions_boundary: None,
         };
         // Answer from the STORED record, so the response cannot differ from what the
         // next `DescribePermissionSet` reads.
