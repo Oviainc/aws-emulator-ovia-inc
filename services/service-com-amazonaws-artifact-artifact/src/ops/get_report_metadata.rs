@@ -6,8 +6,11 @@
 //! names none. Every member it returns takes the same value `ListReports` reported for
 //! that report, because both project the one stored record. This handler only READS.
 //!
-//! The emulator models no IAM, so the modelled `AccessDeniedException` is never raised
-//! here: a pass is not a statement about an AWS-side authorisation decision.
+//! A `reportId` the catalog does not hold is refused by the front door's 401
+//! `UnauthorizedException` rather than the modelled `ResourceNotFoundException`: AWS
+//! Artifact authorises the report resource before looking it up and does not confirm
+//! whether a report the caller cannot reach exists. `ResourceNotFoundException` is left
+//! for a VERSION a reachable report never published.
 //!
 //! The report catalog IS the account's entitlement, though: AWS Artifact is served
 //! through a gateway that authorizes the report the request targets before the service
@@ -175,15 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
         let Some(version) = report.resolve(input.report_version) else {
-            // Total in both shapes: the request either named a version this report never
-            // published, or named none and the report publishes none at all. Nothing a
-            // request carries may abort the handler, so neither arm unwraps.
-            let missing = match input.report_version {
-                Some(requested) => {
-                    crate::state::report_version_not_found(&input.report_id, requested)
-                }
-                None => crate::state::report_not_found(&input.report_id),
-            };
+            // The report itself IS reachable, so this is a plain not-found on one of its
+            // versions. Total in both shapes: the request either named a version this
+            // report never published, or named none and the report publishes none at
+            // all. Nothing a request carries may abort the handler, so neither arm
+            // unwraps.
+            let missing =
+                crate::state::report_version_not_found(&input.report_id, input.report_version);
             return Err(GetReportMetadataErrorModeled::ResourceNotFoundException(missing).into());
         };
 

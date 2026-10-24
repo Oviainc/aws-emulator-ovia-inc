@@ -87,10 +87,16 @@
 //! What it serves is the document the export STORED
 //! (`crate::state::InquiryExport::document`), rendered from the inquiry when the export
 //! ran: a download is a pure read, and a URL whose export has since been released, or
-//! that names another inquiry or another object, is `404`. The report and term URLs
-//! `GetReport` and `GetTermForReport` hand out are NOT served here: their documents are
-//! AWS-published PDFs whose bytes this emulator does not hold, and synthesising them
-//! would be inventing content, so those URLs stay locators.
+//! that names another inquiry or another object, is `404`.
+//!
+//! The REPORT and TERM documents `GetReport` and `GetTermForReport` hand out are served
+//! the same way, by [`Documents`] under `crate::state::DOCUMENT_PATH_PREFIX`: their bytes
+//! are PERSISTED beside the catalog record they belong to (`crate::state::Document`), so
+//! the URL those operations announce resolves to a document this service holds rather
+//! than to a dead locator. What the page says is the stored record and that the emulator
+//! published it — an AWS report's own contents are AWS's and are not invented here. That
+//! URL names the endpoint the CALLER reached this emulator on
+//! (`crate::state::document_url_host`), because this emulator is what serves it.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::SerializableStruct;
@@ -160,9 +166,9 @@ impl ErasedOperation for FrontDoorAnswer {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
-        _req: &'r aws_smithy_runtime_api::http::Request,
+        _req: &'r RtRequest,
         _ctx: &'r smithy_server_runtime::OperationContext<'r>,
-    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+    ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             // Rendered through the service's own protocol, so the front door's refusal
             // carries the same envelope (and the same `x-amzn-errortype` header) as
@@ -217,7 +223,7 @@ fn body_bound(schema: &Schema, violated: &str) -> bool {
 /// would have refused.
 fn judge<I>(
     protocol: &dyn ServerHttpProtocol,
-    req: &aws_smithy_runtime_api::http::Request,
+    req: &RtRequest,
     schema: &'static Schema,
     target: fn(&I) -> Option<Target<'_>>,
 ) -> Option<FrontDoorVerdict>
@@ -250,6 +256,208 @@ where
         .then_some(FrontDoorVerdict::InvalidRequestBody)
 }
 
+/// Serves a report or term document from the stored bytes [`crate::state`] holds.
+///
+/// This is the data plane behind the URL `GetReport` and `GetTermForReport` announce. It
+/// is NOT a modelled operation — AWS serves those documents from a presigned S3 URL, and
+/// this emulator serves them from its own endpoint, because a URL it announces has to
+/// resolve. It only READS: a download neither consumes the grant it was authorised by
+/// nor changes the document.
+struct Documents<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for Documents<Eng> {
+    fn run<'r>(
+        &'r self,
+        _svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The same method policy the export plane answers under: a document is READ,
+            // so `GET` carries it and `HEAD` reports its metadata without the bytes;
+            // anything else is refused as the method it is.
+            if !matches!(req.method(), "GET" | "HEAD") {
+                return method_not_allowed();
+            }
+            let (path, query) = split_uri(req.uri());
+            let Some(wanted) = parse_document_path(&path) else {
+                return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
+            };
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return document_error(
+                    500,
+                    "InternalServerException",
+                    "the artifact report catalog is unavailable",
+                );
+            };
+            let store = state.lock();
+            // The term grant is what authorises a download, so it is checked first and
+            // by the SAME rule `GetReport` applies: one rule, one place. A fetch
+            // carrying NO token carries no grant, so it is refused before the catalog
+            // is consulted rather than looked up as the empty token.
+            let Some(token) = query_param(&query, "termToken").filter(|token| !token.is_empty())
+            else {
+                ::tracing::info!(
+                    operation = "GetReportDocument",
+                    report_id = ?wanted.report_id,
+                    report_version = wanted.version,
+                    document_kind = ?wanted.kind,
+                    outcome = "denied",
+                    reason = "no termToken",
+                    "refused a document fetch"
+                );
+                return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);
+            };
+            // DELIBERATE ORDERING: authorization answers first, so a path naming a
+            // report this service does not hold is refused as unauthorised (403) rather
+            // than reported as absent — a document URL is handed to one caller, and a
+            // 404 here would let anyone probe which report ids exist. Only a path whose
+            // grant DOES cover the report can be answered `404`, for the version or the
+            // object the report does not publish.
+            let authorised = store
+                .reports
+                .get(&wanted.report_id)
+                .is_some_and(|report| store.grant_covers(&token, report));
+            if !authorised {
+                ::tracing::info!(
+                    operation = "GetReportDocument",
+                    report_id = ?wanted.report_id,
+                    report_version = wanted.version,
+                    document_kind = ?wanted.kind,
+                    outcome = "denied",
+                    reason = "termToken does not cover this report's term",
+                    "refused a document fetch"
+                );
+                return document_error(403, "AccessDenied", crate::state::INVALID_TOKEN_MESSAGE);
+            }
+            let held = store.document(&wanted.kind, &wanted.report_id, wanted.version);
+            let Some(document) = held.filter(|held| held.object == wanted.object) else {
+                return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
+            };
+            ::tracing::info!(
+                operation = "GetReportDocument",
+                report_id = ?wanted.report_id,
+                report_version = wanted.version,
+                document_kind = ?wanted.kind,
+                outcome = "served",
+                "served a document"
+            );
+            document_response(
+                &document.bytes,
+                document.content_type,
+                req.method() == "GET",
+            )
+        })
+    }
+
+    /// Served UNSIGNED. A document URL is handed to a caller to fetch directly, so the
+    /// fetch carries no SigV4 `Authorization` header; the term grant the URL carries is
+    /// what authorises it, and a fetch without one is refused. The modelled operations
+    /// are unaffected — the router reads their schemes from the model, which this answer
+    /// cannot weaken.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+}
+
+/// What a document path named.
+struct WantedDocument {
+    kind: String,
+    report_id: String,
+    version: i64,
+    object: String,
+}
+
+/// The document a data-plane path names, or `None` when the path is not one this service
+/// publishes documents at.
+fn parse_document_path(path: &str) -> Option<WantedDocument> {
+    let rest = path
+        .strip_prefix(crate::state::DOCUMENT_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let mut segments = rest.split('/');
+    let kind = segments.next()?;
+    let report_id = segments.next()?;
+    let version = segments.next()?.strip_prefix('v')?.parse::<i64>().ok()?;
+    let object = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(WantedDocument {
+        kind: smithy_server_runtime::percent_decode(kind),
+        report_id: smithy_server_runtime::percent_decode(report_id),
+        version,
+        object: smithy_server_runtime::percent_decode(object),
+    })
+}
+
+/// Serve one stored document: its own bytes, under its own content type and length.
+///
+/// `with_body` is false for a `HEAD`, which reports a document's metadata without its
+/// bytes. BOTH document planes of this service answer through here, so one service does
+/// not serve its documents under two conventions.
+fn document_response(bytes: &[u8], content_type: &str, with_body: bool) -> RtResponse {
+    let body = if with_body {
+        SdkBody::from(bytes.to_vec())
+    } else {
+        SdkBody::empty()
+    };
+    let mut response = RtResponse::new(status(200), body);
+    response
+        .headers_mut()
+        .insert("content-type", content_type.to_string());
+    response
+        .headers_mut()
+        .insert("content-length", bytes.len().to_string());
+    response
+}
+
+/// A status this module answers with. Every call site passes a constant, so the
+/// conversion cannot fail.
+fn status(code: u16) -> StatusCode {
+    StatusCode::try_from(code).expect("the data plane's statuses are valid constants")
+}
+
+/// A request URI's path and query string, in whichever form the request carries them:
+/// an origin-form `/path?query`, or the absolute-form `https://host/path?query` an
+/// SDK-built request carries.
+///
+/// Parsed with `::http::Uri` — the same parser [`Service::can_handle`] reads
+/// `parts.uri.path()` from — so the request this service CLAIMS and the request it then
+/// dispatches cannot disagree about which path was asked for. It is the one path reader
+/// in this module: both document planes (the report documents below and the inquiry
+/// exports above) resolve their path through it.
+fn split_uri(uri: &str) -> (String, String) {
+    if let Ok(parsed) = uri.parse::<::http::Uri>() {
+        return (
+            parsed.path().to_string(),
+            parsed.query().unwrap_or_default().to_string(),
+        );
+    }
+    // A form the URI parser will not accept is still matched the way it reads, rather
+    // than discarded: split at the `?` that separates the two parts.
+    match uri.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (uri.to_string(), String::new()),
+    }
+}
+
+/// The value `name` carries in a URL query string, decoded. `None` when the query string
+/// does not carry it.
+///
+/// The grammar is NOT restated here: the pairs are split and decoded by the framework's
+/// own query decoder (`aws_smithy_schema_server::query::parse_form_urlencoded`), which is
+/// what the protocol's `@httpQuery` binding reads a request with, so the document plane
+/// and the modelled operations cannot disagree about decoding (`+`, `%XX`, a valueless
+/// key). First match wins, as a repeated key's first binding does.
+fn query_param(query: &str, name: &str) -> Option<String> {
+    ::aws_smithy_schema_server::query::parse_form_urlencoded(query.as_bytes())
+        .into_iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
 /// The `com-amazonaws-artifact-artifact` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -268,6 +476,8 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     unauthorized: FrontDoorAnswer,
     /// Answers a request whose body the front door cannot bind to the modelled shape.
     invalid_request_body: FrontDoorAnswer,
+    /// Serves the report and term documents the control plane announces URLs for.
+    documents: Documents<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -277,9 +487,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            engine,
+            engine: Arc::clone(&engine),
             unauthorized: FrontDoorAnswer(FrontDoorRefusal::unauthorized()),
             invalid_request_body: FrontDoorAnswer(FrontDoorRefusal::invalid_request_body()),
+            documents: Documents { engine },
         }
     }
 
@@ -299,10 +510,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// this service's STATE — which tag set the ARN addresses — and each tag handler
     /// answers it with the same 401 through `crate::scaffolded::Scaffolded::unauthorized`.
     /// `TagResource` is here for its `tags` BODY alone.
-    fn front_door(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<FrontDoorVerdict> {
+    fn front_door(&self, req: &RtRequest) -> Option<FrontDoorVerdict> {
         use crate::ops;
 
         let protocol = self.definition().protocol();
@@ -432,6 +640,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         {
             return true;
         }
+        // A REPORT or TERM document fetch carries no credential and no `X-Amz-Target`,
+        // and when a client addresses the emulator directly rather than by endpoint host
+        // its host names no service either, so the path this service publishes those
+        // documents at is the only thing left to identify it. The paths claimed here are
+        // the ones `crate::state::DOCUMENT_PATH_PREFIX` owns, which no modelled operation
+        // of any service is bound to, so claiming a read of one cannot take a request
+        // another service would have served. Every method is claimed, not only the two
+        // that are served: a `POST` to a path this service publishes is this service's to
+        // refuse as a method, exactly as the inquiry-export plane refuses it.
+        if parse_document_path(parts.uri.path()).is_some() {
+            return true;
+        }
         // And a request addressed to the DOCUMENT host this service publishes its
         // presigned URLs under, whose first label names no service at all: without this
         // the router answers `UnknownService` for a URL this service handed out. See the
@@ -439,16 +659,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         request_host(parts).is_some_and(crate::state::is_document_host)
     }
 
-    fn override_operation(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<&dyn ErasedOperation> {
+    fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
         // Return `Some(op)` to serve a request the model's routing key cannot name
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
         //
-        // This service is reached through a gateway that answers before it (see the
+        // The document data plane comes first: a fetch of a URL this service announced
+        // names no modelled operation at all, so there is no routing key to resolve for
+        // it (see the module docs). The plane itself decides the method: a read is served
+        // and anything else is refused as a method, rather than falling through to the
+        // router's answer for an unrouted request.
+        if parse_document_path(&split_uri(req.uri()).0).is_some() {
+            return Some(&self.documents as &dyn ErasedOperation);
+        }
+
+        // And this service is reached through a gateway that answers before it (see the
         // module docs): a request whose target it cannot authorize, or whose body it
         // cannot bind, never reaches the modelled walk at all. Both answers are
         // pre-dispatch, which is what this hook is.
@@ -493,10 +719,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         })
     }
 
-    fn override_routing_error(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
+    fn override_routing_error(&self, req: &RtRequest) -> Option<RtResponse> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
@@ -506,14 +729,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // A request to a DOCUMENT URL this service handed out is exactly that case by
         // construction — the path is not in the model — so this is where an export's
         // presigned URL is served. Anything else keeps the framework's default.
-        let target = crate::state::parse_export_document_path(request_path(req.uri()))?;
+        let target = crate::state::parse_export_document_path(&split_uri(req.uri()).0)?;
         Some(self.serve_export_document(req, &target))
     }
 
     fn override_framework_error(
         &self,
         error: &aws_smithy_schema_server::ProtocolError,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
+    ) -> Option<RtResponse> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
         // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
@@ -539,7 +762,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         target: &crate::state::ExportDocumentTarget,
     ) -> RtResponse {
         if !matches!(req.method(), "GET" | "HEAD") {
-            return document_error(405, "MethodNotAllowed", "This document is served by GET");
+            return method_not_allowed();
         }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return document_error(
@@ -557,29 +780,38 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             return document_error(404, "NoSuchKey", DOCUMENT_NOT_FOUND_MESSAGE);
         };
 
-        let length = export.document.len();
-        // A `HEAD` reports the document's metadata without its bytes, which is what the
-        // method means; a `GET` carries them.
-        let body = if req.method() == "HEAD" {
-            SdkBody::empty()
-        } else {
-            SdkBody::from(export.document.clone())
-        };
-        let mut resp = RtResponse::new(
-            StatusCode::try_from(200u16).expect("200 is a valid status"),
-            body,
-        );
-        resp.headers_mut()
-            .insert("content-type", crate::state::INQUIRY_EXPORT_CONTENT_TYPE);
-        resp.headers_mut()
-            .insert("content-length", length.to_string());
-        resp
+        // The same serving rule both document planes answer under: a `GET` carries the
+        // bytes and a `HEAD` reports the metadata without them.
+        document_response(
+            &export.document,
+            crate::state::INQUIRY_EXPORT_CONTENT_TYPE,
+            req.method() == "GET",
+        )
     }
 }
 
 /// The body of a document-plane refusal that found no document: one sentence carrying
 /// nothing from the request, so a caller cannot probe for exports it was not handed.
 const DOCUMENT_NOT_FOUND_MESSAGE: &str = "The requested document does not exist";
+
+/// The read methods a document plane of this service serves: `GET` carries the bytes and
+/// `HEAD` reports the metadata without them.
+const DOCUMENT_READ_METHODS: &str = "GET, HEAD";
+
+/// The refusal BOTH document planes answer a method they do not serve with. RFC 9110
+/// requires a `405` to state which methods the target does support, so the refusal names
+/// them in the `Allow` header and in its message rather than only in this file.
+fn method_not_allowed() -> RtResponse {
+    let mut response = document_error(
+        405,
+        "MethodNotAllowed",
+        "This document is served by GET or HEAD",
+    );
+    response
+        .headers_mut()
+        .insert("allow", DOCUMENT_READ_METHODS);
+    response
+}
 
 /// One document-plane error response: the status, the code in `x-amzn-errortype`, and a
 /// JSON body carrying the reason.
@@ -602,23 +834,14 @@ fn document_error(status: u16, code: &str, message: &str) -> RtResponse {
 
 /// The `Host` header of a buffered request, or the URI authority when the request is
 /// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+///
+/// It RECOGNISES a host, which is all the claim below needs. The host a document URL is
+/// MINTED with is `crate::state::document_url_host`, which reads the same two sources and
+/// then requires a bare authority, because that value is interpolated into a URL this
+/// service hands out.
 fn request_host(parts: &http::request::Parts) -> Option<&str> {
     match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
         Some(host) => Some(host),
         None => parts.uri.authority().map(http::uri::Authority::as_str),
-    }
-}
-
-/// The path component of a request URI, with any scheme, authority and query removed.
-fn request_path(uri: &str) -> &str {
-    // The query is dropped FIRST: a query VALUE may carry `://`, which a scheme scan over
-    // the whole URI would mistake for the authority.
-    let without_query = uri.split('?').next().unwrap_or(uri);
-    match without_query.split_once("://") {
-        Some((_scheme, authority_and_path)) => match authority_and_path.find('/') {
-            Some(path_start) => &authority_and_path[path_start..],
-            None => "/",
-        },
-        None => without_query,
     }
 }

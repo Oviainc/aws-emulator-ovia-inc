@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the provisioned throughput bounds) are properties of that type — so
                     // each storage type the class can be ordered with is its OWN option,
                     // never one option carrying the type `CreateDBInstance` defaults to.
-                    for storage in storage_profiles(version.engine, &class) {
+                    for storage in storage_profiles(version.engine) {
                         matching.push((
                             format!(
                                 "{}#{}#{}#{license_model}#{}",
@@ -401,17 +401,45 @@ const SERVERLESS_CLASS: &str = "db.serverless";
 const THREADS_PER_CORE: i32 = 2;
 
 /// One DB instance class this service offers, as an option reports it.
-struct InstanceClass {
+pub struct InstanceClass {
     /// `DBInstanceClass`.
-    name: String,
+    pub name: String,
     /// Whether the class is burstable (see [`InstanceFamily::burstable`]).
-    burstable: bool,
+    pub burstable: bool,
     /// The CPU CORES whose count a caller can configure on this class, or `None` for a
     /// class whose processor features are not configurable (a burstable or Graviton
     /// class, or a size whose vCPU count the published naming does not state).
-    cores: Option<i32>,
+    pub cores: Option<i32>,
     /// Whether `SupportsPerformanceInsights`.
-    supports_performance_insights: bool,
+    pub supports_performance_insights: bool,
+}
+
+/// The profile of the class NAMED `name` for `engine`.
+///
+/// A class this service's family table publishes carries that row's profile. A class
+/// outside it is still a real class — `crate::state::check_db_instance_class` admits every
+/// value of the published `db.<family>.<size>` form, because which classes exist is AWS's
+/// moving per-region matrix and this table is an explicitly partial subset of it — so one
+/// is profiled from its NAME: burstable exactly for the burstable (`t`) generations, and
+/// with no configurable processor cores, since the vCPU count of a family this table does
+/// not publish is not known here.
+pub fn instance_class_profile(engine: &str, name: &str) -> InstanceClass {
+    if let Some(published) = instance_classes(engine)
+        .into_iter()
+        .find(|class| class.name.eq_ignore_ascii_case(name))
+    {
+        return published;
+    }
+    let family = name
+        .strip_prefix("db.")
+        .and_then(|rest| rest.split('.').next())
+        .unwrap_or_default();
+    InstanceClass {
+        name: name.to_string(),
+        burstable: family.starts_with('t'),
+        cores: None,
+        supports_performance_insights: true,
+    }
 }
 
 /// The vCPU count the published instance-size naming gives `size`: a `large` is 2 vCPUs
@@ -439,7 +467,12 @@ fn vcpus(size: &str) -> Option<i32> {
 }
 
 /// The classes `engine` can be ordered in, built from the family tables above.
-fn instance_classes(engine: &str) -> Vec<InstanceClass> {
+///
+/// `pub` because this catalogue is the service's one published answer to "what can a DB
+/// instance be": `DescribeValidDBInstanceModifications` reports the bounds of the class a
+/// stored instance already runs, and reads them from here so the two reports cannot
+/// disagree about a class.
+pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
     let cluster = is_cluster_engine(engine);
     let families = if cluster {
         CLUSTER_FAMILIES
@@ -498,27 +531,27 @@ fn license_models(engine: &str) -> &'static [&'static str] {
 }
 
 /// The provisioned IOPS a storage type takes, as the published storage table states them.
-struct ProvisionedIops {
+pub struct ProvisionedIops {
     /// `MinIopsPerDbInstance`.
-    min_per_instance: i32,
+    pub min_per_instance: i32,
     /// `MaxIopsPerDbInstance`.
-    max_per_instance: i32,
+    pub max_per_instance: i32,
     /// `MinIopsPerGib` — the lowest IOPS-to-GiB ratio.
-    min_per_gib: f64,
+    pub min_per_gib: f64,
     /// `MaxIopsPerGib` — the highest IOPS-to-GiB ratio.
-    max_per_gib: f64,
+    pub max_per_gib: f64,
 }
 
 /// The provisioned storage throughput a storage type takes, in MiB/s.
-struct ProvisionedThroughput {
+pub struct ProvisionedThroughput {
     /// `MinStorageThroughputPerDbInstance`.
-    min_per_instance: i32,
+    pub min_per_instance: i32,
     /// `MaxStorageThroughputPerDbInstance`.
-    max_per_instance: i32,
+    pub max_per_instance: i32,
     /// `MinStorageThroughputPerIops`.
-    min_per_iops: f64,
+    pub min_per_iops: f64,
     /// `MaxStorageThroughputPerIops`.
-    max_per_iops: f64,
+    pub max_per_iops: f64,
 }
 
 /// One storage type a DB instance can be ordered with, and everything an option reports
@@ -527,19 +560,19 @@ struct ProvisionedThroughput {
 /// Source: the "Amazon RDS DB instance storage" section of the Amazon RDS User Guide —
 /// General Purpose SSD (`gp2`, `gp3`) and Provisioned IOPS SSD (`io1`, `io2`), with the
 /// sizes, IOPS and throughput each publishes.
-struct StorageProfile {
+pub struct StorageProfile {
     /// `StorageType`.
-    name: &'static str,
+    pub name: &'static str,
     /// `MinStorageSize` and the largest `MaxStorageSize` this type reaches, in GiB,
     /// before the engine's own cap ([`max_allocated_storage`]) is applied. `None` for
     /// storage that is managed by a cluster rather than ordered per instance (Aurora),
     /// which reports no storage bounds and no autoscaling.
-    size_range: Option<(i32, i32)>,
+    pub size_range: Option<(i32, i32)>,
     /// The provisioned IOPS this type takes, which is also `SupportsIops`.
-    iops: Option<ProvisionedIops>,
+    pub iops: Option<ProvisionedIops>,
     /// The provisioned throughput this type takes, which is also
     /// `SupportsStorageThroughput`.
-    throughput: Option<ProvisionedThroughput>,
+    pub throughput: Option<ProvisionedThroughput>,
 }
 
 /// General Purpose SSD `gp2`: 20 GiB upwards, with IOPS and throughput derived from the
@@ -627,27 +660,95 @@ const AURORA_STORAGE: &[StorageProfile] = &[AURORA];
 /// The storage types a DocumentDB or Neptune cluster member is offered with.
 const CLUSTER_STANDARD_STORAGE: &[StorageProfile] = &[CLUSTER_STANDARD];
 
-/// The storage types a burstable class is offered with: General Purpose SSD only —
-/// Provisioned IOPS SSD starts at 100 GiB and is ordered on the standard classes.
-const GENERAL_PURPOSE_STORAGE: &[StorageProfile] = &[GP2, GP3];
-
-/// The storage types a standard (non-burstable) provisioned-storage class is offered
-/// with, in the order the published storage table lists them.
+/// The storage types a provisioned-storage (non-cluster) class is offered with, in the
+/// order the published storage table lists them.
+///
+/// A BURSTABLE class is offered the same four, and two sources say so. The model: the
+/// storage members are bound by SIZE and RATIO and never by DB instance class —
+/// `CreateDBInstanceMessage$StorageType` publishes one value list for every DB instance
+/// ("Valid Values: `gp2 | gp3 | io1 | io2 | standard`") and carves out only Aurora ("This
+/// setting doesn't apply to Amazon Aurora DB instances. Storage is managed by the DB
+/// cluster."), and `CreateDBInstanceMessage$Iops`'s constraints are a multiple of the
+/// storage amount, not a list of classes; the only constraint Provisioned IOPS SSD adds is
+/// its own 100 GiB minimum size ([`IO1`]/[`IO2`]'s `size_range`), which `MinStorageSize`
+/// reports. And the RECORDING: the behavioural unit
+/// `rds.valid-db-instance-modifications-bound-what-modify-accepts` runs on a
+/// `db.t4g.micro` — a burstable class — and requires its reported `StorageSize` to carry a
+/// range starting ABOVE the 20 GiB it runs, which only the Provisioned IOPS SSD minimum
+/// provides; while this table withheld `io1`/`io2` from burstable classes that unit failed
+/// with "must report at least one StorageSize range enlarging beyond the current
+/// allocation 20; it reported only [(20, 65536, 1)]".
 const ALL_PROVISIONED_STORAGE: &[StorageProfile] = &[GP2, GP3, IO1, IO2];
 
-/// The storage types `class` can be ordered with for `engine`.
-fn storage_profiles(engine: &str, class: &InstanceClass) -> &'static [StorageProfile] {
+/// Legacy MAGNETIC storage: still published by `StorageType` ("Valid Values: gp2 | gp3 |
+/// io1 | io2 | standard") and ordered with no option here, since
+/// `DescribeOrderableDBInstanceOptions` offers the four current types — but a modification
+/// can still convert to it, so its bounds live beside theirs and [`storage_bounds`] hands
+/// them out.
+///
+/// Source: the "Magnetic storage (not recommended)" section of the Amazon RDS User Guide —
+/// 20 GiB to 3,072 GiB (3 TiB), with neither provisioned IOPS nor provisioned throughput:
+/// a magnetic volume's performance is not configurable.
+const MAGNETIC: StorageProfile = StorageProfile {
+    name: LEGACY_MAGNETIC_STORAGE,
+    size_range: Some((20, 3_072)),
+    iops: None,
+    throughput: None,
+};
+
+/// The storage types a DB instance of `engine` can be ordered with.
+///
+/// It is a property of the ENGINE alone: an engine whose storage its cluster manages
+/// carries that one type, and every other engine is offered the four per-instance types,
+/// whatever class it runs on.
+///
+/// `pub` because a MODIFICATION is bounded by the same table an order is:
+/// `DescribeValidDBInstanceModifications` reports one `ValidStorageOptions` per type this
+/// returns for the stored instance's engine.
+pub fn storage_profiles(engine: &str) -> &'static [StorageProfile] {
     if crate::state::is_aurora(engine) {
         return AURORA_STORAGE;
     }
     if matches!(engine, "docdb" | "neptune") {
         return CLUSTER_STANDARD_STORAGE;
     }
-    if class.burstable {
-        return GENERAL_PURPOSE_STORAGE;
-    }
     ALL_PROVISIONED_STORAGE
 }
+
+/// The bounds `storage_type` carries for a DB instance of `engine`, or `None` when the
+/// engine publishes no such type at all.
+///
+/// Every type an option is ordered with ([`storage_profiles`]), plus the legacy
+/// [`MAGNETIC`] type `StorageType` publishes for an engine whose storage is its own. This
+/// is what `ModifyDBInstance` judges a storage modification against, so a type the member
+/// admits is bounded rather than unbounded.
+pub fn storage_bounds(engine: &str, storage_type: &str) -> Option<&'static StorageProfile> {
+    let profiles = storage_profiles(engine);
+    if let Some(profile) = profiles
+        .iter()
+        .find(|profile| profile.name.eq_ignore_ascii_case(storage_type))
+    {
+        return Some(profile);
+    }
+    // An engine whose storage is its own also takes the legacy magnetic type.
+    (profiles.iter().any(|profile| profile.size_range.is_some())
+        && storage_type.eq_ignore_ascii_case(LEGACY_MAGNETIC_STORAGE))
+    .then_some(&MAGNETIC)
+}
+
+/// Whether `StorageType` publishes `storage_type` for a DB instance of `engine`.
+///
+/// `CreateDBInstanceMessage$StorageType` publishes one value list for a DB instance whose
+/// storage is its own ("Valid Values: `gp2 | gp3 | io1 | io2 | standard`") and carves out
+/// the engines whose "Storage is managed by the DB cluster", which carry their cluster's
+/// type instead. `standard` — legacy magnetic storage — is in that list and is ordered
+/// with no option here, so it is published with [`MAGNETIC`]'s bounds rather than refused.
+pub fn publishes_storage_type(engine: &str, storage_type: &str) -> bool {
+    storage_bounds(engine, storage_type).is_some()
+}
+
+/// The legacy magnetic storage type `StorageType` still publishes.
+pub const LEGACY_MAGNETIC_STORAGE: &str = "standard";
 
 /// The largest `AllocatedStorage` `engine` accepts, in GiB.
 ///
@@ -655,7 +756,10 @@ fn storage_profiles(engine: &str, class: &InstanceClass) -> &'static [StoragePro
 /// Oracle engines, 16,384 GiB for Microsoft SQL Server and 64,000 GiB for Db2. A storage
 /// type's own maximum ([`StorageProfile::size_range`]) is capped at this; a cluster
 /// engine's storage carries no bounds at all, so this is not consulted for one.
-fn max_allocated_storage(engine: &str) -> i32 {
+///
+/// `pub` for the same reason as [`storage_profiles`]: the storage a modification can grow
+/// to is capped by the engine exactly as the storage an order can ask for is.
+pub fn max_allocated_storage(engine: &str) -> i32 {
     if engine.starts_with("sqlserver") {
         return 16_384;
     }
@@ -701,7 +805,11 @@ fn activity_stream_modes(engine: &str) -> Vec<String> {
 /// full core count and whose allowed values are the EVEN counts up to it (cores are
 /// disabled in pairs), and `threadsPerCore`, which allows one thread or
 /// [`THREADS_PER_CORE`].
-fn available_processor_features(
+///
+/// `pub` because the processor features a stored instance's class can be MODIFIED to are
+/// the same ones it can be ordered with: `DescribeValidDBInstanceModifications` reports
+/// this list as its `ValidProcessorFeatures`.
+pub fn available_processor_features(
     engine: &str,
     class: &InstanceClass,
 ) -> Vec<AvailableProcessorFeature> {

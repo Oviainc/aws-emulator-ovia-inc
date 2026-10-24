@@ -607,17 +607,21 @@ async fn a_class_is_offered_once_per_storage_type_it_can_be_ordered_with() {
         &'static [&'static str],
         Option<i32>,
     );
-    /// The General Purpose SSD types every class takes.
-    const GENERAL_PURPOSE: &[&str] = &["gp2", "gp3"];
-    /// Those plus the Provisioned IOPS SSD types a standard class takes.
+    /// The storage types a per-instance-storage class takes.
     const EVERY_TYPE: &[&str] = &["gp2", "gp3", "io1", "io2"];
     // Rows differ along class family, class size, engine family and the engine's storage
     // cap; the classes are ones no issue cited as well as ones that were.
     const ROWS: &[Row] = &[
-        // A burstable class takes General Purpose SSD only: Provisioned IOPS SSD starts
-        // at 100 GiB and is ordered on the standard classes.
-        ("mysql", "db.t4g.micro", GENERAL_PURPOSE, Some(65_536)),
-        ("mysql", "db.t3.2xlarge", GENERAL_PURPOSE, Some(65_536)),
+        // A storage type is bound by size and ratio, not by class: one value list covers
+        // every DB instance (`CreateDBInstanceMessage$StorageType`), so a burstable class
+        // takes the same types a standard one does — Provisioned IOPS SSD included, whose
+        // only constraint is the 100 GiB minimum size `MinStorageSize` reports. Recorded
+        // behaviour says the same: the behavioural unit
+        // `rds.valid-db-instance-modifications-bound-what-modify-accepts` runs on a
+        // `db.t4g.micro` and requires a storage range above the 20 GiB it runs, which only
+        // the Provisioned IOPS SSD minimum provides.
+        ("mysql", "db.t4g.micro", EVERY_TYPE, Some(65_536)),
+        ("mysql", "db.t3.2xlarge", EVERY_TYPE, Some(65_536)),
         // A standard class takes every published type.
         ("mysql", "db.m6gd.8xlarge", EVERY_TYPE, Some(65_536)),
         ("postgres", "db.x2iedn.32xlarge", EVERY_TYPE, Some(65_536)),
