@@ -134,6 +134,15 @@ pub const MAX_FHIR_RESOURCE_BYTES_TOTAL: usize = 64 << 20;
 /// `ValidationException` they model.
 pub const MAX_TAGS_PER_DATASTORE: usize = 50;
 
+/// The most tags one data transformation profile carries.
+///
+/// Taken from the model rather than chosen: a profile's tags are also written
+/// by `CreateDataTransformationProfile`'s `Tags` (`TagMap`, len 0..50), so the
+/// set a repeated `TagResource` accumulates is held to the same bound the
+/// create path is held to. `TagResource` refuses past it with the
+/// `ValidationException` it models.
+pub const MAX_TAGS_PER_PROFILE: usize = 50;
+
 /// The release-version segment a data store's FHIR endpoint publishes, and so
 /// the third segment of every path on that endpoint
 /// (`/datastore/{DatastoreId}/r4/...`).
@@ -393,14 +402,22 @@ impl Datastore {
 
     /// The stored tags as the modelled `TagList`, ordered by key.
     pub fn tag_list(&self) -> Vec<Tag> {
-        self.tags
-            .iter()
-            .map(|(key, value)| Tag {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .collect()
+        tag_list(&self.tags)
     }
+}
+
+/// A stored tag map as the modelled `TagList`, ordered by key.
+///
+/// Every taggable resource in this service holds its tags the same way (a
+/// `BTreeMap` keyed by tag key), so `ListTagsForResource` reports all of them
+/// through this one function.
+pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
 }
 
 /// What one `CreateFHIRDatastore` `ClientToken` recorded: the data store it
@@ -494,6 +511,12 @@ impl DataTransformationProfile {
         } else {
             self.published.get(&version)
         }
+    }
+
+    /// The stored tags as the modelled `TagList`, ordered by key — the same
+    /// shape `ListTagsForResource` reports a data store's tags through.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
     }
 
     /// The highest published version, or `None` while the profile has only its
@@ -989,6 +1012,60 @@ pub fn is_profile_id(id: &str) -> bool {
 /// caller must still require the stored record's own ARN to equal the one it
 /// was handed, so an ARN naming another region or account resolves to nothing.
 pub fn datastore_id_from_arn(arn: &str) -> Option<&str> {
+    healthlake_arn_resource(arn)?.strip_prefix(DATASTORE_ARN_RESOURCE_PREFIX)
+}
+
+/// The `ProfileId` named by a HealthLake data transformation profile ARN, or
+/// `None` when the ARN is not one (a malformed one, another service's, or a
+/// `datastore/fhir` ARN, which names a different resource).
+///
+/// Like [`datastore_id_from_arn`] this reads the ARN's SHAPE only: the id has
+/// to satisfy the modelled `ProfileIdString` alphabet the `AmazonResourceName`
+/// pattern spells for this form (`dataTransformationProfile\/[a-f0-9]{32}`),
+/// but nothing here says a profile with that id exists, and the caller must
+/// still require the stored record's own ARN to equal the one it was handed so
+/// an ARN naming another partition, region or account resolves to nothing.
+pub fn profile_id_from_arn(arn: &str) -> Option<&str> {
+    let id = healthlake_arn_resource(arn)?.strip_prefix(PROFILE_ARN_RESOURCE_PREFIX)?;
+    is_profile_id(id).then_some(id)
+}
+
+/// Which HealthLake resource an `AmazonResourceName` names, as the modelled
+/// pattern's two resource forms spell them.
+///
+/// The tagging operations take that one shape for EITHER resource, so they
+/// resolve it through [`tagged_resource_from_arn`] rather than each knowing one
+/// form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource<'a> {
+    /// A FHIR data store, by `DatastoreId`.
+    Datastore(&'a str),
+    /// A data transformation profile, by `ProfileId`.
+    Profile(&'a str),
+}
+
+/// The resource a HealthLake `AmazonResourceName` names, or `None` when the ARN
+/// is of neither modelled resource form.
+///
+/// The modelled pattern admits exactly two
+/// (`datastore\/fhir\/.{32}` and `dataTransformationProfile\/[a-f0-9]{32}`),
+/// and both name a resource this service holds and tags, so every tagging
+/// operation resolves its `ResourceARN` here. SHAPE only, as
+/// [`datastore_id_from_arn`] and [`profile_id_from_arn`] are.
+pub fn tagged_resource_from_arn(arn: &str) -> Option<TaggedResource<'_>> {
+    if let Some(id) = datastore_id_from_arn(arn) {
+        return Some(TaggedResource::Datastore(id));
+    }
+    profile_id_from_arn(arn).map(TaggedResource::Profile)
+}
+
+/// The RESOURCE field of a HealthLake ARN (everything after the account
+/// segment), or `None` when `arn` is not an ARN of this service in an `aws`
+/// partition.
+///
+/// The one place the five leading ARN fields are parsed, so every resource form
+/// this service resolves agrees about what an ARN of its own looks like.
+fn healthlake_arn_resource(arn: &str) -> Option<&str> {
     let mut fields = arn.splitn(6, ':');
     let (
         Some("arn"),
@@ -1011,7 +1088,7 @@ pub fn datastore_id_from_arn(arn: &str) -> Option<&str> {
     if !partition.starts_with("aws") {
         return None;
     }
-    resource.strip_prefix(DATASTORE_ARN_RESOURCE_PREFIX)
+    Some(resource)
 }
 
 /// Epoch nanoseconds for a modelled timestamp, so two `HealthLakeTimestamp`
