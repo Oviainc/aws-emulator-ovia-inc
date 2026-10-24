@@ -190,6 +190,13 @@ impl Emulator {
         .await
     }
 
+    /// `DeleteIdNamespace` — `DELETE /idnamespaces/{idNamespaceName}`, whose label is
+    /// an `EntityName` (a name, never an ARN).
+    pub(crate) async fn delete_id_namespace(&self, id_namespace: &str) -> Reply {
+        self.call("DELETE", &format!("/idnamespaces/{id_namespace}"), None)
+            .await
+    }
+
     pub(crate) async fn get_matching_workflow(&self, workflow_name: &str) -> Reply {
         self.call("GET", &format!("/matchingworkflows/{workflow_name}"), None)
             .await
