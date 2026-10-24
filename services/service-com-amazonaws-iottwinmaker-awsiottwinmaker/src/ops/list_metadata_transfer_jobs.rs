@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMetadataTransferJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMetadataTransferJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports a bounded page of the account's metadata transfer jobs from
+//! [`crate::state`], so a caller lists back the jobs
+//! `CreateMetadataTransferJob` persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMetadataTransferJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The listing is taken over the ENDS of a transfer: `sourceType` and
+//! `destinationType` are both required, so a job is in the listing only when one
+//! of its sources carries the named source type and its destination carries the
+//! named destination type. Each entry of `filters` narrows it further — a job is
+//! reported only when it satisfies every filter named, by the workspace at
+//! either end of its transfer or by its state — and a request naming none lists
+//! every job with those ends.
+//!
+//! Jobs are reported in `metadataTransferJobId` order, which is the order the
+//! store keys them in, and a page carries at most
+//! [`crate::state::MAX_PAGE_SIZE`] jobs ([`crate::state::DEFAULT_PAGE_SIZE`]
+//! when the request names no `maxResults`). The `nextToken` a truncated page
+//! carries is opaque and holds the id the next page resumes AT, bound to the
+//! ends the listing was taken over, exactly as `ListComponentTypes`' token is
+//! bound to its workspace.
+//!
+//! A reporting operation: the only thing it writes is the lifecycle transition
+//! the CLOCK had already made due — each job's outcome, owed at
+//! [`crate::state::MetadataTransferJob::settles_at`] whether or not anybody
+//! called — which `GetMetadataTransferJob` materialises the same way. `progress`
+//! is left ABSENT on every summary for the reason that read leaves it absent: a
+//! progress count counts what a transfer moved, and this emulator transfers no
+//! metadata.
+//!
+//! The refusals this handler owns: an end type outside the modelled
+//! `SourceType`/`DestinationType` values, a filter naming a state outside the
+//! modelled `MetadataTransferJobState` values, a `maxResults` below one, and a
+//! `nextToken` this listing did not mint — each the `ValidationException` this
+//! operation models. Authorization is not emulated, so the modelled
+//! `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +175,341 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMetadataTransferJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMetadataTransferJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMetadataTransferJobs"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state. The
+        // ends are recorded with `?` rather than `%`: they are caller-controlled
+        // text at this point (their value lists are checked below), and the
+        // debug form escapes whatever they carry instead of letting it break the
+        // record into lines.
+        ::tracing::info!(
+            operation = "ListMetadataTransferJobs",
+            source_type = ?input.source_type,
+            destination_type = ?input.destination_type,
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMetadataTransferJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iottwinmaker store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // The outcome is recorded where the refusal is BUILT, so one record
+        // covers every refusal this handler owns and says which one it was.
+        let invalid = |message: String| {
+            ::tracing::info!(
+                operation = "ListMetadataTransferJobs",
+                outcome = "ValidationException",
+                reason = ?message,
+                "refusing a request"
+            );
+            ListMetadataTransferJobsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        // The ends the listing is taken over. Both are modelled enumerations,
+        // whose value lists the boundary validator does not enforce (the same
+        // reason `UpdatePricingPlan` checks its `pricingMode` here), so a value
+        // outside them is refused rather than quietly selecting no job. The
+        // message is built from the request: it names the value and the values
+        // the model admits.
+        if !SOURCE_TYPE_VALUES.contains(&input.source_type.as_str()) {
+            return Err(invalid(format!(
+                "sourceType is {}, which is not one of {}",
+                input.source_type,
+                SOURCE_TYPE_VALUES.join(", ")
+            ))
+            .into());
+        }
+        if !DESTINATION_TYPE_VALUES.contains(&input.destination_type.as_str()) {
+            return Err(invalid(format!(
+                "destinationType is {}, which is not one of {}",
+                input.destination_type,
+                DESTINATION_TYPE_VALUES.join(", ")
+            ))
+            .into());
+        }
+
+        // Every filter the request names NARROWS the listing: a job is reported
+        // only when it satisfies all of them, so a request naming none lists
+        // every job with the requested ends. How many a listing accepts is
+        // bounded FIRST ([`MAX_FILTERS`]), so neither the check below nor the
+        // scan further down can be made to cost more by sending a longer list.
+        let filters = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(invalid(format!(
+                "filters accepts at most {MAX_FILTERS} objects, got {}",
+                filters.len()
+            ))
+            .into());
+        }
+        // A filter's `state` is a modelled enumeration too, refused here for the
+        // same reason the end types are.
+        for filter in filters {
+            if let ListMetadataTransferJobsFilter::State(wanted) = filter {
+                if !METADATA_TRANSFER_JOB_STATE_VALUES.contains(&wanted.as_str()) {
+                    return Err(invalid(format!(
+                        "filters names state {wanted}, which is not one of {}",
+                        METADATA_TRANSFER_JOB_STATE_VALUES.join(", ")
+                    ))
+                    .into());
+                }
+            }
+        }
+
+        // A `nextToken` carries the `metadataTransferJobId` the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives a job being
+        // created between two pages. It is bound to the ends the listing was
+        // taken over, so a token from another listing — or from this listing
+        // taken over other ends, whose page would mean something else — is
+        // refused rather than silently resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, &input.source_type, &input.destination_type).ok_or_else(
+                    || {
+                        // The token itself is NOT echoed back: it is opaque to
+                        // the caller and modelled up to 17880 characters, so the
+                        // refusal names the member and what is wrong with it
+                        // rather than copying an arbitrary request string into
+                        // the response.
+                        invalid("nextToken is not a token this listing minted".to_string())
+                    },
+                )?,
+            ),
+        };
+
+        // The page size served: a request that names none is served this
+        // service's default rather than every job, an explicit zero is refused
+        // the way every listing of this service refuses it, and whatever is
+        // asked for the service serves at most `crate::state::MAX_PAGE_SIZE` —
+        // so the page this call BUILDS is bounded by this code and not only by
+        // the boundary validator.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            Some(requested) if requested < 1 => {
+                return Err(invalid(
+                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
+                )
+                .into())
+            }
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        // The clock, not this call, is what moves a job on: its outcome was due
+        // at `settles_at`, so reporting the stored state without materialising
+        // it would report a state that stopped being true before the request
+        // arrived. Done for every job this account holds rather than only the
+        // reported page, so two callers reading different pages — or one
+        // filtering by state — cannot disagree about one job's state. This pass
+        // is therefore O(the account's jobs) under the lock, bounded by
+        // `crate::state::MAX_METADATA_TRANSFER_JOBS`, the ceiling the create
+        // enforces, rather than by the page size.
+        let now = ::std::time::SystemTime::now();
+        let mut settled = 0usize;
+        for job in state.metadata_transfer_jobs.values_mut() {
+            // A settle moves the instant the job was last updated, so the count
+            // of jobs this call materialised a transition for is read from that
+            // rather than kept by `settle` itself.
+            let before = job.update_date_time;
+            job.settle(now);
+            if job.update_date_time != before {
+                settled += 1;
+            }
+        }
+
+        // `metadata_transfer_jobs` is keyed by `metadataTransferJobId`, so
+        // iterating the map IS id order and resuming is a `range` from the
+        // token's key: the page starts at the first id at or past it without
+        // walking what came before.
+        let mut matching = match &resume_at {
+            Some(from) => state.metadata_transfer_jobs.range(from.clone()..),
+            None => state.metadata_transfer_jobs.range::<String, _>(..),
+        }
+        .map(|(_, job)| job)
+        .filter(|job| {
+            transfers_between(job, &input.source_type, &input.destination_type)
+                && filters.iter().all(|filter| matches_filter(job, filter))
+        });
+
+        let mut metadata_transfer_job_summaries = Vec::new();
+        for job in matching.by_ref().take(page_size) {
+            metadata_transfer_job_summaries.push(MetadataTransferJobSummary {
+                metadata_transfer_job_id: job.metadata_transfer_job_id.clone(),
+                arn: job.arn.clone(),
+                creation_date_time: crate::state::timestamp(job.creation_date_time),
+                update_date_time: crate::state::timestamp(job.update_date_time),
+                // The stored state (settled above) and, once the job has
+                // failed, why — read through the same accessor
+                // `GetMetadataTransferJob` reports from, so one job reads the
+                // same whichever operation reports it.
+                status: job.status(),
+                // Absent for the reason the read leaves it absent: a progress
+                // count counts what a transfer moved, and no transfer ran.
+                progress: None,
+            });
+        }
+        // The token the next call resumes at: the first job this page left over.
+        // Absent on the last page, which is how a caller knows to stop.
+        let next_token = matching.next().map(|job| {
+            encode_next_token(
+                &input.source_type,
+                &input.destination_type,
+                &job.metadata_transfer_job_id,
+            )
+        });
+
+        // The outcome is recorded too, so the record of this call says what the
+        // service answered and not only that it was asked — including how many
+        // jobs it materialised the clock's transition for, the one write a
+        // listing performs.
+        ::tracing::info!(
+            operation = "ListMetadataTransferJobs",
+            outcome = "served",
+            reported = metadata_transfer_job_summaries.len(),
+            settled,
+            truncated = next_token.is_some(),
+            "served a request"
+        );
+
+        Ok(ListMetadataTransferJobsOutput {
+            // Required by the model, so present even for an account holding no
+            // job with these ends (or one whose filters select none): an empty
+            // list says there is none.
+            metadata_transfer_job_summaries,
+            next_token,
+        })
     }
+}
+
+/// Whether `job` transfers FROM a source of `source_type` TO a destination of
+/// `destination_type` — the two ends the request names, both required.
+///
+/// A job carries a LIST of sources (`SourceConfigurations`), so it is in the
+/// listing when ANY of its sources is of the requested type; its destination is
+/// a single configuration, so that one must be of the requested type. Each end's
+/// `type` is read from the configuration the create persisted, which is also
+/// what `GetMetadataTransferJob` reports.
+fn transfers_between(
+    job: &crate::state::MetadataTransferJob,
+    source_type: &str,
+    destination_type: &str,
+) -> bool {
+    job.destination.r#type == destination_type
+        && job
+            .sources
+            .iter()
+            .any(|source| source.r#type == source_type)
+}
+
+/// Whether `job` is in the set this one `filter` selects.
+fn matches_filter(
+    job: &crate::state::MetadataTransferJob,
+    filter: &ListMetadataTransferJobsFilter,
+) -> bool {
+    match filter {
+        // The workspace the filter names is at one END of the transfer: a job
+        // names a workspace only through the IoT TwinMaker configuration of one
+        // of its sources or of its destination, so the job matches when either
+        // end names that workspace.
+        ListMetadataTransferJobsFilter::workspaceId(workspace_id) => {
+            referenced_workspaces(job).any(|named| names_workspace(named, workspace_id))
+        }
+        // The job's `MetadataTransferJobState`, as stored — settled by the
+        // caller before this runs, so the filter selects on the state the
+        // listing is about to report rather than a stale one.
+        ListMetadataTransferJobsFilter::State(wanted) => job.state == *wanted,
+    }
+}
+
+/// Every workspace `job` names, in the order it names them: the workspace of
+/// each IoT TwinMaker source, then of an IoT TwinMaker destination — the
+/// traversal `CreateMetadataTransferJob` makes over its request. The other end
+/// types name an Amazon S3 location or an IoT SiteWise asset model instead,
+/// neither of which is a workspace.
+fn referenced_workspaces(
+    job: &crate::state::MetadataTransferJob,
+) -> impl Iterator<Item = &str> + '_ {
+    job.sources
+        .iter()
+        .filter_map(|source| source.iot_twin_maker_configuration.as_ref())
+        .map(|configuration| configuration.workspace.as_str())
+        .chain(
+            job.destination
+                .iot_twin_maker_configuration
+                .as_ref()
+                .map(|configuration| configuration.workspace.as_str()),
+        )
+}
+
+/// Whether the end of a transfer naming `named` names the workspace
+/// `workspace_id`.
+///
+/// An end names its workspace by ARN (the modelled `workspace` member targets
+/// `TwinMakerArn`) while the filter names it by id, so the ARN is reduced to the
+/// id it carries ([`crate::state::workspace_id_in_arn`]) and only ids are
+/// compared — a filter naming a whole ARN therefore matches nothing, as the id
+/// the member is modelled to carry. A stored value that is no workspace ARN at
+/// all is compared as it stands. Reading the id out of the ARN rather than
+/// resolving it through the store is deliberate: a job of a workspace that has
+/// since been deleted is still that workspace's job.
+fn names_workspace(named: &str, workspace_id: &str) -> bool {
+    match crate::state::workspace_id_in_arn(named) {
+        Some(named_id) => named_id == workspace_id,
+        None => named == workspace_id,
+    }
+}
+
+/// The most `filters` one listing accepts.
+///
+/// `ListMetadataTransferJobsFilter` is a union of TWO members — a workspace and
+/// a state — so two entries already narrow the listing on every dimension it
+/// has, and a longer list can only repeat one of them. The model puts no
+/// `@length` on `ListMetadataTransferJobsFilters`, so the bound is this
+/// handler's: the work one listing costs is the number of filters times the jobs
+/// scanned, and bounding the request-sized factor is what keeps that product
+/// bounded whatever a caller sends.
+const MAX_FILTERS: usize = 2;
+
+/// The most filter comparisons one listing can cost, as a bound checked at
+/// COMPILE time: the jobs scanned are bounded by the ceiling the create enforces
+/// and the filters by [`MAX_FILTERS`], so raising either past this budget fails
+/// the build instead of admitting a scan a request can grow.
+const MAX_FILTER_COMPARISONS: usize = 10_000;
+const _: () =
+    assert!(MAX_FILTERS * crate::state::MAX_METADATA_TRANSFER_JOBS <= MAX_FILTER_COMPARISONS);
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, over other ends of a
+/// transfer, or by hand — is recognisably not one of ours. The token itself is
+/// the shape every paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the ends the page was taken
+/// over.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:metadataTransferJobs:1:";
+
+/// The opaque `nextToken` for a page of the jobs between `source_type` and
+/// `destination_type`, starting at `metadata_transfer_job_id`.
+fn encode_next_token(
+    source_type: &str,
+    destination_type: &str,
+    metadata_transfer_job_id: &str,
+) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[source_type, destination_type],
+        metadata_transfer_job_id,
+    )
+}
+
+/// The job id inside a `nextToken` minted for these ends, or `None` when the
+/// token is not one this listing minted for them.
+fn decode_next_token(token: &str, source_type: &str, destination_type: &str) -> Option<String> {
+    crate::state::decode_page_token(NEXT_TOKEN_PREFIX, &[source_type, destination_type], token)
 }

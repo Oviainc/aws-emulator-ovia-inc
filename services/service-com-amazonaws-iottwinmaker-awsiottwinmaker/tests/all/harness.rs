@@ -309,6 +309,14 @@ impl Emulator {
         .await
     }
 
+    /// `ListMetadataTransferJobs`: POST /metadata-transfer-jobs-list, with the
+    /// required end types, any `filters` and the page members all carried in the
+    /// body (the request binds no label and no query).
+    pub(crate) async fn list_metadata_transfer_jobs(&self, request: Value) -> Resp {
+        self.call("POST", "/metadata-transfer-jobs-list", Some(request))
+            .await
+    }
+
     /// `CreateSyncJob`: POST
     /// /workspaces/{workspaceId}/sync-jobs/{syncSource}, with both the
     /// workspace and the sync source as `@httpLabel`s and `syncRole`/`tags` in

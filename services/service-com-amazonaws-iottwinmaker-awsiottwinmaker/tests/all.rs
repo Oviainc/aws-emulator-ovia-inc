@@ -41,6 +41,9 @@ mod metadata_transfer_job;
 #[path = "all/metadata_transfer_job_cancel.rs"]
 mod metadata_transfer_job_cancel;
 
+#[path = "all/metadata_transfer_job_listing.rs"]
+mod metadata_transfer_job_listing;
+
 #[path = "all/metadata_transfer_job_read.rs"]
 mod metadata_transfer_job_read;
 
