@@ -163,6 +163,65 @@ impl Emulator {
     }
 }
 
+/// The `(environmentId, bandwidth)` pairs a connection can be created on, taken
+/// from the live catalog rather than from a copy of it, so a suite's rows can differ
+/// in the environment and the bandwidth as well as in what they are testing.
+pub(crate) async fn placements(emulator: &Emulator) -> Vec<(String, String)> {
+    let catalog = emulator.environments().await;
+    let mut out = Vec::new();
+    for environment in creatable_environments(&catalog) {
+        let environment_id = text(&environment, "environmentId");
+        for bandwidth in available_bandwidths(&environment) {
+            out.push((environment_id.clone(), bandwidth));
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "the seeded catalog must offer at least one environment that takes connections"
+    );
+    out
+}
+
+/// Create a connection on `placement` carrying `tags`, and return the stored
+/// `Connection` as `CreateConnection` reported it. `seed` keeps each row's attach
+/// point distinct.
+pub(crate) async fn create_with_tags(
+    emulator: &Emulator,
+    placement: &(String, String),
+    seed: usize,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> Value {
+    let mut request = Map::new();
+    request.insert("environmentId".to_string(), json!(placement.0));
+    request.insert("bandwidth".to_string(), json!(placement.1));
+    request.insert(
+        "attachPoint".to_string(),
+        json!({ "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-{seed:012}") }),
+    );
+    request.insert("description".to_string(), json!(format!("tag case {seed}")));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), json!(tags));
+    }
+    let created = emulator
+        .ic_ok("CreateConnection", Value::Object(request))
+        .await;
+    created["connection"].clone()
+}
+
+/// The `tags` member of a `Connection` or of a `ListTagsForResource` response, with
+/// absent and empty treated as the same "no tags" — which is what the store holds
+/// once the last key is removed.
+pub(crate) fn tags_of(value: &Value) -> std::collections::BTreeMap<String, String> {
+    value["tags"]
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A string member, or `""` when absent — so a missing member fails an assertion
 /// rather than panicking the harness.
 pub(crate) fn text(value: &Value, member: &str) -> String {

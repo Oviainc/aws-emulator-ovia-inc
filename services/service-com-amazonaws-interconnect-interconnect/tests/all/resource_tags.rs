@@ -20,11 +20,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
-use crate::emulator::{
-    available_bandwidths, code, creatable_environments, message, text, Emulator,
-};
+use crate::emulator::{code, create_with_tags, message, placements, tags_of, text, Emulator};
 
 /// The account id every emulator ARN carries.
 const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -45,68 +43,6 @@ const TAG_VALUE_MAX: usize = 256;
 // ---------------------------------------------------------------------------
 // Harness helpers
 // ---------------------------------------------------------------------------
-
-/// The `(environmentId, bandwidth)` pairs a connection can be created on, taken
-/// from the live catalog rather than from a copy of it, so rows differ in the
-/// environment and the bandwidth as well as in their tags.
-async fn placements(emulator: &Emulator) -> Vec<(String, String)> {
-    let catalog = emulator.environments().await;
-    let mut out = Vec::new();
-    for environment in creatable_environments(&catalog) {
-        let environment_id = text(&environment, "environmentId");
-        for bandwidth in available_bandwidths(&environment) {
-            out.push((environment_id.clone(), bandwidth));
-        }
-    }
-    assert!(
-        !out.is_empty(),
-        "the seeded catalog must offer at least one environment that takes connections"
-    );
-    out
-}
-
-/// Create a connection on `placement` carrying `tags`, and return the stored
-/// `Connection` as `CreateConnection` reported it.
-async fn create_with_tags(
-    emulator: &Emulator,
-    placement: &(String, String),
-    seed: usize,
-    tags: &BTreeMap<String, String>,
-) -> Value {
-    let mut request = Map::new();
-    request.insert("environmentId".to_string(), json!(placement.0));
-    request.insert("bandwidth".to_string(), json!(placement.1));
-    request.insert(
-        "attachPoint".to_string(),
-        json!({ "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-{seed:012}") }),
-    );
-    request.insert("description".to_string(), json!(format!("tag case {seed}")));
-    if !tags.is_empty() {
-        request.insert("tags".to_string(), json!(tags));
-    }
-    let created = emulator
-        .ic_ok("CreateConnection", Value::Object(request))
-        .await;
-    created["connection"].clone()
-}
-
-/// The tag set of a `Connection`, with absent and empty treated as the same "no
-/// tags" — which is what the store holds once the last key is removed.
-fn tags_of(connection: &Value) -> BTreeMap<String, String> {
-    connection["tags"]
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        value.as_str().unwrap_or_default().to_string(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// A `Connection` with its tag set projected out, so two records can be compared
 /// on everything a tag change must NOT touch.

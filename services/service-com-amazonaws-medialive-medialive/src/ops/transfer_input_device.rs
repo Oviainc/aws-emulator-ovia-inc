@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TransferInputDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TransferInputDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TransferInputDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the transfer of one claimed input device to another AWS account: the
+//! device the `InputDeviceId` resolves to keeps its record, and the transfer
+//! `TargetCustomerId`, `TargetRegion` and `TransferMessage` describe is stored
+//! on it until the recipient accepts or rejects it — which is what
+//! `ListInputDeviceTransfers` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TransferInputDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TransferInputDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TransferInputDevice"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        // The recipient is named by an ACCOUNT ID — `TargetCustomerId` is "The
+        // AWS account ID (12 digits) for the recipient of the device transfer" —
+        // and the model carries no constraint for it, so the service is what
+        // refuses anything else: a transfer addressed to something that is not
+        // an account id has no recipient to accept it.
+        if let Some(target) = input.target_customer_id.as_deref() {
+            if !crate::state::is_account_id(target) {
+                return Err(TransferInputDeviceErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::not_an_account_id_message(target)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "An optional message for the recipient. Maximum 280 characters." —
+        // the member's own documented bound, counted in CHARACTERS as it is
+        // documented, so a message of multi-byte characters is measured the way
+        // the sender wrote it.
+        if let Some(message) = input.transfer_message.as_deref() {
+            let characters = message.chars().count();
+            if characters > crate::state::MAX_TRANSFER_MESSAGE_CHARS {
+                return Err(TransferInputDeviceErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "TransferMessage is at most {} characters, got {characters}",
+                            crate::state::MAX_TRANSFER_MESSAGE_CHARS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `TargetRegion` ("The target AWS region to transfer the device") is
+        // stored verbatim and deliberately NOT shape-checked: the model carries
+        // no constraint for it and the member's documentation names no form, so
+        // the service has no rule to refuse a value by — unlike the two members
+        // validated above, whose bounds their own documentation states.
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A transfer transfers a device this account OWNS, so the id is resolved
+        // against the claimed devices: an id no claim registered is the
+        // operation's own modelled not-found rather than a transfer of a device
+        // conjured out of the request.
+        let device = state
+            .input_device_mut(&input.input_device_id)
+            .ok_or_else(|| {
+                TransferInputDeviceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "InputDevice",
+                        &input.input_device_id,
+                    )),
+                })
+            })?;
+
+        // "After you make the request, the other account must accept or reject
+        // the transfer": a device already being transferred is waiting on that
+        // decision, so a second transfer of it conflicts with the pending one
+        // instead of replacing it.
+        if device.is_transferring() {
+            return Err(TransferInputDeviceErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "InputDevice {} is already being transferred",
+                        input.input_device_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        device.begin_transfer(crate::state::InputDeviceTransferRecord {
+            target_customer_id: input.target_customer_id,
+            target_region: input.target_region,
+            message: input.transfer_message,
+        });
+
+        Ok(TransferInputDeviceOutput {})
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no device store to record the transfer in. A modelled server
+/// error, never a fresh engine (which would drop the write when this request
+/// returns).
+fn unavailable() -> TransferInputDeviceError {
+    TransferInputDeviceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

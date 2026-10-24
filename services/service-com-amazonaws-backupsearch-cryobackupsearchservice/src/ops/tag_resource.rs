@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! Puts tags on the resource the ARN names — for this service a search job. Each entry
-//! is merged into the tags stored on that job, so a key already present takes the new
-//! value and the others are left alone; `ListTagsForResource` then returns the merged
-//! set. An ARN no resource of this account matches is a `ResourceNotFoundException`
-//! (404).
+//! Puts tags on the resource the ARN names — any resource this service mints and holds
+//! (a search job or an export job). Each entry is merged into the tags stored on that
+//! resource, so a key already present takes the new value and the others are left alone;
+//! `ListTagsForResource` then returns the merged set. An ARN no resource of this account
+//! matches is a `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -64,7 +64,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::SEARCH_JOB_RESOURCE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,12 +150,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        let job = state.job_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+        // Resolved against every taggable record this store holds, not only the search
+        // jobs: `ResourceArn` is documented as "the resource that will have the
+        // indicated tags", and both of this service's resources carry a tag set.
+        let stored = state.tags_by_arn_mut(&input.resource_arn).ok_or_else(|| {
             TagResourceError::from(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("no resource with ARN '{}' exists", input.resource_arn),
                     resource_id: input.resource_arn.clone(),
-                    resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                    // The type the submitted ARN claims; the lookup spans more than one,
+                    // so the refusal cannot name a fixed one.
+                    resource_type: crate::state::arn_resource_type(&input.resource_arn),
                 },
             ))
         })?;
@@ -168,16 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::check_tag_entry(key, value)
                 .map_err(crate::scaffolded::Scaffolded::validation)?;
         }
-        let merged = job.tags.len()
+        let merged = stored.len()
             + input
                 .tags
                 .keys()
-                .filter(|key| !job.tags.contains_key(*key))
+                .filter(|key| !stored.contains_key(*key))
                 .count();
         crate::state::check_tag_count(merged).map_err(crate::scaffolded::Scaffolded::validation)?;
 
         for (key, value) in input.tags {
-            job.tags.insert(key, value);
+            stored.insert(key, value);
         }
         Ok(TagResourceOutput {})
     }

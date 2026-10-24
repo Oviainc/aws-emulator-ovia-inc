@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `NextToken` the paginated Describe* operations mint.
 hex = { workspace = true }
+# Mints the UUID `ActionId` CreateBudgetAction gives a new budget action — "a
+# system-generated universally unique identifier (UUID) for the action" (`Action$ActionId`).
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

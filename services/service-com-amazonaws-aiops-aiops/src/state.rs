@@ -6,10 +6,16 @@
 //! stored exactly once, keyed by its 16-character id — the last segment of its ARN
 //! — so each operation reads and writes the one record.
 //!
-//! A group is addressed by its ARN alone. The modelled `InvestigationGroupIdentifier`
-//! pattern also admits a bare label, but the service resolves no group from one:
-//! every `{identifier}` that is not this service's investigation-group ARN is a
-//! modelled 404 ([`ComAmazonawsAiopsAiopsState::resolve_group_id`]).
+//! A group is addressed by EITHER of the two forms the modelled
+//! `InvestigationGroupIdentifier` admits: its ARN, or its own name — every
+//! `{identifier}` member documents "Specify either the name or the ARN of the
+//! investigation group". Both forms resolve the same record
+//! ([`ComAmazonawsAiopsAiopsState::resolve_group_id`]); an identifier that is neither
+//! a stored group's ARN nor a stored group's name is a modelled 404.
+//!
+//! The TAGGING operations are addressed differently: their `resourceArn` is documented
+//! as the resource's ARN and carries no name alternative, so they resolve through the
+//! ARN alone ([`ComAmazonawsAiopsAiopsState::resolve_group_arn`]).
 //!
 //! A group belongs to the Region its ARN names, and an account holds at most
 //! [`MAX_INVESTIGATION_GROUPS_PER_REGION`] of them there — so the store is keyed by
@@ -191,14 +197,15 @@ pub struct ComAmazonawsAiopsAiopsState {
 }
 
 impl ComAmazonawsAiopsAiopsState {
-    /// The id of the group `identifier` names — resolved from its ARN and from
-    /// nothing else.
+    /// The id of the group an `InvestigationGroupIdentifier` names: EITHER its ARN or
+    /// its name.
     ///
-    /// The modelled `InvestigationGroupIdentifier` pattern admits a bare
-    /// `[\-_A-Za-z0-9]{1,512}` label beside the ARN, so a name or a bare id reaches a
-    /// handler as a well-formed identifier; the service still resolves no group from
-    /// one, and every operation reports the group as absent instead. A name is
-    /// therefore not an address: only the ARN the create handed back is.
+    /// Every `{identifier}` member of this service documents "Specify either the name
+    /// or the ARN of the investigation group", and the modelled pattern spells the two
+    /// alternatives out (`[\-_A-Za-z0-9]{1,512}` beside the ARN). So both forms address
+    /// the same record, and an identifier that is neither a stored group's ARN nor a
+    /// stored group's name resolves to nothing — a bare id, for one, is not a form the
+    /// member documents.
     ///
     /// An ARN must match the stored ARN in EVERY field, so an ARN naming another
     /// partition, region or account resolves to nothing rather than to the group that
@@ -207,15 +214,60 @@ impl ComAmazonawsAiopsAiopsState {
     /// Resolution is also scoped to `request_region`, the Region the request was signed
     /// for: this service is reached through per-Region endpoints, so an endpoint holds
     /// only its own Region's groups and resolves nothing for a group that belongs to
-    /// another one — whatever ARN the request carried. That keeps a single reader,
-    /// writer and remover consistent with the regional `ListInvestigationGroups` and
-    /// with the per-region create quota.
+    /// another one — whatever ARN or name the request carried. That keeps a single
+    /// reader, writer and remover consistent with the regional
+    /// `ListInvestigationGroups` and with the per-region create quota.
     pub fn resolve_group_id(&self, identifier: &str, request_region: &str) -> Option<String> {
-        let id = group_id_from_arn(identifier)?;
+        self.resolve_group_arn(identifier, request_region)
+            .or_else(|| self.resolve_group_name(identifier, request_region))
+    }
+
+    /// The id of the group whose ARN is exactly `resource_arn`, in `request_region`.
+    ///
+    /// The ARN-only half of resolution, and the whole of it for the TAGGING operations:
+    /// their `resourceArn` is documented as "The ARN of the CloudWatch investigations
+    /// resource" with no name alternative, so a name addresses no tag set.
+    pub fn resolve_group_arn(&self, resource_arn: &str, request_region: &str) -> Option<String> {
+        let id = group_id_from_arn(resource_arn)?;
         self.investigation_groups
             .get(id)
-            .filter(|group| group.arn == identifier && group.region == request_region)
+            .filter(|group| group.arn == resource_arn && group.region == request_region)
             .map(|group| group.id.clone())
+    }
+
+    /// The id of the group NAMED `name` in `request_region`.
+    ///
+    /// A name identifies a group within one Region: an account holds at most
+    /// [`MAX_INVESTIGATION_GROUPS_PER_REGION`] group per Region, so no two groups of one
+    /// Region can share a name, while the SAME name in another Region names a different
+    /// group that this Region's endpoint may not reach. The store's stable id order
+    /// keeps the answer deterministic regardless.
+    fn resolve_group_name(&self, name: &str, request_region: &str) -> Option<String> {
+        self.groups_in_region(request_region)
+            .find(|group| group.name == name)
+            .map(|group| group.id.clone())
+    }
+
+    /// The group `resource_arn` names in `request_region`, for a reporting operation
+    /// addressed by ARN alone (the tagging frontend).
+    pub fn group_by_arn(
+        &self,
+        resource_arn: &str,
+        request_region: &str,
+    ) -> Option<&InvestigationGroup> {
+        let id = self.resolve_group_arn(resource_arn, request_region)?;
+        self.investigation_groups.get(&id)
+    }
+
+    /// The group `resource_arn` names in `request_region`, for a tagging operation the
+    /// spec says mutates its tag set.
+    pub fn group_by_arn_mut(
+        &mut self,
+        resource_arn: &str,
+        request_region: &str,
+    ) -> Option<&mut InvestigationGroup> {
+        let id = self.resolve_group_arn(resource_arn, request_region)?;
+        self.investigation_groups.get_mut(&id)
     }
 
     /// The group `identifier` names in `request_region`, for a reporting operation.

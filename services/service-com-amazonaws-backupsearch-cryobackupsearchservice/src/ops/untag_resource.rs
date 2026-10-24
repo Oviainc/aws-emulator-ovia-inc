@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! Removes tags from the resource the ARN names — for this service a search job. Each
-//! key in `TagKeys` is deleted from the tags stored on that job and every other key is
-//! left alone, so `ListTagsForResource` then reports exactly the surviving set. The
-//! operation is `@idempotent`: a key the resource does not carry removes nothing and is
-//! still a 200, and repeating the same call answers the same way. An ARN no resource of
-//! this account matches is a `ResourceNotFoundException` (404).
+//! Removes tags from the resource the ARN names — any resource this service mints and
+//! holds (a search job or an export job). Each key in `TagKeys` is deleted from the tags
+//! stored on that resource and every other key is left alone, so `ListTagsForResource`
+//! then reports exactly the surviving set. The operation is `@idempotent`: a key the
+//! resource does not carry removes nothing and is still a 200, and repeating the same
+//! call answers the same way. An ARN no resource of this account matches is a
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -64,7 +65,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::SEARCH_JOB_RESOURCE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,21 +156,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tag set is reached by ARN and is independent of both, so settling could not
         // change what this call reads or writes. The operations that report or move a
         // status settle first.
-        let job = state.job_by_arn_mut(&input.resource_arn).ok_or_else(|| {
+        //
+        // The ARN is resolved against every taggable record this store holds, not only
+        // the search jobs: both of this service's resources carry a tag set.
+        let stored = state.tags_by_arn_mut(&input.resource_arn).ok_or_else(|| {
             UntagResourceError::from(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("no resource with ARN '{}' exists", input.resource_arn),
                     resource_id: input.resource_arn.clone(),
-                    resource_type: SEARCH_JOB_RESOURCE.to_string(),
+                    // The type the submitted ARN claims; the lookup spans more than one,
+                    // so the refusal cannot name a fixed one.
+                    resource_type: crate::state::arn_resource_type(&input.resource_arn),
                 },
             ))
         })?;
 
-        // Removal only: a key the job does not carry leaves the stored set as it was,
-        // which is what makes this operation idempotent. Nothing here can grow the
+        // Removal only: a key the resource does not carry leaves the stored set as it
+        // was, which is what makes this operation idempotent. Nothing here can grow the
         // record, so the tag caps `TagResource` enforces have nothing to check.
         for key in &input.tag_keys {
-            job.tags.remove(key);
+            stored.remove(key);
         }
         Ok(UntagResourceOutput {})
     }

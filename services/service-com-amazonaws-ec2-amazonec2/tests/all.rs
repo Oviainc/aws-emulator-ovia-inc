@@ -209,3 +209,9 @@ mod wire;
 // Stopping the advertisement of a BYOIP address range, and what that refuses.
 #[path = "all/withdraw_byoip_cidr.rs"]
 mod withdraw_byoip_cidr;
+// Declared LAST rather than in sorted position, for the reason the note at the top of this
+// file records for `prefix_lists`: a new ec2 suite lands every few minutes and inserts its
+// two lines in sorted order, so a suite's own sorted neighbourhood is the contended region
+// of this file — and this one lost repeated serialized squash merges to exactly that.
+#[path = "all/traffic_mirror_filters.rs"]
+mod traffic_mirror_filters;

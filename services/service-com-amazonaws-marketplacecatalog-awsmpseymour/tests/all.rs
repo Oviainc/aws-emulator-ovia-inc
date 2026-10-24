@@ -21,5 +21,7 @@ mod entity_reads;
 mod request_validation;
 #[path = "all/resource_policy_and_tagging.rs"]
 mod resource_policy_and_tagging;
+#[path = "all/resource_policy_reads.rs"]
+mod resource_policy_reads;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

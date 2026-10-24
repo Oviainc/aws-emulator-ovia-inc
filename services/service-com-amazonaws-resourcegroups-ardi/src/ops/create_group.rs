@@ -300,6 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration: input.configuration.filter(|items| !items.is_empty()),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             members: Vec::new(),
+            // Nothing has been grouped or ungrouped in a group that was just
+            // created, so `ListGroupingStatuses` has nothing to report for it.
+            grouping_statuses: std::collections::BTreeMap::new(),
         };
         // Reported from the record that is about to be stored, so the response and
         // the store cannot disagree.

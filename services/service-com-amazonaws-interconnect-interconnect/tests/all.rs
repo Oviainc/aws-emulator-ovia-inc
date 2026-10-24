@@ -19,6 +19,8 @@ mod connection_lifecycle;
 mod connection_proposal;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/refusals_and_gateway_attach_points.rs"]
 mod refusals_and_gateway_attach_points;
 #[path = "all/resource_tags.rs"]

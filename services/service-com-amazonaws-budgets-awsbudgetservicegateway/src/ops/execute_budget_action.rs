@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteBudgetAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteBudgetAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteBudgetAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drives the `Action$Status` state machine of one stored budget action: the execution
+//! type the caller names takes the action into the matching `*_IN_PROGRESS` status, and
+//! the clock owes the settled status [`crate::state::ACTION_SETTLES_AFTER`] later
+//! ([`crate::state::action_execution`]). An execution type the action's current status
+//! leaves nothing to do is an `InvalidParameterException`; one aimed at an action whose
+//! work is still running is the locked resource `ResourceLockedException` names; a
+//! budget or action this account does not hold is a `NotFoundException`.
+//!
+//! Nothing here applies the action's `Definition` to IAM, Organizations or Systems
+//! Manager: that work belongs to other services and no request in this emulator runs
+//! it. What this operation owns is the budget control plane's own record of the action,
+//! which is what every read of that action reports.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +175,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteBudgetAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteBudgetActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteBudgetAction"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExecuteBudgetActionErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An action is a resource OF the budget it names (`Action$BudgetName`), so a
+        // budget this account does not hold holds no action either.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                ExecuteBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to execute budget action: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+        // The lookup materialises any settle the clock had already made due, so the
+        // status this call decides from is the one the action already carried.
+        let action =
+            crate::state::find_action_mut(stored, &input.action_id, now).ok_or_else(|| {
+                ExecuteBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to execute budget action: {} - the action doesn't exist.",
+                        input.action_id
+                    )),
+                })
+            })?;
+
+        // Work this service started and has not settled yet: the action is locked
+        // against a second execution until it does.
+        if crate::state::action_is_in_progress(&action.action.status) {
+            return Err(ExecuteBudgetActionErrorModeled::ResourceLockedException(
+                ResourceLockedException {
+                    message: Some(format!(
+                        "Unable to execute budget action: {} - the action is {} and cannot \
+                         take another execution until that completes.",
+                        input.action_id, action.action.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Which executions an action's status leaves to do is the rule; an execution
+        // type with nothing to do from here is an invalid input value, not a 501.
+        let execution = crate::state::action_execution(&input.execution_type, &action.action.status)
+            .ok_or_else(|| {
+                ExecuteBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Unable to execute budget action: {} - a {} execution isn't allowed \
+                             while the action is {}.",
+                            input.action_id, input.execution_type, action.action.status
+                        )),
+                    },
+                )
+            })?;
+        // In progress NOW, settled when the clock says so — so a caller reading
+        // straight after this call still sees the in-progress status and the refusals
+        // that status carries.
+        action.start(execution, now);
+
+        Ok(ExecuteBudgetActionOutput {
+            account_id: input.account_id,
+            budget_name: input.budget_name,
+            action_id: input.action_id,
+            execution_type: input.execution_type,
+        })
     }
 }

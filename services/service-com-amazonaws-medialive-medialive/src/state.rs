@@ -28,7 +28,9 @@
 //! its own. A device's `DeviceUpdateStatus` comes out of the maintenance window
 //! `StartInputDeviceMaintenanceWindow` opens on it, and its `OutputType` and
 //! `MedialiveInputArns` out of the inputs this store holds — see
-//! [`input_devices`].
+//! [`input_devices`]. A device also carries the TRANSFER pending on it, which
+//! `TransferInputDevice` records and `ListInputDeviceTransfers` reports in the
+//! direction the reader asks for.
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
@@ -274,7 +276,9 @@ pub use alerts::{
 pub mod input_devices;
 
 pub use input_devices::{
-    input_device_type_for_id, not_a_device_id_message, InputDeviceRecord, MAX_INPUT_DEVICES,
+    input_device_transfer_type, input_device_type_for_id, is_account_id,
+    not_a_device_id_message, not_an_account_id_message, InputDeviceRecord,
+    InputDeviceTransferRecord, MAX_INPUT_DEVICES, MAX_TRANSFER_MESSAGE_CHARS,
 };
 
 pub(crate) use input_devices::input_device_output;

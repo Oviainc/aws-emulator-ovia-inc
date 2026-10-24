@@ -26,6 +26,16 @@
 //! absent and `ConnectionState` is the `DISCONNECTED` the model gives that
 //! situation.
 //!
+//! A device's pending TRANSFER is one optional record on the device it is a
+//! transfer of ([`InputDeviceTransferRecord`]): `TransferInputDevice` records it
+//! ("Start an input device transfer to another AWS account. After you make the
+//! request, the other account must accept or reject the transfer"), and
+//! `ListInputDeviceTransfers` reports it, filtered by the direction the request
+//! asks for. It lives ON the device record rather than in a map beside the
+//! devices, because a transfer is a transfer OF one device and at most one is
+//! pending on a device at a time, so a reader of the device and a reader of the
+//! transfer cannot drift apart.
+//!
 //! A device's MAINTENANCE WINDOW is one stored instant on the record: the
 //! moment the window the clock owes closes. `StartInputDeviceMaintenanceWindow`
 //! opens it, which is what puts the device's `DeviceUpdateStatus` in `UPDATING`,
@@ -36,7 +46,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use crate::ops::types::InputDeviceSummary;
+use crate::ops::types::{InputDeviceSummary, TransferringInputDeviceSummary};
 
 use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 
@@ -74,6 +84,25 @@ pub mod device_settings_sync_state {
 pub mod input_device_type {
     pub const HD: &str = "HD";
     pub const UHD: &str = "UHD";
+}
+
+/// The `InputDeviceTransferType` values, spelled exactly as the model declares
+/// them (`smithy_query(query="shape", shape="InputDeviceTransferType")`:
+/// OUTGOING | INCOMING). The enum's own documentation fixes which direction each
+/// one names: "INCOMING for an input device that is being transferred to you,
+/// OUTGOING for an input device that you are transferring to another AWS
+/// account".
+///
+/// `ListInputDeviceTransfers` takes the direction as a `__string` rather than as
+/// this enum, so the service is what refuses a value outside it — hence
+/// [`ALL`](input_device_transfer_type::ALL), the one list of the accepted
+/// spellings, which both the refusal's wording and the direction filter read.
+pub mod input_device_transfer_type {
+    pub const OUTGOING: &str = "OUTGOING";
+    pub const INCOMING: &str = "INCOMING";
+
+    /// Every value the enum declares, in the model's order.
+    pub const ALL: [&str; 2] = [OUTGOING, INCOMING];
 }
 
 /// The `InputDeviceOutputType` values this slice derives, spelled exactly as the
@@ -145,6 +174,54 @@ pub fn not_a_device_id_message(id: &str) -> String {
     )
 }
 
+/// The longest `TransferMessage` a transfer accepts, in characters: the member's
+/// own documentation is the constraint ("An optional message for the recipient.
+/// Maximum 280 characters."), and the model carries no `@length` for it, so the
+/// service is what enforces it.
+pub const MAX_TRANSFER_MESSAGE_CHARS: usize = 280;
+
+/// The number of digits in the account id a transfer names: `TargetCustomerId`
+/// is "The AWS account ID (12 digits) for the recipient of the device transfer".
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Whether `value` is an AWS account id, the form `TargetCustomerId` documents
+/// ([`ACCOUNT_ID_DIGITS`] decimal digits).
+pub fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|digit| digit.is_ascii_digit())
+}
+
+/// The message a transfer refused for a `TargetCustomerId` that is not an
+/// account id carries: the value the request named and the form the member
+/// documents. Built from the request, so it names what the caller must change.
+pub fn not_an_account_id_message(value: &str) -> String {
+    format!(
+        "{value} is not an AWS account ID: TargetCustomerId is the recipient's \
+         {ACCOUNT_ID_DIGITS}-digit AWS account ID"
+    )
+}
+
+/// One transfer of one input device, pending until the other account accepts or
+/// rejects it (or the sender cancels it).
+///
+/// The members are the ones `TransferInputDevice` records and
+/// `TransferringInputDeviceSummary` reports back; the summary's `TransferType`
+/// is NOT among them, because the direction is not a property of the transfer
+/// but of the side reading it (see
+/// [`ComAmazonawsMedialiveMedialiveState::input_device_transfer_summary`]).
+#[derive(Debug, Clone)]
+pub struct InputDeviceTransferRecord {
+    /// "The AWS account ID (12 digits) for the recipient of the device
+    /// transfer", absent when the request named none.
+    pub target_customer_id: Option<String>,
+    /// "The target AWS region to transfer the device", absent when the request
+    /// named none.
+    pub target_region: Option<String>,
+    /// "An optional message for the recipient", which the summary reports as
+    /// `Message` — "The optional message that the sender has attached to the
+    /// transfer".
+    pub message: Option<String>,
+}
+
 /// One claimed input device.
 ///
 /// The members mirror the model's `InputDeviceSummary` shape minus the ones that
@@ -178,6 +255,12 @@ pub struct InputDeviceRecord {
     /// [`InputDeviceRecord::settle`], and the only way to read it is
     /// [`InputDeviceRecord::device_update_status`].
     maintenance_window_close: Option<SystemTime>,
+    /// The transfer pending on this device, or `None` while none is.
+    ///
+    /// PRIVATE, so the only way in is
+    /// [`InputDeviceRecord::begin_transfer`] and the only way to read it is
+    /// [`InputDeviceRecord::pending_transfer`].
+    transfer: Option<InputDeviceTransferRecord>,
 }
 
 impl InputDeviceRecord {
@@ -230,6 +313,26 @@ impl InputDeviceRecord {
             self.maintenance_window_close = None;
         }
     }
+
+    /// The transfer pending on this device, or `None` while none is.
+    pub fn pending_transfer(&self) -> Option<&InputDeviceTransferRecord> {
+        self.transfer.as_ref()
+    }
+
+    /// Whether a transfer is pending on this device right now.
+    pub fn is_transferring(&self) -> bool {
+        self.transfer.is_some()
+    }
+
+    /// Record `transfer` as the transfer pending on this device.
+    ///
+    /// The caller resolves the conflict first: a device a transfer is already
+    /// pending on is not transferred again ("the other account must accept or
+    /// reject the transfer" before anything else happens to it), which is the
+    /// operation's own modelled `ConflictException`.
+    pub fn begin_transfer(&mut self, transfer: InputDeviceTransferRecord) {
+        self.transfer = Some(transfer);
+    }
 }
 
 /// A freshly claimed device: the id the claim named, the ARN built from it, and
@@ -244,6 +347,36 @@ pub fn new_input_device(id: String, arn: String, device_type: &str) -> InputDevi
         device_settings_sync_state: device_settings_sync_state::SYNCED.to_string(),
         tags: HashMap::new(),
         maintenance_window_close: None,
+        transfer: None,
+    }
+}
+
+/// Whether the pending transfer `transfer` has the direction `transfer_type`
+/// names, read from THIS account's side.
+///
+/// `OUTGOING` is "an input device that you are transferring to another AWS
+/// account", which is every transfer this store holds: `TransferInputDevice` is
+/// the only thing that records one and it transfers a device this account owns.
+/// `INCOMING` is "an input device that is being transferred to you", so it is a
+/// transfer whose RECIPIENT is this account — this emulator serves the single
+/// account `engine::emulator_account_id()`, so a transfer addressed to that
+/// account id is one being transferred to you as much as it is one you sent.
+/// Any other spelling names no direction at all.
+///
+/// A transfer addressed to this emulator's own account is therefore reported by
+/// BOTH directions, which is the consequence of serving one account: on real
+/// AWS the sender and the recipient are different accounts, and each sees the
+/// one transfer from its own side only. Reporting it from both sides is the
+/// faithful reading available here — the alternative, calling a transfer this
+/// account started `INCOMING` only, would hide it from the sender that started
+/// it.
+fn transfer_has_direction(transfer: &InputDeviceTransferRecord, transfer_type: &str) -> bool {
+    match transfer_type {
+        input_device_transfer_type::OUTGOING => true,
+        input_device_transfer_type::INCOMING => {
+            transfer.target_customer_id.as_deref() == Some(::engine::emulator_account_id())
+        }
+        _ => false,
     }
 }
 
@@ -283,6 +416,36 @@ impl ComAmazonawsMedialiveMedialiveState {
         let device = new_input_device(id.clone(), arn, device_type);
         self.input_devices.insert(id, device);
         true
+    }
+
+    /// The `TransferringInputDeviceSummary` projection of the transfer pending
+    /// on the device `id`, as the direction `transfer_type` reads it, or `None`
+    /// when this account has claimed no device with that id, when no transfer is
+    /// pending on it, or when the pending transfer is not of that direction.
+    ///
+    /// The one projection of a pending transfer, so every operation that reports
+    /// one reads the same record the same way — and the one place the direction
+    /// filter is applied, so what a listing reports and what it calls the
+    /// transfer cannot disagree.
+    pub fn input_device_transfer_summary(
+        &self,
+        id: &str,
+        transfer_type: &str,
+    ) -> Option<TransferringInputDeviceSummary> {
+        let device = self.input_devices.get(id)?;
+        let transfer = device.pending_transfer()?;
+        if !transfer_has_direction(transfer, transfer_type) {
+            return None;
+        }
+        Some(TransferringInputDeviceSummary {
+            id: Some(device.id.clone()),
+            message: transfer.message.clone(),
+            target_customer_id: transfer.target_customer_id.clone(),
+            // The direction the READER asked for, which is the side the
+            // transfer was reported to: the same transfer is outgoing for its
+            // sender and incoming for its recipient.
+            transfer_type: Some(transfer_type.to_string()),
+        })
     }
 
     /// The device this account owns under `id`, to write through, or `None` when
