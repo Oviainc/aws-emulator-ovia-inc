@@ -24,13 +24,21 @@ tracing = { workspace = true }
 # `PutParameter`'s AllowedPattern is a regular expression the value must satisfy.
 # The floor matches the version the vendored framework pins, so the tree resolves one.
 regex = "1.12"
+# `arn::parse_of`: the one parse a service reads a caller-supplied resource ARN with,
+# which `DescribeDocument`'s `DocumentARN` name may be.
+service-common = { path = "../common" }
+# `CreateDocument`'s content is "in JSON or YAML format", and the document's schema
+# version, description and parameters are read out of it. yaml-rust2 is a pure-Rust
+# YAML 1.2 implementation, and YAML 1.2 is a superset of JSON, so one parser reads
+# either spelling of the same document.
+yaml-rust2 = { version = "0.10", default-features = false }
+# `DocumentDescription$Hash` is "the Sha256 … hash created by the system when the
+# document was created", rendered hex.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

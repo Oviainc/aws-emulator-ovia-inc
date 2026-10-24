@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDocument`'s real behaviour. Implement it here — this is
+//! Register an SSM document — the write half of this service's document slice. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is read back by `DescribeDocument`; both reach the one store in
+//! [`crate::state`]. A document name is unique within a Region, so a create against a
+//! name the Region already holds is refused with `DocumentAlreadyExists`.
+//!
+//! Everything the response reports beyond the request's own members is derived from the
+//! content that was persisted (`crate::state::parse_document_content`): the schema
+//! version, the description, the parameters, the platform types and the Sha256 hash.
+//! The document is minted `Creating` and the clock owes its move to `Active`
+//! ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), so a caller reading straight after
+//! this call still sees the transient status.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +207,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDocument"))
+        // `Name`'s pattern, `DisplayName`'s and `TargetType`'s patterns and lengths and
+        // the `DocumentFormat` / `DocumentType` value sets are MODELLED constraints, so
+        // the centralized walk has already refused anything outside them. What is
+        // checked here is what the model cannot say: the documented size and name
+        // rules, the content's own structure, and the document quota.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDocumentErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The content of the document must not exceed 64KB" — applied before anything
+        // parses or hashes the content, so no per-request work is proportional to an
+        // unbounded request.
+        if input.content.len() > crate::state::MAX_DOCUMENT_CONTENT {
+            return Err(CreateDocumentErrorModeled::MaxDocumentSizeExceeded(
+                MaxDocumentSizeExceeded {
+                    message: Some(format!(
+                        "Content is {} bytes: the size limit of a document is {} bytes",
+                        input.content.len(),
+                        crate::state::MAX_DOCUMENT_CONTENT
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(why) = crate::state::document_name_rejection(&input.name) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        // `DocumentFormat` and `DocumentType` are modelled enums, so the walk has
+        // already refused a value outside their value sets. Both are re-checked here
+        // because the format decides how the content is parsed and the type decides
+        // which schema versions it may declare: a value the model does not declare must
+        // not be served as if it were the default. A member the request OMITS gets the
+        // documented default; one it sends EMPTY is outside the value set and is
+        // refused, not defaulted.
+        let document_format = input
+            .document_format
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_DOCUMENT_FORMAT.to_string());
+        if !DOCUMENT_FORMAT_VALUES.contains(&document_format.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "DocumentFormat '{document_format}' isn't one of the document formats {}",
+                DOCUMENT_FORMAT_VALUES.join(", ")
+            )));
+        }
+        let document_type = input
+            .document_type
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_DOCUMENT_TYPE.to_string());
+        if !DOCUMENT_TYPE_VALUES.contains(&document_type.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "DocumentType '{document_type}' isn't one of the document types {}",
+                DOCUMENT_TYPE_VALUES.join(", ")
+            )));
+        }
+
+        let parsed =
+            crate::state::parse_document_content(&input.content, &document_format, &document_type)
+                .map_err(|rejection| match rejection {
+                    crate::state::ContentRejection::Content(why) => {
+                        CreateDocumentErrorModeled::InvalidDocumentContent(InvalidDocumentContent {
+                            message: Some(why),
+                        })
+                    }
+                    crate::state::ContentRejection::SchemaVersion(why) => {
+                        CreateDocumentErrorModeled::InvalidDocumentSchemaVersion(
+                            InvalidDocumentSchemaVersion { message: Some(why) },
+                        )
+                    }
+                })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of this store reports what the clock already owes, so a transition due
+        // before this call is materialised before the quota below counts documents.
+        store.materialize_due(now);
+
+        if store.document(&region, &input.name).is_some() {
+            return Err(CreateDocumentErrorModeled::DocumentAlreadyExists(
+                DocumentAlreadyExists {
+                    message: Some(format!(
+                        "Document {} already exists in {region}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+        // The published quota is per Region. The Region comes from the request's own
+        // credential scope, which the caller chooses, so the store also carries the
+        // emulator's own total guard (`MAX_DOCUMENTS_TOTAL`): without it the quota would
+        // be one quota per caller-chosen partition of the key space and the store could
+        // grow without bound.
+        // Each branch reports the limit that actually tripped, through the one modelled
+        // error: the published per-Region quota in the service's own words, and the
+        // emulator's total guard named as the emulator's.
+        let limit_reached = if store.documents_in_region(&region) >= crate::state::MAX_DOCUMENTS {
+            Some(format!(
+                "You can have at most {} active SSM documents",
+                crate::state::MAX_DOCUMENTS
+            ))
+        } else if store.documents.len() >= crate::state::MAX_DOCUMENTS_TOTAL {
+            Some(format!(
+                "This emulator holds at most {} documents across every Region",
+                crate::state::MAX_DOCUMENTS_TOTAL
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = limit_reached {
+            return Err(CreateDocumentErrorModeled::DocumentLimitExceeded(
+                DocumentLimitExceeded {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::DocumentRecord {
+            name: input.name.clone(),
+            region,
+            display_name: input.display_name.clone(),
+            version_name: input.version_name.clone(),
+            document_type,
+            document_format,
+            target_type: input.target_type.clone(),
+            hash: document_hash(&input.content),
+            content: input.content.clone(),
+            parsed,
+            requires: input.requires.clone(),
+            attachment_names: attachment_names(input.attachments.as_deref()),
+            tags: crate::state::to_btree_map(input.tags.clone()),
+            created_date: now,
+            // "The status of the SSM document": a document Systems Manager is still
+            // registering is `Creating`, and the clock owes its move to `Active` at
+            // `active_due`, so a caller acting straight after this call still sees the
+            // transient status.
+            status: crate::state::DOCUMENT_STATUS_CREATING.to_string(),
+            active_due: Some(now + crate::state::DOCUMENT_TRANSITION_DELAY),
+        };
+        let description = record.to_description();
+        store.insert_document(record);
+
+        Ok(CreateDocumentOutput {
+            document_description: Some(description),
+        })
     }
+}
+
+/// The hash the system takes over a document's content: "The Sha256 or Sha1 hash
+/// created by the system when the document was created" (`DocumentDescription$Hash`),
+/// with "Sha1 hashes have been deprecated", rendered hex the way AWS reports it.
+fn document_hash(content: &str) -> String {
+    use ::sha2::Digest;
+    ::hex::encode(::sha2::Sha256::digest(content.as_bytes()))
+}
+
+/// The attachment names `AttachmentsInformation` reports — "details about the document
+/// attachments, including names" — for the attachment sources a create named.
+///
+/// An `AttachmentsSource` carries "the name of the document attachment file" in `Name`;
+/// a source that names none is identified by the file its `Values` URL points at, which
+/// is the last segment of that URL.
+fn attachment_names(attachments: Option<&[AttachmentsSource]>) -> Vec<String> {
+    attachments
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|source| {
+            source
+                .name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    let value = source.values.as_ref()?.first()?;
+                    let file = value.rsplit('/').next().unwrap_or(value);
+                    (!file.is_empty()).then(|| file.to_string())
+                })
+        })
+        .collect()
 }

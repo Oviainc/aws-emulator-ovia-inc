@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/parameter_store.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/documents.rs"]
+mod documents;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
 #[path = "all/managed_node_information.rs"]

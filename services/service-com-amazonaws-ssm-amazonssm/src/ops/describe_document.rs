@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDocument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Describe a stored SSM document — the read half of this service's document slice.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It reports what `CreateDocument` persisted, from the one store in [`crate::state`]:
+//! the only write it makes is materialising the status move the clock already owes
+//! ([`crate::state::DOCUMENT_TRANSITION_DELAY`]), which was due at the same instant
+//! even if nobody had called.
+//!
+//! Implementing this operation also closes
+//! `issues/.../ssm-describedocument-stub.md`, which asks for exactly this handler;
+//! `CreateDocument` needs it for anything to read its write back.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +148,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDocument"))
+        // `Name`'s and `DocumentVersion`'s patterns are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them: reaching here
+        // means `DocumentVersion` is `$LATEST`, `$DEFAULT` or a positive integer.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeDocumentErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        let missing = || {
+            DescribeDocumentErrorModeled::InvalidDocument(InvalidDocument {
+                message: Some(format!("Document {} doesn't exist", input.name)),
+            })
+        };
+
+        // "Name is the full Amazon Resource Name (ARN) of the document" for a shared
+        // document, so either spelling names the same document; a name this service
+        // could never have stored (an ARN of another service, say) names no document,
+        // so it is a miss rather than a refusal.
+        let Some(query) = crate::state::parse_document_query(&input.name) else {
+            return Err(missing().into());
+        };
+        // A document is resolved through the endpoint it is asked for: an ARN naming
+        // another account or another Region than this request was signed for names
+        // nothing reachable here. The Region therefore never comes from the request
+        // body — only from the signed credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        if query
+            .account
+            .is_some_and(|account| account != ::engine::emulator_account_id())
+            || query.region.is_some_and(|named| named != region)
+        {
+            return Err(missing().into());
+        }
+
+        let mut store = state.lock();
+        // The one write a report makes: the move to `Active` the clock already owed.
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(record) = store.document(&region, query.name) else {
+            return Err(missing().into());
+        };
+
+        // "The document version for which you want information. Can be a specific
+        // version or the default version": `$LATEST` and `$DEFAULT` both name the one
+        // version this document holds, and any other number names a version it does
+        // not carry.
+        if let Some(requested) = input
+            .document_version
+            .as_deref()
+            .filter(|version| !version.is_empty())
+        {
+            let names_the_stored_version = requested == crate::state::DOCUMENT_VERSION_LATEST
+                || requested == crate::state::DOCUMENT_VERSION_DEFAULT
+                || requested == crate::state::FIRST_DOCUMENT_VERSION;
+            if !names_the_stored_version {
+                return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
+                    InvalidDocumentVersion {
+                        message: Some(format!(
+                            "Document {} has no version '{requested}'",
+                            record.name
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // "This value is unique across all versions of a document", so a version name
+        // the document does not carry names no version of it.
+        if let Some(requested) = input
+            .version_name
+            .as_deref()
+            .filter(|version_name| !version_name.is_empty())
+        {
+            if record.version_name.as_deref() != Some(requested) {
+                return Err(DescribeDocumentErrorModeled::InvalidDocumentVersion(
+                    InvalidDocumentVersion {
+                        message: Some(format!(
+                            "Document {} has no version named '{requested}'",
+                            record.name
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(DescribeDocumentOutput {
+            document: Some(record.to_description()),
+        })
     }
 }

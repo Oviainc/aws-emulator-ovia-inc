@@ -12,6 +12,10 @@
 //! generalises over (name form and depth, parameter type, data type, value size, tier,
 //! version count, selector form, Region), rather than the single parameter the recorded
 //! unit happened to read.
+//!
+//! The front-door helpers below ([`router`], [`call`], [`call_in_region`],
+//! [`error_code`]) are this crate's ONE test harness: `all/documents.rs` reaches the
+//! same emulator through them rather than building a second router of its own.
 
 use std::sync::Arc;
 
@@ -22,13 +26,13 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region every request signs for unless a case says otherwise. Deliberately not
 /// the emulator's default, so an ARN carrying it proves the Region came from the
 /// request's SigV4 credential scope.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The `X-Amz-Target` prefix from the crate's `OPERATIONS.md` wire-protocol section.
-const TARGET_PREFIX: &str = "AmazonSSM";
+pub(crate) const TARGET_PREFIX: &str = "AmazonSSM";
 
 /// The `ParameterType` values the model's enum declares
 /// (`smithy_query(query="shape", shape="ParameterType")`).
@@ -55,7 +59,7 @@ const MAX_LEVELS: usize = 15;
 const MAX_VERSIONS: usize = 100;
 
 /// A router with just this service mounted on a fresh engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still reads the SigV4
@@ -68,7 +72,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation signed for `region`, returning `(status, body)`.
-async fn call_in_region(
+pub(crate) async fn call_in_region(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -114,12 +118,12 @@ async fn call_in_region(
 }
 
 /// Call one operation signed for [`REGION`].
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     call_in_region(router, REGION, operation, body).await
 }
 
 /// The wire error code of a failure body (`__type`, without its namespace).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     let rendered = body["__type"].as_str().unwrap_or("<no __type>");
     rendered
         .split('#')

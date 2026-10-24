@@ -2,15 +2,11 @@
 
 //! Engine state for the com-amazonaws-ssm-amazonssm service.
 //!
-//! Two slices are modelled here. The first is **Parameter Store**: `PutParameter`
+//! Three slices are modelled here. The first is **Parameter Store**: `PutParameter`
 //! creates or updates a parameter, `GetParameter` reads one back and
 //! `GetParametersByPath` reads the parameters stored under one level of a hierarchy
 //! ([`parameter_path`], [`is_under_path`]). All of them reach the one store below, so
 //! whatever a put persisted is what a later read reports.
-//!
-//! The second slice is the **managed-node inventory** the node describes report: one
-//! record per node that registered with this Region's Systems Manager endpoint
-//! ([`ManagedNodeRecord`]).
 //!
 //! A parameter lives at a name that is unique *within a Region* (the `PutParameter`
 //! `Name` doc: "A parameter name must be unique within an Amazon Web Services Region"),
@@ -19,7 +15,13 @@
 //! version rather than replacing the old one, which is what lets a `name:version`
 //! selector resolve an earlier value.
 //!
-//! The second is the **managed nodes** the node describes report
+//! The second is **SSM documents**: `CreateDocument` registers a document and
+//! `DescribeDocument` reports it. A document is keyed by `(region, name)` the same way,
+//! and everything a read reports beyond the request's own members — the schema version,
+//! the description, the parameters, the platform types, the hash — is derived from the
+//! content that was persisted (see [`parse_document_content`]).
+//!
+//! The third is the **managed nodes** the node describes report
 //! ([`ManagedNodeRecord`]), keyed by `(region, node id)`: `DescribeInstanceProperties`
 //! projects a node's `properties` and `DescribeInstanceInformation` projects the same
 //! record through [`ManagedNodeRecord::to_instance_information`], so both report the one
@@ -30,9 +32,10 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
+    AttachmentInformation, DocumentDescription, DocumentParameter, DocumentRequires,
     InstanceInformation, InstanceProperty, Parameter, Tag, ASSOCIATION_STATUS_NAME_VALUES,
     INSTANCE_INFORMATION_FILTER_KEY_VALUES, INSTANCE_PROPERTY_FILTER_KEY_VALUES,
     PING_STATUS_VALUES, PLATFORM_TYPE_VALUES, RESOURCE_TYPE_VALUES, SOURCE_TYPE_VALUES,
@@ -498,6 +501,348 @@ pub fn parse_parameter_query(name: &str) -> Option<ParameterQuery<'_>> {
 }
 
 // ---------------------------------------------------------------------------
+// SSM documents
+// ---------------------------------------------------------------------------
+
+/// The resource portion a document ARN carries before the document's name, e.g.
+/// `arn:aws:ssm:us-east-2:111122223333:document/MyDocument`.
+pub const ARN_DOCUMENT_RESOURCE_PREFIX: &str = "document/";
+
+/// `DocumentStatus` values, from the modelled enum
+/// (`crate::ops::types::DOCUMENT_STATUS_VALUES`): a document Systems Manager is still
+/// registering is `Creating`, and a registered one is `Active`.
+pub const DOCUMENT_STATUS_CREATING: &str = "Creating";
+
+/// See [`DOCUMENT_STATUS_CREATING`].
+pub const DOCUMENT_STATUS_ACTIVE: &str = "Active";
+
+/// How long a document stays `Creating` before the clock owes its move to `Active`.
+///
+/// AWS publishes no span for it, so this is the emulator's CHOSEN transient window.
+/// It is deliberately never zero: a caller that reads a document straight after
+/// creating it observes `Creating`, the way it would against the real service, and the
+/// move is materialised by [`ComAmazonawsSsmAmazonssmState::materialize_due`] when the
+/// clock makes it due rather than by any call.
+pub const DOCUMENT_TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The version a newly created document carries: "The document version" counts from 1,
+/// and `UpdateDocument` — still a scaffold — is what mints a second one.
+pub const FIRST_DOCUMENT_VERSION: &str = "1";
+
+/// The `DocumentVersion` selectors that name a version by role rather than by number
+/// (the modelled `DocumentVersion` pattern `^([$]LATEST|[$]DEFAULT|^[1-9][0-9]*$)$`).
+pub const DOCUMENT_VERSION_LATEST: &str = "$LATEST";
+
+/// See [`DOCUMENT_VERSION_LATEST`].
+pub const DOCUMENT_VERSION_DEFAULT: &str = "$DEFAULT";
+
+/// "The content of the document must not exceed 64KB" (`CreateDocument`'s `Content`
+/// doc), which `MaxDocumentSizeExceeded` ("The size limit of a document is 64 KB")
+/// reports.
+pub const MAX_DOCUMENT_CONTENT: usize = 64 * 1024;
+
+/// "You can have at most 500 active SSM documents" (the `DocumentLimitExceeded` doc):
+/// the published per-Region quota.
+pub const MAX_DOCUMENTS: usize = 500;
+
+/// How many documents this store holds in TOTAL, across every Region.
+///
+/// Emulator resource guard, NOT a published AWS quota, and the bound that actually
+/// keeps this process finite: the Region a document is stored under comes from the
+/// request's own credential scope ([`request_region`]), so the per-Region quota alone
+/// would be one quota per caller-chosen partition of the key space and the store could
+/// grow without bound. Set ABOVE the per-Region quota so that quota stays exact, and
+/// low enough that the worst case a create can reach — this many documents each holding
+/// [`MAX_DOCUMENT_CONTENT`] of content — is a size a test process can hold (about 64
+/// MB). A create past it is refused with the same modelled `DocumentLimitExceeded` as
+/// one past the per-Region quota.
+pub const MAX_DOCUMENTS_TOTAL: usize = 2 * MAX_DOCUMENTS;
+
+/// "JSON is the default format" (`CreateDocument`'s `DocumentFormat` doc).
+pub const DEFAULT_DOCUMENT_FORMAT: &str = "JSON";
+
+/// The `DocumentFormat` whose content is free text rather than a document tree — a
+/// Change Calendar entry, say — so nothing is derived from it.
+pub const DOCUMENT_FORMAT_TEXT: &str = "TEXT";
+
+/// The document type a create that names none produces: `Command`, Systems Manager's
+/// default document type (`DocumentType` is optional on `CreateDocument` and a
+/// run-command document is what it produces).
+pub const DEFAULT_DOCUMENT_TYPE: &str = "Command";
+
+/// The document type whose versions go through the review workflow, and so the only
+/// one that reports a `ReviewStatus` ("The current status of the review",
+/// `DocumentDescription$ReviewStatus`).
+pub const CHANGE_TEMPLATE_DOCUMENT_TYPE: &str = "Automation.ChangeTemplate";
+
+/// The review status a document version carries before anybody reviews it, from the
+/// modelled `ReviewStatus` enum (`crate::ops::types::REVIEW_STATUS_VALUES`).
+pub const DOCUMENT_REVIEW_STATUS_NOT_REVIEWED: &str = "NOT_REVIEWED";
+
+/// The hash type a document carries: "The Sha256 or Sha1 hash created by the system
+/// when the document was created" with "Sha1 hashes have been deprecated"
+/// (`DocumentDescription$Hash` / `$HashType`), so the system hash is Sha256 and the
+/// deprecated `Sha1` member is left unset.
+pub const DOCUMENT_HASH_TYPE: &str = "Sha256";
+
+/// "You can't use the following strings as document name prefixes. These are reserved
+/// by Amazon Web Services for use as document name prefixes: aws amazon amzn AWSEC2
+/// AWSConfigRemediation AWSSupport" (`CreateDocument`'s `Name` doc). Compared
+/// case-insensitively, the way Systems Manager reserves the `aws` family.
+pub const RESERVED_DOCUMENT_NAME_PREFIXES: &[&str] = &[
+    "aws",
+    "amazon",
+    "amzn",
+    "AWSEC2",
+    "AWSConfigRemediation",
+    "AWSSupport",
+];
+
+/// How deep a document's content may nest, and how many flow openers (`[`, `{`) and
+/// compact indicators (`-`, `?`) the untrusted bytes may carry.
+///
+/// The YAML parser descends recursively, so nesting has to be bounded BEFORE a tree
+/// exists to measure (see [`guard_document_content`]). Every bound is far above what a
+/// real SSM document needs.
+const MAX_DOCUMENT_DEPTH: usize = 64;
+
+/// See [`MAX_DOCUMENT_DEPTH`].
+const MAX_DOCUMENT_FLOW_OPENERS: usize = 1024;
+
+/// See [`MAX_DOCUMENT_DEPTH`].
+const MAX_DOCUMENT_COMPACT_PER_LINE: usize = 256;
+
+/// See [`MAX_DOCUMENT_DEPTH`].
+const MAX_DOCUMENT_INDENT: usize = 256;
+
+/// The schema versions a document of `document_type` may declare, or an EMPTY slice
+/// for a type whose content carries no Systems Manager schema at all (an AppConfig
+/// configuration, a CloudFormation template, a Change Calendar entry).
+///
+/// From the schema-version rules Systems Manager publishes per document type
+/// ("Systems Manager document schemas and features" in the User Guide): Command
+/// documents support 1.2, 2.0 and 2.2, Policy documents 1.0 and 2.0, Session documents
+/// 1.0, Package documents 2.0, and Automation documents and change templates 0.3.
+/// A content declaring anything else for one of those types is what
+/// `InvalidDocumentSchemaVersion` ("The version of the document schema isn't
+/// supported") reports.
+pub fn supported_schema_versions(document_type: &str) -> &'static [&'static str] {
+    match document_type {
+        "Command" => &["1.2", "2.0", "2.2"],
+        "Policy" => &["1.0", "2.0"],
+        "Session" => &["1.0"],
+        "Package" => &["2.0"],
+        "Automation" | "Automation.ChangeTemplate" => &["0.3"],
+        _ => &[],
+    }
+}
+
+/// Why `name` is not a document name `CreateDocument` accepts, or `None` when it is.
+///
+/// The modelled `DocumentName` pattern (`^[a-zA-Z0-9_\-.]{3,128}$`) is already refused
+/// by the boundary walk, so the only rule left is the reserved-prefix one the `Name`
+/// doc states ([`RESERVED_DOCUMENT_NAME_PREFIXES`]).
+pub fn document_name_rejection(name: &str) -> Option<String> {
+    let reserved = RESERVED_DOCUMENT_NAME_PREFIXES.iter().find(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })?;
+    Some(format!(
+        "Name '{name}' is prefixed with '{reserved}': the prefixes {} are reserved by \
+         Amazon Web Services for use as document name prefixes",
+        RESERVED_DOCUMENT_NAME_PREFIXES.join(" ")
+    ))
+}
+
+/// What a `DocumentARN` value names: which document, and — when the value is a full
+/// ARN — in which Region and account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentQuery<'a> {
+    /// The document name to look the document up by.
+    pub name: &'a str,
+    /// The Region a full ARN named, or `None` when the request named a bare name.
+    pub region: Option<&'a str>,
+    /// The account a full ARN named.
+    pub account: Option<&'a str>,
+}
+
+/// What `value` names, or `None` when it is an ARN that names no `ssm` document.
+///
+/// A `DocumentARN` is "the name of the required SSM document. The name can be an
+/// Amazon Resource Name (ARN)" (`DocumentRequires$Name`), so either spelling resolves
+/// to the same document; the ARN is read through the one parse every service reads a
+/// caller-supplied ARN with.
+pub fn parse_document_query(value: &str) -> Option<DocumentQuery<'_>> {
+    if !value.starts_with(ARN_PREFIX) {
+        return Some(DocumentQuery {
+            name: value,
+            region: None,
+            account: None,
+        });
+    }
+    let arn = ::service_common::arn::parse_of(value, ARN_SERVICE)?;
+    Some(DocumentQuery {
+        name: arn.resource.strip_prefix(ARN_DOCUMENT_RESOURCE_PREFIX)?,
+        region: Some(arn.region),
+        account: Some(arn.account),
+    })
+}
+
+/// Why a document's content is not one this service accepts. Each variant maps to the
+/// modelled error that reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentRejection {
+    /// The content isn't a document in the declared format: `InvalidDocumentContent`.
+    Content(String),
+    /// The content declares a schema version the document type doesn't support:
+    /// `InvalidDocumentSchemaVersion`.
+    SchemaVersion(String),
+}
+
+/// What a document's content declares: everything a read reports that is derived from
+/// the content rather than echoed from the create's own members.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedDocumentContent {
+    /// The content's `schemaVersion`, which is what `SchemaVersion` reports.
+    pub schema_version: Option<String>,
+    /// The content's `description`.
+    pub description: Option<String>,
+    /// One entry per `parameters` entry, in the content's own order.
+    pub parameters: Vec<DocumentParameter>,
+    /// The platforms the content's step preconditions restrict the document to, or
+    /// every modelled platform when it restricts it to none.
+    pub platform_types: Vec<String>,
+}
+
+/// The documented size bound, applied to content of EVERY format: "The content of the
+/// document must not exceed 64KB" ([`MAX_DOCUMENT_CONTENT`]).
+fn content_within_size(content: &str) -> Result<(), ContentRejection> {
+    if content.len() > MAX_DOCUMENT_CONTENT {
+        return Err(ContentRejection::Content(format!(
+            "Content is {} bytes; a document's content must not exceed {MAX_DOCUMENT_CONTENT} bytes",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Pre-flight bounds on untrusted content, applied BEFORE any parser builds a tree
+/// from it: the YAML parser descends recursively, so the nesting the bytes can ask for
+/// has to be bounded while there is still no tree to measure.
+///
+/// This is a GUARD, not a parser: it knows nothing about YAML context and measures only
+/// quantities a hiding trick can push UP but never DOWN — the content's length, the
+/// number of flow openers (whose count IS their depth bound, since flow nesting costs
+/// neither a line nor a column), the compact indicators on any one line, and a line's
+/// leading indentation. Closers are never subtracted, so a `]` inside a scalar cannot
+/// buy depth back. The same guard the Greengrass recipe parser
+/// (`service-com-amazonaws-greengrassv2-greengrassv2/src/state.rs`) and the
+/// CloudFormation template parser apply, for the same reason and with the same bounds;
+/// the three copies are to be migrated onto one shared implementation rather than
+/// copied a fourth time.
+fn guard_document_content(content: &str) -> Result<(), ContentRejection> {
+    content_within_size(content)?;
+    let mut flow_openers = 0usize;
+    let mut compact_on_line = 0usize;
+    let mut indent = 0usize;
+    let mut counting_indent = true;
+    for byte in content.bytes() {
+        match byte {
+            b'\n' | b'\r' => {
+                indent = 0;
+                compact_on_line = 0;
+                counting_indent = true;
+            }
+            b' ' | b'\t' if counting_indent => {
+                indent += 1;
+                if indent > MAX_DOCUMENT_INDENT {
+                    return Err(ContentRejection::Content(format!(
+                        "a line of Content must not be indented past {MAX_DOCUMENT_INDENT} columns"
+                    )));
+                }
+            }
+            b'[' | b'{' => {
+                counting_indent = false;
+                flow_openers += 1;
+                if flow_openers > MAX_DOCUMENT_FLOW_OPENERS {
+                    return Err(ContentRejection::Content(format!(
+                        "Content must not carry more than {MAX_DOCUMENT_FLOW_OPENERS} '[' or '{{' \
+                         openers"
+                    )));
+                }
+            }
+            b'-' | b'?' => {
+                counting_indent = false;
+                compact_on_line += 1;
+                if compact_on_line > MAX_DOCUMENT_COMPACT_PER_LINE {
+                    return Err(ContentRejection::Content(format!(
+                        "a line of Content must not carry more than \
+                         {MAX_DOCUMENT_COMPACT_PER_LINE} '-' or '?' indicators"
+                    )));
+                }
+            }
+            _ => counting_indent = false,
+        }
+    }
+    Ok(())
+}
+
+/// Refuses content that uses a YAML alias, BEFORE the loader can expand one.
+///
+/// `yaml-rust2`'s loader RESOLVES an alias by copying the anchored node, so by the
+/// time a tree exists the expansion has already happened — a short alias chain can
+/// expand to gigabytes. The parser's own event stream reports an alias as
+/// `Event::Alias` and copies nothing, so the content is parsed once for this check and
+/// only alias-free content is handed to the loader. An anchor no alias refers to
+/// expands nothing and is accepted.
+fn reject_document_aliases(content: &str) -> Result<(), ContentRejection> {
+    #[derive(Default)]
+    struct AliasDetector {
+        saw_alias: bool,
+    }
+    impl ::yaml_rust2::parser::EventReceiver for AliasDetector {
+        fn on_event(&mut self, event: ::yaml_rust2::parser::Event) {
+            if matches!(event, ::yaml_rust2::parser::Event::Alias(_)) {
+                self.saw_alias = true;
+            }
+        }
+    }
+
+    let mut detector = AliasDetector::default();
+    ::yaml_rust2::parser::Parser::new_from_str(content)
+        .load(&mut detector, true)
+        .map_err(|why| {
+            ContentRejection::Content(format!("Content could not be parsed as a document: {why}"))
+        })?;
+    if detector.saw_alias {
+        return Err(ContentRejection::Content(
+            "Content must not use YAML aliases".to_string(),
+        ))
+    }
+    Ok(())
+}
+
+/// Look a key up in a document mapping.
+fn mapping_get<'a>(
+    map: &'a ::yaml_rust2::yaml::Hash,
+    key: &str,
+) -> Option<&'a ::yaml_rust2::Yaml> {
+    map.iter()
+        .find(|(held, _)| held.as_str() == Some(key))
+        .map(|(_, value)| value)
+}
+
+/// A document scalar as the string the API reports it as.
+fn scalar_string(value: &::yaml_rust2::Yaml) -> Option<String> {
+    match value {
+        ::yaml_rust2::Yaml::String(text) | ::yaml_rust2::Yaml::Real(text) => Some(text.clone()),
+        ::yaml_rust2::Yaml::Boolean(flag) => Some(flag.to_string()),
+        ::yaml_rust2::Yaml::Integer(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reading a hierarchy of parameters
 // ---------------------------------------------------------------------------
 
@@ -735,6 +1080,358 @@ pub fn node_filter_value_rejection(key: &str, value: &str) -> Option<String> {
     }
 }
 
+/// A parameter's `default` as the single string `DefaultValue` reports: the scalar
+/// itself, or the JSON rendering of a list or mapping default.
+///
+/// `budget` is the recursion left, so a deeply nested default cannot drive this into
+/// the stack even though [`guard_document_content`] already bounded the nesting; a
+/// default that exhausts it is REFUSED rather than reported with the member missing.
+fn default_value_string(
+    name: &str,
+    value: &::yaml_rust2::Yaml,
+    budget: usize,
+) -> Result<String, ContentRejection> {
+    if let Some(scalar) = scalar_string(value) {
+        return Ok(scalar);
+    }
+    let rendered = document_as_json(value, budget).ok_or_else(|| {
+        ContentRejection::Content(format!(
+            "the default of parameter '{name}' is not a value this service can read: it nests \
+             past {MAX_DOCUMENT_DEPTH} levels or is keyed by a non-string"
+        ))
+    })?;
+    Ok(rendered.to_string())
+}
+
+/// A document node as the JSON value that renders it.
+fn document_as_json(node: &::yaml_rust2::Yaml, budget: usize) -> Option<::serde_json::Value> {
+    use ::serde_json::Value;
+    use ::yaml_rust2::Yaml;
+    let budget = budget.checked_sub(1)?;
+    Some(match node {
+        Yaml::Null | Yaml::BadValue => Value::Null,
+        Yaml::Boolean(flag) => Value::Bool(*flag),
+        Yaml::Integer(number) => Value::Number((*number).into()),
+        Yaml::Real(real) => real
+            .parse::<f64>()
+            .ok()
+            .and_then(::serde_json::Number::from_f64)
+            .map_or_else(|| Value::String(real.clone()), Value::Number),
+        Yaml::String(text) => Value::String(text.clone()),
+        Yaml::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| document_as_json(item, budget))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Yaml::Hash(map) => {
+            let mut object = ::serde_json::Map::new();
+            for (key, value) in map {
+                object.insert(key.as_str()?.to_string(), document_as_json(value, budget)?);
+            }
+            Value::Object(object)
+        }
+        // An alias is refused before the load by `reject_document_aliases`, so a
+        // resolved alias node can never reach here.
+        Yaml::Alias(_) => return None,
+    })
+}
+
+/// The parameters a document declares: one `DocumentParameter` per `parameters` entry,
+/// in the content's own order.
+///
+/// "A description of the parameters for a document"
+/// (`DocumentDescription$Parameters`): each entry's `type`, `description` and
+/// `default` are reported as the content declares them — the declared type is reported
+/// verbatim rather than narrowed, because an Automation document's parameters carry
+/// types (`Integer`, `StringMap`, …) beyond the two a Command document's do.
+fn declared_parameters(
+    map: &::yaml_rust2::yaml::Hash,
+) -> Result<Vec<DocumentParameter>, ContentRejection> {
+    let Some(declared) = mapping_get(map, "parameters") else {
+        return Ok(Vec::new());
+    };
+    if matches!(declared, ::yaml_rust2::Yaml::Null) {
+        return Ok(Vec::new());
+    }
+    let Some(declared) = declared.as_hash() else {
+        return Err(ContentRejection::Content(
+            "the parameters of a document must be a mapping of parameter name to its definition"
+                .to_string(),
+        ));
+    };
+    let mut parameters = Vec::with_capacity(declared.len());
+    for (name, definition) in declared {
+        let Some(name) = name.as_str() else {
+            return Err(ContentRejection::Content(
+                "every parameter of a document must be named by a string".to_string(),
+            ));
+        };
+        let Some(definition) = definition.as_hash() else {
+            return Err(ContentRejection::Content(format!(
+                "the definition of parameter '{name}' must be a mapping"
+            )));
+        };
+        let default_value = match mapping_get(definition, "default") {
+            None => None,
+            Some(default) => Some(default_value_string(name, default, MAX_DOCUMENT_DEPTH)?),
+        };
+        parameters.push(DocumentParameter {
+            name: Some(name.to_string()),
+            r#type: mapping_get(definition, "type").and_then(scalar_string),
+            description: mapping_get(definition, "description").and_then(scalar_string),
+            default_value,
+        });
+    }
+    Ok(parameters)
+}
+
+/// The platforms the content restricts the document to.
+///
+/// "The list of operating system (OS) platforms compatible with this SSM document"
+/// (`DocumentDescription$PlatformTypes`). A document declares a platform through a step
+/// precondition on `platformType` (`precondition: {StringEquals: [platformType,
+/// Linux]}`), so the compatible platforms are the ones its steps name; content that
+/// names none restricts nothing and so is compatible with every platform the model
+/// lists. Reported in the modelled enum's order, so two reads of one document agree.
+fn declared_platform_types(map: &::yaml_rust2::yaml::Hash) -> Vec<String> {
+    let mut declared: Vec<&str> = Vec::new();
+    if let Some(steps) = mapping_get(map, "mainSteps").and_then(::yaml_rust2::Yaml::as_vec) {
+        for step in steps {
+            let Some(precondition) = step
+                .as_hash()
+                .and_then(|step| mapping_get(step, "precondition"))
+                .and_then(::yaml_rust2::Yaml::as_hash)
+            else {
+                continue;
+            };
+            let Some(equals) =
+                mapping_get(precondition, "StringEquals").and_then(::yaml_rust2::Yaml::as_vec)
+            else {
+                continue;
+            };
+            if equals.first().and_then(::yaml_rust2::Yaml::as_str) != Some("platformType") {
+                continue;
+            }
+            for value in equals.iter().skip(1) {
+                if let Some(platform) = value.as_str() {
+                    if PLATFORM_TYPE_VALUES.contains(&platform) && !declared.contains(&platform) {
+                        declared.push(platform);
+                    }
+                }
+            }
+        }
+    }
+    PLATFORM_TYPE_VALUES
+        .iter()
+        .filter(|platform| declared.is_empty() || declared.contains(*platform))
+        .map(|platform| (*platform).to_string())
+        .collect()
+}
+
+/// What `content` declares, or why it is not a document this service accepts.
+///
+/// "The content for the new SSM document in JSON or YAML format"
+/// (`CreateDocument`'s `Content` doc), so the content is parsed in the format the
+/// request declared — YAML 1.2 is a superset of JSON, so one parser reads either, and
+/// `JSON` is additionally required to BE JSON rather than only YAML that resembles it.
+/// `TEXT` content (a Change Calendar entry) is free text with no document tree, so
+/// nothing is derived from it and nothing in it is refused.
+pub fn parse_document_content(
+    content: &str,
+    format: &str,
+    document_type: &str,
+) -> Result<ParsedDocumentContent, ContentRejection> {
+    // The documented size bound is measured for content of every format, including the
+    // one with no document tree to parse.
+    content_within_size(content)?;
+    if format == DOCUMENT_FORMAT_TEXT {
+        return Ok(ParsedDocumentContent::default());
+    }
+    guard_document_content(content)?;
+    if format == DEFAULT_DOCUMENT_FORMAT
+        && ::serde_json::from_str::<::serde_json::Value>(content).is_err()
+    {
+        return Err(ContentRejection::Content(
+            "Content isn't a valid JSON document".to_string(),
+        ));
+    }
+    reject_document_aliases(content)?;
+    let mut documents = ::yaml_rust2::YamlLoader::load_from_str(content).map_err(|why| {
+        ContentRejection::Content(format!("Content could not be parsed as a document: {why}"))
+    })?;
+    if documents.len() != 1 {
+        return Err(ContentRejection::Content(format!(
+            "Content must be exactly one document; found {}",
+            documents.len()
+        )));
+    }
+    let document = documents.remove(0);
+    let Some(map) = document.as_hash() else {
+        return Err(ContentRejection::Content(
+            "Content must be a mapping of document keys to values".to_string(),
+        ));
+    };
+
+    let schema_version = mapping_get(map, "schemaVersion").and_then(scalar_string);
+    let supported = supported_schema_versions(document_type);
+    if !supported.is_empty() {
+        match schema_version.as_deref() {
+            None => {
+                return Err(ContentRejection::Content(format!(
+                    "Content declares no schemaVersion; a {document_type} document must declare \
+                     one of {}",
+                    supported.join(", ")
+                )))
+            }
+            Some(declared) if !supported.contains(&declared) => {
+                return Err(ContentRejection::SchemaVersion(format!(
+                    "Document schema version '{declared}' isn't supported for a {document_type} \
+                     document; the supported schema versions are {}",
+                    supported.join(", ")
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+
+    Ok(ParsedDocumentContent {
+        schema_version,
+        description: mapping_get(map, "description").and_then(scalar_string),
+        parameters: declared_parameters(map)?,
+        platform_types: declared_platform_types(map),
+    })
+}
+
+/// One stored SSM document: what the create supplied, what the service derived from its
+/// content, and the status move the clock still owes.
+///
+/// A document holds exactly one version here ([`FIRST_DOCUMENT_VERSION`]):
+/// `UpdateDocument`, the operation that mints a second one, is still a scaffold, so
+/// `LatestVersion` and `DefaultVersion` are that one version.
+#[derive(Debug, Clone)]
+pub struct DocumentRecord {
+    /// The name the create supplied, which is what a read reports and part of the
+    /// store key.
+    pub name: String,
+    /// The Region the document was created in; part of its store key and of its ARN.
+    pub region: String,
+    pub display_name: Option<String>,
+    pub version_name: Option<String>,
+    /// A `DocumentType` value.
+    pub document_type: String,
+    /// A `DocumentFormat` value.
+    pub document_format: String,
+    pub target_type: Option<String>,
+    /// The content exactly as the create supplied it: what [`DocumentRecord::hash`] is
+    /// taken over, and what `GetDocument` reports.
+    pub content: String,
+    /// Hex-rendered Sha256 of [`DocumentRecord::content`].
+    pub hash: String,
+    /// Everything derived from the content (see [`parse_document_content`]).
+    pub parsed: ParsedDocumentContent,
+    pub requires: Option<Vec<DocumentRequires>>,
+    /// The attachment names the create named, which is what `AttachmentsInformation`
+    /// reports.
+    pub attachment_names: Vec<String>,
+    pub tags: BTreeMap<String, String>,
+    pub created_date: SystemTime,
+    /// A `DocumentStatus` value.
+    pub status: String,
+    /// When the clock owes this document's move out of `Creating`, or `None` once that
+    /// move has been materialised.
+    pub active_due: Option<SystemTime>,
+}
+
+impl DocumentRecord {
+    /// This document's ARN: `arn:aws:ssm:<region>:<account>:document/<name>`.
+    pub fn arn(&self) -> String {
+        ::engine::emulator_arn(
+            ARN_SERVICE,
+            &self.region,
+            &format!("{ARN_DOCUMENT_RESOURCE_PREFIX}{}", self.name),
+        )
+    }
+
+    /// Materialise the status move the clock already owes at `now` — the move to
+    /// `Active` that was due whether or not anybody called.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        if self.active_due.is_some_and(|due| now >= due) {
+            self.active_due = None;
+            self.status = DOCUMENT_STATUS_ACTIVE.to_string();
+        }
+    }
+
+    /// The modelled `DocumentDescription` for this document.
+    pub fn to_description(&self) -> DocumentDescription {
+        DocumentDescription {
+            // "Sha1 hashes have been deprecated", so the system hash is the Sha256 in
+            // `Hash` and the deprecated member is left unset.
+            sha1: None,
+            hash: Some(self.hash.clone()),
+            hash_type: Some(DOCUMENT_HASH_TYPE.to_string()),
+            name: Some(self.name.clone()),
+            display_name: self.display_name.clone(),
+            version_name: self.version_name.clone(),
+            // "The Amazon Web Services user that created the document" — every
+            // document this emulator holds was created in its one account.
+            owner: Some(::engine::emulator_account_id().to_string()),
+            created_date: Some(::aws_smithy_types::DateTime::from(self.created_date)),
+            status: Some(self.status.clone()),
+            // "A message returned by Amazon Web Services Systems Manager that explains
+            // the Status value", which it sets for a failure; nothing here failed.
+            status_information: None,
+            document_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
+            description: self.parsed.description.clone(),
+            parameters: (!self.parsed.parameters.is_empty())
+                .then(|| self.parsed.parameters.clone()),
+            platform_types: (!self.parsed.platform_types.is_empty())
+                .then(|| self.parsed.platform_types.clone()),
+            document_type: Some(self.document_type.clone()),
+            schema_version: self.parsed.schema_version.clone(),
+            latest_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
+            default_version: Some(FIRST_DOCUMENT_VERSION.to_string()),
+            document_format: Some(self.document_format.clone()),
+            target_type: self.target_type.clone(),
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| Tag {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect()
+            }),
+            attachments_information: (!self.attachment_names.is_empty()).then(|| {
+                self.attachment_names
+                    .iter()
+                    .map(|name| AttachmentInformation {
+                        name: Some(name.clone()),
+                    })
+                    .collect()
+            }),
+            requires: self.requires.clone(),
+            // "The user in your organization who created the document": the emulator
+            // authenticates no human author, so there is none to report.
+            author: None,
+            // A review is the change-template approval workflow, and `UpdateDocument`
+            // metadata — the operation that records one — is still a scaffold, so a
+            // change template created here has not been reviewed and no other document
+            // type carries a review at all.
+            review_information: None,
+            approved_version: None,
+            pending_review_version: None,
+            review_status: (self.document_type == CHANGE_TEMPLATE_DOCUMENT_TYPE)
+                .then(|| DOCUMENT_REVIEW_STATUS_NOT_REVIEWED.to_string()),
+            // "The classification of a document to help you identify and categorize
+            // its use", which Systems Manager assigns to the documents it publishes;
+            // nothing classifies a document created through this API.
+            category: None,
+            category_enum: None,
+        }
+    }
+}
+
 /// The `PingStatus` a node that has just pinged the service carries (from the modelled
 /// enum, `crate::ops::types::PING_STATUS_VALUES`).
 pub const PING_STATUS_ONLINE: &str = "Online";
@@ -785,6 +1482,10 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// unique within an Amazon Web Services Region". A `BTreeMap` so a listing walks a
     /// stable, total order.
     pub parameters: BTreeMap<(String, String), ParameterRecord>,
+    /// Every SSM document, keyed by `(region, name)`: a document name is unique within
+    /// a Region, which is what `DocumentAlreadyExists` reports a collision on. A
+    /// `BTreeMap` so a listing walks a stable, total order.
+    pub documents: BTreeMap<(String, String), DocumentRecord>,
 
     /// Every managed node, keyed by `(region, node id)`: a node is registered with the
     /// Systems Manager endpoint of one Region and is identified there by its node id. A
@@ -801,6 +1502,34 @@ pub struct ComAmazonawsSsmAmazonssmState {
 }
 
 impl ComAmazonawsSsmAmazonssmState {
+    /// Materialise every transition the clock already owes at `now`, so a read reports
+    /// what was due whether or not anybody called (see [`DOCUMENT_TRANSITION_DELAY`]).
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        for document in self.documents.values_mut() {
+            document.materialize_due(now);
+        }
+    }
+
+    /// The document `name` names in `region`, or `None` when that Region holds none.
+    pub fn document(&self, region: &str, name: &str) -> Option<&DocumentRecord> {
+        self.documents.get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Store `record` as `region`'s document of that name.
+    pub fn insert_document(&mut self, record: DocumentRecord) {
+        let key = (record.region.clone(), record.name.clone());
+        self.documents.insert(key, record);
+    }
+
+    /// How many documents `region` holds, which is what the documented document quota
+    /// is measured against.
+    pub fn documents_in_region(&self, region: &str) -> usize {
+        self.documents
+            .keys()
+            .filter(|(held, _)| held == region)
+            .count()
+    }
+
     /// The parameter `name` names in `region`, or `None` when that Region holds none.
     pub fn parameter(&self, region: &str, name: &str) -> Option<&ParameterRecord> {
         self.parameters
