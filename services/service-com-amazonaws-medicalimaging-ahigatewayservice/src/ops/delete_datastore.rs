@@ -168,7 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if !datastore.image_sets.is_empty() {
+        // Image sets the data store still HOLDS block its deletion; ones already deleted
+        // do not, because a deleted image set is a tombstone — it holds no pixel data and
+        // takes part in no further work ([`crate::state::ImageSet::is_deleted`]). Without
+        // that distinction, deleting every image set in a store would never unblock the
+        // store's own delete.
+        let held_image_sets = datastore
+            .image_sets
+            .values()
+            .filter(|image_set| !image_set.is_deleted())
+            .count();
+        if held_image_sets > 0 {
             return Err(DeleteDatastoreErrorModeled::ConflictException(ConflictException {
                 message: format!(
                     "Datastore {} still contains image sets; delete them before deleting the data store",

@@ -120,7 +120,7 @@ pub(crate) async fn copy_image_set(
 
 /// `POST /datastore/{datastoreId}/imageSet/{imageSetId}/getImageSet` — `GetImageSet`,
 /// optionally for one version (`version` is an `@httpQuery`).
-async fn get_image_set(
+pub(crate) async fn get_image_set(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_id: &str,

@@ -393,6 +393,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // COMPLETED, never before: a frame is readable exactly when the copy that
             // delivers it lands.
             delivered_image_frames: Some(copied_image_frames),
+            // A copy does not retire an image set: both the source and the destination
+            // are still there once it has landed.
+            retires_image_set: false,
         };
 
         let datastore = store.datastores.get_mut(&input.datastore_id).ok_or_else(|| {

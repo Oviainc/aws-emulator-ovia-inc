@@ -116,7 +116,7 @@ fn seed_image_set_with_frames(
 
 /// `POST /datastore/{datastoreId}/imageSet/{imageSetId}/getImageFrame` —
 /// `GetImageFrame`. The body IS the `imageFrameInformation` payload.
-async fn get_image_frame(
+pub(crate) async fn get_image_frame(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_id: &str,

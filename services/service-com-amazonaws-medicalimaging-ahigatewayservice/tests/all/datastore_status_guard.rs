@@ -12,10 +12,10 @@
 //!
 //! The rows span what the rule generalises over: which status is in flight (`CREATING`,
 //! `DELETING`) crossed with which operation arrives (`DeleteDatastore`,
-//! `StartDICOMImportJob`, `CopyImageSet`), plus the settled `ACTIVE` store every one of
-//! them is admitted on. The second suite drives the same rule through the REAL clock,
-//! with no reach into the state struct: a delete issued inside the activation span is
-//! refused and the creation it raced still completes.
+//! `StartDICOMImportJob`, `CopyImageSet`, `DeleteImageSet`), plus the settled `ACTIVE`
+//! store every one of them is admitted on. The second suite drives the same rule through
+//! the REAL clock, with no reach into the state struct: a delete issued inside the
+//! activation span is refused and the creation it raced still completes.
 //!
 //! The harness is the sibling suites' (`crate::datastore_lifecycle`,
 //! `crate::image_set_copy`): real requests through `MultiServiceRouter::dispatch`, with
@@ -33,6 +33,7 @@ use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
 
 use crate::datastore_lifecycle::{Emulator, SETTLE_MULTIPLE};
 use crate::image_set_copy::{copy_image_set, information, seed_image_set};
+use crate::image_set_deletion::delete_image_set;
 
 /// How far out a held transition's due instant is pushed, so the data store stays in the
 /// status it has already reached for the whole of a case. Long enough that no scheduling
@@ -68,6 +69,7 @@ enum Call {
     DeleteDatastore,
     StartImportJob,
     CopyImageSet,
+    DeleteImageSet,
 }
 
 /// What the rule says the call is answered with.
@@ -242,6 +244,24 @@ async fn a_datastore_mid_transition_refuses_work_with_a_conflict() {
             call: Call::CopyImageSet,
             expectation: Expectation::Admitted,
         },
+        Row {
+            case: "delete an image set while creating",
+            phase: Phase::Creating,
+            call: Call::DeleteImageSet,
+            expectation: Expectation::Conflict(DATASTORE_NOT_ACTIVE_MESSAGE),
+        },
+        Row {
+            case: "delete an image set while deleting",
+            phase: Phase::Deleting,
+            call: Call::DeleteImageSet,
+            expectation: Expectation::Conflict(DATASTORE_NOT_ACTIVE_MESSAGE),
+        },
+        Row {
+            case: "delete an image set once active",
+            phase: Phase::Active,
+            call: Call::DeleteImageSet,
+            expectation: Expectation::Admitted,
+        },
     ];
 
     for row in &rows {
@@ -254,7 +274,9 @@ async fn a_datastore_mid_transition_refuses_work_with_a_conflict() {
         // it is seeded, AFTER the phase is set up: a store with image sets could not be
         // deleted at all, and the refusal under test must be about the store's status.
         let source_image_set_id = match row.call {
-            Call::CopyImageSet => Some(seed_image_set(&emulator, &datastore_id, 1)),
+            Call::CopyImageSet | Call::DeleteImageSet => {
+                Some(seed_image_set(&emulator, &datastore_id, 1))
+            }
             _ => None,
         };
 
@@ -277,6 +299,12 @@ async fn a_datastore_mid_transition_refuses_work_with_a_conflict() {
                     &[],
                 )
                 .await
+            }
+            Call::DeleteImageSet => {
+                let image_set = source_image_set_id
+                    .as_deref()
+                    .expect("a seeded image set to delete");
+                delete_image_set(&emulator, &datastore_id, image_set).await
             }
         };
 
@@ -335,6 +363,11 @@ async fn a_datastore_mid_transition_refuses_work_with_a_conflict() {
                             "case {case:?}: expected a destination image set from CopyImageSet, got {answer:?}"
                         );
                     }
+                    Call::DeleteImageSet => assert_eq!(
+                        answer.string(&["imageSetState"]),
+                        "LOCKED",
+                        "case {case:?}: expected LOCKED from DeleteImageSet, got {answer:?}"
+                    ),
                 }
             }
         }

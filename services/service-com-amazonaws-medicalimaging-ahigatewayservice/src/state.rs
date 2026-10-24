@@ -59,6 +59,13 @@ pub const IMPORT_JOB_COMPLETION_DELAY: Duration = Duration::from_millis(600);
 /// after the call still observes the `LOCKED` copy in flight.
 pub const IMAGE_SET_COPY_DELAY: Duration = Duration::from_millis(400);
 
+/// How long after `DeleteImageSet` the deletion completes: the image set leaves the
+/// `LOCKED` / `DELETING` pair the delete put it in for `DELETED` / `DELETED`, and gets
+/// its `deletedAt`. A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`]
+/// — AWS publishes no duration for a delete, and a caller reading the image set straight
+/// after the call still observes the deletion in flight.
+pub const IMAGE_SET_DELETION_DELAY: Duration = Duration::from_millis(500);
+
 /// The external version identifier an image set's FIRST version carries. AWS numbers
 /// image set versions from 1 (`ImageSetExternalVersionId` is `^\d+$`), and each later
 /// version is one past the one it supersedes.
@@ -181,6 +188,15 @@ pub const IMAGE_SET_VERSION_CONFLICT_MESSAGE: &str =
 /// stated by rule rather than by which image set it was.
 pub const IMAGE_SET_NOT_ACTIVE_MESSAGE: &str =
     "The image set is not in the ACTIVE state, so it cannot take part in a copy.";
+
+/// The text this service refuses a DELETE of an image set that is `LOCKED` by work
+/// already in flight (a copy) with. A delete admitted mid-copy would leave the copy and
+/// the delete disagreeing about the image set, which is what `ConflictException`
+/// (HTTP 409) reports. Constant, and stated by rule rather than by which image set it
+/// was; a delete the service is ALREADY performing is not refused at all — it is
+/// idempotent.
+pub const IMAGE_SET_NOT_DELETABLE_MESSAGE: &str =
+    "The image set is locked by an action already in flight, so it cannot be deleted.";
 
 /// The text this service answers a request naming an image frame an image set does not
 /// hold with — the resource KIND, by the same rule as [`IMAGE_SET_NOT_FOUND_MESSAGE`],
@@ -871,6 +887,12 @@ pub struct PendingImageSetTransition {
     /// on its source. Nothing is readable through `GetImageFrame` before the transition
     /// that delivers it falls due, because nothing holds it yet.
     pub delivered_image_frames: Option<HashMap<String, ImageFrame>>,
+    /// Whether this transition RETIRES the image set — the landing of the delete a
+    /// `DeleteImageSet` call started. The record stays readable afterwards, because
+    /// `deletedAt` ("the timestamp when the image set properties were deleted") is a
+    /// reported member, but the pixel data goes with the deletion: nothing holds it
+    /// once the image set is gone.
+    pub retires_image_set: bool,
 }
 
 /// One persisted image set, with every version of it the data store holds.
@@ -954,6 +976,23 @@ impl ImageSet {
             .find(|version| version.wire_version_id() == wire_version_id)
     }
 
+    /// Whether this image set has been deleted — the terminal state a delete lands on,
+    /// after which the record is a tombstone: it still reports its properties and its
+    /// `deletedAt`, but holds no pixel data and takes part in no further work.
+    pub fn is_deleted(&self) -> bool {
+        self.latest_version.image_set_state == ImageSetState::Deleted
+    }
+
+    /// Whether a DELETE of this image set is already in flight, i.e. the clock owes it
+    /// the move to `DELETED`. What makes `DeleteImageSet` idempotent: a repeat call
+    /// reports the same `LOCKED` / `DELETING` pair without moving the instant the
+    /// deletion falls due.
+    pub fn deletion_in_flight(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.retires_image_set)
+    }
+
     /// The image frame `image_frame_id` names, or `None` when this image set holds no
     /// pixel data under that identifier.
     pub fn image_frame(&self, image_frame_id: &str) -> Option<&ImageFrame> {
@@ -991,6 +1030,18 @@ impl ImageSet {
         version_id
     }
 
+    /// Put EVERY version of this image set into `image_set_state`.
+    ///
+    /// Used where a change concerns the whole image set rather than one snapshot of it —
+    /// its retirement — so that no version is left reporting a state the image set no
+    /// longer has.
+    pub fn set_state_on_every_version(&mut self, image_set_state: ImageSetState) {
+        self.latest_version.image_set_state = image_set_state;
+        for version in &mut self.earlier_versions {
+            version.image_set_state = image_set_state;
+        }
+    }
+
     /// Materialise the transition the clock owed this image set by `now`.
     fn advance_to(&mut self, now: SystemTime) {
         let Some(pending) = self.pending.clone() else {
@@ -1009,6 +1060,19 @@ impl ImageSet {
         // its pixel data, so the two cannot disagree.
         if let Some(delivered) = pending.delivered_image_frames {
             self.image_frames.extend(delivered);
+        }
+        // A deletion the clock owed lands the same way, at the DUE instant rather than at
+        // `now`, so `deletedAt` does not move between reads — and the pixel data this
+        // image set held goes with it, because a deleted image set holds none.
+        if pending.retires_image_set {
+            self.deleted_at = Some(pending.due_at);
+            self.image_frames.clear();
+            // Retiring the image set reaches EVERY version of it. `ImageSetState` is
+            // whether the image set can be read and written, which is a property of the
+            // image set rather than of one snapshot of it, so no version of a retired
+            // image set is left reporting a state it no longer has; the workflow status
+            // — what last happened — stays on the version it happened to.
+            self.set_state_on_every_version(pending.image_set_state);
         }
         self.pending = None;
     }
