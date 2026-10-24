@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeIpRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeIpRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeIpRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,7 +73,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `AuthorizeIpRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#AuthorizeIpRules")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#AuthorizeIpRules",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum AuthorizeIpRulesErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -91,6 +88,7 @@ pub enum AuthorizeIpRulesErrorModeled {
     InvalidResourceStateException(InvalidResourceStateException),
     ResourceLimitExceededException(ResourceLimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -144,18 +142,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeIpRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeIpRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // The submitted list is checked BEFORE anything is written, by the same
+        // shared rule as `CreateIpGroup`'s and `UpdateRulesOfIpGroup`'s, so one rule
+        // list is refused identically whichever operation it arrives on and a
+        // refused authorize leaves the stored group untouched.
+        crate::state::validate_ip_rules(&input.user_rules)
+            .map_err(|refusal| invalid_parameters(refusal.message()))?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AuthorizeIpRulesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // One lock covers reading the group's rules, merging the submitted ones into
+        // them and writing the result, so two authorizes on one group cannot both
+        // merge into the same starting set and lose one of the two additions.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeIpRules"))
+        // `InvalidResourceStateException` is modelled for this operation but is not
+        // reachable here: an IP access control group carries no lifecycle state in
+        // the model, so no stored group can be in a state that refuses a rule.
+        let authorized = state
+            .lock()
+            .authorize_ip_group_rules(&input.group_id, input.user_rules);
+
+        match authorized {
+            Ok(_) => Ok(AuthorizeIpRulesOutput {}),
+            // The model states this shape's message: `ResourceNotFoundException` and
+            // its `message` member are both documented as "The resource could not be
+            // found.", and the shape carries a separate `ResourceId` member — "The ID
+            // of the resource that could not be found" — which is where the group the
+            // caller asked for is named.
+            Err(crate::state::IpRuleAuthorizeRefusal::NoSuchGroup) => Err(
+                AuthorizeIpRulesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some("The resource could not be found.".to_string()),
+                        resource_id: Some(input.group_id.clone()),
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::IpRuleAuthorizeRefusal::LimitExceeded(held)) => Err(
+                AuthorizeIpRulesErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        message: Some(format!(
+                            "Your resource limits have been exceeded: the group would hold {held} rules and an IP access control group can hold at most {}.",
+                            crate::state::MAX_RULES_PER_IP_GROUP
+                        )),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
+}
+
+/// A refusal of an input value this operation's own rules reject, as the modelled
+/// `InvalidParameterValuesException` ("One or more parameter values are not valid").
+fn invalid_parameters(message: String) -> AuthorizeIpRulesError {
+    AuthorizeIpRulesErrorModeled::InvalidParameterValuesException(InvalidParameterValuesException {
+        message: Some(message),
+    })
+    .into()
 }

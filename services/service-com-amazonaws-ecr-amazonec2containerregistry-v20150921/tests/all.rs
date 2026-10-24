@@ -37,6 +37,8 @@ mod lifecycle_policy_preview;
 mod policy_document_canonical_form;
 #[path = "all/pull_through_cache_rule_deletion.rs"]
 mod pull_through_cache_rule_deletion;
+#[path = "all/pull_through_cache_rule_validation.rs"]
+mod pull_through_cache_rule_validation;
 #[path = "all/pull_through_cache_rules.rs"]
 mod pull_through_cache_rules;
 #[path = "all/pull_time_update_exclusion_removal.rs"]

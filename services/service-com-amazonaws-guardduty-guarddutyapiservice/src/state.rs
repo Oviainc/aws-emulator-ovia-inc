@@ -119,6 +119,38 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// construction: it is the fixed table behind
     /// [`CustomDetectionRuleCatalog::default`].
     pub custom_detection_rules: CustomDetectionRuleCatalog,
+    /// Every custom detection rule ASSOCIATION this account has made, keyed by
+    /// `(region, RuleId, Mode)`.
+    ///
+    /// An association binds a PUBLISHED rule
+    /// ([`Self::custom_detection_rules`]) to this account in one execution mode,
+    /// so `(RuleId, Mode)` identifies it: a second create for the same pair is the
+    /// `ConflictException` the operation models rather than a second record. The
+    /// `AssociationId` the model also carries is a minted handle onto that pair,
+    /// resolved by [`Self::detection_rule_association_by_id`].
+    ///
+    /// BOUNDED by construction: a Region holds at most one association per
+    /// published rule per `AssociationMode` member — a fixed catalogue times a
+    /// two-member enum — across at most [`MAX_DETECTION_RULE_REGIONS`] Regions,
+    /// which the create enforces before it writes
+    /// ([`Self::detection_rule_regions_exhausted`]). The `ClientToken` a create
+    /// carried lives ON the record rather than in an index of its own, so the
+    /// idempotency mappings are bounded by the same ceiling.
+    pub custom_detection_rule_associations:
+        BTreeMap<(String, String, String), DetectionRuleAssociationRecord>,
+    /// Every custom detection rule ORGANIZATION configuration this account has
+    /// created, keyed by `(region, RuleId, Mode)` — the same key, and for the same
+    /// reason, as [`Self::custom_detection_rule_associations`].
+    ///
+    /// Separate from the associations on purpose: an association enrolls THIS
+    /// account in a rule, while an organization configuration says which member
+    /// accounts the organization enrolls, so one `(RuleId, Mode)` pair can carry
+    /// either, both or neither, and a read of one must never answer with the
+    /// other.
+    ///
+    /// BOUNDED exactly as the association map is, by the same create-time guard.
+    pub custom_detection_rule_org_configurations:
+        BTreeMap<(String, String, String), DetectionRuleOrgConfigurationRecord>,
     /// Last instant handed out by [`Self::tick_millis`], so two mutations in the
     /// same millisecond still get strictly increasing timestamps.
     last_millis: i64,
@@ -520,6 +552,111 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             regions.insert(scan.region.as_str());
         }
         !regions.contains(region) && regions.len() >= MAX_MALWARE_SCAN_REGIONS
+    }
+
+    /// The association `region`'s endpoint holds for `(rule_id, mode)`, if any.
+    ///
+    /// Regional for the same reason a detector is: an association is made through
+    /// one Region's endpoint and only that endpoint reports it.
+    pub fn detection_rule_association(
+        &self,
+        region: &str,
+        rule_id: &str,
+        mode: &str,
+    ) -> Option<&DetectionRuleAssociationRecord> {
+        self.custom_detection_rule_associations.get(&(
+            region.to_string(),
+            rule_id.to_string(),
+            mode.to_string(),
+        ))
+    }
+
+    /// The association `region`'s endpoint holds under `association_id` for
+    /// `rule_id`, if any.
+    ///
+    /// The id is a handle onto the `(RuleId, Mode)` pair the record is keyed by,
+    /// so this resolves it by scanning that Region's associations: a Region holds
+    /// at most one per published rule per mode, so the scan is over a table of
+    /// fixed, single-digit-times-two length.
+    pub fn detection_rule_association_by_id(
+        &self,
+        region: &str,
+        rule_id: &str,
+        association_id: &str,
+    ) -> Option<&DetectionRuleAssociationRecord> {
+        self.custom_detection_rule_associations
+            .values()
+            .filter(|record| record.region == region && record.rule_id == rule_id)
+            .find(|record| record.association_id == association_id)
+    }
+
+    /// The association `region`'s endpoint made under `token`, if a create
+    /// recorded one.
+    ///
+    /// The token is a pure REPLAY key, as it is for every other create on this
+    /// service: it resolves to the association the first call made and nothing
+    /// about the replaying request is compared against it, so a replay answers
+    /// with that association rather than making a second one or mutating the
+    /// first.
+    pub fn detection_rule_association_for_client_token(
+        &self,
+        region: &str,
+        token: &str,
+    ) -> Option<&DetectionRuleAssociationRecord> {
+        self.custom_detection_rule_associations
+            .values()
+            .filter(|record| record.region == region)
+            .find(|record| record.client_token.as_deref() == Some(token))
+    }
+
+    /// The organization configuration `region`'s endpoint holds for
+    /// `(rule_id, mode)`, if any.
+    pub fn detection_rule_org_configuration(
+        &self,
+        region: &str,
+        rule_id: &str,
+        mode: &str,
+    ) -> Option<&DetectionRuleOrgConfigurationRecord> {
+        self.custom_detection_rule_org_configurations.get(&(
+            region.to_string(),
+            rule_id.to_string(),
+            mode.to_string(),
+        ))
+    }
+
+    /// The organization configuration `region`'s endpoint created under `token`,
+    /// if a create recorded one. A pure REPLAY key, exactly as
+    /// [`Self::detection_rule_association_for_client_token`] is.
+    pub fn detection_rule_org_configuration_for_client_token(
+        &self,
+        region: &str,
+        token: &str,
+    ) -> Option<&DetectionRuleOrgConfigurationRecord> {
+        self.custom_detection_rule_org_configurations
+            .values()
+            .filter(|record| record.region == region)
+            .find(|record| record.client_token.as_deref() == Some(token))
+    }
+
+    /// Would a custom-detection-rule write through `region`'s endpoint partition
+    /// the association and organization-configuration stores into one Region more
+    /// than they will hold ([`MAX_DETECTION_RULE_REGIONS`])?
+    ///
+    /// The Region is request-chosen ([`request_region`]), so this is the bound on
+    /// the number of PARTITIONS that makes the per-Region ceiling — one record per
+    /// published rule per `AssociationMode` member — a bound on the whole store. A
+    /// Region the store already holds a record for is never refused by it, so the
+    /// bound is invisible to a caller using the Regions AWS runs. Counted over
+    /// BOTH maps, because both are keyed by the same request-chosen Region.
+    pub fn detection_rule_regions_exhausted(&self, region: &str) -> bool {
+        let mut regions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for record in self.custom_detection_rule_associations.values() {
+            regions.insert(record.region.as_str());
+        }
+        for record in self.custom_detection_rule_org_configurations.values() {
+            regions.insert(record.region.as_str());
+        }
+        !regions.contains(region) && regions.len() >= MAX_DETECTION_RULE_REGIONS
     }
 }
 
@@ -1153,6 +1290,56 @@ pub const RELATIONSHIP_CREATED: &str = "Created";
 /// from.
 pub const RELATIONSHIP_REMOVED: &str = "Removed";
 
+/// `Invitation.RelationshipStatus` for an invitation that has been delivered and
+/// not yet answered. See [`RELATIONSHIP_CREATED`] for where the values come from.
+pub const RELATIONSHIP_INVITED: &str = "Invited";
+
+/// `Master.RelationshipStatus` once the member account has accepted the
+/// invitation and is being monitored. See [`RELATIONSHIP_CREATED`] for where the
+/// values come from.
+pub const RELATIONSHIP_ENABLED: &str = "Enabled";
+
+/// How many received invitations one detector's inbox retains.
+///
+/// A bound on [`Detector::received_invitations`], whose key is an ACCOUNT ID and
+/// so request-chosen, exactly as [`MAX_MEMBERS_PER_DETECTOR`] bounds the
+/// request-keyed member store. GuardDuty allows one administrator per member
+/// account, so a member account has at most a handful of competing invitations
+/// pending at once.
+pub const MAX_INVITATIONS_PER_DETECTOR: usize = 50;
+
+/// The wire name of the `MasterId` member — `jsonName` `masterId`
+/// (`smithy_query(operation="AcceptInvitation")`). It is what a rejection names.
+pub const MASTER_ID_MEMBER: &str = "masterId";
+
+/// The wire name of the `InvitationId` member — `jsonName` `invitationId`
+/// (`smithy_query(operation="AcceptInvitation")`).
+pub const INVITATION_ID_MEMBER: &str = "invitationId";
+
+/// The wire name of the `AdministratorId` member — `jsonName` `administratorId`
+/// (`smithy_query(operation="AcceptAdministratorInvitation")`). The current name of
+/// the member [`MASTER_ID_MEMBER`] carries on the deprecated twin, so a rejection
+/// names whichever one the request used.
+pub const ADMINISTRATOR_ID_MEMBER: &str = "administratorId";
+
+/// The message an acceptance naming no pending invitation is refused with, naming
+/// the member that carried the administrator's account id.
+///
+/// It names the two members that together identify the invitation and states the
+/// rule they broke, without quoting either value back — the wording every
+/// rejection on this service follows.
+pub fn invitation_not_pending_message_for(administrator_member: &str) -> String {
+    format!(
+        "The request is rejected because the input {administrator_member} and {INVITATION_ID_MEMBER} do not identify an invitation pending for the current account."
+    )
+}
+
+/// [`invitation_not_pending_message_for`] for the deprecated `AcceptInvitation`,
+/// whose administrator member is [`MASTER_ID_MEMBER`].
+pub fn invitation_not_pending_message() -> String {
+    invitation_not_pending_message_for(MASTER_ID_MEMBER)
+}
+
 /// The message a request is DENIED with when the account is not authorized on the
 /// resource `member` names.
 ///
@@ -1176,6 +1363,19 @@ pub fn detector_id_rejection(detector_id: &str) -> String {
 /// refused exactly as a detector id is.
 pub fn destination_id_rejection(destination_id: &str) -> String {
     minted_id_rejection(DESTINATION_ID_MEMBER, destination_id)
+}
+
+/// The wire name of the `FindingIds` member — `jsonName` `findingIds` on every
+/// operation that addresses findings by id
+/// (`smithy_query(operation="ArchiveFindings")`). It is what a rejection names.
+pub const FINDING_IDS_MEMBER: &str = "findingIds";
+
+/// Classify a finding id the detector does not hold, the same way a detector id
+/// is classified: a finding `Id` is one of the ids this service mints
+/// ([`is_minted_id`]), so a value that is not of that form is a parameter failure
+/// and a well-formed one this detector does not hold an ownership failure.
+pub fn finding_id_rejection(finding_id: &str) -> String {
+    minted_id_rejection(FINDING_IDS_MEMBER, finding_id)
 }
 
 /// The wire name of the `MalwareProtectionPlanId` member, as the request carries
@@ -1601,6 +1801,77 @@ pub struct Detector {
     /// id. `DeleteDetector` drops them with the detector, like the findings and
     /// filters above.
     pub members: BTreeMap<String, MemberRecord>,
+    /// The invitations this detector's ACCOUNT has received, keyed by the account
+    /// id of the administrator that sent each one.
+    ///
+    /// The inbox side of the member relationship: `InviteMembers` is called by an
+    /// administrator and delivers an invitation to the account it names, so an
+    /// entry here is an invitation some OTHER account addressed to this one —
+    /// which is what `AcceptInvitation` / `AcceptAdministratorInvitation` resolve
+    /// `(MasterId, InvitationId)` against, and what `ListInvitations` reports.
+    ///
+    /// This emulator serves a single account ([`administrator_account_id`]) and
+    /// models no way for another account to call `InviteMembers` against it, so no
+    /// operation writes this map and it is EMPTY for every request the emulator
+    /// answers — which is why `AcceptInvitation` refuses every well-formed pair.
+    /// It is state rather than a constant because the refusal is a lookup: an
+    /// invitation this store holds is accepted, and the operations that deliver
+    /// and report one (`InviteMembers`, `ListInvitations`,
+    /// `GetInvitationsCount`, `DeclineInvitations`, `DeleteInvitations`) are
+    /// scaffolds with issues of their own.
+    ///
+    /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
+    /// grow it without limit: the key is an account id, which is request-chosen.
+    pub received_invitations: BTreeMap<String, ReceivedInvitationRecord>,
+    /// The administrator this detector's account is monitored by — what
+    /// `GetMasterAccount` / `GetAdministratorAccount` report — or `None` while the
+    /// account has accepted no invitation.
+    ///
+    /// Written only by accepting an invitation, and dropped by
+    /// `DisassociateFromMasterAccount`; a detector a create just minted
+    /// administers itself, so it starts with none.
+    pub administrator: Option<AdministratorRecord>,
+}
+
+/// An invitation this detector's account RECEIVED, as the store holds it.
+///
+/// Every member is one the `Invitation` shape carries
+/// (`smithy_query(shape="Invitation")`), with the instant held as epoch
+/// milliseconds — the single source for the `InvitedAt` anything reports.
+#[derive(Debug, Clone)]
+pub struct ReceivedInvitationRecord {
+    /// `Invitation.AccountId` — "the ID of the account that the invitation was
+    /// sent from", which is the `MasterId` / `AdministratorId` an acceptance names.
+    pub administrator_account_id: String,
+    /// `Invitation.InvitationId` — "the ID of the invitation. This value is used
+    /// to validate the inviter account to the member account".
+    pub invitation_id: String,
+    /// `Invitation.RelationshipStatus`: [`RELATIONSHIP_INVITED`] while the
+    /// invitation is pending.
+    pub relationship_status: String,
+    /// When the invitation was sent.
+    pub invited_at_millis: i64,
+}
+
+/// The administrator relationship an accepted invitation established.
+///
+/// Every member is one the `Master` shape carries
+/// (`smithy_query(shape="Master")`); `GetAdministratorAccount` reports the same
+/// facts under `Administrator`.
+#[derive(Debug, Clone)]
+pub struct AdministratorRecord {
+    /// `Master.AccountId` — "the ID of the account used as the administrator
+    /// account".
+    pub account_id: String,
+    /// `Master.InvitationId` — "the value used to validate the administrator
+    /// account to the member account": the id of the invitation that was accepted.
+    pub invitation_id: String,
+    /// `Master.RelationshipStatus`: [`RELATIONSHIP_ENABLED`] once the invitation
+    /// has been accepted.
+    pub relationship_status: String,
+    /// When the accepted invitation was sent — `Master.InvitedAt`, which is the
+    /// invitation's instant and not the acceptance's.
+    pub invited_at_millis: i64,
 }
 
 /// A member account of the administrator that owns the detector this record hangs
@@ -1772,6 +2043,61 @@ impl Detector {
                 }
             }
         }
+    }
+
+    /// The first id in `finding_ids` this detector holds no finding for, in the
+    /// order the request listed them.
+    ///
+    /// The archive-state mutations resolve every id BEFORE they write
+    /// ([`Self::set_findings_archived`]), so a batch naming an id the detector
+    /// does not hold is refused whole and moves nothing: a caller archiving in
+    /// bulk learns that one of its ids is wrong instead of having the rest
+    /// silently applied. The FIRST unheld id is reported so the rejection is a
+    /// function of the request alone and not of iteration order over the store.
+    pub fn first_unheld_finding_id<'ids>(&self, finding_ids: &'ids [String]) -> Option<&'ids str> {
+        finding_ids
+            .iter()
+            .find(|id| !self.findings.contains_key(id.as_str()))
+            .map(String::as_str)
+    }
+
+    /// Accept the invitation `(administrator_account_id, invitation_id)` names, if
+    /// this detector's account has one pending under exactly that pair.
+    ///
+    /// Reports whether it did. Both members must match: `InvitationId` is "the
+    /// value that is used to validate the administrator account to the member
+    /// account" (`smithy_query(operation="AcceptInvitation")`), so an id that
+    /// belongs to a different administrator's invitation validates nothing.
+    ///
+    /// The accepted invitation leaves the inbox — it is no longer pending — and
+    /// the relationship it established becomes [`Self::administrator`], carrying
+    /// the invitation's own `InvitedAt` rather than the instant of the acceptance.
+    /// A request that matches nothing writes NOTHING, which is what makes the
+    /// refusal leave master-account state exactly where it was.
+    pub fn accept_invitation(
+        &mut self,
+        administrator_account_id: &str,
+        invitation_id: &str,
+        now: i64,
+    ) -> bool {
+        let matches = self
+            .received_invitations
+            .get(administrator_account_id)
+            .is_some_and(|invitation| invitation.invitation_id == invitation_id);
+        if !matches {
+            return false;
+        }
+        let Some(invitation) = self.received_invitations.remove(administrator_account_id) else {
+            return false;
+        };
+        self.administrator = Some(AdministratorRecord {
+            account_id: invitation.administrator_account_id,
+            invitation_id: invitation.invitation_id,
+            relationship_status: RELATIONSHIP_ENABLED.to_string(),
+            invited_at_millis: invitation.invited_at_millis,
+        });
+        self.updated_at_millis = now;
+        true
     }
 
     /// The investigation a create already minted for `token`, if any — the seam
@@ -4174,6 +4500,262 @@ pub fn custom_detection_rule_arn(region: &str, rule_id: &str) -> String {
         region,
         &format!("detection-rule/{rule_id}"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Custom detection rule associations and organization configurations
+//
+// A rule is published by GuardDuty; what an ACCOUNT owns is its association with
+// one, and — for an organization's delegated administrator — the organization
+// configuration that says which member accounts the rule applies to. Both are
+// identified by the `(RuleId, Mode)` pair they are created for.
+// ---------------------------------------------------------------------------
+
+/// The wire name of the `Mode` member — `jsonName` `mode` on the body-bound
+/// operations and the query parameter `mode` on the rest
+/// (`smithy_query(operation="CreateCustomDetectionRuleAssociation,GetCustomDetectionRuleOrgConfiguration")`).
+pub const MODE_MEMBER: &str = "mode";
+
+/// The wire name of the `AssociationId` member — the URI label
+/// `AssociationId`, rendered `associationId` in a response body
+/// (`smithy_query(operation="GetCustomDetectionRuleAssociation")`).
+pub const ASSOCIATION_ID_MEMBER: &str = "associationId";
+
+/// `DetectionRuleConfigurationStatus`: the organization configuration is in
+/// effect. One of `ACTIVE | PROCESSING | FAILED`
+/// (`smithy_query(shape="DetectionRuleConfigurationStatus")`).
+pub const DETECTION_RULE_CONFIGURATION_ACTIVE: &str = "ACTIVE";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::DETECTION_RULE_CONFIGURATION_STATUS_VALUES,
+    DETECTION_RULE_CONFIGURATION_ACTIVE
+));
+
+/// `DetectionRuleConfigurationStatus`: the organization configuration has been
+/// accepted and is being rolled out to the organization's accounts. See
+/// [`DETECTION_RULE_CONFIGURATION_ACTIVE`] for the enum.
+pub const DETECTION_RULE_CONFIGURATION_PROCESSING: &str = "PROCESSING";
+const _: () = assert!(enum_carries(
+    crate::ops::types::shared_types::DETECTION_RULE_CONFIGURATION_STATUS_VALUES,
+    DETECTION_RULE_CONFIGURATION_PROCESSING
+));
+
+/// How long an organization configuration stays
+/// [`DETECTION_RULE_CONFIGURATION_PROCESSING`] before the CLOCK owes it
+/// [`DETECTION_RULE_CONFIGURATION_ACTIVE`].
+///
+/// GuardDuty documents no duration for rolling a rule configuration out to an
+/// organization, so this emulator CHOOSES one — the same span
+/// [`IP_SET_TRANSITION_MILLIS`] uses, and non-zero for the same reason: a caller
+/// that reads the configuration back immediately after creating it still observes
+/// the transient `PROCESSING` status.
+pub const ORG_CONFIGURATION_TRANSITION_MILLIS: i64 = 500;
+
+/// How many Regions this store will hold custom-detection-rule associations and
+/// organization configurations for.
+///
+/// Per Region the records are bounded by construction — one per published rule
+/// per `AssociationMode` member — but the Region is read from the request's
+/// credential scope ([`request_region`]), so the caller chooses the partition key:
+/// without a ceiling on the number of partitions a caller signing for invented
+/// Region names could make the process retain a full set per distinct Region
+/// string. Emulator-chosen, like [`MAX_MALWARE_PROTECTION_PLAN_REGIONS`], and
+/// enforced before either create writes
+/// ([`ComAmazonawsGuarddutyGuarddutyapiserviceState::detection_rule_regions_exhausted`]).
+pub const MAX_DETECTION_RULE_REGIONS: usize = 50;
+
+/// The message a create that would partition the custom-detection-rule stores
+/// into one Region more than [`MAX_DETECTION_RULE_REGIONS`] is refused with.
+pub const DETECTION_RULE_REGION_LIMIT_MESSAGE: &str =
+    "The request is rejected because the maximum number of custom detection rule associations has been reached.";
+
+/// The message a read of an association the account does not hold answers with.
+///
+/// It names the members that identify the association and states the rule they
+/// broke, without quoting the caller's values back.
+pub fn detection_rule_association_not_found_message() -> String {
+    format!(
+        "The request is rejected because the input {RULE_ID_MEMBER} and {ASSOCIATION_ID_MEMBER} do not refer to a custom detection rule association of the current account."
+    )
+}
+
+/// The message a second association for a `(RuleId, Mode)` pair the account has
+/// already associated is refused with — the `ConflictException` the create
+/// models. Creating is not updating: `UpdateCustomDetectionRuleAssociation` is
+/// the operation that changes an existing association's mode.
+pub fn detection_rule_association_conflict_message() -> String {
+    format!(
+        "The request is rejected because the current account already has an association for the given {RULE_ID_MEMBER} and {MODE_MEMBER}."
+    )
+}
+
+/// The message a read of an organization configuration the account has not
+/// created answers with.
+pub fn detection_rule_org_configuration_not_found_message() -> String {
+    format!(
+        "The request is rejected because the input {RULE_ID_MEMBER} and {MODE_MEMBER} do not refer to an organization configuration of the current account."
+    )
+}
+
+/// The message a second organization configuration for a `(RuleId, Mode)` pair
+/// the account has already configured is refused with — the `ConflictException`
+/// the create models.
+pub fn detection_rule_org_configuration_conflict_message() -> String {
+    format!(
+        "The request is rejected because the current account already has an organization configuration for the given {RULE_ID_MEMBER} and {MODE_MEMBER}."
+    )
+}
+
+/// The message a request naming both `IncludeAccountIds` and `ExcludeAccountIds`
+/// is refused with: the two are "mutually exclusive"
+/// (`smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`).
+pub const ORG_CONFIGURATION_ACCOUNT_SCOPE_MESSAGE: &str =
+    "The request is rejected because includeAccountIds and excludeAccountIds are mutually exclusive.";
+
+/// The ARN of the association `association_id` of rule `rule_id`, as `region`'s
+/// endpoint reports it.
+///
+/// Derived, never stored, exactly as [`custom_detection_rule_arn`] is: the ids and
+/// the Region serving the read are the only variable parts, so a read cannot
+/// report an ARN that disagrees with the ids it was asked about. The resource path
+/// extends the rule's own, because an association belongs to a rule.
+pub fn custom_detection_rule_association_arn(
+    region: &str,
+    rule_id: &str,
+    association_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        GUARDDUTY_ARN_SERVICE,
+        region,
+        &format!("detection-rule/{rule_id}/association/{association_id}"),
+    )
+}
+
+/// One custom detection rule association as the store holds it.
+///
+/// Timestamps are epoch milliseconds, the single source for the instants anything
+/// reports.
+#[derive(Debug, Clone)]
+pub struct DetectionRuleAssociationRecord {
+    /// The minted `AssociationId`: `len 1..64`, `pattern ^[a-zA-Z0-9_-]{1,64}$`
+    /// (`smithy_query(shape="AssociationDetail")`), which the 32 hexadecimal
+    /// characters [`ComAmazonawsGuarddutyGuarddutyapiserviceState::mint_id`] mints
+    /// satisfy.
+    pub association_id: String,
+    /// The Region whose endpoint made this association, and the only one that
+    /// reports it.
+    pub region: String,
+    /// The `RuleId` of the published rule this association binds.
+    pub rule_id: String,
+    /// `AssociationDetail.AccountId` — "the Amazon Web Services account ID
+    /// associated with this rule association", which is the account the emulator
+    /// serves and NOT caller input.
+    pub account_id: String,
+    /// `AssociationMode`: `LIVE` or `DRY_RUN`.
+    pub mode: String,
+    /// The tags of the association resource.
+    pub tags: BTreeMap<String, String>,
+    /// The `ClientToken` the create carried, so a replay answers with this same
+    /// association instead of making a second one.
+    pub client_token: Option<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+}
+
+/// One custom detection rule organization configuration as the store holds it.
+#[derive(Debug, Clone)]
+pub struct DetectionRuleOrgConfigurationRecord {
+    /// The Region whose endpoint created this configuration, and the only one that
+    /// reports it.
+    pub region: String,
+    /// The `RuleId` of the published rule this configuration is for.
+    pub rule_id: String,
+    /// `AssociationMode`: `LIVE` or `DRY_RUN`.
+    pub mode: String,
+    /// The member accounts the configuration includes, empty when it names none.
+    pub include_account_ids: Vec<String>,
+    /// The member accounts the configuration excludes, empty when it names none.
+    /// Mutually exclusive with [`Self::include_account_ids`], which the create
+    /// refuses before it writes.
+    pub exclude_account_ids: Vec<String>,
+    /// When the clock owes this configuration
+    /// [`DETECTION_RULE_CONFIGURATION_ACTIVE`]. Absent once nothing is owed.
+    pub status_due_millis: Option<i64>,
+    /// The `ClientToken` the create carried.
+    pub client_token: Option<String>,
+    pub created_at_millis: i64,
+    pub updated_at_millis: i64,
+}
+
+impl DetectionRuleOrgConfigurationRecord {
+    /// This configuration's `Status` at `now`.
+    ///
+    /// DERIVED from the instant the create recorded rather than stored: the move
+    /// out of [`DETECTION_RULE_CONFIGURATION_PROCESSING`] was owed at
+    /// [`Self::status_due_millis`] whether or not anybody called, so a read
+    /// reports it without writing anything — which is what keeps a report from
+    /// changing what a later caller sees.
+    pub fn status(&self, now: i64) -> &'static str {
+        match self.status_due_millis {
+            Some(due) if now < due => DETECTION_RULE_CONFIGURATION_PROCESSING,
+            _ => DETECTION_RULE_CONFIGURATION_ACTIVE,
+        }
+    }
+}
+
+/// The wire `AssociationDetail` for a stored association.
+///
+/// One builder for the create that mints an association and the read that reports
+/// it, so the two cannot disagree — the same reason [`member_view`] is shared. The
+/// `Arn` is DERIVED from the record's own ids and `region`, never stored.
+///
+/// `ExpiresAt` is the shape's only optional member — "the timestamp when the
+/// association expires" (`smithy_query(shape="AssociationDetail")`) — and
+/// GuardDuty documents no lifetime for an association, so it is reported ABSENT
+/// rather than filled with an invented instant.
+pub fn detection_rule_association_view(
+    record: &DetectionRuleAssociationRecord,
+) -> crate::ops::types::AssociationDetail {
+    crate::ops::types::AssociationDetail {
+        association_id: record.association_id.clone(),
+        arn: custom_detection_rule_association_arn(
+            &record.region,
+            &record.rule_id,
+            &record.association_id,
+        ),
+        rule_id: record.rule_id.clone(),
+        account_id: record.account_id.clone(),
+        mode: record.mode.clone(),
+        created_at: ::aws_smithy_types::DateTime::from_millis(record.created_at_millis),
+        updated_at: ::aws_smithy_types::DateTime::from_millis(record.updated_at_millis),
+        expires_at: None,
+    }
+}
+
+/// The wire `DetectionRuleOrgConfiguration` for a stored organization
+/// configuration, as of `now`.
+///
+/// Shared by the create and the read for the same reason
+/// [`detection_rule_association_view`] is. `Status` comes from
+/// [`DetectionRuleOrgConfigurationRecord::status`], so both report the same
+/// derivation of the clock; `StatusReason` is "the reason for the current
+/// configuration status" and a configuration that is proceeding normally has
+/// none, so it stays absent. `ExpiresAt` is absent for the same reason an
+/// association's is.
+pub fn detection_rule_org_configuration_view(
+    record: &DetectionRuleOrgConfigurationRecord,
+    now: i64,
+) -> crate::ops::types::DetectionRuleOrgConfiguration {
+    crate::ops::types::DetectionRuleOrgConfiguration {
+        rule_id: record.rule_id.clone(),
+        mode: record.mode.clone(),
+        status: record.status(now).to_string(),
+        status_reason: None,
+        include_account_ids: record.include_account_ids.clone(),
+        exclude_account_ids: record.exclude_account_ids.clone(),
+        created_at: ::aws_smithy_types::DateTime::from_millis(record.created_at_millis),
+        updated_at: ::aws_smithy_types::DateTime::from_millis(record.updated_at_millis),
+        expires_at: None,
+    }
 }
 
 /// One custom detection rule as the store holds it.

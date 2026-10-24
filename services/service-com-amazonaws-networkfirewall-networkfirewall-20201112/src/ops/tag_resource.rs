@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds the request's tags to the firewall, firewall policy or rule
+//! group the `ResourceArn` names, keyed by tag key so a key the resource already
+//! carries takes the new value, and refuses a write that would take it past the
+//! documented 50-tag ceiling. The tags land on that resource's own record in
+//! `crate::state`, which is what `ListTagsForResource` reports and what the
+//! resource's own describe and delete responses project.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // Network Firewall tags "the Amazon Web Services resources that you
+        // manage through Network Firewall: firewalls, firewall policies, and
+        // rule groups"; any other resource an `^arn:aws` value can name
+        // "corresponds to a resource that isn't valid in the context of the
+        // request", which is what `InvalidRequestException` documents.
+        if crate::state::taggable_resource_kind(&input.resource_arn).is_none() {
+            return Err(TagResourceErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::untaggable_arn_message(&input.resource_arn)),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                TagResourceErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the resource store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        match state.apply_tags(&input.resource_arn, input.tags) {
+            Ok(()) => Ok(TagResourceOutput {}),
+            Err(crate::state::TagWriteBreach::NotFound) => {
+                Err(TagResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into())
+            }
+            // The ceiling is the documented one ("up to 50 tags for a
+            // resource"), and the envelope is `InvalidRequestException` because
+            // the model declares no limit error for this operation
+            // (`smithy_query(query="operation",operation="TagResource")`: only
+            // InternalServerError, InvalidRequestException,
+            // ResourceNotFoundException and ThrottlingException).
+            Err(crate::state::TagWriteBreach::TooManyTags(requested)) => {
+                Err(TagResourceErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::tag_limit_message(requested)),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }

@@ -379,14 +379,38 @@ impl ImageRecord {
 }
 
 /// See [`MAX_REPOSITORIES`]. This one bounds `uploads`, which grows by one entry per
-/// `InitiateLayerUpload` and shrinks when an upload is completed; an upload a client
-/// opened and then abandoned is never reclaimed — the cap is for the life of the
-/// process, and [`LayerUpload::started_at`] is a record of when the upload was opened,
-/// not an expiry the store acts on — so the registry needs a ceiling on how many
-/// in-flight layer uploads it holds at once. Past it the open is refused with the
+/// `InitiateLayerUpload` and shrinks when an upload is completed. An upload a client
+/// opened and then abandoned is reclaimed only when the registry needs its slot — see
+/// [`ABANDONED_UPLOAD_AGE`] and
+/// [`reclaim_abandoned_uploads`](ComAmazonawsEcrAmazonec2containerregistryV20150921State::reclaim_abandoned_uploads)
+/// — so the registry needs a ceiling on how many in-flight layer uploads it holds at
+/// once. Past it, with nothing reclaimable, the open is refused with the
 /// `ServerException` `InitiateLayerUpload` models: reaching the ceiling is this
 /// registry's own capacity, not a fault in the request.
 pub const MAX_LAYER_UPLOADS: usize = 1_000;
+
+/// How long an in-flight upload nothing has touched may sit in the store before the
+/// registry may reclaim its slot to open a new one.
+///
+/// AWS publishes no age at which an in-flight layer upload expires, so this span is the
+/// EMULATOR's own capacity policy rather than a claim about the service: an upload is
+/// never dropped while the store has room, so no ordinary push can lose its session, and
+/// a client that opens uploads and abandons them cannot pin [`MAX_LAYER_UPLOADS`] slots
+/// (and their bytes) for the life of the process. It is deliberately far longer than any
+/// push takes.
+pub const ABANDONED_UPLOAD_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The registry-wide ceiling on the caller-supplied BYTES this store retains at once:
+/// every in-flight upload's received bytes plus every stored image manifest.
+///
+/// The per-record caps above each bound ONE dimension and their product is far larger
+/// than any host — [`MAX_LAYER_UPLOADS`] uploads of [`MAX_LAYER_UPLOAD_BYTES`] alone
+/// would be 128 GiB — so this is the aggregate the two growing paths are actually held
+/// to: `UploadLayerPart` and `PutImage` refuse, with the `LimitExceededException` each
+/// models, the call that would take the registry past it, and no byte of the refused
+/// payload is kept. It is a bound on THIS PROCESS's memory rather than an AWS quota (AWS
+/// publishes none), set well above the bytes any ordinary push or test sends.
+pub const MAX_REGISTRY_CALLER_BYTES: usize = 512 * 1024 * 1024;
 
 /// The `partSize` `InitiateLayerUpload` reports: the size ECR tells the client to send
 /// future layer parts in.
@@ -435,9 +459,12 @@ pub struct LayerUpload {
     pub repository_name: String,
     /// The `partSize` reported to the client when the upload was opened.
     pub part_size: i64,
-    /// When `InitiateLayerUpload` opened it. Nothing reads it: an upload is closed by
+    /// When `InitiateLayerUpload` opened it. A client closes an upload with
     /// `CompleteLayerUpload`, and AWS publishes no age at which an in-flight upload
-    /// expires, so this registry expires none.
+    /// expires, so this registry expires none while it has room; it is read only when a
+    /// new upload needs a slot the store does not have, to reclaim an upload nothing has
+    /// touched for [`ABANDONED_UPLOAD_AGE`]
+    /// ([`reclaim_abandoned_uploads`](ComAmazonawsEcrAmazonec2containerregistryV20150921State::reclaim_abandoned_uploads)).
     pub started_at: SystemTime,
     /// The layer bytes accepted so far, in the order they arrived. Each part starts
     /// where the previous one ended, so this is the prefix of the layer the registry
@@ -1579,6 +1606,53 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
             .get(&normalize_prefix(prefix))
     }
 
+    /// The caller-supplied BYTES this registry currently holds: every in-flight upload's
+    /// received bytes plus every stored image manifest.
+    ///
+    /// The one accounting behind [`MAX_REGISTRY_CALLER_BYTES`], so the two paths that
+    /// grow the store — `UploadLayerPart` and `PutImage` — are held to one aggregate
+    /// rather than to their own per-record caps alone. Summed on demand: both maps are
+    /// bounded by their entry caps, so this is a walk of at most a few thousand lengths
+    /// and no second copy of the figure can drift from the bytes actually held.
+    pub fn caller_bytes_held(&self) -> usize {
+        let upload_bytes = self
+            .uploads
+            .values()
+            .fold(0usize, |held, upload| {
+                held.saturating_add(upload.received_bytes.len())
+            });
+        self.repositories.values().fold(upload_bytes, |held, repo| {
+            repo.images.values().fold(held, |held, image| {
+                held.saturating_add(image.manifest.len())
+            })
+        })
+    }
+
+    /// Whether `additional` more caller-supplied bytes fit under
+    /// [`MAX_REGISTRY_CALLER_BYTES`]. A caller that asks for more is refused before any
+    /// byte of its payload is stored.
+    pub fn has_byte_budget_for(&self, additional: usize) -> bool {
+        self.caller_bytes_held().saturating_add(additional) <= MAX_REGISTRY_CALLER_BYTES
+    }
+
+    /// Drop every in-flight upload nothing has touched for [`ABANDONED_UPLOAD_AGE`] as of
+    /// `now`.
+    ///
+    /// Called by `InitiateLayerUpload` when it needs a slot: an upload a client opened and
+    /// abandoned otherwise holds its slot and its received bytes for the life of the
+    /// process, so without this the entry cap and the byte budget could both be pinned by
+    /// sessions nobody will ever complete. Nothing is dropped while the registry has room,
+    /// and an upload younger than that age is never dropped, so a push in progress keeps
+    /// its session.
+    pub fn reclaim_abandoned_uploads(&mut self, now: SystemTime) {
+        self.uploads.retain(|_, upload| {
+            let abandoned = now
+                .duration_since(upload.started_at)
+                .is_ok_and(|age| age >= ABANDONED_UPLOAD_AGE);
+            !abandoned
+        });
+    }
+
     /// The value of the account setting `name`: what was last set for it, or its
     /// documented default while nothing has been. Reading one changes nothing.
     pub fn account_setting(&self, name: &str) -> Result<String, Fault> {
@@ -1687,6 +1761,174 @@ pub fn upstream_needs_credential(upstream_registry: Option<&str>, upstream_url: 
                 .any(|(_, anonymous_host)| *anonymous_host == host)
         }
     }
+}
+
+/// The Secrets Manager secret name prefix a pull through cache rule's credential is
+/// stored under. `CredentialArn`'s own modelled pattern states it —
+/// `^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$`
+/// — so a value naming anything else names no secret ECR reads a rule's upstream
+/// credential from.
+pub const CREDENTIAL_SECRET_NAME_PREFIX: &str = "ecr-pullthroughcache/";
+
+/// The ARN vendor (service namespace) field of a `credentialArn`: the secret a rule's
+/// credential lives in is an Amazon Web Services Secrets Manager secret.
+const SECRETS_MANAGER_VENDOR: &str = "secretsmanager";
+
+/// The resource field prefix of a Secrets Manager secret ARN (`…:secret:<name>`).
+const SECRET_RESOURCE_PREFIX: &str = "secret:";
+
+/// Whether `value` is the ARN of the Secrets Manager secret a pull through cache rule's
+/// `credentialArn` names, as that member's own modelled pattern spells one:
+/// `^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$`.
+///
+/// The six fields come from [`::service_common::arn::parse_of`], the tree's ONE ARN parse,
+/// which also settles that the value is an ARN of the `secretsmanager` vendor at all. What
+/// is checked here is the rest of that pattern, field by field: the partition is `aws`
+/// optionally followed by `-`-separated word labels, the region-and-account span is the
+/// `[a-zA-Z0-9-:]+` the pattern states, and the secret name after
+/// [`CREDENTIAL_SECRET_NAME_PREFIX`] is non-empty and drawn from the pattern's own
+/// character class — so a value this accepts is one the member accepts.
+pub fn is_pull_through_cache_credential_arn(value: &str) -> bool {
+    let Some(arn) = ::service_common::arn::parse_of(value, SECRETS_MANAGER_VENDOR) else {
+        return false;
+    };
+    let Some(name) = arn
+        .resource
+        .strip_prefix(SECRET_RESOURCE_PREFIX)
+        .and_then(|name| name.strip_prefix(CREDENTIAL_SECRET_NAME_PREFIX))
+    else {
+        return false;
+    };
+    is_aws_partition(arn.partition)
+        // `[a-zA-Z0-9-:]+` spans the region and account fields together, so each is read
+        // under that class and the pair must carry something.
+        && (!arn.region.is_empty() || !arn.account.is_empty())
+        && [arn.region, arn.account]
+            .iter()
+            .all(|field| field.bytes().all(is_region_or_account_byte))
+        && !name.is_empty()
+        && name.bytes().all(is_secret_name_byte)
+}
+
+/// Whether `partition` is the `aws(-\w+)*` partition label `CredentialArn`'s pattern
+/// states: `aws`, optionally followed by `-`-separated word labels (`aws-cn`,
+/// `aws-us-gov`).
+fn is_aws_partition(partition: &str) -> bool {
+    let Some(labels) = partition.strip_prefix("aws") else {
+        return false;
+    };
+    if labels.is_empty() {
+        return true;
+    }
+    // `(-\w+)*`: every label after the first is introduced by a hyphen and is a non-empty
+    // run of word characters.
+    labels.starts_with('-')
+        && labels.split('-').skip(1).all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+}
+
+/// A byte of the `[a-zA-Z0-9-:]+` span `CredentialArn`'s pattern allows between the
+/// service namespace and the `secret:` resource.
+///
+/// The `:` of that class is what lets the span cover the Region and the account TOGETHER
+/// (so a secret ARN carrying no Region still matches); the two fields are read one at a
+/// time here, each already split on `:`, so only the rest of the class applies to a field.
+fn is_region_or_account_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
+}
+
+/// A byte of the `[a-zA-Z0-9\/_+=.@-]+` secret name `CredentialArn`'s pattern allows
+/// after the `ecr-pullthroughcache/` namespace.
+fn is_secret_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"/_+=.@-".contains(&byte)
+}
+
+/// Whether `value` names an IAM role of this account, which is what a rule's
+/// `customRoleArn` carries ("The ARN of the IAM role associated with the pull through
+/// cache rule").
+///
+/// The reading is [`::service_common::iam_role::role_name`], the tree's one IAM role-ARN
+/// reader — the `iam` vendor, the empty Region a partition-global service's ARN carries,
+/// this account, and a `role/…` resource with a name — so this service and every other
+/// service that resolves a role ARN agree on what one is.
+pub fn is_iam_role_arn(value: &str) -> bool {
+    ::service_common::iam_role::role_name(value).is_some()
+}
+
+/// The reason the stored pull through cache `rule` does not validate, or `None` when it
+/// does.
+///
+/// `ValidatePullThroughCacheRule` is a verdict on the rule the registry HOLDS:
+/// "validates an existing pull through cache rule for an upstream registry that requires
+/// authentication … retrieve the contents of the Secrets Manager secret, verify the
+/// syntax, and then validate that authentication to the upstream registry is
+/// successful". So the verdict is read off the stored record and nothing else:
+///
+/// * a rule has to name the upstream it caches from;
+/// * an upstream that authenticates its callers needs a credential on the rule — a
+///   `credentialArn` or a `customRoleArn` — because without one authentication cannot
+///   even be attempted, while an upstream ECR documents as serving anonymously
+///   ([`ANONYMOUS_UPSTREAM_REGISTRIES`]) needs none;
+/// * a credential the rule does carry has to be the kind of ARN its member documents,
+///   which is the "verify the syntax" step: a `credentialArn` outside the
+///   [`CREDENTIAL_SECRET_NAME_PREFIX`] secret namespace, or a `customRoleArn` that is no
+///   IAM role, names nothing the upstream could be authenticated with.
+///
+/// An empty `customRoleArn` is no credential: the member is modelled `@length(0..2048)`,
+/// so the empty string is a legal value that stores no role.
+///
+/// Nothing here depends on reaching the upstream registry. This emulator opens no
+/// outbound connection, and that is a property of the emulator rather than of the rule,
+/// so it is never reported as the rule's verdict: a complete rule validates.
+pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<String> {
+    let prefix = rule.ecr_repository_prefix.as_deref().unwrap_or_default();
+    let url = rule.upstream_registry_url.as_deref().unwrap_or_default();
+    if url.trim().is_empty() {
+        return Some(format!(
+            "the pull through cache rule for '{prefix}' stores no upstreamRegistryUrl, \
+             so it names no upstream registry to cache from"
+        ));
+    }
+
+    let credential = rule.credential_arn.as_deref().filter(|arn| !arn.is_empty());
+    if let Some(credential) = credential {
+        if !is_pull_through_cache_credential_arn(credential) {
+            return Some(format!(
+                "the credentialArn '{credential}' stored on the pull through cache rule \
+                 for '{prefix}' is not the ARN of an Amazon Web Services Secrets Manager \
+                 secret named '{CREDENTIAL_SECRET_NAME_PREFIX}…', so no upstream \
+                 credential can be retrieved from it"
+            ));
+        }
+    }
+
+    let role = rule.custom_role_arn.as_deref().filter(|arn| !arn.is_empty());
+    if let Some(role) = role {
+        if !is_iam_role_arn(role) {
+            return Some(format!(
+                "the customRoleArn '{role}' stored on the pull through cache rule for \
+                 '{prefix}' is not the ARN of an IAM role, so no role can be assumed to \
+                 read the upstream credential"
+            ));
+        }
+    }
+
+    if credential.is_none()
+        && role.is_none()
+        && upstream_needs_credential(rule.upstream_registry.as_deref(), url)
+    {
+        return Some(format!(
+            "the upstream registry '{}' requires authentication and the pull through \
+             cache rule for '{prefix}' stores neither a credentialArn nor a customRoleArn",
+            rule.upstream_registry.as_deref().unwrap_or(url)
+        ));
+    }
+
+    None
 }
 
 /// Whether `setting` is one of the two `ImageTagMutability` values that honour
@@ -2268,13 +2510,13 @@ pub fn repository_name_from_arn(arn: &str) -> Result<String, Fault> {
              supported resource is an Amazon ECR repository"
         ))
     };
-    // `splitn(6, ..)` keeps the resource field whole: it is the only one that may carry
-    // a colon of its own.
-    let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    let [prefix, partition, service, region, account, resource] = fields[..] else {
+    // Read through [`::service_common::arn::parse_of`], the tree's ONE resource-ARN parse,
+    // which also settles that the value is an ARN of the `ecr` vendor at all.
+    let Some(parsed) = ::service_common::arn::parse_of(arn, "ecr") else {
         return Err(invalid());
     };
-    if prefix != "arn" || partition.is_empty() || service != "ecr" || region.is_empty() {
+    let (region, account, resource) = (parsed.region, parsed.account, parsed.resource);
+    if region.is_empty() {
         return Err(invalid());
     }
     let name = resource

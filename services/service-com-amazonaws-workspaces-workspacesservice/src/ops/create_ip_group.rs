@@ -173,29 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             text_within_bound("GroupDesc", group_desc)?;
         }
 
-        // `IpRuleItem$ipRule`: "The IP address range, in CIDR notation." A value
-        // that is not an IP address range is refused rather than persisted as a
-        // rule that could never match a client address.
+        // `IpRuleItem$ipRule`: "The IP address range, in CIDR notation." The rule
+        // list is checked by the shared `crate::state::validate_ip_rules`, so a
+        // list this operation accepts is exactly a list `UpdateRulesOfIpGroup`
+        // accepts, and a rule that is not an address range is refused rather
+        // than persisted as one that could never match a client address.
         let user_rules = input.user_rules.unwrap_or_default();
-        if user_rules.len() > crate::state::MAX_RULES_PER_IP_GROUP {
-            return Err(invalid_parameters(format!(
-                "UserRules holds {} rules; an IP access control group can hold at most {}.",
-                user_rules.len(),
-                crate::state::MAX_RULES_PER_IP_GROUP
-            )));
-        }
-        for rule in &user_rules {
-            if let Some(ip_rule) = rule.ip_rule.as_deref() {
-                if !crate::state::is_ip_range(ip_rule) {
-                    return Err(invalid_parameters(format!(
-                        "UserRules holds ipRule '{ip_rule}', which is not an IP address range in CIDR notation."
-                    )));
-                }
-            }
-            if let Some(rule_desc) = rule.rule_desc.as_deref() {
-                text_within_bound("UserRules ruleDesc", rule_desc)?;
-            }
-        }
+        crate::state::validate_ip_rules(&user_rules)
+            .map_err(|refusal| invalid_parameters(refusal.message()))?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateIpGroupErrorModeled::InternalServerException(InternalServerException {

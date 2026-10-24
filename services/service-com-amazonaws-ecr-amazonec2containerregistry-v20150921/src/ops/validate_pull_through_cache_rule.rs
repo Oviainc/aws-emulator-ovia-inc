@@ -45,15 +45,16 @@
 //! Manager secret, verify the syntax, and then validate that authentication to the upstream
 //! registry is successful.
 //!
-//! The last of those three steps cannot run here: this emulator opens no outbound
-//! connection, so no request to an upstream registry is ever made and nothing can report
-//! that one succeeded. A rule that EXISTS therefore always ends in this operation's own
-//! modelled failure state — `isValid: false` with a `failure` reason naming the check
-//! that did not pass — which is deliberate, not an oversight: `isValid: true` is
-//! documented as "Amazon ECR was able to reach the upstream registry and authentication
-//! was successful", and claiming it for a round trip that never happened would be a
-//! fabricated success. A prefix no rule answers to is a different answer altogether:
-//! `PullThroughCacheRuleNotFoundException`.
+//! The verdict is a statement about the rule the registry HOLDS, and it is computed from
+//! that stored record alone ([`crate::state::pull_through_cache_rule_failure`]): a rule
+//! names the upstream it caches from, an upstream that authenticates its callers carries
+//! a credential on the rule, and a credential the rule carries is the kind of ARN its
+//! member documents. A rule that meets all three validates — `isValid: true` with an
+//! empty `failure` — and one that does not is reported `isValid: false` with the
+//! `failure` naming the stored configuration defect. This emulator opens no outbound
+//! connection, but that is a property of the emulator rather than of the rule, so it is
+//! never reported as the rule's verdict. A prefix no rule answers to is a different
+//! answer altogether: `PullThroughCacheRuleNotFoundException`.
 //!
 //! ## Input
 //!
@@ -196,11 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Validation is about an EXISTING rule, so a prefix no rule answers to is refused
         // with `PullThroughCacheRuleNotFoundException` — never reported as `isValid:
         // false`, which is the answer for a rule that exists and does not validate. That
-        // distinction is the whole point of this operation.
-        let Some(rule) = store
-            .pull_through_cache_rules
-            .get(&input.ecr_repository_prefix)
-        else {
+        // distinction is the whole point of this operation. The prefix is resolved through
+        // the store's own lookup, so a rule is found by either spelling of its prefix —
+        // "there is always an assumed / applied to the end of the prefix" — exactly as the
+        // describe, update and delete of the same record resolve it.
+        let Some(rule) = store.pull_through_cache_rule(&input.ecr_repository_prefix) else {
             return Err(
                 ValidatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
                     PullThroughCacheRuleNotFoundException {
@@ -213,38 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `isValid` is documented as "Amazon ECR was able to reach the upstream registry
-        // and authentication was successful", so it is only ever true of a round trip that
-        // really happened. This emulator opens no outbound connection, so no upstream
-        // request can run here and nothing can report that one succeeded: validation ends
-        // in this operation's own modelled failure state (`isValid: false`) with the
-        // `failure` reason saying which check failed.
-        let needs_credential = crate::state::upstream_needs_credential(
-            rule.upstream_registry.as_deref(),
-            rule.upstream_registry_url.as_deref().unwrap_or_default(),
-        );
-        let has_credential = rule.credential_arn.is_some() || rule.custom_role_arn.is_some();
-        let failure = if needs_credential && !has_credential {
-            // A real configuration defect, decided entirely from the stored rule: the
-            // upstream authenticates its callers and the rule carries no credential for
-            // it, so authentication cannot even be attempted.
-            format!(
-                "the upstream registry '{}' requires authentication and the pull through \
-                 cache rule for '{}' stores neither a credentialArn nor a customRoleArn",
-                rule.upstream_registry
-                    .as_deref()
-                    .unwrap_or_else(|| rule.upstream_registry_url.as_deref().unwrap_or("unknown")),
-                input.ecr_repository_prefix
-            )
-        } else {
-            format!(
-                "the stored configuration of the pull through cache rule for '{}' is \
-                 complete, but authentication to the upstream registry could not be \
-                 verified: this emulator makes no outbound connection to '{}'",
-                input.ecr_repository_prefix,
-                rule.upstream_registry_url.as_deref().unwrap_or("the upstream registry")
-            )
-        };
+        // The verdict, read off the stored rule: `None` is a rule whose configuration can
+        // authenticate to its upstream, which is what `isValid: true` reports; `Some` is
+        // the configuration defect that stops it, which is what `failure` reports. The
+        // emulator's own lack of egress is not one of those defects — it is not a property
+        // of the rule — so it never decides the verdict.
+        let failure = crate::state::pull_through_cache_rule_failure(rule);
 
         Ok(ValidatePullThroughCacheRuleOutput {
             ecr_repository_prefix: rule.ecr_repository_prefix.clone(),
@@ -253,8 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             credential_arn: rule.credential_arn.clone(),
             custom_role_arn: rule.custom_role_arn.clone(),
             upstream_repository_prefix: rule.upstream_repository_prefix.clone(),
-            is_valid: false,
-            failure: Some(failure),
+            is_valid: failure.is_none(),
+            // A rule that validated has no reason to report, which ECR answers as an
+            // empty `failure` rather than by leaving the member out.
+            failure: Some(failure.unwrap_or_default()),
         })
     }
 }
