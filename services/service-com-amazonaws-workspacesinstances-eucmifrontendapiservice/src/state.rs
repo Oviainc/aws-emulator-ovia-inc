@@ -1390,6 +1390,27 @@ impl WorkspaceInstanceRecord {
     }
 }
 
+/// Where ONE volume is attached: the WorkSpace Instance it is attached to, and the
+/// device path it is attached at.
+///
+/// A volume holds at most one of these ([`VolumeRecord::attachment`]), which is what
+/// makes an attachment the relation `AssociateVolume` creates and `DisassociateVolume`
+/// removes: the backing Amazon EBS volume service attaches a volume to one instance at
+/// a time (its `AttachVolume` answers `VolumeInUse` for a volume that already carries
+/// an attachment), and one device path on an instance carries one volume.
+///
+/// The attachment is held on the VOLUME rather than in a map of its own so the two can
+/// never disagree: deleting the volume record takes its attachment with it, and no
+/// second copy of the relation exists for an operation to read instead.
+#[derive(Debug, Clone)]
+pub struct VolumeAttachment {
+    /// The `wsinst-…` id of the WorkSpace Instance the volume is attached to.
+    pub workspace_instance_id: String,
+    /// The device path the volume is attached at, as the attaching call named it,
+    /// inside the modelled `DeviceName` (`len 0..32`).
+    pub device: String,
+}
+
 /// One volume, as created by `CreateVolume`.
 ///
 /// The configuration is held exactly as the creating call supplied it — nothing is
@@ -1428,6 +1449,9 @@ pub struct VolumeRecord {
     pub client_token: Option<String>,
     /// When the record was created.
     pub created_at: SystemTime,
+    /// Where this volume is attached, or `None` for a volume no `AssociateVolume` has
+    /// attached (or one a `DisassociateVolume` has detached again).
+    pub attachment: Option<VolumeAttachment>,
 }
 
 /// What one spent `@idempotencyToken` created, and WHICH request spent it.
@@ -1632,6 +1656,12 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
 
     /// Apply every clock-due transition across the whole store, and drop every record
     /// whose teardown retention has elapsed.
+    ///
+    /// The volume attachments are settled with the instances: tearing a WorkSpace
+    /// Instance down detaches the volumes attached to it, and that was owed at the
+    /// instant the delete was accepted whether or not anybody called afterwards — so a
+    /// volume whose instance is tearing down (or is no longer reported at all) holds no
+    /// attachment, and is free to be attached elsewhere or deleted.
     pub fn settle_all(&mut self, now: Instant) {
         let forgotten: Vec<String> = self
             .instances
@@ -1643,6 +1673,18 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
             .collect();
         for id in forgotten {
             self.forget(&id);
+        }
+        // Disjoint field borrows: the instances are read while the volumes are written.
+        let instances = &self.instances;
+        for volume in self.volumes.values_mut() {
+            let released = volume.attachment.as_ref().is_some_and(|attachment| {
+                instances
+                    .get(&attachment.workspace_instance_id)
+                    .is_none_or(WorkspaceInstanceRecord::is_tearing_down)
+            });
+            if released {
+                volume.attachment = None;
+            }
         }
     }
 
@@ -1738,6 +1780,44 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
                 .remove(&(removed.region.clone(), token));
         }
         Some(removed)
+    }
+
+    /// Region `region`'s volume `id`.
+    ///
+    /// `None` both for an id this service never minted and for one whose volume belongs
+    /// to ANOTHER Region, exactly as [`Self::remove_volume`] and [`Self::settled`]
+    /// answer: that volume is not one this Region's endpoint holds, so every operation
+    /// looking it up here answers as it does for an id that was never minted.
+    pub fn volume(&self, region: &str, id: &str) -> Option<&VolumeRecord> {
+        self.volumes.get(id).filter(|record| record.region == region)
+    }
+
+    /// [`Self::volume`] for an operation that goes on to CHANGE the record.
+    pub fn volume_mut(&mut self, region: &str, id: &str) -> Option<&mut VolumeRecord> {
+        self.volumes
+            .get_mut(id)
+            .filter(|record| record.region == region)
+    }
+
+    /// The volume of Region `region` already attached to `workspace_instance_id` at
+    /// `device`, or `None` when that device path carries no volume.
+    ///
+    /// One device path on an instance carries one volume, so this is the question an
+    /// attach has to ask before it writes: the attachments are held per volume, so the
+    /// occupant of a device is found by looking across them.
+    pub fn volume_attached_at(
+        &self,
+        region: &str,
+        workspace_instance_id: &str,
+        device: &str,
+    ) -> Option<&VolumeRecord> {
+        self.volumes.values().find(|volume| {
+            volume.region == region
+                && volume.attachment.as_ref().is_some_and(|attachment| {
+                    attachment.workspace_instance_id == workspace_instance_id
+                        && attachment.device == device
+                })
+        })
     }
 }
 
@@ -1958,6 +2038,67 @@ pub fn volume_not_found_error<E>(
 ) -> crate::scaffolded::Scaffolded<E> {
     not_found_error(volume_not_found(id), wrap)
 }
+
+/// The modelled `ConflictException` (HTTP 409) for a request this service cannot act
+/// on because of the CURRENT state of one resource.
+///
+/// The ONE place the state-conflict shape is built, beside
+/// [`idempotent_parameter_mismatch`] for the token case, so every such refusal fills
+/// the same members: `ResourceId` names the resource whose state conflicts and
+/// `ResourceType` its kind ([`WORKSPACE_INSTANCE_RESOURCE_TYPE`] /
+/// [`VOLUME_RESOURCE_TYPE`]), and `Message` states the conflict in a FIXED sentence —
+/// the identity travels in `ResourceId`, as it does for
+/// [`INSTANCE_NOT_FOUND_MESSAGE`], so the prose does not vary per request and echoes
+/// nothing the caller sent.
+pub fn resource_conflict(
+    resource_id: &str,
+    resource_type: &str,
+    message: &str,
+) -> ConflictException {
+    ConflictException {
+        message: message.to_string(),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    }
+}
+
+/// The `Message` for an attach of a volume that already carries an attachment.
+///
+/// A volume is attached to one WorkSpace Instance at a time
+/// ([`VolumeAttachment`]), so a second attach conflicts with the attachment the
+/// volume already holds — including one to the same instance, which the backing
+/// Amazon EBS `AttachVolume` refuses as `VolumeInUse` too.
+pub const VOLUME_ALREADY_ATTACHED_MESSAGE: &str =
+    "Workspace managed EBS volume is already attached to a workspace instance";
+
+/// The `Message` for an attach at a device path that another volume already occupies
+/// on that WorkSpace Instance. `ResourceId` names that other volume.
+pub const DEVICE_ALREADY_IN_USE_MESSAGE: &str =
+    "the device is already in use by another volume on the workspace instance";
+
+/// The `Message` for a detach of a volume that is not attached to the WorkSpace
+/// Instance the request names — one that carries no attachment at all, or one
+/// attached to a different instance.
+pub const VOLUME_NOT_ATTACHED_MESSAGE: &str =
+    "Workspace managed EBS volume is not attached to the workspace instance";
+
+/// The `Message` for a detach whose `Device` names a device path the volume is not
+/// attached at.
+pub const VOLUME_DEVICE_MISMATCH_MESSAGE: &str =
+    "Workspace managed EBS volume is not attached at the device the request names";
+
+/// The `Message` for an attach to a WorkSpace Instance a delete has already been
+/// accepted for, which is tearing down and taking its attachments with it.
+pub const INSTANCE_TEARING_DOWN_MESSAGE: &str =
+    "workspace instance is being deallocated, so no volume can be attached to it";
+
+/// The `Message` for a delete of a volume that is still attached.
+///
+/// From the backing Amazon EBS `DeleteVolume` reference: "The volume must be in the
+/// `available` state (not attached to an instance)."
+pub const VOLUME_IN_USE_MESSAGE: &str =
+    "Workspace managed EBS volume is attached to a workspace instance and must be \
+     detached before it is deleted";
 
 /// The modelled `ServiceQuotaExceededException` (HTTP 402) for a create that would
 /// pass [`MAX_VOLUMES`]. The quota is scoped to one account in one Region and no

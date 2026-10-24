@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateVolume"))
+        // `Device`'s modelled `len 0..32` admits the empty string, which names no
+        // device path at all — the same reason `CreateVolume` refuses an empty
+        // `KmsKeyId` rather than storing it. The wording names the member and the
+        // constraint, never what the caller sent.
+        if input.device.is_empty() {
+            return Err(AssociateVolumeErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "Device",
+                    "Device must name the device path to attach the volume at",
+                ),
+            )
+            .into());
+        }
+
+        // A regional resource is reachable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateVolumeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Materialise what the clock already owed before anything is read: the instance
+        // transitions, the removal of a torn-down record past its retention, and the
+        // attachments a teardown has released. Each was due at its stored instant
+        // whether or not this call came.
+        let now = std::time::Instant::now();
+        state.settle_all(now);
+
+        // "Attaches a volume to a WorkSpace Instance": both resources are resolved
+        // against the store, in the Region this call was signed for, and an id that
+        // satisfies its modelled shape but names no record THIS REGION holds is
+        // `ResourceNotFoundException` — the instance first, since it is the resource the
+        // volume is being attached TO.
+        let Some(instance) = state.settled(&region, &input.workspace_instance_id, now) else {
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                AssociateVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        };
+        let instance_tearing_down = instance.is_tearing_down();
+
+        // Which volume already holds the device path asked for, read before the volume
+        // being attached is borrowed mutably. One device path on an instance carries one
+        // volume, and an instance belongs to one Region, so the search is that Region's.
+        let occupant = state
+            .volume_attached_at(&region, &input.workspace_instance_id, &input.device)
+            .map(|volume| volume.id.clone());
+
+        let Some(volume) = state.volume_mut(&region, &input.volume_id) else {
+            return Err(crate::state::volume_not_found_error(
+                &input.volume_id,
+                AssociateVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        };
+        let volume_already_attached = volume.attachment.is_some();
+
+        // An instance a delete has been accepted for is tearing down and releasing the
+        // volumes it had, so attaching one to it conflicts with the state it is in: the
+        // attachment the caller asked for could not survive that teardown.
+        if instance_tearing_down {
+            return Err(AssociateVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &input.workspace_instance_id,
+                    crate::state::WORKSPACE_INSTANCE_RESOURCE_TYPE,
+                    crate::state::INSTANCE_TEARING_DOWN_MESSAGE,
+                ),
+            )
+            .into());
+        }
+
+        // A volume is attached to one instance at a time, so a volume that already
+        // carries an attachment conflicts with its own state — whichever instance and
+        // device the second call names. `DisassociateVolume` is what frees it.
+        if volume_already_attached {
+            return Err(AssociateVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &input.volume_id,
+                    crate::state::VOLUME_RESOURCE_TYPE,
+                    crate::state::VOLUME_ALREADY_ATTACHED_MESSAGE,
+                ),
+            )
+            .into());
+        }
+
+        // The device path is taken: the conflicting resource is the volume occupying it,
+        // so that is the id the refusal names.
+        if let Some(occupant) = occupant {
+            return Err(AssociateVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &occupant,
+                    crate::state::VOLUME_RESOURCE_TYPE,
+                    crate::state::DEVICE_ALREADY_IN_USE_MESSAGE,
+                ),
+            )
+            .into());
+        }
+
+        // Nothing has been written until every refusal above is past: the attachment is
+        // the one thing this call persists, and the response models no members, so that
+        // stored relation is the whole of its effect — `DisassociateVolume` removes it,
+        // `AssociateVolume` refuses a second attachment of the volume, and `DeleteVolume`
+        // refuses the volume while it holds one.
+        volume.attachment = Some(crate::state::VolumeAttachment {
+            workspace_instance_id: input.workspace_instance_id,
+            device: input.device,
+        });
+
+        Ok(AssociateVolumeOutput {})
     }
 }

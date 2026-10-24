@@ -29,6 +29,8 @@ mod reserved_tag_keys;
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
+#[path = "all/volume_attachment.rs"]
+mod volume_attachment;
 #[path = "all/volume_configuration_validation.rs"]
 mod volume_configuration_validation;
 #[path = "all/volume_lifecycle.rs"]
