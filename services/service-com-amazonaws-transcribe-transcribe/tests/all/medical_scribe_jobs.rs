@@ -17,6 +17,9 @@
 //! table spanning the request class (media URI scheme, speaker partitioning vs channel
 //! identification, each published `MaxSpeakerLabels` bound, vocabulary filtering,
 //! clinical-note template, encryption, tag count, patient context), not over one row.
+//! The name a job is read, started and deleted by is the one the start request
+//! spelled, case included, so spellings differing only in letter case name different
+//! jobs.
 
 use std::time::Duration;
 
@@ -107,6 +110,49 @@ fn start_requests() -> Vec<(&'static str, Value)> {
                 ],
                 "Tags": [{"Key": "clinic", "Value": "primary-care"}]
             }),
+        ),
+    ]
+}
+
+/// The smallest start request that names `name` and `media_uri`, for the rows that
+/// vary only the job NAME.
+fn start_request(name: &str, media_uri: &str) -> Value {
+    json!({
+        "MedicalScribeJobName": name,
+        "Media": {"MediaFileUri": media_uri},
+        "OutputBucketName": "example-scribe-output",
+        "DataAccessRoleArn": ROLE_ARN,
+        "Settings": {"ShowSpeakerLabels": true, "MaxSpeakerLabels": 2}
+    })
+}
+
+/// Pairs of job names that differ from each other ONLY in letter case, one row per
+/// form `TranscriptionJobName` allows (`@pattern ^[0-9a-zA-Z._-]+$`,
+/// `@length(min: 1, max: 200)`): a plain name, a name carrying the pattern's
+/// punctuation and digits, a single character, and a name at the published upper
+/// length bound.
+fn case_variant_names() -> Vec<(&'static str, String, String)> {
+    vec![
+        (
+            "a plain name, lowercase vs uppercase",
+            "scribe-case".to_string(),
+            "SCRIBE-CASE".to_string(),
+        ),
+        (
+            "a name with the pattern's punctuation and digits, differing in one letter",
+            "scribe.case_7".to_string(),
+            "scribe.Case_7".to_string(),
+        ),
+        (
+            "a single-character name, the lowest published length bound",
+            "c".to_string(),
+            "C".to_string(),
+        ),
+        (
+            "a 200-character name, the highest published length bound, differing in its \
+             last letter",
+            format!("{}a", "s".repeat(199)),
+            format!("{}A", "s".repeat(199)),
         ),
     ]
 }
@@ -569,6 +615,76 @@ async fn a_second_start_under_a_live_job_name_is_a_conflict() {
             request["Media"],
             "case {case:?}: a refused start must not rewrite the stored job, got {:?}",
             fetched.body
+        );
+    }
+}
+
+/// A job is identified by its name EXACTLY as the start request spelled it
+/// ("Job names are case sensitive",
+/// `smithy_query(query="doc", shape="GetMedicalScribeJobRequest", member="MedicalScribeJobName")`),
+/// so two spellings differing only in letter case are two different jobs: a read of
+/// one never reports the other, starting the second spelling is no conflict with the
+/// first, and deleting one leaves the other stored.
+#[tokio::test]
+async fn medical_scribe_job_names_differing_only_in_case_are_different_jobs() {
+    const FIRST_MEDIA: &str = "s3://example-media/first-spelling.flac";
+    const SECOND_MEDIA: &str = "s3://example-media/second-spelling.wav";
+
+    let transcribe = Transcribe::new();
+
+    for (case, first, second) in case_variant_names() {
+        transcribe
+            .call("StartMedicalScribeJob", start_request(&first, FIRST_MEDIA))
+            .await
+            .ok(case);
+
+        // Only the first spelling has been started, so the other name is unknown.
+        get(&transcribe, &second)
+            .await
+            .refused(case, 400, "BadRequestException");
+
+        // ... and starting it is therefore not a second start of the same job.
+        transcribe
+            .call("StartMedicalScribeJob", start_request(&second, SECOND_MEDIA))
+            .await
+            .ok(case);
+
+        // Each spelling reads back its own record, named exactly as it was started.
+        for (name, media) in [(&first, FIRST_MEDIA), (&second, SECOND_MEDIA)] {
+            let fetched = get(&transcribe, name).await;
+            let job = fetched.ok(case)["MedicalScribeJob"].clone();
+            assert_eq!(
+                job["MedicalScribeJobName"],
+                json!(name),
+                "case {case:?}: expected the job named {name:?}, got {:?}",
+                job["MedicalScribeJobName"]
+            );
+            assert_eq!(
+                job["Media"]["MediaFileUri"],
+                json!(media),
+                "case {case:?}: the job named {name:?} must report its own media {media:?}, \
+                 got {:?}",
+                job["Media"]["MediaFileUri"]
+            );
+        }
+    }
+
+    // One wait for every row, so each job is terminal and therefore deletable.
+    std::thread::sleep(PAST_THE_TRANSITION);
+
+    for (case, first, second) in case_variant_names() {
+        delete(&transcribe, &first).await.ok_status(case, 200);
+
+        // Deleting one spelling removes only that record.
+        get(&transcribe, &first)
+            .await
+            .refused(case, 400, "BadRequestException");
+        let survivor = get(&transcribe, &second).await;
+        assert_eq!(
+            survivor.ok(case)["MedicalScribeJob"]["Media"]["MediaFileUri"],
+            json!(SECOND_MEDIA),
+            "case {case:?}: deleting {first:?} must leave {second:?} stored, got {:?}",
+            survivor.body
         );
     }
 }
