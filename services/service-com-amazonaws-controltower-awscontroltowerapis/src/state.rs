@@ -227,6 +227,29 @@ impl LandingZoneDriftStatus {
     }
 }
 
+/// A landing zone configuration an asynchronous operation has started deploying but the
+/// clock has not yet made due.
+///
+/// `UpdateLandingZone` "starts an asynchronous operation that updates the landing zone"
+/// (model docs) and `LandingZoneDetail$version` is "the landing zone's CURRENT DEPLOYED
+/// version", so the configuration a caller asked for is NOT what a reporting call reports
+/// while that operation is in flight: it is held here and deployed by [`settle`] at
+/// `due_at`, the same instant the operation record reaches its terminal status.
+///
+/// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+#[derive(Debug, Clone)]
+pub struct PendingLandingZoneConfiguration {
+    pub version: String,
+    pub manifest: ::aws_smithy_types::Document,
+    pub remediation_types: Option<Vec<String>>,
+    /// The drift status the deployed landing zone will carry once this configuration is
+    /// deployed.
+    pub drift_status: Option<LandingZoneDriftStatus>,
+    /// The instant the clock owes this deployment. Stored, never slept on: a reader
+    /// materialises the transition once it is due.
+    pub due_at: SystemTime,
+}
+
 /// `DriftStatus`: whether an enabled control still matches the configuration Control
 /// Tower deployed.
 ///
@@ -305,6 +328,11 @@ pub struct LandingZone {
     /// `LandingZoneDriftStatusSummary$status`, absent when the service has not assessed
     /// drift for this landing zone.
     pub drift_status: Option<LandingZoneDriftStatus>,
+    /// The configuration an in-flight `UPDATE` will deploy, `None` when the deployed
+    /// configuration is the only one. Deployed by [`settle`] once the clock makes it due.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub pending_configuration: Option<PendingLandingZoneConfiguration>,
     pub created_at: SystemTime,
 }
 
@@ -463,8 +491,10 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     ///
     /// An operation whose `due_at` has passed is terminal whether or not anybody called,
     /// so settling it here is not a read-triggered mutation; a landing zone's status is
-    /// then derived from whether any operation against it is still in flight. Call this
-    /// first in every handler so reporting and mutating operations agree on the clock.
+    /// then derived from whether any operation against it is still in flight, and a
+    /// configuration an `UPDATE` queued is deployed once its own `due_at` has passed.
+    /// Call this first in every handler so reporting and mutating operations agree on the
+    /// clock.
     pub fn settle(&mut self, now: SystemTime) {
         for op in self.landing_zone_operations.values_mut() {
             if op.status == LandingZoneOperationStatus::InProgress && now >= op.due_at {
@@ -472,6 +502,24 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 // The end time is when the operation became due, not when a caller
                 // happened to look, so repeated reads report one stable instant.
                 op.end_time = Some(op.due_at);
+            }
+        }
+
+        // A configuration an UPDATE started deploying becomes the deployed one once the
+        // clock has made that deployment due — the same instant the operation record
+        // reaches its terminal status — whether or not anybody called. Until then a
+        // reporting call reports what is actually deployed.
+        for landing_zone in self.landing_zones.values_mut() {
+            let due = landing_zone
+                .pending_configuration
+                .take_if(|pending| now >= pending.due_at);
+            if let Some(pending) = due {
+                landing_zone.version = pending.version;
+                landing_zone.latest_available_version =
+                    latest_available_version(&landing_zone.version, CATALOG_LANDING_ZONE_VERSION);
+                landing_zone.manifest = pending.manifest;
+                landing_zone.remediation_types = pending.remediation_types;
+                landing_zone.drift_status = pending.drift_status;
             }
         }
 

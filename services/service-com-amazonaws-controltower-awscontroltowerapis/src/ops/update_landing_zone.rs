@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLandingZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLandingZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reads and writes this service's state through
+//! [`crate::state`]; it carries no scaffold census marker.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLandingZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UpdateLandingZone` starts an asynchronous `UPDATE` operation against the account's
+//! landing zone: the configuration the call asks for is QUEUED on the landing zone and
+//! deployed by [`crate::state::ComAmazonawsControltowerAwscontroltowerapisState::settle`]
+//! once the clock makes the operation due, so a reporting call keeps reporting the
+//! DEPLOYED configuration while the operation is in flight.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +162,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLandingZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLandingZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLandingZone"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateLandingZoneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(arn) = store.resolve_landing_zone_arn(&input.landing_zone_identifier) else {
+            return Err(UpdateLandingZoneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no landing zone matches landingZoneIdentifier {}",
+                        input.landing_zone_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Updating a landing zone whose own asynchronous operation has not finished would
+        // leave it in an inconsistent state, which is what `ConflictException` reports.
+        if store.has_operation_in_flight(&arn) {
+            return Err(UpdateLandingZoneErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "landing zone {arn} has an operation in progress; updating it now \
+                         would leave it in an inconsistent state"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `resolve_landing_zone_arn` only answers with a key this map holds, so the lookup
+        // cannot miss; the modelled server error stands in for a panic.
+        let Some(landing_zone) = store.landing_zones.get_mut(&arn) else {
+            return Err(UpdateLandingZoneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("landing zone {arn} resolved to no stored record"),
+                },
+            )
+            .into());
+        };
+
+        // The call starts an asynchronous operation, so the configuration it asks for is
+        // QUEUED rather than deployed: `version`, `manifest` and `remediationTypes` keep
+        // reporting the deployed configuration until the clock makes the operation due,
+        // when `settle` deploys this. A member the request omits is not a change, so it
+        // carries the deployed value forward.
+        landing_zone.pending_configuration = Some(crate::state::PendingLandingZoneConfiguration {
+            version: input.version,
+            // The deployed configuration will be exactly the manifest this call supplied,
+            // so it will be in sync with it; an update that supplies no manifest changes
+            // nothing the manifest describes, so it carries the drift status forward.
+            drift_status: if input.manifest.is_some() {
+                Some(crate::state::LandingZoneDriftStatus::InSync)
+            } else {
+                landing_zone.drift_status
+            },
+            manifest: input
+                .manifest
+                .unwrap_or_else(|| landing_zone.manifest.clone()),
+            remediation_types: input
+                .remediation_types
+                .or_else(|| landing_zone.remediation_types.clone()),
+            due_at: now + crate::state::OPERATION_SETTLE_AFTER,
+        });
+        // The landing zone is PROCESSING until the operation recorded below is due; the
+        // status is derived from the log by `settle`, and seeded to match here.
+        landing_zone.status = crate::state::LandingZoneStatus::Processing;
+
+        let operation_identifier =
+            store.record_operation(crate::state::LandingZoneOperationType::Update, &arn, now);
+
+        Ok(UpdateLandingZoneOutput {
+            operation_identifier,
+        })
     }
 }
+

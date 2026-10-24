@@ -19,5 +19,7 @@ mod enabled_control_lifecycle;
 mod front_door_validation;
 #[path = "all/landing_zone_lifecycle.rs"]
 mod landing_zone_lifecycle;
+#[path = "all/landing_zone_update.rs"]
+mod landing_zone_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -235,6 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing has diverged from a manifest the service has only just been
                 // given, so a new landing zone is in sync.
                 drift_status: Some(crate::state::LandingZoneDriftStatus::InSync),
+                // A create deploys the configuration it was given; nothing else is
+                // queued behind it.
+                pending_configuration: None,
                 created_at: now,
             },
         );
