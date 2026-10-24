@@ -2,10 +2,10 @@
 
 //! The Lex V2 runtime session lifecycle, end to end over `restJson1`.
 //!
-//! Every test drives the real router: it builds the service over one shared
-//! engine, registers it, and dispatches buffered HTTP requests, so what is
-//! asserted is the wire behaviour (status, headers, body) and not a handler
-//! called directly.
+//! Every test drives the real router through [`crate::harness::Emulator`]: it
+//! builds the service over one shared engine, registers it, and dispatches
+//! buffered HTTP requests, so what is asserted is the wire behaviour (status,
+//! headers, body) and not a handler called directly.
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one
 //! recorded request:
@@ -13,128 +13,16 @@
 //! 1. A session is addressed by its four `@httpLabel` values, and what
 //!    `PutSession`/`RecognizeText` persist is what `GetSession` reports back,
 //!    until `DeleteSession` removes it — after which the key is a 404.
-//! 2. The structured `x-amz-lex-*` response headers carry their JSON base64
-//!    encoded.
+//! 2. The structured `x-amz-lex-*` response headers carry their JSON compressed
+//!    with gzip and then base64 encoded.
 //! 3. An active context lives until the first of its two budgets runs out: its
 //!    `timeToLiveInSeconds` or its `turnsToLive`, one turn per `RecognizeText`.
 //! 4. A value outside a modelled constraint is refused with HTTP 400
 //!    `ValidationException`.
 
-use bytes::Bytes;
-use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use service_com_amazonaws_lexruntimev2_awsdeepsenseruntimeserviceapi2_0::EmulatedService;
 
-/// The emulator under test: one shared engine, one registered service, driven
-/// through the router every front door uses.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Signatures are the framework's business, not this suite's.
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
-    }
-
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
-        self.send_with_headers(method, path, body, &[]).await
-    }
-
-    /// [`Self::send`] with extra request headers, so a member the model binds
-    /// with `@httpHeader` is exercised through the binding an SDK client uses
-    /// rather than through the body.
-    async fn send_with_headers(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-        headers: &[(&str, &str)],
-    ) -> Reply {
-        let payload = body.map(|b| b.to_string()).unwrap_or_default();
-        let mut builder = http::Request::builder()
-            .method(method)
-            .uri(format!(
-                "https://runtime-v2-lex.us-east-1.amazonaws.com{path}"
-            ))
-            // The routing key: the SigV4 credential scope names the `lex`
-            // signing name, which is how a request reaches this service.
-            .header(
-                "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEXAMPLE/20260102/us-east-1/lex/aws4_request, \
-                 SignedHeaders=host, Signature=0123456789abcdef",
-            )
-            .header("content-type", "application/json");
-        for (name, value) in headers {
-            builder = builder.header(*name, *value);
-        }
-        let request = builder
-            .body(Bytes::from(payload))
-            .expect("the test request is well formed");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let body = response.into_body();
-        Reply {
-            status,
-            headers,
-            body,
-        }
-    }
-}
-
-struct Reply {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Bytes,
-}
-
-impl Reply {
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
-            panic!(
-                "response body is not JSON ({e}): {:?}",
-                String::from_utf8_lossy(&self.body)
-            )
-        })
-    }
-
-    fn header(&self, name: &str) -> Option<String> {
-        self.headers
-            .get(name)
-            .map(|v| v.to_str().expect("header is ASCII").to_string())
-    }
-
-    /// The error shape a failed call names, from the restJson1 `__type`.
-    fn error_type(&self) -> String {
-        self.json()
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or("<no __type>")
-            .to_string()
-    }
-
-    /// Decode one `x-amz-lex-*` header: the base64 of the stored value's JSON
-    /// (`PutSessionResponse$sessionState` / `$requestAttributes`).
-    fn lex_header(&self, name: &str) -> Option<Value> {
-        let encoded = self.header(name)?;
-        let decoded = aws_smithy_types::base64::decode(&encoded)
-            .unwrap_or_else(|e| panic!("header {name} is not base64 ({e}): {encoded}"));
-        let json = String::from_utf8(decoded)
-            .unwrap_or_else(|e| panic!("header {name} is not UTF-8 ({e}): {encoded}"));
-        Some(
-            serde_json::from_str(&json)
-                .unwrap_or_else(|e| panic!("header {name} is not JSON ({e}): {json}")),
-        )
-    }
-}
+use crate::harness::Emulator;
 
 /// The content type a text session answers with when the caller asks for none.
 const TEXT_CONTENT_TYPE: &str = "text/plain;charset=utf-8";
@@ -1240,10 +1128,10 @@ async fn a_request_attribute_in_the_reserved_namespace_is_refused() {
     }
 }
 
-/// The `x-amz-lex-*` headers are encoded, not plain: the exact bytes of one
-/// known payload decode back to the JSON of the stored value.
+/// The `x-amz-lex-*` headers are encoded as the model documents, not plain: the
+/// exact bytes of one known payload gunzip back to the JSON of the stored value.
 #[tokio::test]
-async fn the_lex_headers_are_base64_encoded() {
+async fn the_lex_headers_are_gzipped_and_base64_encoded() {
     let emulator = Emulator::new();
     let path = "/bots/ABCDEFGHIJ/botAliases/TSTALIASID/botLocales/en_US/sessions/encoding";
     let put = emulator

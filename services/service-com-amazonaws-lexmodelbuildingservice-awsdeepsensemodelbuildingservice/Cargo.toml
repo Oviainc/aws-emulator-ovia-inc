@@ -31,5 +31,10 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# `tests/all/shared_model_routes.rs` reads the OTHER Lex model-building API version's
+# generated route table, to pin the set of routes both versions bind.
+service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2 = { workspace = true }
+
 [lints]
 workspace = true

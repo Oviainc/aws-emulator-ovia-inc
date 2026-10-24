@@ -172,10 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Answered from the stored record, so this response and a later
-        // `GetAccountSettings` report the same settings.
+        // `GetAccountSettings` report the same settings — including both settings groups,
+        // which the account-settings document always carries even when a group holds no
+        // written value (then it is the empty document).
         Ok(UpdateAccountSettingsOutput {
             deletion_protection: Some(settings.deletion_protection()),
-            vended_metrics: settings.vended_metrics(),
+            vended_metrics: Some(settings.vended_metrics()),
         })
     }
 }

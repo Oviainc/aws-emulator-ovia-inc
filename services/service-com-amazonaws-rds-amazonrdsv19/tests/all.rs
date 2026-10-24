@@ -29,6 +29,8 @@ mod db_engine_versions;
 mod db_instance_deletion;
 #[path = "all/db_instance_envelope.rs"]
 mod db_instance_envelope;
+#[path = "all/db_instance_stop.rs"]
+mod db_instance_stop;
 #[path = "all/db_instances.rs"]
 mod db_instances;
 #[path = "all/docdb_query_surface.rs"]

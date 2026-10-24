@@ -107,10 +107,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{
-    check_attribute_bytes, check_request_attributes, merge_attributes, AttributesRefused,
-    SessionKey, SessionStoreFull,
-};
+use crate::state::{AttributesRefused, SessionKey, SessionStoreFull, TurnRefused};
 use std::time::SystemTime;
 
 /// An attribute map the caller has to fix: the member and the rule it broke are
@@ -131,20 +128,13 @@ fn store_full(error: SessionStoreFull) -> RecognizeTextError {
     .into()
 }
 
-/// The intent Amazon Lex V2 reports when no intent of the bot locale matches the
-/// input. This emulator holds no bot locale definition — bots are built through
-/// the Lex *models* service, not this runtime — so no intent can be matched from
-/// an utterance, which is exactly the case the real service answers with the
-/// fallback intent.
-const FALLBACK_INTENT: &str = "FallbackIntent";
-
-/// `Close`: "indicates that there will not be a response from the user"
-/// (`DialogAction$type` docs). One of [`DIALOG_ACTION_TYPE_VALUES`].
-const DIALOG_ACTION_CLOSE: &str = "Close";
-
-/// `Lex` itself interpreted the input, as opposed to `Bedrock`. One of
-/// [`INTERPRETATION_SOURCE_VALUES`].
-const INTERPRETATION_SOURCE: &str = "Lex";
+/// A turn this service would not take, in this operation's own error channel.
+fn turn_refused(error: TurnRefused) -> RecognizeTextError {
+    match error {
+        TurnRefused::Attributes(attributes) => refused(attributes),
+        TurnRefused::StoreFull(full) => store_full(full),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -237,95 +227,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.session_id,
         );
 
-        let mut store = state.lock();
-
-        // Refuse an attribute map this turn may not store BEFORE the session is
-        // looked up for writing, so a refused turn leaves the conversation
-        // exactly as it was — and a refused FIRST turn leaves no session behind
-        // at all, so a following GetSession is still the modelled 404. These maps
-        // accumulate over the turns of a session, which is why the bound is
-        // checked against the merge with what is already stored (nothing, for a
-        // session that does not exist yet) rather than against the request alone.
-        {
-            let stored = store.session(&key, now);
-            check_attribute_bytes(
-                "sessionState.sessionAttributes",
-                stored.and_then(|session| session.session_state.session_attributes.as_ref()),
-                input
-                    .session_state
-                    .as_ref()
-                    .and_then(|supplied| supplied.session_attributes.as_ref()),
-            )
-            .map_err(refused)?;
-            check_request_attributes(
-                "requestAttributes",
-                stored.map(|session| &session.request_attributes),
-                input.request_attributes.as_ref(),
-            )
-            .map_err(refused)?;
-        }
-
-        // "Amazon Lex V2 creates a session when the user starts a conversation":
-        // the first utterance of a session starts it, so an absent session is
-        // created here rather than refused. `session_mut` is the bounded
-        // insertion path: it expires idle sessions and refuses to grow the store
-        // past its cap, so a caller looping over fresh session ids is refused
-        // rather than served until the emulator runs out of memory.
-        let session = store.session_mut(key, now).map_err(store_full)?;
-
-        // Charge the turn FIRST, so the contexts already on the session pay for
-        // this turn ("each request and response from the bot is a turn") while
-        // the ones this request supplies below start on their full budget.
-        session.spend_turn(now);
-
-        if let Some(supplied) = input.session_state {
-            session.merge_session_state(supplied, now);
-        }
-        if let Some(supplied) = input.request_attributes {
-            merge_attributes(&mut session.request_attributes, supplied);
-        }
-
-        // The active intent after this turn: the one the session carries (set by
-        // this request or an earlier PutSession), else the fallback intent.
-        // `text` is what the real service runs its NLU model over; this runtime
-        // emulator holds no bot locale to match it against, and matching on the
-        // utterance text would invent intents no bot declares, so the text is
-        // not interpreted into an intent of its own.
-        let intent = session.session_state.intent.clone().unwrap_or(Intent {
-            name: FALLBACK_INTENT.to_string(),
-            slots: None,
-            state: None,
-            confirmation_state: None,
-        });
-        session.session_state.intent = Some(intent.clone());
-        // Nothing was elicited from the user, so unless the caller set the next
-        // step itself the dialog closes.
-        if session.session_state.dialog_action.is_none() {
-            session.session_state.dialog_action = Some(DialogAction {
-                r#type: DIALOG_ACTION_CLOSE.to_string(),
-                slot_to_elicit: None,
-                slot_elicitation_style: None,
-                sub_slot_to_elicit: None,
-            });
-        }
-        // The interpretation of this turn, written back onto the session so a
-        // following GetSession reports the same one. No `nluConfidence` is
-        // reported: no model scored this input, and a made-up score would be
-        // indistinguishable from one.
-        session.interpretations = vec![Interpretation {
-            nlu_confidence: None,
-            sentiment_response: None,
-            intent: Some(intent),
-            interpretation_source: Some(INTERPRETATION_SOURCE.to_string()),
-        }];
+        // One turn of the conversation, which is the whole of what this
+        // operation does: `text` is the input it processes, and the dialog state
+        // and request attributes it carried are folded into the stored session.
+        // The sibling `RecognizeUtterance` takes the same turn from a request
+        // payload, so the turn itself lives in `crate::state` and neither
+        // operation holds a second copy of it.
+        let turn = state
+            .lock()
+            .advance_turn(key, now, input.session_state, input.request_attributes)
+            .map_err(turn_refused)?;
 
         Ok(RecognizeTextOutput {
-            messages: Some(session.messages.clone()),
-            session_state: Some(session.visible_session_state(now)),
-            interpretations: Some(session.interpretations.clone()),
-            request_attributes: (!session.request_attributes.is_empty())
-                .then(|| session.request_attributes.clone()),
-            session_id: Some(session.session_id.clone()),
+            messages: Some(turn.messages),
+            session_state: Some(turn.session_state),
+            interpretations: Some(turn.interpretations),
+            request_attributes: (!turn.request_attributes.is_empty())
+                .then_some(turn.request_attributes),
+            session_id: Some(turn.session_id),
             // A bot member is recognized only for a bot in a network of bots,
             // which this runtime holds no definition of.
             recognized_bot_member: None,

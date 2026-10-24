@@ -160,56 +160,6 @@ impl From<DescribeOrganizationResourceCollectionHealthErrorModeled> for Describe
 /// keeps one page bounded if the model ever widens.
 const MAX_RESULTS_CEILING: usize = 500;
 
-/// Which member accounts of the organization a request leaves in scope.
-///
-/// `AccountIds` is "The ID of the Amazon Web Services account" and
-/// `OrganizationalUnitIds` "The ID of the organizational unit": both NARROW the
-/// organization-wide report to the member accounts they name, so an account is in scope
-/// exactly while every filter the request carries selects it. A filter that names
-/// nothing restricts nothing, which is what an absent filter means, so an empty list and
-/// an absent member behave alike.
-struct AccountScope<'a> {
-    account_ids: Option<&'a Vec<String>>,
-    organizational_unit_ids: Option<&'a Vec<String>>,
-}
-
-impl AccountScope<'_> {
-    /// The scope a request names.
-    fn of(input: &DescribeOrganizationResourceCollectionHealthInput) -> AccountScope<'_> {
-        AccountScope {
-            account_ids: named(&input.account_ids),
-            organizational_unit_ids: named(&input.organizational_unit_ids),
-        }
-    }
-
-    /// Whether this scope holds the member account `account_id`, whose organizational
-    /// unit membership is `organizational_unit_ids`.
-    ///
-    /// An `OrganizationalUnitIds` filter selects the member accounts of the units it
-    /// names, so an account in none of them — which is every account of a store that
-    /// records no organizational unit — is out of scope rather than reported as if the
-    /// filter had not been sent.
-    fn holds(&self, account_id: &str, organizational_unit_ids: &[String]) -> bool {
-        self.account_ids
-            .is_none_or(|wanted| wanted.iter().any(|id| id == account_id))
-            && self.organizational_unit_ids.is_none_or(|wanted| {
-                wanted
-                    .iter()
-                    .any(|unit| organizational_unit_ids.iter().any(|held| held == unit))
-            })
-    }
-}
-
-/// The ids a filter member names, or `None` when it names none: an absent list and an
-/// empty one both restrict nothing (`AccountIdList` and `OrganizationalUnitIdList` are
-/// both modelled len 0..5, so an empty list is a well-formed request).
-fn named(list: &Option<Vec<String>>) -> Option<&Vec<String>> {
-    match list {
-        Some(ids) if !ids.is_empty() => Some(ids),
-        _ => None,
-    }
-}
-
 /// The entries a member account contributes to the report: its own when the request's
 /// filters leave it in scope, and none when they do not.
 fn scoped<T>(member_in_scope: bool, entries: Vec<T>) -> Vec<T> {
@@ -276,7 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal reports nothing about what the organization holds.
         let caller = crate::state::requested_account_id(None);
         let collection_type = input.organization_resource_collection_type.clone();
-        let scope = AccountScope::of(&input);
+        // The two filter members every `*Organization*` read of this service carries,
+        // resolved by the one rule in `crate::state`.
+        let scope = crate::state::OrganizationAccountScope::of(
+            &input.account_ids,
+            &input.organizational_unit_ids,
+        );
         let page_size = input
             .max_results
             .map_or(crate::state::PAGE_SIZE, |requested| {
@@ -299,26 +254,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The member accounts of the organization this store records, with the
-        // organizational units each belongs to. The store holds the coverage and the
-        // insights of the ONE account this emulator serves, and records no
-        // organizational-unit membership for it, so an `OrganizationalUnitIds` filter
-        // leaves no account in scope.
-        let member_organizational_unit_ids: Vec<String> = Vec::new();
-        let member_in_scope = scope.holds(&caller, &member_organizational_unit_ids);
+        // The member accounts of the organization this store records: the ONE account
+        // this emulator serves, which belongs to no organizational unit (see
+        // `OrganizationAccountScope::holds_served_member`).
+        let member_in_scope = scope.holds_served_member(&caller);
 
         // A token names an offset into ONE collection type's organization-wide report
         // under ONE account scope, so it is scoped to both: a token from another type,
         // another filter, or the account-scoped `DescribeResourceCollectionHealth` walk
         // of the same type does not resolve.
         let page_scope = format!(
-            "DescribeOrganizationResourceCollectionHealth/{collection_type}/accounts/{}/units/{}",
-            scope
-                .account_ids
-                .map_or_else(|| "-".to_string(), |ids| ids.join(",")),
-            scope
-                .organizational_unit_ids
-                .map_or_else(|| "-".to_string(), |ids| ids.join(",")),
+            "DescribeOrganizationResourceCollectionHealth/{collection_type}/{}",
+            scope.page_fragment(),
         );
         let invalid_next_token = || -> DescribeOrganizationResourceCollectionHealthError {
             DescribeOrganizationResourceCollectionHealthErrorModeled::ValidationException(
