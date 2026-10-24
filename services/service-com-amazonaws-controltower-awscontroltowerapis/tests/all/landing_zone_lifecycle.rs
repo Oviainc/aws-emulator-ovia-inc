@@ -80,19 +80,37 @@ pub(crate) async fn call(
     path: &str,
     body: serde_json::Value,
 ) -> Answer {
-    let request = http::Request::builder()
-        .method("POST")
+    dispatch(router, "POST", path, Some(body)).await
+}
+
+/// As [`call`], for the operations whose `@http` trait binds a method other than `POST`
+/// or carries their members in the URI rather than a body: `method` and `path` are the
+/// request line, and `body` is omitted entirely when `None`.
+pub(crate) async fn dispatch(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Answer {
+    let mut request = http::Request::builder()
+        .method(method)
         .uri(format!("https://controltower.us-west-2.amazonaws.com{path}"))
         .header(
             "authorization",
             "AWS4-HMAC-SHA256 \
              Credential=AKIDEXAMPLE/20260101/us-west-2/controltower/aws4_request, \
              SignedHeaders=host, Signature=0",
-        )
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
+        );
+    if body.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    let request = request
+        .body(match &body {
+            Some(body) => bytes::Bytes::from(
+                serde_json::to_vec(body).expect("the request body serializes"),
+            ),
+            None => bytes::Bytes::new(),
+        })
         .expect("a valid request");
 
     let response = router.dispatch(request).await;
