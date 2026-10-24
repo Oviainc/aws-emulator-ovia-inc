@@ -169,7 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The response has no members: the configuration is gone, which a Get or
-        // a listing now reports on its own.
+        // a listing now reports on its own. Its EventRules go with it — a rule
+        // is associated with one configuration and reached by an arn nested
+        // under that configuration's, so none can outlive it.
+        store.remove_event_rules_of_configuration(&input.arn);
         Ok(DeleteNotificationConfigurationOutput {})
     }
 }
