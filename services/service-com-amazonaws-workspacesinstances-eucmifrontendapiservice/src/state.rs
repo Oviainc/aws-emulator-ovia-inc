@@ -71,15 +71,38 @@ pub const WORKSPACE_INSTANCE_QUOTA_CODE: &str = "L-WorkSpaceInstancesPerAccount"
 /// this is the emulator's own stable identifier for the quota it enforces.
 pub const VOLUME_QUOTA_CODE: &str = "L-VolumesPerAccount";
 
-/// The number of WorkSpace Instances this emulator will hold at once.
+/// The number of RUNNING WorkSpace Instances this emulator will hold at once.
 ///
 /// A real account has a Service Quotas limit on running WorkSpace Instances, and
 /// `CreateWorkspaceInstance` models `ServiceQuotaExceededException` (HTTP 402) for
 /// reaching it. AWS publishes no figure, so the number itself is CHOSEN: its purpose
 /// is that the store cannot grow without bound, and that it is reached through the
-/// modelled error rather than by exhausting memory. Capacity is released by
-/// `DeleteWorkspaceInstance`, as on the real service.
+/// modelled error rather than by exhausting memory.
+///
+/// WHICH records this counts is CHOSEN too, and AWS documents neither: it counts the
+/// records that are not tearing down
+/// ([`ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState::running_instance_count`]),
+/// so `DeleteWorkspaceInstance` releases a slot as soon as it is accepted rather than
+/// when the teardown it starts finishes. The reasoning is that the quota is on RUNNING
+/// instances and an instance in a deallocation state is not one; the alternative
+/// (holding the slot until the record stops being reported) would keep a deleted
+/// instance's capacity for the teardown span and its retention.
+///
+/// Because a tearing-down record still OCCUPIES the store while it is reported, a
+/// create/delete burst can leave more records held than this; [`MAX_HELD_INSTANCES`]
+/// is what keeps that bounded.
 pub const MAX_INSTANCES: usize = 500;
+
+/// The number of WorkSpace Instance RECORDS this emulator will hold at once, counting
+/// the ones that are tearing down and so no longer count against [`MAX_INSTANCES`].
+///
+/// CHOSEN, like [`MAX_INSTANCES`], and for the same purpose: a caller that creates and
+/// deletes in a tight loop leaves behind records that are still reported for
+/// [`DEALLOCATION_SPAN`] + [`DEALLOCATED_RETENTION`] each, and without a second bound
+/// the store could grow without bound even though no instance is running. A create
+/// past this bound is refused through the same modelled
+/// `ServiceQuotaExceededException`, never by exhausting memory.
+pub const MAX_HELD_INSTANCES: usize = 2 * MAX_INSTANCES;
 
 /// The number of volumes this emulator will hold at once.
 ///
@@ -104,6 +127,21 @@ pub const MAX_TAGS_PER_INSTANCE: usize = 50;
 pub const PROVISION_STATE_ALLOCATING: &str = "ALLOCATING";
 /// See [`PROVISION_STATE_ALLOCATING`].
 pub const PROVISION_STATE_ALLOCATED: &str = "ALLOCATED";
+/// The transient state an instance is in while `DeleteWorkspaceInstance`'s teardown
+/// runs. See [`PROVISION_STATE_ALLOCATING`].
+pub const PROVISION_STATE_DEALLOCATING: &str = "DEALLOCATING";
+/// The terminal state an instance reaches once its teardown has finished, and the
+/// last state it is reported in before it stops being reported at all. See
+/// [`PROVISION_STATE_ALLOCATING`].
+pub const PROVISION_STATE_DEALLOCATED: &str = "DEALLOCATED";
+
+// The two remaining `ProvisionStateEnum` values, `ERROR_ALLOCATING` and
+// `ERROR_DEALLOCATING`, name a FAILED allocation or teardown. Nothing in this
+// emulator can fail either one — every create launches and every delete tears down —
+// so no record is ever put in them: a failure state for work that succeeded would be
+// a fabricated status. They become reachable the day this slice models something that
+// can fail (a capacity refusal, a stuck volume detach), and the filter in
+// `ListWorkspaceInstances` already matches whatever a record holds.
 
 /// How long after `CreateWorkspaceInstance` the `ALLOCATING -> ALLOCATED`
 /// transition the call starts becomes due.
@@ -114,6 +152,29 @@ pub const PROVISION_STATE_ALLOCATED: &str = "ALLOCATED";
 /// The due instant is stored on the record ([`WorkspaceInstanceRecord::allocation_due`])
 /// and materialised lazily by [`WorkspaceInstanceRecord::settle`]; nothing sleeps.
 pub const ALLOCATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteWorkspaceInstance` the `DEALLOCATING -> DEALLOCATED`
+/// transition that call starts becomes due.
+///
+/// Deleting a WorkSpace Instance is asynchronous teardown: the call is accepted and
+/// the instance keeps being reported, in a deallocation state, while the teardown
+/// runs. AWS documents no duration for it, so this is a CHOSEN span, non-zero for the
+/// same reason as [`ALLOCATION_SPAN`]: a caller that reads the instance back straight
+/// after the delete still observes the transient `DEALLOCATING`. The due instant is
+/// stored on the record ([`WorkspaceInstanceRecord::deallocation_due`]) and
+/// materialised lazily by [`WorkspaceInstanceRecord::settle`]; nothing sleeps.
+pub const DEALLOCATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long a torn-down instance stays reported in the terminal `DEALLOCATED` state
+/// before the service stops reporting it at all.
+///
+/// A deleted resource does eventually stop being reported: past this span a `Get`
+/// answers `ResourceNotFoundException` and a `List` no longer carries the instance,
+/// whichever `ProvisionStates` filter is asked for. AWS documents no retention for a
+/// deleted WorkSpace Instance, so the span is CHOSEN; it is non-zero so the terminal
+/// `DEALLOCATED` state is observable, and it is materialised lazily like the two
+/// transitions above ([`WorkspaceInstanceRecord::is_forgotten`]).
+pub const DEALLOCATED_RETENTION: Duration = Duration::from_millis(500);
 
 /// The `BillingMode` an instance created without a `BillingConfiguration` runs on.
 ///
@@ -1212,19 +1273,64 @@ pub struct WorkspaceInstanceRecord {
     /// The instant the `ALLOCATING -> ALLOCATED` transition falls due. Monotonic,
     /// so a wall-clock adjustment cannot make a settled record un-settle.
     pub allocation_due: Instant,
+    /// The instant the `DEALLOCATING -> DEALLOCATED` transition falls due, set by
+    /// the `DeleteWorkspaceInstance` that started the teardown and `None` on a record
+    /// no delete has been accepted for. Monotonic, like [`Self::allocation_due`], and
+    /// also the point the retention of [`DEALLOCATED_RETENTION`] is measured from.
+    pub deallocation_due: Option<Instant>,
 }
 
 impl WorkspaceInstanceRecord {
     /// Materialise the transition the clock has already made due.
     ///
-    /// Called from reads as well as writes: the move to `ALLOCATED` was owed at
-    /// `allocation_due` whether or not anybody called, so applying it on read
-    /// reports the state the service would already be in, and never changes what
-    /// a later caller sees beyond that.
+    /// Called from reads as well as writes: the move to `ALLOCATED`, and the move from
+    /// `DEALLOCATING` to the terminal `DEALLOCATED`, were each owed at their stored
+    /// due instant whether or not anybody called, so applying them on read reports
+    /// the state the service would already be in, and never changes what a later
+    /// caller sees beyond that.
     pub fn settle(&mut self, now: Instant) {
         if self.provision_state == PROVISION_STATE_ALLOCATING && now >= self.allocation_due {
             self.provision_state = PROVISION_STATE_ALLOCATED.to_string();
         }
+        if self.provision_state == PROVISION_STATE_DEALLOCATING
+            && self.deallocation_due.is_some_and(|due| now >= due)
+        {
+            self.provision_state = PROVISION_STATE_DEALLOCATED.to_string();
+        }
+    }
+
+    /// Start the asynchronous teardown `DeleteWorkspaceInstance` performs: the
+    /// instance leaves whatever state it was in for the transient `DEALLOCATING`, and
+    /// the move on to the terminal `DEALLOCATED` falls due one [`DEALLOCATION_SPAN`]
+    /// from `now`.
+    ///
+    /// A record already tearing down is left exactly as it is — same state, same
+    /// deadline: a second delete asks for an end state the instance is already heading
+    /// to, so it must neither push the teardown further out nor move a record that has
+    /// reached `DEALLOCATED` back to `DEALLOCATING`.
+    pub fn begin_deallocation(&mut self, now: Instant) {
+        if self.is_tearing_down() {
+            return;
+        }
+        self.deallocation_due = Some(now + DEALLOCATION_SPAN);
+        self.provision_state = PROVISION_STATE_DEALLOCATING.to_string();
+    }
+
+    /// Whether a delete has been accepted for this instance, so it is tearing down or
+    /// torn down and no longer one of the account's running instances.
+    pub fn is_tearing_down(&self) -> bool {
+        self.deallocation_due.is_some()
+    }
+
+    /// Whether the clock has already taken this torn-down record past
+    /// [`DEALLOCATED_RETENTION`], so the service no longer reports it at all.
+    ///
+    /// Measured from the teardown deadline, so the record is reported in
+    /// `DEALLOCATING` for one [`DEALLOCATION_SPAN`] and then in `DEALLOCATED` for one
+    /// [`DEALLOCATED_RETENTION`] before it goes.
+    pub fn is_forgotten(&self, now: Instant) -> bool {
+        self.deallocation_due
+            .is_some_and(|due| now >= due + DEALLOCATED_RETENTION)
     }
 }
 
@@ -1300,22 +1406,74 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     }
 
     /// Apply every clock-due transition, then hand back the record for `id`.
+    ///
+    /// `None` both for an id this service never minted and for one whose teardown has
+    /// taken it past [`DEALLOCATED_RETENTION`]: a torn-down record that the clock has
+    /// already made due for removal is removed here, so a reporting operation answers
+    /// not-found for it rather than reporting a resource the service would have
+    /// forgotten by now.
     pub fn settled(&mut self, id: &str, now: Instant) -> Option<&WorkspaceInstanceRecord> {
-        let record = self.instances.get_mut(id)?;
-        record.settle(now);
-        Some(record)
+        self.settled_mut(id, now).map(|record| &*record)
     }
 
-    /// Apply every clock-due transition across the whole store.
-    pub fn settle_all(&mut self, now: Instant) {
-        for record in self.instances.values_mut() {
+    /// [`Self::settled`] for an operation that goes on to CHANGE the record.
+    pub fn settled_mut(&mut self, id: &str, now: Instant) -> Option<&mut WorkspaceInstanceRecord> {
+        // The clock-due work is done under its own borrow, so the forgotten record can
+        // be dropped (which needs the store again) before the record is handed back.
+        let forgotten = {
+            let record = self.instances.get_mut(id)?;
             record.settle(now);
+            record.is_forgotten(now)
+        };
+        if forgotten {
+            self.forget(id);
+            return None;
+        }
+        self.instances.get_mut(id)
+    }
+
+    /// Apply every clock-due transition across the whole store, and drop every record
+    /// whose teardown retention has elapsed.
+    pub fn settle_all(&mut self, now: Instant) {
+        let forgotten: Vec<String> = self
+            .instances
+            .values_mut()
+            .filter_map(|record| {
+                record.settle(now);
+                record.is_forgotten(now).then(|| record.id.clone())
+            })
+            .collect();
+        for id in forgotten {
+            self.forget(&id);
         }
     }
 
-    /// Whether another instance fits inside [`MAX_INSTANCES`].
+    /// Stop reporting a torn-down record: the record goes, and so does the
+    /// `ClientToken` of the create that made it, since replaying that token must not
+    /// hand back an id the service no longer knows.
+    fn forget(&mut self, id: &str) {
+        if let Some(removed) = self.instances.remove(id) {
+            if let Some(token) = removed.client_token {
+                self.client_tokens.remove(&token);
+            }
+        }
+    }
+
+    /// The instances that count against the running-instance quota: every stored
+    /// record no delete has been accepted for. See [`MAX_INSTANCES`].
+    pub fn running_instance_count(&self) -> usize {
+        self.instances
+            .values()
+            .filter(|record| !record.is_tearing_down())
+            .count()
+    }
+
+    /// Whether another instance fits inside BOTH bounds this service keeps: the
+    /// running-instance quota [`MAX_INSTANCES`], and [`MAX_HELD_INSTANCES`] on the
+    /// records held in total, so a create/delete burst cannot grow the store without
+    /// bound through the records teardown leaves reported.
     pub fn has_instance_capacity(&self) -> bool {
-        self.instances.len() < MAX_INSTANCES
+        self.running_instance_count() < MAX_INSTANCES && self.instances.len() < MAX_HELD_INSTANCES
     }
 
     /// Mint the next `vol-…` volume id.
