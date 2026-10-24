@@ -8,17 +8,18 @@
 //! `GetTaxRegistration` and `ListTaxRegistrations` report one record the same
 //! way instead of each rebuilding it from the raw fields.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use ::aws_smithy_types::base64;
 
 use crate::ops::types::{
-    AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority, ConflictException,
-    IndonesiaAdditionalInfo, InternalServerException, Jurisdiction, ResourceNotFoundException,
-    SupplementalTaxRegistration, SupplementalTaxRegistrationEntry, TaxDocumentMetadata,
-    TaxExemption, TaxExemptionDetails, TaxExemptionType, TaxRegistration, TaxRegistrationEntry,
-    TaxRegistrationWithJurisdiction, ValidationException, ValidationExceptionField,
+    AccountMetaData, AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority,
+    ConflictException, IndonesiaAdditionalInfo, InternalServerException, Jurisdiction,
+    ResourceNotFoundException, SupplementalTaxRegistration, SupplementalTaxRegistrationEntry,
+    TaxDocumentMetadata, TaxExemption, TaxExemptionDetails, TaxExemptionType, TaxRegistration,
+    TaxRegistrationEntry, TaxRegistrationWithJurisdiction, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The `TaxRegistrationStatus` values, from the model's enum
@@ -105,6 +106,17 @@ pub const DEFAULT_HERITAGE_STATUS: &str = HERITAGE_STATUS_OPT_OUT;
 /// neither models nor is told about by any request it serves.
 pub const MANAGEMENT_ACCOUNT_ONLY: &str =
     "Only AWS orgs management account is allowed to set tax inheritance.";
+
+/// The role the legal address stored with an account's tax registration plays
+/// for that account: one of the model's `AddressRoleType` values
+/// (`TaxAddress | BillingAddress | ContactAddress`).
+///
+/// The address a `TaxRegistrationEntry` carries is the address its TRN is
+/// registered at, so the role it plays is the account's tax address — the role
+/// the reported account metadata files it under. The other two values are a
+/// billing and a contact address, which no operation this service models
+/// accepts, so no stored address plays either role.
+pub const LEGAL_ADDRESS_ROLE: &str = "TaxAddress";
 
 /// The `TaxRegistrationType` values whose legal address AWS derives from the tax
 /// number itself rather than from the request, paired with the country the type
@@ -606,10 +618,48 @@ impl StoredTaxRegistration {
             tax_document_metadatas: self.reported_document_metadatas(),
             certified_email_id: self.certified_email_id.clone(),
             additional_tax_information: self.additional_tax_information.clone(),
-            jurisdiction: Jurisdiction {
-                state_or_region: self.legal_address.state_or_region.clone(),
-                country_code: self.legal_address.country_code.clone(),
-            },
+            jurisdiction: self.jurisdiction(),
+        }
+    }
+
+    /// This registration's `Jurisdiction`: the stored legal address reduced to
+    /// its country code and, where the address has one, its state or region.
+    ///
+    /// One projection for every shape that reports where the registration is
+    /// held, so the jurisdiction beside the TRN and the one in the account's
+    /// address-role map cannot disagree.
+    pub fn jurisdiction(&self) -> Jurisdiction {
+        Jurisdiction {
+            state_or_region: self.legal_address.state_or_region.clone(),
+            country_code: self.legal_address.country_code.clone(),
+        }
+    }
+
+    /// The `AccountMetaData` a listing reports beside the account's TRN: the
+    /// legal profile this service holds for the account.
+    ///
+    /// Every member is projected from the stored record. `accountName` is the
+    /// legal name the registration was stored with — the only name any operation
+    /// this service models persists for an account; `address` is the stored
+    /// legal address in full (the listing's `taxRegistration` carries only its
+    /// jurisdiction, so this is where a caller reads the address); `addressType`
+    /// and `addressRoleMap` report the role that address plays
+    /// ([`LEGAL_ADDRESS_ROLE`]) and, under that role, the jurisdiction of the
+    /// address held in it.
+    ///
+    /// `seller` is the Amazon Web Services seller of record for the account: no
+    /// operation this service models carries one and nothing in the store records
+    /// one, so it stays absent rather than being invented.
+    pub fn to_account_meta_data(&self) -> AccountMetaData {
+        AccountMetaData {
+            account_name: Some(self.legal_name.clone()),
+            seller: None,
+            address: Some(self.legal_address.clone()),
+            address_type: Some(LEGAL_ADDRESS_ROLE.to_string()),
+            address_role_map: Some(HashMap::from([(
+                LEGAL_ADDRESS_ROLE.to_string(),
+                self.jurisdiction(),
+            )])),
         }
     }
 

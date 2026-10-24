@@ -5,6 +5,11 @@
 //! Pages through every stored tax registration in account-id order. Purely
 //! reporting: it changes nothing a later caller sees.
 //!
+//! Each entry reports the account's whole tax profile, not the TRN alone: the
+//! TRN reduced to its jurisdiction, plus the `accountMetaData` legal profile
+//! projected from the same stored record
+//! ([`crate::state::StoredTaxRegistration::to_account_meta_data`]).
+//!
 //! The cursor is opaque and names the account id the previous page stopped
 //! after, so resuming means "the first account strictly greater than it" — well
 //! defined because the store is ordered.
@@ -198,13 +203,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(account_id, stored)| AccountDetails {
                     account_id: Some(account_id.clone()),
                     tax_registration: Some(stored.to_tax_registration_with_jurisdiction()),
-                    // `taxInheritanceDetails` reports the parent entity an
-                    // account inherited its tax settings FROM, and
-                    // `accountMetaData` the account's legal profile. Neither is
-                    // written by any operation this service models, so there is
-                    // nothing stored to report.
+                    // `taxInheritanceDetails` reports the PARENT entity an
+                    // account inherited its tax settings from, which is a fact
+                    // about an organization this service neither models nor is
+                    // told about by any request it serves, so there is nothing
+                    // stored to report.
                     tax_inheritance_details: None,
-                    account_meta_data: None,
+                    // `accountMetaData` is the account's legal profile, and the
+                    // listing exists to report that profile beside the TRN: it
+                    // is projected from the stored record, the same projection
+                    // every reader of that record goes through.
+                    account_meta_data: Some(stored.to_account_meta_data()),
                 })
                 .collect();
             let more_remain = remaining.peek().is_some();
