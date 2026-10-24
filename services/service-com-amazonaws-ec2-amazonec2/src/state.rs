@@ -641,6 +641,21 @@
 //! reporting one group differently. A placement group is "a logical grouping of instances"
 //! (`CreatePlacementGroup`) with nothing to provision, so it is stored `available` and no
 //! clock-owed move is recorded for it.
+//!
+//! ## Infrastructure Performance metric subscriptions
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_performance_subscriptions`] holds the
+//! subscriptions `EnableAwsNetworkPerformanceMetricSubscription` turns on, as the modelled
+//! [`Subscription`] shape itself, keyed by [`subscription_key`] — the four members that
+//! name one (`Source`, `Destination`, `Metric`, `Statistic`), because a subscription
+//! carries no id of its own. Enabling the same four twice therefore leaves ONE
+//! subscription, a disable removes exactly the one it names, and
+//! `DescribeAwsNetworkPerformanceMetricSubscriptions` reports what those two have left
+//! here — it writes nothing itself, because a subscription is enabled the moment the
+//! enable answers and so has no clock-owed move. Every word stored comes from a catalog
+//! (a Region or Availability Zone id of [`subscription_endpoint_region`], a `MetricType`
+//! and a `StatisticType` member, and the service's own [`SUBSCRIPTION_PERIOD`]), so the
+//! store holds no request text.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -676,7 +691,7 @@ use crate::ops::types::{
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SpotPlacementScore, StateReason,
-    Subnet, SubnetAssociation, Tag,
+    Subnet, SubnetAssociation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
@@ -1777,6 +1792,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// "the number of partitions", "the spread level", "the ARN", "any tags applied to the
     /// placement group" — [`PlacementGroup`]) is a member of it.
     pub placement_groups: BTreeMap<String, PlacementGroup>,
+    /// Every Infrastructure Performance metric subscription the account has enabled, as the
+    /// modelled [`Subscription`] shape itself, keyed by [`subscription_key`] — the four
+    /// members that are a subscription's identity.
+    ///
+    /// Starts EMPTY: a fresh account subscribes to nothing.
+    /// `EnableAwsNetworkPerformanceMetricSubscription` is the one way an entry is written
+    /// ([`Self::enable_network_performance_subscription`]) and
+    /// `DisableAwsNetworkPerformanceMetricSubscription` the one way one is removed
+    /// ([`Self::disable_network_performance_subscription`]), so
+    /// `DescribeAwsNetworkPerformanceMetricSubscriptions` reports exactly what those two
+    /// have left here. Keyed by that identity, so the map's order is the stable order the
+    /// describe reports and pages over.
+    pub network_performance_subscriptions: BTreeMap<String, Subscription>,
     /// The state of the account's *block public access for snapshots* setting — see the
     /// module docs.
     ///
@@ -1901,6 +1929,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             spot_instance_requests: BTreeMap::new(),
             spot_instance_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
+            // A fresh account has enabled no Infrastructure Performance metric
+            // subscription.
+            network_performance_subscriptions: BTreeMap::new(),
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
@@ -17915,6 +17946,279 @@ impl ComAmazonawsEc2Amazonec2State {
         self.network_insights_access_scope_analysis_client_tokens
             .insert(spec.client_token, analysis_id);
         Some(stored)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Infrastructure Performance metric subscriptions
+// ---------------------------------------------------------------------------
+
+/// The data aggregation period of a subscription this API enables: the `PeriodType` enum's
+/// `five-minutes` member.
+///
+/// The period is the SERVICE's, not the caller's —
+/// `EnableAwsNetworkPerformanceMetricSubscription`'s request carries no `Period` member at
+/// all, while `Subscription$Period` ("The data aggregation time for the subscription") is
+/// reported back — and it is the period AWS's own Infrastructure Performance
+/// documentation shows on the subscription its
+/// `describe-aws-network-performance-metric-subscriptions` example reports. Naming it once
+/// here is what keeps the enable and the describe from disagreeing about it.
+pub const SUBSCRIPTION_PERIOD: &str = "five-minutes";
+
+/// Which forms of a Region-or-zone endpoint an operation admits.
+///
+/// EC2 names a place in three ways — a Region code (`us-east-1`), an Availability Zone name
+/// (`us-east-1a`) and that zone's id (`use1-az1`) — and its operations differ in which of
+/// them a member accepts, so the difference is a parameter of [`region_of_endpoint`] rather
+/// than a second resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointForms {
+    /// A Region code or an Availability Zone ID, and NOT a zone name: the two forms
+    /// "the source Region (like `us-east-1`) or Availability Zone ID (like `use1-az1`)"
+    /// (`EnableAwsNetworkPerformanceMetricSubscriptionRequest$Source`) names.
+    RegionOrZoneId,
+    /// Any of the three, for a member documented as "a Region or Availability Zone" without
+    /// saying which name of a zone — `GetAwsNetworkPerformanceData`'s locations.
+    RegionOrZoneNameOrZoneId,
+}
+
+/// The Region the endpoint `value` belongs to in the `forms` it admits: the Region itself,
+/// or the Region whose Availability Zone it names. `None` for anything else.
+///
+/// The ONE resolver for every member of this service that names a place, so two operations
+/// cannot disagree about whether a value names one. The catalog is
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry",
+/// sorted — the source of truth [`region_name_is_well_formed`] names), so every partition's
+/// Regions count: this emulator answers for whatever Region a request is signed for
+/// ([`request_region`]), so a GovCloud or China Region is as real an endpoint as a
+/// commercial one. ([`commercial_regions`] is that catalog filtered by partition, which is
+/// a different question — the Regions `GetSpotPlacementScores` scores OVER when a request
+/// narrows nothing.) Both zone forms are derived through
+/// [`availability_zones_in_region`], the one place a Region's zone names and zone ids come
+/// from, so neither form re-derives the shape of a zone id.
+///
+/// The answer is a `&'static str` out of the catalog, so a caller's text can be checked
+/// without any of it reaching the store.
+pub fn region_of_endpoint(value: &str, forms: EndpointForms) -> Option<&'static str> {
+    let catalog = ::emulator_telemetry::policy::KNOWN_REGIONS;
+    if let Ok(position) = catalog.binary_search(&value) {
+        return catalog.get(position).copied();
+    }
+    catalog.iter().copied().find(|region| {
+        availability_zones_in_region(region).iter().any(|zone| {
+            zone.zone_id == value
+                || (forms == EndpointForms::RegionOrZoneNameOrZoneId && zone.zone_name == value)
+        })
+    })
+}
+
+/// The Region the subscription endpoint `endpoint` belongs to, or `None` when it names
+/// neither a Region nor an Availability Zone id.
+///
+/// A `Source`/`Destination` is "the source Region (like `us-east-1`) or Availability Zone
+/// ID (like `use1-az1`)"
+/// (`EnableAwsNetworkPerformanceMetricSubscriptionRequest$Source`), so it is
+/// [`region_of_endpoint`] in [`EndpointForms::RegionOrZoneId`]: the zone's ID is a form of
+/// this member, its NAME is not.
+pub fn subscription_endpoint_region(endpoint: &str) -> Option<&'static str> {
+    region_of_endpoint(endpoint, EndpointForms::RegionOrZoneId)
+}
+
+/// The Region the subscription endpoint `value` of member `member` belongs to, or EC2's
+/// `InvalidParameterValue` refusal naming the value that is neither a Region nor an
+/// Availability Zone id.
+///
+/// The refusal lives HERE, beside the catalog [`subscription_endpoint_region`] it comes
+/// from, so the enable and the disable hold their `Source` and `Destination` to one rule
+/// worded one way rather than to two copies of it — the same reason
+/// [`require_subscription_member`] is shared.
+pub fn require_subscription_endpoint<E>(
+    member: &str,
+    value: &str,
+) -> Result<&'static str, Scaffolded<E>> {
+    subscription_endpoint_region(value).ok_or_else(|| {
+        invalid_parameter_value(format!(
+            "Invalid value '{value}' for {member}. It must be a Region code (like us-east-1) \
+             or an Availability Zone ID (like use1-az1)"
+        ))
+    })
+}
+
+/// The `MetricType` member `requested` names, or `None` when it names none.
+///
+/// The catalog is the generated [`crate::ops::types::METRIC_TYPE_VALUES`], so this module
+/// holds no second copy of it, and answering a `&'static str` out of it keeps request text
+/// out of the store — the same shape as [`snapshot_block_public_access_mode`].
+pub fn subscription_metric(requested: &str) -> Option<&'static str> {
+    crate::ops::types::METRIC_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|metric| *metric == requested)
+}
+
+/// The `StatisticType` member `requested` names, or `None` when it names none
+/// ([`crate::ops::types::STATISTIC_TYPE_VALUES`]).
+pub fn subscription_statistic(requested: &str) -> Option<&'static str> {
+    crate::ops::types::STATISTIC_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|statistic| *statistic == requested)
+}
+
+/// The store key — and the pagination cursor — of the subscription between `source` and
+/// `destination` for one metric and statistic.
+///
+/// A subscription carries no id of its own: the modelled [`Subscription`] is exactly these
+/// four members plus the period the service sets, and the enable and the disable name one
+/// by those four members alone. So they are its identity, and enabling the same four twice
+/// names ONE subscription.
+///
+/// The parts are joined with a space, which sorts ahead of every character a Region code,
+/// an Availability Zone id or a `MetricType`/`StatisticType` member can carry (lowercase
+/// letters, digits and `-`), so one part being a prefix of another cannot reorder two keys
+/// — the same cursor construction as [`offering_page_cursor`].
+pub fn subscription_key(source: &str, destination: &str, metric: &str, statistic: &str) -> String {
+    format!("{source} {destination} {metric} {statistic}")
+}
+
+/// The key `subscription` is stored under, read back off the subscription itself so a
+/// reported subscription and its cursor cannot disagree.
+pub fn subscription_key_of(subscription: &Subscription) -> String {
+    subscription_key(
+        subscription.source.as_deref().unwrap_or_default(),
+        subscription.destination.as_deref().unwrap_or_default(),
+        subscription.metric.as_deref().unwrap_or_default(),
+        subscription.statistic.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The value of a member a subscription request must name, or EC2's `MissingParameter`
+/// refusal naming the member.
+///
+/// The model marks none of `Source`, `Destination`, `Metric` and `Statistic` `@required`
+/// (`smithy_query(query="shape",shape="EnableAwsNetworkPerformanceMetricSubscriptionRequest")`),
+/// so the boundary validator admits a request that omits one and the handler is what
+/// refuses it — with `MissingParameter`, the code EC2 answers for a parameter the request
+/// left out, rather than a 501 or a value error. An empty value names nothing either, so it
+/// is the same refusal.
+pub fn require_subscription_member<'a, E>(
+    value: Option<&'a str>,
+    member: &str,
+) -> Result<&'a str, Scaffolded<E>> {
+    value
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| missing_parameter(format!("The request must contain the parameter {member}")))
+}
+
+/// The largest number of Infrastructure Performance metric subscriptions this in-memory
+/// store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each subscription
+/// is an entry in this process's memory and nothing reclaims one but a disable, so the
+/// number a caller can enable has to be finite. The identity of a subscription already
+/// closes the key space — every part of a key comes from a catalog (a Region or zone of
+/// [`subscription_endpoint_region`], a `MetricType` and a `StatisticType` member), so
+/// repeated enables cannot mint fresh keys without end — and this ceiling is the second,
+/// explicit bound: it is enforced INSIDE
+/// [`ComAmazonawsEc2Amazonec2State::enable_network_performance_subscription`], so no writer
+/// can grow the store past it even if a future caller forgets to ask first.
+pub const MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS: usize = 1_000;
+
+/// The code an enable past [`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`] answers with.
+///
+/// EC2 names every per-resource quota refusal `<Resource>LimitExceeded`
+/// ([`VPC_LIMIT_EXCEEDED`]), and EC2's model declares no error shapes at all, so this
+/// resource's code follows that convention.
+pub const SUBSCRIPTION_LIMIT_EXCEEDED: &str = "SubscriptionLimitExceeded";
+
+/// Refuse an enable that would take the store past
+/// [`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`]: HTTP 400 [`SUBSCRIPTION_LIMIT_EXCEEDED`].
+pub fn subscription_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        SUBSCRIPTION_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of Infrastructure Performance metric subscriptions has been \
+             reached ({MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS})"
+        ),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another subscription fits inside the store's ceiling
+    /// ([`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: an enable asks first and refuses
+    /// with [`subscription_limit_exceeded`] when it answers `false`.
+    pub fn has_network_performance_subscription_capacity(&self) -> bool {
+        self.network_performance_subscriptions.len() < MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS
+    }
+
+    /// Enable the subscription naming `source`, `destination`, `metric` and `statistic`,
+    /// and answer it as stored.
+    ///
+    /// `metric` and `statistic` are `&'static str`s out of
+    /// [`subscription_metric`]/[`subscription_statistic`], and `source` and `destination`
+    /// are endpoints [`subscription_endpoint_region`] resolved, so every word stored here
+    /// comes from a catalog rather than from the request's own bytes.
+    ///
+    /// Enabling a subscription that is already enabled changes nothing — the four members
+    /// are its identity, so there is one subscription either way, and it keeps the period
+    /// it was enabled with. What comes back is the stored subscription itself, so the
+    /// enable and a later describe cannot report one subscription differently.
+    ///
+    /// `None` means the store is at [`MAX_NETWORK_PERFORMANCE_SUBSCRIPTIONS`] and NOTHING
+    /// was stored; the caller refuses with [`subscription_limit_exceeded`] rather than
+    /// reporting a subscription it does not hold. The ceiling is enforced here as well as
+    /// by [`Self::has_network_performance_subscription_capacity`], so a writer that forgets
+    /// the gate cannot grow the store without bound either. An enable naming a subscription
+    /// the store ALREADY holds adds no entry, so it is admitted whatever the count.
+    pub fn enable_network_performance_subscription(
+        &mut self,
+        source: &str,
+        destination: &str,
+        metric: &'static str,
+        statistic: &'static str,
+    ) -> Option<Subscription> {
+        let key = subscription_key(source, destination, metric, statistic);
+        // An enable that names a subscription already held adds no entry, so only a new key
+        // has to fit inside the ceiling.
+        if !self.network_performance_subscriptions.contains_key(&key)
+            && !self.has_network_performance_subscription_capacity()
+        {
+            return None;
+        }
+        Some(
+            self.network_performance_subscriptions
+                .entry(key)
+                .or_insert_with(|| Subscription {
+                    source: Some(source.to_string()),
+                    destination: Some(destination.to_string()),
+                    metric: Some(metric.to_string()),
+                    statistic: Some(statistic.to_string()),
+                    period: Some(SUBSCRIPTION_PERIOD.to_string()),
+                })
+                .clone(),
+        )
+    }
+
+    /// Disable the subscription those four members name, answering whether the account
+    /// held one.
+    ///
+    /// `DisableAwsNetworkPerformanceMetricSubscription` names a subscription the same way
+    /// the enable does, so the key is built the same way; after this call the account has
+    /// no subscription for those members, which is what the disable asked for whether or
+    /// not one was held.
+    pub fn disable_network_performance_subscription(
+        &mut self,
+        source: &str,
+        destination: &str,
+        metric: &str,
+        statistic: &str,
+    ) -> bool {
+        self.network_performance_subscriptions
+            .remove(&subscription_key(source, destination, metric, statistic))
+            .is_some()
     }
 }
 

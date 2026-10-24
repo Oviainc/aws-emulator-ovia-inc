@@ -413,14 +413,11 @@ fn is_location(value: &str) -> bool {
 /// one place a Region's zone names and zone ids are derived, so neither form re-derives
 /// the shape of a zone id and neither can drift from what `DescribeAvailabilityZones`
 /// reports.
+///
+/// Which is [`crate::state::region_of_endpoint`], the crate's ONE endpoint resolver, in the
+/// form that admits all three names: the subscription operations hold `Source` and
+/// `Destination` to the same resolver in the two-form variant their own docs name, so no
+/// operation of this crate carries a second copy of the catalog walk.
 fn region_of_location(location: &str) -> Option<&'static str> {
-    let catalog = ::emulator_telemetry::policy::KNOWN_REGIONS;
-    if let Ok(position) = catalog.binary_search(&location) {
-        return Some(catalog[position]);
-    }
-    catalog.iter().copied().find(|region| {
-        crate::state::availability_zones_in_region(region)
-            .iter()
-            .any(|zone| zone.zone_name == location || zone.zone_id == location)
-    })
+    crate::state::region_of_endpoint(location, crate::state::EndpointForms::RegionOrZoneNameOrZoneId)
 }

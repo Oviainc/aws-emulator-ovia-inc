@@ -112,6 +112,8 @@ mod modify_subnet_attribute;
 mod network_insights_access_scope_analyses;
 #[path = "all/network_performance_data.rs"]
 mod network_performance_data;
+#[path = "all/network_performance_subscriptions.rs"]
+mod network_performance_subscriptions;
 #[path = "all/placement_groups.rs"]
 mod placement_groups;
 #[path = "all/principal_id_format.rs"]
