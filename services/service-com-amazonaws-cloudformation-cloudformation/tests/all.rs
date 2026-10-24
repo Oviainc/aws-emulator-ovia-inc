@@ -51,6 +51,8 @@ mod published_type_schema;
 mod rds_stack_resources;
 #[path = "all/resolved_properties.rs"]
 mod resolved_properties;
+#[path = "all/sam_deployed_resources.rs"]
+mod sam_deployed_resources;
 #[path = "all/sam_transform.rs"]
 mod sam_transform;
 #[path = "all/scratch.rs"]
