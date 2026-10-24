@@ -2,9 +2,11 @@
 
 //! @op DeleteChannel
 //! IMPLEMENTED. Removes one channel from [`crate::state`], so a following `GetChannel`
-//! reports it as absent. A channel that still has origin endpoints is refused with
-//! `ConflictException` — they have to be deleted first. Idempotent: deleting a channel
-//! (or a parent) that is not there succeeds and changes nothing.
+//! reports it as absent. A channel that is still in use is refused with
+//! `ConflictException` and survives: either because it still has origin endpoints, which
+//! have to be deleted first, or because a multiview channel of the same group still
+//! lists it among its available sources, which has to be updated first. Idempotent:
+//! deleting a channel (or a parent) that is not there succeeds and changes nothing.
 //!
 //! `handle` below is the implementation; `crate::state` holds the store it writes.
 //!
@@ -180,6 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
+        }
+        // The model states the other half of the rule on `AttachedMultiviewChannels`: a
+        // channel cannot be deleted while a multiview channel of the same group still
+        // lists it as an available source, because the deletion would leave that
+        // reference pointing at nothing. The refusal consults the SAME derived predicate
+        // every channel reader reports, so what a read shows as attached and what a
+        // delete refuses on can never disagree. A self-reference is not an obstacle:
+        // deleting the channel removes the referrer along with the referent.
+        let attached =
+            crate::state::attached_multiview_channels(group, &input.channel_name).unwrap_or_default();
+        if attached.iter().any(|name| name != &input.channel_name) {
+            return Err(
+                DeleteChannelErrorModeled::ConflictException(crate::state::multiview_source_in_use())
+                    .into(),
+            );
         }
         group.channels.remove(&input.channel_name);
 

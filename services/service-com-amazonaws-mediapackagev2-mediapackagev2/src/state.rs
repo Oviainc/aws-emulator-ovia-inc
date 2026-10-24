@@ -1886,6 +1886,27 @@ pub fn children_attached(parent: ResourceKind, child: ResourceKind) -> ConflictE
     }
 }
 
+/// The 409 a delete answers while another resource still REFERENCES the one it names —
+/// a channel that a multiview channel of the same group lists among its available
+/// sources.
+///
+/// `RESOURCE_IN_USE`, the same discriminator [`children_attached`] uses: a reference is
+/// a use of the resource just as a child is, and the deletion would leave the referrer
+/// pointing at nothing. The sentence names the kind that has to be updated first and,
+/// like every refusal here, neither the caller's names nor how many referrers there are.
+pub fn multiview_source_in_use() -> ConflictException {
+    ConflictException {
+        message: Some(
+            "The channel you tried to delete is listed as an available source by a \
+             multiview channel in the same channel group. If you want to delete this \
+             channel, you must first update the multiview channels that list it as an \
+             available source"
+                .to_string(),
+        ),
+        conflict_exception_type: Some("RESOURCE_IN_USE".to_string()),
+    }
+}
+
 /// The 409 a create answers when the name it was given is already taken.
 ///
 /// `RESOURCE_ALREADY_EXISTS`, and resource-agnostic: mediapackagev2 states the collision
