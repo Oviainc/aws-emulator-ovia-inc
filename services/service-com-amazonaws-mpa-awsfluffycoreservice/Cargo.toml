@@ -7,6 +7,9 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# `service-common` carries the ONE reading of the UTC offset an RFC 3339 timestamp
+# declares, which the `InitiationTime` filter values of `ListSessions` are read through.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
