@@ -3,7 +3,14 @@
 //! @op ListTagsForResource
 //!
 //! `@readonly`: reports the tag map persisted on the one stored deployment
-//! parameter whose `resourceArn` the `@httpLabel` names, and writes nothing.
+//! parameter whose `resourceArn` the `@httpLabel` names, and changes nothing a
+//! later caller sees — beyond materialising the deletion the CLOCK had already made
+//! due: a parameter past the `expirationDate` its last write named is "scheduled for
+//! deletion", and that deletion was owed at this instant whether or not anybody
+//! called, so the store drops it here
+//! (`crate::state::ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`)
+//! rather than report a resource the clock has taken. Such an ARN then gets the same
+//! not-found failure as one that never named a record.
 //!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
@@ -162,7 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Materialise the expiry the clock has already made due before resolving the
+        // ARN: a parameter past its `expirationDate` is scheduled for deletion, and
+        // that deletion was owed at this instant whether or not anybody called — so
+        // this reporting operation may apply it, and must not report a resource the
+        // clock has already taken. ONE clock sample decides it.
+        store.purge_expired(now);
 
         let Some(record) = store.parameters.get(&input.resource_arn) else {
             // The not-found CODE this service emits is `NotFoundException`, not the
