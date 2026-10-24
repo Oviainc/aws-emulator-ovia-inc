@@ -1035,3 +1035,850 @@ async fn dry_run_reports_whether_the_request_would_have_succeeded() {
         );
     }
 }
+
+/// The call that STARTS a modification: `ModifyVolume`'s own end-to-end cover, in its
+/// own module so the two suites' helpers cannot collide. It lives in this file because
+/// this file is this crate's declared suite for the volume-modification surface, and a
+/// modification is only ever observed through the pair.
+mod modify_volume {
+
+    // End-to-end cover for `ModifyVolume`, driven over the wire the service actually speaks —
+    // `ec2Query`, through the crate's shared [`super::ec2_query`] harness. What the
+    // modification it starts looks like to a reader is [`super::volume_modifications`]'s
+    // subject; this suite is about the call that starts one.
+    //
+    // The rules under test are:
+    //
+    // 1. the TARGET CONFIGURATION is the request's members laid over the volume's current ones
+    //    ("Default: The existing value is retained" on `Size`, `Iops`, `Throughput` and
+    //    `VolumeType`), with the per-type default the model publishes where a type change makes
+    //    the retained value inapplicable; it is APPLIED to the stored volume and RECORDED as a
+    //    modification, and a request naming no target member asks for nothing;
+    // 2. a target configuration outside what the model publishes FOR THE TARGET TYPE is refused
+    //    with EC2's own error code and nothing is written — a target size below the volume's
+    //    existing size, a size or an IOPS rate or a throughput outside the target type's
+    //    published range or named for a type that carries none, and a Multi-Attach flag that
+    //    cannot hold together with the target type;
+    // 3. the CLOCK, not a caller, finishes a modification, and until it is `completed` another
+    //    modification of the same volume is refused;
+    // 4. `DryRun` asks whether the request WOULD have worked and writes nothing either way.
+    //
+    // Each table row is a distinct input along what the rules generalise over — which member
+    // the request names, the volume type it starts from and the one it ends at, the size and
+    // the IOPS at each published bound and one past it — so no row is the specification. The
+    // size and IOPS catalogs are the service's own tables ([`VOLUME_SIZE_RANGES`],
+    // [`VOLUME_IOPS_RANGES`]), read here rather than restated.
+
+    use std::time::Duration;
+
+    use ec2::ops::modify_volume::INCORRECT_MODIFICATION_STATE;
+    use ec2::state::{
+        INVALID_VOLUME_MODIFICATION_NOT_FOUND, TRANSITION_DELAY, VOLUME_IOPS_RANGES,
+        VOLUME_MODIFICATION_PROGRESS_COMPLETE, VOLUME_MODIFICATION_STATE_MODIFYING,
+        VOLUME_MODIFICATION_STATE_OPTIMIZING, VOLUME_SIZE_RANGES,
+    };
+    use service_com_amazonaws_ec2_amazonec2 as ec2;
+    use smithy_server_runtime::MultiServiceRouter;
+
+    use crate::ec2_query::{call, element, elements, error_code, indexed};
+    use crate::volume_lifecycle::{REGION, is_volume_id, p, required_iops, zone_name};
+
+    /// One request's form parameters, as the ec2Query harness takes them.
+    type Params = Vec<(String, String)>;
+
+    /// One `(element, expected text)` pair a response is read for.
+    type Member = (&'static str, String);
+
+    /// One row of the apply table: `(case, the source volume's type, its size, the extra create
+    /// parameters, the modify parameters, the members the modification must carry, the members
+    /// the volume must carry afterwards)`.
+    type ApplyRow = (
+        &'static str,
+        &'static str,
+        i64,
+        Params,
+        Params,
+        Vec<Member>,
+        Vec<Member>,
+    );
+
+    /// The states a modification the clock has not finished can be in: a read taken straight
+    /// after the accept sees one of them, never `completed` — which non-terminal one depends on
+    /// how long the read took, so an assertion about "still running" names both.
+    const RUNNING_STATES: [&str; 2] = [
+        VOLUME_MODIFICATION_STATE_MODIFYING,
+        VOLUME_MODIFICATION_STATE_OPTIMIZING,
+    ];
+
+    fn emulator() -> MultiServiceRouter {
+        crate::ec2_query::emulator().0
+    }
+
+    async fn modify(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+        call(router, REGION, "ModifyVolume", params).await
+    }
+
+    async fn describe_volumes(
+        router: &MultiServiceRouter,
+        params: &[(String, String)],
+    ) -> (u16, String) {
+        call(router, REGION, "DescribeVolumes", params).await
+    }
+
+    async fn describe_modifications(
+        router: &MultiServiceRouter,
+        params: &[(String, String)],
+    ) -> (u16, String) {
+        call(router, REGION, "DescribeVolumesModifications", params).await
+    }
+
+    /// Wait until a modification started before now has certainly reached `completed`. Derived
+    /// from the service's own span, not a literal, so the two cannot drift.
+    async fn past_the_modification() {
+        tokio::time::sleep(TRANSITION_DELAY * 2 + Duration::from_millis(200)).await;
+    }
+
+    /// Create one volume of `volume_type` at `size` in the Region's first zone, with whatever
+    /// extra parameters the case needs, and answer its id.
+    async fn seed_volume(
+        router: &MultiServiceRouter,
+        case: &str,
+        volume_type: &str,
+        size: i64,
+        extra: Params,
+    ) -> String {
+        let mut params = vec![
+            p("AvailabilityZone", zone_name(0)),
+            p("VolumeType", volume_type),
+            p("Size", size.to_string()),
+        ];
+        params.extend(required_iops(volume_type));
+        params.extend(extra);
+        let (status, body) = call(router, REGION, "CreateVolume", &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 seeding the volume, got {status} with body {body}"
+        );
+        let volume_id = element(&body, "volumeId").unwrap_or_default();
+        assert!(
+            is_volume_id(&volume_id),
+            "case {case:?}: expected a minted volume id, got {volume_id:?}"
+        );
+        volume_id
+    }
+
+    /// Assert every `(element, expected)` pair reads out of `body`.
+    fn assert_members(case: &str, body: &str, members: &[Member]) {
+        for (member, expected) in members {
+            let actual = element(body, member);
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: expected {member}={expected:?}, got {actual:?} in body {body}"
+            );
+        }
+    }
+
+    /// Assert `body` reports a modification state that is one of `expected`.
+    fn assert_state(case: &str, body: &str, expected: &[&str]) {
+        let actual = element(body, "modificationState").unwrap_or_default();
+        assert!(
+            expected.contains(&actual.as_str()),
+            "case {case:?}: expected the modification state to be one of {expected:?}, got \
+             {actual:?} in body {body}"
+        );
+    }
+
+    /// The configuration members of a described volume — the five a `ModifyVolume` can move —
+    /// so a refused modification can be shown to have moved none of them. The volume's own
+    /// `State` is deliberately NOT among them: the clock moves that one on its own.
+    fn volume_configuration(body: &str) -> Vec<(&'static str, Option<String>)> {
+        ["size", "volumeType", "iops", "throughput", "multiAttachEnabled"]
+            .into_iter()
+            .map(|member| (member, element(body, member)))
+            .collect()
+    }
+
+    /// Assert the volume has NO modification recorded: the describe refuses a volume that
+    /// carries none rather than reporting it empty.
+    async fn assert_no_modification(router: &MultiServiceRouter, case: &str, volume_id: &str) {
+        let (status, body) = describe_modifications(router, &indexed("VolumeId", &[volume_id])).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for a volume with no modification, got {status} \
+             with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INVALID_VOLUME_MODIFICATION_NOT_FOUND,
+            "case {case:?}: expected {INVALID_VOLUME_MODIFICATION_NOT_FOUND}, got body {body}"
+        );
+    }
+
+    /// RULE 1: the modification applies the request's members over the volume's current
+    /// configuration, retains every member the request omits, and is reported by both the
+    /// volume describe and the modification describe.
+    ///
+    /// The rows differ along which member the request names, the volume type it starts from and
+    /// the one it ends at — so no member can be a constant in the handler.
+    #[tokio::test]
+    async fn a_modification_applies_the_target_configuration_and_round_trips() {
+        let rows: [ApplyRow; 7] = [
+            (
+                // Size only: the type, and a gp2 volume's absent IOPS, are retained.
+                "a gp2 volume grown in place",
+                "gp2",
+                10,
+                Vec::new(),
+                vec![p("Size", "20")],
+                vec![
+                    ("originalSize", "10".to_string()),
+                    ("targetSize", "20".to_string()),
+                    ("originalVolumeType", "gp2".to_string()),
+                    ("targetVolumeType", "gp2".to_string()),
+                    ("originalMultiAttachEnabled", "false".to_string()),
+                    ("targetMultiAttachEnabled", "false".to_string()),
+                ],
+                vec![("size", "20".to_string()), ("volumeType", "gp2".to_string())],
+            ),
+            (
+                // IOPS and throughput only, on the one type that provisions both.
+                "a gp3 volume reprovisioned",
+                "gp3",
+                40,
+                Vec::new(),
+                vec![p("Iops", "9000"), p("Throughput", "500")],
+                vec![
+                    ("originalIops", "3000".to_string()),
+                    ("targetIops", "9000".to_string()),
+                    ("originalThroughput", "125".to_string()),
+                    ("targetThroughput", "500".to_string()),
+                    ("originalSize", "40".to_string()),
+                    ("targetSize", "40".to_string()),
+                ],
+                vec![
+                    ("iops", "9000".to_string()),
+                    ("throughput", "500".to_string()),
+                    ("size", "40".to_string()),
+                ],
+            ),
+            (
+                // "The existing value is retained if you keep the same volume type"
+                // (`ModifyVolumeRequest$Iops`): the io1 volume keeps its created IOPS.
+                "an io1 volume grown with its IOPS retained",
+                "io1",
+                100,
+                Vec::new(),
+                vec![p("Size", "200")],
+                vec![
+                    ("originalIops", "100".to_string()),
+                    ("targetIops", "100".to_string()),
+                    ("originalSize", "100".to_string()),
+                    ("targetSize", "200".to_string()),
+                ],
+                vec![("size", "200".to_string()), ("iops", "100".to_string())],
+            ),
+            (
+                // "If you change the volume type to io1, io2, or gp3, the default is 3,000"
+                // (`$Iops`) and "Otherwise, the default value is 125" (`$Throughput`).
+                "an io2 volume converted to gp3",
+                "io2",
+                100,
+                Vec::new(),
+                vec![p("VolumeType", "gp3")],
+                vec![
+                    ("originalVolumeType", "io2".to_string()),
+                    ("targetVolumeType", "gp3".to_string()),
+                    ("originalIops", "100".to_string()),
+                    ("targetIops", "3000".to_string()),
+                    ("targetThroughput", "125".to_string()),
+                ],
+                vec![
+                    ("volumeType", "gp3".to_string()),
+                    ("iops", "3000".to_string()),
+                    ("throughput", "125".to_string()),
+                ],
+            ),
+            (
+                // A type that provisions no IOPS at all keeps none after the change.
+                "a gp3 volume converted to st1",
+                "gp3",
+                200,
+                Vec::new(),
+                vec![p("VolumeType", "st1"), p("Size", "500")],
+                vec![
+                    ("originalVolumeType", "gp3".to_string()),
+                    ("targetVolumeType", "st1".to_string()),
+                    ("originalIops", "3000".to_string()),
+                    ("originalThroughput", "125".to_string()),
+                    ("targetSize", "500".to_string()),
+                ],
+                vec![
+                    ("volumeType", "st1".to_string()),
+                    ("size", "500".to_string()),
+                ],
+            ),
+            (
+                // The Multi-Attach flag on its own, on a type that supports it.
+                "an io2 volume with Multi-Attach cleared",
+                "io2",
+                100,
+                vec![p("MultiAttachEnabled", "true")],
+                vec![p("MultiAttachEnabled", "false")],
+                vec![
+                    ("originalMultiAttachEnabled", "true".to_string()),
+                    ("targetMultiAttachEnabled", "false".to_string()),
+                    ("originalVolumeType", "io2".to_string()),
+                    ("targetVolumeType", "io2".to_string()),
+                ],
+                vec![
+                    ("multiAttachEnabled", "false".to_string()),
+                    ("volumeType", "io2".to_string()),
+                ],
+            ),
+            (
+                // The flag and the target type in ONE request: the target configuration is read
+                // as a whole, so clearing Multi-Attach in the same call that leaves a
+                // Multi-Attach-capable type is a combination that DOES hold — the mirror of the
+                // refusal the type change alone earns below.
+                "an io2 volume converted to gp3 by the request that clears Multi-Attach",
+                "io2",
+                100,
+                vec![p("MultiAttachEnabled", "true")],
+                vec![p("VolumeType", "gp3"), p("MultiAttachEnabled", "false")],
+                vec![
+                    ("originalVolumeType", "io2".to_string()),
+                    ("targetVolumeType", "gp3".to_string()),
+                    ("originalMultiAttachEnabled", "true".to_string()),
+                    ("targetMultiAttachEnabled", "false".to_string()),
+                    ("originalIops", "100".to_string()),
+                    ("targetIops", "3000".to_string()),
+                    ("targetThroughput", "125".to_string()),
+                ],
+                vec![
+                    ("volumeType", "gp3".to_string()),
+                    ("multiAttachEnabled", "false".to_string()),
+                    ("iops", "3000".to_string()),
+                    ("throughput", "125".to_string()),
+                ],
+            ),
+        ];
+
+        for (case, volume_type, size, create_extra, modify_extra, modification, volume) in rows {
+            let router = emulator();
+            let volume_id = seed_volume(&router, case, volume_type, size, create_extra).await;
+
+            let mut params = vec![p("VolumeId", volume_id.clone())];
+            params.extend(modify_extra);
+            let (status, body) = modify(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from ModifyVolume, got {status} with body {body}"
+            );
+            assert_members(case, &body, &modification);
+            assert_members(case, &body, &[("volumeId", volume_id.clone())]);
+            // A modification AWS hands back has not been applied yet, so it is `modifying` and
+            // has no end time.
+            assert_state(case, &body, &[VOLUME_MODIFICATION_STATE_MODIFYING]);
+            assert!(
+                element(&body, "endTime").is_none(),
+                "case {case:?}: a running modification has no end time, got {body}"
+            );
+            let progress: i64 = element(&body, "progress")
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(-1);
+            assert!(
+                (0..VOLUME_MODIFICATION_PROGRESS_COMPLETE).contains(&progress),
+                "case {case:?}: expected a running modification's progress below \
+                 {VOLUME_MODIFICATION_PROGRESS_COMPLETE}, got {progress}"
+            );
+            assert!(
+                element(&body, "startTime").is_some(),
+                "case {case:?}: expected a modification start time, got {body}"
+            );
+
+            // ROUND TRIP 1: the volume itself now carries the target configuration.
+            let (status, described) =
+                describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from DescribeVolumes, got {status} with body \
+                 {described}"
+            );
+            assert_members(case, &described, &volume);
+
+            // ROUND TRIP 2: the modification is stored, and the describe reports exactly what
+            // `ModifyVolume` answered.
+            let (status, reported) =
+                describe_modifications(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from DescribeVolumesModifications, got {status} \
+                 with body {reported}"
+            );
+            assert_eq!(
+                elements(&reported, "volumeId"),
+                vec![volume_id.clone()],
+                "case {case:?}: expected exactly the modified volume's record, got {reported}"
+            );
+            assert_members(case, &reported, &modification);
+        }
+    }
+
+    /// RULE 1, continued: a later modification of the same volume REPLACES the record, "the
+    /// most recent volume modification request" being what the describe reports, and its
+    /// `original` values are the ones the modification before it left behind.
+    #[tokio::test]
+    async fn a_later_modification_replaces_the_record_and_starts_from_what_it_left() {
+        let router = emulator();
+        let volume_id = seed_volume(&router, "a twice-modified volume", "gp3", 40, Vec::new()).await;
+
+        for (case, size, expected) in [
+            ("the first modification", 60, ("40", "60")),
+            ("the second", 80, ("60", "80")),
+        ] {
+            let (status, body) = modify(
+                &router,
+                &[p("VolumeId", volume_id.clone()), p("Size", size.to_string())],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from ModifyVolume, got {status} with body {body}"
+            );
+            assert_members(
+                case,
+                &body,
+                &[
+                    ("originalSize", expected.0.to_string()),
+                    ("targetSize", expected.1.to_string()),
+                ],
+            );
+            past_the_modification().await;
+        }
+
+        let (_, body) = describe_modifications(&router, &[]).await;
+        assert_eq!(
+            elements(&body, "volumeId"),
+            vec![volume_id.clone()],
+            "one volume keeps one record, got {body}"
+        );
+        assert_members(
+            "the most recent modification",
+            &body,
+            &[
+                ("originalSize", "60".to_string()),
+                ("targetSize", "80".to_string()),
+            ],
+        );
+    }
+
+    /// RULE 2: a target configuration outside what the model publishes is refused with EC2's
+    /// own error code, and nothing is written — neither the volume nor the modification store.
+    ///
+    /// The rows differ along which rule is broken and which member breaks it, and each names a
+    /// different volume type, so no refusal can be keyed to one shape of request.
+    #[tokio::test]
+    async fn a_target_configuration_the_model_refuses_leaves_the_volume_untouched() {
+        // (case, source type, source size, create extras, modify parameters, the error code)
+        let rows: [(&str, &str, i64, Params, Params, &str); 12] = [
+            (
+                // "The target volume size must be greater than or equal to the existing size of
+                // the volume" (`ModifyVolumeRequest$Size`).
+                "a size decrease",
+                "gp2",
+                10,
+                Vec::new(),
+                vec![p("Size", "5")],
+                "InvalidParameterValue",
+            ),
+            (
+                "a size decrease that is also a type change",
+                "gp3",
+                200,
+                Vec::new(),
+                vec![p("VolumeType", "io2"), p("Size", "100")],
+                "InvalidParameterValue",
+            ),
+            (
+                // The target type's own published size range bounds the target size.
+                "a type change to a type whose smallest volume is larger",
+                "gp2",
+                10,
+                Vec::new(),
+                vec![p("VolumeType", "st1")],
+                "InvalidParameterValue",
+            ),
+            (
+                "an IOPS rate below the target type's minimum",
+                "gp3",
+                40,
+                Vec::new(),
+                vec![p("Iops", "2999")],
+                "InvalidParameterValue",
+            ),
+            (
+                "an IOPS rate above the target type's maximum",
+                "io1",
+                100,
+                Vec::new(),
+                vec![p("Iops", "64001")],
+                "InvalidParameterValue",
+            ),
+            (
+                // "This parameter is valid only for gp3, io1, and io2 volumes" (`$Iops`).
+                "an IOPS rate on a type that provisions none",
+                "gp2",
+                10,
+                Vec::new(),
+                vec![p("Iops", "3000")],
+                "InvalidParameterValue",
+            ),
+            (
+                // "This parameter is valid only for gp3 volumes" (`$Throughput`).
+                "a throughput on a type that provisions none",
+                "io2",
+                100,
+                Vec::new(),
+                vec![p("Throughput", "250")],
+                "InvalidParameterValue",
+            ),
+            (
+                "a throughput below the published range",
+                "gp3",
+                40,
+                Vec::new(),
+                vec![p("Throughput", "124")],
+                "InvalidParameterValue",
+            ),
+            (
+                "a throughput above the published range",
+                "gp3",
+                40,
+                Vec::new(),
+                vec![p("Throughput", "2001")],
+                "InvalidParameterValue",
+            ),
+            (
+                // "This parameter is supported with io1 and io2 volumes only"
+                // (`$MultiAttachEnabled`): the volume's enabled flag and the target type cannot
+                // hold together, even though the request names only the type.
+                "a type change away from a Multi-Attach-capable type",
+                "io2",
+                100,
+                vec![p("MultiAttachEnabled", "true")],
+                vec![p("VolumeType", "gp3")],
+                "InvalidParameterCombination",
+            ),
+            (
+                "Multi-Attach asked for on a type that does not support it",
+                "gp3",
+                40,
+                Vec::new(),
+                vec![p("MultiAttachEnabled", "true")],
+                "InvalidParameterCombination",
+            ),
+            (
+                // Every target member defaults to the existing value, so a request naming none
+                // asks for no modification at all.
+                "no target member at all",
+                "standard",
+                8,
+                Vec::new(),
+                Vec::new(),
+                "MissingParameter",
+            ),
+        ];
+
+        for (case, volume_type, size, create_extra, modify_extra, expected_code) in rows {
+            let router = emulator();
+            let volume_id = seed_volume(&router, case, volume_type, size, create_extra).await;
+            let (_, before) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+
+            let mut params = vec![p("VolumeId", volume_id.clone())];
+            params.extend(modify_extra);
+            let (status, body) = modify(&router, &params).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 from ModifyVolume, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected error code {expected_code:?}, got {body}"
+            );
+
+            // Nothing was written: the volume's configuration reads exactly as it did, and no
+            // modification was recorded for it.
+            let (_, after) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_eq!(
+                volume_configuration(&after),
+                volume_configuration(&before),
+                "case {case:?}: a refused modification left the volume changed"
+            );
+            assert_no_modification(&router, case, &volume_id).await;
+        }
+    }
+
+    /// RULE 2, continued: the volume id itself. An id that is not shaped like one is malformed
+    /// before it is looked up, and one that names no volume of the account is not found.
+    #[tokio::test]
+    async fn an_unresolvable_volume_id_is_refused() {
+        let rows: [(&str, &str, &str); 4] = [
+            (
+                "a well-formed id no volume has (long form)",
+                "vol-0123456789abcdef0",
+                "InvalidVolume.NotFound",
+            ),
+            (
+                "a well-formed id no volume has (short form)",
+                "vol-12345678",
+                "InvalidVolume.NotFound",
+            ),
+            (
+                "an id of another resource kind",
+                "vpc-12345678",
+                "InvalidVolumeID.Malformed",
+            ),
+            ("not an id at all", "volume-one", "InvalidVolumeID.Malformed"),
+        ];
+
+        for (case, volume_id, expected_code) in rows {
+            let router = emulator();
+            let (status, body) = modify(&router, &[p("VolumeId", volume_id), p("Size", "100")]).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 from ModifyVolume, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?}: expected error code {expected_code:?}, got {body}"
+            );
+        }
+    }
+
+    /// RULE 2, continued, over the service's OWN catalogs: for every volume type the model
+    /// publishes a size range for, a target size at the top of that range is accepted and one
+    /// GiB past it is refused; the same for every type that publishes an IOPS range, at both of
+    /// its published bounds and one past each.
+    ///
+    /// Source: [`VOLUME_SIZE_RANGES`] (`ModifyVolumeRequest$Size`) and [`VOLUME_IOPS_RANGES`]
+    /// (`ModifyVolumeRequest$Iops`), read here rather than restated.
+    #[tokio::test]
+    async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
+        for (volume_type, size_min, size_max) in VOLUME_SIZE_RANGES {
+            for (case, size, expected_status) in [
+                ("at the top of the published range", i64::from(size_max), 200),
+                (
+                    "one GiB past the top of the published range",
+                    i64::from(size_max) + 1,
+                    400,
+                ),
+            ] {
+                let case = format!("a {volume_type} volume {case}");
+                let router = emulator();
+                let volume_id =
+                    seed_volume(&router, &case, volume_type, i64::from(size_min), Vec::new()).await;
+                let (status, body) = modify(
+                    &router,
+                    &[p("VolumeId", volume_id), p("Size", size.to_string())],
+                )
+                .await;
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected HTTP {expected_status} for size {size}, got {status} \
+                     with body {body}"
+                );
+                if expected_status == 400 {
+                    assert_eq!(
+                        error_code(&body),
+                        "InvalidParameterValue",
+                        "case {case:?}: expected InvalidParameterValue for size {size}, got {body}"
+                    );
+                } else {
+                    assert_members(&case, &body, &[("targetSize", size.to_string())]);
+                }
+            }
+        }
+
+        for (volume_type, iops_min, iops_max) in VOLUME_IOPS_RANGES {
+            for (case, iops, expected_status) in [
+                (
+                    "at the bottom of its published IOPS range",
+                    i64::from(iops_min),
+                    200,
+                ),
+                ("one below that bottom", i64::from(iops_min) - 1, 400),
+                (
+                    "at the top of its published IOPS range",
+                    i64::from(iops_max),
+                    200,
+                ),
+                ("one above that top", i64::from(iops_max) + 1, 400),
+            ] {
+                let case = format!("a {volume_type} volume {case}");
+                let router = emulator();
+                // Each row starts from the smallest volume its own type admits, so it
+                // exercises the IOPS rule alone.
+                let (_, size_min, _) = VOLUME_SIZE_RANGES
+                    .iter()
+                    .find(|(name, _, _)| *name == volume_type)
+                    .copied()
+                    .expect("every type with an IOPS range has a published size range");
+                let volume_id =
+                    seed_volume(&router, &case, volume_type, i64::from(size_min), Vec::new()).await;
+                let (status, body) = modify(
+                    &router,
+                    &[p("VolumeId", volume_id), p("Iops", iops.to_string())],
+                )
+                .await;
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected HTTP {expected_status} for iops {iops}, got {status} \
+                     with body {body}"
+                );
+                if expected_status == 400 {
+                    assert_eq!(
+                        error_code(&body),
+                        "InvalidParameterValue",
+                        "case {case:?}: expected InvalidParameterValue for iops {iops}, got {body}"
+                    );
+                } else {
+                    assert_members(&case, &body, &[("targetIops", iops.to_string())]);
+                }
+            }
+        }
+    }
+
+    /// RULE 3: the clock owns the modification's life. A caller that reads straight after the
+    /// call sees it still running; one that waits sees it finished. Until then another
+    /// modification of the SAME volume is refused with EC2's `IncorrectModificationState`, and
+    /// once the clock has finished it is accepted.
+    #[tokio::test]
+    async fn the_clock_gates_the_next_modification_of_the_same_volume() {
+        let router = emulator();
+        let volume_id = seed_volume(&router, "a modified volume", "gp3", 40, Vec::new()).await;
+
+        let (status, body) = modify(
+            &router,
+            &[p("VolumeId", volume_id.clone()), p("Size", "80")],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "expected HTTP 200 from ModifyVolume, got {status} with body {body}"
+        );
+
+        // Straight after the call: still running, and the volume cannot be modified again.
+        let (_, reported) = describe_modifications(&router, &[]).await;
+        assert_state("straight after the call", &reported, &RUNNING_STATES);
+        let (status, body) = modify(
+            &router,
+            &[p("VolumeId", volume_id.clone()), p("Size", "120")],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "expected HTTP 400 modifying a volume whose modification is running, got {status} \
+             with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INCORRECT_MODIFICATION_STATE,
+            "expected {INCORRECT_MODIFICATION_STATE} while a modification runs, got {body}"
+        );
+        // The refused second modification changed nothing: the record is still the first one,
+        // and so is the volume.
+        let (_, reported) = describe_modifications(&router, &[]).await;
+        assert_members(
+            "after the refused second modification",
+            &reported,
+            &[("targetSize", "80".to_string())],
+        );
+        let (_, described) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+        assert_members(
+            "after the refused second modification",
+            &described,
+            &[("size", "80".to_string())],
+        );
+
+        // And once the clock has finished the first one, the next modification is accepted.
+        past_the_modification().await;
+        let (status, body) = modify(
+            &router,
+            &[p("VolumeId", volume_id.clone()), p("Size", "120")],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "expected HTTP 200 modifying a volume whose modification completed, got {status} with \
+             body {body}"
+        );
+        assert_members(
+            "the second modification",
+            &body,
+            &[
+                ("originalSize", "80".to_string()),
+                ("targetSize", "120".to_string()),
+            ],
+        );
+    }
+
+    /// RULE 4: `DryRun` asks whether the request WOULD have worked, so it answers EC2's
+    /// `DryRunOperation` and writes nothing — neither to the volume nor to the modification
+    /// store — while a request that would have been REFUSED carries its own reason instead.
+    #[tokio::test]
+    async fn a_dry_run_modification_writes_nothing() {
+        let router = emulator();
+        let volume_id = seed_volume(&router, "a dry-run target", "gp3", 40, Vec::new()).await;
+        let (_, before) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+
+        let (status, body) = modify(
+            &router,
+            &[
+                p("VolumeId", volume_id.clone()),
+                p("Size", "80"),
+                p("DryRun", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 412,
+            "expected HTTP 412 from a dry-run ModifyVolume, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "DryRunOperation",
+            "expected DryRunOperation from a dry-run ModifyVolume, got {body}"
+        );
+        let (_, after) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+        assert_eq!(
+            volume_configuration(&after),
+            volume_configuration(&before),
+            "a dry run left the volume changed"
+        );
+        assert_no_modification(&router, "after a dry run", &volume_id).await;
+
+        let (status, body) = modify(
+            &router,
+            &[
+                p("VolumeId", volume_id),
+                p("Size", "1"),
+                p("DryRun", "true"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "expected a dry run of a request that would be refused to carry its own reason, got \
+             {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValue",
+            "expected the size rule's own code under DryRun, got {body}"
+        );
+    }
+}
