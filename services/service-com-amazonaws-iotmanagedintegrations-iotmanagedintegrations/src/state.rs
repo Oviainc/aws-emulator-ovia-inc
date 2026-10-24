@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CapabilityReport, CapabilitySchemaItem, ConfigurationStatus, EndpointConfig,
-    GeneralAuthorizationName, PushConfig, ResourceNotFoundException,
-    WiFiSimpleSetupConfiguration,
+    AuthConfig, AuthMaterial, CapabilityReport, CapabilitySchemaItem, ConfigurationStatus,
+    EndpointConfig, GeneralAuthorizationName, PushConfig, ResourceNotFoundException,
+    SecretsManager, WiFiSimpleSetupConfiguration,
 };
 
 /// The region an ARN carries when the request names none (the emulator's default
@@ -19,14 +19,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// `ManagedThingArn` pattern (`^arn:aws:iotmanagedintegrations:…`) requires.
 pub const SERVICE_ARN_NAMESPACE: &str = "iotmanagedintegrations";
 
-/// The `Role`, `AuthMaterialType`, `HubNetworkMode`, `EncryptionType`, `EndpointType`,
-/// `LogLevel`, `ConfigurationState` and `AssociationState` value lists the handlers
-/// validate against and report, re-exported from the MODEL-GENERATED constants in
+/// The `Role`, `AuthMaterialType`, `AuthType`, `HubNetworkMode`, `EncryptionType`,
+/// `EndpointType`, `LogLevel`, `ConfigurationState` and `AssociationState` value lists the
+/// handlers validate against and report, re-exported from the MODEL-GENERATED constants in
 /// `crate::ops::types` so there is no second copy to drift from the model.
 pub use crate::ops::types::{
-    ASSOCIATION_STATE_VALUES, AUTH_MATERIAL_TYPE_VALUES, CONFIGURATION_STATE_VALUES,
-    ENCRYPTION_TYPE_VALUES, ENDPOINT_TYPE_VALUES, HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES,
-    ROLE_VALUES,
+    ASSOCIATION_STATE_VALUES, AUTH_MATERIAL_TYPE_VALUES, AUTH_TYPE_VALUES,
+    CONFIGURATION_STATE_VALUES, ENCRYPTION_TYPE_VALUES, ENDPOINT_TYPE_VALUES,
+    HUB_NETWORK_MODE_VALUES, LOG_LEVEL_VALUES, ROLE_VALUES,
 };
 
 /// The `ProvisioningStatus` a freshly created managed thing carries: it is not yet
@@ -137,6 +137,122 @@ pub const CLOUD_CONNECTOR_RESOURCE_TYPE: &str = "CloudConnector";
 /// words, which is what that sentence states instead of the identifier
 /// ([`resource_not_found_message`]).
 pub const CLOUD_CONNECTOR_RESOURCE_NAME: &str = "Cloud Connector";
+
+/// One stored connector destination: the record `CreateConnectorDestination` inserts —
+/// "a connector destination for connecting a cloud-to-cloud (C2C) connector to the
+/// customer's Amazon Web Services account" — and `GetConnectorDestination` projects onto
+/// its output shape.
+///
+/// It holds no timestamp because no modelled connector-destination shape reports one
+/// (`smithy_query(query="operation",operation="GetConnectorDestination")`); the instant a
+/// create happened is kept on its idempotency record, where the TTL needs it.
+#[derive(Debug, Clone)]
+pub struct ConnectorDestination {
+    /// The generated `ConnectorDestinationId` this record is keyed by.
+    pub id: String,
+    /// The region the creating request was signed for. A connector destination is a
+    /// regional resource, like every other resource of this service: only that region's
+    /// endpoint resolves it.
+    pub region: String,
+    /// The `CloudConnectorId` of the C2C connector this destination connects — required
+    /// on the create, and RESOLVED there against [`Self::region`]'s cloud connectors, so
+    /// every stored record names a connector that existed when it was created.
+    pub cloud_connector_id: String,
+    /// `ConnectorDestinationName`, absent when the create named none.
+    pub name: Option<String>,
+    /// `ConnectorDestinationDescription`, absent when the create named none.
+    pub description: Option<String>,
+    /// `AuthType` enum value (one of [`AUTH_TYPE_VALUES`]), absent when the create named
+    /// none.
+    pub auth_type: Option<String>,
+    /// `AuthConfig` — `@required` on the create, stored exactly as it was supplied so a
+    /// read reports the authentication configuration the caller submitted.
+    pub auth_config: AuthConfig,
+    /// `SecretsManager`, absent when the create named none.
+    pub secrets_manager: Option<SecretsManager>,
+    /// Monotonic insertion sequence, which is also what makes [`Self::id`] unique.
+    pub sequence: u64,
+}
+
+impl ConnectorDestination {
+    /// The `OAuthCompleteRedirectUrl` a read of this destination reports: the URL the
+    /// OAuth configuration of its [`Self::auth_config`] names as where users are
+    /// redirected after completing authorization
+    /// (`smithy_query(query="shape",shape="OAuthConfig")` -> `oAuthCompleteRedirectUrl`),
+    /// which is the same fact the output's own `OAuthCompleteRedirectUrl` member states.
+    ///
+    /// Reported only where that value satisfies the OUTPUT member's modelled constraints
+    /// (`OAuthCompleteRedirectUrl`, len 1..1024, `^(http|https)://.*$`): the member it
+    /// was supplied on targets an unconstrained `String`, so a value this one does not
+    /// admit stays on the `AuthConfig` the read reports in full rather than being
+    /// published on a member whose shape forbids it.
+    pub fn o_auth_complete_redirect_url(&self) -> Option<String> {
+        self.auth_config
+            .o_auth
+            .as_ref()?
+            .o_auth_complete_redirect_url
+            .as_deref()
+            .filter(|url| {
+                (url.starts_with("http://") || url.starts_with("https://"))
+                    && (1..=MAX_O_AUTH_COMPLETE_REDIRECT_URL_LENGTH).contains(&url.chars().count())
+            })
+            .map(str::to_string)
+    }
+
+    /// Write `material` into this destination's General Authorization list under its
+    /// `AuthMaterialName`: a name the list already holds is REPLACED, a name it does not
+    /// hold is appended — what `GeneralAuthorizationUpdate` carries is "authorization
+    /// materials to add or update"
+    /// (`smithy_query(query="shape",shape="GeneralAuthorizationUpdate")`), the material's
+    /// name being what says which of the two it is.
+    ///
+    /// Answers `false` when appending would take the list past
+    /// [`MAX_GENERAL_AUTHORIZATION_MATERIALS`], so a caller refuses the request rather
+    /// than storing a list the MODEL forbids; nothing is written in that case.
+    pub fn upsert_auth_material(&mut self, material: AuthMaterial) -> bool {
+        let materials = self.auth_config.general_authorization.get_or_insert_default();
+        let held = materials
+            .iter()
+            .position(|held| held.auth_material_name == material.auth_material_name);
+        match held {
+            Some(at) => materials[at] = material,
+            None if materials.len() < MAX_GENERAL_AUTHORIZATION_MATERIALS => {
+                materials.push(material);
+            }
+            None => return false,
+        }
+        true
+    }
+}
+
+/// The most `AuthMaterial`s one `AuthConfig` holds for General Authorization, as the model
+/// declares it (`smithy_query(query="shape",shape="AuthConfig")` ->
+/// `GeneralAuthorization` length max 3, the bound `AuthMaterials` itself carries).
+pub const MAX_GENERAL_AUTHORIZATION_MATERIALS: usize = 3;
+
+/// The `@length` maximum of `OAuthCompleteRedirectUrl`, in characters
+/// (`smithy_query(query="shape",shape="OAuthCompleteRedirectUrl")` reports len 1..1024).
+pub const MAX_O_AUTH_COMPLETE_REDIRECT_URL_LENGTH: usize = 1024;
+
+/// The most connector destinations one store holds. A create past it is refused rather
+/// than grown into, so a caller cannot make this emulator's memory grow without end. A
+/// bound CHOSEN for the emulator, not a published AWS quota, like [`MAX_MANAGED_THINGS`].
+pub const MAX_CONNECTOR_DESTINATIONS: usize = 1_000;
+
+/// The `ResourceType` this service reports a connector destination under — the Smithy
+/// resource name, which is also what `ResourceNotFoundException`'s `ResourceType` member
+/// carries and the kind an idempotency token is scoped to ([`IdempotencyKey`]).
+pub const CONNECTOR_DESTINATION_RESOURCE_TYPE: &str = "ConnectorDestination";
+
+/// The connector-destination resource as a READ's reason names it — the resource's name in
+/// words, which is what that sentence states instead of the identifier
+/// ([`resource_name_not_found_message`]).
+pub const CONNECTOR_DESTINATION_RESOURCE_NAME: &str = "Connector Destination";
+
+/// The connector-destination resource as a MUTATION's reason names it: the same name in
+/// SENTENCE case, because that reason is a sentence about it
+/// ([`cannot_be_found_message`]) rather than a label like the read's.
+pub const CONNECTOR_DESTINATION_RESOURCE_SUBJECT: &str = "Connector destination";
 
 /// One stored over-the-air (OTA) task configuration: the authoritative record every
 /// OTA-task-configuration operation reads and writes. `CreateOtaTaskConfiguration`
@@ -383,13 +499,14 @@ pub const INITIAL_ASSOCIATION_STATE: &str = "ASSOCIATION_IN_PROGRESS";
 /// The `OAuthAuthorizationUrl` this emulator reports for an account association: none.
 ///
 /// The URL AWS answers with points at the third-party platform's OAuth authorization
-/// server, whose address is part of the `ConnectorDestination`'s `AuthConfig` — and
-/// `CreateConnectorDestination` is still a scaffold stub here, so this emulator holds no
-/// such configuration and has no authorization server to name. The modelled member has
-/// `@default ""` and AWS itself reports it empty "when using General Authorization flows
-/// that do not require OAuth", so the empty string is a modelled value rather than an
-/// invented one; synthesising an `https://…` URL for a server that does not exist would
-/// be fabrication.
+/// server, "backed with all the required parameters to perform end-user authentication" —
+/// a live handshake with a server outside this emulator, which no stored
+/// `ConnectorDestination` `AuthConfig` can stand in for: the association this URL belongs
+/// to is not resolved against a stored destination at all (see
+/// `crate::ops::create_account_association`). The modelled member has `@default ""` and
+/// AWS itself reports it empty "when using General Authorization flows that do not require
+/// OAuth", so the empty string is a modelled value rather than an invented one;
+/// synthesising an `https://…` URL for a handshake nothing performs would be fabrication.
 pub const NO_OAUTH_AUTHORIZATION_URL: &str = "";
 
 /// The `ResourceType` this service reports an account association under — the Smithy
@@ -430,6 +547,14 @@ pub struct ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// Insertion order of cloud-connector ids, so every operation that reports several
     /// of them reports them in the order they were created. An id is appended on create.
     pub cloud_connector_order: Vec<String>,
+    /// The authoritative connector-destination store, keyed by the generated
+    /// `ConnectorDestinationId`. `CreateConnectorDestination` inserts a record and
+    /// `GetConnectorDestination` projects it onto its output shape.
+    pub connector_destinations: HashMap<String, ConnectorDestination>,
+    /// Insertion order of connector-destination ids, so every operation that reports
+    /// several of them reports them in the order they were created. An id is appended on
+    /// create.
+    pub connector_destination_order: Vec<String>,
     /// A resource kind plus a `ClientToken` (`@idempotencyToken`) -> what the first call
     /// created, so a replayed create returns the original record instead of a duplicate.
     /// The key carries the resource kind because a `ClientToken` is scoped to the
@@ -665,6 +790,30 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.cloud_connectors
             .get(id)
             .filter(|connector| connector.region == region)
+    }
+
+    /// The connector destination `region`'s endpoint holds under `id`, if any. A
+    /// destination created in another region is not visible here, as for every regional
+    /// resource.
+    pub fn connector_destination_in(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&ConnectorDestination> {
+        self.connector_destinations
+            .get(id)
+            .filter(|destination| destination.region == region)
+    }
+
+    /// [`Self::connector_destination_in`], mutably.
+    pub fn connector_destination_in_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<&mut ConnectorDestination> {
+        self.connector_destinations
+            .get_mut(id)
+            .filter(|destination| destination.region == region)
     }
 
     /// The record `region`'s endpoint holds under `id`, if any. A configuration created in
@@ -1138,6 +1287,18 @@ pub fn identifier_not_found_message(resource_type: &str, identifier: &str) -> St
     format!("{resource_type} for identifier '{identifier}' not found")
 }
 
+/// How a MUTATION states that the resource it was to change does not exist WITHOUT naming
+/// the identifier: the resource as the sentence's subject, and that it cannot be found.
+///
+/// Recorded on `UpdateConnectorDestination` for a destination a delete had just removed as
+/// `Connector destination cannot be found.` — a different sentence from the
+/// identifier-quoting one the managed-thing mutations answer
+/// ([`identifier_not_found_message`]), so each resource's mutating path words its own
+/// through one of these two helpers rather than a sentence of its own.
+pub fn cannot_be_found_message(resource_subject: &str) -> String {
+    format!("{resource_subject} cannot be found.")
+}
+
 /// How a READ of this service states the same thing: the resource's name in words and
 /// that no such resource exists, naming no identifier.
 ///
@@ -1184,6 +1345,19 @@ pub fn managed_thing_not_found_on_read(identifier: &str) -> ResourceNotFoundExce
         message: Some(resource_not_found_message(MANAGED_THING_RESOURCE_NAME)),
         ..resource_not_found(MANAGED_THING_RESOURCE_TYPE, identifier)
     }
+}
+
+/// How a READ states the same absence WITHOUT the word "resource": the resource's name in
+/// words and that it was not found.
+///
+/// The read 404s of this service are not one sentence. A managed thing's reads
+/// `Managed Thing resource not found.` ([`resource_not_found_message`]); a connector
+/// destination's, recorded on `GetConnectorDestination` for an identifier a delete had just
+/// removed, reads `Connector Destination not found` — the same two facts (the kind, and
+/// that it is absent) with neither the noun nor the full stop. Each resource's read path
+/// words its own, through one of these two helpers rather than a sentence of its own.
+pub fn resource_name_not_found_message(resource_name: &str) -> String {
+    format!("{resource_name} not found")
 }
 
 /// How a read of a resource reached THROUGH a managed thing states that the managed
@@ -1236,6 +1410,49 @@ pub fn cloud_connector_not_found_on_read(identifier: &str) -> ResourceNotFoundEx
         message: Some(resource_not_found_message(CLOUD_CONNECTOR_RESOURCE_NAME)),
         ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
     }
+}
+
+/// The modelled `ResourceNotFoundException` a READ answers for a connector destination the
+/// store does not hold under the identifier a request named: the connector destination's
+/// own read-path reason ([`resource_name_not_found_message`]) plus the `ResourceId` and
+/// `ResourceType` members every 404 of this service reports the same way.
+pub fn connector_destination_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_name_not_found_message(
+            CONNECTOR_DESTINATION_RESOURCE_NAME,
+        )),
+        ..resource_not_found(CONNECTOR_DESTINATION_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// The modelled `ResourceNotFoundException` a MUTATION answers for a connector destination
+/// the store does not hold under the `Identifier` a request named: the connector
+/// destination's own mutating-path reason ([`cannot_be_found_message`]) plus the
+/// `ResourceId` and `ResourceType` members every 404 of this service reports the same way.
+pub fn connector_destination_not_found_on_mutation(identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(cannot_be_found_message(
+            CONNECTOR_DESTINATION_RESOURCE_SUBJECT,
+        )),
+        ..resource_not_found(CONNECTOR_DESTINATION_RESOURCE_TYPE, identifier)
+    }
+}
+
+/// How a create states that a member of its request names a resource of ANOTHER kind that
+/// this account does not have: the member the identifier arrived on, and that no such
+/// resource exists.
+///
+/// The text is BUILT FROM THE REQUEST — the member at fault is what names it — so it is
+/// part of the contract and not just an example: the recorded refusal of a
+/// `CreateConnectorDestination` whose `CloudConnectorId` named no connector of the account
+/// reads `The provided CloudConnectorId does not exist.` Every create that resolves a
+/// reference states its refusal through here, so one phrasing serves them all.
+///
+/// No value is quoted back, the way every other refusal this service words does
+/// (`crate::service::enum_value_set_refusal`), so an identifier the model marks
+/// `@sensitive` is never published in an error body.
+pub fn unknown_reference_message(member: &str) -> String {
+    format!("The provided {member} does not exist.")
 }
 
 /// The modelled `ResourceNotFoundException` a READ answers for an OTA task configuration

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnectorDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnectorDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Applies the members the request names to the connector destination the signing region's
+//! store holds under the `Identifier`, leaving every member it does not name as it was, and
+//! answers 204 with no body. An identifier that region holds no record for is the modelled
+//! `ResourceNotFoundException` (HTTP 404).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnectorDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +174,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnectorDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectorDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnectorDestination"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConnectorDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the connector-destination store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `AuthType` is a modelled enum, so a value outside the enum is a client error
+        // rather than a stored record. The model's own constraint walk refuses one before
+        // this handler runs; this second line states it through the SAME formatter, so the
+        // two cannot word one refusal two ways
+        // (`crate::service::enum_value_set_refusal`).
+        if let Some(auth_type) = input
+            .auth_type
+            .as_deref()
+            .filter(|value| !crate::state::AUTH_TYPE_VALUES.contains(value))
+        {
+            return Err(UpdateConnectorDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        "AuthType",
+                        crate::state::AUTH_TYPE_VALUES,
+                        auth_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A connector destination is regional: only the region that created it resolves
+        // it.
+        let region = crate::state::request_region(ctx.parts());
+        // The update is applied to a COPY and written back only once every part of it has
+        // been accepted, so a request this handler refuses half way through leaves the
+        // stored record exactly as it was.
+        let mut updated = store
+            .connector_destination_in(&region, &input.identifier)
+            .cloned()
+            .ok_or_else(|| {
+                UpdateConnectorDestinationErrorModeled::ResourceNotFoundException(
+                    // A mutation states the reason from the identifier the request
+                    // carried, through the one formatter every mutating path shares.
+                    crate::state::connector_destination_not_found_on_mutation(&input.identifier),
+                )
+            })?;
+
+        // Each member the request names REPLACES the stored one; a member it does not name
+        // is left alone, so an update of one member does not drop the rest of the record.
+        if input.name.is_some() {
+            updated.name = input.name;
+        }
+        if input.description.is_some() {
+            updated.description = input.description;
+        }
+        if input.auth_type.is_some() {
+            updated.auth_type = input.auth_type;
+        }
+        if input.secrets_manager.is_some() {
+            updated.secrets_manager = input.secrets_manager;
+        }
+
+        if let Some(auth_config) = input.auth_config {
+            if let Some(o_auth_update) = auth_config.o_auth_update {
+                // `OAuthUpdate` carries only the two members of `OAuthConfig` that the
+                // model leaves optional, and none of its three required ones
+                // (`authUrl`, `tokenUrl`, `tokenEndpointAuthenticationScheme`), so it can
+                // only UPDATE an OAuth configuration a create already supplied — there is
+                // nothing in the request to build a missing one out of. An update of the
+                // OAuth settings of a destination that has none is therefore a request
+                // problem, refused with the modelled `ValidationException`.
+                let Some(o_auth) = updated.auth_config.o_auth.as_mut() else {
+                    return Err(UpdateConnectorDestinationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "oAuthUpdate names the OAuth configuration of a connector \
+                                 destination that has none"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                if o_auth_update.o_auth_complete_redirect_url.is_some() {
+                    o_auth.o_auth_complete_redirect_url =
+                        o_auth_update.o_auth_complete_redirect_url;
+                }
+                if o_auth_update.proactive_refresh_token_renewal.is_some() {
+                    o_auth.proactive_refresh_token_renewal =
+                        o_auth_update.proactive_refresh_token_renewal;
+                }
+            }
+
+            if let Some(general) = auth_config.general_authorization_update {
+                // Both lists are authorization materials "to add or update": each is
+                // written under its own `AuthMaterialName`, replacing the material held
+                // under that name or taking a new place in the list.
+                let materials = general
+                    .auth_materials_to_add
+                    .into_iter()
+                    .chain(general.auth_materials_to_update)
+                    .flatten();
+                for material in materials {
+                    if !updated.upsert_auth_material(material) {
+                        return Err(UpdateConnectorDestinationErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(format!(
+                                    "a connector destination holds at most {} General \
+                                     Authorization materials",
+                                    crate::state::MAX_GENERAL_AUTHORIZATION_MATERIALS
+                                )),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        if let Some(stored) = store.connector_destination_in_mut(&region, &input.identifier) {
+            *stored = updated;
+        }
+
+        Ok(UpdateConnectorDestinationOutput)
     }
 }

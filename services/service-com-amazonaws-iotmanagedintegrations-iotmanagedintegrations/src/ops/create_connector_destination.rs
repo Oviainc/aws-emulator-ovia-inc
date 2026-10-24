@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnectorDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnectorDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//!
+//! Inserts the connector destination into `crate::state`'s `connector_destinations` store
+//! under a freshly generated `ConnectorDestinationId`, and answers with that id. The
+//! `CloudConnectorId` the request names is RESOLVED against the signing region's cloud
+//! connectors first: a destination for a connector this account does not have is refused
+//! with the modelled `ValidationException` (HTTP 400) and nothing is stored. A replayed
+//! `ClientToken` (`@idempotencyToken`) answers with the destination the first call created
+//! instead of creating a second one.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnectorDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +167,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnectorDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnectorDestination"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectorDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the connector-destination store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `AuthType` is a modelled enum, so a value outside the enum is a client error
+        // rather than a stored record. The model's own constraint walk refuses one before
+        // this handler runs; this second line states it through the SAME formatter, so the
+        // two cannot word one refusal two ways
+        // (`crate::service::enum_value_set_refusal`).
+        if let Some(auth_type) = input
+            .auth_type
+            .as_deref()
+            .filter(|value| !crate::state::AUTH_TYPE_VALUES.contains(value))
+        {
+            return Err(CreateConnectorDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        "AuthType",
+                        crate::state::AUTH_TYPE_VALUES,
+                        auth_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything
+        // reads them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action — so it is answered BEFORE the checks below, which
+        // the first call already passed. The destination the token replays into is
+        // resolved through this region's endpoint, as every read of one is.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::CONNECTOR_DESTINATION_RESOURCE_TYPE, token)
+        });
+        if let Some(created) = replayed.and_then(|id| store.connector_destination_in(&region, &id))
+        {
+            return Ok(CreateConnectorDestinationOutput {
+                id: Some(created.id.clone()),
+            });
+        }
+
+        // A connector destination connects ONE C2C connector to this account, so the
+        // `CloudConnectorId` it names has to name a connector this account has: a create
+        // naming one the signing region's store does not hold is refused and stores
+        // nothing, rather than minting a destination that points at no connector. The
+        // refusal names the member at fault and quotes no value back
+        // (`crate::state::unknown_reference_message`).
+        if store
+            .cloud_connector_in(&region, &input.cloud_connector_id)
+            .is_none()
+        {
+            return Err(CreateConnectorDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unknown_reference_message(
+                        "CloudConnectorId",
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The operation models no quota error, so the refusal is the modelled error
+        // closest to "this service will not take another one now".
+        if store.connector_destinations.len() >= crate::state::MAX_CONNECTOR_DESTINATIONS {
+            return Err(CreateConnectorDestinationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this service holds the maximum of {} connector destinations; \
+                         delete one before creating another",
+                        crate::state::MAX_CONNECTOR_DESTINATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.take_sequence();
+        // `ConnectorDestinationId` is `^[A-Za-z0-9-_]+$`, len 1..64, which the
+        // lowercase-hex opaque id satisfies.
+        let id = crate::state::opaque_id(sequence);
+        let destination = crate::state::ConnectorDestination {
+            id: id.clone(),
+            region,
+            cloud_connector_id: input.cloud_connector_id,
+            name: input.name,
+            description: input.description,
+            auth_type: input.auth_type,
+            auth_config: input.auth_config,
+            secrets_manager: input.secrets_manager,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::CONNECTOR_DESTINATION_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store.connector_destination_order.push(id.clone());
+        store.connector_destinations.insert(id.clone(), destination);
+
+        Ok(CreateConnectorDestinationOutput { id: Some(id) })
     }
 }

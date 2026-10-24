@@ -15,6 +15,8 @@
 mod account_association_lifecycle;
 #[path = "all/cloud_connector_lifecycle.rs"]
 mod cloud_connector_lifecycle;
+#[path = "all/connector_destination_lifecycle.rs"]
+mod connector_destination_lifecycle;
 #[path = "all/default_encryption_configuration.rs"]
 mod default_encryption_configuration;
 #[path = "all/enum_value_set_rendering.rs"]
