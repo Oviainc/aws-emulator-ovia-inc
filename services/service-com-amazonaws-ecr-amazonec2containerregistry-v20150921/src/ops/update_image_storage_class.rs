@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateImageStorageClass
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateImageStorageClass`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateImageStorageClass::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Transitions one stored image between Amazon ECR standard storage and Amazon ECR
+//! archive, recording the instant of the transition on the image, and answers with the
+//! status the image is in after the call. An `imageId` that names no stored image, or a
+//! repository that does not exist, is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -133,6 +128,41 @@ impl From<UpdateImageStorageClassErrorModeled> for UpdateImageStorageClassError 
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> UpdateImageStorageClassErrorModeled {
+    let message = Some(fault.message().to_string());
+    // Matched exhaustively, so a `Fault` variant added later is a compile error here
+    // rather than a silently mis-categorised 400.
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            UpdateImageStorageClassErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        crate::state::Fault::ImageNotFound(_) => {
+            UpdateImageStorageClassErrorModeled::ImageNotFoundException(ImageNotFoundException {
+                message,
+            })
+        }
+        crate::state::Fault::InvalidParameter(_) => {
+            UpdateImageStorageClassErrorModeled::InvalidParameterException(
+                InvalidParameterException { message },
+            )
+        }
+        // Nothing here resolves a tag or a lifecycle policy, so these cannot arise:
+        // reaching one would be a bug in this handler rather than a bad request.
+        crate::state::Fault::LifecyclePolicyNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
+            UpdateImageStorageClassErrorModeled::ServerException(ServerException { message })
+        }
+    }
+}
+
+/// The `TargetStorageClass` that moves an image into Amazon ECR archive, as the modelled
+/// enum spells it (`TargetStorageClass`: `STANDARD` | `ARCHIVE`).
+const ARCHIVE_TARGET_STORAGE_CLASS: &str = "ARCHIVE";
+
 /// The `UpdateImageStorageClass` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,18 +199,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateImageStorageClass` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateImageStorageClassErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateImageStorageClass"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateImageStorageClassErrorModeled::ServerException(ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let _ = ctx;
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // A value outside `TargetStorageClass` was already refused at the boundary, so
+        // what arrives here is `ARCHIVE` or `STANDARD`.
+        let to_archive = input.target_storage_class == ARCHIVE_TARGET_STORAGE_CLASS;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+        // A restore the clock has already made due is written down first, so a transition
+        // decided here starts from the status the image was already in.
+        repo.settle_image_storage_classes(now);
+
+        // The image is resolved the way every operation taking an `imageId` resolves one,
+        // so a transition names an image exactly as a read does.
+        let digest = repo
+            .resolve_image(&input.image_id)
+            .map_err(fault_error)?
+            .digest
+            .clone();
+        let registry_id = repo.registry_id.clone();
+        let repository_name = repo.name.clone();
+        let Some(image) = repo.images.get_mut(&digest) else {
+            return Err(
+                UpdateImageStorageClassErrorModeled::ServerException(ServerException {
+                    message: Some(format!("the image '{digest}' was not stored")),
+                })
+                .into(),
+            );
+        };
+
+        // The transition is recorded on the image itself, so it moves that image's status
+        // and nothing else in the repository. Asking for the storage class the image is
+        // already in, or re-asking for a restore that is already running, transitions
+        // nothing: the request is already satisfied, so the stored instants are left as
+        // the last real transition set them.
+        if to_archive {
+            if !image.is_archived() || image.is_activating() {
+                image.archive(now);
+            }
+        } else if image.is_archived() && !image.is_activating() {
+            image.activate(now);
+        }
+        let image_status = image.status.clone();
+        let image_id = image.identifier(input.image_id.image_tag.as_deref());
+
+        Ok(UpdateImageStorageClassOutput {
+            registry_id: Some(registry_id),
+            repository_name: Some(repository_name),
+            image_id: Some(image_id),
+            image_status: Some(image_status),
+        })
     }
 }

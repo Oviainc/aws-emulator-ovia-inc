@@ -55,6 +55,15 @@
 //! * `notFound` (TargetDomainIdList) — The list of target domain identifiers that were not
 //!   found.
 //! * `targetDomains` (TargetDomainList) — The list of target domains that were found.
+//!
+//! ## Recorded, not modelled
+//!
+//! Both lists above are always present, empty when nothing fell on that side of the
+//! partition, and each target domain carries the same projection the create answers: a
+//! `status` beside the modelled `verificationStatus`, RFC 3339 `createdAt`/`verifiedAt`,
+//! and the recorded challenge. The wire form lives on `BatchGetTargetDomainsOutput` and
+//! `TargetDomain` in `src/ops/types/batch_get_target_domains_types.rs`; the projection
+//! on `TargetDomainRecord` in `src/state.rs`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -157,8 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(BatchGetTargetDomainsOutput {
-            target_domains: Some(target_domains),
-            not_found: Some(not_found),
+            target_domains,
+            not_found,
         })
     }
 }

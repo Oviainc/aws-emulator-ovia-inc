@@ -59,6 +59,8 @@ mod instance_metric_data;
 mod instance_public_ports;
 #[path = "all/instance_reboot.rs"]
 mod instance_reboot;
+#[path = "all/load_balancer_listing.rs"]
+mod load_balancer_listing;
 #[path = "all/load_balancer_provisioning.rs"]
 mod load_balancer_provisioning;
 #[path = "all/region_catalog.rs"]
