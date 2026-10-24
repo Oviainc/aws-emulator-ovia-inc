@@ -224,6 +224,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // The repository the push addresses has to exist before anything is charged
+        // against the registry's capacity: a push to a repository the registry does not
+        // hold is that refusal, not a capacity one. The same resolved record answers what
+        // the push would COST: the per-record caps below each bound ONE dimension, while
+        // this is the registry-wide budget the bytes of every stored manifest and every
+        // in-flight upload share, so a client cannot hold the product of those caps in
+        // this process's memory. A manifest the repository already holds costs nothing
+        // more, so only a new one is charged, and the push is refused before any byte of
+        // it is stored. See [`crate::state::MAX_REGISTRY_CALLER_BYTES`].
+        let manifest_bytes = {
+            let repo = store
+                .repository(&input.repository_name)
+                .map_err(fault_error)?;
+            if repo.images.contains_key(&digest) {
+                0
+            } else {
+                input.image_manifest.len()
+            }
+        };
+        if !store.has_byte_budget_for(manifest_bytes) {
+            return Err(
+                PutImageErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(format!(
+                        "this registry holds at most {} bytes of stored image manifests \
+                         and in-flight layer uploads together",
+                        crate::state::MAX_REGISTRY_CALLER_BYTES
+                    )),
+                })
+                .into(),
+            );
+        }
+
         let repo = store
             .repository_mut(&input.repository_name)
             .map_err(fault_error)?;

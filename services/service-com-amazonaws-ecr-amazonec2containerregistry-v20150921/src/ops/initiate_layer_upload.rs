@@ -256,6 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .repository(&input.repository_name)
             .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
 
+        // An upload a client opened and abandoned otherwise holds its slot — and the bytes
+        // it received — for the life of the process, so the registry reclaims those it no
+        // longer owes anybody before it decides it is full. Nothing is reclaimed while
+        // there is room, and no upload younger than
+        // [`crate::state::ABANDONED_UPLOAD_AGE`] is ever dropped.
+        if store.uploads.len() >= crate::state::MAX_LAYER_UPLOADS {
+            store.reclaim_abandoned_uploads(::std::time::SystemTime::now());
+        }
+
         // The store is bounded: past its cap an upload is not opened. The refusal is
         // this operation's `ServerException` — reaching the cap is this registry's own
         // capacity, not a fault in the caller's request. See

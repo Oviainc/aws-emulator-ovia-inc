@@ -198,6 +198,43 @@ pub async fn given_layer(
         .to_string()
 }
 
+/// Seed one pull through cache rule straight into the registry's store, under `prefix`
+/// as its key.
+///
+/// `CreatePullThroughCacheRule` is the operation that creates one, and it refuses an
+/// upstream URL it cannot resolve to a supported registry while the request boundary
+/// refuses a `credentialArn` outside its modelled pattern — so a suite that has to
+/// exercise a STORED record the create path cannot produce places it here, in the same
+/// store the handlers read. Every other case goes through the wire.
+pub fn seed_pull_through_cache_rule(
+    engine: &engine::InMemoryEngine,
+    prefix: &str,
+    upstream_registry: Option<&str>,
+    upstream_url: &str,
+    credential_arn: Option<&str>,
+    custom_role_arn: Option<&str>,
+) {
+    use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921 as ecr;
+
+    let state = ecr::state::service_state(engine).expect("the ecr store is reachable");
+    state.lock().pull_through_cache_rules.insert(
+        prefix.to_string(),
+        ecr::ops::types::PullThroughCacheRule {
+            ecr_repository_prefix: Some(prefix.to_string()),
+            upstream_registry_url: Some(upstream_url.to_string()),
+            created_at: Some(::aws_smithy_types::DateTime::from(
+                ::std::time::SystemTime::now(),
+            )),
+            registry_id: Some(REGISTRY_ID.to_string()),
+            credential_arn: credential_arn.map(ToString::to_string),
+            custom_role_arn: custom_role_arn.map(ToString::to_string),
+            upstream_repository_prefix: Some("ROOT".to_string()),
+            upstream_registry: upstream_registry.map(ToString::to_string),
+            updated_at: None,
+        },
+    );
+}
+
 /// The same call as [`call`], made against `region`: the credential scope's region is
 /// the Region a request is made against, so a suite exercising regional behaviour picks
 /// it per call instead of taking [`REGION`].

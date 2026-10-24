@@ -243,6 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .repository(&input.repository_name)
             .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
 
+        // The bytes the registry already holds, read before the upload is borrowed for
+        // mutation. The per-upload cap bounds ONE upload; this is the registry-wide budget
+        // the bytes of every in-flight upload and every stored manifest share, so a client
+        // cannot hold the product of the per-record caps in this process's memory. See
+        // [`crate::state::MAX_REGISTRY_CALLER_BYTES`].
+        let caller_bytes_held = store.caller_bytes_held();
+
         // An upload id is only valid for the repository it was issued for, so an id this
         // registry never handed out and one opened against another repository are the
         // same refusal.
@@ -259,6 +266,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The addressed upload resolved, so the part is now charged against the
+        // registry-wide budget: it is refused before any byte of it is kept.
+        if caller_bytes_held.saturating_add(input.layer_part_blob.len())
+            > crate::state::MAX_REGISTRY_CALLER_BYTES
+        {
+            return Err(refusal(
+                "registry byte budget reached",
+                &caller_akid,
+                UploadLayerPartErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(format!(
+                        "this registry holds at most {} bytes of in-flight layer uploads \
+                         and stored image manifests together",
+                        crate::state::MAX_REGISTRY_CALLER_BYTES
+                    )),
+                }),
+            )
+            .into());
+        }
 
         // What the upload held before this part: the last byte a client may still rely
         // on, which is what a refused part reports back as `lastValidByteReceived`.
