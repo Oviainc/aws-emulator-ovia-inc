@@ -4426,6 +4426,21 @@ pub const PRECONDITION_FAILED_MESSAGE: &str =
     "The request failed because it didn't meet the preconditions in one or more \
      request-header fields.";
 
+/// `InvalidIfMatchVersion`'s message, as CloudFront sends it: "The If-Match version is
+/// missing or not valid for the resource."
+///
+/// ONE constant for every operation that evaluates an `If-Match`, because the condition
+/// is a property of the HEADER the request carried rather than of the resource it names:
+/// a distribution, a policy or a key group refused for it learns the same sentence, and
+/// nothing about the request belongs in the text.
+///
+/// The value below is the WIRE text — what the recorded service answers this code with,
+/// and what this emulator therefore serves. It deliberately differs from the sentence the
+/// MODEL's documentation of the error shape uses for the same rule ("The If-Match version
+/// is missing or not valid.").
+pub const INVALID_IF_MATCH_VERSION_MESSAGE: &str =
+    "The If-Match version is missing or not valid for the resource.";
+
 /// The sentence `DistributionAlreadyExists` carries, up to the distribution the caller
 /// reference is already associated with, which CloudFront names at the end of it.
 const DISTRIBUTION_ALREADY_EXISTS_PREFIX: &str =
@@ -4462,6 +4477,18 @@ pub fn no_such_invalidation() -> NoSuchInvalidation {
 pub fn precondition_failed() -> crate::ops::types::PreconditionFailed {
     crate::ops::types::PreconditionFailed {
         message: Some(PRECONDITION_FAILED_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `InvalidIfMatchVersion` for an `If-Match` that is missing where the
+/// operation requires one, or carries something that is no version token at all.
+///
+/// Fixed service text ([`INVALID_IF_MATCH_VERSION_MESSAGE`]), for the same reason
+/// [`precondition_failed`] is: the caller learns which header failed from the one it
+/// sent, never from a value echoed back to it.
+pub fn invalid_if_match_version() -> crate::ops::types::InvalidIfMatchVersion {
+    crate::ops::types::InvalidIfMatchVersion {
+        message: Some(INVALID_IF_MATCH_VERSION_MESSAGE.to_string()),
     }
 }
 

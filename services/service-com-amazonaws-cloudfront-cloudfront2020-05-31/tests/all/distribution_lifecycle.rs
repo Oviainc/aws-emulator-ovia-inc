@@ -72,6 +72,14 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router
 }
 
+/// Long enough after a mutation that the clock owes the distribution its deployment.
+///
+/// `pub(crate)` and defined ONCE here: every suite that waits for a propagation waits for
+/// the same span rather than carrying its own copy of it.
+pub(crate) fn past_propagation() -> Duration {
+    PROPAGATION_DELAY + Duration::from_millis(250)
+}
+
 // ---------------------------------------------------------------------------
 // XML reading
 // ---------------------------------------------------------------------------
@@ -429,6 +437,10 @@ pub(crate) struct Config {
     /// One of `PriceClass`'s values, or `None` to leave the member out entirely (the
     /// service then resolves it).
     pub(crate) price_class: Option<&'static str>,
+    /// `DistributionConfig$WebACLId` — the WAF web ACL this configuration associates the
+    /// distribution with, or `None` to leave the member out entirely (the service then
+    /// stores no association).
+    pub(crate) web_acl_id: Option<String>,
 }
 
 impl Config {
@@ -480,6 +492,10 @@ impl Config {
             out.push_str(&format!("<PriceClass>{price_class}</PriceClass>"));
         }
         out.push_str(&format!("<Enabled>{}</Enabled>", self.enabled));
+        // After `Enabled`, which is where `DistributionConfig` carries `WebACLId`.
+        if let Some(web_acl_id) = &self.web_acl_id {
+            out.push_str(&format!("<WebACLId>{web_acl_id}</WebACLId>"));
+        }
         out.push_str("</DistributionConfig>");
         out
     }
@@ -575,6 +591,15 @@ impl Config {
             "case {case} ({context}): expected PriceClass {expected_price_class:?}, got {:?}",
             config.text_at("PriceClass")
         );
+        // `WebACLId` the same way: a configuration that named no web ACL reads back as the
+        // empty value, which is what "associated with no web ACL" is.
+        let expected_web_acl_id = self.web_acl_id.clone().unwrap_or_default();
+        let reported_web_acl_id = config.text_at("WebACLId").unwrap_or_default();
+        assert_eq!(
+            reported_web_acl_id, expected_web_acl_id,
+            "case {case} ({context}): expected WebACLId {expected_web_acl_id:?}, got \
+             {reported_web_acl_id:?}"
+        );
     }
 }
 
@@ -592,6 +617,7 @@ pub(crate) fn config(case: &'static str, reference: &str) -> Config {
         aliases: Vec::new(),
         viewer_protocol_policy: "allow-all",
         price_class: None,
+        web_acl_id: None,
     }
 }
 

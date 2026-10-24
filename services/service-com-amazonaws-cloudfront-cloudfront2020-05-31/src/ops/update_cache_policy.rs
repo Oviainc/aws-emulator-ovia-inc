@@ -239,13 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             IfMatch::Current => {}
             IfMatch::Invalid => {
                 return Err(UpdateCachePolicyErrorModeled::InvalidIfMatchVersion(
-                    InvalidIfMatchVersion {
-                        message: Some(
-                            "The If-Match version is missing or not valid: supply the ETag of \
-                             the cache policy's current version"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::invalid_if_match_version(),
                 )
                 .into());
             }

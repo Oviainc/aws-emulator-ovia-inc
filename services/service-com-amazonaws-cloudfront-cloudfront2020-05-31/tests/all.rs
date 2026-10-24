@@ -37,6 +37,8 @@ mod distribution_lifecycle;
 mod distribution_tags;
 #[path = "all/distribution_tenant_lifecycle.rs"]
 mod distribution_tenant_lifecycle;
+#[path = "all/distribution_web_acl_association.rs"]
+mod distribution_web_acl_association;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/function_lifecycle.rs"]

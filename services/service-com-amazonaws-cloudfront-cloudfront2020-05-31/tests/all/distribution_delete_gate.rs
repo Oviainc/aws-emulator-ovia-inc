@@ -23,20 +23,12 @@
 //! `DistributionConfig` builder) is the one in [`crate::distribution_lifecycle`], so
 //! these rules are asserted over the same wire path as the rest of the suite.
 
-use std::time::Duration;
-
-use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::PROPAGATION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
     config, create_distribution, delete_distribution, emulator, get_distribution,
-    list_distributions, update_distribution, Answer, Config, API_VERSION, HOST,
+    list_distributions, past_propagation, update_distribution, Answer, Config, API_VERSION, HOST,
 };
-
-/// Long enough after a mutation that the clock owes the distribution its deployment.
-fn past_propagation() -> Duration {
-    PROPAGATION_DELAY + Duration::from_millis(250)
-}
 
 /// Create one distribution and report `(Id, ETag)`.
 async fn create(router: &MultiServiceRouter, row: &Config) -> (String, String) {
