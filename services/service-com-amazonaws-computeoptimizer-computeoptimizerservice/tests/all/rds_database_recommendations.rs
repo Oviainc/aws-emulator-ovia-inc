@@ -360,7 +360,17 @@ async fn the_seeded_analysed_database_is_reported_from_its_catalog_row() {
             "instanceRecommendationOptions": [{
                 "dbInstanceClass": "db.r6g.xlarge",
                 "rank": 1,
-                "performanceRisk": 0.0,
+                // The same work on half the capacity: CPU and memory are shares of the
+                // class's capacity, so each doubles from db.r6g.2xlarge to db.r6g.xlarge,
+                // while the connection count the workload makes does not move.
+                "projectedUtilizationMetrics": [
+                    {"name": "CPU", "statistic": "Maximum", "value": 35.0},
+                    {"name": "Memory", "statistic": "Maximum", "value": 48.0},
+                    {"name": "DatabaseConnections", "statistic": "Maximum", "value": 12.0},
+                ],
+                // The most loaded share takes 48% of the recommended class, which is
+                // (0.48 - 0.25) / 0.25 on the modelled 0..4 risk scale.
+                "performanceRisk": 0.92,
                 "savingsOpportunity": {
                     "savingsOpportunityPercentage": 25.0,
                     "estimatedMonthlySavings": {"currency": "USD", "value": 75.0},

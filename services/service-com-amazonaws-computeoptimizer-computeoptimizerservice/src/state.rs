@@ -3273,7 +3273,7 @@ pub fn rds_projected_metric_value(
     current_instance_class: Option<&str>,
     recommended_instance_class: Option<&str>,
 ) -> f64 {
-    if metric_name != RDS_METRIC_CPU && metric_name != RDS_METRIC_MEMORY {
+    if !rds_metric_sized_by_instance_class(Some(metric_name)) {
         return observed;
     }
     let capacities = current_instance_class
@@ -3286,6 +3286,60 @@ pub fn rds_projected_metric_value(
     round_hundredths(
         (observed * current / recommended).clamp(0.0, UTILIZATION_PERCENTAGE_CEILING),
     )
+}
+
+/// Whether an `RDSDBMetricName` measures, as a percentage, a resource the DB instance class
+/// sizes — the metrics [`RDS_METRIC_CPU`] and [`RDS_METRIC_MEMORY`] name, and so the ones a
+/// projection scales and a risk is read off.
+pub fn rds_metric_sized_by_instance_class(metric_name: Option<&str>) -> bool {
+    metric_name.is_some_and(|name| name == RDS_METRIC_CPU || name == RDS_METRIC_MEMORY)
+}
+
+/// The utilization the observed workload is projected to reach once the database runs on
+/// `recommended_instance_class`, as
+/// `RDSDBInstanceRecommendationOption$projectedUtilizationMetrics` reports it: every observed
+/// metric, each projected by the ONE rule [`rds_projected_metric_value`] states, so the
+/// option's projection and the series `GetRDSDatabaseRecommendationProjectedMetrics` projects
+/// for that option cannot disagree. Empty for a database the analysis observed nothing on,
+/// which then reports no projection rather than an invented one.
+pub fn rds_projected_utilization_metrics(
+    observed: &[RDSDBUtilizationMetric],
+    current_instance_class: Option<&str>,
+    recommended_instance_class: Option<&str>,
+) -> Vec<RDSDBUtilizationMetric> {
+    observed
+        .iter()
+        .map(|metric| RDSDBUtilizationMetric {
+            value: rds_projected_metric_value(
+                metric.name.as_deref().unwrap_or_default(),
+                metric.value,
+                current_instance_class,
+                recommended_instance_class,
+            ),
+            ..metric.clone()
+        })
+        .collect()
+}
+
+/// The `PerformanceRisk` a DB instance recommendation option carries: how close the
+/// utilization projected onto it ([`rds_projected_utilization_metrics`]) comes to the capacity
+/// of the recommended class, on the model's 0..4 scale ([`performance_risk_score`]).
+///
+/// "The higher the risk, the more likely the current [configuration] doesn't have sufficient
+/// capacity", so an option is as risky as its most loaded dimension: the highest projected
+/// percentage of what the recommended class sizes, against the whole of that capacity
+/// ([`UTILIZATION_PERCENTAGE_CEILING`]). An option nothing was projected onto carries no
+/// risk, which is the member's modelled default.
+pub fn rds_option_performance_risk(projected: &[RDSDBUtilizationMetric]) -> f64 {
+    let peak = projected
+        .iter()
+        .filter(|metric| rds_metric_sized_by_instance_class(metric.name.as_deref()))
+        .map(|metric| metric.value)
+        .fold(0.0_f64, f64::max);
+    round_hundredths(performance_risk_score(
+        peak,
+        UTILIZATION_PERCENTAGE_CEILING,
+    ))
 }
 
 /// The most data points one projected-metrics response carries, whatever window and
