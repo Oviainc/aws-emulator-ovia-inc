@@ -704,6 +704,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::S3Tables::TableBucket",
     "AWS::S3Tables::TableBucketPolicy",
     "AWS::S3Tables::TablePolicy",
+    // Amazon S3 Vectors, whose namespace segment is that model's own sdk identity
+    // (`smithy_query(query="service_info",
+    // model_path="services/service-com-amazonaws-s3vectors-s3vectors/smithy-model/\
+    // com-amazonaws-s3vectors-s3vectors.json")`: `sdkId: S3Vectors`,
+    // `arnNamespace: s3vectors`), beside the sibling bucket variants above.
+    "AWS::S3Vectors::Index",
+    "AWS::S3Vectors::VectorBucket",
     // Amazon SES
     "AWS::SES::ConfigurationSet",
     "AWS::SES::EmailIdentity",
