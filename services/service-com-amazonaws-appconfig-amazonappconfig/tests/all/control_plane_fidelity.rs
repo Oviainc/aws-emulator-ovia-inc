@@ -10,8 +10,9 @@
 //! 1. the account-settings surface (`GET`/`PATCH /settings`) is served and round-trips;
 //! 2. `EnvironmentState` goes on the wire in its CamelCase form, not as the model's
 //!    SCREAMING_SNAKE member name;
-//! 3. a `ResourceNotFoundException` message names the resource kind, every identifier
-//!    the request scoped the lookup with, and the account;
+//! 3. a `ResourceNotFoundException` message is the looked-up resource kind's own
+//!    AppConfig template: the identifiers that template echoes, and the account only
+//!    where that template reports one;
 //! 4. a violation of a MODELLED constraint is refused with the modelled
 //!    `BadRequestException`, never with an unmodelled `ValidationException`;
 //! 5. an over-sized hosted configuration is refused with the SERVICE's own message;
@@ -27,16 +28,10 @@ use service_com_amazonaws_appconfig_amazonappconfig::ops::types::ENVIRONMENT_STA
 use service_com_amazonaws_appconfig_amazonappconfig::state;
 
 use super::appconfig_workflow::{
-    create_application, create_environment, create_profile, json_call, router, send, Answer,
-    RETRIEVAL_ROLE,
+    account, create_application, create_environment, create_profile, json_call, router, send,
+    Answer, RETRIEVAL_ROLE,
 };
 use super::resource_tags::pct;
-
-/// The one account id a generated emulator presents, which every refusal that names an
-/// account must name.
-fn account() -> &'static str {
-    engine::emulator_account_id()
-}
 
 /// An ARN of the shape an AppConfig resource carries, addressing nothing this service
 /// holds — what the tagging operations' `ResourceArn` lookup must refuse.
@@ -383,10 +378,11 @@ async fn write_hosted_version(
 }
 
 /// A lookup of a resource nothing holds answers 404 `ResourceNotFoundException` whose
-/// `Message` names the resource kind, every identifier the request scoped the lookup
-/// with, and the account — for every resource kind this service can fail to find.
+/// `Message` is that resource kind's own AppConfig template — the identifier labels that
+/// template echoes, and the account clause only where it reports one — for every resource
+/// kind this service can fail to find.
 #[tokio::test]
-async fn a_not_found_message_names_the_requested_identifiers_and_the_account() {
+async fn a_not_found_message_is_the_template_of_the_kind_that_was_looked_up() {
     let router = router();
     let application = create_application(&router, "not-found-messages").await;
     let environment = create_environment(&router, &application, "prod").await;
@@ -428,8 +424,9 @@ async fn a_not_found_message_names_the_requested_identifiers_and_the_account() {
     let account = account();
     // The forms are the recorded AWS messages, spelled out here rather than built with
     // the service's own builder so the test pins the contract instead of restating the
-    // implementation. The hosted configuration version's recorded message ends WITHOUT a
-    // full stop; every other one ends with it.
+    // implementation. They are NOT uniform: the hosted configuration version's recorded
+    // message ends WITHOUT a full stop where every other one ends with it, the
+    // deployment strategy's names no account, and the extension's echoes no identifier.
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an application nothing holds",
@@ -481,16 +478,12 @@ async fn a_not_found_message_names_the_requested_identifiers_and_the_account() {
         (
             "a deployment strategy that is neither created nor predefined",
             "/deploymentstrategies/nostrat".to_string(),
-            format!(
-                "Deployment Strategy with Id nostrat could not be found for account {account}."
-            ),
+            "DeploymentStrategy with Id nostrat could not be found.".to_string(),
         ),
         (
             "an extension no identifier resolves to",
             "/extensions/no-such-extension".to_string(),
-            format!(
-                "Extension with Id no-such-extension could not be found for account {account}."
-            ),
+            format!("Extension could not be found for account {account}."),
         ),
         (
             "a version an extension does not hold",

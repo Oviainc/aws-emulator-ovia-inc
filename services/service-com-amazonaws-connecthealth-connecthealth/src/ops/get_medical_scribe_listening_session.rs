@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMedicalScribeListeningSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMedicalScribeListeningSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMedicalScribeListeningSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the listening session the request names under EXACTLY the
+//! (`domainId`, `subscriptionId`) scope it was started in, and reports the PERSISTED
+//! session record ([`crate::state::ScribeSession`]). Any link of that chain the store
+//! does not hold — the domain, the subscription, or the session under that subscription
+//! — is the modelled 404 `ResourceNotFoundException`, so a session is never leaked
+//! across subscriptions.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +74,15 @@
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request exceeds a service quota.
 //! * `ThrottlingException` (HTTP 429) — This error is thrown when the client exceeds the
 //!   allowed request rate.
+//!
+//! ## Where a session comes from
+//!
+//! The only operation that STARTS one, `StartMedicalScribeListeningSession`, is not
+//! generated into this crate (`src/ops/SKIPPED_STUBS.md`: its input carries a
+//! `@streaming` event-stream member, which needs wire framing the generator does not
+//! emit), so nothing this emulator serves writes a session yet. This operation is still
+//! a lookup rather than a constant: it resolves the session out of state and reports
+//! what is stored, which is the modelled 404 for every scope that holds none.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -153,18 +159,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMedicalScribeListeningSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMedicalScribeListeningSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMedicalScribeListeningSession"))
+        // The store is unreachable only when this service was mounted on a foreign
+        // engine. This operation models `InternalServerException`, so that is the
+        // channel for a server-side failure.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetMedicalScribeListeningSessionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "GetMedicalScribeListeningSession could not reach this service's store"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A reporting operation, so it writes only what the CLOCK already made due: a
+        // domain whose DELETING span has elapsed is purged here, and its subscriptions
+        // and their sessions go with it.
+        store.purge_due_deletions(now);
+
+        // One miss, one answer. The domain, the subscription and the session are
+        // resolved as a single scoped chain, so a session started under one subscription
+        // cannot be read through a sibling subscription or through another domain: the
+        // request has to name the scope the session actually belongs to.
+        let not_found = |message: String| -> Self::Error {
+            GetMedicalScribeListeningSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        if store.live_domain(&input.domain_id).is_none() {
+            return Err(not_found(
+                crate::service::error_detail::domain_not_found_message(&input.domain_id),
+            ));
+        }
+        if store
+            .live_subscription(&input.domain_id, &input.subscription_id)
+            .is_none()
+        {
+            return Err(not_found(
+                crate::service::error_detail::subscription_not_found_message(
+                    &input.domain_id,
+                    &input.subscription_id,
+                ),
+            ));
+        }
+        let Some(session) = store.live_scribe_session(
+            &input.domain_id,
+            &input.subscription_id,
+            &input.session_id,
+        ) else {
+            return Err(not_found(
+                crate::service::error_detail::scribe_session_not_found_message(&input.session_id),
+            ));
+        };
+
+        Ok(GetMedicalScribeListeningSessionOutput {
+            // Read back OUT of the stored record, never echoed from the request.
+            medical_scribe_listening_session_details: Some(session.details()),
+        })
     }
 }

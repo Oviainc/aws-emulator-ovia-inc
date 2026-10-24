@@ -21,6 +21,8 @@ mod error_envelopes;
 mod fhir_datastore_lifecycle;
 #[path = "all/fhir_rest_and_validate_source.rs"]
 mod fhir_rest_and_validate_source;
+#[path = "all/fhir_update_interaction.rs"]
+mod fhir_update_interaction;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_fhir_datastore.rs"]
