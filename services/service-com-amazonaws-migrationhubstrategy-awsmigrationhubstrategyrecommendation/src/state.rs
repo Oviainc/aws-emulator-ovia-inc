@@ -18,7 +18,9 @@
 //! `ListServers` reports: the servers an import file task ingested, each carrying the
 //! import groups it came in with, the recommendation the service holds for it and the
 //! strategy option the account prefers for it — what `UpdateServerConfig` writes and
-//! `GetServerStrategies` reports.
+//! `GetServerStrategies` reports. A server a collector fetched also carries the discovery
+//! data that fetch brought with it ([`ServerDiscovery`]), which is what
+//! `ListAnalyzableServers` reports.
 //!
 //! Beside the servers, the account's **application components**
 //! ([`ApplicationComponentRecord`]) — the processes and databases the assessment found
@@ -40,9 +42,9 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AppUnitError, ApplicationComponentDetail, ApplicationPreferences, AssessmentTarget,
-    AssociatedApplication, DataCollectionDetails, DatabaseConfigDetail, DatabasePreferences,
-    GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
+    AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail, ApplicationPreferences,
+    AssessmentTarget, AssociatedApplication, DataCollectionDetails, DatabaseConfigDetail,
+    DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
     StrategyOption, SystemInfo, TransformationTool, ValidationException, GROUP_NAME_VALUES,
@@ -276,6 +278,14 @@ pub const SERVER_PAGE_MARKER: &str = "migrationhubstrategy:servers:";
 /// other list's records.
 pub const SERVER_DETAIL_PAGE_MARKER: &str = "migrationhubstrategy:server-applications:";
 
+/// The marker a `ListAnalyzableServers` cursor carries.
+///
+/// That list holds the servers a collector fetched, which is a SUBSET of the inventory in
+/// an order of its own, so it gets its own marker: a `ListServers` token handed to it (or
+/// one of its own handed to `ListServers`) is foreign and refused instead of resuming at
+/// whatever position its server happens to have in the other list.
+pub const ANALYZABLE_SERVER_PAGE_MARKER: &str = "migrationhubstrategy:analyzable-servers:";
+
 /// Encode the key a page stopped at as an opaque `nextToken` carrying `marker`.
 ///
 /// Hex round-trips exactly and is non-empty for a non-empty key, so the token satisfies
@@ -495,6 +505,38 @@ pub const SORT_DESCENDING: &str = "DESC";
 /// nothing computed.
 pub const STRATEGY_RECOMMENDED: &str = "recommended";
 
+/// What a data collector fetched about one server when it discovered it — the
+/// `AnalyzableServerSummary` members, held on the server they describe.
+///
+/// `ListAnalyzableServers` is documented "Retrieves a list of all the servers fetched from
+/// customer vCenter using Strategy Recommendation Collector", so an analyzable server is a
+/// server the service holds a collector's discovery data for. That data is held HERE,
+/// beside the rest of the server's record ([`ServerRecord::discovery`]), rather than in a
+/// second collection of servers: a discovered server and a portfolio server are one
+/// machine, and `AnalyzableServerSummary` carries no id of its own that could key a
+/// separate one.
+///
+/// Every member is what the discovery stored, so a read derives nothing from the request
+/// that reads it, and a member the discovery did not carry stays `None` rather than being
+/// filled with a value nothing fetched. None of these four members is a member of
+/// `ServerDetail`, which is why `ListServers` reports none of them: the model gives the
+/// server's addresses to `SystemInfo$networkInfoList`, whose `NetworkInfo` requires an
+/// interface name, a MAC address and a subnet mask that no part of this emulator holds.
+#[derive(Debug, Clone, Default)]
+pub struct ServerDiscovery {
+    /// `AnalyzableServerSummary$hostname` — "The host name of the analyzable server."
+    pub hostname: Option<String>,
+    /// `AnalyzableServerSummary$ipAddress` — "The ip address of the analyzable server."
+    pub ip_address: Option<String>,
+    /// `AnalyzableServerSummary$source` — "The data source of the analyzable server."
+    ///
+    /// A free-text string in the model (it targets `String`, not `DataSourceType`), so it
+    /// is held as the discovery recorded it.
+    pub source: Option<String>,
+    /// `AnalyzableServerSummary$vmId` — "The virtual machine id of the analyzable server."
+    pub vm_id: Option<String>,
+}
+
 /// One server of this account's portfolio, as this emulator persists it.
 ///
 /// A server enters the portfolio when an import file task ingests it — that ingestion
@@ -560,6 +602,15 @@ pub struct ServerRecord {
     /// application was recorded for, so that read answers an empty list rather than an
     /// application nothing holds.
     pub associated_applications: Vec<AssociatedApplication>,
+    /// The discovery data a collector fetched for this server ([`ServerDiscovery`]), or
+    /// `None` for a server no collector fetched — a server that came in some other way
+    /// (an import file, Application Discovery Service) and that the service therefore
+    /// holds no vCenter discovery data for.
+    ///
+    /// It is this member that makes a server ANALYZABLE: `ListAnalyzableServers` reports
+    /// the servers that carry it ([`Self::to_analyzable_summary`]) and no others, so a
+    /// server nothing discovered is not reported as an empty summary.
+    pub discovery: Option<ServerDiscovery>,
 }
 
 impl ServerRecord {
@@ -727,6 +778,22 @@ impl ServerRecord {
             });
         }
         strategies
+    }
+
+    /// The `AnalyzableServerSummary` a read reports for this server, or `None` when no
+    /// collector discovered it and the service therefore holds nothing to summarise.
+    ///
+    /// The four members of the stored [`ServerDiscovery`], member for member and nothing
+    /// else: `AnalyzableServerSummary` declares exactly those four, so a summary carries
+    /// what the discovery fetched and leaves absent what it did not.
+    pub fn to_analyzable_summary(&self) -> Option<AnalyzableServerSummary> {
+        let discovery = self.discovery.as_ref()?;
+        Some(AnalyzableServerSummary {
+            hostname: discovery.hostname.clone(),
+            ip_address: discovery.ip_address.clone(),
+            source: discovery.source.clone(),
+            vm_id: discovery.vm_id.clone(),
+        })
     }
 
     /// True when this server came in with one of `groups`.
@@ -1333,6 +1400,22 @@ pub fn check_group_names(groups: &[Group]) -> Result<(), ValidationException> {
     groups
         .iter()
         .try_for_each(|group| check_enum(group.name.as_deref(), GROUP_NAME_VALUES))
+}
+
+/// Whether a list is reported in descending order, from the `sort` the request carries.
+///
+/// Every `sort` member of this service targets `SortOrder` and is documented the same way
+/// — "Specifies whether to sort by ascending (ASC) or descending (DESC) order" — and names
+/// no key, so the direction is all a request chooses and the rule is one for every list
+/// here. An ABSENT `sort` is ascending ([`SORT_ASCENDING`]); a value `SortOrder` does not
+/// declare is refused with the service's [`invalid_request_body`], since the boundary
+/// validator admits any string for an enum-targeting member.
+pub fn sort_descending(sort: Option<&str>) -> Result<bool, ValidationException> {
+    match sort {
+        None | Some(SORT_ASCENDING) => Ok(false),
+        Some(SORT_DESCENDING) => Ok(true),
+        Some(_) => Err(invalid_request_body()),
+    }
 }
 
 /// `GetAssessment`'s refusal of an `id` that names no assessment of this account.

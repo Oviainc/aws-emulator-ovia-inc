@@ -285,13 +285,11 @@ fn filter_of<'a>(
 /// order" and names no key, so the order is taken over the one total order every server
 /// has — its id, which is also what a page resumes at. An absent `sort` is ascending. A
 /// `SortOrder` value the model does not declare is refused, for the same reason as an
-/// undeclared criteria.
+/// undeclared criteria. The direction is read by the service's one
+/// [`crate::state::sort_descending`], which every list of this service shares; this
+/// wrapper lifts its refusal into this operation's error channel.
 fn descending(sort: Option<&str>) -> Result<bool, ListServersError> {
-    match sort {
-        None | Some(SORT_ASCENDING) => Ok(false),
-        Some(SORT_DESCENDING) => Ok(true),
-        Some(_) => Err(refused()),
-    }
+    crate::state::sort_descending(sort).map_err(|_| refused())
 }
 
 /// Refuse a `groupIdFilter` entry whose `name` is not a `GroupName` the model declares —

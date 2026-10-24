@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAnalyzableServers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAnalyzableServers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAnalyzableServers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the servers a data collector fetched — the inventory records this service
+//! holds discovery data for ([`crate::state::ServerDiscovery`]) — ordered and paged as the
+//! request asks. It is a REPORT: it writes nothing, so two identical calls answer the same
+//! thing and a later caller sees exactly what this one did.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +80,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    decode_page_token, encode_page_token, invalid_request_body, page_token_not_accepted,
+    ANALYZABLE_SERVER_PAGE_MARKER, MAX_LIST_PAGE_SIZE, SORT_ASCENDING, SORT_DESCENDING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -117,6 +118,104 @@ impl From<ListAnalyzableServersErrorModeled> for ListAnalyzableServersError {
     fn from(modeled: ListAnalyzableServersErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// What a `nextToken` carries, beside the marker: the ORDER the list was taken in, and the
+/// server the next page starts at.
+///
+/// A token names a position in ONE list. The only thing a request chooses about this list
+/// is its direction — the operation takes no filter — so that is what the token carries
+/// beside the resume point: handed back under the other direction it is refused, rather
+/// than resuming at whatever position that server has when the list is read backwards. The
+/// page SIZE is deliberately not part of it: `maxResults` is documented per call ("if a
+/// previous call to this action returned 100 items, but you set maxResults to 10"), so
+/// changing it between pages is the caller's business.
+struct Cursor {
+    order: &'static str,
+    resume_at: String,
+}
+
+impl Cursor {
+    /// This cursor as the opaque `nextToken` the caller hands back, through the service's
+    /// one page-token codec.
+    fn to_token(&self) -> String {
+        encode_page_token(
+            ANALYZABLE_SERVER_PAGE_MARKER,
+            &format!("{}:{}", self.order, self.resume_at),
+        )
+    }
+
+    /// The cursor a token carries, or `None` for anything this operation did not mint.
+    fn from_token(token: &str) -> Option<(String, String)> {
+        let payload = decode_page_token(ANALYZABLE_SERVER_PAGE_MARKER, token)?;
+        let (order, resume_at) = payload.split_once(':')?;
+        Some((order.to_string(), resume_at.to_string()))
+    }
+}
+
+/// The page the request asks for: how many servers it takes, and the server it resumes
+/// from.
+struct Page {
+    size: usize,
+    resume_at: Option<String>,
+}
+
+/// This operation's refusal of a request the model admits member by member but that it
+/// cannot act on, in the service's own wording.
+fn refused() -> ListAnalyzableServersError {
+    ListAnalyzableServersErrorModeled::ValidationException(invalid_request_body()).into()
+}
+
+/// This operation's refusal of a `nextToken` it cannot resolve, worded the way the service
+/// words any unresolvable parameter — the same refusal its sibling lists answer for a
+/// cursor of their own that resolves to nothing.
+fn token_refused() -> ListAnalyzableServersError {
+    ListAnalyzableServersErrorModeled::ValidationException(page_token_not_accepted()).into()
+}
+
+/// Whether this list is reported in descending order.
+///
+/// Read by the service's one [`crate::state::sort_descending`] — `sort` carries the same
+/// documentation and the same `SortOrder` catalog on every list of this service — with its
+/// refusal lifted into this operation's error channel. The direction is taken over the one
+/// total order the inventory gives these servers, their record's id, which is also what a
+/// page resumes at: `AnalyzableServerSummary` itself declares no key to order by.
+fn descending(sort: Option<&str>) -> Result<bool, ListAnalyzableServersError> {
+    crate::state::sort_descending(sort).map_err(|_| refused())
+}
+
+/// Hold `maxResults` to the documented maximum and `nextToken` to a token this operation
+/// issued for THIS order.
+///
+/// `maxResults` is documented "The maximum number of items to include in the response. The
+/// maximum value is 100" and its target shape carries no `@range`, so a request past that
+/// bound (or one asking for a page of nothing) is refused here rather than silently
+/// clamped: a caller that asked for more than the service gives has to learn it cannot
+/// have it. An absent `maxResults` takes the documented maximum.
+fn page_of(
+    max_results: Option<i32>,
+    next_token: Option<String>,
+    order: &str,
+) -> Result<Page, ListAnalyzableServersError> {
+    let size = match max_results {
+        None => MAX_LIST_PAGE_SIZE,
+        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
+        Some(_) => return Err(refused()),
+    };
+    let resume_at = match next_token {
+        None => None,
+        Some(token) => {
+            let (token_order, resume_at) = Cursor::from_token(&token).ok_or_else(token_refused)?;
+            if token_order != order {
+                return Err(token_refused());
+            }
+            Some(resume_at)
+        }
+    };
+    Ok(Page {
+        size: usize::try_from(size).unwrap_or(0),
+        resume_at,
+    })
 }
 
 /// The `ListAnalyzableServers` operation.
@@ -155,18 +254,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAnalyzableServers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAnalyzableServersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAnalyzableServers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAnalyzableServersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy server inventory is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Every refusal is decided from the request alone, before the store is read.
+        let descending = descending(input.sort.as_deref())?;
+        let order = if descending {
+            SORT_DESCENDING
+        } else {
+            SORT_ASCENDING
+        };
+        let page = page_of(input.max_results, input.next_token, order)?;
+
+        // A read: the store is only looked at here, so running ListAnalyzableServers
+        // changes nothing a later caller sees.
+        let store = state.lock();
+        // The servers a collector fetched, each beside the inventory id that orders it: a
+        // server the service holds no discovery data for is not an analyzable server and
+        // is left out rather than reported as an empty summary.
+        let discovered: Vec<(&str, AnalyzableServerSummary)> = store
+            .servers
+            .values()
+            .filter_map(|server| {
+                server
+                    .to_analyzable_summary()
+                    .map(|summary| (server.id.as_str(), summary))
+            })
+            .collect();
+
+        // `servers` is keyed by id, so iterating it already gives the ascending order;
+        // `DESC` is that order reversed.
+        let ordered: Vec<(&str, AnalyzableServerSummary)> = if descending {
+            discovered.into_iter().rev().collect()
+        } else {
+            discovered
+        };
+
+        // Where this page starts: at the server the cursor names, which is the first one
+        // the previous page did not report. The cursor already proved it was issued for
+        // this order, so an id the list no longer holds means the record went away between
+        // pages, and the token is refused rather than answered from the top.
+        let start = match page.resume_at {
+            None => 0,
+            Some(resume_at) => ordered
+                .iter()
+                .position(|(id, _)| *id == resume_at)
+                .ok_or_else(token_refused)?,
+        };
+        let end = start.saturating_add(page.size).min(ordered.len());
+        let analyzable_servers: Vec<AnalyzableServerSummary> = ordered[start..end]
+            .iter()
+            .map(|(_, summary)| summary.clone())
+            .collect();
+        // The cursor the next page resumes from, or none once this page ended the list.
+        let next_token = ordered.get(end).map(|(id, _)| {
+            Cursor {
+                order,
+                resume_at: (*id).to_string(),
+            }
+            .to_token()
+        });
+
+        Ok(ListAnalyzableServersOutput {
+            analyzable_servers: Some(analyzable_servers),
+            next_token,
+        })
     }
 }
