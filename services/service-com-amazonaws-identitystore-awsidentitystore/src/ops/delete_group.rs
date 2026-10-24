@@ -15,11 +15,11 @@
 //! behaviour its own issue and units fixed, so the two are deliberately left as their
 //! own recordings describe them.
 //!
-//! Idempotence covers the group, NOT the identity store it is addressed to: a store
-//! that does not exist is not a post-condition this call can already satisfy — the
-//! caller addressed a deployment that is not there — so it is refused with the
-//! modelled `ResourceNotFoundException`, exactly as every other operation of this
-//! service refuses one.
+//! Idempotence covers the group, NOT the identifier the call is addressed to: an
+//! `IdentityStoreId` naming no store this emulator serves (another account's) is refused
+//! with the modelled `ResourceNotFoundException`, exactly as every other operation of
+//! this service refuses one. A well-formed id of this account names the caller's own
+//! store, which holds no such group either — an empty 200, as idempotence promises.
 //!
 //! `Revision`, when the caller sends one, is an optimistic-concurrency precondition on
 //! a group that IS still there: a value that is not the group's current revision is
@@ -183,13 +183,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
-        // The store is RESOLVED, never vivified: naming an identity store does not bring
-        // one into being, and one that names no store is refused rather than answered.
-        // `@idempotent` makes a GROUP that is already gone a success (below); it says
-        // nothing about a store that was never there.
-        let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(DeleteGroupErrorModeled::ResourceNotFoundException)?;
+        // The store is RESOLVED but never REGISTERED: a delete stores nothing. An
+        // identifier naming no store this emulator serves is refused; a store it holds no
+        // record of holds no such group either, which `@idempotent` owes the same empty
+        // success it owes for a group that is already gone (below).
+        let Some(store) = state
+            .resolve_recorded_store_mut(&input.identity_store_id)
+            .map_err(DeleteGroupErrorModeled::ResourceNotFoundException)?
+        else {
+            return Ok(DeleteGroupOutput {});
+        };
         // Both the bare id and the resource's ARN name the same group.
         let group_key = crate::state::resource_key(&input.group_id);
 

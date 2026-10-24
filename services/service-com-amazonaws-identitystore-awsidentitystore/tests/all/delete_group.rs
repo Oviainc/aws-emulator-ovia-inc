@@ -315,32 +315,32 @@ async fn deleting_a_group_that_was_never_created_is_a_success_that_removes_nothi
     }
 }
 
-/// Idempotence covers the GROUP, not the identity store: a delete addressed to a store
-/// that does not exist is refused with the modelled 404 — the same refusal every other
-/// operation of this service answers one with — and brings no store into being.
+/// Idempotence covers the GROUP, not the identifier the call is addressed to: a delete
+/// addressed to a store of ANOTHER account is refused with the modelled 404 — the same
+/// refusal every other operation of this service answers one with — while a store of this
+/// account that holds no such group is the empty success idempotence promises.
 #[tokio::test]
-async fn deleting_a_group_in_an_identity_store_that_does_not_exist_is_refused() {
-    // Rows differ along the form the unknown store id takes and whether the group id it
-    // names was ever minted, so the refusal is the STORE's and not the group's.
+async fn deleting_a_group_in_a_store_this_emulator_does_not_serve_is_refused() {
+    // Rows differ along the form the other account's store id takes and whether the group
+    // id it names was ever minted, so the refusal is the STORE's and not the group's.
     let router = emulator();
     let kept = create_group(&router, STORE, "engineering", "seed").await;
     let rows: [(&str, String, String); 3] = [
         (
-            "an unknown store and a group nothing created",
+            "another account's store and a group nothing created",
             MISSING_STORE.to_string(),
             UNMINTED_ID.to_string(),
         ),
         (
-            "an unknown store and a group that exists in the real one",
+            "another account's store and a group that exists in ours",
             MISSING_STORE.to_string(),
             kept.clone(),
         ),
         (
-            "an unknown store named by its ARN",
-            format!(
-                "arn:aws:identitystore::{}:identitystore/{MISSING_STORE}",
-                engine::emulator_account_id()
-            ),
+            "another account's store in UUID form",
+            "arn:aws:identitystore::210987654321:identitystore/\
+             a1b2c3d4-5678-90ab-cdef-111122223333"
+                .to_string(),
             kept.clone(),
         ),
     ];
@@ -371,6 +371,41 @@ async fn deleting_a_group_in_an_identity_store_that_does_not_exist_is_refused() 
             case,
         )
         .await;
+    }
+
+    // A store of THIS account that holds no such group is served, and `@idempotent`
+    // makes that delete the empty success: the post-condition already holds. It writes no
+    // group either — the store still lists none.
+    for (case, store) in [
+        ("a store nothing has written to", "d-0e0f000102".to_string()),
+        (
+            "that store by ARN",
+            format!(
+                "arn:aws:identitystore::{}:identitystore/d-0e0f000102",
+                engine::emulator_account_id()
+            ),
+        ),
+    ] {
+        delete_group(
+            &router,
+            json!({ "IdentityStoreId": store.clone(), "GroupId": kept.clone() }),
+            case,
+        )
+        .await;
+        let listed = ok(
+            &router,
+            "ListGroups",
+            json!({ "IdentityStoreId": store }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            listed["Groups"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: expected the delete to leave that store empty, got {listed}"
+        );
+        // And the group it named is still in the store that does hold it.
+        assert_described(&router, STORE, &kept, "engineering", CREATED_REVISION, case).await;
     }
 }
 

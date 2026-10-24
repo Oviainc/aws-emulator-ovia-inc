@@ -29,6 +29,8 @@ mod distribution_tags;
 mod distribution_tenant_lifecycle;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/function_lifecycle.rs"]
+mod function_lifecycle;
 #[path = "all/invalidation_list.rs"]
 mod invalidation_list;
 #[path = "all/key_value_store_lifecycle.rs"]

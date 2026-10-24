@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_identitystore_awsidentitystore as identitystore;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, ok, string, STORE};
+use crate::harness::{call, emulator, ok, string, MISSING_STORE, STORE};
 use crate::identity_store_lifecycle::{create_group, create_user};
 
 /// A `ResourceId` the modelled pattern admits but that no create ever minted.
@@ -424,13 +424,14 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             vec![UNKNOWN_ID.to_string()],
         ),
         (
-            // The STORE is what is missing here, so the refusal names that class: a
-            // store that does not exist holds no group to report as missing.
-            "a group id in a store that does not exist",
+            // The identifier names a store of another account, which is no store this
+            // emulator serves, so the refusal names THAT class: there is no store to
+            // look a group up in.
+            "a group id under another account's store",
             "DescribeGroup",
-            json!({ "IdentityStoreId": "d-0000000000", "GroupId": OTHER_UNKNOWN_ID }),
+            json!({ "IdentityStoreId": MISSING_STORE, "GroupId": OTHER_UNKNOWN_ID }),
             "Identity store not found",
-            vec!["d-0000000000".to_string()],
+            vec![OTHER_UNKNOWN_ID.to_string()],
         ),
         (
             "a group named by its ARN",
@@ -542,11 +543,11 @@ async fn a_resource_that_is_not_there_is_reported_with_its_classs_fixed_message(
             vec![UNKNOWN_ID.to_string(), group.clone()],
         ),
         (
-            "an identity store nothing ever created",
+            "an identity store of another account",
             "ListUsers",
-            json!({ "IdentityStoreId": "d-0000000000" }),
+            json!({ "IdentityStoreId": MISSING_STORE }),
             "Identity store not found",
-            vec!["d-0000000000".to_string()],
+            vec!["d-9999999999".to_string()],
         ),
         (
             // Named through `MemberId` on a listing too: one member end, one constant,

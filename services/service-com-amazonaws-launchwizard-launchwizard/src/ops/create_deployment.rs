@@ -186,17 +186,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if !workload
-            .patterns
-            .contains_key(&input.deployment_pattern_name)
-        {
+        let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
             return Err(CreateDeploymentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
-        }
+        };
+        // The versions this deployment deploys are the catalogue's for the pattern it
+        // is created against: `CreateDeployment` models no version members, so the
+        // record names the version it was resolved against rather than nothing, and
+        // `UpdateDeployment` is what moves it to another one. Cloned here so the
+        // catalogue borrow ends before the store is written to below.
+        let workload_version_name = pattern.workload_version_name.clone();
+        let pattern_version_name = pattern.pattern_version_name.clone();
 
         // A deployment name identifies the deployment to a caller, so it cannot be
         // reused while a deployment still holds it.
@@ -309,6 +313,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_group: None,
             deployment_arn,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            workload_version_name,
+            pattern_version_name,
             created_at: now,
             modified_at: now,
             deleted_at: None,

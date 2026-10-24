@@ -3,26 +3,28 @@
 //! Four rules about addressing an identity store and changing what it holds, driven
 //! end to end over HTTP through [`crate::harness`]:
 //!
-//! 1. every operation RESOLVES the `IdentityStoreId` it is given against the stores
-//!    that exist, and one that names none is refused with the modelled 404
-//!    `ResourceNotFoundException` having written nothing;
+//! 1. every operation RESOLVES the `IdentityStoreId` it is given as the store the
+//!    CALLER names — any value the modelled pattern admits is served, holding whatever
+//!    has been written to it — and only an identifier naming a store of another account
+//!    is refused, with the modelled 404 `ResourceNotFoundException` having written
+//!    nothing;
 //! 2. a user this API creates reports a `UserStatus`, and it is `ENABLED`;
 //! 3. a resource created or updated through the API records the CALLING principal, so
-//!    a describe reports `CreatedBy` and, after a change, `UpdatedBy`;
+//!    a describe reports `CreatedBy` and `UpdatedBy` — the latter naming the principal
+//!    of the LAST write, which is the create until something changes the resource;
 //! 4. an update refuses an `AttributePath` the service does not let it change — the
 //!    resource's own identifiers and service-generated values among them — with the
 //!    modelled 400 `ValidationException`, leaving the resource exactly as it was.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over: the
-//! form of the store id, which operation is addressed, which attribute path is
-//! requested and what kind of value it carries. The issue's `d-9999999999` / `userId`
-//! case is one row of each.
+//! form of the store id and what it addresses, which operation is addressed, which
+//! attribute path is requested and what kind of value it carries.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, emulator, error_message, ok, ok_as, refused, refused_as, string, STORE,
+    call, emulator, error_message, ok, ok_as, refused, refused_as, string, MISSING_STORE, STORE,
 };
 
 /// The emulator's account id, for the ARN forms the modelled `IdentityStoreId` pattern
@@ -97,17 +99,35 @@ async fn describe_group(router: &MultiServiceRouter, group_id: &str, case: &str)
     .await
 }
 
-/// Rule 1: an `IdentityStoreId` that names no identity store is refused, by every
-/// operation that takes one, and nothing is written.
+/// What a row's `IdentityStoreId` addresses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Addressed {
+    /// The store this suite's seed resources live in, in one of the forms that name it.
+    SeedStore,
+    /// Another store of THIS account: one this emulator serves, holding nothing until
+    /// something is written to it.
+    OtherStoreOfThisAccount,
+    /// A store owned by ANOTHER account — not a store this emulator serves at all.
+    AnotherAccountsStore,
+}
+
+/// Rule 1: every operation resolves the `IdentityStoreId` it is given as the store the
+/// CALLER names — any value the modelled pattern admits names a store this emulator
+/// serves, holding whatever has been written to it — and only an identifier that names a
+/// store of another account is refused, with the modelled 404
+/// `ResourceNotFoundException` naming `IDENTITY_STORE`.
 ///
-/// Rows are the forms a well-formed-but-unknown id takes — the two shapes the modelled
-/// pattern admits (`d-` + 10 hex, a UUID) and each of those as the store's ARN — plus
-/// the EXISTING store in both its id and its ARN form, which must still be served.
+/// Rows span the forms the modelled pattern admits (`smithy_query(query="shape",
+/// shape="IdentityStoreId")`: `d-` + 10 hex or a UUID, each optionally written as
+/// `arn:aws…:identitystore::<account>:identitystore/<id>`) across the three things an
+/// identifier can address ([`Addressed`]). The seeded store is two of those rows, not a
+/// privileged case.
 #[tokio::test]
-async fn an_identity_store_that_does_not_exist_is_refused_by_every_operation() {
+async fn every_well_formed_identity_store_id_is_served_and_only_another_accounts_is_not() {
     let router = emulator();
-    // A user and a group in the real store, so a row addressed to a store that does not
-    // exist is refused for the STORE's sake and not because the resource is unknown.
+    // A user and a group in the seeded store, so a row addressed elsewhere is answered
+    // for the right reason: the STORE when it is another account's, and the RESOURCE
+    // when the store is served but does not hold it.
     let user = create_user(&router, "AKIDGATE", "gate-user", "seed").await;
     let group = create_group(&router, "AKIDGATE", "gate-group", "seed").await;
     ok(
@@ -122,30 +142,69 @@ async fn an_identity_store_that_does_not_exist_is_refused_by_every_operation() {
     )
     .await;
 
-    let store_arn = format!("arn:aws:identitystore::{}:identitystore/{STORE}", account_id());
-    let unknown_uuid = "11111111-2222-3333-4444-555555555555";
-    let rows: [(&str, String, bool); 7] = [
-        ("the id the issue reports", "d-9999999999".to_string(), false),
-        ("another unknown d- id", "d-00000000ff".to_string(), false),
-        ("an unknown id in UUID form", unknown_uuid.to_string(), false),
+    let other_uuid = "11111111-2222-3333-4444-555555555555";
+    // (case, the IdentityStoreId as written, the id the store reports for it, what it
+    // addresses)
+    let rows: [(&str, String, &str, Addressed); 8] = [
         (
-            "an unknown id in ARN form",
-            format!("arn:aws:identitystore::{}:identitystore/d-9999999999", account_id()),
-            false,
+            "the seeded store",
+            STORE.to_string(),
+            STORE,
+            Addressed::SeedStore,
         ),
         (
-            // The modelled `IdentityStoreId` pattern admits any 12-digit account, and an
-            // ARN carries the store's OWNER: this one names a store of another account,
-            // which is not a store this emulator holds however its id ends.
-            "this store's id under another account",
+            "the seeded store by ARN",
+            format!("arn:aws:identitystore::{}:identitystore/{STORE}", account_id()),
+            STORE,
+            Addressed::SeedStore,
+        ),
+        (
+            // The id the recording this issue was filed from uses: a store the client
+            // read out of its own environment, which is not the seeded value.
+            "a recorded client's own store",
+            "d-a2ede64c82".to_string(),
+            "d-a2ede64c82",
+            Addressed::OtherStoreOfThisAccount,
+        ),
+        (
+            "another d- id nothing has written to",
+            "d-00000000ff".to_string(),
+            "d-00000000ff",
+            Addressed::OtherStoreOfThisAccount,
+        ),
+        (
+            "an id in UUID form",
+            other_uuid.to_string(),
+            other_uuid,
+            Addressed::OtherStoreOfThisAccount,
+        ),
+        (
+            "an id in UUID form, by ARN",
+            format!(
+                "arn:aws:identitystore::{}:identitystore/{other_uuid}",
+                account_id()
+            ),
+            other_uuid,
+            Addressed::OtherStoreOfThisAccount,
+        ),
+        (
+            // The modelled pattern admits any 12-digit account, and an ARN carries the
+            // store's OWNER: this names the SEEDED id under another account, which is a
+            // different store and not one this emulator serves.
+            "the seeded id under another account",
             format!("arn:aws:identitystore::210987654321:identitystore/{STORE}"),
-            false,
+            STORE,
+            Addressed::AnotherAccountsStore,
         ),
-        ("the store that exists", STORE.to_string(), true),
-        ("the store that exists, by ARN", store_arn, true),
+        (
+            "another account's own store",
+            MISSING_STORE.to_string(),
+            "d-9999999999",
+            Addressed::AnotherAccountsStore,
+        ),
     ];
 
-    for (case, identity_store_id, exists) in rows {
+    for (case, identity_store_id, reported_id, addressed) in rows {
         // The modelled `UserName` / `DisplayName` patterns admit no whitespace, so a
         // row's name is its case with the spaces hyphenated.
         let slug = case.replace(' ', "-");
@@ -204,81 +263,134 @@ async fn an_identity_store_that_does_not_exist_is_refused_by_every_operation() {
 
         for (operation, request) in requests {
             let case = format!("{case} / {operation}");
-            if exists {
-                // The store exists, so the call is answered on its own merits. Every
-                // operation here succeeds against it, EXCEPT the delete (it names a
-                // membership nothing created — its own 404) and the membership create
-                // on the second such row (the pair is already a member — its own 409).
-                let (status, code, body) = call(&router, operation, request).await;
-                let accepted: &[u16] = match operation {
-                    "DeleteGroupMembership" => &[404],
-                    "CreateGroupMembership" => &[200, 409],
-                    _ => &[200],
-                };
-                assert!(
-                    accepted.contains(&status),
-                    "case {case:?}: expected one of {accepted:?} against the store that \
-                     exists, got {status} {code} with {body}"
-                );
-                assert!(
-                    body["ResourceType"].as_str().unwrap_or_default() != "IDENTITY_STORE",
-                    "case {case:?}: expected the store to resolve, got {status} {code} \
-                     with {body}"
+            if addressed == Addressed::AnotherAccountsStore {
+                let body = refused(
+                    &router,
+                    operation,
+                    request,
+                    404,
+                    "ResourceNotFoundException",
+                    &case,
+                )
+                .await;
+                assert_eq!(
+                    body["ResourceType"].as_str().unwrap_or_default(),
+                    "IDENTITY_STORE",
+                    "case {case:?}: expected the identity store to be the missing \
+                     resource, got {body}"
                 );
                 continue;
             }
-            let body = refused(
+
+            // The store is served, so the call is answered on its own merits: never with
+            // the store as the missing resource.
+            let (status, code, body) = call(&router, operation, request).await;
+            assert!(
+                body["ResourceType"].as_str().unwrap_or_default() != "IDENTITY_STORE",
+                "case {case:?}: expected the store to resolve, got {status} {code} \
+                 with {body}"
+            );
+            let accepted: &[u16] = match (operation, addressed) {
+                // A create is served by every store this emulator serves, and a
+                // `DisplayName`/`UserName` claim is scoped to one store, so no row
+                // collides with another.
+                ("CreateGroup" | "CreateUser", _) => &[200],
+                // The seed store holds the resources the other requests name: the
+                // membership create repeats a pair it already holds (409) and the delete
+                // names a membership nothing created (404).
+                ("DeleteGroupMembership", Addressed::SeedStore) => &[404],
+                ("CreateGroupMembership", Addressed::SeedStore) => &[200, 409],
+                (_, Addressed::SeedStore) => &[200],
+                // Any other store is served and holds none of those resources, so each
+                // request is answered by what IT names being absent.
+                _ => &[404],
+            };
+            assert!(
+                accepted.contains(&status),
+                "case {case:?}: expected one of {accepted:?} from a store that is served, \
+                 got {status} {code} with {body}"
+            );
+        }
+
+        if addressed == Addressed::AnotherAccountsStore {
+            // Nothing was written: the refused creates left no store behind, so a repeat
+            // is refused exactly as the first attempt was.
+            let case = format!("{case} / nothing stored");
+            refused(
                 &router,
-                operation,
-                request,
+                "CreateGroup",
+                json!({ "IdentityStoreId": identity_store_id, "DisplayName": format!("g-{slug}") }),
                 404,
                 "ResourceNotFoundException",
                 &case,
             )
             .await;
-            assert_eq!(
-                body["ResourceType"].as_str().unwrap_or_default(),
-                "IDENTITY_STORE",
-                "case {case:?}: expected the identity store to be the missing resource, got {body}"
-            );
-        }
-
-        if exists {
             continue;
         }
 
-        // Nothing was written: the refused creates left no store behind, so a repeat is
-        // refused exactly as the first attempt was, and no later read of that store
-        // succeeds either.
-        let case = format!("{case} / nothing stored");
-        refused(
+        // What the creates above stored is readable back through the store the request
+        // named, which reports that store's own id — the bare id, for either form that
+        // names it — and the group is listed by it and by nothing else.
+        let case = format!("{case} / round trip");
+        let listed = ok(
             &router,
-            "CreateGroup",
-            json!({ "IdentityStoreId": identity_store_id, "DisplayName": format!("g-{slug}") }),
-            404,
-            "ResourceNotFoundException",
+            "ListGroups",
+            json!({ "IdentityStoreId": identity_store_id }),
             &case,
         )
         .await;
+        let names: Vec<String> = listed["Groups"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|group| group["DisplayName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            names.contains(&format!("g-{slug}")),
+            "case {case:?}: expected the group created in that store to be listed, got {names:?}"
+        );
+        for group in listed["Groups"].as_array().unwrap_or(&Vec::new()) {
+            assert_eq!(
+                group["IdentityStoreId"].as_str().unwrap_or_default(),
+                reported_id,
+                "case {case:?}: expected every listed group to report store \
+                 {reported_id:?}, got {group}"
+            );
+        }
     }
 
-    // And the names the refused creates claimed are still free in the store that does
-    // exist, so nothing leaked into it.
-    for case in [
-        "the id the issue reports",
-        "another unknown d- id",
-        "an unknown id in UUID form",
-        "this store's id under another account",
+    // The stores are ISOLATED: the seeded store lists only the group created in it, so a
+    // create addressed to another store never landed there.
+    let case = "stores are isolated";
+    let seeded = ok(
+        &router,
+        "ListGroups",
+        json!({ "IdentityStoreId": STORE }),
+        case,
+    )
+    .await;
+    let seeded_names: Vec<String> = seeded["Groups"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|group| group["DisplayName"].as_str().unwrap_or_default().to_string())
+        .collect();
+    for leaked in [
+        "g-a-recorded-client's-own-store",
+        "g-another-d--id-nothing-has-written-to",
+        "g-an-id-in-UUID-form",
     ] {
-        let slug = case.replace(' ', "-");
-        create_group(&router, "AKIDGATE", &format!("g-{slug}"), "names still free").await;
-        create_user(&router, "AKIDGATE", &format!("u-{slug}"), "names still free").await;
+        assert!(
+            !seeded_names.contains(&leaked.to_string()),
+            "case {case:?}: expected {leaked:?} to stay in its own store, got {seeded_names:?}"
+        );
     }
 }
 
 /// Rules 2 and 3: a created user reports `UserStatus` `ENABLED`, and every resource
 /// created through the API records the principal that created it — a different one per
-/// caller — while `UpdatedBy` appears only once something has updated it.
+/// caller — while `UpdatedBy` names the principal of the LAST write, which is that same
+/// create until something updates the resource.
 ///
 /// Rows differ along which caller creates the resource and how much of a profile the
 /// create carried.
@@ -333,10 +445,11 @@ async fn a_created_resource_reports_its_status_and_the_principal_that_created_it
             "case {case:?}: expected CreatedBy to name the calling principal {akid}, \
              got {created_by:?}"
         );
-        assert!(
-            described.get("UpdatedBy").is_none_or(Value::is_null),
-            "case {case:?}: expected no UpdatedBy before anything updated the user, \
-             got {described}"
+        assert_eq!(
+            described.get("UpdatedBy").and_then(Value::as_str),
+            Some(created_by.as_str()),
+            "case {case:?}: expected UpdatedBy to report the create as the last write of \
+             the user, got {described}"
         );
         by_caller.push(((*akid).to_string(), created_by));
 

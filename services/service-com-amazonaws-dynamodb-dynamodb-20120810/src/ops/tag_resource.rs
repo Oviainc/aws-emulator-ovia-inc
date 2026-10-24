@@ -10,6 +10,10 @@
 //! [`crate::state::resolve_resource_arn`] and read and write the one tag set the
 //! table holds, so no two of them can disagree about what a resource carries.
 //!
+//! The write is ASYNCHRONOUS, as the doc below says: the merge lands on the resource
+//! at once, and the eventually consistent reader sees it one propagation span later
+//! (see [`crate::state::ResourceTags`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -224,11 +228,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Merging overwrites a key the table already carries and adds only the new
         // ones, so re-tagging an existing key can never push the set past the limit.
-        let would_hold = table.tag_count_after_merging(&incoming);
+        let would_hold = table.tags.count_after_merging(&incoming);
         if would_hold > crate::state::MAX_TAGS_PER_TABLE {
             return Err(too_many_tags(would_hold));
         }
-        table.merge_tags(incoming);
+        // The merge lands on the resource now and becomes VISIBLE to
+        // `ListTagsOfResource` one propagation span later: "TagResource is an
+        // asynchronous operation ... The application or removal of tags using
+        // TagResource and UntagResource APIs is eventually consistent" (this
+        // operation's own doc above).
+        table.tags.merge(incoming, now);
 
         Ok(TagResourceOutput)
     }

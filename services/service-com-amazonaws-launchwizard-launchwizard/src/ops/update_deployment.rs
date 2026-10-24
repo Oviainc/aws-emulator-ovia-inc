@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies new settings to a stored deployment in [`crate::state`] and reports the
+//! deployment summary read back out of the record. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDeployment"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDeploymentErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Launch Wizard state store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        // Clock-owed status steps first, so the status this update reads (and refuses
+        // on) is the one the clock has already produced.
+        store.materialize_due(now);
+
+        // The submitted settings, ordered, so a warning report over them is stable.
+        let specifications: ::std::collections::BTreeMap<String, String> =
+            input.specifications.into_iter().collect();
+
+        let Some(deployment) = store.deployments.get(&input.deployment_id) else {
+            // Fixed, identifier-free message: see `state::DEPLOYMENT_NOT_FOUND_MESSAGE`.
+            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::DEPLOYMENT_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // A deployment whose delete has started has no settings left to apply, so the
+        // update is refused rather than applied. `force` does not reach this: it
+        // overrides validation WARNINGS, not the state the resource is in.
+        if deployment.is_deleting_or_deleted() {
+            return Err(UpdateDeploymentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::DEPLOYMENT_NOT_UPDATABLE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let name = deployment.name.clone();
+        let workload_name = deployment.workload_name.clone();
+        let pattern_name = deployment.pattern_name.clone();
+
+        // The settings are judged against the specification schema of the pattern this
+        // deployment deploys, which is also where its versions come from.
+        let Some(pattern) = store
+            .workloads
+            .get(&workload_name)
+            .and_then(|workload| workload.patterns.get(&pattern_name))
+        else {
+            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // A version the caller names has to be one the catalogue holds for this
+        // deployment's workload and pattern: naming one it does not is a resource that
+        // cannot be found rather than a setting that is merely odd. Both messages are
+        // the fixed, identifier-free ones a catalogue lookup carries, so the version
+        // asked about is not reflected back.
+        if input
+            .workload_version_name
+            .as_ref()
+            .is_some_and(|requested| *requested != pattern.workload_version_name)
+        {
+            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        if input
+            .deployment_pattern_version_name
+            .as_ref()
+            .is_some_and(|requested| *requested != pattern.pattern_version_name)
+        {
+            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let warnings = crate::state::specification_warnings(pattern, &specifications);
+        // A version the caller did not name is the one the deployment already deploys,
+        // which is why the record carries it. Cloned out of the catalogue borrow so the
+        // store can be written to below.
+        let workload_version_name = input
+            .workload_version_name
+            .clone()
+            .unwrap_or_else(|| pattern.workload_version_name.clone());
+        let pattern_version_name = input
+            .deployment_pattern_version_name
+            .clone()
+            .unwrap_or_else(|| pattern.pattern_version_name.clone());
+
+        // `force` applies the update "even if validation warnings are present"; without
+        // it, those warnings are what the request is refused with.
+        if !warnings.is_empty() && !input.force {
+            return Err(UpdateDeploymentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::specification_warning_refusal(&warnings)),
+                },
+            )
+            .into());
+        }
+
+        // `dryRun` checks the request without making it: every check above has run and,
+        // by definition, NOTHING is persisted — so there is no updated deployment to
+        // report either, which is the answer `CreateDeployment` gives a dry run too.
+        if input.dry_run {
+            return Ok(UpdateDeploymentOutput { deployment: None });
+        }
+
+        let Some(deployment) = store.deployments.get_mut(&input.deployment_id) else {
+            return Err(UpdateDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::DEPLOYMENT_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // `specifications` is the settings the deployment now has rather than a patch
+        // over the ones it had: the member is required and carries the whole map, the
+        // way `CreateDeployment` stores it.
+        deployment.specifications = specifications;
+        deployment.workload_version_name = workload_version_name.clone();
+        deployment.pattern_version_name = pattern_version_name.clone();
+        // Applying settings is not instantaneous, and the model declares the pair of
+        // statuses an UPDATE moves a deployment through (`UPDATE_IN_PROGRESS` ->
+        // `UPDATE_COMPLETED`). The first is non-terminal, so reaching the second is owed
+        // by the CLOCK one `TRANSITION_SPAN` from here and a caller that reads straight
+        // back still sees the update under way. Any step the deployment still owed is
+        // replaced: these settings are what it is applying now.
+        deployment.status = crate::state::STATUS_UPDATE_IN_PROGRESS.to_string();
+        deployment.status_reason = None;
+        deployment.modified_at = now;
+        deployment.append_event(crate::state::DeploymentEvent::new(
+            "DeploymentUpdateInProgress",
+            format!(
+                "Deployment '{name}' is applying updated settings for workload version \
+                 '{workload_version_name}' and deployment pattern version \
+                 '{pattern_version_name}'."
+            ),
+            crate::state::EVENT_IN_PROGRESS,
+            now,
+        ));
+        let completed_at = now + crate::state::TRANSITION_SPAN;
+        deployment.pending = ::std::collections::VecDeque::from(vec![
+            crate::state::PendingTransition {
+                due_at: completed_at,
+                status: crate::state::STATUS_UPDATE_COMPLETED.to_string(),
+                event: crate::state::DeploymentEvent::new(
+                    "DeploymentUpdateCompleted",
+                    format!("Deployment '{name}' finished applying its updated settings."),
+                    crate::state::EVENT_COMPLETED,
+                    completed_at,
+                ),
+            },
+        ]);
+
+        // Every member comes from the stored record, which now holds the update.
+        Ok(UpdateDeploymentOutput {
+            deployment: Some(deployment.to_summary()),
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a create MINTS the function's identity (its ARN and the version token of
+//! its `DEVELOPMENT` stage) and PERSISTS the code, the configuration and the tags it was
+//! given in `crate::state`, so `DescribeFunction` and `GetFunction` answer from that one
+//! record rather than from the request being served. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +162,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // Every refusal below is decided BEFORE anything is minted or inserted, so a
+        // refused create leaves the store exactly as it was: no ARN, no version token and
+        // no name is spent on it.
+
+        // A tag set no resource can carry (one key named twice, or more tags than a
+        // resource may hold) is refused with "An argument is invalid" — the refusal this
+        // operation models for an unusable argument. The rule is the service's one
+        // tagging rule, shared with every tagged resource.
+        let tags = input
+            .tags
+            .as_ref()
+            .map(crate::state::tag_set)
+            .transpose()
+            .map_err(invalid_argument)?
+            .unwrap_or_default();
+
+        // "The function is too large": `FunctionBlob` admits more on the wire than
+        // CloudFront's published function-size quota allows, so code within the model but
+        // past that quota is refused with the modelled 413.
+        if input.function_code.len() > crate::state::MAX_FUNCTION_CODE_BYTES {
+            return Err(CreateFunctionErrorModeled::FunctionSizeLimitExceeded(
+                FunctionSizeLimitExceeded {
+                    message: Some(format!(
+                        "The function is too large: the code is {} bytes and at most {} bytes \
+                         are allowed per function",
+                        input.function_code.len(),
+                        crate::state::MAX_FUNCTION_CODE_BYTES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every CloudFront list travels in a wrapper stating its own length, and a
+        // configuration whose `Quantity` disagrees with its `Items` describes no function
+        // at all. `CreateFunction` models no `InconsistentQuantities`, so the refusal is
+        // reported as the `InvalidArgument` it does model.
+        if let Some(message) =
+            crate::state::function_config_quantity_mismatch(&input.function_config)
+        {
+            return Err(invalid_argument(message).into());
+        }
+
+        let associations = input
+            .function_config
+            .key_value_store_associations
+            .as_ref()
+            .map_or(&[][..], |associations| {
+                associations.items.as_deref().unwrap_or_default()
+            });
+        if associations.len() > crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS {
+            return Err(invalid_argument(format!(
+                "the configuration associates {} key value stores with the function but at \
+                 most {} may be associated",
+                associations.len(),
+                crate::state::MAX_KEY_VALUE_STORE_ASSOCIATIONS
+            ))
+            .into());
+        }
+        // An association names a key value store by the ARN that store's own create
+        // minted, so a function can only be associated with a store this service HOLDS:
+        // the check is against the stored ARN, never against the request alone.
+        for association in associations {
+            if store
+                .key_value_store_by_arn(&association.key_value_store_arn)
+                .is_none()
+            {
+                return Err(invalid_argument(format!(
+                    "the key value store {} does not exist",
+                    association.key_value_store_arn
+                ))
+                .into());
+            }
+        }
+
+        // "A function with the same name already exists in this Amazon Web Services
+        // account. To create a function, you must provide a unique name": a name
+        // identifies ONE function for its whole life, so a name the store already holds
+        // cannot name a second one.
+        if store.functions.contains_key(&input.name) {
+            return Err(CreateFunctionErrorModeled::FunctionAlreadyExists(
+                crate::state::function_already_exists(&input.name),
+            )
+            .into());
+        }
+
+        // "You have reached the maximum number of CloudFront functions for this Amazon
+        // Web Services account." A function record is what a later read answers from, so
+        // it cannot be evicted: the account quota is an entry count refused before the
+        // insert.
+        if store.functions.len() >= crate::state::MAX_FUNCTIONS {
+            return Err(CreateFunctionErrorModeled::TooManyFunctions(
+                TooManyFunctions {
+                    message: Some(format!(
+                        "You have reached the maximum number of CloudFront functions for this \
+                         Amazon Web Services account: at most {} are allowed",
+                        crate::state::MAX_FUNCTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let etag = store.next_etag();
+        let stored = crate::state::StoredFunction {
+            arn: crate::state::function_arn(&input.name),
+            name: input.name.clone(),
+            // "When you create a function, it's in the DEVELOPMENT stage", and it has not
+            // been published to LIVE, which is what its status reports.
+            development: crate::state::StoredFunctionStage {
+                stage: crate::state::FUNCTION_STAGE_DEVELOPMENT.to_string(),
+                config: input.function_config,
+                code: input.function_code,
+                status: crate::state::FUNCTION_STATUS_UNPUBLISHED.to_string(),
+                etag: etag.clone(),
+                created_time: now,
+                last_modified_time: now,
+            },
+            // The LIVE stage exists only once `PublishFunction` has copied the
+            // DEVELOPMENT stage into it.
+            live: None,
+            // Held as the one tag representation every tagged resource uses: a later read
+            // answers from this record, never from the request that is being served.
+            tags,
+        };
+        let function_summary = stored.development.to_summary(&stored.name, &stored.arn);
+        let location = crate::state::location_uri(&crate::state::function_path(&stored.name));
+        store.functions.insert(input.name, stored);
+
+        Ok(CreateFunctionOutput {
+            // "Contains configuration information and metadata about a CloudFront
+            // function" — the projection of the record that was just stored.
+            function_summary: Some(function_summary),
+            // "The URL of the CloudFront function. Use the URL to manage the function
+            // with the CloudFront API."
+            location: Some(location),
+            // "The version identifier for the current version of the CloudFront function"
+            // — the token an `If-Match` against its DEVELOPMENT stage is checked against.
+            e_tag: Some(etag),
+        })
     }
+}
+
+/// The modelled `InvalidArgument` ("An argument is invalid") for a request this operation
+/// refuses, carrying `reason`.
+///
+/// One constructor rather than the shape at each use site: every refusal below that is
+/// not a name conflict, a size or a count is the same error with a different reason, and
+/// the sentence a client reads names the error it was given.
+fn invalid_argument(reason: impl ::std::fmt::Display) -> CreateFunctionErrorModeled {
+    CreateFunctionErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    })
 }

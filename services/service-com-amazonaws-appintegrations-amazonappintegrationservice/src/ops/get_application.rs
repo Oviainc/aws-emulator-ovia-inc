@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the application `CreateApplication` persisted, read back from this
+//! service's store by the application the request's `ArnOrUUID` identifier names —
+//! either the full ARN this service minted or the bare `UUID`. Nothing is written: a
+//! read cannot change what a later caller sees.
+//!
+//! An identifier no application carries is refused with
+//! `ResourceNotFoundException` (HTTP 404), worded by
+//! [`crate::state::application_not_found`] like every other 404 of this service.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +178,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApplication"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetApplicationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        let record = state
+            .application_id(&input.arn)
+            .and_then(|id| state.applications.get(&id))
+            .ok_or_else(|| {
+                GetApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(&input.arn)),
+                })
+            })?;
+
+        Ok(GetApplicationOutput {
+            arn: Some(record.arn.clone()),
+            id: Some(record.id.clone()),
+            name: Some(record.name.clone()),
+            namespace: Some(record.namespace.clone()),
+            description: record.description.clone(),
+            application_source_config: Some(record.application_source_config.clone()),
+            subscriptions: record.subscriptions.clone(),
+            publications: record.publications.clone(),
+            created_time: Some(::aws_smithy_types::DateTime::from(record.created_time)),
+            last_modified_time: Some(::aws_smithy_types::DateTime::from(
+                record.last_modified_time,
+            )),
+            tags: record.modeled_tags(),
+            permissions: record.permissions.clone(),
+            is_service: record.is_service,
+            initialization_timeout: record.initialization_timeout,
+            application_config: record.application_config.clone(),
+            iframe_config: record.iframe_config.clone(),
+            application_type: record.application_type.clone(),
+            auth_config: record.auth_config.clone(),
+        })
     }
 }

@@ -301,8 +301,9 @@ async fn a_member_this_identity_store_does_not_hold_is_reported_as_not_found() {
     let group = create_group(&router, STORE, "engineering", case).await;
     join(&router, STORE, &group, &member, case).await;
 
-    // Rows differ along WHY the member is not in the named store: no such id, and a
-    // store that does not exist at all — which is a different missing resource.
+    // Rows differ along WHY the member is not in the named store: no such id, and an
+    // identifier naming no store this emulator serves — which is a different missing
+    // resource.
     let rows = [
         (
             "an id no resource carries",
@@ -311,14 +312,14 @@ async fn a_member_this_identity_store_does_not_hold_is_reported_as_not_found() {
             "USER",
         ),
         (
-            "a store that does not exist",
+            "a store of another account",
             MISSING_STORE.to_string(),
             member.clone(),
             "IDENTITY_STORE",
         ),
         (
-            "another store that does not exist",
-            "d-0000000000".to_string(),
+            "another account's other store",
+            "arn:aws:identitystore::210987654321:identitystore/d-0000000000".to_string(),
             member.clone(),
             "IDENTITY_STORE",
         ),

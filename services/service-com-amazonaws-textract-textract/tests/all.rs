@@ -19,6 +19,8 @@ mod adapter_mutations;
 mod adapter_versions;
 #[path = "all/adapters.rs"]
 mod adapters;
+#[path = "all/block_geometry.rs"]
+mod block_geometry;
 #[path = "all/document_extraction.rs"]
 mod document_extraction;
 #[path = "all/expense_analysis.rs"]

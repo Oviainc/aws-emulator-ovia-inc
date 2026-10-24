@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePresignedMlflowAppUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePresignedMlflowAppUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a presigned MLflow UI URL for the app `crate::state` holds under
+//! the requested `MlflowAppArn`, and refuses an ARN no app was created under with HTTP
+//! 400 `ValidationException` and the fixed message [`APP_DOES_NOT_EXIST`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePresignedMlflowAppUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The URL's shape, the token mint and the refusal text live in THIS file: nothing else
+//! in the crate presigns an MLflow App, so they are this operation's own and sit beside
+//! the handler rather than in the shared state module.
+//!
+//! That refusal is deliberately NOT the modelled `ResourceNotFound`: the recorded AWS
+//! response for this operation on a missing MLflow App carries the error code
+//! `ValidationException` and that message (corpus unit
+//! `sagemaker.presigned-mlflow-app-url-not-found-for-missing-app`), and the recorded
+//! status, code and fixed text are what a client sees. `DescribeMlflowApp` keeps its own
+//! recorded refusal (`ResourceNotFound`, naming the ARN) — one operation's wire behaviour
+//! is no evidence about another's.
+//!
+//! The URL is built from the STORED app's own ARN — the opaque id that identifies it and
+//! the region that ARN names, both read by `service_common::arn`, the one ARN parse this
+//! workspace has, and each admitted only as a label an authority may carry — plus a
+//! freshly minted authorization token, so it addresses the app that exists rather than
+//! the string the request carried, and a repeated call yields a different URL because the
+//! token is single-use ([`authorized_url`]).
+//!
+//! The token is NOT constructed in this service: it comes from the emulator's credential
+//! store, the one component that generates secrets, and is removed from that store again
+//! so the emulator accepts no SigV4 credential it just handed out
+//! ([`mint_ui_auth_token`]).
+//!
+//! The only write on the app itself is the `Creating` -> `Created` transition the clock
+//! already owed ([`crate::state::MlflowApp::settle_status`]); minting the credential is
+//! the mutation this operation's own contract asks for ("Returns a presigned URL").
+//!
+//! `ExpiresInSeconds` and `SessionExpirationDurationInSeconds` are accepted and bounded
+//! by the model (range 5..300 and 1800..43200, refused before this handler runs), but
+//! nothing here serves the MLflow UI — so there is no session for a window to govern and
+//! no gatekeeper to expire the URL. Rendering either value into the answer would report
+//! an expiry nothing enforces, so neither is reflected: the response carries the one
+//! member the model declares.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +103,115 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The message SageMaker's `CreatePresignedMlflowAppUrl` refusal carries when the ARN
+/// names no MLflow App.
+///
+/// A FIXED text that repeats nothing from the request: the recorded AWS response for this
+/// operation on a missing app carries exactly this (corpus unit
+/// `sagemaker.presigned-mlflow-app-url-not-found-for-missing-app`), so it is a constant of
+/// the service's behaviour rather than a value derived from one call.
+pub const APP_DOES_NOT_EXIST: &str = "Resource does not exist";
+
+/// The domain SageMaker serves the managed MLflow UI on, as the `TrackingServerUrl` of
+/// an MLflow tracking server (`https://<server>.<region>.experiments.sagemaker.aws`)
+/// spells it. The MLflow App UI is the same managed UI, so its presigned URL is served
+/// under the same domain.
+const UI_DOMAIN: &str = "experiments.sagemaker.aws";
+
+/// The path a presigned MLflow URL authorizes against before the UI loads, and the query
+/// parameter the authorization token travels in.
+const UI_AUTH_PATH: &str = "/auth";
+const UI_AUTH_TOKEN_PARAM: &str = "authToken";
+
+/// The characters a percent-encoded query value keeps unescaped: RFC 3986's unreserved
+/// set (`ALPHA / DIGIT / "-" / "." / "_" / "~"`). Everything else is escaped, which is
+/// what a presigned URL's token needs — the minted alphabet includes `+` and `/`, neither
+/// of which may travel unescaped in a query value. The escaping itself is the
+/// `percent-encoding` crate's, not this file's.
+const QUERY_VALUE_ENCODE_SET: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// The longest DNS label a host name may carry (RFC 1035 §2.3.1), the cap the ARN id is
+/// held to before it becomes a host label.
+const MAX_HOST_LABEL: usize = 63;
+
+/// The resource TYPE an MLflow App's ARN carries, i.e. the `<kind>` in
+/// `arn:aws:sagemaker:<region>:<account>:<kind>/<id>` — the token `MlflowAppArn`'s
+/// modelled pattern spells (`…:[0-9]{12}:mlflow-app/`) and the one `CreateMlflowApp`
+/// mints an app's ARN with.
+const APP_KIND: &str = "mlflow-app";
+
+/// The presigned MLflow UI URL for the app `app_arn`, carrying `auth_token`:
+/// `https://<app id>.<app region>.experiments.sagemaker.aws/auth?authToken=<token>`.
+///
+/// Both host labels come from the app's OWN ARN — the opaque id that identifies it and
+/// the region that ARN names — and never from the app's name or from the request: two
+/// apps may carry one name (the model documents that the name is not part of the ARN, and
+/// nothing refuses a name already in use), so a name-keyed host would address two apps at
+/// once.
+///
+/// The ARN's fields are read by `service_common::arn`, the ONE ARN parse this workspace
+/// has, so nothing here splits an ARN again: `resource_id_of_type` reads the id out of the
+/// `<kind>/<id>` resource field of a `mlflow-app` ARN, and `region_of` reports the Region
+/// field only when it is a Region LABEL — the check a value destined for an authority
+/// needs, which is exactly why the region is not re-checked here. The id is held to the
+/// crate's one DNS-label grammar ([`crate::state::is_dns_label`]) at the cap a host label
+/// admits.
+///
+/// `None` when the value names no `mlflow-app` of this service, when its Region field is
+/// not a Region label, or when its id is not a label a host name may carry — so no value
+/// that is not a DNS label is ever spliced into an authority and no URL names a region the
+/// app is not in. Every ARN this service mints satisfies all three, which is why the caller
+/// answers `None` as "this emulator did not serve it" rather than as a client error.
+///
+/// The token is percent-encoded with [`QUERY_VALUE_ENCODE_SET`]. The result stays inside
+/// `MlflowAppUrl`'s modelled `len 0..2048` — the host is a 32-character id plus a Region
+/// label `service_common::arn` caps at 20 characters, and the escaped token is the
+/// credential store's session token percent-escaped.
+fn authorized_url(app_arn: &str, auth_token: &str) -> Option<String> {
+    let id = ::service_common::arn::resource_id_of_type(app_arn, APP_KIND)?;
+    let region = ::service_common::arn::region_of(app_arn, crate::state::ARN_SERVICE)?;
+    if !crate::state::is_dns_label(id, MAX_HOST_LABEL) {
+        return None;
+    }
+    let token = ::percent_encoding::utf8_percent_encode(auth_token, QUERY_VALUE_ENCODE_SET);
+    Some(format!(
+        "https://{id}.{region}.{UI_DOMAIN}{UI_AUTH_PATH}?{UI_AUTH_TOKEN_PARAM}={token}"
+    ))
+}
+
+/// A fresh authorization token for a presigned MLflow URL.
+///
+/// The token authorizes against the MLflow UI, NOT against this emulator, so it must
+/// never be accepted as a SigV4 credential — but it is still a secret handed to a caller,
+/// and nothing in a service may construct a secret itself. It is therefore minted by the
+/// one component that generates secrets, the emulator's credential store, and removed
+/// from that store again: the caller gets the secret, the emulator keeps no credential it
+/// would accept, and nothing accumulates per call. (`crate::state::mint_grant_token` is
+/// the other thing a presign may need — the ID of a grant this emulator stores, which is
+/// no secret; this one is the secret itself.)
+///
+/// `None` when the store minted no session-token secret, or when the minted credential
+/// could not be removed from the store again, which leaves the operation to refuse rather
+/// than report a URL carrying a token it made up or one the emulator would still accept.
+fn mint_ui_auth_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The token is not a credential of this emulator; see above. A removal that did NOT
+    // take effect leaves resident a credential this emulator's SigV4 path would accept,
+    // so it counts as a failed mint and no token is handed out — the invariant is
+    // enforced, not merely intended. (`CredentialStore::delete` answers `NotFound` for an
+    // id the store does not hold, which for an id it has just minted means the credential
+    // is not where this function put it.)
+    store.delete(&minted.id).ok()?;
+    token
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +281,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePresignedMlflowAppUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePresignedMlflowAppUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePresignedMlflowAppUrl"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        // A URL is minted for the app the STORE holds, so an ARN no app was created under
+        // has nothing to presign. The refusal is a 400 `ValidationException` carrying the
+        // fixed text [`APP_DOES_NOT_EXIST`], NOT the modelled `ResourceNotFound`: that
+        // status, code and message are what the recorded AWS response for this operation
+        // on a missing MLflow App carry (corpus unit
+        // `sagemaker.presigned-mlflow-app-url-not-found-for-missing-app`). The text
+        // repeats nothing from the request, so the refusal is identical for every ARN
+        // that matches no app.
+        let Some(app) = store.mlflow_apps.get_mut(&input.arn) else {
+            return Err(crate::scaffolded::Scaffolded::validation(APP_DOES_NOT_EXIST));
+        };
+        // The transition the clock already owed, materialised the way the rest of this
+        // slice materialises it, so the app this URL addresses is not left behind in a
+        // status that fell due before the call.
+        app.settle_status(::std::time::SystemTime::now());
+        // The URL is derived from the STORED ARN rather than from `input.arn`, so it
+        // names the app that exists.
+        let arn = app.arn.clone();
+
+        // Nothing in a service constructs a secret itself; see the helper's docs. The
+        // store's guard is still held, so the app cannot be released between the check
+        // above and the credential this call hands out for it. No secret minted, or an
+        // ARN whose labels a host name cannot carry, leaves nothing to report and this
+        // operation will not invent either; it models no server fault, so the honest
+        // answer is "this emulator did not serve it" (the channel `CreateCliToken`
+        // answers its own mint failure on).
+        let url = mint_ui_auth_token(ctx.credential_store())
+            .and_then(|auth_token| authorized_url(&arn, &auth_token));
+        drop(store);
+        let Some(authorized_url) = url else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // Minting a credential changed state, so the call leaves the audit record a
+        // create leaves — the operation, the app's ARN and the access key id the request
+        // presented, never the token.
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePresignedMlflowAppUrlOutput {
+            authorized_url: Some(authorized_url),
+        })
     }
 }

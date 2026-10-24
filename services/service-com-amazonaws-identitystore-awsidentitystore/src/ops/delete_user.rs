@@ -173,12 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
-        // The identity store must EXIST: a delete addressed to one that does not is
-        // refused rather than answered as a no-op success, and naming a store never
-        // brings one into being.
+        // The store is RESOLVED but never REGISTERED: a delete stores nothing, so a
+        // store this emulator holds no record of holds no such user either and the USER
+        // is what is missing. Only an identifier naming no store this emulator serves is
+        // refused for the store's own sake.
         let store = state
-            .resolve_store_mut(&input.identity_store_id)
-            .map_err(DeleteUserErrorModeled::ResourceNotFoundException)?;
+            .resolve_recorded_store_mut(&input.identity_store_id)
+            .map_err(DeleteUserErrorModeled::ResourceNotFoundException)?
+            .ok_or_else(not_found)?;
         // Both the bare id and the resource's ARN name the same user.
         let user_key = crate::state::resource_key(&input.user_id);
         // `Revision` is the caller's EXPECTED current revision: "the user is deleted
