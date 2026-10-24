@@ -23,3 +23,5 @@ mod hosted_zone_records;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_associations.rs"]
+mod vpc_associations;

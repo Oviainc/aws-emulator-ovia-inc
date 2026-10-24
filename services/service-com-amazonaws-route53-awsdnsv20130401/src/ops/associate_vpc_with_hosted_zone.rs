@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateVPCWithHostedZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateVPCWithHostedZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateVPCWithHostedZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates an Amazon VPC with a PRIVATE hosted zone: the association list this
+//! operation appends to is the one `GetHostedZone` reports, and the one a private
+//! zone's first association (made by `CreateHostedZone`) starts.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +102,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    no_such_hosted_zone, normalize_zone_id, vpc_id_is_well_formed, vpc_region_is_modelled,
+    MAX_VPCS_PER_HOSTED_ZONE,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -181,20 +180,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateVPCWithHostedZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateVPCWithHostedZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateVPCWithHostedZone"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            AssociateVPCWithHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // An association names ONE VPC, and a VPC is named by its id together
+        // with the region it was created in: `VPC$VPCId` is what identifies it,
+        // and `VPC$VPCRegion` is "(Private hosted zones only) The region that an
+        // Amazon VPC was created in". Neither member is modelled as required
+        // (the `VPC` container is shared with the operations that merely report
+        // one), so the handler is what refuses a request naming no VPC at all.
+        let vpc_id = input.vpc.vpc_id.as_deref().unwrap_or_default().trim();
+        let vpc_region = input.vpc.vpc_region.as_deref().unwrap_or_default().trim();
+        if !vpc_id_is_well_formed(vpc_id) {
+            return Err(AssociateVPCWithHostedZoneErrorModeled::InvalidVPCId(InvalidVPCId {
+                message: Some(format!(
+                    "Invalid VPC ID: {vpc_id:?} is not a valid Amazon VPC ID"
+                )),
+            })
+            .into());
+        }
+        if !vpc_region_is_modelled(vpc_region) {
+            return Err(AssociateVPCWithHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                message: Some(format!(
+                    "Invalid request: VPC.VPCRegion {vpc_region:?} is not a region an Amazon VPC \
+                     can be created in"
+                )),
+            })
+            .into());
+        }
+
+        // The caller may pass the bare id or the `/hostedzone/`-prefixed `Id` a
+        // HostedZone handed it back; both name the same zone.
+        let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+        let mut store = state.lock();
+
+        let zone = store.zones.get(&zone_id).ok_or_else(|| {
+            AssociateVPCWithHostedZoneErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
+                &input.hosted_zone_id,
+            ))
+        })?;
+
+        // "You can't convert a public hosted zone into a private hosted zone":
+        // a VPC association belongs to a private zone only, and the model
+        // carries a refusal of its own for exactly this request.
+        if !zone.private_zone {
+            return Err(AssociateVPCWithHostedZoneErrorModeled::PublicZoneVPCAssociation(
+                PublicZoneVPCAssociation {
+                    message: Some(format!(
+                        "You're trying to associate a VPC with a public hosted zone: {} is a \
+                         public hosted zone, and Route 53 doesn't support associating a VPC \
+                         with a public hosted zone.",
+                        zone.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An association list is a SET keyed by VPC id, so associating a VPC the
+        // zone already carries leaves the zone as it was; the request is still
+        // accepted and still answers with a change, as every accepted request on
+        // this path does.
+        let already_associated = zone.vpc_position(vpc_id).is_some();
+        let association_count = zone.vpcs.len();
+        let zone_name = zone.name.clone();
+
+        if !already_associated {
+            if let Some(other) =
+                store.zone_with_name_associated_to_vpc(&zone_name, &zone_id, vpc_id)
+            {
+                return Err(AssociateVPCWithHostedZoneErrorModeled::ConflictingDomainExists(
+                    ConflictingDomainExists {
+                        message: Some(format!(
+                            "The VPC {vpc_id} is already associated with another hosted zone \
+                             that has the name {}.",
+                            other.name
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The zone's own quota on associations; past it the next one is the
+            // modelled `LimitsExceeded`.
+            if association_count >= MAX_VPCS_PER_HOSTED_ZONE {
+                return Err(AssociateVPCWithHostedZoneErrorModeled::LimitsExceeded(
+                    LimitsExceeded {
+                        message: Some(format!(
+                            "This operation can't be completed because the hosted zone has \
+                             reached the limit of {MAX_VPCS_PER_HOSTED_ZONE} associated VPCs."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The change the caller polls through `GetChange`, carrying the
+        // `Comment` this request gave it.
+        let change = store.submit_change(input.comment.clone());
+        if !already_associated {
+            let zone = store
+                .zones
+                .get_mut(&zone_id)
+                .expect("the hosted zone resolved above must still be present");
+            zone.vpcs.push(VPC {
+                vpc_id: Some(vpc_id.to_string()),
+                vpc_region: Some(vpc_region.to_string()),
+            });
+        }
+
+        Ok(AssociateVPCWithHostedZoneOutput {
+            change_info: change.to_change_info(),
+        })
     }
 }

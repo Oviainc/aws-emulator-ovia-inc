@@ -265,6 +265,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let mut store = state.lock();
+        // Everything below reads the store, so the transitions the clock has already made
+        // due are written down FIRST — including the reclamation of a composition whose
+        // stop has finished. Doing it here rather than inside the idempotency branch is
+        // what keeps the token lookup, the quota check and the mint all deciding against
+        // the same store: a token whose composition the clock has reclaimed names nothing,
+        // so the request starts a fresh composition instead of replaying a record that is
+        // about to disappear.
+        store.materialize_due_compositions(now);
 
         // `idempotencyToken` carries the `@idempotencyToken` trait, so a retry of one
         // start request must not start a second composition: the composition the first
@@ -283,10 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::idempotency_token_reused_message(Self::NAME, token),
                     ));
                 }
-                store.materialize_due_compositions(now);
-                // The ARN was found under this same lock, so the record is there; a miss
-                // is answered as the modelled server fault rather than as an empty 200,
-                // which a client could not tell from a real composition.
+                // The ARN was found under this same lock, after the clock's own writes, so
+                // the record is there; a miss is answered as the modelled server fault
+                // rather than as an empty 200, which a client could not tell from a real
+                // composition.
                 let composition = store
                     .compositions
                     .get(&arn)

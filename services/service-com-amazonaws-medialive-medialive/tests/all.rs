@@ -62,6 +62,9 @@ mod deleted_resource_mutation;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 
+#[path = "all/event_bridge_rule_template_group_listing.rs"]
+mod event_bridge_rule_template_group_listing;
+
 #[path = "all/event_bridge_rule_template_groups.rs"]
 mod event_bridge_rule_template_groups;
 
