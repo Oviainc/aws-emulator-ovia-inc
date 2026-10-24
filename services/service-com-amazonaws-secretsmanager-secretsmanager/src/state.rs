@@ -10,19 +10,34 @@
 //! time; a version that carries no label is deprecated and is left out of
 //! `VersionIdsToStages` / `SecretVersionsToStages`.
 //!
+//! A secret also carries the rotation configuration `RotateSecret` set for it —
+//! the rotation function, the rules, the external-rotation metadata and the
+//! instant the schedule next makes a rotation due — and, while a rotation it
+//! started has not finished, the version id that rotation staked `AWSPENDING`
+//! on before its rotation function created that version.
+//!
 //! Everything a handler needs to resolve, mutate or project a secret is a method
 //! here, so the per-operation files hold only that operation's own rules.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{ReplicationStatusType, Tag};
+use crate::ops::types::{
+    ExternalSecretRotationMetadataItem, ReplicationStatusType, RotationRulesType, Tag,
+};
 
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
 
 /// The staging label that moves to the version `AWSCURRENT` was taken from.
 pub const STAGE_PREVIOUS: &str = "AWSPREVIOUS";
+
+/// The staging label a rotation stages the new secret value under: "AWSPENDING,
+/// which indicates the version of the secret that contains new secret
+/// information that will become the next current version when rotation
+/// finishes" (`DescribeSecretResponse$VersionIdsToStages`, this service's
+/// Smithy model).
+pub const STAGE_PENDING: &str = "AWSPENDING";
 
 /// Secrets Manager appends "a hyphen and six random characters after the secret
 /// name at the end of the ARN" (`CreateSecretRequest$Name`, this service's
@@ -45,6 +60,144 @@ pub const MAX_RECOVERY_WINDOW_DAYS: i64 = 30;
 
 /// Seconds in a day, for turning a recovery window into an instant.
 const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Seconds in an hour, for turning a `rate(n hours)` rotation interval into a
+/// duration.
+const SECONDS_PER_HOUR: u64 = 3_600;
+
+/// The shortest rotation interval a schedule expression may ask for: "You can
+/// rotate a secret as often as every four hours"
+/// (`RotationRulesType$ScheduleExpression`, this service's Smithy model).
+pub const MIN_ROTATION_INTERVAL_HOURS: u64 = 4;
+
+/// The longest rotation interval a schedule may ask for, in days.
+///
+/// The EMULATOR's own bound, not a documented AWS one: an interval has to be
+/// addable to an instant, so a magnitude that cannot be represented is refused
+/// where the caller is told why rather than carried into instant arithmetic. Its
+/// value is the upper bound of the range the model puts on the other way of
+/// naming the same interval, `AutomaticallyAfterDays`
+/// (`AutomaticallyRotateAfterDaysType`, range 1..1000, this service's Smithy
+/// model), so the two ways of asking for one interval accept the same span.
+pub const MAX_ROTATION_INTERVAL_DAYS: u64 = 1_000;
+
+/// The units a `rate()` rotation interval is expressed in, and the seconds each
+/// one counts: "Secrets Manager rate() expressions represent the interval in
+/// hours or days that you want to rotate your secret, for example rate(12
+/// hours) or rate(10 days)" (`RotationRulesType$ScheduleExpression`, this
+/// service's Smithy model). Both the singular and the plural are accepted, as
+/// the documented examples use the plural and a rate of one is singular.
+const RATE_UNITS: &[(&str, u64)] = &[
+    ("hour", SECONDS_PER_HOUR),
+    ("hours", SECONDS_PER_HOUR),
+    ("day", SECONDS_PER_DAY),
+    ("days", SECONDS_PER_DAY),
+];
+
+/// How many fields the documented cron form carries: "A cron() or rate()
+/// expression that defines the schedule for rotating your secret", in the
+/// six-field form `cron(minutes hours day-of-month month day-of-week year)`
+/// (`RotationRulesType$ScheduleExpression`, this service's Smithy model).
+const CRON_FIELDS: usize = 6;
+
+/// What a schedule expression that is not one of the two documented forms is
+/// refused with.
+pub const SCHEDULE_EXPRESSION_SYNTAX: &str = "ScheduleExpression must be a rate() or cron() \
+     expression, for example rate(10 days) or cron(0 8 1 * ? *).";
+
+/// The interval the schedule in `rules` rotates the secret on, or the
+/// `InvalidParameterException` message for rules that cannot hold together.
+///
+/// `Ok(None)` is rules this emulator computes no next due instant from: rules
+/// that name no schedule at all (a bare `Duration`, or an empty structure), and
+/// a `cron()` expression — see [`parse_schedule_expression`].
+pub fn parse_rotation_rules(rules: &RotationRulesType) -> Result<Option<Duration>, String> {
+    // "In RotateSecret, you can set the rotation schedule in RotationRules with
+    // AutomaticallyAfterDays or ScheduleExpression, but not both."
+    if rules.automatically_after_days.is_some() && rules.schedule_expression.is_some() {
+        return Err("You can specify either AutomaticallyAfterDays or ScheduleExpression in \
+                    RotationRules, but not both."
+            .to_string());
+    }
+    if let Some(days) = rules.automatically_after_days {
+        return Ok(Some(interval_of(
+            u64::try_from(days).unwrap_or_default(),
+            SECONDS_PER_DAY,
+            "AutomaticallyAfterDays",
+        )?));
+    }
+    match rules.schedule_expression.as_deref() {
+        Some(expression) => parse_schedule_expression(expression),
+        None => Ok(None),
+    }
+}
+
+/// The interval a `ScheduleExpression` names.
+///
+/// A `rate()` expression names one outright. A `cron()` expression names
+/// occurrences on a calendar rather than an interval, so there is nothing to add
+/// to an instant: it is checked for the six fields the service documents, stored
+/// and reported back unchanged, and answers `Ok(None)` — this emulator reports
+/// `NextRotationDate` for the interval forms and OMITS it for a `cron()`
+/// schedule rather than reporting an instant it did not compute.
+fn parse_schedule_expression(expression: &str) -> Result<Option<Duration>, String> {
+    let expression = expression.trim();
+    let body = |keyword: &str| {
+        expression
+            .strip_prefix(keyword)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+    };
+    if let Some(rate) = body("rate") {
+        let mut parts = rate.split_whitespace();
+        let (Some(value), Some(unit), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(SCHEDULE_EXPRESSION_SYNTAX.to_string());
+        };
+        let value: u64 = value
+            .parse()
+            .map_err(|_| SCHEDULE_EXPRESSION_SYNTAX.to_string())?;
+        let seconds = RATE_UNITS
+            .iter()
+            .find(|(name, _)| *name == unit)
+            .map(|(_, seconds)| *seconds)
+            .ok_or_else(|| SCHEDULE_EXPRESSION_SYNTAX.to_string())?;
+        return Ok(Some(interval_of(value, seconds, "ScheduleExpression")?));
+    }
+    if let Some(fields) = body("cron") {
+        let fields = fields.split_whitespace().count();
+        if fields != CRON_FIELDS {
+            return Err(format!(
+                "ScheduleExpression must carry a cron expression of {CRON_FIELDS} fields \
+                 (minutes hours day-of-month month day-of-week year), not {fields}."
+            ));
+        }
+        return Ok(None);
+    }
+    Err(SCHEDULE_EXPRESSION_SYNTAX.to_string())
+}
+
+/// `value` units of `seconds` as a rotation interval, refused when it falls
+/// outside the interval the service's own rules allow: no more often than every
+/// four hours, and no longer than the maximum `AutomaticallyAfterDays` names.
+///
+/// `member` is the member the refusal names, so the caller is told which half of
+/// `RotationRules` it has to fix.
+fn interval_of(value: u64, seconds: u64, member: &str) -> Result<Duration, String> {
+    let total = value.saturating_mul(seconds);
+    if total < MIN_ROTATION_INTERVAL_HOURS * SECONDS_PER_HOUR {
+        return Err(format!(
+            "{member} must schedule a rotation no more often than every \
+             {MIN_ROTATION_INTERVAL_HOURS} hours."
+        ));
+    }
+    if total > MAX_ROTATION_INTERVAL_DAYS * SECONDS_PER_DAY {
+        return Err(format!(
+            "{member} must not schedule a rotation further apart than every \
+             {MAX_ROTATION_INTERVAL_DAYS} days."
+        ));
+    }
+    Ok(Duration::from_secs(total))
+}
 
 /// How many secrets the store holds before `CreateSecret` refuses with the
 /// modelled `LimitExceededException`.
@@ -221,6 +374,62 @@ impl StoredTag {
     }
 }
 
+/// One `ExternalSecretRotationMetadata` item as stored: the same optional
+/// key/value pair the modelled `ExternalSecretRotationMetadataItem` has, so the
+/// metadata a partner specified round-trips through state unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredKeyValue {
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
+impl StoredKeyValue {
+    /// The stored form of a modelled metadata item.
+    pub fn from_modeled(item: &ExternalSecretRotationMetadataItem) -> Self {
+        Self {
+            key: item.key.clone(),
+            value: item.value.clone(),
+        }
+    }
+
+    /// The metadata item for the wire.
+    pub fn to_modeled(&self) -> ExternalSecretRotationMetadataItem {
+        ExternalSecretRotationMetadataItem {
+            key: self.key.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
+/// A secret's rotation schedule as stored: every member of the modelled
+/// `RotationRulesType`, so the rules round-trip through state unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredRotationRules {
+    pub automatically_after_days: Option<i64>,
+    pub duration: Option<String>,
+    pub schedule_expression: Option<String>,
+}
+
+impl StoredRotationRules {
+    /// The stored form of a modelled `RotationRulesType`.
+    pub fn from_modeled(rules: &RotationRulesType) -> Self {
+        Self {
+            automatically_after_days: rules.automatically_after_days,
+            duration: rules.duration.clone(),
+            schedule_expression: rules.schedule_expression.clone(),
+        }
+    }
+
+    /// The rules for the wire.
+    pub fn to_modeled(&self) -> RotationRulesType {
+        RotationRulesType {
+            automatically_after_days: self.automatically_after_days,
+            duration: self.duration.clone(),
+            schedule_expression: self.schedule_expression.clone(),
+        }
+    }
+}
+
 /// One replica of a secret: the Region it is in, the KMS key it is encrypted
 /// with, and the `StatusType` its creation has reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +547,29 @@ pub struct Secret {
     /// `Some(..)` means it is scheduled for deletion.
     pub deleted_date: Option<SystemTime>,
     pub rotation_enabled: bool,
+    /// The ARN of the Lambda rotation function `RotateSecret` configured for
+    /// this secret; `None` for a secret no rotation has been configured for.
+    pub rotation_lambda_arn: Option<String>,
+    /// The rotation schedule `RotateSecret` configured.
+    pub rotation_rules: Option<StoredRotationRules>,
+    /// "The metadata needed to successfully rotate a managed external secret",
+    /// as the partner specified it.
+    pub external_rotation_metadata: Vec<StoredKeyValue>,
+    /// The role that lets Secrets Manager rotate a secret a third-party partner
+    /// holds.
+    pub external_rotation_role_arn: Option<String>,
+    /// The instant the last rotation of this secret COMPLETED; `None` while no
+    /// rotation has ever completed, which is what a started rotation that has
+    /// not finished leaves it at.
+    pub last_rotated_date: Option<SystemTime>,
+    /// The instant the rotation schedule next makes a rotation due.
+    pub next_rotation_date: Option<SystemTime>,
+    /// The version id a started rotation has staked `AWSPENDING` on, while the
+    /// rotation function has not created that version yet: "During rotation,
+    /// Secrets Manager creates an AWSPENDING version ID before creating the new
+    /// secret version" (`DescribeSecretResponse$VersionIdsToStages`, this
+    /// service's Smithy model).
+    pub pending_rotation_version_id: Option<String>,
     /// The replicas of this secret, in the order their Regions were first
     /// replicated to. Empty for a secret that does not participate in
     /// cross-region replication.
@@ -363,6 +595,13 @@ impl Secret {
             last_accessed_date: None,
             deleted_date: None,
             rotation_enabled: false,
+            rotation_lambda_arn: None,
+            rotation_rules: None,
+            external_rotation_metadata: Vec::new(),
+            external_rotation_role_arn: None,
+            last_rotated_date: None,
+            next_rotation_date: None,
+            pending_rotation_version_id: None,
             replicas: Vec::new(),
             versions: Vec::new(),
         }
@@ -386,14 +625,92 @@ impl Secret {
     /// Every version that still carries a staging label, mapped to its labels.
     /// A version with no label is deprecated and is left out, which is what
     /// makes this map the live staging state rather than a version history.
+    ///
+    /// A rotation that has staked `AWSPENDING` on a version its rotation
+    /// function has not created yet is in the map too, under the id it staked:
+    /// "During rotation, Secrets Manager creates an AWSPENDING version ID
+    /// before creating the new secret version. To check if a secret version
+    /// exists, call GetSecretValue"
+    /// (`DescribeSecretResponse$VersionIdsToStages`, this service's Smithy
+    /// model) — so the label is reported before the version it will name is
+    /// readable.
     pub fn versions_to_stages(&self) -> Option<HashMap<String, Vec<String>>> {
-        let map: HashMap<String, Vec<String>> = self
+        let mut map: HashMap<String, Vec<String>> = self
             .versions
             .iter()
             .filter(|v| !v.version_stages.is_empty())
             .map(|v| (v.version_id.clone(), v.version_stages.clone()))
             .collect();
+        if let Some(reserved) = self.reserved_pending_version_id() {
+            map.insert(reserved.to_string(), vec![STAGE_PENDING.to_string()]);
+        }
         (!map.is_empty()).then_some(map)
+    }
+
+    /// The version id a started rotation staked `AWSPENDING` on and whose
+    /// version does not exist yet; `None` once the rotation function has created
+    /// it, which is when the label lives on the version itself.
+    pub fn reserved_pending_version_id(&self) -> Option<&str> {
+        self.pending_rotation_version_id
+            .as_deref()
+            .filter(|id| self.version(id).is_none())
+    }
+
+    /// The version id `AWSPENDING` names: the version carrying the label, or the
+    /// id a started rotation reserved for the version its rotation function has
+    /// not created yet.
+    pub fn pending_version_id(&self) -> Option<&str> {
+        self.version_with_stage(STAGE_PENDING)
+            .map(|version| version.version_id.as_str())
+            .or_else(|| self.reserved_pending_version_id())
+    }
+
+    /// Whether a rotation of this secret is still in progress.
+    ///
+    /// "When rotation is successful, the AWSPENDING staging label might be
+    /// attached to the same version as the AWSCURRENT version, or it might not
+    /// be attached to any version. If the AWSPENDING staging label is present
+    /// but not attached to the same version as AWSCURRENT, then any later
+    /// invocation of RotateSecret assumes that a previous rotation request is
+    /// still in progress" (`RotateSecret`, this service's Smithy model).
+    pub fn rotation_in_progress(&self) -> bool {
+        match self.pending_version_id() {
+            Some(pending) => {
+                self.version_with_stage(STAGE_CURRENT)
+                    .map(|current| current.version_id.as_str())
+                    != Some(pending)
+            }
+            None => false,
+        }
+    }
+
+    /// The interval the stored rules rotate the secret on, for recomputing the
+    /// next due instant. Rules are validated before they are stored, so rules
+    /// that no longer parse, and a `cron()` schedule, name no interval.
+    pub fn rotation_interval(&self) -> Option<Duration> {
+        parse_rotation_rules(&self.rotation_rules.as_ref()?.to_modeled())
+            .ok()
+            .flatten()
+    }
+
+    /// The stored rotation rules for the wire.
+    pub fn rotation_rules_out(&self) -> Option<RotationRulesType> {
+        self.rotation_rules
+            .as_ref()
+            .map(StoredRotationRules::to_modeled)
+    }
+
+    /// The stored external rotation metadata for the wire, omitted while the
+    /// secret carries none.
+    pub fn external_rotation_metadata_out(
+        &self,
+    ) -> Option<Vec<ExternalSecretRotationMetadataItem>> {
+        (!self.external_rotation_metadata.is_empty()).then(|| {
+            self.external_rotation_metadata
+                .iter()
+                .map(StoredKeyValue::to_modeled)
+                .collect()
+        })
     }
 
     /// The secret's tags for the wire, omitted while it carries none.
@@ -602,6 +919,16 @@ impl Secret {
     /// more than [`VERSIONS_PER_SECRET`] versions.
     pub fn put_version(&mut self, version: SecretVersion, at: SystemTime) {
         let claimed = version.version_stages.clone();
+        // A rotation reserves the id of the version its rotation function will
+        // create and stakes `AWSPENDING` on it, so a version arriving under that
+        // id — or any version claiming that label — is that label moving onto a
+        // version that now exists: the reservation has done its job, and
+        // dropping it is what keeps `AWSPENDING` on one version at a time.
+        if self.pending_rotation_version_id.as_deref() == Some(version.version_id.as_str())
+            || claimed.iter().any(|stage| stage == STAGE_PENDING)
+        {
+            self.pending_rotation_version_id = None;
+        }
         let demoted = if claimed.iter().any(|stage| stage == STAGE_CURRENT) {
             self.version_with_stage(STAGE_CURRENT)
                 .map(|current| current.version_id.clone())
@@ -642,6 +969,61 @@ impl Secret {
             }
         }
     }
+
+    /// Apply the rotation configuration a `RotateSecret` call carries.
+    ///
+    /// A member the call does not name keeps the value already stored: "If you
+    /// include the configuration parameters, the operation sets the values for
+    /// the secret and then immediately starts a rotation. If you don't include
+    /// the configuration parameters, the operation starts a rotation with the
+    /// values already stored in the secret" (`RotateSecret`, this service's
+    /// Smithy model). Configuring rotation is what enables it, and the next due
+    /// instant is recomputed from whichever schedule the secret now holds.
+    pub fn configure_rotation(&mut self, config: RotationConfig, at: SystemTime) {
+        if let Some(lambda_arn) = config.lambda_arn {
+            self.rotation_lambda_arn = Some(lambda_arn);
+        }
+        if let Some(rules) = config.rules {
+            self.rotation_rules = Some(rules);
+        }
+        if let Some(metadata) = config.metadata {
+            self.external_rotation_metadata = metadata;
+        }
+        if let Some(role_arn) = config.role_arn {
+            self.external_rotation_role_arn = Some(role_arn);
+        }
+        self.rotation_enabled = true;
+        self.next_rotation_date = self
+            .rotation_interval()
+            .and_then(|interval| at.checked_add(interval));
+        self.last_changed_date = at;
+    }
+
+    /// Stake `AWSPENDING` on `version_id`, the id the rotation that is starting
+    /// will create its new version of the secret under.
+    ///
+    /// A staging label names at most one version of a secret at a time, so the
+    /// label is taken off whichever version holds it — which is how a rotation
+    /// that starts where the previous one left `AWSPENDING` on the `AWSCURRENT`
+    /// version (the documented "rotation succeeded" shape) still leaves the
+    /// label naming one version.
+    pub fn start_rotation(&mut self, version_id: String, at: SystemTime) {
+        for existing in &mut self.versions {
+            existing.version_stages.retain(|held| held != STAGE_PENDING);
+        }
+        self.pending_rotation_version_id = Some(version_id);
+        self.last_changed_date = at;
+    }
+}
+
+/// The rotation configuration one `RotateSecret` call carries: a member it does
+/// not name is `None` and leaves what the secret already stores in place.
+#[derive(Debug, Clone, Default)]
+pub struct RotationConfig {
+    pub lambda_arn: Option<String>,
+    pub rules: Option<StoredRotationRules>,
+    pub metadata: Option<Vec<StoredKeyValue>>,
+    pub role_arn: Option<String>,
 }
 
 /// Per-service state for com-amazonaws-secretsmanager-secretsmanager. A handler reaches it through [`service_state`].

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RotateSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RotateSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Configures rotation for a stored secret and starts a rotation: it persists the
+//! rotation function, rules and external-rotation metadata the call names (leaving
+//! anything it does not name at what the secret already holds), enables rotation,
+//! recomputes the next due instant from the schedule, and stakes `AWSPENDING` on
+//! the id of the version the rotation will create.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RotateSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rotation itself is carried out by a Lambda rotation function — user code —
+//! and Lambda's `Invoke` in this emulator does not run a deployment package, so
+//! the rotation this call starts never finishes: no version holding a new secret
+//! value appears, `AWSCURRENT` does not move, `LastRotatedDate` stays unset, and a
+//! later `RotateSecret` is refused while `AWSPENDING` names a version other than
+//! the `AWSCURRENT` one — which is exactly how the service itself leaves a
+//! rotation that did not complete. Nothing here reports a rotation that ran.
 //!
 //! ## Shape of an operation
 //!
@@ -201,20 +205,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RotateSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RotateSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        // "A unique identifier for the new version of the secret. ... If you use
+        // the Amazon Web Services CLI or one of the Amazon Web Services SDKs to
+        // call this operation, then you can leave this parameter empty. The CLI
+        // or SDK generates a random UUID for you": the id of the version this
+        // rotation creates, minted here when the caller named none.
+        let version_id = input
+            .client_request_token
+            .clone()
+            .unwrap_or_else(crate::state::new_version_id);
+        // "The default for RotateImmediately is true. If you don't specify this
+        // value, Secrets Manager rotates the secret immediately."
+        let rotate_immediately = input.rotate_immediately.unwrap_or(true);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(RotateSecretErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Secrets Manager can't find the specified secret: {}",
+                        input.secret_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "In RotateSecret, you can set the rotation schedule in RotationRules
+        // with AutomaticallyAfterDays or ScheduleExpression, but not both" —
+        // rules that cannot hold together, or a schedule expression that is not
+        // one of the documented forms, are refused before anything is stored.
+        // Checked after the secret is resolved, so a call that names a secret
+        // this service does not hold is answered with that, whatever else it
+        // carries. `configure_rotation` reads the same schedule back out of the
+        // stored rules when it computes the next due instant.
+        if let Some(rules) = input.rotation_rules.as_ref() {
+            crate::state::parse_rotation_rules(rules).map_err(invalid_parameter)?;
+        }
+
+        // The documented causes of `InvalidRequestException`, in the order the
+        // model lists them: "The secret is scheduled for deletion. You tried to
+        // enable rotation on a secret that doesn't already have a Lambda
+        // function ARN configured and you didn't include such an ARN as a
+        // parameter in this call. The secret is managed by another service, and
+        // you must use that service to update it."
+        if secret.scheduled_for_deletion() {
+            return Err(invalid_request(
+                "You can't perform this operation on the secret because it was marked for \
+                 deletion.",
+            ));
+        }
+        if let Some(owner) = secret.owning_service.clone() {
+            return Err(invalid_request(format!(
+                "You can't perform this operation on the secret because it is managed by \
+                 {owner}, and you must use that service to update it."
+            )));
+        }
+        // "For secrets that use a Lambda rotation function to rotate, the ARN of
+        // the Lambda rotation function. For secrets that use managed rotation,
+        // omit this field" — and a managed external secret names a rotation role
+        // instead, so a rotation is configurable once the secret has either, from
+        // this call or from a previous one. An empty `RotationLambdaARN` names no
+        // function (`RotationLambdaARNType` is modelled with a minimum length of
+        // 0).
+        let lambda_arn = input
+            .rotation_lambda_arn
+            .clone()
+            .filter(|arn| !arn.is_empty());
+        let role_arn = input
+            .external_secret_rotation_role_arn
+            .clone()
+            .filter(|arn| !arn.is_empty());
+        if lambda_arn.is_none()
+            && role_arn.is_none()
+            && secret.rotation_lambda_arn.is_none()
+            && secret.external_rotation_role_arn.is_none()
+        {
+            return Err(invalid_request(
+                "You must specify RotationLambdaARN, or the secret must already have a Lambda \
+                 rotation function configured, to enable rotation.",
+            ));
+        }
+
+        // "If the AWSPENDING staging label is present but not attached to the
+        // same version as AWSCURRENT, then any later invocation of RotateSecret
+        // assumes that a previous rotation request is still in progress and
+        // returns an error."
+        if secret.rotation_in_progress() {
+            return Err(invalid_request(format!(
+                "A previous rotation request is still in progress: the AWSPENDING staging label \
+                 is attached to version {} rather than to the AWSCURRENT version.",
+                secret.pending_version_id().unwrap_or_default()
+            )));
+        }
+        // `ClientRequestToken` is "a unique identifier for the NEW version of the
+        // secret", and a version id names one version of a secret for as long as
+        // that version is stored — so a token that already names a stored version
+        // cannot be the id of the version this rotation creates, and the call is
+        // refused rather than answered with a version id it did not stake.
+        if secret.version(&version_id).is_some() {
+            return Err(invalid_request(format!(
+                "The ClientRequestToken {version_id} already identifies a version of this \
+                 secret, so it can't identify the new version this rotation creates."
+            )));
+        }
+
+        secret.configure_rotation(
+            crate::state::RotationConfig {
+                lambda_arn,
+                rules: input
+                    .rotation_rules
+                    .as_ref()
+                    .map(crate::state::StoredRotationRules::from_modeled),
+                metadata: input
+                    .external_secret_rotation_metadata
+                    .as_ref()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(crate::state::StoredKeyValue::from_modeled)
+                            .collect()
+                    }),
+                role_arn,
+            },
+            now,
+        );
+
+        // Starting a rotation is the one thing this operation does that the
+        // emulator cannot carry through: the rotation function is user code, and
+        // Lambda's `Invoke` in this emulator does not run a deployment package,
+        // so no version holding a new secret value is ever created and
+        // AWSCURRENT never moves. What Secrets Manager itself does for a
+        // rotation it has started IS done: the version id is minted and
+        // AWSPENDING is staked on it ("During rotation, Secrets Manager creates
+        // an AWSPENDING version ID before creating the new secret version"),
+        // which leaves the secret in the state the service leaves an unfinished
+        // rotation in — the current value still readable, `LastRotatedDate`
+        // unset, and a later RotateSecret refused while that label is not on the
+        // AWSCURRENT version.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RotateSecret"))
+        // With `RotateImmediately` false nothing is staked: "Secrets Manager
+        // tests the rotation configuration by running the testSecret step of the
+        // Lambda rotation function. This test creates an AWSPENDING version of
+        // the secret and then removes it" — a test that leaves no version
+        // behind, and that this emulator cannot run either.
+        if rotate_immediately {
+            secret.start_rotation(version_id.clone(), now);
+        }
+
+        Ok(RotateSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+            version_id: Some(version_id),
+        })
     }
+}
+
+/// `InvalidParameterException` for a parameter value this operation refuses:
+/// "The parameter name or value is invalid."
+fn invalid_parameter(message: String) -> RotateSecretError {
+    RotateSecretErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `InvalidRequestException` for a request this secret's current state does not
+/// allow: "A parameter value is not valid for the current state of the
+/// resource."
+fn invalid_request(message: impl Into<String>) -> RotateSecretError {
+    RotateSecretErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> RotateSecretError {
+    RotateSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }
