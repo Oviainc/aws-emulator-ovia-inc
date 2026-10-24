@@ -184,6 +184,41 @@ pub const SOFTWARE_UPDATE_BUCKET: &str = "snowball-software-updates";
 /// [`SOFTWARE_UPDATE_BUCKET`].
 pub const SOFTWARE_UPDATE_OBJECT: &str = "update.tar";
 
+/// How long the task that creates a return shipping label runs before the label exists.
+///
+/// `CreateReturnShippingLabel` answers a `ShippingLabelStatus` — "the status information
+/// of the task on a Snow device that is being returned to Amazon Web Services" — rather
+/// than a finished label, and `DescribeReturnShippingLabel` is what a caller polls for the
+/// label's URL, so the label is not ready at the instant the creating call is served: it
+/// becomes ready this long afterwards. The span is this emulator's own CHOICE — no
+/// documented duration governs it — and it is never zero, so a caller asking straight
+/// after the create still observes the task in progress, which is also the window in which
+/// a second create is the "more than once when other requests are not completed" case
+/// `ConflictException` describes.
+pub const RETURN_SHIPPING_LABEL_PREPARATION: Duration = Duration::from_millis(500);
+
+/// How long a return shipping label stays usable once the task that creates it has
+/// finished.
+///
+/// `DescribeReturnShippingLabelResult$ExpirationDate` is documented only as "The
+/// expiration date of the current return shipping label", and neither the model nor the
+/// Snow Family documentation publishes the length of that window, so this one is the
+/// emulator's own CHOICE. What the API fixes is the behaviour around it: a label carries
+/// an expiry, `DescribeReturnShippingLabel` reports it, a second create while a valid
+/// label exists is refused, and a create once the label has expired mints a new one.
+pub const RETURN_SHIPPING_LABEL_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The Amazon S3 bucket this emulator publishes return shipping labels under.
+///
+/// `DescribeReturnShippingLabelResult$ReturnShippingLabelURI` is "The pre-signed Amazon S3
+/// URI used to download the return shipping label", so the URI a caller receives addresses
+/// an S3 bucket; this is the bucket this emulator names.
+pub const RETURN_SHIPPING_LABEL_BUCKET: &str = "snowball-return-shipping-labels";
+
+/// The object a job's return shipping label is published as, under the job's own key
+/// prefix in [`RETURN_SHIPPING_LABEL_BUCKET`].
+pub const RETURN_SHIPPING_LABEL_OBJECT: &str = "return-shipping-label.pdf";
+
 /// The lifecycle states a job can be in: the whole `JobState` enum
 /// (`shared_types::JOB_STATE_VALUES`), so the cancellation rule below is expressed
 /// over the modelled set rather than over the two states this slice can reach.
@@ -256,6 +291,30 @@ impl JobState {
     /// file is available.
     pub fn has_software_update(self) -> bool {
         !matches!(self, Self::Cancelled)
+    }
+
+    /// Whether a job in this state has a device that can still be returned to AWS.
+    ///
+    /// `CreateReturnShippingLabel` "creates a shipping label that will be used to return
+    /// the Snow device to Amazon Web Services", so the job must still have a device on the
+    /// customer's side of that journey. Two groups of states leave it with none: a job in
+    /// `Cancelled` stopped before any appliance was prepared for it ("You can only cancel a
+    /// job before its `JobState` value changes to `PreparingAppliance`", `CancelJob`), so no
+    /// device of its own will ever ship; and a job that has reached
+    /// `WithAWSSortingFacility`, `WithAWS`, `InProgress` or `Complete` has its device back
+    /// at Amazon Web Services already — the `JobState` values that say where the device
+    /// is — so there is nothing left to return. From every other state the device is on its
+    /// way to the customer, with the customer, or on its way back and not yet received, and
+    /// a return shipment is still in play.
+    pub fn has_returnable_device(self) -> bool {
+        !matches!(
+            self,
+            Self::Cancelled
+                | Self::WithAWSSortingFacility
+                | Self::WithAWS
+                | Self::InProgress
+                | Self::Complete
+        )
     }
 }
 
@@ -577,6 +636,116 @@ impl SoftwareUpdateGrant {
     }
 }
 
+/// The status of the task that creates a job's return shipping label: the whole
+/// `ShippingLabelStatus` enum (`shared_types::SHIPPING_LABEL_STATUS_VALUES`), so a status
+/// is reported from the modelled set rather than from the two values this emulator's own
+/// task can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShippingLabelStatus {
+    InProgress,
+    Succeeded,
+    /// The task gave up before producing a label. Nothing in this emulator abandons the
+    /// task it starts, so no stored label reports this.
+    TimedOut,
+    /// The task ran and produced no label. Nothing in this emulator fails the task it
+    /// starts, so no stored label reports this.
+    Failed,
+}
+
+impl ShippingLabelStatus {
+    /// This status's wire value, exactly as `ShippingLabelStatus` spells it.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::InProgress => "InProgress",
+            Self::Succeeded => "Succeeded",
+            Self::TimedOut => "TimedOut",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// The current return shipping label of one job: what a `CreateReturnShippingLabel` call
+/// started and what `DescribeReturnShippingLabel` reports.
+///
+/// The record carries the instants the label's whole lifecycle is derived from rather than
+/// a stored status, so the status a caller reads is always the one the clock makes true at
+/// the instant it asks: the creating task is in progress until [`Self::ready_at`] and has
+/// succeeded from then on, and the label is usable until [`Self::expires_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReturnShippingLabel {
+    /// The job whose device this label returns.
+    pub job_id: String,
+    /// This label's own token: what makes two labels this store minted distinct.
+    pub token: String,
+    /// The shipping speed the return travels at: the `ShippingOption` the create supplied,
+    /// or — when it supplied none — the one the job itself was created with.
+    pub shipping_option: Option<String>,
+    /// When the `CreateReturnShippingLabel` call that started this label was served.
+    pub requested_at: SystemTime,
+    /// When the creating task finishes and the label exists:
+    /// [`RETURN_SHIPPING_LABEL_PREPARATION`] after [`Self::requested_at`].
+    pub ready_at: SystemTime,
+    /// When the label stops being usable: [`RETURN_SHIPPING_LABEL_VALIDITY`] after
+    /// [`Self::ready_at`].
+    pub expires_at: SystemTime,
+}
+
+impl StoredReturnShippingLabel {
+    /// The status of this label's creating task at `now`.
+    pub fn status(&self, now: SystemTime) -> ShippingLabelStatus {
+        if now < self.ready_at {
+            ShippingLabelStatus::InProgress
+        } else {
+            ShippingLabelStatus::Succeeded
+        }
+    }
+
+    /// Whether this is a label a caller can still use at `now`: the task that creates it
+    /// has finished and the label has not expired.
+    ///
+    /// This is the "valid return shipping label already exists" that
+    /// `ReturnShippingLabelAlreadyExistsException` describes, so a label whose window has
+    /// closed is not one and a fresh create replaces it.
+    pub fn is_valid(&self, now: SystemTime) -> bool {
+        self.status(now) == ShippingLabelStatus::Succeeded && now < self.expires_at
+    }
+
+    /// This label as the `ReturnShippingLabelURI` `DescribeReturnShippingLabel` reports:
+    /// the label file's location in [`RETURN_SHIPPING_LABEL_BUCKET`] under the job's own
+    /// key prefix, carrying the label's token, the instant it expires and the shipping
+    /// speed the return travels at.
+    ///
+    /// NO SigV4 signature is attached, and no credential of this emulator's own appears in
+    /// it: a fabricated signature would claim a computation nothing performed, and the
+    /// emulator's own credentials must never travel in a response. The query carries what
+    /// this emulator really holds for the label — the token it minted, the expiry it
+    /// recorded as whole epoch seconds, and the stored shipping option, which is a value of
+    /// the modelled `ShippingOption` enum and so cannot carry a caller's own characters.
+    pub fn label_uri(&self, region: &str) -> String {
+        // The Region label is honoured only when the signed scope carries one with an AWS
+        // Region's SHAPE: it is interpolated into a URL host, so an arbitrary header value
+        // must not be able to shape one. Without such a scope the URL names S3's global
+        // endpoint, which carries no Region at all.
+        let host = if is_region_shaped(region) {
+            format!("{RETURN_SHIPPING_LABEL_BUCKET}.s3.{region}.amazonaws.com")
+        } else {
+            format!("{RETURN_SHIPPING_LABEL_BUCKET}.s3.amazonaws.com")
+        };
+        let mut uri = format!(
+            "https://{host}/{job_id}/{RETURN_SHIPPING_LABEL_OBJECT}\
+             ?labelToken={token}&Expires={expires}",
+            job_id = self.job_id,
+            token = self.token,
+            expires = epoch_seconds(self.expires_at),
+        );
+        if let Some(shipping_option) = &self.shipping_option {
+            uri.push_str("&shippingOption=");
+            uri.push_str(shipping_option);
+        }
+        uri
+    }
+}
+
 /// `at` as whole seconds since the UNIX epoch — how a URL's `Expires` parameter spells an
 /// instant.
 fn epoch_seconds(at: SystemTime) -> u64 {
@@ -765,6 +934,12 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// inside its availability window, oldest first — this service's record of which
     /// update URLs it published. Bounded by [`MAX_SOFTWARE_UPDATE_GRANTS`].
     software_update_grants: Vec<SoftwareUpdateGrant>,
+    /// The current return shipping label of each job that has one, keyed by `JobId`.
+    ///
+    /// A job has one current label — `ExpirationDate` is "the expiration date of the
+    /// current return shipping label" — so this holds at most one record per stored job
+    /// and is bounded by [`MAX_STORED_JOBS`] without a ceiling of its own.
+    return_shipping_labels: HashMap<String, StoredReturnShippingLabel>,
     /// How many addresses this store has ever minted an id for, and how many jobs: the
     /// per-store sequence [`mint_id`] hashes, so two records never share an id.
     next_address_seq: u64,
@@ -773,6 +948,9 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// How many software-update grants this store has ever issued: the per-store sequence
     /// [`mint_update_token`] hashes, so two grants never share a token.
     next_software_update_seq: u64,
+    /// How many return shipping labels this store has ever started: the per-store sequence
+    /// the label token hashes, so two labels never share a token.
+    next_return_shipping_label_seq: u64,
 }
 
 impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
@@ -786,10 +964,12 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             job_order: Vec::new(),
             service_versions: seed_service_versions(),
             software_update_grants: Vec::new(),
+            return_shipping_labels: HashMap::new(),
             next_address_seq: 0,
             next_job_seq: 0,
             next_cluster_seq: 0,
             next_software_update_seq: 0,
+            next_return_shipping_label_seq: 0,
         }
     }
 }
@@ -978,6 +1158,46 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         };
         self.software_update_grants.push(grant.clone());
         grant
+    }
+
+    /// The current return shipping label of `job_id`, or `None` when no label has been
+    /// started for that job.
+    pub fn return_shipping_label(&self, job_id: &str) -> Option<&StoredReturnShippingLabel> {
+        self.return_shipping_labels.get(job_id)
+    }
+
+    /// Start the return shipping label of `job_id` at `now`, travelling at
+    /// `shipping_option`, and record it as that job's current label.
+    ///
+    /// A job has ONE current label, so this REPLACES whatever label the job held — which a
+    /// caller can only reach once the old one has expired, since a valid label is what
+    /// `ReturnShippingLabelAlreadyExistsException` refuses a second create for. The label
+    /// is not ready at the instant the call is served: the task that creates it runs for
+    /// [`RETURN_SHIPPING_LABEL_PREPARATION`], and the label it produces is then usable for
+    /// [`RETURN_SHIPPING_LABEL_VALIDITY`].
+    pub fn start_return_shipping_label(
+        &mut self,
+        job_id: &str,
+        shipping_option: Option<String>,
+        now: SystemTime,
+    ) -> StoredReturnShippingLabel {
+        self.next_return_shipping_label_seq += 1;
+        let ready_at = now + RETURN_SHIPPING_LABEL_PREPARATION;
+        let label = StoredReturnShippingLabel {
+            job_id: job_id.to_string(),
+            token: mint_digest(
+                "return-shipping-label",
+                self.next_return_shipping_label_seq,
+                now,
+            ),
+            shipping_option,
+            requested_at: now,
+            ready_at,
+            expires_at: ready_at + RETURN_SHIPPING_LABEL_VALIDITY,
+        };
+        self.return_shipping_labels
+            .insert(job_id.to_string(), label.clone());
+        label
     }
 
     /// The software-update grants issued for `job_id` that are still inside their

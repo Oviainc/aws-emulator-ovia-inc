@@ -23,6 +23,8 @@ mod export_job_parts;
 mod job_lifecycle;
 #[path = "all/job_updates.rs"]
 mod job_updates;
+#[path = "all/return_shipping_labels.rs"]
+mod return_shipping_labels;
 #[path = "all/service_versions.rs"]
 mod service_versions;
 #[path = "all/software_updates.rs"]
