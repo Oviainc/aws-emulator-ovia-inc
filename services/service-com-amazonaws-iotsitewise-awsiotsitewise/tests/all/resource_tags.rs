@@ -162,7 +162,11 @@ async fn tag_resource(
 }
 
 /// `ListTagsForResource` on `arn`.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+///
+/// `pub(crate)` because the sibling `create_pipeline_bounds` suite reads a created
+/// resource's tags through the same route: one definition of it, so the two cannot
+/// drift.
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     call(router, "GET", &format!("/tags?resourceArn={arn}"), None).await
 }
 
