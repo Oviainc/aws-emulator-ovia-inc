@@ -153,7 +153,11 @@ pub(crate) async fn create_proposal(
 }
 
 /// Read one proposal back.
-async fn get_proposal(
+///
+/// `pub(crate)` for the same reason as [`create_proposal`] above: a sibling suite in this
+/// target reads a proposal back through this one helper rather than a second copy of the
+/// request.
+pub(crate) async fn get_proposal(
     router: &smithy_server_runtime::MultiServiceRouter,
     network_id: &str,
     proposal_id: &str,

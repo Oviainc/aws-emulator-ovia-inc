@@ -50,6 +50,12 @@
 //!   queries. `ListJobTemplates` orders the job templates the same way and pages them the
 //!   same way, and `ListQueues` orders and pages the queues through [`page_of_queues`],
 //!   over at most [`MAX_QUEUES`] records.
+//! * [`ComAmazonawsMediaconvertMediaconvertState::rearm_queue`] — the one other walk over
+//!   the job set — runs only when `UpdateQueue` sets a queue back to `ACTIVE`, and is
+//!   likewise bounded by `MAX_JOBS`, as `job_counts` is.
+//! * [`unreadable_job_input`] probes at most the first `MAX_PROBED_INPUTS` of a job's S3
+//!   inputs, so a request cannot make `CreateJob` issue an unbounded number of in-process
+//!   S3 calls.
 //!
 //! # No panic on caller-supplied input
 //!
@@ -65,8 +71,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccelerationSettings, HopDestination, Job, JobEngineVersion, JobMessages, JobSettings,
-    JobTemplate, JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue,
+    AccelerationSettings, HopDestination, Input, InputTemplate, Job, JobEngineVersion, JobMessages,
+    JobSettings, JobTemplate, JobTemplateSettings, Output, Policy, Preset, PresetSettings, Queue,
     ReservationPlan, ReservationPlanSettings, Timing,
 };
 
@@ -92,6 +98,11 @@ pub const QUEUE_TYPE_CUSTOM: &str = TYPE_CUSTOM;
 
 /// `QueueStatus` values (`smithy_query(query="shape",shape="QueueStatus")`).
 pub const QUEUE_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`QUEUE_STATUS_ACTIVE`]. `QueueStatus`' own documentation states the contract a
+/// paused queue carries: "Queues can be ACTIVE or PAUSED. If you pause a queue, jobs in
+/// that queue won't begin. Jobs that are running when you pause a queue continue to run
+/// until they finish or result in an error."
+pub const QUEUE_STATUS_PAUSED: &str = "PAUSED";
 
 /// The `InputPolicy` decision that forbids an input location
 /// (`smithy_query(query="shape",shape="InputPolicy")`, whose generated value set is
@@ -376,6 +387,40 @@ const NO_TRANSCODER_MESSAGE: &str =
     "This emulator has no media transcoding engine, so the transcode for this job never \
      ran. The job's control-plane lifecycle (queue, priority, metadata, status) is \
      emulated; its output files are not produced.";
+
+/// MediaConvert's job error code for an input the service could not open.
+///
+/// `Job$ErrorCode` is an `__integer` ("Error code for the job") and the model carries no
+/// catalogue of its values, so this ONE entry is named from MediaConvert's published job
+/// error-code reference, where 1404 is the failure to open or probe a job input. It is
+/// reported only for a job whose input THIS emulator actually tried to read and could
+/// not — see [`unreadable_job_input`]; nothing else here keys on a particular code.
+pub const INPUT_PROBE_FAILURE_CODE: i32 = 1404;
+
+/// How this service words the failure of a job whose input could not be opened.
+///
+/// Built from the job's OWN request — the `Settings.Inputs[].FileInput` URI that could
+/// not be read — exactly as the member-naming refusals in this module are, so the
+/// message names the input that failed rather than any fixed example text.
+pub fn input_probe_failure_message(file_input: &str) -> String {
+    format!(
+        "Unable to open input file [{file_input}]. The service could not read that \
+         location, so the job's input was never probed."
+    )
+}
+
+/// The URI scheme a job input stored in Amazon S3 carries.
+const S3_URI_PREFIX: &str = "s3://";
+
+/// How many of a job's S3 inputs are probed before [`unreadable_job_input`] stops.
+///
+/// Counted over the inputs that are actually probed — the `s3://` ones — so an input the
+/// probe cannot address does not consume the budget of one it can.
+///
+/// A CHOSEN bound, as [`MAX_QUEUES`] is: `Settings.Inputs` is caller-driven, so the
+/// per-request work has to have a ceiling. A job past it is simply not probed further —
+/// an unprobed input is reported as nothing known, never as a failure.
+const MAX_PROBED_INPUTS: usize = 20;
 
 /// The region a request was signed for, from its SigV4 credential scope.
 pub fn request_region(parts: &::http::request::Parts) -> String {
@@ -1020,6 +1065,256 @@ impl JobTemplateRecord {
     }
 }
 
+/// The effective `Settings` of a job created from a job template: the template's
+/// settings with the request's own `Settings` laid over them, MEMBER BY MEMBER.
+///
+/// A job template is "a pre-made set of encoding instructions that you can use to quickly
+/// create a job", and `Job$JobTemplate` is "the job template that the job is created
+/// from" — so a job that names one submits only what it wants to differ: every member the
+/// request states wins, and every member it omits comes from the template. Nothing is
+/// merged WITHIN a member: a member the request states replaces the template's whole
+/// value for it, which is what makes the result the caller's own statement wherever they
+/// made one.
+pub fn merge_template_settings(
+    template: &JobTemplateSettings,
+    requested: JobSettings,
+) -> JobSettings {
+    JobSettings {
+        ad_avail_offset: requested.ad_avail_offset.or(template.ad_avail_offset),
+        avail_blanking: requested
+            .avail_blanking
+            .or_else(|| template.avail_blanking.clone()),
+        color_conversion3_dlut_settings: requested
+            .color_conversion3_dlut_settings
+            .or_else(|| template.color_conversion3_dlut_settings.clone()),
+        esam: requested.esam.or_else(|| template.esam.clone()),
+        extended_data_services: requested
+            .extended_data_services
+            .or_else(|| template.extended_data_services.clone()),
+        follow_source: requested.follow_source.or(template.follow_source),
+        // `JobTemplateSettings$Inputs` is a list of `InputTemplate`, the same input
+        // without the members only a job can state, so a template's inputs become the
+        // job's through [`job_input_from_template`].
+        inputs: requested.inputs.or_else(|| {
+            template
+                .inputs
+                .as_ref()
+                .map(|inputs| inputs.iter().map(job_input_from_template).collect())
+        }),
+        kantar_watermark: requested
+            .kantar_watermark
+            .or_else(|| template.kantar_watermark.clone()),
+        motion_image_inserter: requested
+            .motion_image_inserter
+            .or_else(|| template.motion_image_inserter.clone()),
+        motion_image_inserters: requested
+            .motion_image_inserters
+            .or_else(|| template.motion_image_inserters.clone()),
+        nielsen_configuration: requested
+            .nielsen_configuration
+            .or_else(|| template.nielsen_configuration.clone()),
+        nielsen_non_linear_watermark: requested
+            .nielsen_non_linear_watermark
+            .or_else(|| template.nielsen_non_linear_watermark.clone()),
+        output_groups: requested
+            .output_groups
+            .or_else(|| template.output_groups.clone()),
+        timecode_config: requested
+            .timecode_config
+            .or_else(|| template.timecode_config.clone()),
+        timed_metadata_insertion: requested
+            .timed_metadata_insertion
+            .or_else(|| template.timed_metadata_insertion.clone()),
+    }
+}
+
+/// An `InputTemplate` as the `Input` a job carries.
+///
+/// `InputTemplate` is `Input` minus the members a template cannot state — the input's own
+/// location (`FileInput`), its decryption keys, its supplemental IMPs, its TAMS settings
+/// and its generated video — so those stay absent here rather than being invented: a job
+/// that wants them states them in its own `Settings`.
+fn job_input_from_template(template: &InputTemplate) -> Input {
+    Input {
+        advanced_input_filter: template.advanced_input_filter.clone(),
+        advanced_input_filter_settings: template.advanced_input_filter_settings.clone(),
+        audio_selector_groups: template.audio_selector_groups.clone(),
+        audio_selectors: template.audio_selectors.clone(),
+        caption_selectors: template.caption_selectors.clone(),
+        crop: template.crop.clone(),
+        deblock_filter: template.deblock_filter.clone(),
+        decryption_settings: None,
+        denoise_filter: template.denoise_filter.clone(),
+        dolby_vision_metadata_xml: template.dolby_vision_metadata_xml.clone(),
+        dynamic_audio_selectors: template.dynamic_audio_selectors.clone(),
+        file_input: None,
+        filter_enable: template.filter_enable.clone(),
+        filter_strength: template.filter_strength,
+        image_inserter: template.image_inserter.clone(),
+        input_clippings: template.input_clippings.clone(),
+        input_scan_type: template.input_scan_type.clone(),
+        multi_view_settings: template.multi_view_settings.clone(),
+        position: template.position.clone(),
+        program_number: template.program_number,
+        psi_control: template.psi_control.clone(),
+        supplemental_imps: None,
+        tams_settings: None,
+        timecode_source: template.timecode_source.clone(),
+        timecode_start: template.timecode_start.clone(),
+        video_generator: None,
+        video_overlays: template.video_overlays.clone(),
+        video_selector: template.video_selector.clone(),
+    }
+}
+
+/// The `FileInput` of every input in these job settings, in the order the settings state
+/// them — the ONE walk over `Settings.Inputs[].FileInput` in this module, so a caller
+/// reading a job's inputs and a caller probing them cannot disagree about what they are.
+fn settings_input_files(settings: &JobSettings) -> impl Iterator<Item = &str> + '_ {
+    settings
+        .inputs
+        .iter()
+        .flatten()
+        .filter_map(|input| input.file_input.as_deref())
+}
+
+/// Every `Settings.Inputs[].FileInput` a job will read, in the order the job states them.
+///
+/// Blank values are left out: an input that states no location is nothing to read. Not
+/// capped here — the probe's ceiling ([`MAX_PROBED_INPUTS`]) is applied where the probing
+/// happens, in [`unreadable_job_input`], so it counts the inputs that are really probed
+/// rather than being spent on inputs that are skipped for not being S3 addresses. This
+/// list is bounded by the request body the server already bounds.
+pub fn job_input_uris(settings: &JobSettings) -> Vec<String> {
+    settings_input_files(settings)
+        .filter(|uri| !uri.trim().is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The `(bucket, key)` an `s3://<bucket>/<key>` input URI addresses, or `None` for a
+/// value that is not one.
+fn s3_location(uri: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = uri.strip_prefix(S3_URI_PREFIX)?.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+}
+
+/// The first of `inputs` that S3 reports this account does not hold, or `None` when every
+/// one of them could be read.
+///
+/// MediaConvert opens (probes) a job's inputs before it can transcode them, and a job
+/// whose input cannot be opened fails with [`INPUT_PROBE_FAILURE_CODE`]. This emulator
+/// performs that probe for real rather than assuming its result: S3 is reached the way any
+/// emulated service reaches another, through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no other
+/// service crate.
+///
+/// `None` means NOTHING IS KNOWN against the job's inputs, which includes every case where
+/// the probe could not be performed — an input that is not an `s3://` URI (this emulator
+/// makes no outbound connection to fetch one), or an emulator with no S3 to ask. A failure
+/// is reported only when S3 itself answered 404 for the address, never assumed.
+///
+/// WHEN the probe runs is a recorded limitation: real MediaConvert probes a job's inputs
+/// when the job BEGINS, whereas this runs once at `CreateJob` and the verdict is then
+/// frozen on the record. The transition itself is materialised by
+/// [`ComAmazonawsMediaconvertMediaconvertState::settle`], which is synchronous and
+/// clock-driven and so cannot make an in-process call; an input that appears or disappears
+/// between the submit and the job's due instant is therefore classified as it was at
+/// submit time.
+pub async fn unreadable_job_input(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    inputs: &[String],
+) -> Option<String> {
+    // The ceiling is applied AFTER the S3 filter, so the budget is spent on addresses
+    // this emulator can actually ask about: a job that states many non-S3 inputs first
+    // still has its S3 inputs probed.
+    let locations: Vec<(&String, &str, &str)> = inputs
+        .iter()
+        .filter_map(|uri| s3_location(uri).map(|(bucket, key)| (uri, bucket, key)))
+        .take(MAX_PROBED_INPUTS)
+        .collect();
+    if locations.is_empty() {
+        return None;
+    }
+    let client = s3_client(ctx, region);
+    for (uri, bucket, key) in locations {
+        match client.head_object().bucket(bucket).key(key).send().await {
+            Ok(_) => {}
+            Err(error) if address_is_absent(&error) => return Some(uri.clone()),
+            // Any other answer is this emulator failing to ask, not S3 reporting an
+            // absent object, so it classifies nothing — and it is worth a warning,
+            // because a deployment with no S3 to ask is one where this probe does not
+            // run.
+            Err(error) => {
+                ::tracing::warn!(
+                    %uri,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "a job input could not be probed against S3"
+                );
+            }
+        }
+    }
+    None
+}
+
+/// An S3 client over the in-process callback, addressed path-style so the request carries
+/// the bucket in its path rather than in a host this emulator does not resolve.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The error codes S3 answers for an address this account holds nothing at — a bucket it
+/// does not hold (`NoSuchBucket`), a key that bucket does not hold (`NoSuchKey`), and the
+/// code `HeadObject` models for either (`NotFound`).
+///
+/// Named from S3's own API: the codes its `NoSuchBucket`/`NoSuchKey`/`NotFound` error
+/// shapes carry, which is what the emulated S3 answers a `HeadObject` of a missing
+/// address with.
+const S3_ABSENT_CODES: [&str; 3] = ["NoSuchBucket", "NoSuchKey", "NotFound"];
+
+/// Whether S3's answer to a `HeadObject` is S3 ITSELF saying "this account holds nothing
+/// at that address".
+///
+/// Both halves are required: HTTP 404, and one of the codes [`S3_ABSENT_CODES`] S3 sends
+/// for a missing address. A 404 alone is not enough — an emulator with no S3 mounted
+/// answers the callback 404 too, and reading that as "the input does not exist" would
+/// classify a job from the absence of a service rather than from the absence of a file.
+fn address_is_absent(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_object::HeadObjectError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    use ::aws_sdk_s3::error::ProvideErrorMetadata;
+
+    let answered_404 = error
+        .raw_response()
+        .is_some_and(|response| response.status().as_u16() == 404);
+    answered_404 && error.code().is_some_and(|code| S3_ABSENT_CODES.contains(&code))
+}
+
 /// One transcoding job, exactly as `CreateJob` persisted it plus whatever its status
 /// has become since. The ARN is derived from the reading request's region, as
 /// [`QueueRecord`]'s is.
@@ -1057,9 +1352,19 @@ pub struct JobRecord {
     pub tags: BTreeMap<String, String>,
     pub timing: JobTiming,
     /// When the clock owes this job its exit from `SUBMITTED`; `None` once the job has
-    /// reached a status nothing further is due from.
+    /// reached a status nothing further is due from, and `None` while the job's queue is
+    /// `PAUSED` and nothing is therefore due at all (see
+    /// [`ComAmazonawsMediaconvertMediaconvertState::settle`]).
     pub settles_at: Option<SystemTime>,
     pub error_message: Option<String>,
+    /// `Job$ErrorCode`, "Error code for the job": set when the job reaches `ERROR`, and
+    /// absent for every other status.
+    pub error_code: Option<i32>,
+    /// The `Settings.Inputs[].FileInput` of this job that S3 reported it could not read,
+    /// found by the probe `CreateJob` ran against this job's own inputs
+    /// ([`unreadable_job_input`]). `None` when every input read back, or when nothing
+    /// could be learned about them.
+    pub unreadable_input: Option<String>,
 }
 
 /// When a job was submitted, started and finished.
@@ -1133,13 +1438,10 @@ impl JobRecord {
         self.input_files().any(|file| file.contains(needle))
     }
 
-    /// The `FileInput` of every input of this job's settings.
+    /// The `FileInput` of every input of this job's settings, through the module's one
+    /// walk over them ([`settings_input_files`]).
     fn input_files(&self) -> impl Iterator<Item = &str> + '_ {
-        self.settings
-            .inputs
-            .iter()
-            .flatten()
-            .filter_map(|input| input.file_input.as_deref())
+        settings_input_files(&self.settings)
     }
 
     /// Every output of every output group of this job's settings.
@@ -1178,7 +1480,7 @@ impl JobRecord {
             created_at: Some(epoch_seconds(self.created_at)),
             current_phase: None,
             elemental_inference_configuration: None,
-            error_code: None,
+            error_code: self.error_code,
             error_message: self.error_message.clone(),
             hop_destinations: Some(self.hop_destinations.clone()),
             id: Some(self.id.clone()),
@@ -1968,6 +2270,12 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     /// number of records that came due and nothing else; neither kind re-reads the store.
     /// It is the only write a reporting operation makes, and every change it applies was
     /// owed at `now` whether or not anybody called.
+    ///
+    /// Whether a job may leave `SUBMITTED` at all is its QUEUE's decision, not the
+    /// clock's: `QueueStatus` says "If you pause a queue, jobs in that queue won't
+    /// begin", so a job whose queue is `PAUSED` keeps `SUBMITTED` and is left with no due
+    /// instant until [`Self::rearm_queue`] gives it a fresh one when the queue is
+    /// `ACTIVE` again. See [`Self::settle_job`].
     pub fn settle(&mut self, now: SystemTime) {
         loop {
             let next_job = self.pending.first().cloned();
@@ -1998,12 +2306,84 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
     }
 
-    /// The exit from `SUBMITTED` the clock owed the job `id` at `due`.
+    /// Whether `queue_name` names a queue this store holds in `PAUSED`.
+    ///
+    /// A job whose queue is gone is not held: the queue that could hold it back no longer
+    /// exists, and `DeleteQueue` already refuses a queue with jobs in a non-terminal
+    /// status, so this is only ever a job whose queue outlived it.
+    fn queue_is_paused(&self, queue_name: &str) -> bool {
+        self.queues
+            .get(queue_name)
+            .is_some_and(|queue| queue.status == QUEUE_STATUS_PAUSED)
+    }
+
+    /// Give every job still waiting in `queue_name` a fresh due instant for its exit from
+    /// `SUBMITTED`.
+    ///
+    /// `QueueStatus`: a paused queue's jobs "won't begin". So a job held while its queue
+    /// was paused begins only once the queue is `ACTIVE` again, and the span it then waits
+    /// is the same one every other job waits — the time the queue spent paused does not
+    /// count towards it. Called by `UpdateQueue` when it sets a queue's status to
+    /// `ACTIVE`. Every still-`SUBMITTED` job in the queue is re-armed, including one
+    /// whose own due instant elapsed unobserved during the pause (nothing drained
+    /// `pending` while it was paused), so no job transitions on the first read after the
+    /// unpause on the strength of an instant that passed while it was held.
+    pub fn rearm_queue(&mut self, queue_name: &str, now: SystemTime) {
+        let due = now + self.job_settles_after;
+        let waiting: Vec<(String, Option<SystemTime>)> = self
+            .jobs
+            .values()
+            .filter(|job| job.queue == queue_name && job.status == JOB_STATUS_SUBMITTED)
+            .map(|job| (job.id.clone(), job.settles_at))
+            .collect();
+        for (id, previous_due) in waiting {
+            if let Some(previous_due) = previous_due {
+                self.pending.remove(&(previous_due, id.clone()));
+            }
+            // The index entry is written only where the job it names is: the two cannot be
+            // left disagreeing even if the store changed under this walk.
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.settles_at = Some(due);
+                self.pending.insert((due, id));
+            }
+        }
+    }
+
+    /// The exit from `SUBMITTED` the clock owed the job `id` at `due` — if its queue lets
+    /// the job begin at all.
+    ///
+    /// A job whose queue is `PAUSED` does not begin ("jobs in that queue won't begin"):
+    /// it keeps `SUBMITTED` and is left with no due instant, and [`Self::rearm_queue`]
+    /// gives it a fresh one when the queue is `ACTIVE` again.
     fn settle_job(&mut self, due: SystemTime, id: &str) {
+        let held = self.jobs.get(id).is_some_and(|job| {
+            job.status == JOB_STATUS_SUBMITTED && self.queue_is_paused(&job.queue)
+        });
         if let Some(job) = self.jobs.get_mut(id) {
+            if held {
+                // The queue is paused, so this job does not begin: it keeps SUBMITTED
+                // and nothing is due from it while the pause lasts.
+                job.settles_at = None;
+                return;
+            }
             if job.status == JOB_STATUS_SUBMITTED {
                 job.status = JOB_STATUS_ERROR.to_string();
-                job.error_message = Some(NO_TRANSCODER_MESSAGE.to_string());
+                // Why the job failed decides what it reports. An input THIS emulator
+                // tried to read and could not is the service's own input-probe failure,
+                // classified with the code MediaConvert publishes for it and worded from
+                // the job's own `Settings.Inputs`. Otherwise the input was readable and
+                // the failure is the missing transcoder, which no MediaConvert error code
+                // classifies — so none is reported rather than one invented.
+                match job.unreadable_input.clone() {
+                    Some(file_input) => {
+                        job.error_code = Some(INPUT_PROBE_FAILURE_CODE);
+                        job.error_message = Some(input_probe_failure_message(&file_input));
+                    }
+                    None => {
+                        job.error_code = None;
+                        job.error_message = Some(NO_TRANSCODER_MESSAGE.to_string());
+                    }
+                }
                 job.timing.start_time = Some(due);
                 job.timing.finish_time = Some(due);
             }
@@ -2130,7 +2510,13 @@ impl ComAmazonawsMediaconvertMediaconvertState {
     }
 
     /// Cancel a stored job: "Permanently cancel a job. Once you have canceled a job, you
-    /// can't start it again." Only a job still waiting in its queue can be cancelled.
+    /// can't start it again."
+    ///
+    /// Only a job still waiting in its queue can be cancelled — with one exception that is
+    /// not a transition at all: a job ALREADY in the terminal `CANCELED` status is the
+    /// state the request asks for, so the call succeeds again and changes nothing. That
+    /// makes `CancelJob` retry-safe, which is what a client re-sending it after a timeout,
+    /// or a teardown path that runs twice, relies on.
     pub fn cancel_job(&mut self, id: &str, now: SystemTime) -> CancelOutcome {
         let Some(job) = self.jobs.get_mut(id) else {
             return CancelOutcome::NotFound;
