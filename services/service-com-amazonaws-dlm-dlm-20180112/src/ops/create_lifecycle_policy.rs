@@ -275,17 +275,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The other cross-member rule the model cannot express: a schedule's
-        // `CreateRule` states when to create EITHER as a cron expression OR as an
-        // interval, never both. Refused before anything is stored, so a request
-        // AWS would never have accepted leaves no policy behind.
-        if let Some(schedule) =
-            crate::state::schedule_with_conflicting_create_rule(input.policy_details.as_ref())
+        // The other cross-member rules the model cannot express, and the reason
+        // `InvalidRequestException` carries a `RequiredParameters` member at
+        // all: which configuration members a request must state depends on the
+        // KIND of policy it describes, so the model can mark none of them
+        // `@required`. A request that names neither `DefaultPolicy` nor
+        // `PolicyDetails` describes no policy at all; a configuration that
+        // describes one leaves out nothing that kind of policy is built from.
+        // Refused before anything is stored, so no policy is left holding a
+        // configuration AWS would never have accepted.
+        if !is_default {
+            let Some(details) = input.policy_details.as_ref() else {
+                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    crate::state::no_policy_configuration(),
+                )
+                .into());
+            };
+            let omitted = crate::state::omitted_configuration_members(details);
+            if !omitted.is_empty() {
+                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    crate::state::configuration_members_omitted(&omitted),
+                )
+                .into());
+            }
+        }
+
+        // And the either/or rules inside a schedule: a `CreateRule` states when
+        // to create in exactly one of its two documented forms, and a
+        // `RetainRule` retains by exactly one of its two documented modes.
+        // Refused before anything is stored, so a request AWS would never have
+        // accepted leaves no policy behind.
+        if let Some(refusal) =
+            crate::state::schedule_rule_violation(input.policy_details.as_ref())
         {
-            return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
-                crate::state::conflicting_create_rule(&schedule),
-            )
-            .into());
+            return Err(
+                CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
+            );
         }
 
         // And the documented domain of a custom schedule's creation interval:
