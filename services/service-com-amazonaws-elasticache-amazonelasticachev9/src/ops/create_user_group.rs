@@ -310,6 +310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user_ids: members.clone(),
             status: crate::state::STATUS_CREATING.to_string(),
             pending_status: crate::state::user_group_transition(now),
+            // Nothing is pending on a group that has just been created: the
+            // membership it was asked for IS its membership. A later
+            // `ModifyUserGroup` is what fills these.
+            pending_user_ids_to_add: Vec::new(),
+            pending_user_ids_to_remove: Vec::new(),
             replication_group_ids: Vec::new(),
             serverless_cache_names: Vec::new(),
             region,
