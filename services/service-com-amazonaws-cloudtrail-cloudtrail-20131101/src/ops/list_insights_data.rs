@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInsightsData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInsightsData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the Insights events of one trail, read from the shared trail registry
+//! (`crate::state`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInsightsData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The dimension keys are checked first, in the boundary validator's own envelope;
+//! the `InsightSource` must then be the ARN of a trail this account holds and the
+//! calling Region can see; and the window the request asks for is checked last.
+//! Each refusal is HTTP 400 `ValidationException`. A trail that does exist answers
+//! with its Insights event log, which is empty: see [`ListInsightsData::handle`]
+//! for why.
+//!
+//! NOT modelled here: the organization-trail caller restriction the docs below
+//! state ("only the management account and delegated administrator accounts can
+//! call ListInsightsData" for data event Insights on an organization trail). This
+//! emulator carries no organization, no management account and no delegated
+//! administrator, and a request carries no caller account to compare one with, so
+//! the restriction is deliberately out of scope rather than judged unnecessary —
+//! which is why the modelled `OperationNotPermittedException` is never answered.
+//! The documented request rate limit ("two per second, per account, per Region")
+//! is out of scope for the same reason: this emulator meters no caller, so no
+//! throttling error is answered.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +119,71 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::time::{Duration, SystemTime};
+
+/// How far back Insights events can be listed, from this operation's model doc:
+/// "You can list Insights events that occurred in a Region within the last 90
+/// days."
+pub const INSIGHTS_LOOKBACK_DAYS: u64 = 90;
+
+/// [`INSIGHTS_LOOKBACK_DAYS`] as a duration.
+const INSIGHTS_LOOKBACK: Duration = Duration::from_secs(INSIGHTS_LOOKBACK_DAYS * 24 * 60 * 60);
+
+/// The order the service's own validation message states the dimension key set
+/// in — which is neither the model's declaration order nor alphabetical.
+///
+/// The one piece of evidence for the order is the recorded refusal in the wire
+/// fixture `cloudtrail-list-insights-data-invalid-params` (its `ListInsightsData`
+/// step that sends an unmodelled dimension key), which lists the set this way.
+///
+/// MEMBERSHIP is the model's: the set itself is the generated
+/// `LIST_INSIGHTS_DATA_DIMENSION_KEY_VALUES` (the key shape of this map,
+/// `ListInsightsDataDimensionKey`), and this table only orders it, so the handler
+/// cannot drift from the model and a value the enum gains is appended rather than
+/// dropped.
+const DIMENSION_KEYS_AS_STATED: [&str; 3] = ["EventName", "EventSource", "EventId"];
+
+/// The modelled dimension key set, in the order the service states it in.
+fn dimension_keys_as_stated() -> impl Iterator<Item = &'static str> {
+    DIMENSION_KEYS_AS_STATED
+        .into_iter()
+        .filter(|key| LIST_INSIGHTS_DATA_DIMENSION_KEY_VALUES.contains(key))
+        .chain(
+            LIST_INSIGHTS_DATA_DIMENSION_KEY_VALUES
+                .iter()
+                .copied()
+                .filter(|key| !DIMENSION_KEYS_AS_STATED.contains(key)),
+        )
+}
+
+/// The refusal for a `Dimensions` key outside the modelled key enum.
+///
+/// The map's key shape is an enum, so this is a constraint the model declares —
+/// but the boundary validator walks map VALUES and not map KEYS, so the refusal
+/// is stated here instead, in the same validation envelope the boundary uses:
+/// the member path, then the constraint its keys must satisfy.
+fn unsupported_dimension_message() -> String {
+    format!(
+        "1 validation error detected: Value at 'dimensions' failed to satisfy \
+         constraint: Map keys must satisfy constraint: [Member must satisfy enum \
+         value set: [{}]]",
+        dimension_keys_as_stated().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// An instant as a comparable key. `::aws_smithy_types::DateTime` carries seconds
+/// plus subsecond nanos, and orders by neither on its own.
+fn instant_key(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
+/// Render an instant the way a refusal quotes it back to the caller (ISO 8601),
+/// falling back to epoch seconds for an instant ISO 8601 cannot carry.
+fn quote(at: &::aws_smithy_types::DateTime) -> String {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| at.secs().to_string())
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,18 +254,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInsightsData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInsightsDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // EVERY refusal below answers HTTP 400 `ValidationException` rather than the
+        // modelled `InvalidParameterException`, because that is what CloudTrail was
+        // RECORDED answering for this operation: the wire corpus's
+        // `cloudtrail-list-insights-data-*` fixtures carry
+        // `{"__type":"ValidationException"}` for an `InsightSource` that is not a
+        // trail ARN, for a `DataType` outside its enum, for a `Dimensions` key
+        // outside its enum and for an end before a start. The modelled error stays
+        // unconstructed here for that reason, not by oversight.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInsightsData"))
+        // ----- the request shape -----
+        //
+        // The dimension map's key is the `ListInsightsDataDimensionKey` enum, so a
+        // request that filters on anything else breaks a constraint the model
+        // declares, and is refused in the boundary validator's own envelope before
+        // anything about the account is read.
+        let unsupported_dimension = input
+            .dimensions
+            .iter()
+            .flatten()
+            .any(|(key, _)| !LIST_INSIGHTS_DATA_DIMENSION_KEY_VALUES.contains(&key.as_str()));
+        if unsupported_dimension {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                unsupported_dimension_message(),
+            ));
+        }
+
+        // ----- the trail the request names -----
+        //
+        // The source is settled BEFORE the time range: a request that both names a
+        // trail that does not exist and carries an end before its start is refused
+        // for the source.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInsightsDataErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "ListInsightsData needs the CloudTrail trail registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // `InsightSource` is "the ARN of the trail for which you want to retrieve
+        // Insights events": not a trail name, and not another account's or another
+        // partition's ARN. The identifier goes through the registry's own resolver
+        // (`State::resolve`, the seam every trail operation reads through), and the
+        // value is then compared with the stored trail's own ARN — which settles
+        // partition, account, Region, resource type and name at once, so every source
+        // that is not the ARN of a trail this account holds (a bare name, a malformed
+        // value, a non-trail CloudTrail ARN, or an ARN naming no trail) is refused
+        // identically. The trail also has to be one this Region can see, because the
+        // events this operation lists are the ones "that occurred in a Region": its
+        // home Region sees it, and every Region sees a multi-Region trail's shadow.
+        let source_names_a_visible_trail = store
+            .resolve(&input.insight_source, &region)
+            .ok()
+            .flatten()
+            .is_some_and(|record| {
+                record.trail_arn == input.insight_source && record.visible_from(&region, true)
+            });
+        if !source_names_a_visible_trail {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "The Insight source {} is not a valid trail ARN.",
+                input.insight_source
+            )));
+        }
+
+        // ----- the window the request asks for -----
+        //
+        // Both rules below are stated in the operation's own docs rather than as a
+        // model constraint, and the recorded fixture
+        // `cloudtrail-list-insights-data-time-range-rejected-on-live-trail` shows a
+        // window refused on a trail that does exist — so the window is checked after
+        // the source, and refused rather than answered with an empty page.
+
+        // "If the specified end time is before the specified start time, an error is
+        // returned." (model doc for `StartTime` and `EndTime`). The service states
+        // that rule in one fixed sentence rather than quoting the two instants back.
+        // The comparison is deliberately strict: only an end BEFORE the start is
+        // refused, so a zero-length window (end equal to start) is a valid window,
+        // which is the rule the doc states even though the sentence reads as an
+        // ordering.
+        if let (Some(start), Some(end)) = (&input.start_time, &input.end_time) {
+            if instant_key(end) < instant_key(start) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The start time must be before the end time.",
+                ));
+            }
+        }
+
+        // "You can list Insights events that occurred in a Region within the last 90
+        // days" — a window that starts before that is outside the range of values
+        // this operation accepts. The evidence is the wire fixture
+        // `cloudtrail-list-insights-data-time-range-rejected-on-live-trail`, whose
+        // `ListInsightsData` steps are both REFUSALS of a window on a trail that
+        // does exist and which replay green with this check in place; no recording
+        // shows an out-of-lookback window answered with an empty page. Only the
+        // START of the window is bounded: that is the member the doc sentence
+        // constrains, so an `EndTime` alone leaves the window starting at the
+        // lookback, which is in range, and a request naming no window at all is in
+        // range too, as the fixtures that send none show.
+        // A host clock within the lookback of the platform epoch has no instant
+        // that far back, and then no start time is outside it.
+        let earliest = SystemTime::now()
+            .checked_sub(INSIGHTS_LOOKBACK)
+            .map(::aws_smithy_types::DateTime::from);
+        if let (Some(start), Some(earliest)) = (&input.start_time, earliest) {
+            if instant_key(start) < instant_key(&earliest) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "The StartTime {} is more than {INSIGHTS_LOOKBACK_DAYS} days in the \
+                     past; Insights events can be listed only for the last \
+                     {INSIGHTS_LOOKBACK_DAYS} days.",
+                    quote(start)
+                )));
+            }
+        }
+
+        // A `NextToken` is only ever one this operation minted, and it mints none: no
+        // page it answers is ever full (see below), so there is never a next page to
+        // resume at. Any token a caller sends is one this emulator did not issue,
+        // which is "a parameter that is not valid" — the modelled
+        // `InvalidParameterException`, as the sibling `ListInsightsMetricData` answers
+        // for a token it did not issue. No recording covers a token on this operation,
+        // so the modelled error is preferred over the framework's envelope.
+        if let Some(token) = &input.next_token {
+            return Err(ListInsightsDataErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!("The NextToken {token} is not valid.")),
+                },
+            )
+            .into());
+        }
+
+        // The trail exists, so the answer is its Insights event log — and that log is
+        // empty. CloudTrail mints an Insights event by analysing the volume of the
+        // management and data events a trail records against that trail's own
+        // baseline; nothing in this emulator records CloudTrail events or runs that
+        // analysis, so no trail has ever had an Insights event, for any dimension or
+        // time window. Synthesising one here would be inventing API activity that
+        // never happened. An empty page is also why no page is ever full: `MaxResults`
+        // never truncates one and no `NextToken` is ever minted.
+        Ok(ListInsightsDataOutput {
+            events: Some(Vec::new()),
+            next_token: None,
+        })
     }
 }
