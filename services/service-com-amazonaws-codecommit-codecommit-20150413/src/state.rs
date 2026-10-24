@@ -27,7 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{ApprovalRuleTemplate, Comment, Location, RepositoryMetadata, UserInfo};
+use crate::ops::types::{
+    ApprovalRule, ApprovalRuleTemplate, Comment, Location, MergeMetadata, OriginApprovalRuleTemplate,
+    PullRequest, PullRequestTarget, RepositoryMetadata, UserInfo,
+};
 use git_object::{Kind, Object, TreeEntry};
 
 /// The region an ARN or clone URL uses when the request carries no SigV4
@@ -60,6 +63,30 @@ pub const COMMENTS_PAGE_MAX: i32 = 500;
 /// kept for the life of the repository, so this is what keeps one repository's
 /// stored size bounded. Every record it holds is released by `DeleteRepository`.
 pub const MAX_COMMENTS_PER_REPOSITORY: usize = 1_000;
+
+/// `pullRequestStatus` values the model's `PullRequestStatusEnum` declares
+/// (`smithy_query(query="shape",shape="PullRequestStatusEnum")`). The modelled
+/// doc on `PullRequest.pullRequestStatus` states the only transition: "Pull
+/// request status can only change from OPEN to CLOSED."
+pub const PULL_REQUEST_STATUS_OPEN: &str = "OPEN";
+
+/// How many OPEN pull requests one repository holds before `CreatePullRequest`
+/// refuses the write with the modelled
+/// `MaximumOpenPullRequestsExceededException`.
+///
+/// Documented on that error shape: "You cannot create the pull request because
+/// the repository has too many open pull requests. The maximum number of open
+/// pull requests for a repository is 1,000."
+pub const MAX_OPEN_PULL_REQUESTS_PER_REPOSITORY: usize = 1_000;
+
+/// How many pull requests one repository RETAINS in total, open and closed.
+///
+/// The emulator's OWN bound, not an AWS limit, and the one
+/// [`MAX_OPEN_PULL_REQUESTS_PER_REPOSITORY`] leaves open: a closed pull request
+/// is kept for the life of the repository, so without this a caller could open
+/// and close pull requests without end. Every record it holds is released by
+/// `DeleteRepository`.
+pub const MAX_PULL_REQUESTS_PER_REPOSITORY: usize = 2_000;
 
 /// `fileMode` values the model's `FileModeTypeEnum` declares
 /// (`smithy_query(query="shape",shape="FileModeTypeEnum")`).
@@ -687,9 +714,27 @@ pub struct ComAmazonawsCodecommitCodecommit20150413State {
     /// is held once, on the repository ([`Repository::associated_templates`]), so
     /// the two sides of an association cannot disagree.
     pub approval_rule_templates: BTreeMap<String, ApprovalRuleTemplateRecord>,
+    /// How many pull requests this account has created, which is what the next
+    /// one's `pullRequestId` counts from: CodeCommit ids a pull request with a
+    /// decimal integer that is unique per ACCOUNT rather than per repository
+    /// (`GetPullRequest` takes a `pullRequestId` and nothing else), and ids are
+    /// never reused, so this counter only ever goes up.
+    pub pull_requests_created: u64,
 }
 
 impl ComAmazonawsCodecommitCodecommit20150413State {
+    /// The pull request this `pullRequestId` names, wherever it was created.
+    ///
+    /// A pull request id is addressable on its own — `GetPullRequest` takes
+    /// nothing else — while a pull request's lifetime is its repository's, so
+    /// pull requests live on the repository that holds them and are found
+    /// through this one lookup rather than through a second index that could
+    /// disagree with it, exactly as [`Self::comment`] finds a comment.
+    pub fn pull_request(&self, pull_request_id: u64) -> Option<&PullRequestRecord> {
+        self.repositories
+            .values()
+            .find_map(|repository| repository.pull_requests.get(&pull_request_id))
+    }
     /// The comment this `commentId` names, wherever it was posted.
     ///
     /// A comment id is addressable on its own — `GetComment` takes nothing else —
@@ -768,6 +813,15 @@ pub struct Repository {
     /// The sequence number the next comment takes: comments are reported in the
     /// order they were posted.
     pub next_comment_sequence: u64,
+    /// Pull requests opened against this repository, keyed by the numeric
+    /// `pullRequestId`, so the map's order IS the order the ids were minted in.
+    /// Bounded by [`MAX_PULL_REQUESTS_PER_REPOSITORY`].
+    pub pull_requests: BTreeMap<u64, PullRequestRecord>,
+    /// Each `clientRequestToken` a pull request was created with, mapped to the
+    /// `pullRequestId` that first request created, so a repeated request
+    /// carrying the same token returns that pull request instead of opening a
+    /// second one.
+    pub pull_request_tokens: BTreeMap<String, u64>,
 }
 
 /// A branch: its name and the commit it points at (its tip).
@@ -1063,7 +1117,18 @@ impl Repository {
             comments: BTreeMap::new(),
             comment_tokens: BTreeMap::new(),
             next_comment_sequence: 0,
+            pull_requests: BTreeMap::new(),
+            pull_request_tokens: BTreeMap::new(),
         }
+    }
+
+    /// How many of this repository's pull requests are still open — what
+    /// [`MAX_OPEN_PULL_REQUESTS_PER_REPOSITORY`] bounds.
+    pub fn open_pull_requests(&self) -> usize {
+        self.pull_requests
+            .values()
+            .filter(|pull_request| pull_request.status == PULL_REQUEST_STATUS_OPEN)
+            .count()
     }
 
     /// This repository as the modeled `RepositoryMetadata` shape — the one place
@@ -1695,6 +1760,318 @@ impl ApprovalRuleTemplateRecord {
     }
 }
 
+/// One pull request and everything CodeCommit reports about it.
+///
+/// A pull request lives on the repository its target names
+/// ([`Repository::pull_requests`]), because that is what bounds its lifetime: a
+/// deleted repository takes its pull requests with it.
+#[derive(Debug, Clone)]
+pub struct PullRequestRecord {
+    /// The numeric `pullRequestId`, unique per account. Reported as its decimal
+    /// text, which is what [`PullRequestRecord::to_modeled`] renders.
+    pub pull_request_id: u64,
+    pub title: String,
+    pub description: Option<String>,
+    pub creation_date: SystemTime,
+    /// "The day and time of the last user or system activity on the pull
+    /// request": the creation instant for a pull request nothing has touched
+    /// yet, and the instant of each later change.
+    pub last_activity_date: SystemTime,
+    /// [`PULL_REQUEST_STATUS_OPEN`] until something closes it; the model admits
+    /// no other transition.
+    pub status: String,
+    pub author_arn: String,
+    pub client_request_token: Option<String>,
+    /// The targets of the pull request. CodeCommit admits exactly one.
+    pub targets: Vec<PullRequestTargetRecord>,
+    /// The approval rules applied to this pull request, in the order they were
+    /// applied: the ones derived from the repository's associated approval rule
+    /// templates when it was created, and any rule added to it later.
+    pub approval_rules: Vec<ApprovalRuleRecord>,
+    /// How many times the reviewable state of this pull request has moved. It
+    /// is what distinguishes one `revisionId` from the next — see
+    /// [`PullRequestRecord::revision_id`] — so a caller that holds a revision id
+    /// can tell whether it still names the revision it read.
+    pub revision: u64,
+}
+
+impl PullRequestRecord {
+    /// The system-generated `revisionId` of this pull request's CURRENT
+    /// revision: a digest over the pull request's identity, how many times its
+    /// reviewable state has moved, and the tips each target is between.
+    ///
+    /// Derived rather than stored, so it cannot disagree with the state it
+    /// names: it is stable for as long as that state is, and a change to it (a
+    /// source branch moving, a revision of the pull request) gives the next
+    /// read a different one. The digest form is the hex SHA-256 this crate
+    /// already reports for content signatures ([`content_sha256`]).
+    pub fn revision_id(&self) -> String {
+        let tips: Vec<String> = self
+            .targets
+            .iter()
+            .map(|target| {
+                format!(
+                    "{}/{}/{}/{}/{}",
+                    target.repository_name,
+                    target.source_reference,
+                    target.source_commit,
+                    target.destination_reference,
+                    target.destination_commit
+                )
+            })
+            .collect();
+        content_sha256(&format!(
+            "codecommit/{}/pull-request/{}/{}/{}",
+            ::engine::emulator_account_id(),
+            self.pull_request_id,
+            self.revision,
+            tips.join(",")
+        ))
+    }
+
+    /// This pull request as the modeled `PullRequest` shape — the one place that
+    /// projection is written, so `CreatePullRequest`, `GetPullRequest` and any
+    /// later updater cannot disagree about a stored pull request.
+    pub fn to_modeled(&self) -> PullRequest {
+        PullRequest {
+            pull_request_id: Some(self.pull_request_id.to_string()),
+            title: Some(self.title.clone()),
+            description: self.description.clone(),
+            last_activity_date: Some(to_date_time(self.last_activity_date)),
+            creation_date: Some(to_date_time(self.creation_date)),
+            pull_request_status: Some(self.status.clone()),
+            author_arn: Some(self.author_arn.clone()),
+            pull_request_targets: Some(
+                self.targets
+                    .iter()
+                    .map(PullRequestTargetRecord::to_modeled)
+                    .collect(),
+            ),
+            client_request_token: self.client_request_token.clone(),
+            revision_id: Some(self.revision_id()),
+            approval_rules: Some(
+                self.approval_rules
+                    .iter()
+                    .map(ApprovalRuleRecord::to_modeled)
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// One target of a pull request: the two references it is between, the tips they
+/// pointed at, their merge base, and how the merge stands.
+#[derive(Debug, Clone)]
+pub struct PullRequestTargetRecord {
+    pub repository_name: String,
+    /// The FULLY QUALIFIED reference (`refs/heads/<branch>`), which is the form
+    /// CodeCommit reports whichever form the request named — see
+    /// [`pull_request_reference`].
+    pub source_reference: String,
+    pub destination_reference: String,
+    /// The tip of the source branch when the pull request was created. "If the
+    /// pull request branch is updated by a push while the pull request is open,
+    /// the commit ID changes to reflect the new tip of the branch."
+    pub source_commit: String,
+    pub destination_commit: String,
+    /// "The commit ID of the most recent commit that the source branch and the
+    /// destination branch have in common" — absent for two histories that share
+    /// no commit at all.
+    pub merge_base: Option<String>,
+    pub merged: bool,
+    pub merged_by: Option<String>,
+    pub merge_commit_id: Option<String>,
+    pub merge_option: Option<String>,
+}
+
+impl PullRequestTargetRecord {
+    /// This target as the modeled `PullRequestTarget` shape.
+    pub fn to_modeled(&self) -> PullRequestTarget {
+        PullRequestTarget {
+            repository_name: Some(self.repository_name.clone()),
+            source_reference: Some(self.source_reference.clone()),
+            destination_reference: Some(self.destination_reference.clone()),
+            destination_commit: Some(self.destination_commit.clone()),
+            source_commit: Some(self.source_commit.clone()),
+            merge_base: self.merge_base.clone(),
+            // "Returns metadata about the state of the merge, including whether
+            // the merge has been made": a target that has not been merged
+            // reports that, rather than reporting nothing.
+            merge_metadata: Some(MergeMetadata {
+                is_merged: self.merged,
+                merged_by: self.merged_by.clone(),
+                merge_commit_id: self.merge_commit_id.clone(),
+                merge_option: self.merge_option.clone(),
+            }),
+        }
+    }
+}
+
+/// One approval rule applied to a pull request.
+#[derive(Debug, Clone)]
+pub struct ApprovalRuleRecord {
+    pub approval_rule_id: String,
+    pub approval_rule_name: String,
+    /// The approval rule document, canonicalized exactly as a template's
+    /// content is ([`canonical_json_document`]), so `ruleContentSha256` is the
+    /// digest of the bytes every reader reports.
+    pub content: String,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+    pub last_modified_user: String,
+    /// The approval rule template this rule was derived from, for a rule a
+    /// template applied; absent for one created on the pull request itself.
+    pub origin_template: Option<(String, String)>,
+}
+
+impl ApprovalRuleRecord {
+    /// This rule as the modeled `ApprovalRule` shape.
+    pub fn to_modeled(&self) -> ApprovalRule {
+        ApprovalRule {
+            approval_rule_id: Some(self.approval_rule_id.clone()),
+            approval_rule_name: Some(self.approval_rule_name.clone()),
+            approval_rule_content: Some(self.content.clone()),
+            rule_content_sha256: Some(content_sha256(&self.content)),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+            creation_date: Some(to_date_time(self.creation_date)),
+            last_modified_user: Some(self.last_modified_user.clone()),
+            origin_approval_rule_template: self.origin_template.as_ref().map(|(id, name)| {
+                OriginApprovalRuleTemplate {
+                    approval_rule_template_id: Some(id.clone()),
+                    approval_rule_template_name: Some(name.clone()),
+                }
+            }),
+        }
+    }
+}
+
+/// The `lastModifiedUser` CodeCommit attributes an approval rule it applied
+/// ITSELF to: the service principal, because a rule that an associated approval
+/// rule template put on a new pull request is written by the service rather than
+/// by the caller who opened the pull request (the recorded behaviour the corpus
+/// names "approval-rule-template-auto-attaches-to-new-pull-requests", whose
+/// recorded `lastModifiedUser` for such a rule is this principal and not the
+/// creating caller's ARN). A rule a caller creates on a pull request names that
+/// caller instead.
+pub const SERVICE_PRINCIPAL: &str = "codecommit.amazonaws.com";
+
+/// An approval rule's opaque `approvalRuleId`: the same kind of version-8 UUID
+/// as every other id this service mints, over the account, the pull request the
+/// rule is on, the rule's name and the instant it was applied.
+pub fn approval_rule_id(pull_request_id: u64, name: &str, created: SystemTime) -> String {
+    let nanos = nanos_since_epoch(created);
+    uuid_v8(&format!(
+        "codecommit/{}/pull-request/{pull_request_id}/approval-rule/{name}/{nanos}",
+        ::engine::emulator_account_id()
+    ))
+}
+
+/// Does an approval rule template's content apply to a pull request whose
+/// destination is this fully qualified reference?
+///
+/// A template document may carry `DestinationReferences` (the member
+/// [`is_approval_rule_template_content`] accepts): CodeCommit's approval rule
+/// template schema uses it to scope the template to pull requests merging into
+/// those branches, so a template that lists any applies only to a destination it
+/// lists, and one that lists none applies to every pull request in the
+/// repositories it is associated with. A listed entry matches either spelling of
+/// the reference, since the two name the same branch.
+pub fn template_applies_to_destination(content: &str, destination_reference: &str) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(references) = document
+        .get("DestinationReferences")
+        .and_then(::serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    if references.is_empty() {
+        return true;
+    }
+    let branch = destination_reference
+        .strip_prefix(HEADS_PREFIX)
+        .unwrap_or(destination_reference);
+    references.iter().filter_map(::serde_json::Value::as_str).any(|listed| {
+        listed == destination_reference
+            || listed.strip_prefix(HEADS_PREFIX).unwrap_or(listed) == branch
+    })
+}
+
+/// Why a `pullRequestId` cannot name a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestIdProblem {
+    /// The id is absent or blank: the operations model
+    /// `PullRequestIdRequiredException` for this.
+    Missing,
+    /// The id is not the form a pull request id takes:
+    /// `InvalidPullRequestIdException`.
+    Invalid,
+}
+
+/// The pull request a `pullRequestId` names, with surrounding space removed, or
+/// why it names none.
+///
+/// CodeCommit ids a pull request with a decimal integer, so a value that is not
+/// one addresses no pull request in any account and is refused as invalid rather
+/// than reported as missing: a sign, a fractional part or surrounding space all
+/// make it a value no id was ever minted as. Every operation that takes a
+/// `pullRequestId` classifies it here, so they cannot disagree about which ids
+/// are addressable.
+pub fn normalize_pull_request_id(raw: &str) -> Result<u64, PullRequestIdProblem> {
+    if raw.trim().is_empty() {
+        return Err(PullRequestIdProblem::Missing);
+    }
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(PullRequestIdProblem::Invalid);
+    }
+    raw.parse::<u64>()
+        .map_err(|_| PullRequestIdProblem::Invalid)
+}
+
+/// `PullRequestDoesNotExistException`'s message, built from the id the request
+/// asked for — the one place this crate words that code, for the same reason
+/// [`repository_does_not_exist_message`] is the one place it words its own.
+pub fn pull_request_does_not_exist_message(pull_request_id: &str) -> String {
+    format!(
+        "The pull request ID {pull_request_id} could not be found. Make sure that you have \
+         specified the correct repository name and pull request ID, and then try again."
+    )
+}
+
+/// `InvalidPullRequestIdException`'s message: a FIXED sentence pair that states
+/// the failure and then the rule, echoing nothing from the request.
+pub const INVALID_PULL_REQUEST_ID_MESSAGE: &str =
+    "The pull request ID is not valid. Make sure that you have provided the full ID and that the \
+     pull request is in the specified repository, and then try again.";
+
+/// `PullRequestIdRequiredException`'s message: a FIXED sentence.
+pub const PULL_REQUEST_ID_REQUIRED_MESSAGE: &str =
+    "A pull request ID is required, but none was provided.";
+
+/// `ReferenceNameRequiredException`'s message: a FIXED sentence.
+///
+/// The one place this crate words that code, for the same reason
+/// [`repository_does_not_exist_message`] is the one place it words its own: the
+/// request boundary (`crate::service`) and every handler that classifies a
+/// reference answer the same text.
+pub const REFERENCE_NAME_REQUIRED_MESSAGE: &str =
+    "A reference name is required, but none was provided.";
+
+/// `InvalidReferenceNameException`'s message: the sentence pair the model states
+/// for that error shape, echoing nothing from the request.
+pub const INVALID_REFERENCE_NAME_MESSAGE: &str =
+    "The specified reference name format is not valid. Reference names must conform to the Git \
+     references format (for example, refs/heads/main).";
+
+/// `ReferenceTypeNotSupportedException`'s message: a FIXED sentence.
+pub const REFERENCE_TYPE_NOT_SUPPORTED_MESSAGE: &str =
+    "The specified reference is not a supported type.";
+
+/// `ReferenceDoesNotExistException`'s message: a FIXED sentence that names
+/// neither the reference nor the repository.
+pub const REFERENCE_DOES_NOT_EXIST_MESSAGE: &str = "The specified reference does not exist.";
+
 /// An approval rule template's description as CodeCommit HOLDS it, whatever a
 /// request carried.
 ///
@@ -2119,6 +2496,63 @@ pub fn is_valid_branch_name(name: &str) -> bool {
 /// modelled member.
 pub fn is_valid_ref_name(name: &str) -> bool {
     name.chars().count() <= MAX_REF_NAME && is_valid_branch_name(name)
+}
+
+/// Why a reference a pull request target names cannot address a branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceProblem {
+    /// The reference is absent or blank: the operations model
+    /// `ReferenceNameRequiredException` for this.
+    Missing,
+    /// The reference is not a name a git reference can take:
+    /// `InvalidReferenceNameException`.
+    Invalid,
+    /// The reference is well formed but names something other than a branch — a
+    /// tag, or another `refs/` namespace: `ReferenceTypeNotSupportedException`.
+    UnsupportedType,
+}
+
+/// The BRANCH a pull request target's reference names, or why it names none.
+///
+/// A pull request is between two branches: `ReferenceName` documents the member
+/// as "The branch of the repository …", and
+/// `ReferenceTypeNotSupportedException` is what CodeCommit answers for a
+/// reference of any other kind. CodeCommit is a git host, so both the short
+/// branch name and the fully qualified `refs/heads/<branch>` name the same
+/// branch — the form the request used is not what is stored, since
+/// `PullRequestTarget` reports the qualified form either way (see
+/// [`qualified_reference`]).
+///
+/// The one place this crate classifies such a reference, so the operations that
+/// take one cannot disagree about which references address a branch.
+pub fn pull_request_reference(raw: &str) -> Result<&str, ReferenceProblem> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ReferenceProblem::Missing);
+    }
+    // A reference in another namespace than `refs/heads/` is a reference of a
+    // type a pull request does not take, rather than a malformed one.
+    if let Some(name) = trimmed.strip_prefix("refs/") {
+        let Some(branch) = name.strip_prefix("heads/") else {
+            return Err(ReferenceProblem::UnsupportedType);
+        };
+        return if is_valid_ref_name(branch) {
+            Ok(branch)
+        } else {
+            Err(ReferenceProblem::Invalid)
+        };
+    }
+    if is_valid_ref_name(trimmed) {
+        Ok(trimmed)
+    } else {
+        Err(ReferenceProblem::Invalid)
+    }
+}
+
+/// The fully qualified reference of a branch: `refs/heads/<branch>`, the form
+/// `PullRequestTarget`'s `sourceReference` and `destinationReference` report.
+pub fn qualified_reference(branch: &str) -> String {
+    format!("{HEADS_PREFIX}{branch}")
 }
 
 /// The total content size of the folder a path lives in, over the sizes a tree
