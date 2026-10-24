@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegexPatternSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegexPatternSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegexPatternSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +118,23 @@ impl From<ListRegexPatternSetsErrorModeled> for ListRegexPatternSetsError {
     }
 }
 
+/// The largest page `ListRegexPatternSets` answers with when the request names no
+/// `Limit`: the upper bound of the model's `PaginationLimit` (`range 1..100`).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The name a stored set is ordered and markered by.
+///
+/// `RegexPatternSet$Name` is modelled as an optional MEMBER, so the stored shape
+/// holds an `Option` — but the only way a set enters the store is
+/// `CreateRegexPatternSet`, whose `Name` is `@required` with `length 1..128` and
+/// pattern `^[\w\-]+$`, and which stores exactly that name. Every stored set
+/// therefore has a non-empty name, and the fallback below is unreachable: it
+/// exists so a nameless entry would still be LISTED (sorted ahead of the named
+/// ones) rather than dropped from the page.
+fn set_name(entry: &crate::state::RegexPatternSetEntry) -> &str {
+    entry.regex_pattern_set.name.as_deref().unwrap_or_default()
+}
+
 /// The `ListRegexPatternSets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +171,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegexPatternSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegexPatternSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegexPatternSets"))
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                ListRegexPatternSetsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the regex pattern sets live in, and is one of CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListRegexPatternSetsErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let state = state.lock();
+
+        // Only this scope's regex pattern sets — a scope is a namespace — in a stable
+        // order so a marker names the same position on every call.
+        let mut entries: Vec<&crate::state::RegexPatternSetEntry> = state
+            .regex_pattern_sets
+            .values()
+            .filter(|entry| entry.scope == input.scope)
+            .collect();
+        entries.sort_by(|left, right| set_name(left).cmp(set_name(right)));
+
+        // `NextMarker` is the name of the last summary of the previous page, so this
+        // page starts at the first name after it.
+        if let Some(marker) = input.next_marker.as_deref() {
+            entries.retain(|entry| set_name(entry) > marker);
+        }
+
+        // Absent `Limit`, a page holds as many as the model's `PaginationLimit` range
+        // allows (`range 1..100`); a `Limit` outside that range is refused rather
+        // than clamped, so no caller gets a silently empty terminal page.
+        let page_size = match input.limit {
+            None => MAX_PAGE_SIZE,
+            Some(limit) if (1..=MAX_PAGE_SIZE).contains(&limit) => limit,
+            Some(limit) => {
+                return Err(
+                    ListRegexPatternSetsErrorModeled::WAFInvalidParameterException(
+                        crate::state::invalid_parameter_exception(
+                            crate::state::FIELD_ENTITY_LIMIT,
+                            &limit.to_string(),
+                            &format!("a page holds between 1 and {MAX_PAGE_SIZE} summaries"),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        };
+        let page_size = usize::try_from(page_size).unwrap_or(0);
+        entries.truncate(page_size);
+
+        // WAF answers every non-empty page with a `NextMarker`: the name of the LAST
+        // summary on the page even when the page is not full, so a client resumes
+        // from it and learns it reached the end from the empty page that follows.
+        // `ListRegexPatternSetsResponse$NextMarker` is `length 1..256` with pattern
+        // `\S`, so a page with no last name to report — an empty page, or one whose
+        // last entry carries no name — carries no marker, which is also what ends the
+        // paginator's loop.
+        let next_marker = entries
+            .last()
+            .map(|entry| set_name(entry))
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let regex_pattern_sets = entries
+            .into_iter()
+            .map(|entry| RegexPatternSetSummary {
+                name: entry.regex_pattern_set.name.clone(),
+                id: entry.regex_pattern_set.id.clone(),
+                description: entry.regex_pattern_set.description.clone(),
+                lock_token: Some(entry.lock_token.clone()),
+                arn: entry.regex_pattern_set.arn.clone(),
+            })
+            .collect();
+
+        Ok(ListRegexPatternSetsOutput {
+            next_marker,
+            regex_pattern_sets: Some(regex_pattern_sets),
+        })
     }
 }
