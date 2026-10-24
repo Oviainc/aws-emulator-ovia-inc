@@ -15,6 +15,8 @@
 mod alarm_history;
 #[path = "all/alarm_history_data.rs"]
 mod alarm_history_data;
+#[path = "all/composite_alarms.rs"]
+mod composite_alarms;
 #[path = "all/ec2_alarm_actions.rs"]
 mod ec2_alarm_actions;
 #[path = "all/harness.rs"]
