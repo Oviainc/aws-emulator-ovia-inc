@@ -41,5 +41,7 @@ mod site_and_outpost_lifecycle;
 mod site_and_outpost_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/supported_instance_types.rs"]
+mod supported_instance_types;
 #[path = "all/update_persistence.rs"]
 mod update_persistence;

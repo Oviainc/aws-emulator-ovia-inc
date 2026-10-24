@@ -1593,6 +1593,14 @@ pub const TAGS_MEMBER: &str = "tags";
 /// operations take. See [`SITE_ID_MEMBER`].
 pub const ADDRESS_TYPE_MEMBER: &str = "addressType";
 
+/// The validation-path name of the `AssetId` input member an operation scopes its
+/// answer to one of an Outpost's assets by. See [`SITE_ID_MEMBER`].
+pub const ASSET_ID_MEMBER: &str = "assetId";
+
+/// The validation-path name of the `OrderId` input member an operation names an
+/// Amazon Web Services Outposts order by. See [`SITE_ID_MEMBER`].
+pub const ORDER_ID_MEMBER: &str = "orderId";
+
 /// How many entries the modelled `TagMap` holds (`@length(min: 1, max: 50)`).
 ///
 /// It is the bound on a RESOURCE's tag map and not only on one request's: the
@@ -1855,6 +1863,15 @@ pub const ASSET_PAGE: &str = "assets";
 /// in THAT list and the route it is replayed on names the Outpost (and the capacity
 /// task) it belongs to. See [`ASSET_PAGE`].
 pub const BLOCKING_INSTANCE_PAGE: &str = "blockingInstances";
+
+/// The stamp a `GetOutpostSupportedInstanceTypes` page token carries.
+///
+/// What that report pages through is the instance-type catalog NARROWED to what one
+/// Outpost's hardware can support, so it is a different list from the whole catalog
+/// `ListOrderableInstanceTypes` pages ([`ORDERABLE_INSTANCE_TYPE_PAGE`]) even though
+/// both name a boundary in the same catalog order — and a token issued for one of
+/// them is therefore not a boundary of the other. See [`OUTPOST_PAGE`].
+pub const SUPPORTED_INSTANCE_TYPE_PAGE: &str = "supportedInstanceTypes";
 
 /// The page size a list uses when the caller named no `MaxResults`, which is also
 /// the ceiling the model declares for it (`MaxResults1000`, `range(1..1000)`).

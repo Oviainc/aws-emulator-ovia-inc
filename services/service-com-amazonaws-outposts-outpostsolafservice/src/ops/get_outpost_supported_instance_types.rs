@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOutpostSupportedInstanceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOutpostSupportedInstanceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the instance types the hardware of ONE Outpost can support,
+//! computed from the stored Outpost and the instance-type catalog this service
+//! publishes, cut into pages of at most `MaxResults` with the modelled `NextToken` the
+//! next page resumes from. A read: it never changes what a later caller sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOutpostSupportedInstanceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule, stated once here and applied by [`supports`] below: an instance type the
+//! scope the request names can support is a catalog entry that every hardware fact the
+//! store records about that scope admits —
+//!
+//! * the Outpost's recorded `SupportedHardwareType` is the form factor its hardware
+//!   has, so an entry whose `FormFactorConfigs` does not offer it in that form factor
+//!   is not one this Outpost can support; an Outpost that recorded no hardware type
+//!   narrows nothing;
+//! * an `AssetId` scopes the report to ONE of that Outpost's assets. An asset that
+//!   recorded no `ComputeAttributes` is not compute hardware, so it can host no
+//!   instance at all; one that did is narrowed by the instance families it records
+//!   (an entry of another family is not hardware it can host) and by its recorded
+//!   `MaxVcpus` ("the maximum number of vCPUs possible for the specified asset", so
+//!   an entry needing more than that cannot run on it). A fact the asset did not
+//!   record narrows nothing.
+//!
+//! What is reported is the CAPABILITY of that hardware, not its current
+//! configuration: "this will generally include instance types that are not currently
+//! configured and therefore cannot be launched with the current Outpost capacity
+//! configuration", so the per-type counts an asset's `InstanceTypeCapacities` records
+//! are deliberately not consulted.
+//!
+//! An `OrderId` names an Amazon Web Services Outposts ORDER, and this store holds no
+//! order record — an order is placed by `CreateOrder` and read by `GetOrder`, both
+//! still scaffold stubs with issues of their own — so an `OrderId` names no order this
+//! emulator holds and is answered with the not-found error this operation models,
+//! exactly as an `OutpostIdentifier` the store does not hold is.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +174,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // Everything this report answers comes from `input` and the store: the same
+        // Outpost answers the same supported instance types to every caller, so
+        // nothing here reads the request's metadata.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOutpostSupportedInstanceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOutpostSupportedInstanceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOutpostSupportedInstanceTypes"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetOutpostSupportedInstanceTypesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Outposts store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                GetOutpostSupportedInstanceTypesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::outpost_identifier_pattern_report()),
+                    },
+                )
+            })?;
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS report is a bad request, not an empty page — the same rule
+        // every other paged answer in this service applies to its own token.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::SUPPORTED_INSTANCE_TYPE_PAGE, token)
+                    .ok_or_else(|| {
+                        GetOutpostSupportedInstanceTypesErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(crate::state::page_token_report(
+                                    "GetOutpostSupportedInstanceTypes",
+                                )),
+                            },
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        // A read, so the guard is taken immutably: what an Outpost's hardware can
+        // support is a fact about that hardware rather than a transition the clock
+        // owes, so there is nothing here for this call to materialise and nothing for
+        // it to write.
+        let store = state.lock();
+        // The supported instance types are reported OFF one Outpost, so one the store
+        // does not hold is the not-found error this operation models, worded as the
+        // identifier echo of the value AS SUPPLIED — not of the bare id an ARN
+        // resolved to.
+        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+            GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        })?;
+        // An order this emulator holds no record of names no hardware to scope the
+        // report to; see this module's header. Checked before the asset, so a request
+        // naming both is answered about the coarser scope it could not resolve.
+        if let Some(order_id) = input.order_id.as_deref().filter(|id| !id.is_empty()) {
+            return Err(
+                GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::ORDER_ID_MEMBER,
+                            order_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The hardware the request scopes the report to: one named asset of this
+        // Outpost, or the Outpost itself. An `AssetId` that names none of its assets
+        // is the same not-found error, echoed on the member it arrived in.
+        let hardware = match input.asset_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(asset_id) => {
+                let asset = record
+                    .assets
+                    .iter()
+                    .find(|asset| asset.asset_id.as_deref() == Some(asset_id))
+                    .ok_or_else(|| {
+                        GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
+                            NotFoundException {
+                                message: Some(crate::state::identifier_not_found(
+                                    crate::state::ASSET_ID_MEMBER,
+                                    asset_id,
+                                )),
+                            },
+                        )
+                    })?;
+                Hardware::Asset(asset.compute_attributes.as_ref())
+            }
+            None => Hardware::Outpost,
+        };
+        let form_factor = record.outpost.supported_hardware_type.as_deref();
+
+        // The boundary a page of this report stops at is the catalog entry's own
+        // position in the catalog's stable order, which is the order the whole report
+        // is reported in.
+        let (instance_types, next_token) = crate::state::page(
+            crate::state::SUPPORTED_INSTANCE_TYPE_PAGE,
+            store
+                .orderable_instance_types
+                .iter()
+                .filter(|entry| supports(&entry.instance_type, form_factor, hardware))
+                .map(|entry| {
+                    (
+                        entry.sequence,
+                        // An `InstanceTypeItem` reports the instance type and the
+                        // number of default vCPUs in it; both come from the catalog
+                        // entry, so what this answers about an instance type cannot
+                        // disagree with what `ListOrderableInstanceTypes` answers.
+                        InstanceTypeItem {
+                            instance_type: entry.instance_type.instance_type.clone(),
+                            vcp_us: entry.instance_type.vcp_us,
+                        },
+                    )
+                }),
+            after,
+            size,
+        );
+
+        Ok(GetOutpostSupportedInstanceTypesOutput {
+            instance_types: Some(instance_types),
+            next_token,
+        })
     }
+}
+
+/// The hardware of an Outpost a request scopes this report to.
+#[derive(Debug, Clone, Copy)]
+enum Hardware<'a> {
+    /// The Outpost itself — the request named no asset of it, so the only hardware
+    /// fact in scope is the Outpost's own form factor.
+    Outpost,
+    /// ONE asset of it, with the `ComputeAttributes` that asset recorded (`None` for
+    /// an asset that recorded none, which is therefore not compute hardware).
+    Asset(Option<&'a ComputeAttributes>),
+}
+
+/// Whether the hardware in scope can support one catalog entry — the rule this
+/// module's header states, applied to one entry.
+fn supports(
+    entry: &DetailedInstanceTypeItem,
+    form_factor: Option<&str>,
+    hardware: Hardware<'_>,
+) -> bool {
+    // An entry's `FormFactorConfigs` names every form factor it is offered in, so an
+    // Outpost of one form factor can support the entries offered in that one. An
+    // Outpost that recorded no `SupportedHardwareType` narrows nothing.
+    let offered_in_form_factor = form_factor.is_none_or(|form_factor| {
+        entry
+            .form_factor_configs
+            .iter()
+            .flatten()
+            .any(|config| config.form_factor.as_deref() == Some(form_factor))
+    });
+    if !offered_in_form_factor {
+        return false;
+    }
+    match hardware {
+        Hardware::Outpost => true,
+        // Not compute hardware: a storage server, a powershelf, a switch or a
+        // networking asset hosts no instance, so it supports no instance type.
+        Hardware::Asset(None) => false,
+        Hardware::Asset(Some(compute)) => {
+            let in_recorded_family = match compute.instance_families.as_deref() {
+                Some(families) if !families.is_empty() => families
+                    .iter()
+                    .any(|family| instance_family(entry) == Some(family.as_str())),
+                // An asset that recorded no instance family narrows nothing: the
+                // emulator does not claim its hardware is limited to families nothing
+                // recorded.
+                _ => true,
+            };
+            let within_vcpu_ceiling = compute
+                .max_vcpus
+                .is_none_or(|max| entry.vcp_us.is_none_or(|vcpus| vcpus <= max));
+            in_recorded_family && within_vcpu_ceiling
+        }
+    }
+}
+
+/// The instance FAMILY of a catalog entry: the part of an EC2 instance type before
+/// the size, which is what `ComputeAttributes$InstanceFamilies` names.
+fn instance_family(entry: &DetailedInstanceTypeItem) -> Option<&str> {
+    entry
+        .instance_type
+        .as_deref()
+        .and_then(|instance_type| instance_type.split('.').next())
 }
