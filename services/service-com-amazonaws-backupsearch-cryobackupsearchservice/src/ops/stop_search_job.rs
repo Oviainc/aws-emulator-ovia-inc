@@ -199,11 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         job.status = crate::state::STOPPING.to_string();
-        job.next_status_due = Some((
+        // The stop REPLACES whatever the scan still owed (its own RUNNING and terminal
+        // statuses), so a stopped job settles to STOPPED and never to the status its scan
+        // would have reached.
+        job.owe_only(
             now + crate::state::TRANSITION_DELAY,
             crate::state::STOPPED,
             None,
-        ));
+        );
         Ok(StopSearchJobOutput {})
     }
 }

@@ -4,14 +4,15 @@
 //! Mints a search job and PERSISTS it in [`crate::state`]: a UUID
 //! `SearchJobIdentifier`, the `search-job/<id>` ARN built from it, the server clock's
 //! `CreationTime`, the submitted `SearchScope`/`ItemFilters`/`Name`/`EncryptionKeyArn`/
-//! `Tags`, the recovery points that scope resolves to, and `Status = RUNNING`. The
+//! `Tags`, the recovery points that scope resolves to, and `Status = CREATING`. The
 //! members it answers with are read back out of that record, so `GetSearchJob` reports
 //! the same values.
 //!
-//! The clock owes the job a terminal status, and WHICH one follows from the resolved
-//! scope: a scan with recovery points in scope runs to `COMPLETED`, while a scope that
-//! resolved to none ends `FAILED` with the `StatusMessage` the service explains an empty
-//! scope with ([`crate::state::scan_outcome`]).
+//! The clock then owes the job `RUNNING` and after that a terminal status, and WHICH
+//! terminal one follows from the resolved scope: a scan with recovery points in scope
+//! runs to `COMPLETED`, while a scope that resolved to none ends `FAILED` with the
+//! `StatusMessage` the service explains an empty scope with
+//! ([`crate::state::scan_outcome`]).
 //!
 //! `ClientToken` is idempotent: the same token with the same body answers with the job
 //! the first call minted, and the same token with a different body is a
@@ -99,6 +100,7 @@
 use super::types::*;
 
 use crate::state::{SearchJob, SEARCH_JOB_RESOURCE};
+use std::collections::VecDeque;
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -293,9 +295,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identifier: identifier.clone(),
             arn,
             name: input.name.clone(),
-            // A new search job is RUNNING; the clock owes it the status above once the
-            // scan's span has passed (`crate::state::TRANSITION_DELAY`).
-            status: crate::state::RUNNING.to_string(),
+            // A new search job is being set up, so the first status any caller can
+            // observe is CREATING; the clock owes it RUNNING once the set-up span has
+            // passed (`crate::state::CREATING_DELAY`) and the terminal status above once
+            // the scan's span has (`crate::state::TRANSITION_DELAY`).
+            status: crate::state::CREATING.to_string(),
             creation_time: crate::state::timestamp(now),
             completion_time: None,
             status_message: None,
@@ -315,11 +319,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             client_token: input.client_token.clone(),
             request_fingerprint: fingerprint,
-            next_status_due: Some((
-                now + crate::state::TRANSITION_DELAY,
-                owed_status,
-                owed_message,
-            )),
+            owed_statuses: VecDeque::from([
+                (now + crate::state::CREATING_DELAY, crate::state::RUNNING, None),
+                (
+                    now + crate::state::TRANSITION_DELAY,
+                    owed_status,
+                    owed_message,
+                ),
+            ]),
         };
         state.insert_job(job);
 
