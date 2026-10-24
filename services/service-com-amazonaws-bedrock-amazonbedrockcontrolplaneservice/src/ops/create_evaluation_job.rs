@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEvaluationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEvaluationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEvaluationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! Mints one evaluation job in the store and answers its `jobArn`. The job is accepted and
+//! runs asynchronously, so it is stored `InProgress`, which is the only status this
+//! operation mints: see [`crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS`] for why no
+//! clock transition moves it. `GetEvaluationJob` reads the job back.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +183,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEvaluationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEvaluationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEvaluationJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEvaluationJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("evaluation job state is not available on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TooManyTagsException` is not among this operation's modelled errors, so the
+        // per-resource tag bound is refused with the modelled `ValidationException`
+        // instead. The bound itself is the one `TooManyTagsException` documents elsewhere
+        // in this service ("50 tags per resource"); the modelled `@length(0..200)` on
+        // `TagList` is enforced ahead of this handler, so this is the tighter
+        // per-resource bound inside that span.
+        let tag_count = input.job_tags.as_ref().map_or(0, Vec::len);
+        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "a resource may carry at most {} tags, and jobTags carries {tag_count}",
+                crate::state::MAX_TAGS_PER_RESOURCE
+            )));
+        }
+
+        // "For model evaluation jobs, automated jobs support a single model or inference
+        // profile, and jobs that use human workers support two models or inference
+        // profiles"
+        // (`smithy_query(query="doc",shape="CreateEvaluationJobRequest",member="inferenceConfig")`),
+        // so an automated job carrying more than one model is refused. The modelled
+        // `@length(1..2)` on `EvaluationModelConfigs` is enforced ahead of this handler;
+        // this is the narrower bound the automated configuration has inside it.
+        if let (
+            EvaluationConfig::Automated(_),
+            EvaluationInferenceConfig::Models(models),
+        ) = (&input.evaluation_config, &input.inference_config)
+        {
+            if models.len() > 1 {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "an automated evaluation job supports a single model or inference \
+                     profile, and inferenceConfig names {}",
+                    models.len()
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: a replay answers with what the first request minted.
+        let replayed = input
+            .client_request_token
+            .as_ref()
+            .and_then(|token| {
+                store
+                    .evaluation_job_create_tokens
+                    .get(&(region.clone(), token.clone()))
+            })
+            .cloned();
+        if let Some(minted) = replayed {
+            if let Some(job) = store.evaluation_job(&minted) {
+                return Ok(CreateEvaluationJobOutput {
+                    job_arn: job.arn.clone(),
+                });
+            }
+        }
+
+        // "Names must unique with your Amazon Web Services account, and your account's
+        // Amazon Web Services region"
+        // (`smithy_query(query="doc",shape="CreateEvaluationJobRequest",member="jobName")`),
+        // so a create reusing a stored job's name in the same region conflicts.
+        let name_key = (region.clone(), input.job_name.clone());
+        if store.evaluation_job_names.contains_key(&name_key) {
+            return Err(CreateEvaluationJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "an evaluation job named {} already exists in this account in {region}",
+                        input.job_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's evaluation job bound. Enforcing it here is also what bounds this
+        // part of the store: without a server-side cap a caller could grow it with nothing
+        // but fresh job names.
+        if store.evaluation_jobs.len() >= crate::state::MAX_EVALUATION_JOBS_PER_ACCOUNT {
+            return Err(
+                CreateEvaluationJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} evaluation jobs; \
+                             request a quota increase",
+                            crate::state::MAX_EVALUATION_JOBS_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let job_id = store.mint_evaluation_job_id(now);
+        let arn = crate::state::evaluation_job_arn(&region, &job_id);
+        let job = crate::state::EvaluationJobRecord {
+            arn: arn.clone(),
+            name: input.job_name,
+            region: region.clone(),
+            description: input.job_description,
+            role_arn: input.role_arn,
+            customer_encryption_key_id: input.customer_encryption_key_id,
+            application_type: input.application_type,
+            job_type: crate::state::evaluation_job_type_of(&input.evaluation_config),
+            evaluation_config: input.evaluation_config,
+            inference_config: input.inference_config,
+            output_data_config: input.output_data_config,
+            tags: input.job_tags.unwrap_or_default(),
+            // The evaluation runs after this call returns, so the job is reported running
+            // from here onwards.
+            status: crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS,
+            created_at: now,
+            last_modified_at: now,
+        };
+
+        store.evaluation_job_names.insert(name_key, arn.clone());
+        if let Some(token) = input.client_request_token {
+            store
+                .evaluation_job_create_tokens
+                .insert((region, token), arn.clone());
+        }
+        store.evaluation_jobs.insert(arn.clone(), job);
+
+        // Read the response back out of the STORED record, so what the caller is told is
+        // exactly what a later GetEvaluationJob will find.
+        let stored = store
+            .evaluation_job(&arn)
+            .expect("the evaluation job just inserted under this ARN");
+        Ok(CreateEvaluationJobOutput {
+            job_arn: stored.arn.clone(),
+        })
     }
 }

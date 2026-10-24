@@ -392,7 +392,7 @@ async fn an_unknown_identifier_is_a_not_found_and_removes_nothing() {
         assert_failure(
             &delete_method_response(&gateway, &api, &resource, "GET", status).await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("DeleteMethodResponse({status})"),
         );
     }
