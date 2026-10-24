@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveListenerCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveListenerCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveListenerCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes certificates from the CERTIFICATE LIST of the listener `ListenerArn` names.
+//!
+//! The listener's DEFAULT certificate lives outside that list — "You can't remove the
+//! default certificate for a listener. To replace the default certificate, call
+//! `ModifyListener`" — so a request naming a certificate that is the default and not a
+//! list entry is refused with the modelled `OperationNotPermittedException`, while a list
+//! entry is removed even when the same certificate is also the default. An ARN this store
+//! holds no listener for is `ListenerNotFoundException`.
+//!
+//! Removing a certificate the list does not hold leaves the list as it was: the removal
+//! is idempotent over the list's contents, so a repeated call answers the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +140,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveListenerCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveListenerCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveListenerCertificates"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("RemoveListenerCertificates")
+        })?;
+
+        // A value that is no listener ARN at all names no listener this API can have:
+        // an invalid ARN rather than a missing listener.
+        crate::state::check_listener_arn(&input.listener_arn)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // The REQUEST is read, bounded and deduplicated before the store is reached: one
+        // call cannot name more certificates than a listener's list holds, and the shared
+        // state guard is taken only once there is a bounded set to remove.
+        if input.certificates.len() > crate::state::CERTIFICATES_PER_LISTENER {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Certificates can name at most {} certificates in a single call, got {}",
+                crate::state::CERTIFICATES_PER_LISTENER,
+                input.certificates.len()
+            )));
+        }
+        let mut requested: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for certificate in &input.certificates {
+            let Some(arn) = certificate
+                .certificate_arn
+                .as_deref()
+                .filter(|arn| !arn.is_empty())
+            else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    "CertificateArn must be set on each certificate to remove",
+                ));
+            };
+            // Naming one certificate twice removes it once.
+            requested.insert(arn);
+        }
+
+        let mut guard = state.lock();
+        let Some(listener) = guard.listeners.get_mut(&input.listener_arn) else {
+            return Err(
+                RemoveListenerCertificatesErrorModeled::ListenerNotFoundException(
+                    ListenerNotFoundException {
+                        message: Some(crate::state::listener_not_found_message(
+                            &input.listener_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole request is checked before the first removal, so a refused call
+        // removes nothing. The certificate LIST is what this operation removes from, so a
+        // list entry goes even when the same certificate is also the listener's default
+        // one: what cannot be removed is the DEFAULT certificate, which lives outside the
+        // list and is replaced through `ModifyListener`. A certificate the list does not
+        // hold leaves it as it was.
+        for arn in &requested {
+            if listener.list_certificate_arns.iter().any(|held| held == arn) {
+                continue;
+            }
+            if listener.certificate_arns.iter().any(|held| held == arn) {
+                return Err(
+                    RemoveListenerCertificatesErrorModeled::OperationNotPermittedException(
+                        OperationNotPermittedException {
+                            message: Some(format!(
+                                "Certificate '{arn}' is the default certificate of listener \
+                                 '{}' and cannot be removed; call ModifyListener to replace it",
+                                input.listener_arn
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        listener
+            .list_certificate_arns
+            .retain(|held| !requested.contains(held.as_str()));
+
+        Ok(RemoveListenerCertificatesOutput {})
     }
 }

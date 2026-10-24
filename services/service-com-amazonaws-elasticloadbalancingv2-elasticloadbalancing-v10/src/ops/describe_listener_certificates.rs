@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeListenerCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeListenerCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeListenerCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the default certificate and the certificate list of the listener
+//! `ListenerArn` names, in one page walked by `Marker`/`PageSize`.
+//!
+//! `Certificate$IsDefault` is what tells the two apart — "This value is not included in
+//! the output when describing a listener, but is included when describing listener
+//! certificates" — so the default certificate is reported with it set and each list
+//! entry with it clear, and a certificate that is both appears once as each rather than
+//! being collapsed.
+//!
+//! A reporting operation: it reads the store and writes nothing to it, and an ARN this
+//! store holds no listener for is the modelled `ListenerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeListenerCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeListenerCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeListenerCertificates"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeListenerCertificates")
+        })?;
+
+        // A value that is no listener ARN at all names no listener this API can have:
+        // an invalid ARN rather than a missing listener.
+        crate::state::check_listener_arn(&input.listener_arn)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        let guard = state.lock();
+        let Some(listener) = guard.listeners.get(&input.listener_arn) else {
+            return Err(
+                DescribeListenerCertificatesErrorModeled::ListenerNotFoundException(
+                    ListenerNotFoundException {
+                        message: Some(crate::state::listener_selection_not_found_message()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let (page, next_marker) = crate::state::paginate(
+            listener.certificate_shapes(),
+            input.marker.as_deref(),
+            input.page_size,
+        )
+        .map_err(|_| {
+            crate::scaffolded::Scaffolded::validation(
+                "The marker is not valid: it must be a NextMarker from a previous page of this collection",
+            )
+        })?;
+
+        Ok(DescribeListenerCertificatesOutput {
+            certificates: Some(page),
+            next_marker,
+        })
     }
 }

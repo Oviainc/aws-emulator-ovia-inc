@@ -157,10 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(arns) = input.listener_arns.as_deref() {
                 let mut selected = Vec::new();
                 for arn in arns {
+                    // A value that is no listener ARN at all names no listener this API
+                    // can have: an invalid ARN rather than a missing listener.
+                    crate::state::check_listener_arn(arn)
+                        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
                     let Some(listener) = guard.listeners.get(arn) else {
                         return Err(DescribeListenersErrorModeled::ListenerNotFoundException(
                             ListenerNotFoundException {
-                                message: Some(format!("Listener '{arn}' not found")),
+                                // A read over a LIST of identifiers: the refusal is about
+                                // the selection the request asked for rather than one
+                                // listener it acts on, and the service names no value in
+                                // it.
+                                message: Some(crate::state::listener_selection_not_found_message()),
                             },
                         )
                         .into());

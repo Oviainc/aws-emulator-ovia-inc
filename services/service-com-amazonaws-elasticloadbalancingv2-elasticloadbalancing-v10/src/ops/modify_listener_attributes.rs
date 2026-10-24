@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyListenerAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyListenerAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyListenerAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the listener attributes the request names on the listener `ListenerArn` names,
+//! after checking each one against the catalog the model's `ListenerAttribute$Key`
+//! documentation states (`crate::state::LISTENER_ATTRIBUTES`): the key must be an
+//! attribute this service models, the listener's load balancer family must carry it, and
+//! the value must be in the domain that documentation states for it. Anything else is
+//! the modelled `InvalidConfigurationRequestException`, and an ARN this store holds no
+//! listener for is `ListenerNotFoundException`.
+//!
+//! The whole request is checked before the first write, so a refused call stores
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +141,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyListenerAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyListenerAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyListenerAttributes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("ModifyListenerAttributes")
+        })?;
+
+        // A value that is no listener ARN at all names no listener this API can have:
+        // an invalid ARN rather than a missing listener.
+        crate::state::check_listener_arn(&input.listener_arn)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        let mut guard = state.lock();
+        if !guard.listeners.contains_key(&input.listener_arn) {
+            return Err(
+                ModifyListenerAttributesErrorModeled::ListenerNotFoundException(
+                    ListenerNotFoundException {
+                        message: Some(crate::state::listener_not_found_message(
+                            &input.listener_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A listener exists only under its load balancer, so the family is always
+        // resolvable here; `Application` is the modelled default for `Type`.
+        let family = guard
+            .listener_family(&input.listener_arn)
+            .unwrap_or(crate::state::LoadBalancerFamily::Application);
+
+        // The whole request is checked before the first write, so a caller that sent one
+        // bad attribute beside three good ones can resend the corrected request without
+        // wondering which of them landed.
+        let mut writes: Vec<(String, String)> = Vec::with_capacity(input.attributes.len());
+        for attribute in &input.attributes {
+            let key = attribute.key.clone().unwrap_or_default();
+            // The value is stored exactly as the request wrote it, so a read reports the
+            // caller's own value rather than a re-rendered one.
+            let value = attribute.value.clone().unwrap_or_default();
+            let Some(spec) = crate::state::listener_attribute(&key) else {
+                return Err(invalid_configuration(format!(
+                    "'{key}' is not a listener attribute this service supports"
+                )));
+            };
+            if !spec.applies_to(family) {
+                return Err(invalid_configuration(format!(
+                    "The attribute '{key}' is not supported for a listener of a {} load \
+                     balancer",
+                    family_name(family)
+                )));
+            }
+            if let Err(domain) = spec.domain.check(&value) {
+                return Err(invalid_configuration(format!(
+                    "The value '{value}' is not valid for the attribute '{key}': it must be \
+                     {domain}"
+                )));
+            }
+            writes.push((key, value));
+        }
+
+        let listener = guard
+            .listeners
+            .get_mut(&input.listener_arn)
+            .expect("the listener found above");
+        for (key, value) in &writes {
+            listener.attributes.insert(key.clone(), value.clone());
+        }
+
+        // The attributes the call modified, in the order the request named them — not the
+        // whole set, which is what `DescribeListenerAttributes` reports.
+        Ok(ModifyListenerAttributesOutput {
+            attributes: Some(
+                writes
+                    .into_iter()
+                    .map(|(key, value)| ListenerAttribute {
+                        key: Some(key),
+                        value: Some(value),
+                    })
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// The operation's own refusal for an attribute it cannot store: an unknown key, a key
+/// this listener does not carry, or a value outside the domain the attribute's
+/// documentation states. The message names the key and the value from the request and
+/// the rule they broke, because that is what the caller has to fix.
+fn invalid_configuration(detail: String) -> ModifyListenerAttributesError {
+    ModifyListenerAttributesErrorModeled::InvalidConfigurationRequestException(
+        InvalidConfigurationRequestException {
+            message: Some(detail),
+        },
+    )
+    .into()
+}
+
+/// How a refusal names the load balancer family it judged the attribute against, in the
+/// words the model's `LoadBalancerTypeEnum` uses.
+fn family_name(family: crate::state::LoadBalancerFamily) -> &'static str {
+    match family {
+        crate::state::LoadBalancerFamily::Application => "application",
+        crate::state::LoadBalancerFamily::Network => "network",
+        crate::state::LoadBalancerFamily::Gateway => "gateway",
     }
 }
